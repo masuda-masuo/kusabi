@@ -270,7 +270,7 @@ async function runPrompt({ cwd, kind, title, promptText, agent, model, session, 
     cwd,
     startedAt: new Date().toISOString(),
     finishedAt: null,
-    stats: { events: 0, steps: 0, lastTool: null, permissionsAllowed: 0, permissionsRejected: 0, lastActivity: null },
+    stats: { events: 0, steps: 0, lastTool: null, permissionsAllowed: 0, permissionsRejected: 0, lastActivity: null, models: [] },
     error: null,
   };
   saveJob(stateDir, job);
@@ -332,6 +332,12 @@ async function runPrompt({ cwd, kind, title, promptText, agent, model, session, 
               job.stats.lastTool = part.tool;
             } else if (part?.type === "step-start") {
               job.stats.steps += 1;
+            }
+          } else if (type === "message.updated") {
+            const info = event?.properties?.info;
+            if (info?.role === "assistant" && info?.providerID && info?.modelID) {
+              const m = `${info.providerID}/${info.modelID}`;
+              if (!job.stats.models.includes(m)) job.stats.models.push(m);
             }
           } else if (type === "session.idle") {
             sawIdle = true;
@@ -400,6 +406,7 @@ function renderHeader(job) {
   return [
     `opencode ${job.kind} ${job.id} — ${job.status} (${durationS(job)}s)`,
     `session: ${job.sessionID} (continue in opencode: \`opencode -s ${job.sessionID}\`)`,
+    ...(job.stats?.models?.length ? [`model: ${job.stats.models.join(" → ")}`] : []),
     "",
   ].join("\n");
 }
