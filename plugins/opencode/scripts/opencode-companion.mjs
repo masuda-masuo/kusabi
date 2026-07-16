@@ -489,7 +489,7 @@ function parseArgs(argv) {
     const arg = argv[i];
     if (arg === "--auto" || arg === "--read-only" || arg === "--resume-last" || arg === "--wait" || arg === "--background") {
       flags[arg.slice(2).replace(/-([a-z])/g, (_, c) => c.toUpperCase())] = true;
-    } else if (arg === "--base" || arg === "--model" || arg === "--agent" || arg === "--session" || arg === "--timeout") {
+    } else if (arg === "--base" || arg === "--model" || arg === "--agent" || arg === "--session" || arg === "--timeout" || arg === "--deny") {
       flags[arg.slice(2)] = argv[++i];
     } else {
       rest.push(arg);
@@ -532,7 +532,11 @@ async function cmdTask(cwd, { flags, text }) {
     session = latestJob(stateDir, (j) => j.kind === "task")?.sessionID;
     if (!session) throw new Error("--resume-last: no previous task session found for this directory");
   }
-  const tools = flags.readOnly ? Object.fromEntries(WRITE_TOOL_NAMES.map((t) => [t, false])) : undefined;
+  let tools = flags.readOnly ? Object.fromEntries(WRITE_TOOL_NAMES.map((t) => [t, false])) : undefined;
+  if (flags.deny) {
+    tools = { ...(tools ?? {}) };
+    for (const name of flags.deny.split(",").filter(Boolean)) tools[name] = false;
+  }
   const { job, resultText } = await runPrompt({
     cwd,
     kind: "task",

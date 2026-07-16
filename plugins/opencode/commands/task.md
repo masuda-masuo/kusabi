@@ -1,6 +1,6 @@
 ---
 description: Delegate a task to opencode through the local opencode server
-argument-hint: '[--wait|--background] [--model provider/model] [--agent name] [--read-only] [--auto] [--resume-last|--session <id>] <task description>'
+argument-hint: '[--wait|--background] [--model provider/model] [--agent name] [--read-only] [--deny tool1,tool2] [--auto] [--resume-last|--session <id>] <task description>'
 disable-model-invocation: true
 allowed-tools: Read, Bash(node:*), Bash(git:*), AskUserQuestion
 ---
@@ -22,6 +22,7 @@ Execution mode rules:
 Argument handling:
 - Preserve the user's arguments exactly. Do not strip flags or rewrite the task text.
 - `--auto` auto-approves opencode permission requests (dangerous); pass it through only when the user asked for it.
+- `--deny name1,name2` disables the named opencode tools for this task via the session tools config. MCP tools do not go through opencode's permission asks, so this is the only effective way to block them (e.g. `--deny sunaba_publish` to keep the network exit with the orchestrator).
 
 Foreground flow:
 ```bash
