@@ -494,12 +494,25 @@ function buildReviewInput(cwd, base) {
 function parseArgs(argv) {
   const flags = {};
   const rest = [];
+  let literal = false;
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
-    if (arg === "--auto" || arg === "--read-only" || arg === "--resume-last" || arg === "--wait" || arg === "--background") {
-      flags[arg.slice(2).replace(/-([a-z])/g, (_, c) => c.toUpperCase())] = true;
+    if (literal) {
+      rest.push(arg);
+    } else if (arg === "--") {
+      literal = true;
+    } else if (
+      arg === "--auto" || arg === "--read-only" || arg === "--resume-last" ||
+      arg === "--wait" || arg === "--background" || arg === "--help" || arg === "-h"
+    ) {
+      const key = arg.startsWith("--")
+        ? arg.slice(2).replace(/-([a-z])/g, (_, c) => c.toUpperCase())
+        : arg.slice(1);
+      flags[key] = true;
     } else if (arg === "--base" || arg === "--model" || arg === "--agent" || arg === "--session" || arg === "--timeout" || arg === "--deny") {
       flags[arg.slice(2)] = argv[++i];
+    } else if (arg.startsWith("--")) {
+      throw new Error(`unknown flag: ${arg}`);
     } else {
       rest.push(arg);
     }
@@ -660,11 +673,48 @@ function cmdServeStop(cwd) {
 // main
 // ---------------------------------------------------------------------------
 
+function usage() {
+  return [
+    "Usage: opencode-companion <subcommand> [flags] [text]",
+    "",
+    "Subcommands:",
+    "  setup      Start or verify the opencode server for this directory",
+    "  task       Run an opencode task",
+    "  review     Run an adversarial review of working-tree changes",
+    "  status     List recent jobs or show one by ID",
+    "  result     Show completed job result (latest, or by ID)",
+    "  cancel     Cancel a running job",
+    "  serve-stop Stop the background opencode server",
+    "  help       Show this help message",
+    "",
+    "Flags (task / review):",
+    "  --auto, --read-only, --resume-last, --wait, --background",
+    "  --base <ref>, --model <provider/model>, --agent <id>",
+    "  --session <id>, --timeout <s>, --deny <tools>",
+    "  -h, --help",
+    "",
+    "Unknown flags cause an error. Use -- to treat subsequent tokens as literal text.",
+  ].join("\n");
+}
+
 async function main() {
   const [subcommand, ...argv] = process.argv.slice(2);
   const cwd = process.cwd();
+
   // Claude Code passes "$ARGUMENTS" as a single string; re-split it.
   const flat = argv.length === 1 && argv[0]?.includes(" ") ? argv[0].split(/\s+/).filter(Boolean) : argv;
+
+  // --help / -h before any literal "--", or the help subcommand -> usage, exit 0
+  const sepIdx = flat.indexOf("--");
+  const preLiteral = flat.slice(0, sepIdx >= 0 ? sepIdx : flat.length);
+  if (
+    subcommand === "help" || subcommand === "--help" || subcommand === "-h" ||
+    preLiteral.includes("--help") || preLiteral.includes("-h")
+  ) {
+    process.stdout.write(`${usage()}\n`);
+    process.exit(0);
+  }
+
   const parsed = parseArgs(flat);
   switch (subcommand) {
     case "setup":
