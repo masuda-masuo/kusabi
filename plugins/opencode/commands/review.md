@@ -28,6 +28,7 @@ Execution mode rules:
 Argument handling:
 - Preserve the user's arguments exactly; extra non-flag text is the review focus.
 - Do not add extra review instructions or rewrite the user's intent.
+- Review quality depends sharply on the focus text carrying the change's premise (linked issue, intent, known empirical facts). Measured 2026-07-17: the same diff reviewed without context produced a finding built on a false premise about the old code's intent; with the issue's premise in the focus text the reviewer instead verified the claim against upstream sources. This context must come from the caller — never invent it. If the arguments contain no focus text, you may append one line after the verbatim output: "Tip: reviews are more accurate when the focus text states the change's premise (issue link, intent, known facts)."
 
 Foreground flow:
 ```bash

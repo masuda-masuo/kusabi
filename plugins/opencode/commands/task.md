@@ -21,6 +21,7 @@ Execution mode rules:
 
 Argument handling:
 - Preserve the user's arguments exactly. Do not strip flags or rewrite the task text.
+- The companion automatically prepends worker guardrails (`prompts/task-guardrails.md`: scope adherence, verification honesty, no credential hunting, no VCS exit, fixed report format) to every task prompt. The task text does not need to restate them — it should carry only task-specific content: precise scope, relevant premise/context, and acceptance criteria.
 - `--auto` auto-approves opencode permission requests (dangerous); pass it through only when the user asked for it.
 - `--deny name1,name2` disables the named opencode tools for this task via the session tools config. MCP tools do not go through opencode's permission asks, so this is the only effective way to block them (e.g. `--deny sunaba_publish` to keep the network exit with the orchestrator).
 

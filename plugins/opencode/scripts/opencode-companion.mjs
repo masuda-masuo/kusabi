@@ -539,11 +539,12 @@ async function cmdTask(cwd, { flags, text }) {
     tools = { ...(tools ?? {}) };
     for (const name of flags.deny.split(",").filter(Boolean)) tools[name] = false;
   }
+  const guardrails = fs.readFileSync(path.join(PLUGIN_ROOT, "prompts", "task-guardrails.md"), "utf8").trim();
   const { job, resultText } = await runPrompt({
     cwd,
     kind: "task",
     title: text.slice(0, 80),
-    promptText: text,
+    promptText: `${guardrails}\n\n<task>\n${text}\n</task>`,
     agent: flags.agent,
     model: parseModel(flags.model),
     session,
