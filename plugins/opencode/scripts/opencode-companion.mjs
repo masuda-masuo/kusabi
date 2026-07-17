@@ -488,6 +488,13 @@ function extractJson(text) {
 
 function renderReview(parsed, rawText) {
   if (!parsed) {
+    const lines = rawText.split("\n").filter((l) => l.trim() !== "");
+    const lastLine = lines.length > 0 ? lines[lines.length - 1].trim() : "";
+    const tokenMatch = lastLine.match(/^VERDICT:\s*(approve|needs-attention)\s*$/i);
+    if (tokenMatch) {
+      const verdict = tokenMatch[1].toLowerCase();
+      return `**Verdict: ${verdict}** (recovered from terminal token; JSON malformed)\n\n${rawText}`;
+    }
     return `(review output was not valid JSON; raw output below)\n\n${rawText}`;
   }
   const lines = [`**Verdict: ${parsed.verdict}**`, "", parsed.summary, ""];
@@ -568,7 +575,7 @@ function parseArgs(argv) {
         ? arg.slice(2).replace(/-([a-z])/g, (_, c) => c.toUpperCase())
         : arg.slice(1);
       flags[key] = true;
-    } else if (arg === "--base" || arg === "--model" || arg === "--agent" || arg === "--session" || arg === "--timeout" || arg === "--deny" || arg === "--watchdog" || arg === "--phase" || arg === "--container") {
+    } else if (arg === "--base" || arg === "--model" || arg === "--agent" || arg === "--session" || arg === "--timeout" || arg === "--deny" || arg === "--watchdog" || arg === "--phase" || arg === "--container" || arg === "--prior") {
       flags[arg.slice(2)] = argv[++i];
     } else if (arg.startsWith("--")) {
       throw new Error(`unknown flag: ${arg}`);
@@ -671,7 +678,8 @@ async function cmdReview(cwd, { flags, text }) {
     .replaceAll("{{TARGET_LABEL}}", label)
     .replaceAll("{{USER_FOCUS}}", text || "(none — general adversarial review)")
     .replaceAll("{{OUTPUT_SCHEMA}}", JSON.stringify(schema))
-    .replaceAll("{{REVIEW_INPUT}}", input);
+    .replaceAll("{{REVIEW_INPUT}}", input)
+    .replaceAll("{{PRIOR_FINDINGS}}", flags.prior || "(none — first review round)");
   const { job, resultText } = await runPrompt({
     cwd,
     kind: "review",
@@ -690,7 +698,10 @@ async function cmdReview(cwd, { flags, text }) {
   if (job.status !== "completed") {
     return `${renderHeader(job)}${job.error ?? ""}\nCheck /opencode:status ${job.id} for details.`;
   }
-  const rendered = renderReview(extractJson(resultText), resultText);
+  // Strip trailing VERDICT token line before JSON parsing so the token
+  // does not make extractJson fail on well-formed JSON.
+  const stripped = resultText.replace(/\s*VERDICT:\s*(approve|needs-attention)\s*$/i, "");
+  const rendered = renderReview(extractJson(stripped), resultText);
   fs.writeFileSync(path.join(jobDir(stateDirFor(cwd), job.id), "result.md"), rendered, "utf8");
   return `${renderHeader(job)}${rendered}`;
 }
@@ -845,6 +856,7 @@ function usage() {
     "  --base <ref>, --model <provider/model>, --agent <id>, --phase <name>",
     "  --session <id>, --timeout <s>, --watchdog <s>, --deny <tools>",
     "  --container <cid> (salvage: container to attach to)",
+    "  --prior <text> (review: prior findings for anti-ratchet)",
     "  -h, --help",
     "",
     "Unknown flags cause an error. Use -- to treat subsequent tokens as literal text.",
