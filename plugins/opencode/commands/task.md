@@ -1,6 +1,6 @@
 ---
 description: Delegate a task to opencode through the local opencode server
-argument-hint: '[--wait|--background] [--model provider/model] [--agent name] [--read-only] [--deny tool1,tool2] [--auto] [--resume-last|--session <id>] <task description>'
+argument-hint: '[--wait|--background] [--model provider/model] [--agent name] [--phase name] [--read-only] [--deny tool1,tool2] [--auto] [--resume-last|--session <id>] <task description>'
 disable-model-invocation: true
 allowed-tools: Read, Bash(node:*), Bash(git:*), AskUserQuestion
 ---
@@ -24,6 +24,7 @@ Argument handling:
 - The companion automatically prepends worker guardrails (`prompts/task-guardrails.md`: scope adherence, verification honesty, no credential hunting, no VCS exit, fixed report format) to every task prompt. The task text does not need to restate them — it should carry only task-specific content: precise scope, relevant premise/context, and acceptance criteria.
 - `--auto` auto-approves opencode permission requests (dangerous); pass it through only when the user asked for it.
 - `--deny name1,name2` disables the named opencode tools for this task via the session tools config. MCP tools do not go through opencode's permission asks, so this is the only effective way to block them (e.g. `--deny sunaba_publish` to keep the network exit with the orchestrator).
+- `--phase draft|investigate|implement|review|respond` selects a phase agent (maps to a preconfigured opencode agent with a phase-specific deny profile). Mutually exclusive with `--agent`. Cross-phase session reuse via `--resume-last`/`--session` is rejected. Run `/opencode:setup` once so the phase agents are installed.
 
 Foreground flow:
 ```bash

@@ -25,6 +25,14 @@ const REVIEW_DIFF_LIMIT = 200_000;
 const READ_ONLY_PERMISSIONS = ["read", "glob", "grep", "list", "ls", "webfetch", "websearch", "question", "lsp", "skill"];
 const WRITE_TOOL_NAMES = ["bash", "edit", "write", "patch", "task"];
 
+const PHASE_AGENTS = {
+  draft: "oc-draft",
+  investigate: "oc-investigate",
+  implement: "oc-implement",
+  review: "oc-review",
+  respond: "oc-respond",
+};
+
 // ---------------------------------------------------------------------------
 // state dir / server lifecycle
 // ---------------------------------------------------------------------------
@@ -251,7 +259,7 @@ async function fetchFinalMessage(server, sessionID) {
     .trim();
 }
 
-async function runPrompt({ cwd, kind, title, promptText, agent, model, session, tools, format, auto, timeoutS, watchdogS }) {
+async function runPrompt({ cwd, kind, title, promptText, agent, model, session, tools, format, auto, timeoutS, watchdogS, phase }) {
   const server = await ensureServer(cwd);
   const { stateDir } = server;
 
@@ -269,6 +277,7 @@ async function runPrompt({ cwd, kind, title, promptText, agent, model, session, 
     status: "running",
     sessionID,
     cwd,
+    phase: phase ?? null,
     startedAt: new Date().toISOString(),
     finishedAt: null,
     stats: { events: 0, steps: 0, lastTool: null, permissionsAllowed: 0, permissionsRejected: 0, lastActivity: null, models: [] },
@@ -454,6 +463,7 @@ function renderHeader(job) {
   return [
     `opencode ${job.kind} ${job.id} — ${job.status} (${durationS(job)}s)`,
     `session: ${job.sessionID} (continue in opencode: \`opencode -s ${job.sessionID}\`)`,
+    ...(job.phase ? [`phase: ${job.phase}`] : []),
     ...(job.stats?.models?.length ? [`model: ${job.stats.models.join(" → ")}`] : []),
     "",
   ].join("\n");
@@ -557,7 +567,7 @@ function parseArgs(argv) {
         ? arg.slice(2).replace(/-([a-z])/g, (_, c) => c.toUpperCase())
         : arg.slice(1);
       flags[key] = true;
-    } else if (arg === "--base" || arg === "--model" || arg === "--agent" || arg === "--session" || arg === "--timeout" || arg === "--deny" || arg === "--watchdog") {
+    } else if (arg === "--base" || arg === "--model" || arg === "--agent" || arg === "--session" || arg === "--timeout" || arg === "--deny" || arg === "--watchdog" || arg === "--phase") {
       flags[arg.slice(2)] = argv[++i];
     } else if (arg.startsWith("--")) {
       throw new Error(`unknown flag: ${arg}`);
@@ -591,16 +601,40 @@ async function cmdSetup(cwd) {
     `opencode ${version} — OK`,
     `server: http://127.0.0.1:${server.port} (pid ${server.pid}, password-protected)`,
     `state dir: ${server.stateDir}`,
+    cmdInstallAgents(),
   ].join("\n");
 }
 
 async function cmdTask(cwd, { flags, text }) {
   if (!text) throw new Error("task requires a task description");
+  let agent = flags.agent;
+  let phase = null;
+  if (flags.phase) {
+    phase = flags.phase;
+    if (!PHASE_AGENTS[phase]) {
+      throw new Error(`unknown phase: ${phase}. Use draft|investigate|implement|review|respond`);
+    }
+    if (flags.agent) {
+      throw new Error("--phase and --agent are mutually exclusive");
+    }
+    agent = PHASE_AGENTS[phase];
+  }
   const stateDir = stateDirFor(cwd);
   let session = flags.session;
   if (!session && flags.resumeLast) {
-    session = latestJob(stateDir, (j) => j.kind === "task")?.sessionID;
-    if (!session) throw new Error("--resume-last: no previous task session found for this directory");
+    const prev = latestJob(stateDir, (j) => j.kind === "task" && (!phase || j.phase === phase));
+    session = prev?.sessionID;
+    if (!session) {
+      throw new Error(phase
+        ? `--resume-last: no previous ${phase} session found for this directory`
+        : "--resume-last: no previous task session found for this directory");
+    }
+  }
+  if (session && phase) {
+    const owner = latestJob(stateDir, (j) => j.sessionID === session);
+    if (owner && owner.phase && owner.phase !== phase) {
+      throw new Error(`cross-phase session reuse is forbidden: session belongs to phase '${owner.phase}', requested '${phase}'`);
+    }
   }
   let tools = flags.readOnly ? Object.fromEntries(WRITE_TOOL_NAMES.map((t) => [t, false])) : undefined;
   if (flags.deny) {
@@ -613,7 +647,8 @@ async function cmdTask(cwd, { flags, text }) {
     kind: "task",
     title: text.slice(0, 80),
     promptText: `${guardrails}\n\n<task>\n${text}\n</task>`,
-    agent: flags.agent,
+    agent,
+    phase,
     model: parseModel(flags.model),
     session,
     tools,
@@ -719,6 +754,15 @@ function cmdServeStop(cwd) {
   }
 }
 
+function cmdInstallAgents() {
+  const src = path.join(PLUGIN_ROOT, "opencode-agents");
+  const dest = process.env.OPENCODE_AGENT_DIR || path.join(os.homedir(), ".config", "opencode", "agent");
+  fs.mkdirSync(dest, { recursive: true });
+  const files = fs.existsSync(src) ? fs.readdirSync(src).filter((f) => f.endsWith(".md")) : [];
+  for (const f of files) fs.copyFileSync(path.join(src, f), path.join(dest, f));
+  return `installed ${files.length} phase agents to ${dest}`;
+}
+
 // ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
@@ -735,11 +779,12 @@ function usage() {
     "  result     Show completed job result (latest, or by ID)",
     "  cancel     Cancel a running job",
     "  serve-stop Stop the background opencode server",
+    "  install-agents  Copy phase agent definitions to OPENCODE_AGENT_DIR",
     "  help       Show this help message",
     "",
     "Flags (task / review):",
     "  --auto, --read-only, --resume-last, --wait, --background",
-    "  --base <ref>, --model <provider/model>, --agent <id>",
+    "  --base <ref>, --model <provider/model>, --agent <id>, --phase <name>",
     "  --session <id>, --timeout <s>, --watchdog <s>, --deny <tools>",
     "  -h, --help",
     "",
@@ -781,8 +826,10 @@ async function main() {
       return cmdCancel(cwd, parsed);
     case "serve-stop":
       return cmdServeStop(cwd);
+    case "install-agents":
+      return cmdInstallAgents();
     default:
-      throw new Error(`unknown subcommand: ${subcommand ?? "(none)"}. Use setup|task|review|status|result|cancel|serve-stop`);
+      throw new Error(`unknown subcommand: ${subcommand ?? "(none)"}. Use setup|task|review|status|result|cancel|serve-stop|install-agents`);
   }
 }
 

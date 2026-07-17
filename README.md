@@ -40,7 +40,7 @@ Then run `/opencode:setup` to verify the CLI and server come up.
 
 | Command | What it does |
 | --- | --- |
-| `/opencode:task <text>` | Delegate a task. Flags: `--model provider/model`, `--agent name`, `--read-only`, `--auto`, `--resume-last`, `--session <id>`, `--wait`, `--background` |
+| `/opencode:task <text>` | Delegate a task. Flags: `--model provider/model`, `--agent name`, `--phase <name>`, `--read-only`, `--auto`, `--resume-last`, `--session <id>`, `--wait`, `--background` |
 | `/opencode:review` | Adversarial, read-only review of the working tree; `--base <ref>` for branch review; extra text = review focus |
 | `/opencode:status [job-id]` | Compact job list, or progress detail for one job |
 | `/opencode:result [job-id]` | Stored final output of a finished job |
