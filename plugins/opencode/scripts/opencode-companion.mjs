@@ -22,7 +22,6 @@ const DEFAULT_TASK_TIMEOUT_S = 3600;
 const DEFAULT_REVIEW_TIMEOUT_S = 1800;
 const DEFAULT_WATCHDOG_S = 900; // must be > opencode mcp_timeout (600s) so inner timeout trips first
 const REVIEW_DIFF_LIMIT = 200_000;
-const READ_ONLY_PERMISSIONS = ["read", "glob", "grep", "list", "ls", "webfetch", "websearch", "question", "lsp", "skill"];
 const WRITE_TOOL_NAMES = ["bash", "edit", "write", "patch", "task"];
 
 const PHASE_AGENTS = {
@@ -236,11 +235,7 @@ function permissionInfo(event) {
   };
 }
 
-function decidePermission({ kind, auto }, label) {
-  if (auto) return "once";
-  const readOnly = READ_ONLY_PERMISSIONS.some((t) => label.includes(t));
-  if (kind === "review") return readOnly ? "once" : "reject";
-  if (label.includes("external")) return "reject";
+function decidePermission() {
   return "once";
 }
 
@@ -260,7 +255,7 @@ async function fetchFinalMessage(server, sessionID) {
     .trim();
 }
 
-async function runPrompt({ cwd, kind, title, promptText, agent, model, session, tools, format, auto, timeoutS, watchdogS, phase }) {
+async function runPrompt({ cwd, kind, title, promptText, agent, model, session, tools, format, timeoutS, watchdogS, phase }) {
   const server = await ensureServer(cwd);
   const { stateDir } = server;
 
@@ -363,7 +358,7 @@ async function runPrompt({ cwd, kind, title, promptText, agent, model, session, 
             const { id, label } = permissionInfo(event);
             if (id && !replied.has(id)) {
               replied.add(id);
-              const reply = decidePermission({ kind, auto }, label);
+              const reply = decidePermission();
               try {
                 await api(server, "POST", `/permission/${id}/reply`, { reply });
                 appendEvent(stateDir, job.id, { type: "companion.permission.reply", permission: label, reply });
@@ -653,7 +648,6 @@ async function cmdTask(cwd, { flags, text }) {
     model: parseModel(flags.model),
     session,
     tools,
-    auto: Boolean(flags.auto),
     timeoutS: Number(flags.timeout ?? DEFAULT_TASK_TIMEOUT_S),
     watchdogS: Number(flags.watchdog ?? DEFAULT_WATCHDOG_S),
   });
@@ -683,7 +677,6 @@ async function cmdReview(cwd, { flags, text }) {
     // NOTE: opencode's `format: json_schema` is not used — some providers 400
     // on it, and sessions created with it break GET /session/:id/message in
     // opencode 1.17.x. The schema is embedded in the prompt instead.
-    auto: false,
     timeoutS: Number(flags.timeout ?? DEFAULT_REVIEW_TIMEOUT_S),
     watchdogS: Number(flags.watchdog ?? DEFAULT_WATCHDOG_S),
   });
@@ -805,7 +798,6 @@ async function cmdSalvage(cwd, { flags, text }) {
     tools: Object.fromEntries(
       ["bash", "edit", "write", "patch", "task", "skill"].map((t) => [t, false])
     ),
-    auto: false,
     timeoutS: Number(flags.timeout ?? 600),
     watchdogS: 0,
   });
@@ -841,7 +833,7 @@ function usage() {
     "  help       Show this help message",
     "",
     "Flags (task / review / salvage):",
-    "  --auto, --read-only, --resume-last, --wait, --background",
+    "  --read-only, --resume-last, --wait, --background",
     "  --base <ref>, --model <provider/model>, --agent <id>, --phase <name>",
     "  --session <id>, --timeout <s>, --watchdog <s>, --deny <tools>",
     "  --container <cid> (salvage: container to attach to)",
