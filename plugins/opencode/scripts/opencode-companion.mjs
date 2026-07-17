@@ -31,6 +31,7 @@ const PHASE_AGENTS = {
   implement: "oc-implement",
   review: "oc-review",
   respond: "oc-respond",
+  salvage: "oc-salvage",
 };
 
 // ---------------------------------------------------------------------------
@@ -567,7 +568,7 @@ function parseArgs(argv) {
         ? arg.slice(2).replace(/-([a-z])/g, (_, c) => c.toUpperCase())
         : arg.slice(1);
       flags[key] = true;
-    } else if (arg === "--base" || arg === "--model" || arg === "--agent" || arg === "--session" || arg === "--timeout" || arg === "--deny" || arg === "--watchdog" || arg === "--phase") {
+    } else if (arg === "--base" || arg === "--model" || arg === "--agent" || arg === "--session" || arg === "--timeout" || arg === "--deny" || arg === "--watchdog" || arg === "--phase" || arg === "--container") {
       flags[arg.slice(2)] = argv[++i];
     } else if (arg.startsWith("--")) {
       throw new Error(`unknown flag: ${arg}`);
@@ -763,6 +764,62 @@ function cmdInstallAgents() {
   return `installed ${files.length} phase agents to ${dest}`;
 }
 
+async function cmdSalvage(cwd, { flags, text }) {
+  const deadJobId = text.split(/\s+/).filter(Boolean)[0];
+  if (!deadJobId) throw new Error("salvage requires a dead job ID");
+  const stateDir = stateDirFor(cwd);
+  const deadJob = loadJob(stateDir, deadJobId);
+  if (!deadJob) throw new Error(`no such job: ${deadJobId}`);
+
+  // read dead job artifacts
+  const deadDir = jobDir(stateDir, deadJobId);
+  const originalBrief = fs.readFileSync(path.join(deadDir, "prompt.md"), "utf8");
+  const eventsRaw = fs.readFileSync(path.join(deadDir, "events.ndjson"), "utf8")
+    .split("\n").filter(Boolean).slice(-50)
+    .map((l) => JSON.parse(l));
+
+  // build salvage prompt
+  const promptText = [
+    `## Dead job info`,
+    `- job ID: ${deadJob.id}`,
+    `- kind: ${deadJob.kind}`,
+    `- phase: ${deadJob.phase ?? "(none)"}`,
+    `- status: ${deadJob.status}`,
+    `- error: ${deadJob.error ?? "(none)"}`,
+    `- models used: ${(deadJob.stats?.models ?? []).join(", ") || "(none)"}`,
+    `- container ID: ${flags.container ?? "(not provided)"}`,
+    `- Original brief:`,
+    originalBrief,
+    `## Recent events (${eventsRaw.length} items)`,
+    eventsRaw.map((e) => JSON.stringify(e)).join("\n"),
+  ].join("\n\n");
+
+  const { job, resultText } = await runPrompt({
+    cwd,
+    kind: "salvage",
+    title: `salvage: ${deadJobId}`,
+    promptText,
+    agent: "oc-salvage",
+    phase: "salvage",
+    model: parseModel(flags.model),
+    tools: Object.fromEntries(
+      ["bash", "edit", "write", "patch", "task", "skill"].map((t) => [t, false])
+    ),
+    auto: false,
+    timeoutS: Number(flags.timeout ?? 600),
+    watchdogS: 0,
+  });
+
+  // record salvagedFrom
+  job.salvagedFrom = deadJobId;
+  saveJob(stateDir, job);
+
+  if (job.status !== "completed") {
+    return `${renderHeader(job)}${job.error ?? ""}`;
+  }
+  return `${renderHeader(job)}${resultText || "(empty report)"}`;
+}
+
 // ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
@@ -780,12 +837,14 @@ function usage() {
     "  cancel     Cancel a running job",
     "  serve-stop Stop the background opencode server",
     "  install-agents  Copy phase agent definitions to OPENCODE_AGENT_DIR",
+    "  salvage    Salvage a dead job (inspect progress and produce structured report)",
     "  help       Show this help message",
     "",
-    "Flags (task / review):",
+    "Flags (task / review / salvage):",
     "  --auto, --read-only, --resume-last, --wait, --background",
     "  --base <ref>, --model <provider/model>, --agent <id>, --phase <name>",
     "  --session <id>, --timeout <s>, --watchdog <s>, --deny <tools>",
+    "  --container <cid> (salvage: container to attach to)",
     "  -h, --help",
     "",
     "Unknown flags cause an error. Use -- to treat subsequent tokens as literal text.",
@@ -828,8 +887,10 @@ async function main() {
       return cmdServeStop(cwd);
     case "install-agents":
       return cmdInstallAgents();
+    case "salvage":
+      return cmdSalvage(cwd, parsed);
     default:
-      throw new Error(`unknown subcommand: ${subcommand ?? "(none)"}. Use setup|task|review|status|result|cancel|serve-stop|install-agents`);
+      throw new Error(`unknown subcommand: ${subcommand ?? "(none)"}. Use setup|task|review|status|result|cancel|serve-stop|install-agents|salvage`);
   }
 }
 

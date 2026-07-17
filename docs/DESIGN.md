@@ -68,7 +68,9 @@ Claude Code (オーケストレーター)
 
 フェーズは opencode.json の agent 定義として実装する。deny リスト+モデル既定+システムプロンプトを agent に束ね、companion の `--phase <name>` は `--agent` への写像にする。
 
-注意(1.17.x 実測): セッション `tools` 設定も agent の permission も**実行時 deny ルールに変換されるだけ**で、モデルに送られるツール一覧からは除外されない(`session/tools.ts` の MCP ループは無条件)。つまり `--deny` は実行ガードであり、コンテキスト削減にはならない。真のフェーズ別ロードの実現ルートは:
+注意(1.17.x 実測→1.18.3 で改善): セッション `tools` 設定も agent の permission も**実行時 deny ルールに変換される**。1.17.x ではモデルに送られるツール一覧から除外されていなかったが、**1.18.3 の `resolveTools` 修正により全面 `deny` は物理除外される**(issue #3 2026-07-17 実機A/B確認)。つまり `--deny` は実行ガードであると同時にコンテキスト削減にもなる。oc-salvage.md の deny 構成案はコンテキスト汚染の削減も同時に達成する。
+
+真のフェーズ別ロードの実現ルートは:
 
 1. 上流修正(deny ツールをリクエストから除外する提案 → issue #8 でトラッキング)
 2. sunaba / shiori 側にプロファイル別 MCP エンドポイント(例: `/mcp/investigate` は read 系+issue_write のみ列挙)
@@ -107,13 +109,13 @@ Claude Code (オーケストレーター)
 
 タイムアウトの層構造: sunaba exec < opencode `experimental.mcp_timeout`(600000 に引き上げ済み。フル verify の MCP 呼び出しが実測 110s で、既定 120s の崖の 10s 手前だった)< companion ウォッチドッグ。
 
-## 7. 実測で判明した opencode の制約 (1.17.x)
+## 7. 実測で判明した opencode の制約 (1.17.x → 1.18.3)
 
 | 制約 | 影響 | 対処 |
 |---|---|---|
 | `format: json_schema` でセッション破損 | provider 400 + 以後 GET /message も 400 | スキーマをプロンプト埋め込み。上流起票 → issue #8 |
 | MCP ツールは permission ask を発生させない(無音許可) | companion の permission 防波堤が MCP に無効 | `tools: {name: false}`(= `--deny`)で実行時ブロック |
-| deny してもツール一覧はモデルに全量送信 | コンテキスト削減にならない、無駄呼び出しの可能性 | 上流提案 or MCP サーバー側プロファイル(§3) |
+| deny ツールはモデル送信リストから物理除外(1.18.3+) | コンテキスト削減になる、無駄呼び出しの危険も除去 | 全面deny＋agent定義で実現済み(§3参照) |
 | `mcp_timeout` 既定 120s | テスト増加でフル verify が時間切れ必至 | 600000 に引き上げ |
 
 ## 8. 検証記録 (2026-07-16, VM / opencode 1.17.20)
