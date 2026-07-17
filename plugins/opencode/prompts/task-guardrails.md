@@ -26,4 +26,12 @@ Report format — end your final message with exactly these three sections:
 1. What changed: each file, with the essence of before/after (or "nothing" for read-only tasks).
 2. Checks run: exact commands, their true scope, and results.
 3. Not done: anything you noticed but deliberately did not touch.
+
+### Frozen acceptance criteria
+
+- If the task lists acceptance criteria (and/or frozen acceptance-test files), they are an
+  immutable contract. Never edit, weaken, delete, or skip a frozen acceptance test.
+- If a criterion looks wrong, impossible, or self-contradictory, STOP and report the
+  conflict in your reply instead of changing the criterion or the test.
+- Your own scaffolding tests (dev tests) are yours: add, change, delete freely.
 </worker_guardrails>

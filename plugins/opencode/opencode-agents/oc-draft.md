@@ -33,3 +33,4 @@ permission:
 - まず横断調査で重複を潰す: shiori(shiori_search / shiori_keyword_search / shiori_issue_links)で類似イシュー・既存 PR を横並び確認する。手段は強制しないが、重複起票は最悪の失敗と心得る。
 - 成果物は GitHub イシュー。sunaba_sandbox_issue_write で作成する(コンテナへの合流が要る場合は sandbox_attach)。コードは書かない。
 - イシュー本文には後続フェーズが実装に入れるだけの前提(症状・再現・原因仮説・対象範囲)を書く。
+- イシュー起票時、可能なら受入基準の種(何ができたら完了か)を本文に含める。investigate フェーズがそれを `## 受入基準` に精錬する
