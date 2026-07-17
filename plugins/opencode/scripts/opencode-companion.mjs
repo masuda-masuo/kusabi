@@ -20,6 +20,7 @@ const PLUGIN_ROOT = path.resolve(HERE, "..");
 const SERVER_READY_TIMEOUT_MS = 20_000;
 const DEFAULT_TASK_TIMEOUT_S = 3600;
 const DEFAULT_REVIEW_TIMEOUT_S = 1800;
+const DEFAULT_WATCHDOG_S = 900; // must be > opencode mcp_timeout (600s) so inner timeout trips first
 const REVIEW_DIFF_LIMIT = 200_000;
 const READ_ONLY_PERMISSIONS = ["read", "glob", "grep", "list", "ls", "webfetch", "websearch", "question", "lsp", "skill"];
 const WRITE_TOOL_NAMES = ["bash", "edit", "write", "patch", "task"];
@@ -250,7 +251,7 @@ async function fetchFinalMessage(server, sessionID) {
     .trim();
 }
 
-async function runPrompt({ cwd, kind, title, promptText, agent, model, session, tools, format, auto, timeoutS }) {
+async function runPrompt({ cwd, kind, title, promptText, agent, model, session, tools, format, auto, timeoutS, watchdogS }) {
   const server = await ensureServer(cwd);
   const { stateDir } = server;
 
@@ -281,6 +282,49 @@ async function runPrompt({ cwd, kind, title, promptText, agent, model, session, 
   const replied = new Set();
   let sawIdle = false;
   let sessionError = null;
+  let watchdogFired = false;
+  let watchdogKilled = false;
+  let watchdogInterval = null;
+
+  if (watchdogS > 0) {
+    watchdogInterval = setInterval(() => {
+      if (watchdogFired) return;
+      const lastActivity = job.stats.lastActivity ?? job.startedAt;
+      const silenceMs = Date.now() - Date.parse(lastActivity);
+      if (silenceMs > watchdogS * 1000) {
+        watchdogFired = true;
+        clearInterval(watchdogInterval);
+        const silenceSec = Math.round(silenceMs / 1000);
+        appendEvent(stateDir, job.id, { type: "companion.watchdog.fired", silenceS: silenceSec });
+        (async () => {
+          let abortOk = false;
+          try {
+            const r = await fetch(`http://127.0.0.1:${server.port}/session/${sessionID}/abort`, {
+              method: "POST",
+              headers: authHeader(server),
+              signal: AbortSignal.timeout(2000),
+            });
+            abortOk = r.ok;
+          } catch { /* abort attempt timed out or failed */ }
+          let healthOk = false;
+          try {
+            const r = await fetch(`http://127.0.0.1:${server.port}/session`, {
+              headers: authHeader(server),
+              signal: AbortSignal.timeout(2000),
+            });
+            healthOk = r.ok;
+          } catch { /* health check timed out or failed */ }
+          if (!abortOk || !healthOk) {
+            try { process.kill(server.pid, "SIGKILL"); } catch { /* best-effort */ }
+            watchdogKilled = true;
+            try { fs.unlinkSync(path.join(stateDir, "server.json")); } catch { /* best-effort */ }
+            appendEvent(stateDir, job.id, { type: "companion.watchdog.kill" });
+          }
+          abort.abort();
+        })();
+      }
+    }, 10000);
+  }
 
   // Connect SSE before sending the prompt so a fast-finishing session's
   // `session.idle` cannot slip past between POST and subscription.
@@ -368,10 +412,14 @@ async function runPrompt({ cwd, kind, title, promptText, agent, model, session, 
     await watcher;
   } finally {
     clearTimeout(timeout);
+    clearInterval(watchdogInterval);
     abort.abort();
   }
 
-  if (abort.signal.aborted && !sawIdle && !sessionError) {
+  if (watchdogFired) {
+    job.status = "stalled";
+    job.error = `watchdog: no events for ${watchdogS}s` + (watchdogKilled ? " (process killed)" : "");
+  } else if (abort.signal.aborted && !sawIdle && !sessionError) {
     job.status = "timeout";
     job.error = `timed out after ${timeoutS}s`;
     await api(server, "POST", `/session/${sessionID}/abort`).catch(() => {});
@@ -509,7 +557,7 @@ function parseArgs(argv) {
         ? arg.slice(2).replace(/-([a-z])/g, (_, c) => c.toUpperCase())
         : arg.slice(1);
       flags[key] = true;
-    } else if (arg === "--base" || arg === "--model" || arg === "--agent" || arg === "--session" || arg === "--timeout" || arg === "--deny") {
+    } else if (arg === "--base" || arg === "--model" || arg === "--agent" || arg === "--session" || arg === "--timeout" || arg === "--deny" || arg === "--watchdog") {
       flags[arg.slice(2)] = argv[++i];
     } else if (arg.startsWith("--")) {
       throw new Error(`unknown flag: ${arg}`);
@@ -571,6 +619,7 @@ async function cmdTask(cwd, { flags, text }) {
     tools,
     auto: Boolean(flags.auto),
     timeoutS: Number(flags.timeout ?? DEFAULT_TASK_TIMEOUT_S),
+    watchdogS: Number(flags.watchdog ?? DEFAULT_WATCHDOG_S),
   });
   if (job.status !== "completed") {
     return `${renderHeader(job)}${job.error ?? ""}\nCheck /opencode:status ${job.id} for details.`;
@@ -600,6 +649,7 @@ async function cmdReview(cwd, { flags, text }) {
     // opencode 1.17.x. The schema is embedded in the prompt instead.
     auto: false,
     timeoutS: Number(flags.timeout ?? DEFAULT_REVIEW_TIMEOUT_S),
+    watchdogS: Number(flags.watchdog ?? DEFAULT_WATCHDOG_S),
   });
   if (job.status !== "completed") {
     return `${renderHeader(job)}${job.error ?? ""}\nCheck /opencode:status ${job.id} for details.`;
@@ -690,7 +740,7 @@ function usage() {
     "Flags (task / review):",
     "  --auto, --read-only, --resume-last, --wait, --background",
     "  --base <ref>, --model <provider/model>, --agent <id>",
-    "  --session <id>, --timeout <s>, --deny <tools>",
+    "  --session <id>, --timeout <s>, --watchdog <s>, --deny <tools>",
     "  -h, --help",
     "",
     "Unknown flags cause an error. Use -- to treat subsequent tokens as literal text.",
