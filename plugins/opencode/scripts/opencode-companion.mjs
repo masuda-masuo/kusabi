@@ -526,23 +526,38 @@ function git(cwd, args) {
   }
 }
 
-function buildReviewInput(cwd, base) {
+// Run git inside a running sandbox container (sunaba clones to /workspace).
+// Lets `review --container <cid>` diff work that lives in the container rather
+// than the local working tree.
+function dockerGit(container, args, workdir = "/workspace") {
+  try {
+    return execFileSync("docker", ["exec", container, "git", "-C", workdir, ...args], { encoding: "utf8", maxBuffer: 16 * 1024 * 1024 });
+  } catch (err) {
+    return `(docker exec ${container} git ${args.join(" ")} failed: ${String(err.message).slice(0, 200)})\n`;
+  }
+}
+
+function buildReviewInput(cwd, base, container) {
+  const runGit = container ? (args) => dockerGit(container, args) : (args) => git(cwd, args);
+  const where = container ? ` in container ${container}` : "";
   let label;
   let diff;
   if (base) {
     label = `branch diff against ${base}`;
-    diff = git(cwd, ["diff", `${base}...HEAD`]);
+    diff = runGit(["diff", `${base}...HEAD`]);
   } else {
     label = "uncommitted working tree changes";
-    diff = git(cwd, ["diff", "HEAD"]) + git(cwd, ["diff", "--cached"]);
+    diff = runGit(["diff", "HEAD"]) + runGit(["diff", "--cached"]);
   }
-  const status = git(cwd, ["status", "--short", "--untracked-files=all"]);
+  const status = runGit(["status", "--short", "--untracked-files=all"]);
   let truncated = "";
   if (diff.length > REVIEW_DIFF_LIMIT) {
     diff = diff.slice(0, REVIEW_DIFF_LIMIT);
-    truncated = "\n(diff truncated; use the read tools to inspect files directly)";
+    truncated = container
+      ? `\n(diff truncated; inspect files directly with the sunaba read tools on container ${container})`
+      : "\n(diff truncated; use the read tools to inspect files directly)";
   }
-  const input = `## git status\n${status}\n## diff (${label})\n${diff}${truncated}`;
+  const input = `## git status\n${status}\n## diff (${label}${where})\n${diff}${truncated}`;
   return { label, input };
 }
 
@@ -666,7 +681,7 @@ async function cmdTask(cwd, { flags, text }) {
 async function cmdReview(cwd, { flags, text }) {
   const promptTemplate = fs.readFileSync(path.join(PLUGIN_ROOT, "prompts", "adversarial-review.md"), "utf8");
   const schema = JSON.parse(fs.readFileSync(path.join(PLUGIN_ROOT, "schemas", "review-output.schema.json"), "utf8"));
-  const { label, input } = buildReviewInput(cwd, flags.base);
+  const { label, input } = buildReviewInput(cwd, flags.base, flags.container);
   const promptText = promptTemplate
     .replaceAll("{{TARGET_LABEL}}", label)
     .replaceAll("{{USER_FOCUS}}", text || "(none — general adversarial review)")
@@ -844,7 +859,7 @@ function usage() {
     "  --auto, --read-only, --resume-last, --wait, --background",
     "  --base <ref>, --model <provider/model>, --agent <id>, --phase <name>",
     "  --session <id>, --timeout <s>, --watchdog <s>, --deny <tools>",
-    "  --container <cid> (salvage: container to attach to)",
+    "  --container <cid> (salvage: container to attach to; review: sandbox container whose diff to review)",
     "  -h, --help",
     "",
     "Unknown flags cause an error. Use -- to treat subsequent tokens as literal text.",
