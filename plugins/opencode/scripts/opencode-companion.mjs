@@ -235,7 +235,7 @@ function permissionInfo(event) {
   };
 }
 
-function decidePermission() {
+export function decidePermission() {
   return "once";
 }
 
@@ -465,7 +465,7 @@ function renderHeader(job) {
   ].join("\n");
 }
 
-function extractJson(text) {
+export function extractJson(text) {
   try {
     return JSON.parse(text);
   } catch {
@@ -481,7 +481,7 @@ function extractJson(text) {
   }
 }
 
-function renderReview(parsed, rawText) {
+export function renderReview(parsed, rawText) {
   if (!parsed) {
     const lines = rawText.split("\n").filter((l) => l.trim() !== "");
     const lastLine = lines.length > 0 ? lines[lines.length - 1].trim() : "";
@@ -552,7 +552,7 @@ function buildReviewInput(cwd, base) {
 // argument parsing
 // ---------------------------------------------------------------------------
 
-function parseArgs(argv) {
+export function parseArgs(argv) {
   const flags = {};
   const rest = [];
   let literal = false;
@@ -898,12 +898,14 @@ async function main() {
   }
 }
 
-main()
-  .then((output) => {
-    if (output) process.stdout.write(`${output}\n`);
-    process.exit(0);
-  })
-  .catch((err) => {
-    process.stdout.write(`opencode-companion error: ${err.message}\n`);
-    process.exit(1);
-  });
+if (process.argv[1] === fileURLToPath(import.meta.url)) {
+  main()
+    .then((output) => {
+      if (output) process.stdout.write(`${output}\n`);
+      process.exit(0);
+    })
+    .catch((err) => {
+      process.stdout.write(`opencode-companion error: ${err.message}\n`);
+      process.exit(1);
+    });
+}
