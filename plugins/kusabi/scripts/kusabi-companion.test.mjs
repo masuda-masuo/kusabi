@@ -111,7 +111,42 @@ describe("renderReview", () => {
     assert.match(result, /approve/);
   });
 
-  it("(c) falls back for null parsed with no terminal token", () => {
+  it("(b2) recovers from terminal token when parsed is null and rawText ends with VERDICT: approve-partial", () => {
+    const rawText = "Some output text\nVERDICT: approve-partial";
+    const result = renderReview(null, rawText);
+    assert.match(result, /recovered from terminal token/);
+    assert.match(result, /approve-partial/);
+  });
+
+  it("(c) renders unverified field when present in parsed object", () => {
+    const parsed = {
+      verdict: "approve-partial",
+      summary: "Mostly OK but some checks could not run.",
+      findings: [],
+      next_steps: ["Ask orchestrator to verify remaining items."],
+      unverified: ["Integration tests require Docker", "Load test environment not available"],
+    };
+    const result = renderReview(parsed, "");
+    assert.match(result, /\*\*Verdict: approve-partial\*\*/);
+    assert.match(result, /\*\*Unverified:\*\*/);
+    assert.match(result, /Integration tests require Docker/);
+    assert.match(result, /Load test environment not available/);
+    assert.match(result, /\*\*Next steps:\*\*/);
+  });
+
+  it("(c2) skips unverified section when unverified is empty", () => {
+    const parsed = {
+      verdict: "approve",
+      summary: "All clear.",
+      findings: [],
+      unverified: [],
+    };
+    const result = renderReview(parsed, "");
+    assert.match(result, /\*\*Verdict: approve\*\*/);
+    assert.doesNotMatch(result, /\*\*Unverified:\*\*/);
+  });
+
+  it("(d) falls back for null parsed with no terminal token", () => {
     const rawText = "Some random output without a verdict token";
     const result = renderReview(null, rawText);
     assert.match(result, /review output was not valid JSON/);

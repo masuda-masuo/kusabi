@@ -13,6 +13,7 @@
       "type": "string",
       "enum": [
         "approve",
+        "approve-partial",
         "needs-attention"
       ]
     },
@@ -77,6 +78,13 @@
       }
     },
     "next_steps": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "unverified": {
       "type": "array",
       "items": {
         "type": "string",

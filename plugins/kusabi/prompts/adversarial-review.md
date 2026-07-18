@@ -61,15 +61,17 @@ Return only valid JSON matching the schema in <output_schema>. No prose, no mark
 Keep the output compact and specific.
 Use `needs-attention` if there is any material risk worth blocking on.
 Use `approve` only if you cannot support any substantive adversarial finding from the provided context.
+Use `approve-partial` if some acceptance criteria could not be verified (e.g. missing tools, inaccessible environment); list the unverified items in `unverified`.
 Every finding must include:
 - the affected file
 - `line_start` and `line_end`
 - a confidence score from 0 to 1
 - a concrete recommendation
 Write the summary like a terse ship/no-ship assessment, not a neutral recap.
-After the JSON, output on the final line exactly `VERDICT: approve` or
-`VERDICT: needs-attention` and nothing else on that line. The JSON is
-authoritative; the token is a fast-path fallback for the harness.
+After the JSON, output on the final line exactly `VERDICT: approve`,
+`VERDICT: approve-partial`, or `VERDICT: needs-attention` and nothing
+else on that line. The JSON is authoritative; the token is a fast-path
+fallback for the harness.
 </structured_output_contract>
 
 <grounding_rules>

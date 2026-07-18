@@ -493,7 +493,7 @@ export function renderReview(parsed, rawText) {
   if (!parsed) {
     const lines = rawText.split("\n").filter((l) => l.trim() !== "");
     const lastLine = lines.length > 0 ? lines[lines.length - 1].trim() : "";
-    const tokenMatch = lastLine.match(/^VERDICT:\s*(approve|needs-attention)\s*$/i);
+    const tokenMatch = lastLine.match(/^VERDICT:\s*(approve-partial|approve|needs-attention)\s*$/i);
     if (tokenMatch) {
       const verdict = tokenMatch[1].toLowerCase();
       return `**Verdict: ${verdict}** (recovered from terminal token; JSON malformed)\n\n${rawText}`;
@@ -520,6 +520,11 @@ export function renderReview(parsed, rawText) {
   if (next.length) {
     lines.push("**Next steps:**");
     next.forEach((s) => lines.push(`- ${s}`));
+  }
+  const unverified = parsed.unverified ?? [];
+  if (unverified.length) {
+    lines.push("", "**Unverified:**");
+    unverified.forEach((s) => lines.push(`- ${s}`));
   }
   return lines.join("\n");
 }
@@ -701,7 +706,7 @@ async function cmdReview(cwd, { flags, text }) {
   }
   // Strip trailing VERDICT token line before JSON parsing so the token
   // does not make extractJson fail on well-formed JSON.
-  const stripped = resultText.replace(/\s*VERDICT:\s*(approve|needs-attention)\s*$/i, "");
+  const stripped = resultText.replace(/\s*VERDICT:\s*(approve-partial|approve|needs-attention)\s*$/i, "");
   const rendered = renderReview(extractJson(stripped), resultText);
   fs.writeFileSync(path.join(jobDir(stateDirFor(cwd), job.id), "result.md"), rendered, "utf8");
   return `${renderHeader(job)}${rendered}`;
