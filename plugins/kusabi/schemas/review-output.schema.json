@@ -14,7 +14,8 @@
       "enum": [
         "approve",
         "approve-partial",
-        "needs-attention"
+        "needs-attention",
+        "discard"
       ]
     },
     "summary": {
@@ -90,6 +91,22 @@
         "type": "string",
         "minLength": 1
       }
+    },
+    "discard_reason": {
+      "type": "string",
+      "enum": [
+        "wrong_premise",
+        "needs_stronger_model"
+      ]
     }
+  },
+  "if": {
+    "properties": {
+      "verdict": { "const": "discard" }
+    },
+    "required": ["verdict"]
+  },
+  "then": {
+    "required": ["discard_reason"]
   }
 }

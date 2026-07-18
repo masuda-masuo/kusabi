@@ -493,7 +493,7 @@ export function renderReview(parsed, rawText) {
   if (!parsed) {
     const lines = rawText.split("\n").filter((l) => l.trim() !== "");
     const lastLine = lines.length > 0 ? lines[lines.length - 1].trim() : "";
-    const tokenMatch = lastLine.match(/^VERDICT:\s*(approve-partial|approve|needs-attention)\s*$/i);
+    const tokenMatch = lastLine.match(/^VERDICT:\s*(approve-partial|approve|needs-attention|discard)\s*$/i);
     if (tokenMatch) {
       const verdict = tokenMatch[1].toLowerCase();
       return `**Verdict: ${verdict}** (recovered from terminal token; JSON malformed)\n\n${rawText}`;
@@ -583,7 +583,7 @@ export function parseArgs(argv) {
         ? arg.slice(2).replace(/-([a-z])/g, (_, c) => c.toUpperCase())
         : arg.slice(1);
       flags[key] = true;
-    } else if (arg === "--base" || arg === "--model" || arg === "--agent" || arg === "--session" || arg === "--timeout" || arg === "--deny" || arg === "--watchdog" || arg === "--phase" || arg === "--container" || arg === "--prior") {
+    } else if (arg === "--base" || arg === "--model" || arg === "--agent" || arg === "--session" || arg === "--timeout" || arg === "--deny" || arg === "--watchdog" || arg === "--phase" || arg === "--container" || arg === "--prior" || arg === "--max-rounds") {
       flags[arg.slice(2)] = argv[++i];
     } else if (arg.startsWith("--")) {
       throw new Error(`unknown flag: ${arg}`);
@@ -599,6 +599,70 @@ function parseModel(value) {
   const idx = value.indexOf("/");
   if (idx < 0) throw new Error(`--model expects provider/model, got: ${value}`);
   return { providerID: value.slice(0, idx), modelID: value.slice(idx + 1) };
+}
+
+// ---------------------------------------------------------------------------
+// deriveDisposition — pure function mapping review + probe results to
+// chain disposition.  Exported for testing.
+// ---------------------------------------------------------------------------
+
+/**
+ * @param {object} opts
+ * @param {"approve"|"approve-partial"|"needs-attention"|"discard"} opts.verdict
+ * @param {boolean} opts.probesGreen  — all deterministic probes passed
+ * @param {number}  opts.round        — 1-based current round number
+ * @param {number}  opts.maxRounds
+ * @param {boolean} opts.repeatedAreas — same file area flagged 2+ rounds
+ * @returns {{ disposition: "accept"|"rework"|"escalate", reason?: string }}
+ */
+export function deriveDisposition({ verdict, probesGreen, round, maxRounds, repeatedAreas }) {
+  // Hard limit: max rounds reached without acceptance → escalate
+  if (round >= maxRounds && verdict !== "approve") {
+    return { disposition: "escalate", reason: `max rounds (${maxRounds}) reached without acceptance` };
+  }
+
+  if (verdict === "approve" && probesGreen) {
+    return { disposition: "accept" };
+  }
+
+  // All other cases have a reason
+  let disposition;
+  let reason;
+
+  switch (verdict) {
+    case "approve":
+      disposition = "rework";
+      reason = "deterministic probes failed";
+      break;
+
+    case "approve-partial":
+      disposition = "escalate";
+      reason = "approve-partial: unverified items remain";
+      break;
+
+    case "needs-attention": {
+      if (repeatedAreas) {
+        disposition = "escalate";
+        reason = "same file area flagged for two consecutive rounds";
+      } else {
+        disposition = "rework";
+        reason = "needs-attention";
+      }
+      break;
+    }
+
+    case "discard":
+      disposition = "escalate";
+      reason = "reviewer discarded the work";
+      break;
+
+    default:
+      disposition = "escalate";
+      reason = `unexpected verdict: ${verdict}`;
+      break;
+  }
+
+  return { disposition, reason };
 }
 
 // ---------------------------------------------------------------------------
@@ -706,7 +770,7 @@ async function cmdReview(cwd, { flags, text }) {
   }
   // Strip trailing VERDICT token line before JSON parsing so the token
   // does not make extractJson fail on well-formed JSON.
-  const stripped = resultText.replace(/\s*VERDICT:\s*(approve-partial|approve|needs-attention)\s*$/i, "");
+  const stripped = resultText.replace(/\s*VERDICT:\s*(approve-partial|approve|needs-attention|discard)\s*$/i, "");
   const rendered = renderReview(extractJson(stripped), resultText);
   fs.writeFileSync(path.join(jobDir(stateDirFor(cwd), job.id), "result.md"), rendered, "utf8");
   return `${renderHeader(job)}${rendered}`;
@@ -848,6 +912,277 @@ async function cmdSalvage(cwd, { flags, text }) {
 }
 
 // ---------------------------------------------------------------------------
+// chain
+// ---------------------------------------------------------------------------
+
+async function cmdChain(cwd, { flags, text }) {
+  if (!text) throw new Error("chain requires a brief description");
+  const stateDir = stateDirFor(cwd);
+  const chainId = `chain-${Date.now().toString(36)}${crypto.randomBytes(2).toString("hex")}`;
+  const chainDir = path.join(stateDir, "chains", chainId);
+  fs.mkdirSync(chainDir, { recursive: true });
+
+  const container = flags.container;
+  if (!container) throw new Error("chain requires --container <cid>");
+  const model = flags.model;
+  if (!model) throw new Error("chain requires --model <provider/model>");
+  const maxRounds = Number(flags["max-rounds"] ?? 3);
+  const brief = text;
+
+  // ---- chain initialisation: record base + checkpoint ----
+  let baseSha = null;
+  try {
+    const { callTool } = await import("./sunaba-rpc.mjs");
+    const gitRev = await callTool("sandbox_exec", {
+      container_id: container,
+      commands: ["git rev-parse HEAD"],
+    });
+    baseSha = (gitRev?.output ?? "").trim() || null;
+  } catch (initErr) {
+    // Record initialisation failure; probes will catch it per-round
+    baseSha = null;
+  }
+
+  const records = [];
+
+  for (let round = 1; round <= maxRounds; round += 1) {
+    const isFirstRound = round === 1;
+    const hasPreviousRound = round > 1 && records.length > 0;
+    const previousRecord = hasPreviousRound ? records[records.length - 1] : null;
+
+    // Round 2: same session continue (rework 1st attempt)
+    // Round 3+: checkpoint_restore(chain-base) -> new session
+    const useNewSession = round >= 3;
+    let resumeMethod;
+    if (useNewSession) {
+      // Actually attempt checkpoint_restore; record outcome honestly
+      let restoreOk = false;
+      let restoreDetail = null;
+      if (baseSha) {
+        try {
+          const { callTool } = await import("./sunaba-rpc.mjs");
+          await callTool("checkpoint_restore", {
+            container_id: container,
+            sha: baseSha,
+          });
+          restoreOk = true;
+        } catch (restoreErr) {
+          restoreDetail = String(restoreErr);
+        }
+      } else {
+        restoreDetail = "baseSha was never recorded at chain start";
+      }
+      resumeMethod = {
+        type: restoreOk ? "checkpoint_restore" : "checkpoint_restore_failed",
+        base: baseSha,
+        detail: restoreDetail,
+      };
+    } else {
+      resumeMethod = { type: "continue_session" };
+    }
+    const roundRecord = { round, resumeMethod, startedAt: new Date().toISOString(), verdict: null, probesGreen: false };
+
+    let implementText;
+    if (isFirstRound) {
+      implementText = brief;
+    } else if (previousRecord) {
+      implementText = "## Prior findings\n" + (previousRecord.findingsText || "(none)") + "\n\n## Acceptance criteria\n" + brief;
+    } else {
+      implementText = brief;
+    }
+
+    // ---- implement phase ----
+    let session = flags.session;
+    if (!session && !isFirstRound && previousRecord?.sessionID) {
+      if (!useNewSession) {
+        session = previousRecord.sessionID;
+      }
+    }
+
+    const implementJob = await runPrompt({
+      cwd,
+      kind: "task",
+      title: "chain: " + chainId + " round " + round + " implement",
+      promptText: implementText,
+      agent: "kusabi-implement",
+      phase: "implement",
+      model: parseModel(model),
+      session: useNewSession ? undefined : session,
+      timeoutS: 3600,
+      watchdogS: 900,
+    });
+    roundRecord.implementJobId = implementJob.job.id;
+    roundRecord.sessionID = implementJob.job.sessionID;
+
+    // ---- deterministic probes (via sunaba-rpc) ----
+    let probesGreen = false;
+    const probeResults = [];
+
+    try {
+      const { callTool } = await import("./sunaba-rpc.mjs");
+
+      // P1: HEAD clean - compare with baseSha recorded at chain start
+      let p1Passed = false;
+      let p1Detail = "";
+      if (baseSha) {
+        const gitRev = await callTool("sandbox_exec", {
+          container_id: container,
+          commands: ["git rev-parse HEAD"],
+        });
+        const headSha = (gitRev?.output ?? "").trim();
+        if (headSha !== baseSha) {
+          p1Detail = "HEAD " + headSha + " != base " + baseSha + "; auto reset";
+          try {
+            await callTool("sandbox_exec", {
+              container_id: container,
+              commands: ["git reset --mixed " + baseSha],
+            });
+            p1Passed = true;
+            p1Detail += " - reset OK";
+          } catch (resetErr) {
+            p1Detail += " - reset FAILED: " + String(resetErr);
+          }
+        } else {
+          p1Passed = true;
+          p1Detail = "HEAD matches base " + baseSha;
+        }
+      } else {
+        p1Detail = "baseSha not recorded at chain start; cannot check HEAD";
+      }
+      probeResults.push({ probe: "P1: HEAD clean", passed: p1Passed, detail: p1Detail });
+
+      // P2: verify gate (no skip flags)
+      const verifyResult = await callTool("verify_in_container", {
+        container_id: container,
+        path: ".",
+      });
+      const verifyPassed = verifyResult?.gate_passed === true;
+      probeResults.push({ probe: "P2: verify gate", passed: verifyPassed, detail: JSON.stringify(verifyResult) });
+
+      probesGreen = probeResults.every(function(p) { return p.passed; });
+    } catch (probeErr) {
+      probeResults.push({ probe: "sunaba-rpc", passed: false, detail: String(probeErr) });
+      probesGreen = false;
+    }
+
+    roundRecord.probesGreen = probesGreen;
+    roundRecord.probeResults = probeResults;
+
+    // ---- review phase ----
+    const promptTemplate = fs.readFileSync(path.join(PLUGIN_ROOT, "prompts", "adversarial-review.md"), "utf8");
+    const schemaJson = JSON.parse(fs.readFileSync(path.join(PLUGIN_ROOT, "schemas", "review-output.schema.json"), "utf8"));
+    const reviewInput = [
+      "## Review target",
+      "",
+      "The artifact under review lives inside container `" + container + "`.",
+      "You may use the following Sunaba read/verify tools to inspect it:",
+      "- `read_file_range` - read file contents from the container",
+      "- `search_in_container` - grep/search within the container",
+      "- `verify_in_container` / `lint_in_container` / `type_check_in_container` - re-run the project's gates in the container",
+      "",
+      "Do NOT rely on host cwd git state; the actual changes are in the container.",
+    ].join("\n");
+    const priorFindings = previousRecord?.findingsText || "(none -- first review round)";
+
+    const reviewPromptText = promptTemplate
+      .replaceAll("{{TARGET_LABEL}}", "container " + container + " changes")
+      .replaceAll("{{USER_FOCUS}}", brief)
+      .replaceAll("{{OUTPUT_SCHEMA}}", JSON.stringify(schemaJson))
+      .replaceAll("{{REVIEW_INPUT}}", reviewInput)
+      .replaceAll("{{PRIOR_FINDINGS}}", priorFindings);
+
+    const reviewJob = await runPrompt({
+      cwd,
+      kind: "review",
+      title: "chain: " + chainId + " round " + round + " review",
+      promptText: reviewPromptText,
+      model: parseModel(model),
+      agent: "kusabi-review",
+      tools: Object.fromEntries(WRITE_TOOL_NAMES.map(function(t) { return [t, false]; })),
+      timeoutS: 1800,
+      watchdogS: 900,
+    });
+    roundRecord.reviewJobId = reviewJob.job.id;
+
+    // ---- parse review result ----
+    const reviewResultText = reviewJob.resultText || "";
+    const stripped = reviewResultText.replace(/\s*VERDICT:\s*(approve-partial|approve|needs-attention|discard)\s*$/i, "");
+    const parsedReview = extractJson(stripped);
+    const verdict = (parsedReview && parsedReview.verdict) || "needs-attention";
+    roundRecord.verdict = verdict;
+    roundRecord.findingsText = (parsedReview && parsedReview.findings)
+      ? parsedReview.findings.map(function(f) { return "[" + f.severity + "] " + f.title + " (" + f.file + ":" + f.line_start + ")"; }).join("\n")
+      : "(no structured findings)";
+
+    // ---- determine repeated areas ----
+    let repeatedAreas = false;
+    if (previousRecord?.findingsText && parsedReview?.findings) {
+      var prevFiles = new Set(
+        (previousRecord.findingsText.match(/\([^:]+/g) || []).map(function(s) { return s.slice(1); }),
+      );
+      for (var fi = 0; fi < parsedReview.findings.length; fi++) {
+        if (prevFiles.has(parsedReview.findings[fi].file)) {
+          repeatedAreas = true;
+          break;
+        }
+      }
+    }
+
+    // ---- derive disposition ----
+    const disposition = deriveDisposition({
+      verdict: verdict,
+      probesGreen: probesGreen,
+      round: round,
+      maxRounds: maxRounds,
+      repeatedAreas: repeatedAreas,
+    });
+    roundRecord.disposition = disposition;
+
+    // ---- persist record ----
+    records.push(roundRecord);
+    writeJson(path.join(chainDir, "round-" + round + ".json"), roundRecord);
+    writeJson(path.join(chainDir, "chain.json"), { chainId: chainId, container: container, model: model, maxRounds: maxRounds, brief: brief, records: records, baseSha: baseSha, chainBaseCreated: chainBaseCreated });
+
+    if (disposition.disposition === "accept") {
+      return "Chain " + chainId + " accepted at round " + round + ".\n\n" + renderReview(parsedReview, reviewResultText);
+    }
+
+    if (disposition.disposition === "escalate") {
+      var reason = disposition.reason || "unknown";
+      var lines = [
+        "Chain " + chainId + " escalated at round " + round + ": " + reason,
+        "",
+        "Remaining findings:",
+        roundRecord.findingsText,
+        "",
+      ];
+      for (var ri = 0; ri < records.length; ri++) {
+        var r = records[ri];
+        var detail = r.resumeMethod.detail ? ": " + r.resumeMethod.detail : "";
+        lines.push("Round " + (ri + 1) + ": verdict=" + r.verdict + ", probesGreen=" + r.probesGreen + ", resume=" + r.resumeMethod.type + detail);
+      }
+      lines.push("", "Hand over to orchestrator for final judgement.");
+      return lines.join("\n");
+    }
+  }
+
+  var lastRecord = records.length > 0 ? records[records.length - 1] : {};
+  var finalFindings = lastRecord.findingsText || "(none)";
+  var lines = [
+    "Chain " + chainId + " reached max rounds (" + maxRounds + ") without acceptance.",
+    "",
+    "Remaining findings:",
+    finalFindings,
+    "",
+  ];
+  for (var ri2 = 0; ri2 < records.length; ri2++) {
+    var r2 = records[ri2];
+    var detail2 = r2.resumeMethod.detail ? ": " + r2.resumeMethod.detail : "";
+    lines.push("Round " + (ri2 + 1) + ": verdict=" + r2.verdict + ", probesGreen=" + r2.probesGreen + ", resume=" + r2.resumeMethod.type + detail2);
+  }
+  lines.push("", "Hand over to orchestrator for final judgement.");
+  return lines.join("\n");
+}// ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
 
@@ -859,6 +1194,7 @@ function usage() {
     "  setup      Start or verify the opencode server for this directory",
     "  task       Run an opencode task",
     "  review     Run an adversarial review of working-tree changes",
+    "  chain      Run implement→review→rework chain until acceptance or escalate",
     "  status     List recent jobs or show one by ID",
     "  result     Show completed job result (latest, or by ID)",
     "  cancel     Cancel a running job",
@@ -867,12 +1203,13 @@ function usage() {
     "  salvage    Salvage a dead job (inspect progress and produce structured report)",
     "  help       Show this help message",
     "",
-    "Flags (task / review / salvage):",
+    "Flags (task / review / salvage / chain):",
     "  --read-only, --resume-last, --wait, --background",
     "  --base <ref>, --model <provider/model>, --agent <id>, --phase <name>",
     "  --session <id>, --timeout <s>, --watchdog <s>, --deny <tools>",
-    "  --container <cid> (salvage: container to attach to)",
+    "  --container <cid> (chain: container to run probes in)",
     "  --prior <text> (review: prior findings for anti-ratchet)",
+    "  --max-rounds <N> (chain: max rounds, default 3)",
     "  -h, --help",
     "",
     "Unknown flags cause an error. Use -- to treat subsequent tokens as literal text.",
@@ -917,8 +1254,10 @@ async function main() {
       return cmdInstallAgents();
     case "salvage":
       return cmdSalvage(cwd, parsed);
+    case "chain":
+      return cmdChain(cwd, parsed);
     default:
-      throw new Error(`unknown subcommand: ${subcommand ?? "(none)"}. Use setup|task|review|status|result|cancel|serve-stop|install-agents|salvage`);
+      throw new Error(`unknown subcommand: ${subcommand ?? "(none)"}. Use setup|task|review|chain|status|result|cancel|serve-stop|install-agents|salvage`);
   }
 }
 
