@@ -1,272 +1,273 @@
-# kusabi 設計書
+# kusabi Design Document
 
-最終更新: 2026-07-19
-ステータス: フェーズチェーンまで設計確定+実地検証、自動チェーン(chain サブコマンド+sunaba-rpc)実装済み/main 反映済み。段階B/C/D は計画(#36 参照)。
+Last updated: 2026-07-19
+Status: Design finalized + field-verified up to the phase chain, auto-chain (chain subcommand + sunaba-rpc) **implemented / reflected in main**. Stages B/C/D are planned (see #36).
 
-## 1. 目的と位置づけ
+## 1. Purpose and positioning
 
-opencode (anomalyco/opencode) を Claude Code から委譲可能なワーカーとして使うためのプラグイン。
-Claude Code がオーケストレーター(計画・検収・publish 判断)、opencode + deepseek がワーカー(調査・実装・レビューの実働)という分業を成立させる。
+A plugin for using opencode (anomalyco/opencode) as a delegatable worker from Claude Code.
+Establishes a division of labor where Claude Code serves as the **orchestrator** (planning, inspection/acceptance by the orchestrator, publish decisions) while opencode + deepseek serves as the **worker** (investigation, implementation, review).
 
-動機はコスト構造: deepseek v4 Flash は安価(zen の日次無料枠 deepseek-v4-flash-free もある)で、実感として Haiku より良い仕事をする。調査・一次実装を実質無料で回し、仕上げだけ Pro に少額を払う構造を作る。
+The motivation is cost structure: deepseek v4 Flash is cheap (zen's free-tier deepseek-v4-flash-free is also available) and empirically does better work than Haiku. This creates a structure where investigation and first-pass implementation run at essentially no cost, and only finishing work pays a small amount to Pro.
 
-手本: openai/codex-plugin-cc (Apache-2.0)。プロンプト資産(adversarial-review.md / review-output.schema.json)は NOTICE 帰属付きで移植。
+Derived from: openai/codex-plugin-cc (Apache-2.0). Prompt assets (adversarial-review.md / review-output.schema.json) are transplanted with NOTICE attribution.
 
-## 2. アーキテクチャ
+## 2. Architecture
 
 ```
-Claude Code (オーケストレーター)
-  └─ /kusabi:task 等のコマンド → 転送専用サブエージェント (agents/opencode-worker.md)
-       └─ scripts/kusabi-companion.mjs (防波堤)
-            └─ opencode serve (HTTP API, 127.0.0.1 + OPENCODE_SERVER_PASSWORD, on-demand 起動)
-                 └─ deepseek ワーカー
-                      └─ MCP: sunaba / shiori (opencode 側の opencode.json に設定)
-                           └─ sunaba コンテナ (sandbox_attach で既存コンテナに合流)
+Claude Code (orchestrator)
+  └─ /kusabi:task etc. commands → dedicated transfer subagent (agents/opencode-worker.md)
+       └─ scripts/kusabi-companion.mjs (context firewall)
+            └─ opencode serve (HTTP API, 127.0.0.1 + OPENCODE_SERVER_PASSWORD, on-demand start)
+                 └─ deepseek worker
+                      └─ MCP: sunaba / shiori (configured in opencode.json on the opencode side)
+                           └─ sunaba container (merges into existing container via sandbox_attach)
 ```
 
-### 採用した案と棄却した案
+### Adopted and rejected approaches
 
-- **HTTP サーバー案を採用**。`opencode run` 直叩きは不採用 — 中間テキストが全ターン stdout に、ツールログが stderr に流れ、Claude のコンテキストを汚染するため。
-- **companion スクリプトが防波堤**: SSE `/event` 購読、permission.asked への自動応答、イベントは state dir(`~/.kusabi/<hash(cwd)>/jobs/`)に保存、stdout には整形済み最終結果のみ。
-- **転送専用サブエージェント**: オーケストレーターの認知負荷削減が最優先要件。コマンドの仕事は companion の実行と stdout の verbatim 転送のみ。
-- opencode API は v1 面(`/session/...`, `/event`, `/permission/:id/reply`)を使用。v1→v2 移行中のため SDK を使う場合は pin する。
+- **Adopted: HTTP server approach**. Direct `opencode run` was rejected — intermediate text pollutes stdout across all turns, tool logs flow to stderr, contaminating Claude's context.
+- **Companion script as context firewall**: SSE `/event` subscription, automatic replies to permission.asked, events saved to state dir (`~/.kusabi/<hash(cwd)>/jobs/`), stdout receives only the formatted final result.
+- **Dedicated transfer subagent**: Reducing the orchestrator's cognitive load is the top priority. Its job is only to execute the companion command and relay stdout verbatim.
+- opencode API uses the v1 surface (`/session/...`, `/event`, `/permission/:id/reply`). Because v1→v2 migration is in progress, pin the SDK when using it.
 
-### 実行環境の前提
+### Execution environment prerequisites
 
-- ローカルに git リポジトリを持たない開発スタイル。作業はすべて sunaba コンテナ内で行い、ワーカーには container_id を渡して `sandbox_attach` で合流させる。opencode 本体はホスト側に留まる。
-- sunaba の設計テーゼ(sunaba#478)と整合: **セッションは使い捨て、状態は外部**(合意=イシュー/PR、成果=コンテナ、監査=ジャーナル)。
+- Development style without a local git repository. All work happens inside the sunaba container; the worker receives a `container_id` and merges in via `sandbox_attach`. opencode itself stays on the host side.
+- Aligned with sunaba's design tenets (sunaba#478): **sessions are disposable, state is external** (agreement = issue/PR, artifact = container, audit trail = journal).
 
-## 3. フェーズチェーン(本設計の中核)
+## 3. Phase chain (core of this design)
 
-長いセッションはコンテキスト汚染が始まるため、作業を5フェーズに分割し、**各フェーズ=新規 opencode セッション**とする。フェーズ跨ぎのセッション再利用は禁止(`--resume-last` / `--session` は同一フェーズ内の追い込み専用)。
+Long sessions cause context pollution, so work is split into 5 phases, with **each phase = a new opencode session**. Cross-phase session reuse is prohibited (`--resume-last` / `--session` are for follow-ups within the same phase only).
 
-### 3.1 フェーズとツールマトリクス
+### 3.1 Phase and tool matrix
 
-| フェーズ | 役割 | shiori | コード書込 | issue_write |
+| Phase | Role | shiori | Code write | issue_write |
 |---|---|---|---|---|
-| 起票 | 重複チェック(横並び)+イシュー作成 | ○ | ✕ | ○(成果物) |
-| investigate | イシュー深掘り、原因特定 | ○ | ✕ | ○(brief 追記) |
-| implement | brief に基づく実装+verify | ✕ | ○ | ✕ |
-| review | PR の adversarial レビュー | ○ | ✕ | ○ |
-| respond | レビュー指摘への対応 | ✕ | ○ | ✕ |
+| Draft | Duplicate check (horizontal) + issue creation | ○ | ✕ | ○ (artifact) |
+| investigate | Deep issue dive, root cause identification | ○ | ✕ | ○ (brief appendix) |
+| implement | Implementation + verify based on brief | ✕ | ○ | ✕ |
+| review | Adversarial review of PR | ○ | ✕ | ○ |
+| respond | Address review findings | ✕ | ○ | ✕ |
 
-設計原理:
+Design principles:
 
-- **shiori は縦横で使い分ける**。イシューが特定箇所を指す「縦」の調査はコンテナ内 grep で足りる(実測: shiori#210 は shiori なしで完走)。shiori が効くのは「横」= 類似パターンの横並びチェック、重複イシュー確認、issue→PR→ファイルの跨ぎ。よってプロンプトでは手段を強制せず「横断調査には shiori がある」と選択肢を提示する。
-- **implement / respond に shiori を渡さないのは意図的**。brief を信じて実装に集中させる構造的強制であり、同時に小型モデルのツール選択負荷とスキーマ分コンテキストの削減になる。
-- ツールが多いとモデルは迷うだけ。フェーズごとに必要最小限を渡す。
+- **Use shiori vertically and horizontally**. Investigation of "vertical" issues pointing to a specific location can be done with in-container grep (measured: shiori#210 completed without shiori). shiori is effective for "horizontal" = cross-cutting pattern checks, duplicate issue confirmation, and cross-referencing issues → PRs → files. Therefore, prompts do not force a particular tool; instead, they present the option: "shiori is available for cross-cutting investigation."
+- **shiori is intentionally withheld from implement / respond**. This is a structural enforcement to make the worker trust the brief and focus on implementation, while also reducing tool selection overhead and tool-choice context for smaller models.
+- **More tools only confuse the model**. Give each phase the bare minimum it needs.
 
-### 3.2 brief(フェーズ間の引き継ぎ)
+### 3.2 Brief (handover between phases)
 
-**GitHub イシューへの追記(`sunaba_issue_write`)を媒体とする。** コピペしない。
+**Uses `sunaba_issue_write` to the GitHub issue as the medium.** No copy-pasting.
 
-- sunaba#478 の「合意はイシュー/PR に住む」と一致する
-- shiori が索引するため、調査成果がそのまま恒久的な検索可能知識になる
-- コンテナ内ファイルと違い、複数の開発環境(VM / 自宅機)を跨げる
+- Consistent with sunaba#478's principle that "agreement lives in the issue/PR"
+- shiori indexes it, so investigation results become permanently searchable knowledge
+- Unlike in-container files, it spans multiple development environments (VM / home machine)
 
-### 3.3 フェーズ=opencode agent 定義
+### 3.3 Phase = opencode agent definition
 
-フェーズは opencode.json の agent 定義として実装する。deny リスト+モデル既定+システムプロンプトを agent に束ね、companion の `--phase <name>` は `--agent` への写像にする。
+Phases are implemented as agent definitions in opencode.json. The deny list + default model + system prompt are bundled into the agent; the companion's `--phase <name>` is mapped to `--agent`.
 
-注意(1.17.x 実測→1.18.3 で改善): セッション `tools` 設定も agent の permission も**実行時 deny ルールに変換される**。1.17.x ではモデルに送られるツール一覧から除外されていなかったが、**1.18.3 の `resolveTools` 修正により全面 `deny` は物理除外される**(issue #3 2026-07-17 実機A/B確認)。つまり `--deny` は実行ガードであると同時にコンテキスト削減にもなる。
+Note (field-tested on 1.17.x → improved in 1.18.3): Both the session `tools` setting and the agent's permission settings are **converted to denial rules at execution time**. On 1.17.x, denied tools were still listed in the tool list sent to the model, but **with the 1.18.3 `resolveTools` fix, full `deny` physically excludes them** (confirmed via live A/B testing on 2026-07-17, issue #3). In other words, `--deny` serves simultaneously as an execution guard and context-size reduction.
 
-真のフェーズ別ロードの実現ルートは:
+The true phase-level load implementation path is:
 
-1. 上流修正(deny ツールをリクエストから除外する提案 → issue #8 でトラッキング)
-2. sunaba / shiori 側にプロファイル別 MCP エンドポイント(例: `/mcp/investigate` は read 系+issue_write のみ列挙)
+1. Upstream fix (proposal to exclude denied tools from the request → tracked in issue #8)
+2. Profile-specific MCP endpoints on the sunaba / shiori side (e.g. `/mcp/investigate` exposes only read + issue_write)
 
-どちらが実現しても agent 定義がそのまま受け皿になる。
+Whichever path is taken, agent definitions remain the receiving end unchanged.
 
-### 3.4 失敗時リトライ
+### 3.4 Retry on failure
 
-**checkpoint_restore + 同じ brief + 新セッション(またはモデル昇格)。**
-失敗アプローチへのアンカリングを構造的に排除する。実測: Flash が泥沼込み 343s で作った一次実装を、brief 付きの新セッションで Pro が 173s で仕上げた。
+**checkpoint_restore + same brief + new session (or model upgrade).**
+Structurally prevents anchoring to a failed approach. Measured: Flash, stuck in a rut for 343s, produced a first-pass implementation. With a brief-attached new session, Pro polished it in 173s.
 
-### 3.5 自動チェーン(chain サブコマンド) — 実装済み
+### 3.5 Auto-chain (chain subcommand) — implemented
 
-`chain --container <cid> --model <m> [--max-rounds N] "<brief>"` で起動する。実装は `plugins/kusabi/scripts/kusabi-companion.mjs` の `cmdChain`。
+Launched with `chain --container <cid> --model <m> [--max-rounds N] "<brief>"`. Implementation is `cmdChain` in `plugins/kusabi/scripts/kusabi-companion.mjs`.
 
-#### 3.5.1 ラウンド構造
+#### 3.5.1 Round structure
 
-各ラウンド r (1..maxRounds, 既定 3) の流れ:
+Each round r (1..maxRounds, default 3) flows as follows:
 
-1. **implement**: `kusabi-implement` agent で実装。r=1 は brief 全文、r≧2 は前ラウンド findings + brief の acceptance criteria のみ。前セッションの試行錯誤ログは渡さない
-2. **決定論的プローブ**(→3.5.2): sunaba-rpc 経由でコンテナ内を非LLM検査
-3. **review**: `kusabi-review` agent で adversarial レビュー。`--prior` で前ラウンド findings を持ち越す
-4. **処遇導出**(→3.5.4): 機械的に disposition を決める
+1. **implement**: implement with the `kusabi-implement` agent. r=1 gets the full brief; r≥2 gets only the previous round's findings + the brief's acceptance criteria. The previous session's trial-and-error log is not carried over.
+2. **Deterministic probes** (§3.5.2): non-LLM checks inside the container via sunaba-rpc.
+3. **review**: adversarial review with the `kusabi-review` agent. Carries over previous round findings via `--prior`.
+4. **Derive disposition** (§3.5.4): mechanically determine the disposition.
 
-#### 3.5.2 決定論的プローブ(P1/P2, 非LLM)
+#### 3.5.2 Deterministic probes (P1/P2, non-LLM)
 
-sunaba-rpc(→3.6) 経由でコンテナ内を直接検査。LLM に触らせない:
+Direct container inspection via sunaba-rpc (§3.6). Does not involve the LLM:
 
-| プローブ | 内容 | 失敗時の動作 |
+| Probe | Content | Behavior on failure |
 |---|---|---|
-| **P1: HEAD clean** | chain 開始時に `git rev-parse HEAD` で baseSha を記録。implement 後に HEAD≠base なら `git reset --mixed <base>` を自動実行 | 自動修復(コンテキスト汚染の実測: brief で明示禁止しても3回中2回発生)。事実はメタデータに記録 |
-| **P2: verify gate** | `verify_in_container`(skip フラグ一切なし)を実行 | gate_passed=false なら review をスキップし、結果を findings 化して rework(ラウンド消費) |
+| **P1: HEAD clean** | Record baseSha via `git rev-parse HEAD` at chain start. After implement, if HEAD≠base, auto-execute `git reset --mixed <base>` | Auto-fix (empirical: even when the brief explicitly prohibited it, it happened 2 out of 3 times). Record in metadata |
+| **P2: verify gate** | Run `verify_in_container` (no skip flags at all) | If gate_passed=false, skip review, turn results into findings, and rework (consumes a round) |
 
-段階B で P3(テスト件数不変)・P4(パッチ挿入検査)・P5(移設バイト同一性)が追加予定(→§9.3)。
+Stage B will add P3 (test count unchanged), P4 (patch injection check), and P5 (migration byte identity) — see §9.3.
 
-#### 3.5.3 レビュー
+#### 3.5.3 Review
 
-`plugins/kusabi/prompts/adversarial-review.md` + `plugins/kusabi/schemas/review-output.schema.json` を使用。JSON schema は opencode の `format: json_schema` ではなく**プロンプトに埋め込む**(opencode 1.17.x のバグ回避、issue #8)。companion がモデルの応答から JSON を抽出(`extractJson`+`strip`)+整形(`renderReview`)する。
+Uses `plugins/kusabi/prompts/adversarial-review.md` + `plugins/kusabi/schemas/review-output.schema.json`. The JSON schema is **embedded in the prompt** rather than passed via opencode's `format: json_schema` (workaround for opencode 1.17.x bug, issue #8). The companion extracts JSON from the model's response (`extractJson`+`strip`) and formats it (`renderReview`).
 
-レビュアー(kusabi-review)の権限:
-- **allow**: `sunaba_verify_in_container`, `sunaba_lint_in_container`, `sunaba_type_check_in_container` — 実装者の「gate 緑」申告を独立に再実行して裏取る(PR#37/#40)
-- **deny**: 変更系全般(sandbox_exec, write_file, edit_file, checkout, publish 等) — レビュアーが直し始めたら独立性が消えるため
+Reviewer (kusabi-review) permissions:
+- **allow**: `sunaba_verify_in_container`, `sunaba_lint_in_container`, `sunaba_type_check_in_container` — independently re-runs the implementer's "gate green" claim to verify it (PR#37/#40)
+- **deny**: all mutation tools (sandbox_exec, write_file, edit_file, checkout, publish, etc.) — because if the reviewer starts fixing, independence is lost
 
-verdict は4値 + optional `unverified`:
-| verdict | 意味 |
+Verdict: 4-value + optional `unverified`:
+
+| verdict | Meaning |
 |---|---|
-| `approve` | 全 acceptance criteria が検証可能かつ合格 |
-| `approve-partial` | 一部の criteria が検証できなかった。`unverified` に列挙 |
-| `needs-attention` | 修正可能な欠陥あり |
-| `discard` | 前提・方針が誤り。`discard_reason` 必須(`wrong_premise` / `needs_stronger_model`) |
+| `approve` | All acceptance criteria verifiable and passing |
+| `approve-partial` | Some criteria could not be verified. Listed in `unverified` |
+| `needs-attention` | Fixable defects found |
+| `discard` | Premise or policy is wrong. `discard_reason` required (`wrong_premise` / `needs_stronger_model`) |
 
-#### 3.5.4 処遇導出(deriveDisposition)
+#### 3.5.4 Derive disposition (deriveDisposition)
 
-`plugins/kusabi/scripts/kusabi-companion.mjs` の純関数 `deriveDisposition({verdict, probesGreen, round, maxRounds, repeatedAreas})`:
+Pure function `deriveDisposition({verdict, probesGreen, round, maxRounds, repeatedAreas})` in `plugins/kusabi/scripts/kusabi-companion.mjs`:
 
-| verdict | probesGreen | 条件 | disposition | 意味 |
+| verdict | probesGreen | Condition | disposition | Meaning |
 |---|---|---|---|---|
-| approve | true | — | **accept** | 収束、orchestrator へ |
-| approve | false | — | rework | プローブ失敗 |
-| approve-partial | — | — | **escalate** | 未確認項目あり、orchestrator 判断へ |
-| needs-attention | — | repeatedAreas=false | rework | 修正して再レビュー |
-| needs-attention | — | repeatedAreas=true | **escalate** | 同ファイル領域の指摘が2ラウンド連続=停滞 |
-| discard | — | — | **escalate** | レビュアーが廃棄判定 |
-| — | — | round ≥ maxRounds かつ未accept | **escalate** | 最大ラウンド到達 |
+| approve | true | — | **accept** | Conclude, hand to orchestrator |
+| approve | false | — | rework | Probe failure |
+| approve-partial | — | — | **escalate** | Unverified items remain, orchestrator decides |
+| needs-attention | — | repeatedAreas=false | rework | Fix and re-review |
+| needs-attention | — | repeatedAreas=true | **escalate** | Same file area flagged 2 rounds in a row = stalled |
+| discard | — | — | **escalate** | Reviewer deemed it discardable |
+| — | — | round ≥ maxRounds and not accepted | **escalate** | Max rounds reached |
 
-rework → escalate の間に strategist 段(→§9.1) を挿入可能(段階B、未実装)。
+A strategist stage (§9.1) may be inserted between rework → escalate (Stage B, not implemented).
 
-#### 3.5.5 再開方法と記録
+#### 3.5.5 Restart method and recording
 
-rework の再開方法:
-- **1回目**: 同一 implement セッション継続(findings のみ投入)
-- **2回目以降**: `checkpoint_restore(baseSha)` → **新セッション**(新規コンテキストで再挑戦)。restore できない場合はその事実を resumeMethod に記録する(実際にやっていないことを記録しない)
+Rework restart methods:
+- **1st time**: Continue the same implement session (feed only findings)
+- **2nd time onward**: `checkpoint_restore(baseSha)` → **new session** (re-challenge with fresh context). If restore is not possible, record that fact in resumeMethod (do not record something that was not actually done)
 
-どちらを使ったかは各ラウンドのメタデータに記録。state dir の `chains/<chain-id>/` にラウンドごとの JSON(`round-N.json`) + 集約 JSON(`chain.json`)で永続化。
+Which method was used is recorded in each round's metadata. Persisted per-round as JSON (`round-N.json`) + aggregate JSON (`chain.json`) in state dir `chains/<chain-id>/`.
 
-escalate 時は残 findings + 経緯(各ラウンドの verdict/probes/disposition/resume方法) を最終出力に含める。publish は chain から一切呼ばれない(許可リストにない)。
+On escalate, include remaining findings + history (each round's verdict/probes/disposition/resume method) in the final output. publish is never called from the chain (not on the allow list).
 
-### 3.6 sunaba-rpc(生JSON-RPCクライアント) — 実装済み
+### 3.6 sunaba-rpc (raw JSON-RPC client) — implemented
 
-`plugins/kusabi/scripts/sunaba-rpc.mjs`。companion の非LLMパイプライン(決定論的プローブ等)が sunaba の MCP ツールを呼ぶための**生 HTTP+SSE クライアント**。MCP クライアントではない。
+`plugins/kusabi/scripts/sunaba-rpc.mjs`. A **raw HTTP+SSE client** for the companion's non-LLM pipeline (deterministic probes, etc.) to call sunaba's MCP tools. **Not an MCP client.**
 
-- **エンドポイント**: env `KUSABI_SUNABA_URL`、既定 `http://127.0.0.1:8750/mcp`。127.0.0.1(固定、localhost は IPv6 名前解決問題回避)
-- **プロトコル**: Streamable HTTP。`initialize` POST → レスポンスヘッダ `mcp-session-id` を保持 → `notifications/initialized` → `tools/call`
-- **レスポンス形式**: SSE(`data:` 行)。最終行の JSON を結果とする。MCP の `content[0].text` ラップを自動 unwrap(`unwrapResult`)
-- **ツール許可リスト(ハードコード)** — 以下の5ツールのみ。リスト外は呼び出し前のバリデーションで `throw`:
+- **Endpoint**: env `KUSABI_SUNABA_URL`, default `http://127.0.0.1:8750/mcp`. 127.0.0.1 (fixed, avoids IPv6 name resolution issues with localhost)
+- **Protocol**: Streamable HTTP. `initialize` POST → save `mcp-session-id` from response header → `notifications/initialized` → `tools/call`
+- **Response format**: SSE (`data:` lines). The last line's JSON is the result. Auto-unwraps MCP's `content[0].text` wrapper (`unwrapResult`)
+- **Tool allow list (hardcoded)** — only the following 5 tools. Calling anything outside the list throws a pre-call validation error:
   - `verify_in_container`
   - `sandbox_exec`
   - `checkpoint`
   - `checkpoint_list`
   - `checkpoint_restore`
 
-publish / issue_write / sandbox_initialize 等は**構造的に呼べない**(設計不変条件: ネットワーク出口はオーケストレーター専有)。
+publish / issue_write / sandbox_initialize etc. are **structurally uncallable** (design invariant: network exit is orchestrator-exclusive).
 
-`sandbox_exec` の `commands` は**必ず配列**で渡す(文字列は validation error)。
+`sandbox_exec`'s `commands` **must be passed as an array** (a string causes a validation error).
 
-## 4. モデル運用
+## 4. Model operations
 
-- **既定は Flash**: zen の deepseek-v4-flash-free(日次無料枠)→ go の deepseek v4 Flash。
-- **品質昇格は自動化しない**: 検収(オーケストレーター)が指摘事項を brief にまとめて Pro に明示的に再委譲する。Flash 8割(無料)→検収→Pro 仕上げ(少額)のループが実測で成立済み。
-- **自動フォールバックは quota エラー時のみ**。発動したら結果に明示する。
-- **実際に使われた provider/model を必ず表示する**(issue #7)。zen 無料枠切れ→有料 go への無言フォールバックはコスト構造を無言で崩すため、可視化は必須要件。
+- **Default is Flash**: zen's deepseek-v4-flash-free (daily free tier) → go's deepseek v4 Flash.
+- **Quality upgrades are not automated**: The inspection/acceptance by the orchestrator collects findings into a brief and explicitly re-delegates to Pro. The loop "Flash 80% (free) → inspection/acceptance by the orchestrator → Pro finishing (small cost)" has been empirically validated.
+- **Auto-fallback only on quota errors**. When triggered, indicate it in the result.
+- **Always display the provider/model actually used** (issue #7). Silent fallback from zen free tier to paid go would silently break the cost structure, so visibility is mandatory.
 
-## 5. 検収(オーケストレーターの責務)
+## 5. Inspection/acceptance by the orchestrator (orchestrator's responsibility)
 
-- **二段 verify**: ワーカーの verify はサブセット/スコープ付きになりがち(実測: 「フルスイート」報告が単一ファイル21件だった)。publish 前の真のフル `verify_in_container` は必ずオーケストレーターが実行する。
-- **publish はオーケストレーター専権**: ネットワーク出口(publish)はワーカーに渡さない。資格情報は sunaba がホスト側で解決し、コンテナ内にトークンは存在しない。
-- ワーカーガードレール(issue #5): verify スコープはディレクトリ単位まで / 再現はモックのユニットテストで行う / ライブ環境構築・資格情報探索をしない(実測: Flash が `env | grep -i token` まで進んだ。sunaba の no-token 設計が実害を防止)。
-  - **資産化済み**: `prompts/task-guardrails.md` を companion が全 task プロンプトに自動前置する(スコープ厳守 / verify 正直報告 / モック再現 / VCS 出口禁止 / 3部構成の報告形式)。オーケストレーターはタスク固有の内容(スコープ・前提・受入基準)だけ書けばよい。フェーズチェーン(§3)実装時は agent 定義側に吸収する。
-- **レビューは前提文脈が必須**(2026-07-17 A/B 実測): 同一 diff でも、フォーカス文脈なしだと旧コードの意図を好意的に捏造した誤前提の指摘になり、リンク先イシューの前提を与えると上流ソース実引用の検証可能なレビューに変わった。レビュー委譲時はフォーカスに前提(イシュー・意図・既知の実測事実)を必ず入れる。
+- **Two-stage verify**: The worker's verify tends to be scoped to a subset or directory (empirical: a "full suite" report was actually 21 single-file runs). The orchestrator always executes the true full `verify_in_container` before publish.
+- **publish is orchestrator-exclusive**: The network exit (publish) is never given to the worker. Credentials are resolved by sunaba on the host side; no tokens exist inside the container.
+- Worker guardrails (issue #5): verify scope must be at directory level / reproduction must use mocked unit tests / do not build live environments or search credentials (empirical: Flash progressed to `env | grep -i token`. Sunaba's no-token design prevented actual damage).
+  - **Codified**: `prompts/task-guardrails.md` is auto-prepended by the companion to every task prompt (scope adherence / honest verify reporting / mock reproduction / VCS exit prohibited / three-part report format). The orchestrator only needs to write task-specific content (scope, premise, acceptance criteria). When the phase chain (§3) is implemented, this is absorbed into the agent definition side.
+- **Review requires context premise** (2026-07-17 A/B measurement): The same diff, without a focus context, produced a finding built on a false premise that benevolently fabricated the old code's intent. When given the issue's premise as context, the review became a verifiable upstream-source review. When delegating a review, always include the premise (issue, intent, known empirical facts) in the focus.
 
-### 5.1 凍結オラクルと integrity check
+### 5.1 Frozen oracle and integrity check
 
-dev-workflow-orchestrator(プロトタイプ)から「受け入れテスト=凍結・読み取り専用の唯一のオラクル / 開発テスト=可変の足場」の 2 層構造を移植する。FSM 等は持ち込まない。
+Transplant the two-layer structure from dev-workflow-orchestrator (prototype): **"acceptance test = frozen, read-only oracle / development test = mutable scaffold"**. Does not carry over FSM etc.
 
-- brief の `## 受入基準` は凍結された契約。`## 凍結テスト` に列挙されたファイルは implement/respond ワーカーの変更禁止対象
-- 検収手順に 1 ステップ追加: publish 前に、凍結テストのパスに差分がないことを diff で機械的に確認する(差分があれば理由を問わず差し戻し)。受入基準の充足確認はその後に行う
-- 出典: dev-workflow-orchestrator の設計思想。テストの二層構造(凍結 oracle と可変 scaffold)により、ワーカーの verify 正直さへの依存を減らす
+- The brief's `## Acceptance Criteria` is a frozen contract. Files listed under `## Frozen Tests` are off-limits to implement/respond workers
+- Add one step to the inspection/acceptance by the orchestrator procedure: before publish, mechanically verify via diff that there are no changes to the frozen test paths (if there are, revert without asking why). Then confirm satisfaction of the acceptance criteria
+- Source: dev-workflow-orchestrator design philosophy. The two-layer test structure (frozen oracle + mutable scaffold) reduces reliance on the honesty of the worker's verify
 
-## 6. 障害と復旧
+## 6. Failure and recovery
 
-ワーカーは固有状態を持たないため、opencode がサイレントに死んでも sunaba 側の痕跡から救出できる:
+Since workers hold no intrinsic state, even if opencode dies silently, recovery from sunaba-side traces is possible:
 
-- どこまで進んだか = `checkpoint_list` + `diff_in_container`
-- 何をやっていたか = ジャーナル(sandbox_attach で session_label が付け替わり、ワーカーの操作が記録される)
-- 何を考えていたか = イシュー上の brief
+- How far they got = `checkpoint_list` + `diff_in_container`
+- What they were doing = journal (sandbox_attach's session_label is replaced, recording the worker's operations)
+- What they were thinking = brief on the issue
 
-復旧手順は品質不良時のリトライと**同一パス**(diff 検収 → 採用 or restore → 再委譲)。よって companion のウォッチドッグ(issue #6)は遠慮なく kill してよい — 失うのはフェーズ跨ぎでどうせ捨てる会話コンテキストのみ。
+The recovery path is **the same path as quality-failure retries** (diff inspection → accept or restore → re-delegate). Therefore, the companion's watchdog (issue #6) can kill unceremoniously — the only loss is the session context which would be discarded across phases anyway.
 
-タイムアウトの層構造: sunaba exec < opencode `experimental.mcp_timeout`(600000 に引き上げ済み。フル verify の MCP 呼び出しが実測 110s で、既定 120s の崖の 10s 手前だった)< companion ウォッチドッグ。
+Timeout layering: sunaba exec < opencode `experimental.mcp_timeout` (raised to 600000; full verify's MCP call measured at 110s, only 10s shy of the default 120s cliff) < companion watchdog.
 
-## 7. 実測で判明した opencode の制約 (1.17.x → 1.18.3)
+## 7. opencode constraints identified through testing (1.17.x → 1.18.3)
 
-| 制約 | 影響 | 対処 |
+| Constraint | Impact | Mitigation |
 |---|---|---|
-| `format: json_schema` でセッション破損 | provider 400 + 以後 GET /message も 400 | スキーマをプロンプト埋め込み。上流起票 → issue #8 |
-| MCP ツールは permission ask を発生させない(無音許可) | companion の permission 防波堤が MCP に無効 | `tools: {name: false}`(= `--deny`)で実行時ブロック |
-| deny ツールはモデル送信リストから物理除外(1.18.3+) | コンテキスト削減になる、無駄呼び出しの危険も除去 | 全面deny、agent定義で実現済み(§3.3参照) |
-| `mcp_timeout` 既定 120s | テスト増加でフル verify が時間切れ必至 | 600000 に引き上げ |
+| `format: json_schema` corrupts session | provider 400 + all subsequent GET /message also 400 | Embed schema in prompt. Upstream tracking → issue #8 |
+| MCP tools do not trigger permission asks (silent allow) | Companion's permission firewall is ineffective against MCP | `tools: {name: false}` (= `--deny`) blocks at execution time |
+| Denied tools are physically excluded from the model's tool list (1.18.3+) | Reduces context, also eliminates wasted call attempts | Full deny, implemented via agent definitions (see §3.3) |
+| Default `mcp_timeout` 120s | Full verify times out as tests increase | Raised to 600000 |
 
-### レビュアー権限(PR#37/#40 で確定)
+### Reviewer permissions (finalized in PR#37/#40)
 
-| ツール | 権限 | 理由 |
+| Tool | Permission | Rationale |
 |---|---|---|
-| `verify_in_container` / `lint_in_container` / `type_check_in_container` | **allow** | 実装者の「gate 緑」申告を独立に再実行するために必須 |
-| `sandbox_exec` / `sandbox_exec_background` / `run_container_and_exec` | **deny** | 任意シェル実行は read-only 性を破壊する |
-| 変更系全般(write_file/edit_file/checkpoint_restore/publish 等) | **deny** | レビュアーが直し始めたら独立性が消える |
+| `verify_in_container` / `lint_in_container` / `type_check_in_container` | **allow** | Necessary to independently re-run the implementer's "gate green" claim |
+| `sandbox_exec` / `sandbox_exec_background` / `run_container_and_exec` | **deny** | Arbitrary shell execution breaks read-only |
+| All mutation tools (write_file/edit_file/checkpoint_restore/publish etc.) | **deny** | If the reviewer starts fixing, independence is lost |
 
-`sandbox_initialize` / `sandbox_stop` 等のコンテナ管理系も deny。この設定は `plugins/kusabi/opencode-agents/kusabi-review.md` でハードコードされている。
+Container management tools (`sandbox_initialize` / `sandbox_stop`, etc.) are also denied. This configuration is hardcoded in `plugins/kusabi/opencode-agents/kusabi-review.md`.
 
-## 8. 検証記録 (2026-07-16, VM / opencode 1.17.20)
+## 8. Verification record (2026-07-16, VM / opencode 1.17.20)
 
-1. **serve モード E2E**: flash-free ワーカーが attach → フル verify(1443 tests)→ 正確な報告まで 121s で完走。
-2. **実イシュー委譲 (shiori#210)**: Flash が原因特定(rg が単一ファイル引数で FILE: prefix を省略)→修正+回帰テスト→checkpoint→verify→構造化報告まで 343s。検収で3件指摘(スコープ付き verify の過大報告 / ハッキーな修正 / rel_path のユーザー入力エコー)。
-3. **Pro 仕上げ再委譲**: 指摘を brief 化して Pro に 173s で再委譲。`rg -H` 化・パス正規化・repo 全体 verify(422/422)を正確に実施。shiori PR #274 として publish。
+1. **Serve mode E2E**: flash-free worker attach → full verify (1443 tests) → correct report, completed in 121s.
+2. **Real issue delegation (shiori#210)**: Flash identified root cause (rg omits `FILE:` prefix with a single file argument) → fix + regression test → checkpoint → verify → structured report in 343s. Inspection/acceptance by the orchestrator produced 3 findings (over-scoped verify report / hacky fix / user-input error with rel_path).
+3. **Pro finishing re-delegation**: Findings consolidated into a brief and re-delegated to Pro in 173s. Correctly implemented `rg -H`, path normalization, and repo-wide verify (422/422). Published as shiori PR #274.
 
-## 9. 自動チェーンの拡張計画(未実装)
+## 9. Auto-chain expansion plan (not implemented)
 
-以下の内容は issue #36 の「着手にあたっての設計確定」コメント(2026-07-19)で合意された**計画**である。**現行 main には実装されていない。**
+The following content is a **plan** agreed in the "design confirmation before starting" comment (2026-07-19) on issue #36. **NOT implemented in current main.**
 
-### 9.1 決定4: strategist段(停滞対策) — 段階B(計画)
+### 9.1 Decision 4: strategist stage (stall countermeasure) — Stage B (planned)
 
-`deriveDisposition` に `strategize` を追加: repeatedAreas 検知時、escalate の前に1回だけ strategist 段を許す(2回目の停滞で escalate)。kusabi-investigate 流用+専用テンプレートで根本原因診断(1〜3文) + 「WHAT(受入基準)は不変のままHOWを変える構造的変更を1つ」を出力。その勧告を次の rework ラウンドに findings と一緒に渡す。
+Add `strategize` to `deriveDisposition`: when repeatedAreas is detected, allow one strategist stage before escalate (second stall → escalate). Reuses kusabi-investigate with a dedicated template for root-cause diagnosis (1–3 sentences) + outputs "WHAT (acceptance criteria) stays the same, change HOW structurally — one concrete suggestion". That suggestion is passed to the next rework round together with findings.
 
-参照: issue #36 コメント「決定4: escalateの中間形としてstrategist段を段階Bに追加」
+Reference: issue #36 comment "Decision 4: add strategist stage as an intermediate form of escalate in Stage B"
 
-### 9.2 決定5: accept-with-followup(経済的打ち切り) — 段階B(計画)
+### 9.2 Decision 5: accept-with-followup (economic cutoff) — Stage B (planned)
 
-`deriveDisposition` に `accept-with-followup` を追加。条件:
-- プローブ全緑
-- かつ verdict が approve、または needs-attention でも残 findings がすべて minor(severity low/medium)かつ受入基準のいずれにも触れない
+Add `accept-with-followup` to `deriveDisposition`. Conditions:
+- All probes green
+- AND verdict is approve, or needs-attention but remaining findings are all minor (severity low/medium) AND none touch any acceptance criterion
 
-→ 残 findings を `followup_issue_draft`(タイトル+本文: 完了済み範囲と検証結果/残作業/既知 findings/元issue参照)に落として終了。
+→ Conclude by dropping remaining findings into a `followup_issue_draft` (title + body: completed scope and verification results / remaining work / known findings / reference to original issue).
 
-悪用ガード:
-1. severity はレビュアー(実装者と別セッション)の出力。実装者は自己申告できない
-2. 適用は**プローブ全緑が前提**(機械検査を通らない限り severity 分類は無関係)
-3. 繰延された findings は**必ず orchestrator の目に入る**(publish 前の最終検分で内容を見る)
+Anti-abuse guards:
+1. severity is the output of the reviewer (separate session from the implementer). The implementer cannot self-declare
+2. Application requires **all probes green as a precondition** (severity classification is irrelevant as long as mechanical checks are not passed)
+3. Carried-over findings **always reach the orchestrator's eyes** (content is seen during final inspection before publish)
 
-参照: issue #36 コメント「決定5: accept-with-followup(経済的打ち切り規則)」
+Reference: issue #36 comment "Decision 5: accept-with-followup (economic cutoff rule)"
 
-### 9.3 段階B/C 概要
+### 9.3 Stage B/C overview
 
-| 段階 | 内容 | 前提 |
+| Stage | Content | Prerequisite |
 |---|---|---|
-| **B** | brief 宣言型プローブ: `kind: refactor` / `baseline_collected: N` 書式。テスト件数不変(P3)・移設バイト同一性(P5) | 段階A 安定稼働 |
-| **B** | 決定4(strategist段)・決定5(accept-with-followup)の実装 | 段階A |
-| **C** | サボタージュ検査(P4): patch/monkeypatch.setattr 対象を AST で機械分類。mock対象テストのみ判定に使い、被検体テストは除外 | 段階B |
-| **D** | discard 経路の #33(best-of-N)接続 | 段階C、実摩擦待ち |
+| **B** | Brief-declaration probes: `kind: refactor` / `baseline_collected: N` format. Test count unchanged (P3), migration byte identity (P5) | Stage A stable operation |
+| **B** | Implement Decision 4 (strategist stage) and Decision 5 (accept-with-followup) | Stage A |
+| **C** | Patch injection check (P4): mechanically classify patch/monkeypatch.setattr targets via AST. Use only for mock-target determination; exclude system-under-test tests | Stage B |
+| **D** | Connect discard path to #33 (best-of-N) | Stage C, awaiting real-world experience |
 
-参照: issue #36 コメント「着手にあたっての設計確定 → 決定3: 段階分割(1PR=1段階)」
+Reference: issue #36 comment "Design confirmation before starting → Decision 3: stage split (1 PR = 1 stage)"
 
-### 9.4 残タスク(現状)
+### 9.4 Remaining tasks (current state)
 
-issue で管理:
-- #7-2(モデル可視化の残余)
-- #8(上流起票: opencode format:json_schema バグの報告と修正)
-- #33(best-of-n トーナメント)
-- #35(脅威モデル: 決定論的プローブの設計不変条件に該当)
-- #36(本issue)段階B以降の実装項目
+Managed via issues:
+- #7-2 (remaining model visualization items)
+- #8 (upstream tracking: report and fix opencode format:json_schema bug)
+- #33 (best-of-n tournament)
+- #35 (threat model: qualifies as a design invariant for deterministic probes)
+- #36 (this issue) implementation items from Stage B onward

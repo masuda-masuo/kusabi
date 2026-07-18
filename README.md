@@ -42,7 +42,7 @@ kusabi ships 6 agent definitions (`plugins/kusabi/opencode-agents/`) that are au
 
 | Agent | Phase role | Permission profile |
 |---|---|---|
-| `kusabi-draft` | 起票 — research + issue creation | read-only + shiori + issue_write |
+| `kusabi-draft` | Draft — research + issue creation | read-only + shiori + issue_write |
 | `kusabi-investigate` | investigate — deep dive, root cause | read-only + shiori + issue_write |
 | `kusabi-implement` | implement — code + verify | code write + verify; publish / issue_write / sandbox lifecycle **deny** |
 | `kusabi-review` | review — adversarial review | verify/lint/type_check **allow**, sandbox_exec/sandbox_write **deny** |
