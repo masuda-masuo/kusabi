@@ -9,6 +9,7 @@ import {
   extractJson,
   renderReview,
   parseArgs,
+  parseModel,
   stateRoot,
   deriveDisposition,
   loadConfig,
@@ -1023,6 +1024,180 @@ describe("resolveModel", () => {
     // chain should still be the built-in default when no config
     assert.equal(result.chain.length, 3);
     assert.equal(result.chain[0], "opencode/deepseek-v4-flash-free");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// parseModel — variant suffix parsing
+// ---------------------------------------------------------------------------
+
+describe("parseModel", () => {
+  it("parses provider/model without variant", () => {
+    const result = parseModel("opencode-go/deepseek-v4-flash");
+    assert.deepEqual(result, { providerID: "opencode-go", modelID: "deepseek-v4-flash" });
+  });
+
+  it("parses provider/model:variant suffix", () => {
+    const result = parseModel("opencode-go/deepseek-v4-flash:max");
+    assert.deepEqual(result, { providerID: "opencode-go", modelID: "deepseek-v4-flash", variant: "max" });
+  });
+
+  it("parses :high variant suffix", () => {
+    const result = parseModel("p/a:high");
+    assert.deepEqual(result, { providerID: "p", modelID: "a", variant: "high" });
+  });
+
+  it("throws on trailing colon (empty variant)", () => {
+    assert.throws(
+      () => parseModel("p/a:"),
+      (err) => {
+        assert.ok(err.message.includes("empty variant in model entry: p/a:"));
+        return true;
+      },
+    );
+  });
+
+  it("throws on missing slash (no provider/model separator)", () => {
+    assert.throws(
+      () => parseModel("just-a-model"),
+      (err) => {
+        assert.ok(err.message.includes("--model expects provider/model"));
+        return true;
+      },
+    );
+  });
+
+  it("returns undefined for empty value", () => {
+    assert.equal(parseModel(""), undefined);
+    assert.equal(parseModel(undefined), undefined);
+    assert.equal(parseModel(null), undefined);
+  });
+
+  it("resolves through resolveModel with variant suffix", () => {
+    const result = resolveModel({ flag: "p/a:max", phase: undefined, config: null });
+    assert.equal(result.model.providerID, "p");
+    assert.equal(result.model.modelID, "a");
+    assert.equal(result.model.variant, "max");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Model variant — API request body boundary
+// ---------------------------------------------------------------------------
+
+describe("model variant API body boundary", () => {
+  it("prompt_async body includes variant when model has variant", () => {
+    const model = parseModel("p/a:max");
+    const body = {
+      parts: [{ type: "text", text: "test" }],
+      ...(model ? { model: { providerID: model.providerID, modelID: model.modelID } } : {}),
+      ...(model?.variant ? { variant: model.variant } : {}),
+    };
+    assert.equal(body.variant, "max");
+    assert.equal(body.model.providerID, "p");
+    assert.equal(body.model.modelID, "a");
+  });
+
+  it("prompt_async body omits variant when model has no variant", () => {
+    const model = parseModel("p/a");
+    const body = {
+      parts: [{ type: "text", text: "test" }],
+      ...(model ? { model: { providerID: model.providerID, modelID: model.modelID } } : {}),
+      ...(model?.variant ? { variant: model.variant } : {}),
+    };
+    assert.equal(body.variant, undefined);
+    assert.equal(body.model.providerID, "p");
+    assert.equal(body.model.modelID, "a");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Chain round-to-entry mapping — model variant escalation
+// ---------------------------------------------------------------------------
+
+describe("chain round model resolution", () => {
+  const chain = ["p/a", "p/a:max", "p/b"];
+
+  function resolveRoundModel(round, modelFlag) {
+    if (round === 1 && modelFlag) return parseModel(modelFlag);
+    const idx = Math.min(round - 1, chain.length - 1);
+    return parseModel(chain[idx]);
+  }
+
+  it("round 1 uses chain[0] when no --model", () => {
+    const result = resolveRoundModel(1, null);
+    assert.deepEqual(result, { providerID: "p", modelID: "a" });
+  });
+
+  it("round 2 uses chain[1] (:max variant)", () => {
+    const result = resolveRoundModel(2, null);
+    assert.deepEqual(result, { providerID: "p", modelID: "a", variant: "max" });
+  });
+
+  it("round 3 uses chain[2]", () => {
+    const result = resolveRoundModel(3, null);
+    assert.deepEqual(result, { providerID: "p", modelID: "b" });
+  });
+
+  it("rounds beyond chain length clamp to last entry", () => {
+    const result = resolveRoundModel(4, null);
+    assert.deepEqual(result, { providerID: "p", modelID: "b" });
+    const result5 = resolveRoundModel(5, null);
+    assert.deepEqual(result5, { providerID: "p", modelID: "b" });
+  });
+
+  it("--model overrides round 1 only", () => {
+    const result = resolveRoundModel(1, "p/c:high");
+    assert.deepEqual(result, { providerID: "p", modelID: "c", variant: "high" });
+  });
+
+  it("round 2+ ignores --model and follows chain", () => {
+    // Even with --model, round 2 follows the chain
+    const result = resolveRoundModel(2, "p/c:high");
+    assert.deepEqual(result, { providerID: "p", modelID: "a", variant: "max" });
+  });
+
+  it("single-entry chain clamps all rounds to that entry", () => {
+    const single = ["p/x"];
+    function resolveForRound(n) {
+      const idx = Math.min(n - 1, single.length - 1);
+      return parseModel(single[idx]);
+    }
+    assert.deepEqual(resolveForRound(1), { providerID: "p", modelID: "x" });
+    assert.deepEqual(resolveForRound(2), { providerID: "p", modelID: "x" });
+    assert.deepEqual(resolveForRound(5), { providerID: "p", modelID: "x" });
+  });
+
+  it("variant stored in round record is visible", () => {
+    // Simulate what cmdChain stores on roundRecord
+    const round = 2;
+    const idx = Math.min(round - 1, chain.length - 1);
+    const entry = chain[idx];
+    const roundModel = parseModel(entry);
+    const roundModelEntry = (roundModel && roundModel.variant)
+      ? roundModel.providerID + "/" + roundModel.modelID + ":" + roundModel.variant
+      : (roundModel ? roundModel.providerID + "/" + roundModel.modelID : null);
+    const roundRecord = {
+      round,
+      modelEntry: roundModelEntry,
+      modelVariant: roundModel?.variant || null,
+    };
+    assert.equal(roundRecord.modelEntry, "p/a:max");
+    assert.equal(roundRecord.modelVariant, "max");
+  });
+
+  it("round without variant has null variant in record", () => {
+    const round = 1;
+    const idx = Math.min(round - 1, chain.length - 1);
+    const entry = chain[idx];
+    const roundModel = parseModel(entry);
+    const roundRecord = {
+      round,
+      modelEntry: roundModel ? roundModel.providerID + "/" + roundModel.modelID : null,
+      modelVariant: roundModel?.variant || null,
+    };
+    assert.equal(roundRecord.modelEntry, "p/a");
+    assert.equal(roundRecord.modelVariant, null);
   });
 });
 

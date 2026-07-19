@@ -81,13 +81,30 @@ You can customise this with a config file at `<state root>/config.json`
 ```json
 {
   "models": {
-    "chain": ["opencode/deepseek-v4-flash-free", "opencode-go/deepseek-v4-flash", "opencode-go/deepseek-v4-pro"],
+    "chain": ["opencode/deepseek-v4-flash-free", "opencode-go/deepseek-v4-flash:max", "opencode-go/deepseek-v4-pro"],
     "phases": { "implement": ["opencode-go/deepseek-v4-flash"] }
   }
 }
 ```
 
-Resolution precedence (highest to lowest):
+### Variant syntax
+
+Chain entries (and `--model` / `task --model`) accept an optional `:variant` suffix:
+
+    provider/model[:variant]
+
+For example, `opencode-go/deepseek-v4-flash:max` requests the model with
+reasoning effort set to `max`. The variant is passed as the top-level
+`variant` field in the `POST /session/{id}/prompt_async` request body.
+
+**Caveat:** opencode silently ignores a variant the model does not define — no
+error is returned. To detect this, inspect the `modelVariant` field stored on
+each chain round record or the `variant` field in `job.modelChain` entries via
+`/kusabi:status <job-id>` or `/kusabi:result <job-id>`.
+
+A trailing colon (`p/a:`) or missing `/` are fatal parse errors.
+
+### Resolution precedence (highest to lowest)
 
 1. **Explicit `--model` flag** — always wins when provided.
 2. **Per-phase chain** — `models.phases.<phase>` first entry (e.g. a config with `"implement": ["m1"]` resolves to `m1` for implement-phase tasks).
@@ -97,6 +114,29 @@ Resolution precedence (highest to lowest):
 Missing config file = silently uses the built-in defaults. A malformed config file (unparseable JSON or wrong shape) produces a fatal error naming the file path — kusabi does not silently fall back in that case.
 
 The full resolved chain is stored on every job record (`job.modelChain`) for use by future fallback logic (issue #50).
+
+### Chain round escalation
+
+When the `chain` subcommand reworks after a needs-attention review, each
+subsequent implement round escalates by moving down the model chain:
+
+| Round | Entry selected |
+|---|---|
+| 1 | `--model` flag (if provided), otherwise chain[0] |
+| 2 | chain[1] (or last entry if chain has only 1 element) |
+| 3 | chain[2] (or last entry if shorter) |
+| N | chain[N-1], clamped to the last entry |
+
+Rounds beyond the end of the chain keep using the last entry.
+
+The review phase always uses the same model as round 1 (the model resolved
+from `--model` or the first chain entry); escalation applies only to the
+implementer role.
+
+If a chain entry carries a `:variant` suffix (e.g. `:max`), the `variant`
+field is included in the `prompt_async` request for that round and stored
+on the round record (`modelEntry` and `modelVariant` fields). The variant
+is visible in `status` and `result` output for each round.
 
 ## Notes
 

@@ -537,7 +537,8 @@ async function runPrompt({ cwd, kind, title, promptText, agent, model, session, 
     await api(server, "POST", `/session/${sessionID}/prompt_async`, {
       parts: [{ type: "text", text: promptText }],
       ...(agent ? { agent } : {}),
-      ...(model ? { model } : {}),
+      ...(model ? { model: { providerID: model.providerID, modelID: model.modelID } } : {}),
+      ...(model?.variant ? { variant: model.variant } : {}),
       ...(tools ? { tools } : {}),
       ...(format ? { format } : {}),
     });
@@ -735,11 +736,20 @@ export function parseArgs(argv) {
   return { flags, text: rest.join(" ").trim() };
 }
 
-function parseModel(value) {
+export function parseModel(value) {
   if (!value) return undefined;
   const idx = value.indexOf("/");
   if (idx < 0) throw new Error(`--model expects provider/model, got: ${value}`);
-  return { providerID: value.slice(0, idx), modelID: value.slice(idx + 1) };
+  const providerID = value.slice(0, idx);
+  let modelID = value.slice(idx + 1);
+  let variant;
+  const vi = modelID.indexOf(":");
+  if (vi >= 0) {
+    variant = modelID.slice(vi + 1);
+    modelID = modelID.slice(0, vi);
+    if (!variant) throw new Error(`empty variant in model entry: ${value}`);
+  }
+  return { providerID, modelID, ...(variant ? { variant } : {}) };
 }
 
 // ---------------------------------------------------------------------------
@@ -1269,7 +1279,22 @@ async function cmdChain(cwd, { flags, text }) {
     } else {
       resumeMethod = { type: "continue_session" };
     }
-    const roundRecord = { round, resumeMethod, startedAt: new Date().toISOString(), verdict: null, probesGreen: false };
+    // ---- resolve round-specific model ----
+    // Round 1: use --model if provided, else chain entry 0 (already in `model`).
+    // Round 2+: use chain entry (round-1), clamped to last entry.
+    let roundModel;
+    if (isFirstRound && flags.model) {
+      roundModel = model;  // --model overrides round 1
+    } else {
+      const chainIdx = Math.min(round - 1, modelChain.length - 1);
+      const entry = modelChain[chainIdx];
+      roundModel = parseModel(entry);
+    }
+    const roundModelEntry = (roundModel && roundModel.variant)
+      ? roundModel.providerID + "/" + roundModel.modelID + ":" + roundModel.variant
+      : (roundModel ? roundModel.providerID + "/" + roundModel.modelID : null);
+
+    const roundRecord = { round, resumeMethod, startedAt: new Date().toISOString(), verdict: null, probesGreen: false, modelEntry: roundModelEntry, modelVariant: roundModel?.variant || null };
 
     let implementText;
     if (isFirstRound) {
@@ -1295,7 +1320,7 @@ async function cmdChain(cwd, { flags, text }) {
       promptText: implementText,
       agent: "kusabi-implement",
       phase: "implement",
-      model,
+      model: roundModel,
       session: useNewSession ? undefined : session,
       timeoutS: 3600,
       watchdogS: 900,
@@ -1476,7 +1501,7 @@ async function cmdChain(cwd, { flags, text }) {
       for (var ri = 0; ri < records.length; ri++) {
         var r = records[ri];
         var detail = r.resumeMethod.detail ? ": " + r.resumeMethod.detail : "";
-        lines.push("Round " + (ri + 1) + ": verdict=" + r.verdict + ", probesGreen=" + r.probesGreen + ", resume=" + r.resumeMethod.type + detail);
+        lines.push("Round " + (ri + 1) + ": model=" + (r.modelEntry || "?") + ", verdict=" + r.verdict + ", probesGreen=" + r.probesGreen + ", resume=" + r.resumeMethod.type + detail);
       }
       lines.push("", "Hand over to orchestrator for final judgement.");
       return lines.join("\n");
@@ -1495,7 +1520,7 @@ async function cmdChain(cwd, { flags, text }) {
   for (var ri2 = 0; ri2 < records.length; ri2++) {
     var r2 = records[ri2];
     var detail2 = r2.resumeMethod.detail ? ": " + r2.resumeMethod.detail : "";
-    lines.push("Round " + (ri2 + 1) + ": verdict=" + r2.verdict + ", probesGreen=" + r2.probesGreen + ", resume=" + r2.resumeMethod.type + detail2);
+    lines.push("Round " + (ri2 + 1) + ": model=" + (r2.modelEntry || "?") + ", verdict=" + r2.verdict + ", probesGreen=" + r2.probesGreen + ", resume=" + r2.resumeMethod.type + detail2);
   }
   lines.push("", "Hand over to orchestrator for final judgement.");
   return lines.join("\n");
