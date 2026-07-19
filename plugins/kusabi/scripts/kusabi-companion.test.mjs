@@ -1,4 +1,4 @@
-import { describe, it } from "node:test";
+import { describe, it, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import os from "node:os";
 import path from "node:path";
@@ -11,6 +11,9 @@ import {
   parseArgs,
   stateRoot,
   deriveDisposition,
+  loadConfig,
+  resolveModel,
+  readBriefFile,
 } from "./kusabi-companion.mjs";
 
 // ---------------------------------------------------------------------------
@@ -735,5 +738,358 @@ describe("accumulateUsage", () => {
     assert.equal(result.available, true);
     assert.equal(result.input, 0);
     assert.equal(result.output, 0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// parseArgs — --brief-file flag
+// ---------------------------------------------------------------------------
+
+describe("parseArgs brief-file", () => {
+  it("parses --brief-file as a value flag", () => {
+    const result = parseArgs(["--brief-file", "/tmp/test-brief.md"]);
+    assert.equal(result.flags["brief-file"], "/tmp/test-brief.md");
+  });
+
+  it("does not set --brief-file when not provided", () => {
+    const result = parseArgs(["some inline text"]);
+    assert.equal(result.flags["brief-file"], undefined);
+  });
+
+  it("combines --brief-file with other flags", () => {
+    const result = parseArgs(["--model", "p/m", "--brief-file", "/tmp/b.md", "--", "text"]);
+    assert.equal(result.flags.model, "p/m");
+    assert.equal(result.flags["brief-file"], "/tmp/b.md");
+    // text after -- is literal; brief-file flag was consumed before --
+    assert.equal(result.text, "text");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// loadConfig — config file loading
+// ---------------------------------------------------------------------------
+
+describe("loadConfig", () => {
+  /** @type {string} */
+  let tmpDir;
+
+  beforeEach(() => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-loadConfig-"));
+  });
+
+  afterEach(() => {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it("returns null when no config file exists", () => {
+    const result = loadConfig(tmpDir);
+    assert.equal(result, null);
+  });
+
+  it("returns parsed config when valid JSON with models.chain exists", () => {
+    const config = {
+      models: {
+        chain: ["opencode-go/deepseek-v4-flash", "opencode-go/deepseek-v4-pro"],
+      },
+    };
+    fs.writeFileSync(path.join(tmpDir, "config.json"), JSON.stringify(config), "utf8");
+    const result = loadConfig(tmpDir);
+    assert.deepEqual(result, config);
+  });
+
+  it("returns parsed config when valid JSON with models.phases exists", () => {
+    const config = {
+      models: {
+        phases: { implement: ["opencode-go/deepseek-v4-flash"] },
+      },
+    };
+    fs.writeFileSync(path.join(tmpDir, "config.json"), JSON.stringify(config), "utf8");
+    const result = loadConfig(tmpDir);
+    assert.deepEqual(result, config);
+  });
+
+  it("returns parsed config when models key is absent", () => {
+    const config = { unrelated: true };
+    fs.writeFileSync(path.join(tmpDir, "config.json"), JSON.stringify(config), "utf8");
+    const result = loadConfig(tmpDir);
+    assert.deepEqual(result, config);
+  });
+
+  it("throws on malformed JSON (unparseable)", () => {
+    fs.writeFileSync(path.join(tmpDir, "config.json"), "not json at all", "utf8");
+    assert.throws(
+      () => loadConfig(tmpDir),
+      (err) => {
+        assert.ok(err.message.includes(path.join(tmpDir, "config.json")), "error must mention file path");
+        assert.ok(err.message.includes("not valid JSON"), "error must mention invalid JSON");
+        return true;
+      },
+    );
+  });
+
+  it("throws on null JSON value", () => {
+    fs.writeFileSync(path.join(tmpDir, "config.json"), "null", "utf8");
+    assert.throws(
+      () => loadConfig(tmpDir),
+      (err) => {
+        assert.ok(err.message.includes("must contain a JSON object"));
+        return true;
+      },
+    );
+  });
+
+  it("throws on array JSON value", () => {
+    fs.writeFileSync(path.join(tmpDir, "config.json"), "[]", "utf8");
+    assert.throws(
+      () => loadConfig(tmpDir),
+      (err) => {
+        assert.ok(err.message.includes("must contain a JSON object"));
+        return true;
+      },
+    );
+  });
+
+  it("throws when models is not an object", () => {
+    fs.writeFileSync(path.join(tmpDir, "config.json"), JSON.stringify({ models: "string" }), "utf8");
+    assert.throws(
+      () => loadConfig(tmpDir),
+      (err) => {
+        assert.ok(err.message.includes('"models" must be a JSON object'));
+        return true;
+      },
+    );
+  });
+
+  it("throws when models.chain is not an array of strings", () => {
+    fs.writeFileSync(path.join(tmpDir, "config.json"), JSON.stringify({ models: { chain: "not-array" } }), "utf8");
+    assert.throws(
+      () => loadConfig(tmpDir),
+      (err) => {
+        assert.ok(err.message.includes('"models.chain" must be an array'));
+        return true;
+      },
+    );
+  });
+
+  it("throws when models.chain is an empty array (must not silently drop built-in defaults)", () => {
+    fs.writeFileSync(path.join(tmpDir, "config.json"), JSON.stringify({ models: { chain: [] } }), "utf8");
+    assert.throws(
+      () => loadConfig(tmpDir),
+      (err) => {
+        assert.ok(err.message.includes('"models.chain" must not be empty'));
+        return true;
+      },
+    );
+  });
+
+  it("throws when a models.phases entry is an empty array", () => {
+    fs.writeFileSync(
+      path.join(tmpDir, "config.json"),
+      JSON.stringify({ models: { phases: { implement: [] } } }),
+      "utf8",
+    );
+    assert.throws(
+      () => loadConfig(tmpDir),
+      (err) => {
+        assert.ok(err.message.includes('"models.phases.implement" must not be empty'));
+        return true;
+      },
+    );
+  });
+
+  it("throws when models.phases.phase is not an array of strings", () => {
+    fs.writeFileSync(
+      path.join(tmpDir, "config.json"),
+      JSON.stringify({ models: { phases: { implement: "not-array" } } }),
+      "utf8",
+    );
+    assert.throws(
+      () => loadConfig(tmpDir),
+      (err) => {
+        assert.ok(err.message.includes('"models.phases.implement" must be an array'));
+        return true;
+      },
+    );
+  });
+
+  it("throws when models.phases is not an object", () => {
+    fs.writeFileSync(path.join(tmpDir, "config.json"), JSON.stringify({ models: { phases: "string" } }), "utf8");
+    assert.throws(
+      () => loadConfig(tmpDir),
+      (err) => {
+        assert.ok(err.message.includes('"models.phases" must be a JSON object'));
+        return true;
+      },
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// resolveModel — model resolution precedence
+// ---------------------------------------------------------------------------
+
+describe("resolveModel", () => {
+  it("returns built-in default chain when no flag and no config", () => {
+    const result = resolveModel({ flag: undefined, phase: undefined, config: null });
+    assert.ok(result.model, "should resolve a model");
+    assert.equal(result.model.providerID, "opencode");
+    assert.equal(result.model.modelID, "deepseek-v4-flash-free");
+    assert.ok(Array.isArray(result.chain));
+    assert.equal(result.chain.length, 3);
+    assert.equal(result.chain[0], "opencode/deepseek-v4-flash-free");
+  });
+
+  it("uses explicit --model flag over everything", () => {
+    const config = {
+      models: {
+        chain: ["opencode-go/deepseek-v4-flash", "opencode-go/deepseek-v4-pro"],
+        phases: { implement: ["anthropic/claude-4"] },
+      },
+    };
+    const result = resolveModel({ flag: "some-provider/some-model", phase: "implement", config });
+    assert.equal(result.model.providerID, "some-provider");
+    assert.equal(result.model.modelID, "some-model");
+  });
+
+  it("uses per-phase chain first entry when phase matches", () => {
+    const config = {
+      models: {
+        chain: ["opencode-go/deepseek-v4-flash", "opencode-go/deepseek-v4-pro"],
+        phases: { implement: ["anthropic/claude-4"] },
+      },
+    };
+    const result = resolveModel({ flag: undefined, phase: "implement", config });
+    assert.equal(result.model.providerID, "anthropic");
+    assert.equal(result.model.modelID, "claude-4");
+  });
+
+  it("uses global chain first entry when no phase match", () => {
+    const config = {
+      models: {
+        chain: ["opencode-go/deepseek-v4-flash", "opencode-go/deepseek-v4-pro"],
+        phases: { implement: ["anthropic/claude-4"] },
+      },
+    };
+    const result = resolveModel({ flag: undefined, phase: "review", config });
+    assert.equal(result.model.providerID, "opencode-go");
+    assert.equal(result.model.modelID, "deepseek-v4-flash");
+  });
+
+  it("uses global chain first entry when no phases config at all", () => {
+    const config = {
+      models: {
+        chain: ["opencode-go/deepseek-v4-flash", "opencode-go/deepseek-v4-pro"],
+      },
+    };
+    const result = resolveModel({ flag: undefined, phase: "implement", config });
+    assert.equal(result.model.providerID, "opencode-go");
+    assert.equal(result.model.modelID, "deepseek-v4-flash");
+  });
+
+  it("returns full chain from config when present", () => {
+    const config = {
+      models: {
+        chain: ["opencode-go/m1", "opencode-go/m2"],
+        phases: { implement: ["opencode-go/m3"] },
+      },
+    };
+    const result = resolveModel({ flag: undefined, phase: "implement", config });
+    assert.deepEqual(result.chain, ["opencode-go/m3"]);
+  });
+
+  it("returns global chain when no per-phase override", () => {
+    const config = {
+      models: {
+        chain: ["opencode-go/m1", "opencode-go/m2"],
+      },
+    };
+    const result = resolveModel({ flag: undefined, phase: "implement", config });
+    assert.deepEqual(result.chain, ["opencode-go/m1", "opencode-go/m2"]);
+  });
+
+  it("returns built-in default chain when config has no models.chain", () => {
+    const config = { models: { phases: { implement: ["p/m"] } } };
+    const result = resolveModel({ flag: undefined, phase: "review", config });
+    // No per-phase match for review, no global chain -> built-in
+    assert.equal(result.model.providerID, "opencode");
+    assert.equal(result.model.modelID, "deepseek-v4-flash-free");
+    assert.equal(result.chain.length, 3);
+  });
+
+  it("explicit flag + no config still returns built-in chain", () => {
+    const result = resolveModel({ flag: "explicit/p", phase: undefined, config: null });
+    assert.equal(result.model.providerID, "explicit");
+    assert.equal(result.model.modelID, "p");
+    // chain should still be the built-in default when no config
+    assert.equal(result.chain.length, 3);
+    assert.equal(result.chain[0], "opencode/deepseek-v4-flash-free");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// readBriefFile — brief-file runtime error paths
+// ---------------------------------------------------------------------------
+
+describe("readBriefFile", () => {
+  it("returns inline text when no --brief-file flag", () => {
+    const result = readBriefFile({}, "hello world");
+    assert.equal(result, "hello world");
+  });
+
+  it("throws when --brief-file and inline text are both provided", () => {
+    assert.throws(
+      () => readBriefFile({ "brief-file": "/tmp/x.md" }, "inline text"),
+      /--brief-file and inline text are mutually exclusive/,
+    );
+  });
+
+  it("throws when --brief-file points to a missing file", () => {
+    assert.throws(
+      () => readBriefFile({ "brief-file": "/nonexistent/path/brief.md" }, ""),
+      (err) => {
+        assert.ok(err.message.includes("--brief-file: cannot read"));
+        assert.ok(err.message.includes("/nonexistent/path/brief.md"));
+        return true;
+      },
+    );
+  });
+
+  it("returns file content when --brief-file points to a valid file", () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-brief-"));
+    try {
+      const filePath = path.join(tmpDir, "brief.md");
+      fs.writeFileSync(filePath, "file content here", "utf8");
+      const result = readBriefFile({ "brief-file": filePath }, "");
+      assert.equal(result, "file content here");
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// parseArgs -- flag-without-value errors
+// ---------------------------------------------------------------------------
+
+describe("parseArgs flag value required", () => {
+  it("throws when --brief-file has no value", () => {
+    assert.throws(
+      () => parseArgs(["--brief-file"]),
+      /--brief-file requires a value/,
+    );
+  });
+
+  it("throws when --brief-file is followed by another flag", () => {
+    assert.throws(
+      () => parseArgs(["--brief-file", "--model", "p/m"]),
+      /--brief-file requires a value/,
+    );
+  });
+
+  it("throws when --model has no value (same pattern)", () => {
+    assert.throws(
+      () => parseArgs(["--model"]),
+      /--model requires a value/,
+    );
   });
 });

@@ -719,8 +719,13 @@ export function parseArgs(argv) {
         ? arg.slice(2).replace(/-([a-z])/g, (_, c) => c.toUpperCase())
         : arg.slice(1);
       flags[key] = true;
-    } else if (arg === "--base" || arg === "--model" || arg === "--agent" || arg === "--session" || arg === "--timeout" || arg === "--deny" || arg === "--watchdog" || arg === "--phase" || arg === "--container" || arg === "--prior" || arg === "--max-rounds") {
-      flags[arg.slice(2)] = argv[++i];
+    } else if (arg === "--base" || arg === "--model" || arg === "--agent" || arg === "--session" || arg === "--timeout" || arg === "--deny" || arg === "--watchdog" || arg === "--phase" || arg === "--container" || arg === "--prior" || arg === "--max-rounds" || arg === "--brief-file") {
+      const flagName = arg.slice(2);
+      const val = argv[++i];
+      if (val === undefined || (typeof val === "string" && val.startsWith("--"))) {
+        throw new Error(`${arg} requires a value`);
+      }
+      flags[flagName] = val;
     } else if (arg.startsWith("--")) {
       throw new Error(`unknown flag: ${arg}`);
     } else {
@@ -735,6 +740,138 @@ function parseModel(value) {
   const idx = value.indexOf("/");
   if (idx < 0) throw new Error(`--model expects provider/model, got: ${value}`);
   return { providerID: value.slice(0, idx), modelID: value.slice(idx + 1) };
+}
+
+// ---------------------------------------------------------------------------
+// config loading & model resolution
+// ---------------------------------------------------------------------------
+
+const BUILTIN_DEFAULT_CHAIN = [
+  "opencode/deepseek-v4-flash-free",
+  "opencode-go/deepseek-v4-flash",
+  "opencode-go/deepseek-v4-pro",
+];
+
+/**
+ * Load the kusabi config file from the state root.
+ * @param {string} stateRootDir - The state root directory (e.g. ~/.kusabi)
+ * @returns {object|null} Config object or null if the file does not exist.
+ * @throws {Error} If the file exists but is unparseable or has wrong shape.
+ */
+export function loadConfig(stateRootDir) {
+  const configPath = path.join(stateRootDir, "config.json");
+  if (!fs.existsSync(configPath)) return null;
+
+  let parsed;
+  try {
+    parsed = JSON.parse(fs.readFileSync(configPath, "utf8"));
+  } catch (err) {
+    throw new Error(`kusabi config file ${configPath} is not valid JSON: ${err.message}`);
+  }
+
+  // Validate shape: must be an object with an optional "models" key
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error(`kusabi config file ${configPath} must contain a JSON object`);
+  }
+
+  const models = parsed.models;
+  if (models !== undefined) {
+    if (typeof models !== "object" || Array.isArray(models) || models === null) {
+      throw new Error(`kusabi config file ${configPath}: "models" must be a JSON object`);
+    }
+    if (models.chain !== undefined) {
+      if (!Array.isArray(models.chain) || !models.chain.every((m) => typeof m === "string")) {
+        throw new Error(`kusabi config file ${configPath}: "models.chain" must be an array of strings`);
+      }
+      if (models.chain.length === 0) {
+        throw new Error(`kusabi config file ${configPath}: "models.chain" must not be empty (omit it to use the built-in default chain)`);
+      }
+    }
+    if (models.phases !== undefined) {
+      if (typeof models.phases !== "object" || Array.isArray(models.phases) || models.phases === null) {
+        throw new Error(`kusabi config file ${configPath}: "models.phases" must be a JSON object`);
+      }
+      for (const [phaseName, chain] of Object.entries(models.phases)) {
+        if (!Array.isArray(chain) || !chain.every((m) => typeof m === "string")) {
+          throw new Error(`kusabi config file ${configPath}: "models.phases.${phaseName}" must be an array of strings`);
+        }
+        if (chain.length === 0) {
+          throw new Error(`kusabi config file ${configPath}: "models.phases.${phaseName}" must not be empty (omit it to fall back to the global chain)`);
+        }
+      }
+    }
+  }
+
+  return parsed;
+}
+
+/**
+ * Resolve the model for a dispatch based on precedence:
+ *   1. explicit --model flag
+ *   2. per-phase chain first entry
+ *   3. global chain first entry
+ *   4. built-in default chain first entry
+ *
+ * Returns the full ordered chain (array of "provider/model" strings).
+ *
+ * @param {object} opts
+ * @param {string|undefined} opts.flag  - Raw --model flag value (e.g. "anthropic/claude-4")
+ * @param {string|undefined} opts.phase - Phase name (e.g. "implement")
+ * @param {object|null}      opts.config - Parsed config object or null
+ * @returns {{ model: { providerID: string, modelID: string } | undefined, chain: string[] }}
+ */
+export function resolveModel({ flag, phase, config }) {
+  // Determine the full ordered chain
+  let chain;
+  if (config?.models?.chain) {
+    chain = [...config.models.chain];
+  } else {
+    chain = [...BUILTIN_DEFAULT_CHAIN];
+  }
+
+  // If we have an explicit --model flag, use it directly
+  if (flag) {
+    return { model: parseModel(flag), chain };
+  }
+
+  // Per-phase override
+  if (phase && config?.models?.phases?.[phase]) {
+    const phaseChain = config.models.phases[phase];
+    const first = phaseChain[0];
+    if (first) {
+      return { model: parseModel(first), chain: phaseChain };
+    }
+  }
+
+  // Global chain first entry
+  const firstGlobal = chain[0];
+  if (firstGlobal) {
+    return { model: parseModel(firstGlobal), chain };
+  }
+
+  // No model resolved
+  return { model: undefined, chain };
+}
+
+/**
+ * Read the brief text from a file or return the inline text.
+ * Throws a clear error when `--brief-file` and inline text are both provided,
+ * or when the file cannot be read.
+ *
+ * @param {object} flags  - Parsed flags from parseArgs (may contain "brief-file")
+ * @param {string} text   - Inline text (may be empty)
+ * @returns {string} The resolved brief text.
+ */
+export function readBriefFile(flags, text) {
+  if (flags["brief-file"]) {
+    if (text) throw new Error("--brief-file and inline text are mutually exclusive");
+    try {
+      return fs.readFileSync(flags["brief-file"], "utf8").trim();
+    } catch (err) {
+      throw new Error(`--brief-file: cannot read ${flags["brief-file"]}: ${err.message}`);
+    }
+  }
+  return text;
 }
 
 // ---------------------------------------------------------------------------
@@ -822,7 +959,9 @@ async function cmdSetup(cwd) {
 }
 
 async function cmdTask(cwd, { flags, text }) {
-  if (!text) throw new Error("task requires a task description");
+  // ---- brief-file resolution ----
+  text = readBriefFile(flags, text);
+  if (!text) throw new Error("task requires a task description (inline or via --brief-file)");
   let agent = flags.agent;
   let phase = null;
   if (flags.phase) {
@@ -836,6 +975,11 @@ async function cmdTask(cwd, { flags, text }) {
     agent = PHASE_AGENTS[phase];
   }
   const stateDir = stateDirFor(cwd);
+  const config = loadConfig(stateRoot());
+  const resolved = resolveModel({ flag: flags.model, phase, config });
+  const model = resolved.model;
+  const modelChain = resolved.chain;
+
   let session = flags.session;
   if (!session && flags.resumeLast) {
     const prev = latestJob(stateDir, (j) => j.kind === "task" && (!phase || j.phase === phase));
@@ -865,12 +1009,16 @@ async function cmdTask(cwd, { flags, text }) {
     promptText: `${guardrails}\n\n<task>\n${text}\n</task>`,
     agent,
     phase,
-    model: parseModel(flags.model),
+    model,
     session,
     tools,
     timeoutS: Number(flags.timeout ?? DEFAULT_TASK_TIMEOUT_S),
     watchdogS: Number(flags.watchdog ?? DEFAULT_WATCHDOG_S),
   });
+
+  // Store the resolved model chain on the job record
+  job.modelChain = modelChain;
+  saveJob(stateDir, job);
   if (job.status !== "completed") {
     return `${renderHeader(job)}${job.error ?? ""}\nCheck /kusabi:status ${job.id} for details.`;
   }
@@ -1052,16 +1200,21 @@ async function cmdSalvage(cwd, { flags, text }) {
 // ---------------------------------------------------------------------------
 
 async function cmdChain(cwd, { flags, text }) {
-  if (!text) throw new Error("chain requires a brief description");
+  // ---- brief-file resolution ----
+  text = readBriefFile(flags, text);
+  if (!text) throw new Error("chain requires a brief description (inline or via --brief-file)");
   const stateDir = stateDirFor(cwd);
+  const config = loadConfig(stateRoot());
+  const resolved = resolveModel({ flag: flags.model, phase: "implement", config });
+  const model = resolved.model;
+  const modelChain = resolved.chain;
+
   const chainId = `chain-${Date.now().toString(36)}${crypto.randomBytes(2).toString("hex")}`;
   const chainDir = path.join(stateDir, "chains", chainId);
   fs.mkdirSync(chainDir, { recursive: true });
 
   const container = flags.container;
   if (!container) throw new Error("chain requires --container <cid>");
-  const model = flags.model;
-  if (!model) throw new Error("chain requires --model <provider/model>");
   const maxRounds = Number(flags["max-rounds"] ?? 3);
   const brief = text;
 
@@ -1142,7 +1295,7 @@ async function cmdChain(cwd, { flags, text }) {
       promptText: implementText,
       agent: "kusabi-implement",
       phase: "implement",
-      model: parseModel(model),
+      model,
       session: useNewSession ? undefined : session,
       timeoutS: 3600,
       watchdogS: 900,
@@ -1233,7 +1386,7 @@ async function cmdChain(cwd, { flags, text }) {
       kind: "review",
       title: "chain: " + chainId + " round " + round + " review",
       promptText: reviewPromptText,
-      model: parseModel(model),
+      model,
       agent: "kusabi-review",
       tools: Object.fromEntries(WRITE_TOOL_NAMES.map(function(t) { return [t, false]; })),
       timeoutS: 1800,
@@ -1299,6 +1452,7 @@ async function cmdChain(cwd, { flags, text }) {
       chainId: chainId,
       container: container,
       model: model,
+      modelChain: modelChain,
       maxRounds: maxRounds,
       brief: brief,
       records: records,
@@ -1370,6 +1524,7 @@ function usage() {
     "  --read-only, --resume-last, --wait, --background",
     "  --base <ref>, --model <provider/model>, --agent <id>, --phase <name>",
     "  --session <id>, --timeout <s>, --watchdog <s>, --deny <tools>",
+    "  --brief-file <path> (task / chain: read the brief from a file; exclusive with inline text)",
     "  --container <cid> (chain: container to run probes in)",
     "  --prior <text> (review: prior findings for anti-ratchet)",
     "  --max-rounds <N> (chain: max rounds, default 3)",

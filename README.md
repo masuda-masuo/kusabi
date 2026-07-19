@@ -55,9 +55,9 @@ Run `/kusabi:setup` or `kusabi-companion.mjs install-agents` to copy them to `OP
 
 | Command | What it does |
 | --- | --- |
-| `/kusabi:task <text>` | Delegate a task. Flags: `--model provider/model`, `--agent name`, `--phase <name>`, `--read-only`, `--resume-last`, `--session <id>`, `--wait`, `--background`, `--deny <tools>`, `--timeout <s>`, `--watchdog <s>` |
+| `/kusabi:task [--brief-file <path>]` | Delegate a task. Provide the brief inline or via `--brief-file <path>` (mutually exclusive). Flags: `--model provider/model`, `--agent name`, `--phase <name>`, `--read-only`, `--resume-last`, `--session <id>`, `--wait`, `--background`, `--deny <tools>`, `--timeout <s>`, `--watchdog <s>` |
 | `/kusabi:review` | Adversarial, read-only review of the working tree; `--base <ref>` for branch review; `--prior <text>` for anti-ratchet carry-over; extra text = review focus |
-| `/kusabi:chain` | **Auto chain** — run implement → review → rework until acceptance or escalate. Requires `--container <cid> --model <m>`. Optional: `--max-rounds <N>` (default 3), `--session` |
+| `/kusabi:chain [--brief-file <path>]` | **Auto chain** — run implement → review → rework until acceptance or escalate. Requires `--container <cid>`. Optional: `--model <provider/model>`, `--brief-file <path>`, `--max-rounds <N>` (default 3), `--session`. When `--model` is omitted the model is resolved from the config file or built-in default chain. |
 | `/kusabi:status [job-id]` | Compact job list, or progress detail for one job |
 | `/kusabi:result [job-id]` | Stored final output of a finished job |
 | `/kusabi:cancel [job-id]` | Abort a running job |
@@ -67,6 +67,36 @@ Run `/kusabi:setup` or `kusabi-companion.mjs install-agents` to copy them to `OP
 The `kusabi:opencode-worker` subagent forwards delegation requests to `task` so the main Claude thread never carries the work.
 
 Every result includes the opencode session ID; continue the same session in the opencode TUI with `opencode -s <session-id>`.
+
+## Model configuration
+
+By default, kusabi resolves the model to use through an ordered chain:
+`opencode/deepseek-v4-flash-free` → `opencode-go/deepseek-v4-flash` → `opencode-go/deepseek-v4-pro`.
+The first entry in the chain is used unless overridden.
+
+You can customise this with a config file at `<state root>/config.json`
+(typically `~/.kusabi/config.json`, or the directory pointed to by
+`KUSABI_STATE_DIR` or `OPENCODE_COMPANION_STATE_DIR`).
+
+```json
+{
+  "models": {
+    "chain": ["opencode/deepseek-v4-flash-free", "opencode-go/deepseek-v4-flash", "opencode-go/deepseek-v4-pro"],
+    "phases": { "implement": ["opencode-go/deepseek-v4-flash"] }
+  }
+}
+```
+
+Resolution precedence (highest to lowest):
+
+1. **Explicit `--model` flag** — always wins when provided.
+2. **Per-phase chain** — `models.phases.<phase>` first entry (e.g. a config with `"implement": ["m1"]` resolves to `m1` for implement-phase tasks).
+3. **Global chain** — `models.chain` first entry, or the built-in default chain when no config file exists.
+4. **Built-in default** — `opencode/deepseek-v4-flash-free` when no config file and no flag is set.
+
+Missing config file = silently uses the built-in defaults. A malformed config file (unparseable JSON or wrong shape) produces a fatal error naming the file path — kusabi does not silently fall back in that case.
+
+The full resolved chain is stored on every job record (`job.modelChain`) for use by future fallback logic (issue #50).
 
 ## Notes
 
