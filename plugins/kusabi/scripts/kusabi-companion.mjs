@@ -56,6 +56,58 @@ function stateDirFor(cwd) {
   return dir;
 }
 
+/**
+ * Scan all hash directories under the state root and reap idle serves whose
+ * last activity is older than *ttlMs*.  A serve is never touched when any of
+ * its jobs still has `status === "running"`.
+ *
+ * Best-effort: per-directory errors are caught and the function never throws.
+ */
+function reapIdleServes(root, ttlMs) {
+  if (!fs.existsSync(root)) return;
+  let entries;
+  try { entries = fs.readdirSync(root); } catch { return; }
+  for (const entry of entries) {
+    try {
+      const hashDir = path.join(root, entry);
+      if (!fs.statSync(hashDir).isDirectory()) continue;
+      const serverFile = path.join(hashDir, "server.json");
+      if (!fs.existsSync(serverFile)) continue;
+
+      const server = readJson(serverFile);
+      if (!server?.pid) continue;
+
+      // Pid alive?
+      try { process.kill(server.pid, 0); } catch { continue; }
+
+      // Collect job statuses + mtimes.
+      const jobRecords = [];
+      const jobsDir = path.join(hashDir, "jobs");
+      if (fs.existsSync(jobsDir)) {
+        const jobIds = fs.readdirSync(jobsDir);
+        for (const jobId of jobIds) {
+          const jobFile = path.join(jobsDir, jobId, "job.json");
+          if (!fs.existsSync(jobFile)) continue;
+          const job = readJson(jobFile);
+          if (!job) continue;
+          try {
+            jobRecords.push({ status: job.status, mtime: fs.statSync(jobFile).mtimeMs });
+          } catch { /* skip unreadable job */ }
+        }
+      }
+
+      const serverMtime = fs.statSync(serverFile).mtimeMs;
+      const now = Date.now();
+      const decision = shouldReapServer({ serverMtime, jobRecords, now, ttlMs });
+
+      if (decision.reap) {
+        try { process.kill(server.pid); } catch { /* already gone */ }
+        try { fs.unlinkSync(serverFile); } catch { /* best-effort */ }
+      }
+    } catch { /* best-effort per hash dir */ }
+  }
+}
+
 function opencodeBin() {
   return process.env.OPENCODE_BIN || "opencode";
 }
@@ -714,7 +766,7 @@ export function parseArgs(argv) {
       literal = true;
     } else if (
       arg === "--auto" || arg === "--read-only" || arg === "--resume-last" ||
-      arg === "--wait" || arg === "--background" || arg === "--help" || arg === "-h"
+      arg === "--wait" || arg === "--background" || arg === "--keep-serve" || arg === "--help" || arg === "-h"
     ) {
       const key = arg.startsWith("--")
         ? arg.slice(2).replace(/-([a-z])/g, (_, c) => c.toUpperCase())
@@ -949,6 +1001,37 @@ export function deriveDisposition({ verdict, probesGreen, round, maxRounds, repe
 }
 
 // ---------------------------------------------------------------------------
+// shouldReapServer — pure function: decide whether an idle serve should be
+// killed based on job statuses and last-activity timestamps.  Exported for
+// testing.
+// ---------------------------------------------------------------------------
+
+/**
+ * @param {object} opts
+ * @param {number} opts.serverMtime  — mtimeMs of server.json
+ * @param {Array<{status: string, mtime: number}>} opts.jobRecords
+ * @param {number} opts.now          — Date.now() at decision time
+ * @param {number} opts.ttlMs        — idle TTL in milliseconds
+ * @returns {{ reap: boolean, reason: string }}
+ */
+export function shouldReapServer({ serverMtime, jobRecords, now, ttlMs }) {
+  const hasRunning = jobRecords.some(function (j) { return j.status === "running"; });
+  if (hasRunning) return { reap: false, reason: "a running job exists" };
+
+  let maxJobMtime = 0;
+  for (let i = 0; i < jobRecords.length; i++) {
+    maxJobMtime = Math.max(maxJobMtime, jobRecords[i].mtime || 0);
+  }
+  const lastActivity = Math.max(serverMtime || 0, maxJobMtime);
+  const idleMs = now - lastActivity;
+
+  if (idleMs > ttlMs) {
+    return { reap: true, reason: "idle " + idleMs + "ms exceeds TTL " + ttlMs + "ms" };
+  }
+  return { reap: false, reason: "not yet stale (idle " + idleMs + "ms, TTL " + ttlMs + "ms)" };
+}
+
+// ---------------------------------------------------------------------------
 // subcommands
 // ---------------------------------------------------------------------------
 
@@ -1120,12 +1203,15 @@ async function cmdCancel(cwd, { text }) {
 
 function cmdServeStop(cwd) {
   const stateDir = stateDirFor(cwd);
-  const server = readJson(path.join(stateDir, "server.json"));
+  const serverFile = path.join(stateDir, "server.json");
+  const server = readJson(serverFile);
   if (!server?.pid) return "no server recorded for this directory.";
   try {
     process.kill(server.pid);
+    try { fs.unlinkSync(serverFile); } catch { /* best-effort */ }
     return `stopped opencode server (pid ${server.pid}).`;
   } catch {
+    try { fs.unlinkSync(serverFile); } catch { /* best-effort */ }
     return `server pid ${server.pid} was not running.`;
   }
 }
@@ -1213,8 +1299,9 @@ async function cmdChain(cwd, { flags, text }) {
   // ---- brief-file resolution ----
   text = readBriefFile(flags, text);
   if (!text) throw new Error("chain requires a brief description (inline or via --brief-file)");
-  const stateDir = stateDirFor(cwd);
-  const config = loadConfig(stateRoot());
+  try {
+    const stateDir = stateDirFor(cwd);
+    const config = loadConfig(stateRoot());
   const resolved = resolveModel({ flag: flags.model, phase: "implement", config });
   const model = resolved.model;
   const modelChain = resolved.chain;
@@ -1524,6 +1611,18 @@ async function cmdChain(cwd, { flags, text }) {
   }
   lines.push("", "Hand over to orchestrator for final judgement.");
   return lines.join("\n");
+  } finally {
+    // Stop the serve for this cwd unless --keep-serve or another job is running
+    if (!flags.keepServe) {
+      try {
+        const jobs = listJobs(stateDirFor(cwd));
+        const hasRunning = jobs.some(function (j) { return j.status === "running"; });
+        if (!hasRunning) {
+          cmdServeStop(cwd);
+        }
+      } catch { /* best-effort */ }
+    }
+  }
 }// ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
@@ -1540,7 +1639,7 @@ function usage() {
     "  status     List recent jobs or show one by ID",
     "  result     Show completed job result (latest, or by ID)",
     "  cancel     Cancel a running job",
-    "  serve-stop Stop the background opencode server",
+    "  serve-stop Stop the background opencode server and remove its state file",
     "  install-agents  Copy phase agent definitions to OPENCODE_AGENT_DIR",
     "  salvage    Salvage a dead job (inspect progress and produce structured report)",
     "  help       Show this help message",
@@ -1551,17 +1650,33 @@ function usage() {
     "  --session <id>, --timeout <s>, --watchdog <s>, --deny <tools>",
     "  --brief-file <path> (task / chain: read the brief from a file; exclusive with inline text)",
     "  --container <cid> (chain: container to run probes in)",
+    "  --keep-serve (chain: keep the serve alive after chain finishes)",
     "  --prior <text> (review: prior findings for anti-ratchet)",
     "  --max-rounds <N> (chain: max rounds, default 3)",
     "  -h, --help",
     "",
     "Unknown flags cause an error. Use -- to treat subsequent tokens as literal text.",
+    "",
+    "Serve lifecycle:",
+    "  - chain stops its serve on completion unless --keep-serve is passed.",
+    "  - serve-stop kills the serve and removes its server.json.",
+    "  - Idle serves without running jobs are reaped on next invocation after",
+    "    KUSABI_SERVE_TTL_MS (default 30 min).",
   ].join("\n");
 }
 
 async function main() {
   const [subcommand, ...argv] = process.argv.slice(2);
   const cwd = process.cwd();
+
+  // Startup reaper: reap idle serves whose last activity is older than TTL.
+  // Best-effort; a failure here must never crash the invoking command.
+  try {
+    const raw = process.env.KUSABI_SERVE_TTL_MS;
+    const ttlMs = parseFloat(raw);
+    const ttl = Number.isFinite(ttlMs) && ttlMs > 0 ? ttlMs : 30 * 60 * 1000;
+    reapIdleServes(stateRoot(), ttl);
+  } catch { /* best-effort */ }
 
   // Claude Code passes "$ARGUMENTS" as a single string; re-split it.
   const flat = argv.length === 1 && argv[0]?.includes(" ") ? argv[0].split(/\s+/).filter(Boolean) : argv;
