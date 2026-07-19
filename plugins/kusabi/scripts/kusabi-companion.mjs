@@ -247,6 +247,117 @@ export function decidePermission() {
   return "once";
 }
 
+/**
+ * Accumulate token usage from an array of SSE events.
+ *
+ * @param {Array<object>} events  Raw event objects (as yielded by the SSE stream).
+ * @returns {{ available: boolean, input?: number, output?: number, reasoning?: number,
+ *             cacheRead?: number, cacheWrite?: number, cost?: number, model?: string }}
+ *
+ * Per-message usage (`message.updated`) is summed for per-job accuracy even when
+ * a session is reused across jobs.  Falls back to session-level deltas when no
+ * per-message data exists.
+ */
+export function accumulateUsage(events) {
+  const messages = new Map(); // msg id → info (latest update per message)
+  let firstSession = null;
+  let lastSession = null;
+
+  for (const event of events) {
+    if (!event || !event.type) continue;
+    const props = event.properties || {};
+
+    if (event.type === "message.updated") {
+      const info = props.info;
+      if (info && info.id && info.tokens) {
+        messages.set(info.id, info);
+      }
+    } else if (event.type === "session.updated") {
+      const info = props.info;
+      if (info && info.tokens) {
+        if (!firstSession) firstSession = info;
+        lastSession = info;
+      }
+    }
+  }
+
+  // No usage data observed at all.
+  if (messages.size === 0 && !firstSession) {
+    return { available: false };
+  }
+
+  // Prefer per-message aggregation (accurate per-job when session is reused).
+  if (messages.size > 0) {
+    let input = 0;
+    let output = 0;
+    let reasoning = 0;
+    let cacheRead = 0;
+    let cacheWrite = 0;
+    let cost = 0;
+    let model = null;
+
+    for (const info of messages.values()) {
+      const t = info.tokens || {};
+      input += t.input || 0;
+      output += t.output || 0;
+      reasoning += t.reasoning || 0;
+      if (t.cache) {
+        cacheRead += t.cache.read || 0;
+        cacheWrite += t.cache.write || 0;
+      }
+      cost += info.cost || 0;
+      if (!model && info.modelID && info.providerID) {
+        model = `${info.providerID}/${info.modelID}`;
+      }
+    }
+
+    return {
+      available: true,
+      input,
+      output,
+      reasoning,
+      cacheRead,
+      cacheWrite,
+      cost,
+      model,
+    };
+  }
+
+  // Fallback: session-level delta (less accurate when session was reused).
+  if (firstSession && lastSession && firstSession !== lastSession) {
+    const firstT = firstSession.tokens || {};
+    const lastT = lastSession.tokens || {};
+    const input = (lastT.input || 0) - (firstT.input || 0);
+    const output = (lastT.output || 0) - (firstT.output || 0);
+    const reasoning = (lastT.reasoning || 0) - (firstT.reasoning || 0);
+    let cacheRead = 0;
+    let cacheWrite = 0;
+    if (lastT.cache && firstT.cache) {
+      cacheRead = (lastT.cache.read || 0) - (firstT.cache.read || 0);
+      cacheWrite = (lastT.cache.write || 0) - (firstT.cache.write || 0);
+    }
+    const cost = (lastSession.cost || 0) - (firstSession.cost || 0);
+    let model = null;
+    if (lastSession.model) {
+      model = `${lastSession.model.providerID}/${lastSession.model.id}`;
+    }
+
+    return {
+      available: true,
+      input,
+      output,
+      reasoning,
+      cacheRead,
+      cacheWrite,
+      cost,
+      model,
+    };
+  }
+
+  // Single session.updated with no messages — cannot compute delta.
+  return { available: false };
+}
+
 // ---------------------------------------------------------------------------
 // prompt execution
 // ---------------------------------------------------------------------------
@@ -339,6 +450,9 @@ async function runPrompt({ cwd, kind, title, promptText, agent, model, session, 
     }, 10000);
   }
 
+  // Collect usage-related events for accumulateUsage.
+  const usageEvents = [];
+
   // Connect SSE before sending the prompt so a fast-finishing session's
   // `session.idle` cannot slip past between POST and subscription.
   let markConnected;
@@ -361,6 +475,11 @@ async function runPrompt({ cwd, kind, title, promptText, agent, model, session, 
           job.stats.lastActivity = new Date().toISOString();
           const type = String(event?.type ?? "");
           appendEvent(stateDir, job.id, event);
+
+          // Harvest usage-relevant events for post-job accumulation.
+          if (type === "message.updated" || type === "session.updated") {
+            usageEvents.push(event);
+          }
 
           if (type.startsWith("permission.") && type.endsWith("asked")) {
             const { id, label } = permissionInfo(event);
@@ -444,6 +563,15 @@ async function runPrompt({ cwd, kind, title, promptText, agent, model, session, 
   }
   job.finishedAt = new Date().toISOString();
 
+  // ---- accumulate and persist usage ----
+  const usage = {
+    ...accumulateUsage(usageEvents),
+    phase: job.phase || null,
+    durationSeconds: durationS(job),
+  };
+  job.usage = usage;
+  writeJson(path.join(jobDir(stateDir, job.id), "usage.json"), usage);
+
   let resultText = "";
   if (job.status === "completed") {
     resultText = await fetchFinalMessage(server, sessionID).catch(() => "");
@@ -464,11 +592,19 @@ function durationS(job) {
 }
 
 function renderHeader(job) {
+  const usageLine = (() => {
+    const u = job.usage;
+    if (!u || !u.available) return [];
+    const parts = [`${u.input} in / ${u.output} out`];
+    if (u.reasoning) parts.push(`${u.reasoning} reasoning`);
+    return [`tokens: ${parts.join(", ")}`];
+  })();
   return [
     `opencode ${job.kind} ${job.id} — ${job.status} (${durationS(job)}s)`,
     `session: ${job.sessionID} (continue in opencode: \`opencode -s ${job.sessionID}\`)`,
     ...(job.phase ? [`phase: ${job.phase}`] : []),
     ...(job.stats?.models?.length ? [`model: ${job.stats.models.join(" → ")}`] : []),
+    ...usageLine,
     "",
   ].join("\n");
 }
@@ -1013,6 +1149,7 @@ async function cmdChain(cwd, { flags, text }) {
     });
     roundRecord.implementJobId = implementJob.job.id;
     roundRecord.sessionID = implementJob.job.sessionID;
+    roundRecord.implementUsage = implementJob.job.usage || null;
 
     // ---- deterministic probes (via sunaba-rpc) ----
     let probesGreen = false;
@@ -1103,6 +1240,7 @@ async function cmdChain(cwd, { flags, text }) {
       watchdogS: 900,
     });
     roundRecord.reviewJobId = reviewJob.job.id;
+    roundRecord.reviewUsage = reviewJob.job.usage || null;
 
     // ---- parse review result ----
     const reviewResultText = reviewJob.resultText || "";
@@ -1141,7 +1279,32 @@ async function cmdChain(cwd, { flags, text }) {
     // ---- persist record ----
     records.push(roundRecord);
     writeJson(path.join(chainDir, "round-" + round + ".json"), roundRecord);
-    writeJson(path.join(chainDir, "chain.json"), { chainId: chainId, container: container, model: model, maxRounds: maxRounds, brief: brief, records: records, baseSha: baseSha, chainBaseCreated: chainBaseCreated });
+
+    // Compute chain-wide usage totals from all round records.
+    const chainTotals = { input: 0, output: 0, reasoning: 0, cacheRead: 0, cacheWrite: 0, cost: 0 };
+    for (const rec of records) {
+      for (const usage of [rec.implementUsage, rec.reviewUsage]) {
+        if (usage && usage.available) {
+          chainTotals.input += usage.input || 0;
+          chainTotals.output += usage.output || 0;
+          chainTotals.reasoning += usage.reasoning || 0;
+          chainTotals.cacheRead += usage.cacheRead || 0;
+          chainTotals.cacheWrite += usage.cacheWrite || 0;
+          chainTotals.cost += usage.cost || 0;
+        }
+      }
+    }
+
+    writeJson(path.join(chainDir, "chain.json"), {
+      chainId: chainId,
+      container: container,
+      model: model,
+      maxRounds: maxRounds,
+      brief: brief,
+      records: records,
+      baseSha: baseSha,
+      chainTotals: chainTotals,
+    });
 
     if (disposition.disposition === "accept") {
       return "Chain " + chainId + " accepted at round " + round + ".\n\n" + renderReview(parsedReview, reviewResultText);
