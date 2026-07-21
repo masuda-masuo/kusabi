@@ -1,7 +1,7 @@
 # kusabi Design Document
 
-Last updated: 2026-07-19
-Status: Design finalized + field-verified up to the phase chain, auto-chain (chain subcommand + sunaba-rpc) **implemented / reflected in main**. Stages B/C/D are planned (see #36).
+Last updated: 2026-07-22
+Status: Design finalized + field-verified up to the phase chain, auto-chain (chain subcommand + sunaba-rpc) **implemented / reflected in main**. Decision 5 (accept-with-followup, §9.2) **implemented**. Decision 4 (strategist) + Stages C/D are planned (see #36).
 
 ## 1. Purpose and positioning
 
@@ -132,17 +132,23 @@ Verdict: 4-value + optional `unverified`:
 
 #### 3.5.4 Derive disposition (deriveDisposition)
 
-Pure function `deriveDisposition({verdict, probesGreen, round, maxRounds, repeatedAreas})` in `plugins/kusabi/scripts/kusabi-companion.mjs`:
+Pure function `deriveDisposition({verdict, probesGreen, round, maxRounds, repeatedAreas, findingSeverities})` in `plugins/kusabi/scripts/kusabi-companion.mjs`:
 
 | verdict | probesGreen | Condition | disposition | Meaning |
-|---|---|---|---|---|
+|---|---|---|---|---|---|
 | approve | true | — | **accept** | Conclude, hand to orchestrator |
 | approve | false | — | rework | Probe failure |
 | approve-partial | — | — | **escalate** | Unverified items remain, orchestrator decides |
+| needs-attention | true | all findings low/medium (no critical/high) | **accept-with-followup** | Economic cutoff: see Decision 5 (§9.2) |
 | needs-attention | — | repeatedAreas=false | rework | Fix and re-review |
 | needs-attention | — | repeatedAreas=true | **escalate** | Same file area flagged 2 rounds in a row = stalled |
 | discard | — | — | **escalate** | Reviewer deemed it discardable |
 | — | — | round ≥ maxRounds and not accepted | **escalate** | Max rounds reached |
+
+accept-with-followup misuse guards:
+- Severity comes from the reviewer's separate session (not the implementer)
+- probesGreen must be true (mechanical checks passed)
+- The follow-up draft always surfaces to the orchestrator (never posted automatically)
 
 A strategist stage (§9.1) may be inserted between rework → escalate (Stage B, not implemented).
 
@@ -244,18 +250,24 @@ Add `strategize` to `deriveDisposition`: when repeatedAreas is detected, allow o
 
 Reference: issue #36 comment "Decision 4: add strategist stage as an intermediate form of escalate in Stage B"
 
-### 9.2 Decision 5: accept-with-followup (economic cutoff) — Stage B (planned)
+### 9.2 Decision 5: accept-with-followup (economic cutoff) — **implemented**
 
-Add `accept-with-followup` to `deriveDisposition`. Conditions:
+Implemented in `plugins/kusabi/scripts/kusabi-companion.mjs`:
+
+- `deriveDisposition` accepts an optional `findingSeverities` array. When `probesGreen=true`, `verdict="needs-attention"`, and every element of `findingSeverities` is `"low"` or `"medium"`, returns `{ disposition: "accept-with-followup", reason: "probes green; remaining findings all minor" }`.
+- `renderFollowupDraft` is an exported pure function that builds a markdown draft from chainId, briefTitle, and findings.
+- On `accept-with-followup`, the chain stores the draft on `chain.json` (and the round record), ends successfully, and includes the draft under the heading `## Follow-up issue draft (not posted — orchestrator judgement required)`.
+- `chain-show` displays the draft when present, verbatim, with no truncation of findings.
+- The companion never posts the draft (no `issue_write` call site added).
+
+Conditions:
 - All probes green
-- AND verdict is approve, or needs-attention but remaining findings are all minor (severity low/medium) AND none touch any acceptance criterion
-
-→ Conclude by dropping remaining findings into a `followup_issue_draft` (title + body: completed scope and verification results / remaining work / known findings / reference to original issue).
+- Verdict is needs-attention AND all findings are low/medium (no critical/high)
 
 Anti-abuse guards:
-1. severity is the output of the reviewer (separate session from the implementer). The implementer cannot self-declare
+1. Severity comes from the reviewer's separate session (not the implementer). The implementer cannot self-declare
 2. Application requires **all probes green as a precondition** (severity classification is irrelevant as long as mechanical checks are not passed)
-3. Carried-over findings **always reach the orchestrator's eyes** (content is seen during final inspection before publish)
+3. Carried-over findings **always reach the orchestrator's eyes** (draft is included in the chain output and `chain-show`, never posted automatically)
 
 Reference: issue #36 comment "Decision 5: accept-with-followup (economic cutoff rule)"
 
@@ -264,7 +276,7 @@ Reference: issue #36 comment "Decision 5: accept-with-followup (economic cutoff 
 | Stage | Content | Prerequisite |
 |---|---|---|
 | **B** | Brief-declaration probes: `kind: refactor` / `baseline_collected: N` format. Migration byte identity (P5) | Stage A stable operation |
-| **B** | Implement Decision 4 (strategist stage) and Decision 5 (accept-with-followup) | Stage A |
+| **B** | Implement Decision 5 (accept-with-followup) — **done**. Decision 4 (strategist stage) remains future work | Stage A |
 | **C** | Patch-target audit (future, unnumbered): mechanically classify patch/monkeypatch.setattr targets via AST. Use only for mock-target determination; exclude system-under-test tests | Stage B |
 | **D** | Connect discard path to #33 (best-of-N) | Stage C, awaiting real-world experience |
 

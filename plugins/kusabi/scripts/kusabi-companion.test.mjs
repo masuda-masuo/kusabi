@@ -33,6 +33,7 @@ import {
   implementDenyTools,
   reviewDenyTools,
   renderBaseFacts,
+  renderFollowupDraft,
 } from "./kusabi-companion.mjs";
 
 // ---------------------------------------------------------------------------
@@ -439,6 +440,111 @@ describe("deriveDisposition", () => {
     assert.equal(result.disposition, "escalate");
     assert.match(result.reason, /unexpected verdict/);
   });
+
+  it("accept-with-followup: needs-attention + probesGreen + all-minor severities", () => {
+    const result = deriveDisposition({ verdict: "needs-attention", probesGreen: true, round: 1, maxRounds: 3, repeatedAreas: false, findingSeverities: ["low", "medium", "low"] });
+    assert.deepEqual(result, { disposition: "accept-with-followup", reason: "probes green; remaining findings all minor" });
+  });
+
+  it("accept-with-followup on final round: needs-attention + probesGreen + all-minor → accept-with-followup, not escalate", () => {
+    const result = deriveDisposition({ verdict: "needs-attention", probesGreen: true, round: 3, maxRounds: 3, repeatedAreas: false, findingSeverities: ["low"] });
+    assert.deepEqual(result, { disposition: "accept-with-followup", reason: "probes green; remaining findings all minor" });
+  });
+
+  it("rework (unchanged): one high among lows → not eligible for accept-with-followup", () => {
+    const result = deriveDisposition({ verdict: "needs-attention", probesGreen: true, round: 1, maxRounds: 3, repeatedAreas: false, findingSeverities: ["low", "high", "low"] });
+    assert.deepEqual(result, { disposition: "rework", reason: "needs-attention" });
+  });
+
+  it("rework (unchanged): probes red + minors → not eligible for accept-with-followup", () => {
+    const result = deriveDisposition({ verdict: "needs-attention", probesGreen: false, round: 1, maxRounds: 3, repeatedAreas: false, findingSeverities: ["low", "medium"] });
+    assert.deepEqual(result, { disposition: "rework", reason: "needs-attention" });
+  });
+
+  it("escalate (unchanged): approve-partial + minors → not eligible for accept-with-followup", () => {
+    const result = deriveDisposition({ verdict: "approve-partial", probesGreen: true, round: 1, maxRounds: 3, repeatedAreas: false, findingSeverities: ["low", "low"] });
+    assert.deepEqual(result, { disposition: "escalate", reason: "approve-partial: unverified items remain" });
+  });
+
+  it("today's behavior: undefined findingSeverities", () => {
+    const result = deriveDisposition({ verdict: "needs-attention", probesGreen: true, round: 1, maxRounds: 3, repeatedAreas: false });
+    assert.deepEqual(result, { disposition: "rework", reason: "needs-attention" });
+  });
+
+  it("today's behavior: empty findingSeverities array", () => {
+    const result = deriveDisposition({ verdict: "needs-attention", probesGreen: true, round: 1, maxRounds: 3, repeatedAreas: false, findingSeverities: [] });
+    assert.deepEqual(result, { disposition: "rework", reason: "needs-attention" });
+  });
+
+  it("rework (unchanged): critical severity among lows", () => {
+    const result = deriveDisposition({ verdict: "needs-attention", probesGreen: true, round: 1, maxRounds: 3, repeatedAreas: false, findingSeverities: ["critical", "low"] });
+    assert.deepEqual(result, { disposition: "rework", reason: "needs-attention" });
+  });
+
+  it("rework (unchanged): unknown severity string", () => {
+    const result = deriveDisposition({ verdict: "needs-attention", probesGreen: true, round: 1, maxRounds: 3, repeatedAreas: false, findingSeverities: ["low", "info", "low"] });
+    assert.deepEqual(result, { disposition: "rework", reason: "needs-attention" });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// renderFollowupDraft — Decision 5 follow-up issue draft
+// ---------------------------------------------------------------------------
+
+describe("renderFollowupDraft", () => {
+  it("renders a follow-up draft with chain id, brief title, and findings", () => {
+    const findings = [
+      { severity: "low", title: "Minor style issue", file: "src/foo.js", line_start: 10 },
+      { severity: "medium", title: "Unused variable", file: "src/bar.js", line_start: 42 },
+    ];
+    const result = renderFollowupDraft({
+      chainId: "chain-abc123",
+      briefTitle: "Implement feature X",
+      findings: findings,
+    });
+    assert.match(result, /Follow-up issue draft/);
+    assert.match(result, /not posted.*orchestrator judgement required/);
+    assert.match(result, /Chain: chain-abc123/);
+    assert.match(result, /Brief: Implement feature X/);
+    assert.match(result, /\[low\] Minor style issue \(src\/foo\.js:10\)/);
+    assert.match(result, /\[medium\] Unused variable \(src\/bar\.js:42\)/);
+    assert.match(result, /economic cutoff/);
+    assert.match(result, /orchestrator should review/);
+  });
+
+  it("graceful with missing fields (never throws)", () => {
+    const result = renderFollowupDraft({});
+    assert.match(result, /Follow-up issue draft/);
+    assert.match(result, /Chain: \(unknown\)/);
+    assert.match(result, /\(none\)/);
+  });
+
+  it("graceful with no arguments (never throws)", () => {
+    const result = renderFollowupDraft();
+    assert.match(result, /Follow-up issue draft/);
+    assert.match(result, /Chain: \(unknown\)/);
+  });
+
+  it("renders findings verbatim with severity, title, file, line_start", () => {
+    const findings = [
+      { severity: "low", title: "Typo in comment", file: "src/utils.js", line_start: 15 },
+    ];
+    const result = renderFollowupDraft({ findings: findings });
+    assert.ok(result.includes("[low] Typo in comment (src/utils.js:15)"));
+  });
+
+  it("handles missing severity, title, file, line_start gracefully", () => {
+    const findings = [
+      { severity: undefined, title: undefined, file: undefined, line_start: undefined },
+    ];
+    const result = renderFollowupDraft({ findings: findings });
+    assert.ok(result.includes("[unknown] (untitled) (unknown:?)"));
+  });
+
+  it("shows (none) for empty findings array", () => {
+    const result = renderFollowupDraft({ findings: [] });
+    assert.ok(result.includes("(none)"));
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -675,6 +781,42 @@ describe("renderChainShow", () => {
     const result = renderChainShow(chain, undefined);
     assert.match(result, /chain: chain-undefinedrounds/);
     assert.match(result, /status: incomplete/);
+  });
+
+  it("renders follow-up issue draft when present on chain", () => {
+    const chain = {
+      chainId: "chain-followup",
+      followupIssueDraft: "## Follow-up issue draft (not posted — orchestrator judgement required)\n\n### Completed scope\n\n- Chain: chain-followup\n- Brief: fix thing\n\n### Remaining findings\n\n- [low] Minor style (src/foo.js:10)\n\nThese findings were deferred by the accept-with-followup economic cutoff.",
+    };
+    const rounds = [
+      {
+        round: 1,
+        verdict: "needs-attention",
+        disposition: { disposition: "accept-with-followup", reason: "probes green; remaining findings all minor" },
+        resumeMethod: { type: "continue_session" },
+        findingsText: "[low] Minor style (src/foo.js:10)",
+      },
+    ];
+    const result = renderChainShow(chain, rounds);
+    assert.match(result, /status: accepted-with-followup/);
+    assert.match(result, /Follow-up issue draft:/);
+    assert.ok(result.includes("[low] Minor style (src/foo.js:10)"));
+    assert.ok(result.includes("Follow-up issue draft (not posted"));
+    assert.ok(result.includes("orchestrator judgement required"));
+  });
+
+  it("renders accept-with-followup status when disposition is accept-with-followup", () => {
+    const chain = { chainId: "chain-awf" };
+    const rounds = [
+      {
+        round: 1,
+        verdict: "needs-attention",
+        disposition: { disposition: "accept-with-followup", reason: "probes green; remaining findings all minor" },
+        resumeMethod: { type: "continue_session" },
+      },
+    ];
+    const result = renderChainShow(chain, rounds);
+    assert.match(result, /status: accepted-with-followup at round 1/);
   });
 });
 

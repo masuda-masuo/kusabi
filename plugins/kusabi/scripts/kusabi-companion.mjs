@@ -794,6 +794,8 @@ export function renderChainShow(chain, rounds, unreadable = []) {
   const lastRound = safeRounds.length > 0 ? safeRounds[safeRounds.length - 1] : null;
   if (lastRound?.disposition?.disposition === "accept") {
     lines.push(`status: accepted at round ${lastRound.round}`);
+  } else if (lastRound?.disposition?.disposition === "accept-with-followup") {
+    lines.push(`status: accepted-with-followup at round ${lastRound.round} (${lastRound.disposition.reason || "economic cutoff"})`);
   } else if (lastRound?.disposition?.disposition === "escalate") {
     lines.push(`status: escalated at round ${lastRound.round} (${lastRound.disposition.reason || "unknown"})`);
   } else {
@@ -923,6 +925,19 @@ export function renderChainShow(chain, rounds, unreadable = []) {
     }
     if (t.cost !== undefined) parts.push(`cost=$${t.cost}`);
     lines.push(parts.join(", "));
+  }
+
+  // Follow-up issue draft (Decision 5 accept-with-followup)
+  if (chain?.followupIssueDraft) {
+    lines.push("");
+    lines.push("---");
+    lines.push("");
+    lines.push("Follow-up issue draft:");
+    // Split on lines and include each verbatim, preserving the markdown structure
+    var draftLines = chain.followupIssueDraft.split("\n");
+    for (var dl = 0; dl < draftLines.length; dl++) {
+      lines.push(draftLines[dl]);
+    }
   }
 
   return lines.join("\n");
@@ -1450,9 +1465,16 @@ export function checkSmokeProbe(entries, observed) {
  * @param {number}  opts.round        — 1-based current round number
  * @param {number}  opts.maxRounds
  * @param {boolean} opts.repeatedAreas — same file area flagged 2+ rounds
- * @returns {{ disposition: "accept"|"rework"|"escalate", reason?: string }}
+ * @param {string[]} [opts.findingSeverities] — severity strings from the round's review findings
+ * @returns {{ disposition: "accept"|"accept-with-followup"|"rework"|"escalate", reason?: string }}
  */
-export function deriveDisposition({ verdict, probesGreen, round, maxRounds, repeatedAreas }) {
+export function deriveDisposition({ verdict, probesGreen, round, maxRounds, repeatedAreas, findingSeverities }) {
+  // Decision 5: accept-with-followup (economic cutoff)
+  // Checked BEFORE max-rounds escalate so it takes precedence for the needs-attention case.
+  if (probesGreen && verdict === "needs-attention" && Array.isArray(findingSeverities) && findingSeverities.length > 0 && findingSeverities.every(function (s) { return s === "low" || s === "medium"; })) {
+    return { disposition: "accept-with-followup", reason: "probes green; remaining findings all minor" };
+  }
+
   // Hard limit: max rounds reached without acceptance → escalate
   if (round >= maxRounds && verdict !== "approve") {
     return { disposition: "escalate", reason: `max rounds (${maxRounds}) reached without acceptance` };
@@ -1500,6 +1522,50 @@ export function deriveDisposition({ verdict, probesGreen, round, maxRounds, repe
   }
 
   return { disposition, reason };
+}
+
+// ---------------------------------------------------------------------------
+// renderFollowupDraft — pure function: build a follow-up issue draft for the
+// accept-with-followup economic cutoff (Decision 5).  Never throws.
+// Exported for testing.
+// ---------------------------------------------------------------------------
+
+/**
+ * @param {object} opts
+ * @param {string}  [opts.chainId]
+ * @param {string}  [opts.briefTitle]  — first line of the brief
+ * @param {Array<{severity?: string, title?: string, file?: string, line_start?: number}>} [opts.findings]
+ * @param {string}  [opts.roundsSummary]
+ * @returns {string} Markdown text (a draft, never posted by the companion)
+ */
+export function renderFollowupDraft({ chainId, briefTitle, findings, roundsSummary } = {}) {
+  const lines = [];
+  lines.push("## Follow-up issue draft (not posted — orchestrator judgement required)");
+  lines.push("");
+  lines.push("### Completed scope");
+  lines.push("");
+  lines.push("- Chain: " + (chainId || "(unknown)"));
+  if (briefTitle) {
+    lines.push("- Brief: " + briefTitle);
+  }
+  lines.push("");
+  lines.push("### Remaining findings");
+  lines.push("");
+  if (Array.isArray(findings) && findings.length > 0) {
+    for (var i = 0; i < findings.length; i++) {
+      var f = findings[i];
+      var severity = f.severity || "unknown";
+      var title = f.title || "(untitled)";
+      var file = f.file || "unknown";
+      var lineStart = f.line_start !== undefined && f.line_start !== null ? f.line_start : "?";
+      lines.push("- [" + severity + "] " + title + " (" + file + ":" + lineStart + ")");
+    }
+  } else {
+    lines.push("(none)");
+  }
+  lines.push("");
+  lines.push("These findings were deferred by the accept-with-followup economic cutoff. The orchestrator should review and decide whether to handle them.");
+  return lines.join("\n");
 }
 
 // ---------------------------------------------------------------------------
@@ -2467,12 +2533,18 @@ async function cmdChain(cwd, { flags, text }) {
     }
 
     // ---- derive disposition ----
+    // Collect finding severities for the accept-with-followup check
+    var chainFindingSeverities = chainParsedReview?.findings
+      ? chainParsedReview.findings.map(function (f) { return f.severity; })
+      : undefined;
+
     const disposition = deriveDisposition({
       verdict: chainVerdict || "needs-attention",
       probesGreen: probesGreen,
       round: round,
       maxRounds: maxRounds,
       repeatedAreas: chainRepeatedAreas,
+      findingSeverities: chainFindingSeverities,
     });
     roundRecord.disposition = disposition;
 
@@ -2500,6 +2572,17 @@ async function cmdChain(cwd, { flags, text }) {
       roundRecord.findingsText = "(no review — change set was empty)";
     }
 
+    var chainFollowupDraft = null;
+    if (disposition.disposition === "accept-with-followup" && chainParsedReview?.findings) {
+      var briefTitle = brief ? brief.split("\n")[0].trim() : "";
+      chainFollowupDraft = renderFollowupDraft({
+        chainId: chainId,
+        briefTitle: briefTitle,
+        findings: chainParsedReview.findings,
+      });
+      roundRecord.followupIssueDraft = chainFollowupDraft;
+    }
+
     writeJson(path.join(chainDir, "chain.json"), {
       chainId: chainId,
       container: container,
@@ -2511,6 +2594,7 @@ async function cmdChain(cwd, { flags, text }) {
       records: records,
       baseSha: baseSha,
       chainTotals: chainTotals,
+      followupIssueDraft: chainFollowupDraft,
     });
 
     if (disposition.disposition === "accept") {
@@ -2518,6 +2602,19 @@ async function cmdChain(cwd, { flags, text }) {
         ? renderReview(chainParsedReview, chainFindingsText || "")
         : "(no review text available)";
       return "Chain " + chainId + " accepted at round " + round + ".\n\n" + acceptReviewText;
+    }
+
+    if (disposition.disposition === "accept-with-followup") {
+      var awfBriefTitle = brief ? brief.split("\n")[0].trim() : "";
+      var awfDraft = chainFollowupDraft || renderFollowupDraft({
+        chainId: chainId,
+        briefTitle: awfBriefTitle,
+        findings: chainParsedReview?.findings || [],
+      });
+      var awfReviewText = chainParsedReview
+        ? renderReview(chainParsedReview, chainFindingsText || "")
+        : "(no review text available)";
+      return "Chain " + chainId + " accepted-with-followup at round " + round + ".\n\n" + awfReviewText + "\n\n" + awfDraft;
     }
 
     if (disposition.disposition === "escalate") {
