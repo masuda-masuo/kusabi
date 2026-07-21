@@ -38,7 +38,7 @@ Claude Code (orchestrator)
 
 ## 3. Phase chain (core of this design)
 
-Long sessions cause context pollution, so work is split into 5 phases, with **each phase = a new opencode session**. Cross-phase session reuse is prohibited (`--resume-last` / `--session` are for follow-ups within the same phase only).
+Long sessions cause context pollution, so work is split into phases, with **each phase = a new opencode session**. Cross-phase session reuse is prohibited (`--resume-last` / `--session` are for follow-ups within the same phase only).
 
 ### 3.1 Phase and tool matrix
 
@@ -49,6 +49,9 @@ Long sessions cause context pollution, so work is split into 5 phases, with **ea
 | implement | Implementation + verify based on brief | ✕ | ○ | ✕ |
 | review | Adversarial review of PR | ○ | ✕ | ○ |
 | respond | Address review findings | ✕ | ○ | ✕ |
+| gofer | Evidence-gathering errands (#64) — run, observe, quote verbatim; no judgments, no issue writes | ✕ | ✕ | ✕ |
+
+The gofer phase (`kusabi-gofer`, added in #64) is a cheap evidence-collector: it runs commands via `sunaba_sandbox_exec`, reads files/logs, and reports verbatim excerpts with provenance. Unlike investigate, gofer never posts to issues and never forms judgments — its contract is raw evidence returned in the final report. Write tools, host bash, and shiori are denied; `sunaba_sandbox_exec`, verify/lint/type tools, and sunaba read tools are explicitly allowed. The chain does not use gofer; it is for `task --phase gofer` invocations.
 
 Design principles:
 

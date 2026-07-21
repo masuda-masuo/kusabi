@@ -14,6 +14,7 @@ import {
   parseArgs,
   parseModel,
   parseOrchestratorSignature,
+  PHASE_AGENTS,
   stateRoot,
   deriveDisposition,
   loadConfig,
@@ -2875,5 +2876,36 @@ describe("implementDenyTools", () => {
     const b = implementDenyTools();
     assert.notEqual(a, b);
     assert.deepEqual(a, b);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// PHASE_AGENTS — maps phase names to agent definition filenames
+// ---------------------------------------------------------------------------
+
+describe("PHASE_AGENTS", () => {
+  it("contains 7 entries", () => {
+    assert.equal(Object.keys(PHASE_AGENTS).length, 7);
+  });
+
+  it("maps gofer to kusabi-gofer", () => {
+    assert.equal(PHASE_AGENTS.gofer, "kusabi-gofer");
+  });
+
+  it("maps all known phases", () => {
+    assert.equal(PHASE_AGENTS.draft, "kusabi-draft");
+    assert.equal(PHASE_AGENTS.investigate, "kusabi-investigate");
+    assert.equal(PHASE_AGENTS.implement, "kusabi-implement");
+    assert.equal(PHASE_AGENTS.review, "kusabi-review");
+    assert.equal(PHASE_AGENTS.respond, "kusabi-respond");
+    assert.equal(PHASE_AGENTS.salvage, "kusabi-salvage");
+  });
+
+  it("every phase value ends with a .md file in opencode-agents directory", () => {
+    const agentsDir = path.resolve(import.meta.dirname, "..", "opencode-agents");
+    for (const [phase, agentName] of Object.entries(PHASE_AGENTS)) {
+      const filePath = path.join(agentsDir, `${agentName}.md`);
+      assert.ok(fs.existsSync(filePath), `agent file missing: ${filePath}`);
+    }
   });
 });
