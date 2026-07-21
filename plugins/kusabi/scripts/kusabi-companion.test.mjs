@@ -16,6 +16,10 @@ import {
   resolveModel,
   readBriefFile,
   shouldReapServer,
+  cwdSlug,
+  findTranscriptFile,
+  extractAssistantText,
+  resolveExplainPassage,
 } from "./kusabi-companion.mjs";
 
 // ---------------------------------------------------------------------------
@@ -203,6 +207,37 @@ describe("parseArgs", () => {
   it("treats -h as a boolean flag", () => {
     const result = parseArgs(["-h"]);
     assert.equal(result.flags.h, true);
+  });
+
+  it("parses --tools as a boolean flag", () => {
+    const result = parseArgs(["--tools"]);
+    assert.equal(result.flags.tools, true);
+  });
+
+  it("parses --last as a value flag", () => {
+    const result = parseArgs(["--last", "3"]);
+    assert.equal(result.flags.last, "3");
+  });
+
+  it("parses --quote as a value flag", () => {
+    const result = parseArgs(["--quote", "some passage text"]);
+    assert.equal(result.flags.quote, "some passage text");
+  });
+
+  it("combines --last, --tools, --quote with rest text", () => {
+    const result = parseArgs(["--last", "2", "--tools", "--quote", "the passage", "--", "the question"]);
+    assert.equal(result.flags.last, "2");
+    assert.equal(result.flags.tools, true);
+    assert.equal(result.flags.quote, "the passage");
+    assert.equal(result.text, "the question");
+  });
+
+  it("throws when --last is missing its value", () => {
+    assert.throws(() => parseArgs(["--last"]), /--last requires a value/);
+  });
+
+  it("throws when --quote is missing its value", () => {
+    assert.throws(() => parseArgs(["--quote"]), /--quote requires a value/);
   });
 });
 
@@ -1405,5 +1440,447 @@ describe("shouldReapServer", () => {
     ];
     const result = shouldReapServer({ serverMtime, jobRecords, now, ttlMs: TTL });
     assert.equal(result.reap, true);
+  });
+});
+
+
+// ---------------------------------------------------------------------------
+// cwdSlug — path-to-slug conversion
+// ---------------------------------------------------------------------------
+
+describe("cwdSlug", () => {
+  it("replaces / and . with -", () => {
+    assert.equal(cwdSlug("/home/u/dev/x"), "-home-u-dev-x");
+  });
+
+  it("handles a path with dots", () => {
+    assert.equal(cwdSlug("/home/u/dev/my.project"), "-home-u-dev-my-project");
+  });
+
+  it("handles root path", () => {
+    assert.equal(cwdSlug("/"), "-");
+  });
+
+  it("handles empty string", () => {
+    assert.equal(cwdSlug(""), "");
+  });
+
+  it("handles path with trailing slash", () => {
+    assert.equal(cwdSlug("/home/user/"), "-home-user-");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// findTranscriptFile — newest *.jsonl in the slug dir
+// ---------------------------------------------------------------------------
+
+describe("findTranscriptFile", () => {
+  let tmpDir;
+
+  beforeEach(() => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-test-transcript-"));
+  });
+
+  afterEach(() => {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it("returns null when the slug dir does not exist", () => {
+    const result = findTranscriptFile({ baseDir: tmpDir, cwdSlug: "nonexistent-slug" });
+    assert.equal(result, null);
+  });
+
+  it("returns null when the slug dir has no .jsonl files", () => {
+    const slugDir = path.join(tmpDir, "-home-test");
+    fs.mkdirSync(slugDir, { recursive: true });
+    fs.writeFileSync(path.join(slugDir, "foo.txt"), "not a transcript", "utf8");
+    const result = findTranscriptFile({ baseDir: tmpDir, cwdSlug: "-home-test" });
+    assert.equal(result, null);
+  });
+
+  it("returns the only .jsonl file", () => {
+    const slugDir = path.join(tmpDir, "-home-test");
+    fs.mkdirSync(slugDir, { recursive: true });
+    fs.writeFileSync(path.join(slugDir, "transcript.jsonl"), "{}", "utf8");
+    const result = findTranscriptFile({ baseDir: tmpDir, cwdSlug: "-home-test" });
+    assert.ok(result.endsWith("transcript.jsonl"));
+  });
+
+  it("returns the newest .jsonl when multiple exist", () => {
+    const slugDir = path.join(tmpDir, "-home-test");
+    fs.mkdirSync(slugDir, { recursive: true });
+    // Write an older file first
+    fs.writeFileSync(path.join(slugDir, "old.jsonl"), "{}", "utf8");
+    const oldMtime = Date.now() - 60000;
+    fs.utimesSync(path.join(slugDir, "old.jsonl"), new Date(oldMtime / 1000), new Date(oldMtime / 1000));
+    // Write a newer file
+    fs.writeFileSync(path.join(slugDir, "new.jsonl"), "{}", "utf8");
+    const result = findTranscriptFile({ baseDir: tmpDir, cwdSlug: "-home-test" });
+    assert.ok(result.endsWith("new.jsonl"), `expected new.jsonl, got ${result}`);
+  });
+
+  it("skips subdirectories and non-jsonl files", () => {
+    const slugDir = path.join(tmpDir, "-home-test");
+    fs.mkdirSync(path.join(slugDir, "subdir"), { recursive: true });
+    fs.writeFileSync(path.join(slugDir, "transcript.jsonl"), "{}", "utf8");
+    fs.writeFileSync(path.join(slugDir, "notes.txt"), "hello", "utf8");
+    const result = findTranscriptFile({ baseDir: tmpDir, cwdSlug: "-home-test" });
+    assert.equal(result, path.join(slugDir, "transcript.jsonl"));
+  });
+
+  it("uses filename tiebreak when multiple .jsonl files have the same mtime", () => {
+    const slugDir = path.join(tmpDir, "-home-tiebreak");
+    fs.mkdirSync(slugDir, { recursive: true });
+    const sameTime = new Date(Date.now() - 10000);
+    const a = path.join(slugDir, "z-first.jsonl");
+    const b = path.join(slugDir, "a-second.jsonl");
+    fs.writeFileSync(a, "{}", "utf8");
+    fs.writeFileSync(b, "{}", "utf8");
+    fs.utimesSync(a, sameTime, sameTime);
+    fs.utimesSync(b, sameTime, sameTime);
+    const result = findTranscriptFile({ baseDir: tmpDir, cwdSlug: "-home-tiebreak" });
+    // "a-second.jsonl" sorts before "z-first.jsonl" lexicographically
+    assert.ok(result.endsWith("a-second.jsonl"), `expected a-second.jsonl, got ${result}`);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// extractAssistantText — text-block extraction from transcript records
+// ---------------------------------------------------------------------------
+
+const makeRecord = (type, blocks) => ({
+  type,
+  message: { content: blocks },
+});
+
+const textBlock = (text) => ({ type: "text", text });
+const toolUseBlock = (name, input) => ({ type: "tool_use", name, input });
+const toolResultBlock = (text) => ({ type: "tool_result", text });
+const thinkingBlock = (text) => ({ type: "thinking", text });
+
+describe("extractAssistantText", () => {
+  it("returns empty string for empty records", () => {
+    assert.equal(extractAssistantText([]), "");
+  });
+
+  it("returns empty string when no assistant records exist", () => {
+    const records = [
+      makeRecord("user", [textBlock("hello")]),
+      makeRecord("user", [textBlock("world")]),
+    ];
+    assert.equal(extractAssistantText(records), "");
+  });
+
+  it("extracts last assistant text block (default lastN=1)", () => {
+    const records = [
+      makeRecord("user", [textBlock("question 1")]),
+      makeRecord("assistant", [textBlock("answer 1")]),
+      makeRecord("user", [textBlock("question 2")]),
+      makeRecord("assistant", [textBlock("answer 2"), toolUseBlock("bash", {})]),
+    ];
+    const result = extractAssistantText(records);
+    // Should only include the last assistant's text block, skipping tool_use
+    assert.equal(result, "answer 2");
+  });
+
+  it("excludes tool_use, tool_result, and thinking blocks by default", () => {
+    const records = [
+      makeRecord("assistant", [
+        textBlock("only text"),
+        toolUseBlock("bash", { cmd: "ls" }),
+        toolResultBlock("file1\nfile2"),
+        thinkingBlock("I should list files"),
+      ]),
+    ];
+    const result = extractAssistantText(records);
+    assert.equal(result, "only text");
+  });
+
+  it("includes tool_result blocks when includeTools is true", () => {
+    const records = [
+      makeRecord("assistant", [
+        textBlock("running ls"),
+        toolUseBlock("bash", { cmd: "ls" }),
+        toolResultBlock("file1\nfile2"),
+        thinkingBlock("done"),
+      ]),
+    ];
+    const result = extractAssistantText(records, { includeTools: true });
+    assert.ok(result.includes("running ls"));
+    assert.ok(result.includes("file1\nfile2"));
+    // tool_use and thinking still excluded
+    assert.ok(!result.includes("bash"));
+    assert.ok(!result.includes("done"));
+  });
+
+  it("skips trailing tool_use-only assistant records (in-progress turn)", () => {
+    const records = [
+      makeRecord("assistant", [textBlock("the actual last message")]),
+      makeRecord("user", [{ type: "tool_result", content: "output" }]),
+      makeRecord("assistant", [toolUseBlock("bash", { cmd: "ls" })]),
+      makeRecord("assistant", [toolUseBlock("read", { file: "x" })]),
+    ];
+    assert.equal(extractAssistantText(records), "the actual last message");
+  });
+
+  it("reads tool_result payloads in the real transcript shape (content array / string)", () => {
+    const records = [
+      makeRecord("assistant", [textBlock("checking output")]),
+      makeRecord("user", [
+        { type: "tool_result", content: [{ type: "text", text: "array shaped" }] },
+        { type: "tool_result", content: "string shaped" },
+      ]),
+    ];
+    assert.equal(extractAssistantText(records), "checking output");
+    const widened = extractAssistantText(records, { includeTools: true });
+    assert.ok(widened.includes("array shaped"));
+    assert.ok(widened.includes("string shaped"));
+  });
+
+  it("includes multiple assistant messages with --last N", () => {
+    const records = [
+      makeRecord("user", [textBlock("q1")]),
+      makeRecord("assistant", [textBlock("a1")]),
+      makeRecord("user", [textBlock("q2")]),
+      makeRecord("assistant", [textBlock("a2")]),
+    ];
+    const result = extractAssistantText(records, { lastN: 2 });
+    // Should include both a1 and a2 (and interleaved user messages)
+    assert.ok(result.includes("a1"));
+    assert.ok(result.includes("a2"));
+    // Should also include user messages between them
+    assert.ok(result.includes("q2"));
+  });
+
+  it("--last N with includeTools widens context to include tool results across N messages", () => {
+    const records = [
+      makeRecord("assistant", [textBlock("first answer")]),
+      makeRecord("user", [textBlock("follow-up")]),
+      makeRecord("assistant", [
+        textBlock("second answer"),
+        toolUseBlock("bash", {}),
+        toolResultBlock("output data"),
+      ]),
+    ];
+    const result = extractAssistantText(records, { lastN: 2, includeTools: true });
+    assert.ok(result.includes("first answer"));
+    assert.ok(result.includes("follow-up"));
+    assert.ok(result.includes("second answer"));
+    assert.ok(result.includes("output data"));
+  });
+
+  it("handles records without message.content gracefully", () => {
+    const records = [
+      { type: "assistant" },
+      { type: "assistant", message: {} },
+      { type: "assistant", message: { content: [textBlock("valid")] } },
+    ];
+    const result = extractAssistantText(records);
+    assert.equal(result, "valid");
+  });
+
+  it("extracts inline assistant text from typescript fixture records", () => {
+    // Simulate a realistic mini transcript
+    const records = [
+      { type: "user", message: { content: [{ type: "text", text: "hello" }] } },
+      { type: "assistant", message: { content: [{ type: "text", text: "hi there" }] } },
+      { type: "user", message: { content: [{ type: "text", text: "explain this code" }] } },
+      {
+        type: "assistant",
+        message: {
+          content: [
+            { type: "text", text: "The code does X." },
+            { type: "tool_use", name: "bash", input: {} },
+            { type: "tool_result", text: "output" },
+          ],
+        },
+      },
+    ];
+    // Default: last assistant only, no tools
+    const defaultResult = extractAssistantText(records);
+    assert.equal(defaultResult, "The code does X.");
+    // With includeTools
+    const toolsResult = extractAssistantText(records, { includeTools: true });
+    assert.ok(toolsResult.includes("The code does X."));
+    assert.ok(toolsResult.includes("output"));
+    // With --last 2
+    const last2 = extractAssistantText(records, { lastN: 2 });
+    assert.ok(last2.includes("hi there"));
+    assert.ok(last2.includes("explain this code"));
+    assert.ok(last2.includes("The code does X."));
+  });
+});
+
+
+// ---------------------------------------------------------------------------
+// resolveExplainPassage — passage resolution (quote bypass, transcript error)
+// ---------------------------------------------------------------------------
+
+describe("resolveExplainPassage", () => {
+  let tmpBase;
+
+  beforeEach(() => {
+    tmpBase = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-test-explain-"));
+  });
+
+  afterEach(() => {
+    fs.rmSync(tmpBase, { recursive: true, force: true });
+  });
+
+  function writeTranscript(slug, records) {
+    const slugDir = path.join(tmpBase, slug);
+    fs.mkdirSync(slugDir, { recursive: true });
+    const file = path.join(slugDir, "session.jsonl");
+    fs.writeFileSync(file, records.map(function (r) { return JSON.stringify(r); }).join("\n"), "utf8");
+    return file;
+  }
+
+  it("returns the explicit quote and skips transcript resolution", () => {
+    const result = resolveExplainPassage({
+      baseDir: tmpBase,
+      cwd: "/home/user/project",
+      quote: "This is an explicit passage.",
+      last: 1,
+    });
+    assert.equal(result.passage, "This is an explicit passage.");
+    assert.equal(result.source, "quote");
+    // quote works even when there is no transcript dir at all
+  });
+
+  it("rejects an empty --quote instead of sending an empty prompt", () => {
+    for (const empty of ["", "   "]) {
+      assert.throws(
+        () => resolveExplainPassage({
+          baseDir: tmpBase,
+          cwd: "/home/user/project",
+          quote: empty,
+          last: 1,
+        }),
+        /--quote must not be empty/,
+      );
+    }
+  });
+
+  it("throws when the slug dir does not exist", () => {
+    assert.throws(
+      () => resolveExplainPassage({
+        baseDir: tmpBase,
+        cwd: "/home/nonexistent",
+        last: 1,
+      }),
+      /No Claude Code transcript found/,
+    );
+  });
+
+  it("throws when the transcript file is malformed JSONL", () => {
+    const slugDir = path.join(tmpBase, "-home-bad");
+    fs.mkdirSync(slugDir, { recursive: true });
+    fs.writeFileSync(path.join(slugDir, "bad.jsonl"), "not valid json", "utf8");
+    assert.throws(
+      () => resolveExplainPassage({
+        baseDir: tmpBase,
+        cwd: "/home/bad",
+        last: 1,
+      }),
+      /Failed to read transcript/,
+    );
+  });
+
+  it("throws when the transcript is empty", () => {
+    const slugDir = path.join(tmpBase, "-home-empty");
+    fs.mkdirSync(slugDir, { recursive: true });
+    fs.writeFileSync(path.join(slugDir, "empty.jsonl"), "", "utf8");
+    assert.throws(
+      () => resolveExplainPassage({
+        baseDir: tmpBase,
+        cwd: "/home/empty",
+        last: 1,
+      }),
+      /is empty/,
+    );
+  });
+
+  it("throws when the transcript has no assistant records", () => {
+    const records = [
+      { type: "user", message: { content: [{ type: "text", text: "hello" }] } },
+    ];
+    writeTranscript("-home-no-assistant", records);
+    assert.throws(
+      () => resolveExplainPassage({
+        baseDir: tmpBase,
+        cwd: "/home/no-assistant",
+        last: 1,
+      }),
+      /No assistant text found/,
+    );
+  });
+
+  it("extracts the last assistant text passage from a valid transcript", () => {
+    const records = [
+      { type: "user", message: { content: [{ type: "text", text: "help" }] } },
+      { type: "assistant", message: { content: [{ type: "text", text: "I can explain this." }] } },
+    ];
+    writeTranscript("-home-valid", records);
+    const result = resolveExplainPassage({
+      baseDir: tmpBase,
+      cwd: "/home/valid",
+      last: 1,
+    });
+    assert.equal(result.passage, "I can explain this.");
+    assert.equal(result.source, "transcript");
+  });
+
+  it("passes lastN and includeTools through to extractAssistantText", () => {
+    const records = [
+      { type: "assistant", message: { content: [
+        { type: "text", text: "answer one" },
+        { type: "tool_result", text: "tool output" },
+      ] } },
+    ];
+    writeTranscript("-home-tools-test", records);
+    const result = resolveExplainPassage({
+      baseDir: tmpBase,
+      cwd: "/home/tools-test",
+      last: 1,
+      tools: true,
+    });
+    assert.equal(result.source, "transcript");
+    assert.ok(result.passage.includes("answer one"));
+    assert.ok(result.passage.includes("tool output"));
+  });
+
+  it("throws on --last 0 (positive integer required)", () => {
+    assert.throws(
+      () => resolveExplainPassage({ baseDir: tmpBase, cwd: "/tmp/x", last: 0 }),
+      /--last must be a positive integer/,
+    );
+  });
+
+  it("throws on --last -1 (positive integer required)", () => {
+    assert.throws(
+      () => resolveExplainPassage({ baseDir: tmpBase, cwd: "/tmp/x", last: -1 }),
+      /--last must be a positive integer/,
+    );
+  });
+
+  it("throws on --last NaN (positive integer required)", () => {
+    assert.throws(
+      () => resolveExplainPassage({ baseDir: tmpBase, cwd: "/tmp/x", last: NaN }),
+      /--last must be a positive integer/,
+    );
+  });
+
+  it("throws on --last 3.5 (non-integer)", () => {
+    assert.throws(
+      () => resolveExplainPassage({ baseDir: tmpBase, cwd: "/tmp/x", last: 3.5 }),
+      /--last must be a positive integer/,
+    );
+  });
+
+  it("throws on --last Infinity", () => {
+    assert.throws(
+      () => resolveExplainPassage({ baseDir: tmpBase, cwd: "/tmp/x", last: Infinity }),
+      /--last must be a positive integer/,
+    );
   });
 });
