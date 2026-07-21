@@ -8,8 +8,10 @@ import {
   decidePermission,
   extractJson,
   renderReview,
+  renderJobLine,
   parseArgs,
   parseModel,
+  parseOrchestratorSignature,
   stateRoot,
   deriveDisposition,
   loadConfig,
@@ -1882,5 +1884,212 @@ describe("resolveExplainPassage", () => {
       () => resolveExplainPassage({ baseDir: tmpBase, cwd: "/tmp/x", last: Infinity }),
       /--last must be a positive integer/,
     );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// parseOrchestratorSignature
+// ---------------------------------------------------------------------------
+
+describe("parseOrchestratorSignature", () => {
+  it("parses a full signature from the first line", () => {
+    const brief = "Orchestrator: claude-fable-5 | session dfbdc7dc | 2026-07-22\n\nDo the thing.";
+    const result = parseOrchestratorSignature(brief);
+    assert.deepEqual(result, {
+      model: "claude-fable-5",
+      session: "dfbdc7dc",
+      date: "2026-07-22",
+    });
+  });
+
+  it("parses signature from second line", () => {
+    const brief = "# Brief\nOrchestrator: gpt-4 | session abc123 | 2026-01-01\n\nDo stuff";
+    const result = parseOrchestratorSignature(brief);
+    assert.deepEqual(result, {
+      model: "gpt-4",
+      session: "abc123",
+      date: "2026-01-01",
+    });
+  });
+
+  it("parses signature from fifth line (last scanned)", () => {
+    const brief = "line 1\nline 2\nline 3\nline 4\nOrchestrator: deepseek-v4 | session xyz | 2026-12-31";
+    const result = parseOrchestratorSignature(brief);
+    assert.deepEqual(result, {
+      model: "deepseek-v4",
+      session: "xyz",
+      date: "2026-12-31",
+    });
+  });
+
+  it("returns null when signature is beyond first 5 lines", () => {
+    const brief = "a\nb\nc\nd\ne\nOrchestrator: claude | session s1 | 2026-01-01";
+    const result = parseOrchestratorSignature(brief);
+    assert.equal(result, null);
+  });
+
+  it("returns null when no signature line exists", () => {
+    const brief = "Just a regular brief with no orchestrator line.\nDo the work.";
+    const result = parseOrchestratorSignature(brief);
+    assert.equal(result, null);
+  });
+
+  it("returns null for empty string", () => {
+    assert.equal(parseOrchestratorSignature(""), null);
+  });
+
+  it("returns null for null/undefined input", () => {
+    assert.equal(parseOrchestratorSignature(null), null);
+    assert.equal(parseOrchestratorSignature(undefined), null);
+  });
+
+  it("handles missing parts gracefully (only model present)", () => {
+    const brief = "Orchestrator: claude-fable-5";
+    const result = parseOrchestratorSignature(brief);
+    assert.deepEqual(result, {
+      model: "claude-fable-5",
+      session: null,
+      date: null,
+    });
+  });
+
+  it("handles missing session and date", () => {
+    const brief = "Orchestrator: claude-fable-5 |  | 2026-07-22";
+    const result = parseOrchestratorSignature(brief);
+    assert.deepEqual(result, {
+      model: "claude-fable-5",
+      session: null,
+      date: "2026-07-22",
+    });
+  });
+
+  it("handles malformed separators (no pipes)", () => {
+    const brief = "Orchestrator: just a string without pipes";
+    const result = parseOrchestratorSignature(brief);
+    assert.deepEqual(result, {
+      model: "just a string without pipes",
+      session: null,
+      date: null,
+    });
+  });
+
+  it("strips 'session ' prefix from the session field", () => {
+    const brief = "Orchestrator: claude-4 | session abc-def | 2026-03-15";
+    const result = parseOrchestratorSignature(brief);
+    assert.deepEqual(result, {
+      model: "claude-4",
+      session: "abc-def",
+      date: "2026-03-15",
+    });
+  });
+
+  it("never throws on malformed input", () => {
+    assert.doesNotThrow(() => parseOrchestratorSignature(null));
+    assert.doesNotThrow(() => parseOrchestratorSignature(undefined));
+    assert.doesNotThrow(() => parseOrchestratorSignature(42));
+    assert.doesNotThrow(() => parseOrchestratorSignature({}));
+    assert.doesNotThrow(() => parseOrchestratorSignature(""));
+    assert.doesNotThrow(() => parseOrchestratorSignature("Orchestrator:"));
+  });
+});
+
+// ---------------------------------------------------------------------------
+// orchestrator recording (acceptance criteria 1 & 2)
+// ---------------------------------------------------------------------------
+
+describe("orchestrator recording", () => {
+  it("produces orchestrator data when brief has a signature (criterion 1)", () => {
+    const brief = "Orchestrator: claude-fable-5 | session dfbdc7dc | 2026-07-22\n\nImplement the feature.";
+    const text = readBriefFile({}, brief);
+    const orchestrator = parseOrchestratorSignature(text);
+    // Simulate what cmdTask does: store orchestrator on the job record
+    const job = {
+      id: "job-123",
+      kind: "task",
+      title: text.slice(0, 80),
+      status: "completed",
+      orchestrator: orchestrator,
+    };
+    assert.deepEqual(job.orchestrator, {
+      model: "claude-fable-5",
+      session: "dfbdc7dc",
+      date: "2026-07-22",
+    });
+  });
+
+  it("produces null orchestrator when brief has no signature (criterion 2)", () => {
+    const brief = "Just a normal brief with no orchestrator line.\n\nDo the work.";
+    const text = readBriefFile({}, brief);
+    const orchestrator = parseOrchestratorSignature(text);
+    // Simulate what cmdTask does: orchestrator is null, job has no field or null
+    const job = {
+      id: "job-456",
+      kind: "task",
+      title: text.slice(0, 80),
+      status: "completed",
+      orchestrator: orchestrator,
+    };
+    assert.equal(job.orchestrator, null);
+  });
+
+  it("readBriefFile with --brief-file flag is not needed for inline briefs", () => {
+    const brief = "Orchestrator: gpt-4 | session abc123 | 2026-01-01\n\nTask description";
+    const text = readBriefFile({}, brief);
+    const orchestrator = parseOrchestratorSignature(text);
+    assert.deepEqual(orchestrator, {
+      model: "gpt-4",
+      session: "abc123",
+      date: "2026-01-01",
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// renderJobLine — stats display (acceptance criterion 4)
+// ---------------------------------------------------------------------------
+
+describe("renderJobLine", () => {
+  const baseJob = {
+    id: "job-abc",
+    kind: "task",
+    title: "Implement the feature",
+    status: "completed",
+    startedAt: "2026-07-22T10:00:00.000Z",
+    finishedAt: "2026-07-22T10:00:05.000Z",
+  };
+
+  it("includes orch=<model> when job has orchestrator with model (criterion 4)", () => {
+    const job = {
+      ...baseJob,
+      orchestrator: { model: "claude-fable-5", session: "dfbdc7dc", date: "2026-07-22" },
+    };
+    const line = renderJobLine(job);
+    assert.match(line, /orch=claude-fable-5/);
+  });
+
+  it("does not include orchestrator when job has no orchestrator field", () => {
+    const line = renderJobLine(baseJob);
+    assert.doesNotMatch(line, /orch=/);
+  });
+
+  it("does not include orchestrator when orchestrator is null", () => {
+    const job = { ...baseJob, orchestrator: null };
+    const line = renderJobLine(job);
+    assert.doesNotMatch(line, /orch=/);
+  });
+
+  it("does not include orchestrator when orchestrator.model is null", () => {
+    const job = { ...baseJob, orchestrator: { model: null, session: null, date: null } };
+    const line = renderJobLine(job);
+    assert.doesNotMatch(line, /orch=/);
+  });
+
+  it("renders the full line format correctly with orchestrator", () => {
+    const job = {
+      ...baseJob,
+      orchestrator: { model: "deepseek-v4", session: "xyz", date: "2026-12-31" },
+    };
+    const line = renderJobLine(job);
+    assert.match(line, /^job-abc\s+task\s+completed\s+5s\s+orch=deepseek-v4\s+Implement the feature$/);
   });
 });

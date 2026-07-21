@@ -662,6 +662,18 @@ function renderHeader(job) {
   ].join("\n");
 }
 
+/**
+ * Render a single job line for the status listing (one-liner).
+ * Includes an "orch=<model>" suffix when the job has orchestrator data.
+ *
+ * @param {object} job - A job record from listJobs / loadJob.
+ * @returns {string} A single-line formatted job summary.
+ */
+export function renderJobLine(job) {
+  const orch = job.orchestrator?.model ? ` orch=${job.orchestrator.model}` : "";
+  return `${job.id}  ${job.kind.padEnd(6)}  ${job.status.padEnd(9)}  ${durationS(job)}s${orch}  ${job.title ?? ""}`;
+}
+
 export function extractJson(text) {
   try {
     return JSON.parse(text);
@@ -935,6 +947,42 @@ export function readBriefFile(flags, text) {
     }
   }
   return text;
+}
+
+/**
+ * Parse an optional orchestrator signature line from a brief text.
+ * Scans the first 5 lines for a line starting with "Orchestrator:"
+ * and extracts model, session, and date fields.
+ *
+ * @param {string} briefText  - The full brief text.
+ * @returns {{ model: string|null, session: string|null, date: string|null } | null}
+ *   Parsed fields (null for missing parts) or null when no signature exists.
+ *   Never throws on malformed input.
+ */
+export function parseOrchestratorSignature(briefText) {
+  if (!briefText || typeof briefText !== "string") return null;
+  const lines = briefText.split("\n");
+  const maxLines = Math.min(lines.length, 5);
+  for (let i = 0; i < maxLines; i++) {
+    const line = lines[i];
+    if (typeof line !== "string") continue;
+    const trimmed = line.trim();
+    if (trimmed.startsWith("Orchestrator:")) {
+      const remainder = trimmed.slice("Orchestrator:".length).trim();
+      // Split on |, trim each part
+      const parts = remainder.split("|").map((s) => s.trim());
+      const model = parts[0] || null;
+      let session = parts[1] || null;
+      // Strip optional "session " prefix
+      if (session && session.startsWith("session ")) {
+        session = session.slice("session ".length).trim();
+        if (session === "") session = null;
+      }
+      const date = parts[2] || null;
+      return { model, session, date };
+    }
+  }
+  return null;
 }
 
 // ---------------------------------------------------------------------------
@@ -1237,6 +1285,7 @@ async function cmdTask(cwd, { flags, text }) {
   // ---- brief-file resolution ----
   text = readBriefFile(flags, text);
   if (!text) throw new Error("task requires a task description (inline or via --brief-file)");
+  const orchestrator = parseOrchestratorSignature(text);
   let agent = flags.agent;
   let phase = null;
   if (flags.phase) {
@@ -1291,8 +1340,9 @@ async function cmdTask(cwd, { flags, text }) {
     watchdogS: Number(flags.watchdog ?? DEFAULT_WATCHDOG_S),
   });
 
-  // Store the resolved model chain on the job record
+  // Store the resolved model chain and orchestrator on the job record
   job.modelChain = modelChain;
+  job.orchestrator = orchestrator;
   saveJob(stateDir, job);
   if (job.status !== "completed") {
     return `${renderHeader(job)}${job.error ?? ""}\nCheck /kusabi:status ${job.id} for details.`;
@@ -1406,7 +1456,7 @@ function cmdStatus(cwd, { text }) {
   const jobs = listJobs(stateDir).slice(0, 10);
   if (jobs.length === 0) return "no opencode jobs for this directory yet.";
   return jobs
-    .map((j) => `${j.id}  ${j.kind.padEnd(6)}  ${j.status.padEnd(9)}  ${durationS(j)}s  ${j.title ?? ""}`)
+    .map((j) => renderJobLine(j))
     .join("\n");
 }
 
@@ -1534,6 +1584,7 @@ async function cmdChain(cwd, { flags, text }) {
   // ---- brief-file resolution ----
   text = readBriefFile(flags, text);
   if (!text) throw new Error("chain requires a brief description (inline or via --brief-file)");
+  const orchestrator = parseOrchestratorSignature(text);
   try {
     const stateDir = stateDirFor(cwd);
     const config = loadConfig(stateRoot());
@@ -1802,6 +1853,7 @@ async function cmdChain(cwd, { flags, text }) {
       modelChain: modelChain,
       maxRounds: maxRounds,
       brief: brief,
+      orchestrator: orchestrator,
       records: records,
       baseSha: baseSha,
       chainTotals: chainTotals,
@@ -1813,8 +1865,10 @@ async function cmdChain(cwd, { flags, text }) {
 
     if (disposition.disposition === "escalate") {
       var reason = disposition.reason || "unknown";
+      var orchLine = orchestrator?.model ? "orchestrator=" + orchestrator.model : "";
       var lines = [
         "Chain " + chainId + " escalated at round " + round + ": " + reason,
+        orchLine,
         "",
         "Remaining findings:",
         roundRecord.findingsText,
@@ -1832,8 +1886,10 @@ async function cmdChain(cwd, { flags, text }) {
 
   var lastRecord = records.length > 0 ? records[records.length - 1] : {};
   var finalFindings = lastRecord.findingsText || "(none)";
+  var orchLine = orchestrator?.model ? "orchestrator=" + orchestrator.model : "";
   var lines = [
     "Chain " + chainId + " reached max rounds (" + maxRounds + ") without acceptance.",
+    orchLine,
     "",
     "Remaining findings:",
     finalFindings,
