@@ -45,7 +45,7 @@ kusabi ships 7 agent definitions (`plugins/kusabi/opencode-agents/`) that are au
 | `kusabi-draft` | Draft — research + issue creation | read-only + shiori + issue_write |
 | `kusabi-investigate` | investigate — deep dive, root cause | read-only + shiori + issue_write |
 | `kusabi-implement` | implement — code + verify | writes happen only via sunaba container tools (sunaba_edit_file/write_file); host bash/edit/write/patch and sunaba_copy_project/sunaba_copy_file **deny** |
-| `kusabi-review` | review — adversarial review | verify/lint/type_check **allow**, sandbox_exec/sandbox_write **deny** |
+| `kusabi-review` | review — adversarial review | verify/lint/type_check **allow**, sandbox_exec/sandbox_write/issue_write/pr_review_write **deny** (deliverable is structured report, not issue comments) |
 | `kusabi-respond` | respond — address review findings | code write; issue_write **deny** |
 | `kusabi-salvage` | salvage — recover stalled / dead jobs | read-only + structured report |
 | `kusabi-gofer` | gofer — evidence-gathering errands | sandbox_exec + read/verify tools **allow**; host write/shiori/sunaba mutation **deny** |

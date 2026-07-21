@@ -31,6 +31,8 @@ import {
   checkDeliverablesProbe,
   checkSmokeProbe,
   implementDenyTools,
+  reviewDenyTools,
+  renderBaseFacts,
 } from "./kusabi-companion.mjs";
 
 // ---------------------------------------------------------------------------
@@ -2907,5 +2909,145 @@ describe("PHASE_AGENTS", () => {
       const filePath = path.join(agentsDir, `${agentName}.md`);
       assert.ok(fs.existsSync(filePath), `agent file missing: ${filePath}`);
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// reviewDenyTools — deny map for review-phase sessions
+// ---------------------------------------------------------------------------
+
+describe("reviewDenyTools", () => {
+  it("returns a plain object", () => {
+    const result = reviewDenyTools();
+    assert.equal(typeof result, "object");
+    assert.notEqual(result, null);
+    assert.equal(Array.isArray(result), false);
+  });
+
+  it("denies bash, edit, write, patch, task", () => {
+    const result = reviewDenyTools();
+    assert.equal(result.bash, false);
+    assert.equal(result.edit, false);
+    assert.equal(result.write, false);
+    assert.equal(result.patch, false);
+    assert.equal(result.task, false);
+  });
+
+  it("denies sunaba_copy_project and sunaba_copy_file", () => {
+    const result = reviewDenyTools();
+    assert.equal(result.sunaba_copy_project, false);
+    assert.equal(result.sunaba_copy_file, false);
+  });
+
+  it("denies sunaba_sandbox_issue_write and sunaba_sandbox_pr_review_write", () => {
+    const result = reviewDenyTools();
+    assert.equal(result.sunaba_sandbox_issue_write, false);
+    assert.equal(result.sunaba_sandbox_pr_review_write, false);
+  });
+
+  it("contains exactly 9 keys", () => {
+    const result = reviewDenyTools();
+    const keys = Object.keys(result);
+    assert.equal(keys.length, 9);
+    assert.ok(keys.includes("bash"));
+    assert.ok(keys.includes("edit"));
+    assert.ok(keys.includes("write"));
+    assert.ok(keys.includes("patch"));
+    assert.ok(keys.includes("task"));
+    assert.ok(keys.includes("sunaba_copy_project"));
+    assert.ok(keys.includes("sunaba_copy_file"));
+    assert.ok(keys.includes("sunaba_sandbox_issue_write"));
+    assert.ok(keys.includes("sunaba_sandbox_pr_review_write"));
+  });
+
+  it("all values are false", () => {
+    const result = reviewDenyTools();
+    const allFalse = Object.values(result).every((v) => v === false);
+    assert.equal(allFalse, true);
+  });
+
+  it("returns a fresh object on each call", () => {
+    const a = reviewDenyTools();
+    const b = reviewDenyTools();
+    assert.notEqual(a, b);
+    assert.deepEqual(a, b);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// renderBaseFacts — base change-set context block for chain review prompts
+// ---------------------------------------------------------------------------
+
+describe("renderBaseFacts", () => {
+  it("renders all four elements when all inputs are provided", () => {
+    const result = renderBaseFacts({
+      baseSha: "basesha-dummy-0001",
+      baseLog: "abc123 first commit\ndef456 second commit",
+      statusOutput: " M src/foo.js\n?? newfile.js",
+    });
+    assert.match(result, /### Base change-set context/);
+    assert.match(result, /Base commit: `basesha-dummy-0001`/);
+    assert.match(result, /Recent base history/);
+    assert.match(result, /abc123 first commit/);
+    assert.match(result, /def456 second commit/);
+    assert.match(result, /Actual change set/);
+    assert.match(result, /src\/foo\.js/);
+    assert.match(result, /newfile\.js/);
+    assert.match(result, /Review ONLY this change set/);
+    assert.match(result, /NOT scope creep/);
+  });
+
+  it("includes the verbatim boundary instruction sentence", () => {
+    const result = renderBaseFacts({
+      baseSha: "abc",
+      baseLog: "abc log",
+      statusOutput: "",
+    });
+    assert.ok(result.includes("Review ONLY this change set. Code that is already part of the base (see the log above) is NOT scope creep and must not be flagged as such."));
+  });
+
+  it("handles missing baseSha gracefully", () => {
+    const result = renderBaseFacts({
+      baseLog: "abc log",
+      statusOutput: " M f.txt",
+    });
+    assert.match(result, /Base commit: \(unavailable\)/);
+    assert.match(result, /abc log/);
+    assert.match(result, /f\.txt/);
+  });
+
+  it("handles missing baseLog gracefully", () => {
+    const result = renderBaseFacts({
+      baseSha: "abc",
+      statusOutput: " M f.txt",
+    });
+    assert.match(result, /Base commit: `abc`/);
+    assert.match(result, /\(unavailable\)/);
+    assert.match(result, /f\.txt/);
+  });
+
+  it("handles missing statusOutput gracefully", () => {
+    const result = renderBaseFacts({
+      baseSha: "abc",
+      baseLog: "abc log",
+    });
+    assert.match(result, /Base commit: `abc`/);
+    assert.match(result, /abc log/);
+    assert.match(result, /empty change set/);
+  });
+
+  it("handles empty input object gracefully", () => {
+    const result = renderBaseFacts({});
+    assert.match(result, /Base commit: \(unavailable\)/);
+    assert.match(result, /\(unavailable\)/);
+    assert.match(result, /empty change set/);
+    assert.match(result, /Review ONLY this change set/);
+  });
+
+  it("handles no argument gracefully", () => {
+    const result = renderBaseFacts();
+    assert.match(result, /Base commit: \(unavailable\)/);
+    assert.match(result, /empty change set/);
+    assert.match(result, /Review ONLY this change set/);
   });
 });

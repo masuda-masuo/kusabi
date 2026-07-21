@@ -30,6 +30,36 @@ export function implementDenyTools() {
   );
 }
 
+export function reviewDenyTools() {
+  return Object.fromEntries(
+    [...WRITE_TOOL_NAMES, "sunaba_copy_project", "sunaba_copy_file", "sunaba_sandbox_issue_write", "sunaba_sandbox_pr_review_write"].map((t) => [t, false]),
+  );
+}
+
+export function renderBaseFacts({ baseSha, baseLog, statusOutput } = {}) {
+  const parts = [];
+  parts.push("### Base change-set context (machine-recorded)");
+  parts.push("");
+  if (baseSha) {
+    parts.push("- Base commit: `" + baseSha + "`");
+  } else {
+    parts.push("- Base commit: (unavailable)");
+  }
+  parts.push("");
+  parts.push("Recent base history (top 5):");
+  parts.push("```");
+  parts.push(baseLog || "(unavailable)");
+  parts.push("```");
+  parts.push("");
+  parts.push("Actual change set (`git status --porcelain`):");
+  parts.push("```");
+  parts.push(statusOutput || "(empty change set)");
+  parts.push("```");
+  parts.push("");
+  parts.push("Review ONLY this change set. Code that is already part of the base (see the log above) is NOT scope creep and must not be flagged as such.");
+  return parts.join("\n");
+}
+
 export const PHASE_AGENTS = {
   draft: "kusabi-draft",
   investigate: "kusabi-investigate",
@@ -1966,7 +1996,7 @@ async function cmdReview(cwd, { flags, text }) {
     promptText,
     model: parseModel(flags.model),
     agent: flags.agent,
-    tools: Object.fromEntries(WRITE_TOOL_NAMES.map((t) => [t, false])),
+    tools: reviewDenyTools(),
     // NOTE: opencode's `format: json_schema` is not used — some providers 400
     // on it, and sessions created with it break GET /session/:id/message in
     // opencode 1.17.x. The schema is embedded in the prompt instead.
@@ -2254,6 +2284,8 @@ async function cmdChain(cwd, { flags, text }) {
     const probeResults = [];
     let chainChangedPaths = [];
     let chainStatusObserved = false;
+    let chainStatusOutput = "";
+    let chainBaseLog = "";
     const chainDeliverables = parseDeliverables(brief);
 
     try {
@@ -2302,10 +2334,18 @@ async function cmdChain(cwd, { flags, text }) {
         container_id: container,
         commands: ["git status --porcelain"],
       });
-      chainChangedPaths = parseChangedPaths(statusResult?.output ?? "");
+      chainStatusOutput = statusResult?.output ?? "";
+      chainChangedPaths = parseChangedPaths(chainStatusOutput);
       chainStatusObserved = true;
       const p3Result = checkDeliverablesProbe(chainDeliverables, chainChangedPaths);
       probeResults.push(p3Result);
+
+      // Base log for review context (reuse P3's sunaba-rpc call, collect once per round)
+      const baseLogResult = await callTool("sandbox_exec", {
+        container_id: container,
+        commands: ["git log --oneline -5"],
+      });
+      chainBaseLog = baseLogResult?.output ?? "";
 
       // P4: smoke probe
       const chainSmokeEntries = parseSmoke(brief);
@@ -2364,7 +2404,7 @@ async function cmdChain(cwd, { flags, text }) {
     if (!chainSkipReview) {
       const promptTemplate = fs.readFileSync(path.join(PLUGIN_ROOT, "prompts", "adversarial-review.md"), "utf8");
       const schemaJson = JSON.parse(fs.readFileSync(path.join(PLUGIN_ROOT, "schemas", "review-output.schema.json"), "utf8"));
-      const reviewInput = [
+      const reviewInputParts = [
         "## Review target",
         "",
         "The artifact under review lives inside container `" + container + "`.",
@@ -2374,7 +2414,10 @@ async function cmdChain(cwd, { flags, text }) {
         "- `verify_in_container` / `lint_in_container` / `type_check_in_container` - re-run the project's gates in the container",
         "",
         "Do NOT rely on host cwd git state; the actual changes are in the container.",
-      ].join("\n");
+      ];
+      const baseFactsBlock = renderBaseFacts({ baseSha, baseLog: chainBaseLog, statusOutput: chainStatusOutput });
+      reviewInputParts.push("", baseFactsBlock);
+      const reviewInput = reviewInputParts.join("\n");
       const priorFindings = previousRecord?.findingsText || "(none -- first review round)";
 
       const reviewPromptText = promptTemplate
@@ -2391,7 +2434,7 @@ async function cmdChain(cwd, { flags, text }) {
         promptText: reviewPromptText,
         model,
         agent: "kusabi-review",
-        tools: Object.fromEntries(WRITE_TOOL_NAMES.map(function(t) { return [t, false]; })),
+        tools: reviewDenyTools(),
         timeoutS: 1800,
         watchdogS: 900,
       });

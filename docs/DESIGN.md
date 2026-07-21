@@ -47,7 +47,7 @@ Long sessions cause context pollution, so work is split into phases, with **each
 | Draft | Duplicate check (horizontal) + issue creation | ○ | ✕ | ○ (artifact) |
 | investigate | Deep issue dive, root cause identification | ○ | ✕ | ○ (brief appendix) |
 | implement | Implementation + verify based on brief | ✕ | ○ | ✕ |
-| review | Adversarial review of PR | ○ | ✕ | ○ |
+| review | Adversarial review of PR | ○ | ✕ | ✕ |
 | respond | Address review findings | ✕ | ○ | ✕ |
 | gofer | Evidence-gathering errands (#64) — run, observe, quote verbatim; no judgments, no issue writes | ✕ | ✕ | ✕ |
 
@@ -118,6 +118,8 @@ Uses `plugins/kusabi/prompts/adversarial-review.md` + `plugins/kusabi/schemas/re
 Reviewer (kusabi-review) permissions:
 - **allow**: `sunaba_verify_in_container`, `sunaba_lint_in_container`, `sunaba_type_check_in_container` — independently re-runs the implementer's "gate green" claim to verify it (PR#37/#40)
 - **deny**: all mutation tools (sandbox_exec, write_file, edit_file, checkout, publish, etc.) — because if the reviewer starts fixing, independence is lost
+- **deny**: `sunaba_sandbox_issue_write` and `sunaba_sandbox_pr_review_write` — outward writes are the orchestrator's exclusive exit; the reviewer's deliverable is the structured final report, not issue comments or PR reviews
+- The chain review prompt is augmented with machine-collected base facts (`baseSha`, recent base history, actual change set from `git status --porcelain`) so the reviewer receives "what is this task's change set" as data rather than guessing. See `renderBaseFacts` in `kusabi-companion.mjs`.
 
 Verdict: 4-value + optional `unverified`:
 
