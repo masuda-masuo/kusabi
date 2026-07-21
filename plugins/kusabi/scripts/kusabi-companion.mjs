@@ -43,11 +43,12 @@ const PHASE_AGENTS = {
 // state dir / server lifecycle
 // ---------------------------------------------------------------------------
 
-export function stateRoot() {
+export function stateRoot(homeDir) {
   const envDir = process.env.KUSABI_STATE_DIR || process.env.OPENCODE_COMPANION_STATE_DIR;
   if (envDir) return envDir;
-  const newDir = path.join(os.homedir(), ".kusabi");
-  const oldDir = path.join(os.homedir(), ".opencode-plugin-cc");
+  const home = homeDir ?? os.homedir();
+  const newDir = path.join(home, ".kusabi");
+  const oldDir = path.join(home, ".opencode-plugin-cc");
   // One-time migration: rename old state dir to new name if only the old exists.
   if (!fs.existsSync(newDir) && fs.existsSync(oldDir)) {
     try { fs.renameSync(oldDir, newDir); } catch { /* best-effort */ }
