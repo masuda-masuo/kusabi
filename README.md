@@ -38,7 +38,7 @@ Then run `/kusabi:setup` to verify the CLI and server come up.
 
 ## Phase agents
 
-kusabi ships 6 agent definitions (`plugins/kusabi/opencode-agents/`) that are automatically installed by `setup`:
+kusabi ships 7 agent definitions (`plugins/kusabi/opencode-agents/`) that are automatically installed by `setup`:
 
 | Agent | Phase role | Permission profile |
 |---|---|---|
@@ -48,6 +48,7 @@ kusabi ships 6 agent definitions (`plugins/kusabi/opencode-agents/`) that are au
 | `kusabi-review` | review — adversarial review | verify/lint/type_check **allow**, sandbox_exec/sandbox_write **deny** |
 | `kusabi-respond` | respond — address review findings | code write; issue_write **deny** |
 | `kusabi-salvage` | salvage — recover stalled / dead jobs | read-only + structured report |
+| `kusabi-gofer` | gofer — evidence-gathering errands | sandbox_exec + read/verify tools **allow**; host write/shiori/sunaba mutation **deny** |
 
 Run `/kusabi:setup` or `kusabi-companion.mjs install-agents` to copy them to `OPENCODE_AGENT_DIR` (default `~/.config/opencode/agent/`). Legacy `oc-*` names are automatically cleaned up.
 

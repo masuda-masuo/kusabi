@@ -30,13 +30,14 @@ export function implementDenyTools() {
   );
 }
 
-const PHASE_AGENTS = {
+export const PHASE_AGENTS = {
   draft: "kusabi-draft",
   investigate: "kusabi-investigate",
   implement: "kusabi-implement",
   review: "kusabi-review",
   respond: "kusabi-respond",
   salvage: "kusabi-salvage",
+  gofer: "kusabi-gofer",
 };
 
 // ---------------------------------------------------------------------------
@@ -1713,7 +1714,7 @@ async function cmdTask(cwd, { flags, text }) {
   if (flags.phase) {
     phase = flags.phase;
     if (!PHASE_AGENTS[phase]) {
-      throw new Error(`unknown phase: ${phase}. Use draft|investigate|implement|review|respond`);
+      throw new Error(`unknown phase: ${phase}. Use draft|investigate|implement|review|respond|salvage|gofer`);
     }
     if (flags.agent) {
       throw new Error("--phase and --agent are mutually exclusive");
@@ -2634,7 +2635,7 @@ function usage() {
     "",
     "Flags:",
     "  --read-only, --resume-last, --wait, --background",
-    "  --base <ref>, --model <provider/model>, --agent <id>, --phase <name>",
+    "  --base <ref>, --model <provider/model>, --agent <id>, --phase <name> (draft|investigate|implement|review|respond|salvage|gofer)",
     "  --session <id>, --timeout <s>, --watchdog <s>, --deny <tools>",
     "  --brief-file <path> (task / chain: read the brief from a file; exclusive with inline text)",
     "  --container <cid> (chain/task: container to run deterministic probes in)",
