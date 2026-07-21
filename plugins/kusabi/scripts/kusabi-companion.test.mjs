@@ -24,6 +24,9 @@ import {
   findTranscriptFile,
   extractAssistantText,
   resolveExplainPassage,
+  parseDeliverables,
+  parseChangedPaths,
+  checkDeliverablesProbe,
 } from "./kusabi-companion.mjs";
 
 // ---------------------------------------------------------------------------
@@ -2397,5 +2400,206 @@ describe("renderJobLine", () => {
     };
     const line = renderJobLine(job);
     assert.match(line, /^job-abc\s+task\s+completed\s+5s\s+orch=deepseek-v4\s+Implement the feature$/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// parseDeliverables — ## Deliverables section parsing
+// ---------------------------------------------------------------------------
+
+describe("parseDeliverables", () => {
+  it("returns [] for text without ## Deliverables section", () => {
+    assert.deepEqual(parseDeliverables("some brief text\n## Other section\ncontent"), []);
+  });
+
+  it("returns [] for empty string", () => {
+    assert.deepEqual(parseDeliverables(""), []);
+  });
+
+  it("returns [] for null/undefined", () => {
+    assert.deepEqual(parseDeliverables(null), []);
+    assert.deepEqual(parseDeliverables(undefined), []);
+  });
+
+  it("parses backtick-quoted paths from bullet list", () => {
+    const text = "## Deliverables\n- `plugins/kusabi/scripts/foo.mjs`\n- `docs/DESIGN.md`\n";
+    assert.deepEqual(parseDeliverables(text), ["plugins/kusabi/scripts/foo.mjs", "docs/DESIGN.md"]);
+  });
+
+  it("stops at next ## heading", () => {
+    const text = "## Deliverables\n- `file1.js`\n## Other section\n- `file2.js`\n";
+    assert.deepEqual(parseDeliverables(text), ["file1.js"]);
+  });
+
+  it("parses bullet without backtick using first token", () => {
+    const text = "## Deliverables\n- plugins/kusabi/scripts/foo.mjs\n";
+    assert.deepEqual(parseDeliverables(text), ["plugins/kusabi/scripts/foo.mjs"]);
+  });
+
+  it("strips trailing punctuation from path", () => {
+    const text = "## Deliverables\n- `plugins/kusabi/scripts/foo.mjs` — implement the thing\n";
+    assert.deepEqual(parseDeliverables(text), ["plugins/kusabi/scripts/foo.mjs"]);
+  });
+
+  it("strips variable trailing punctuation characters", () => {
+    const text = "## Deliverables\n- `file.js`; also note:\n- `other.py`: the main one\n";
+    assert.deepEqual(parseDeliverables(text), ["file.js", "other.py"]);
+  });
+
+  it("ignores empty bullet lines but takes first token from non-empty ones", () => {
+    const text = "## Deliverables\n- \n- just text without a backtick path\n";
+    // First bullet is empty (skipped). Second has first token "just".
+    assert.deepEqual(parseDeliverables(text), ["just"]);
+  });
+
+  it("handles * bullets", () => {
+    const text = "## Deliverables\n* `file1.js`\n* `file2.js`\n";
+    assert.deepEqual(parseDeliverables(text), ["file1.js", "file2.js"]);
+  });
+
+  it("handles Deliverables section not at the start of the brief", () => {
+    const text = "## Brief\nImplement the thing.\n\n## Deliverables\n- `output.txt`\n";
+    assert.deepEqual(parseDeliverables(text), ["output.txt"]);
+  });
+
+  it("never throws on any input", () => {
+    assert.doesNotThrow(() => parseDeliverables(null));
+    assert.doesNotThrow(() => parseDeliverables(undefined));
+    assert.doesNotThrow(() => parseDeliverables(42));
+    assert.doesNotThrow(() => parseDeliverables({}));
+    assert.doesNotThrow(() => parseDeliverables([]));
+  });
+});
+
+// ---------------------------------------------------------------------------
+// parseChangedPaths — git status --porcelain path extraction
+// ---------------------------------------------------------------------------
+
+describe("parseChangedPaths", () => {
+  it("parses modified paths", () => {
+    const output = "M  plugins/kusabi/scripts/foo.mjs\n M docs/DESIGN.md\n";
+    const result = parseChangedPaths(output);
+    assert.deepEqual(result, ["plugins/kusabi/scripts/foo.mjs", "docs/DESIGN.md"]);
+  });
+
+  it("parses untracked files", () => {
+    const output = "?? plugins/kusabi/scripts/new-file.mjs\n";
+    const result = parseChangedPaths(output);
+    assert.deepEqual(result, ["plugins/kusabi/scripts/new-file.mjs"]);
+  });
+
+  it("parses rename entries (returns both old and new paths)", () => {
+    const output = "R  old.js -> new.js\n";
+    const result = parseChangedPaths(output);
+    assert.deepEqual(result, ["old.js", "new.js"]);
+  });
+
+  it("returns [] for empty output", () => {
+    assert.deepEqual(parseChangedPaths(""), []);
+  });
+
+  it("returns [] for null/undefined", () => {
+    assert.deepEqual(parseChangedPaths(null), []);
+    assert.deepEqual(parseChangedPaths(undefined), []);
+  });
+
+  it("handles mixed status entries", () => {
+    const output = [
+      "M  src/index.js",
+      "?? src/new.py",
+      "R  old.txt -> renamed.txt",
+      "MM src/shared.js",
+    ].join("\n");
+    const result = parseChangedPaths(output);
+    assert.deepEqual(result, ["src/index.js", "src/new.py", "old.txt", "renamed.txt", "src/shared.js"]);
+  });
+
+  it("strips trailing slash from untracked directory entries", () => {
+    assert.deepEqual(parseChangedPaths("?? newdir/\n"), ["newdir"]);
+  });
+
+  it("ignores comment lines (starting with #)", () => {
+    const output = [
+      "# branch.oid abc123",
+      "M  src/main.js",
+      "# branch.head main",
+    ].join("\n");
+    const result = parseChangedPaths(output);
+    assert.deepEqual(result, ["src/main.js"]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// checkDeliverablesProbe — P3 probe decision logic
+// ---------------------------------------------------------------------------
+
+describe("checkDeliverablesProbe", () => {
+  it("passes when no deliverables declared (trivial pass)", () => {
+    const result = checkDeliverablesProbe([], ["file.js"]);
+    assert.equal(result.passed, true);
+    assert.match(result.detail, /no Deliverables declared/);
+  });
+
+  it("fails when change set is empty but deliverables are declared", () => {
+    const result = checkDeliverablesProbe(["file.js"], []);
+    assert.equal(result.passed, false);
+    assert.match(result.detail, /work set is empty/);
+  });
+
+  it("passes when a declared path exactly matches a changed path", () => {
+    const result = checkDeliverablesProbe(
+      ["plugins/kusabi/scripts/foo.mjs"],
+      ["plugins/kusabi/scripts/foo.mjs", "docs/DESIGN.md"],
+    );
+    assert.equal(result.passed, true);
+    assert.match(result.detail, /touches declared deliverables/);
+  });
+
+  it("passes when a declared directory matches changed paths inside it", () => {
+    const result = checkDeliverablesProbe(
+      ["plugins/kusabi/scripts"],
+      ["plugins/kusabi/scripts/kusabi-companion.mjs"],
+    );
+    assert.equal(result.passed, true);
+  });
+
+  it("fails when no declared path is in the change set", () => {
+    const result = checkDeliverablesProbe(
+      ["plugins/kusabi/scripts/foo.mjs"],
+      ["docs/DESIGN.md"],
+    );
+    assert.equal(result.passed, false);
+    assert.match(result.detail, /no declared deliverable touched/);
+  });
+
+  it("fails with detail containing both deliverables and changed paths", () => {
+    const result = checkDeliverablesProbe(
+      ["a.js", "b.js"],
+      ["c.js"],
+    );
+    assert.equal(result.passed, false);
+    assert.ok(result.detail.includes("a.js"));
+    assert.ok(result.detail.includes("b.js"));
+    assert.ok(result.detail.includes("c.js"));
+  });
+
+  it("passes when changed path is inside a declared directory (reverse)", () => {
+    const result = checkDeliverablesProbe(
+      ["plugins/kusabi/scripts/foo.mjs"],
+      ["plugins/kusabi"],
+    );
+    assert.equal(result.passed, true);
+  });
+
+  it("probe name is 'P3: deliverables'", () => {
+    const result = checkDeliverablesProbe([], []);
+    assert.equal(result.probe, "P3: deliverables");
+  });
+
+  it("never throws on any input", () => {
+    assert.doesNotThrow(() => checkDeliverablesProbe(null, null));
+    assert.doesNotThrow(() => checkDeliverablesProbe(undefined, undefined));
+    assert.doesNotThrow(() => checkDeliverablesProbe([], null));
+    assert.doesNotThrow(() => checkDeliverablesProbe("not-array", "not-array"));
   });
 });

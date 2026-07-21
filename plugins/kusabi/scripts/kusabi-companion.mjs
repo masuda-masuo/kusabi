@@ -1146,6 +1146,143 @@ export function parseOrchestratorSignature(briefText) {
 }
 
 // ---------------------------------------------------------------------------
+// parseDeliverables — pure function parsing ## Deliverables section from a
+// brief text.  Exported for testing.
+// ---------------------------------------------------------------------------
+
+/**
+ * Parse an optional `## Deliverables` section from a brief text.
+ *
+ * Section = lines after a `## Deliverables` heading up to the next `## `
+ * heading or EOF.  From each bullet line (`- ` or `* `), extract the file
+ * path: the first backtick-quoted token if present, else the first
+ * whitespace-delimited token.  Strip surrounding backticks and trailing
+ * punctuation.  Ignore bullet lines that yield nothing.
+ *
+ * @param {string|null|undefined} briefText  The full brief text.
+ * @returns {string[]}  Repo-relative path strings; [] when section absent or empty.
+ *                      Never throws.
+ */
+export function parseDeliverables(briefText) {
+  if (!briefText || typeof briefText !== "string") return [];
+  const lines = briefText.split("\n");
+  let inSection = false;
+  const deliverables = [];
+  for (let li = 0; li < lines.length; li++) {
+    const trimmed = lines[li].trim();
+    if (trimmed.startsWith("## ")) {
+      const heading = trimmed.slice(3).trim();
+      if (heading === "Deliverables") {
+        inSection = true;
+        continue;
+      }
+      if (inSection) break; // next heading ends the section
+      continue;
+    }
+    if (!inSection) continue;
+
+    // Bullet line?
+    const bulletMatch = trimmed.match(/^[-*]\s+(.*)/);
+    if (!bulletMatch) continue;
+    const content = bulletMatch[1].trim();
+    if (!content) continue;
+
+    // First backtick-quoted token, else first whitespace-delimited token
+    let path = null;
+    const backtickMatch = content.match(/`([^`]+)`/);
+    if (backtickMatch) {
+      path = backtickMatch[1];
+    } else {
+      const tokens = content.split(/\s+/);
+      path = tokens[0];
+    }
+    if (!path) continue;
+
+    // Strip trailing punctuation
+    path = path.replace(/[,;.:!?]+$/, "").trim();
+    if (path) deliverables.push(path);
+  }
+  return deliverables;
+}
+
+/**
+ * Parse paths from `git status --porcelain` output.
+ * For rename entries both old and new paths are returned.
+ *
+ * @param {string} output  Raw stdout from `git status --porcelain`.
+ * @returns {string[]}  Array of changed path strings.
+ */
+export function parseChangedPaths(output) {
+  if (!output || typeof output !== "string") return [];
+  const paths = [];
+  for (const line of output.split("\n")) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith("#")) continue;
+    // Skip the first 3 characters (XY status chars + space), rest is the path.
+    const rest = line.length > 3 ? line.substring(3).trim() : "";
+    if (!rest) continue;
+    // Handle rename: "oldpath -> newpath"
+    const arrowIdx = rest.indexOf(" -> ");
+    if (arrowIdx >= 0) {
+      const oldPath = rest.substring(0, arrowIdx).trim().replace(/\/+$/, "");
+      const newPath = rest.substring(arrowIdx + 4).trim().replace(/\/+$/, "");
+      if (oldPath) paths.push(oldPath);
+      if (newPath) paths.push(newPath);
+    } else {
+      // Untracked directories appear as "dir/"; strip the trailing slash so
+      // prefix matching against declared deliverables works.
+      const cleaned = rest.replace(/\/+$/, "");
+      if (cleaned) paths.push(cleaned);
+    }
+  }
+  return paths;
+}
+
+/**
+ * Pure function: determine the P3 (deliverables) probe outcome from declared
+ * deliverables and the actual changed paths.
+ *
+ * @param {string[]} deliverables  Declared deliverable paths (parseDeliverables output).
+ * @param {string[]} changedPaths  Actual changed paths from git status --porcelain.
+ * @returns {{ probe: string, passed: boolean, detail: string }}
+ */
+export function checkDeliverablesProbe(deliverables, changedPaths) {
+  const probe = "P3: deliverables";
+  // Defensive: ensure array inputs
+  const delArr = Array.isArray(deliverables) ? deliverables : [];
+  const chArr = Array.isArray(changedPaths) ? changedPaths : [];
+  // No deliverables declared → trivially pass
+  if (delArr.length === 0) {
+    return { probe, passed: true, detail: "no Deliverables declared; check skipped" };
+  }
+  // Change set empty
+  if (chArr.length === 0) {
+    return {
+      probe,
+      passed: false,
+      detail: "work set is empty; declared deliverables: " + delArr.join(", "),
+    };
+  }
+  // Check if at least one declared path is touched
+  const touched = delArr.some(function (d) {
+    return chArr.some(function (cp) {
+      // Equal path, or changed path is inside a declared directory
+      return cp === d || cp.startsWith(d + "/") || d.startsWith(cp + "/");
+    });
+  });
+  if (touched) {
+    return { probe, passed: true, detail: "touches declared deliverables" };
+  }
+  const delStr = delArr.join(", ");
+  const chStr = chArr.join(", ");
+  return {
+    probe,
+    passed: false,
+    detail: "no declared deliverable touched; deliverables: [" + delStr + "]; changed: [" + chStr + "]",
+  };
+}
+
+// ---------------------------------------------------------------------------
 // deriveDisposition — pure function mapping review + probe results to
 // chain disposition.  Exported for testing.
 // ---------------------------------------------------------------------------
@@ -1485,6 +1622,19 @@ async function cmdTask(cwd, { flags, text }) {
     tools = { ...(tools ?? {}) };
     for (const name of flags.deny.split(",").filter(Boolean)) tools[name] = false;
   }
+  // ---- record baseSha before dispatching the job if --container (for probe comparison) ----
+  let taskBaseSha = null;
+  if (flags.container) {
+    try {
+      const { callTool } = await import("./sunaba-rpc.mjs");
+      const gitRev = await callTool("sandbox_exec", {
+        container_id: flags.container,
+        commands: ["git rev-parse HEAD"],
+      });
+      taskBaseSha = (gitRev?.output ?? "").trim() || null;
+    } catch { /* probe will handle missing baseSha */ }
+  }
+
   const guardrails = fs.readFileSync(path.join(PLUGIN_ROOT, "prompts", "task-guardrails.md"), "utf8").trim();
   const { job, resultText } = await runPrompt({
     cwd,
@@ -1503,11 +1653,90 @@ async function cmdTask(cwd, { flags, text }) {
   // Store the resolved model chain and orchestrator on the job record
   job.modelChain = modelChain;
   job.orchestrator = orchestrator;
-  saveJob(stateDir, job);
-  if (job.status !== "completed") {
-    return `${renderHeader(job)}${job.error ?? ""}\nCheck /kusabi:status ${job.id} for details.`;
+
+  // ---- deterministic probes (when --container given) ----
+  if (flags.container) {
+    try {
+      const { callTool } = await import("./sunaba-rpc.mjs");
+      const container = flags.container;
+      const probeResults = [];
+
+      // P1: HEAD clean
+      let p1Passed = false;
+      let p1Detail = "";
+      if (taskBaseSha) {
+        const gitRev = await callTool("sandbox_exec", {
+          container_id: container,
+          commands: ["git rev-parse HEAD"],
+        });
+        const headSha = (gitRev?.output ?? "").trim();
+        if (headSha !== taskBaseSha) {
+          p1Detail = "HEAD " + headSha + " != base " + taskBaseSha + "; auto reset";
+          try {
+            await callTool("sandbox_exec", {
+              container_id: container,
+              commands: ["git reset --mixed " + taskBaseSha],
+            });
+            p1Passed = true;
+            p1Detail += " - reset OK";
+          } catch (resetErr) {
+            p1Detail += " - reset FAILED: " + String(resetErr);
+          }
+        } else {
+          p1Passed = true;
+          p1Detail = "HEAD matches base " + taskBaseSha;
+        }
+      } else {
+        p1Detail = "baseSha not recorded at task start; cannot check HEAD";
+      }
+      probeResults.push({ probe: "P1: HEAD clean", passed: p1Passed, detail: p1Detail });
+
+      // P2: verify gate (no skip flags)
+      const verifyResult = await callTool("verify_in_container", {
+        container_id: container,
+        path: ".",
+      });
+      const verifyPassed = verifyResult?.gate_passed === true;
+      probeResults.push({ probe: "P2: verify gate", passed: verifyPassed, detail: JSON.stringify(verifyResult) });
+
+      // P3: deliverables
+      const deliverables = parseDeliverables(text);
+      const statusResult = await callTool("sandbox_exec", {
+        container_id: container,
+        commands: ["git status --porcelain"],
+      });
+      const taskChangedPaths = parseChangedPaths(statusResult?.output ?? "");
+      const p3Result = checkDeliverablesProbe(deliverables, taskChangedPaths);
+      probeResults.push(p3Result);
+
+      job.probeResults = probeResults;
+      job.probesGreen = probeResults.every(function (p) { return p.passed; });
+    } catch (probeErr) {
+      job.probeResults = [{ probe: "task probes", passed: false, detail: String(probeErr) }];
+      job.probesGreen = false;
+    }
   }
-  return `${renderHeader(job)}${resultText || "(empty result)"}`;
+  saveJob(stateDir, job);
+
+  let taskOutput;
+  if (job.status !== "completed") {
+    taskOutput = `${renderHeader(job)}${job.error ?? ""}\nCheck /kusabi:status ${job.id} for details.`;
+  } else {
+    taskOutput = `${renderHeader(job)}${resultText || "(empty result)"}`;
+  }
+
+  // Append probe summary when --container
+  if (job.probeResults && job.probeResults.length > 0) {
+    taskOutput += "\n\nProbes:";
+    for (const p of job.probeResults) {
+      let detail = p.detail || "";
+      if (detail.length > 300) detail = detail.slice(0, 300) + "...";
+      taskOutput += "\n  " + p.probe + " — " + (p.passed ? "PASS" : "FAIL");
+      if (detail) taskOutput += " (" + detail + ")";
+    }
+  }
+
+  return taskOutput;
 }
 
 async function cmdExplain(cwd, { flags, text }) {
@@ -1865,6 +2094,9 @@ async function cmdChain(cwd, { flags, text }) {
     // ---- deterministic probes (via sunaba-rpc) ----
     let probesGreen = false;
     const probeResults = [];
+    let chainChangedPaths = [];
+    let chainStatusObserved = false;
+    const chainDeliverables = parseDeliverables(brief);
 
     try {
       const { callTool } = await import("./sunaba-rpc.mjs");
@@ -1907,6 +2139,16 @@ async function cmdChain(cwd, { flags, text }) {
       const verifyPassed = verifyResult?.gate_passed === true;
       probeResults.push({ probe: "P2: verify gate", passed: verifyPassed, detail: JSON.stringify(verifyResult) });
 
+      // P3: deliverables probe
+      const statusResult = await callTool("sandbox_exec", {
+        container_id: container,
+        commands: ["git status --porcelain"],
+      });
+      chainChangedPaths = parseChangedPaths(statusResult?.output ?? "");
+      chainStatusObserved = true;
+      const p3Result = checkDeliverablesProbe(chainDeliverables, chainChangedPaths);
+      probeResults.push(p3Result);
+
       probesGreen = probeResults.every(function(p) { return p.passed; });
     } catch (probeErr) {
       probeResults.push({ probe: "sunaba-rpc", passed: false, detail: String(probeErr) });
@@ -1916,74 +2158,89 @@ async function cmdChain(cwd, { flags, text }) {
     roundRecord.probesGreen = probesGreen;
     roundRecord.probeResults = probeResults;
 
-    // ---- review phase ----
-    const promptTemplate = fs.readFileSync(path.join(PLUGIN_ROOT, "prompts", "adversarial-review.md"), "utf8");
-    const schemaJson = JSON.parse(fs.readFileSync(path.join(PLUGIN_ROOT, "schemas", "review-output.schema.json"), "utf8"));
-    const reviewInput = [
-      "## Review target",
-      "",
-      "The artifact under review lives inside container `" + container + "`.",
-      "You may use the following Sunaba read/verify tools to inspect it:",
-      "- `read_file_range` - read file contents from the container",
-      "- `search_in_container` - grep/search within the container",
-      "- `verify_in_container` / `lint_in_container` / `type_check_in_container` - re-run the project's gates in the container",
-      "",
-      "Do NOT rely on host cwd git state; the actual changes are in the container.",
-    ].join("\n");
-    const priorFindings = previousRecord?.findingsText || "(none -- first review round)";
+    // ---- P3 empty-change: skip review, set probe-sourced discard verdict ----
+    let chainSkipReview = false;
+    if (chainStatusObserved && chainChangedPaths.length === 0 && chainDeliverables.length > 0) {
+      roundRecord.verdict = "discard";
+      roundRecord.verdictSource = "probe";
+      chainSkipReview = true;
+    }
 
-    const reviewPromptText = promptTemplate
-      .replaceAll("{{TARGET_LABEL}}", "container " + container + " changes")
-      .replaceAll("{{USER_FOCUS}}", brief)
-      .replaceAll("{{OUTPUT_SCHEMA}}", JSON.stringify(schemaJson))
-      .replaceAll("{{REVIEW_INPUT}}", reviewInput)
-      .replaceAll("{{PRIOR_FINDINGS}}", priorFindings);
+    // ---- review phase (skipped when change set empty) ----
+    let chainVerdict = roundRecord.verdict; // may already be set by probe skip above
+    let chainFindingsText = null;
+    let chainParsedReview = null;
+    let chainRepeatedAreas = false;
 
-    const reviewJob = await runPrompt({
-      cwd,
-      kind: "review",
-      title: "chain: " + chainId + " round " + round + " review",
-      promptText: reviewPromptText,
-      model,
-      agent: "kusabi-review",
-      tools: Object.fromEntries(WRITE_TOOL_NAMES.map(function(t) { return [t, false]; })),
-      timeoutS: 1800,
-      watchdogS: 900,
-    });
-    roundRecord.reviewJobId = reviewJob.job.id;
-    roundRecord.reviewUsage = reviewJob.job.usage || null;
+    if (!chainSkipReview) {
+      const promptTemplate = fs.readFileSync(path.join(PLUGIN_ROOT, "prompts", "adversarial-review.md"), "utf8");
+      const schemaJson = JSON.parse(fs.readFileSync(path.join(PLUGIN_ROOT, "schemas", "review-output.schema.json"), "utf8"));
+      const reviewInput = [
+        "## Review target",
+        "",
+        "The artifact under review lives inside container `" + container + "`.",
+        "You may use the following Sunaba read/verify tools to inspect it:",
+        "- `read_file_range` - read file contents from the container",
+        "- `search_in_container` - grep/search within the container",
+        "- `verify_in_container` / `lint_in_container` / `type_check_in_container` - re-run the project's gates in the container",
+        "",
+        "Do NOT rely on host cwd git state; the actual changes are in the container.",
+      ].join("\n");
+      const priorFindings = previousRecord?.findingsText || "(none -- first review round)";
 
-    // ---- parse review result ----
-    const reviewResultText = reviewJob.resultText || "";
-    const stripped = reviewResultText.replace(/\s*VERDICT:\s*(approve-partial|approve|needs-attention|discard)\s*$/i, "");
-    const parsedReview = extractJson(stripped);
-    const verdict = (parsedReview && parsedReview.verdict) || "needs-attention";
-    roundRecord.verdict = verdict;
-    roundRecord.findingsText = (parsedReview && parsedReview.findings)
-      ? parsedReview.findings.map(function(f) { return "[" + f.severity + "] " + f.title + " (" + f.file + ":" + f.line_start + ")"; }).join("\n")
-      : "(no structured findings)";
+      const reviewPromptText = promptTemplate
+        .replaceAll("{{TARGET_LABEL}}", "container " + container + " changes")
+        .replaceAll("{{USER_FOCUS}}", brief)
+        .replaceAll("{{OUTPUT_SCHEMA}}", JSON.stringify(schemaJson))
+        .replaceAll("{{REVIEW_INPUT}}", reviewInput)
+        .replaceAll("{{PRIOR_FINDINGS}}", priorFindings);
 
-    // ---- determine repeated areas ----
-    let repeatedAreas = false;
-    if (previousRecord?.findingsText && parsedReview?.findings) {
-      var prevFiles = new Set(
-        (previousRecord.findingsText.match(/\([^:]+/g) || []).map(function(s) { return s.slice(1); }),
-      );
-      for (var fi = 0; fi < parsedReview.findings.length; fi++) {
-        if (prevFiles.has(parsedReview.findings[fi].file)) {
-          repeatedAreas = true;
-          break;
+      const reviewJob = await runPrompt({
+        cwd,
+        kind: "review",
+        title: "chain: " + chainId + " round " + round + " review",
+        promptText: reviewPromptText,
+        model,
+        agent: "kusabi-review",
+        tools: Object.fromEntries(WRITE_TOOL_NAMES.map(function(t) { return [t, false]; })),
+        timeoutS: 1800,
+        watchdogS: 900,
+      });
+      roundRecord.reviewJobId = reviewJob.job.id;
+      roundRecord.reviewUsage = reviewJob.job.usage || null;
+
+      // ---- parse review result ----
+      const reviewResultText = reviewJob.resultText || "";
+      const stripped = reviewResultText.replace(/\s*VERDICT:\s*(approve-partial|approve|needs-attention|discard)\s*$/i, "");
+      chainParsedReview = extractJson(stripped);
+      chainVerdict = (chainParsedReview && chainParsedReview.verdict) || "needs-attention";
+      roundRecord.verdict = chainVerdict;
+      chainFindingsText = (chainParsedReview && chainParsedReview.findings)
+        ? chainParsedReview.findings.map(function(f) { return "[" + f.severity + "] " + f.title + " (" + f.file + ":" + f.line_start + ")"; }).join("\n")
+        : "(no structured findings)";
+      roundRecord.findingsText = chainFindingsText;
+
+      // ---- determine repeated areas ----
+      if (previousRecord?.findingsText && chainParsedReview?.findings) {
+        var prevFiles = new Set(
+          (previousRecord.findingsText.match(/\([^:]+/g) || []).map(function(s) { return s.slice(1); }),
+        );
+        for (var fi = 0; fi < chainParsedReview.findings.length; fi++) {
+          if (prevFiles.has(chainParsedReview.findings[fi].file)) {
+            chainRepeatedAreas = true;
+            break;
+          }
         }
       }
     }
 
     // ---- derive disposition ----
     const disposition = deriveDisposition({
-      verdict: verdict,
+      verdict: chainVerdict || "needs-attention",
       probesGreen: probesGreen,
       round: round,
       maxRounds: maxRounds,
-      repeatedAreas: repeatedAreas,
+      repeatedAreas: chainRepeatedAreas,
     });
     roundRecord.disposition = disposition;
 
@@ -2006,6 +2263,11 @@ async function cmdChain(cwd, { flags, text }) {
       }
     }
 
+    // When review was skipped, ensure findingsText is set
+    if (chainSkipReview && !roundRecord.findingsText) {
+      roundRecord.findingsText = "(no review — change set was empty)";
+    }
+
     writeJson(path.join(chainDir, "chain.json"), {
       chainId: chainId,
       container: container,
@@ -2020,7 +2282,10 @@ async function cmdChain(cwd, { flags, text }) {
     });
 
     if (disposition.disposition === "accept") {
-      return "Chain " + chainId + " accepted at round " + round + ".\n\n" + renderReview(parsedReview, reviewResultText);
+      const acceptReviewText = chainParsedReview
+        ? renderReview(chainParsedReview, chainFindingsText || "")
+        : "(no review text available)";
+      return "Chain " + chainId + " accepted at round " + round + ".\n\n" + acceptReviewText;
     }
 
     if (disposition.disposition === "escalate") {
@@ -2184,7 +2449,7 @@ function usage() {
     "  --base <ref>, --model <provider/model>, --agent <id>, --phase <name>",
     "  --session <id>, --timeout <s>, --watchdog <s>, --deny <tools>",
     "  --brief-file <path> (task / chain: read the brief from a file; exclusive with inline text)",
-    "  --container <cid> (chain: container to run probes in)",
+    "  --container <cid> (chain/task: container to run deterministic probes in)",
     "  --keep-serve (chain: keep the serve alive after chain finishes)",
     "  --prior <text> (review: prior findings for anti-ratchet)",
     "  --max-rounds <N> (chain: max rounds, default 3)",
