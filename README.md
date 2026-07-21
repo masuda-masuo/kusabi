@@ -67,6 +67,17 @@ Run `/kusabi:setup` or `kusabi-companion.mjs install-agents` to copy them to `OP
 
 The `kusabi:opencode-worker` subagent forwards delegation requests to `task` so the main Claude thread never carries the work.
 
+## Skills
+
+| Skill | What it is for |
+| --- | --- |
+| `delegate` | The orchestrator-side discipline: what belongs in a brief, how to inspect what comes back, what never leaves the orchestrator. Load it before starting an implementation task. |
+| `kusabi-result-handling` | Internal rule for relaying worker output faithfully (not user-invocable). |
+
+The `delegate` skill intentionally points at `--help` and `docs/DESIGN.md` for the CLI
+surface and the chain semantics instead of restating them, so that improving kusabi does
+not silently make the skill wrong.
+
 Every result includes the opencode session ID; continue the same session in the opencode TUI with `opencode -s <session-id>`.
 
 ## Model configuration
