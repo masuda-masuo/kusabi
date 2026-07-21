@@ -1099,10 +1099,16 @@ function parseTranscript(filePath) {
  * @returns {string} Concatenated text, trimmed.
  */
 export function extractAssistantText(records, { lastN = 1, includeTools = false } = {}) {
-  // Walk backwards to find indices of the last N assistant records.
+  // Walk backwards to find indices of the last N assistant records that
+  // actually carry a text block.  In real transcripts each content block is
+  // its own record, so the trailing assistant records of an in-progress turn
+  // are tool_use-only and must be skipped, not treated as "no text found".
   const assistantIndices = [];
   for (let i = records.length - 1; i >= 0 && assistantIndices.length < lastN; i--) {
-    if (records[i].type === "assistant") {
+    if (records[i].type !== "assistant") continue;
+    const content = records[i].message?.content;
+    if (!Array.isArray(content)) continue;
+    if (content.some(function (b) { return b.type === "text" && b.text; })) {
       assistantIndices.unshift(i);
     }
   }

@@ -1613,6 +1613,16 @@ describe("extractAssistantText", () => {
     assert.ok(!result.includes("done"));
   });
 
+  it("skips trailing tool_use-only assistant records (in-progress turn)", () => {
+    const records = [
+      makeRecord("assistant", [textBlock("the actual last message")]),
+      makeRecord("user", [{ type: "tool_result", content: "output" }]),
+      makeRecord("assistant", [toolUseBlock("bash", { cmd: "ls" })]),
+      makeRecord("assistant", [toolUseBlock("read", { file: "x" })]),
+    ];
+    assert.equal(extractAssistantText(records), "the actual last message");
+  });
+
   it("reads tool_result payloads in the real transcript shape (content array / string)", () => {
     const records = [
       makeRecord("assistant", [textBlock("checking output")]),
