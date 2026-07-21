@@ -730,6 +730,166 @@ export function renderReview(parsed, rawText) {
   return lines.join("\n");
 }
 
+/**
+ * Render a compact plain-text digest of a chain for the orchestrator.
+ * Pure function: takes chain data and round records, returns formatted string.
+ * Never throws on absent fields — missing optional fields are simply omitted.
+ *
+ * @param {object|null} chain - Parsed chain.json object (may have partial fields)
+ * @param {Array<object>} rounds - Parsed round-N.json objects (sorted by round number)
+ * @returns {string} Formatted digest
+ */
+export function renderChainShow(chain, rounds, unreadable = []) {
+  const lines = [];
+  // Tolerate null/undefined rounds — treat as empty
+  const safeRounds = rounds ?? [];
+
+  // Header
+  lines.push(`chain: ${chain?.chainId || "(unknown)"}`);
+  // Corrupt round records must be surfaced, never silently omitted —
+  // a digest that hides evidence defeats its purpose.
+  if (unreadable.length > 0) {
+    lines.push(`!! unreadable round records (excluded below): ${unreadable.join(", ")}`);
+  }
+
+  // Status/outcome
+  const lastRound = safeRounds.length > 0 ? safeRounds[safeRounds.length - 1] : null;
+  if (lastRound?.disposition?.disposition === "accept") {
+    lines.push(`status: accepted at round ${lastRound.round}`);
+  } else if (lastRound?.disposition?.disposition === "escalate") {
+    lines.push(`status: escalated at round ${lastRound.round} (${lastRound.disposition.reason || "unknown"})`);
+  } else {
+    lines.push("status: incomplete");
+  }
+
+  // Orchestrator model when present
+  if (chain?.orchestrator?.model) {
+    lines.push(`orchestrator: ${chain.orchestrator.model}`);
+  }
+
+  // Brief first line only (the full brief can be read from chain.json)
+  if (chain?.brief) {
+    const briefLine = chain.brief.split("\n")[0].trim();
+    lines.push(`brief: ${briefLine.slice(0, 80)}${briefLine.length > 80 ? "..." : ""}`);
+  }
+
+  // Container if recorded
+  if (chain?.container) {
+    lines.push(`container: ${chain.container}`);
+  }
+
+  lines.push("");
+
+  // Per round
+  for (const round of safeRounds) {
+    lines.push(`Round ${round.round}`);
+
+    // Model entry(+variant)
+    if (round.modelEntry) {
+      lines.push(`  model: ${round.modelEntry}`);
+    }
+
+    // Verdict
+    if (round.verdict) {
+      lines.push(`  verdict: ${round.verdict}`);
+    }
+
+    // Disposition + reason
+    if (round.disposition) {
+      const disp = round.disposition.disposition || "unknown";
+      const reason = round.disposition.reason ? ` (${round.disposition.reason})` : "";
+      lines.push(`  disposition: ${disp}${reason}`);
+    }
+
+    // Resume method
+    if (round.resumeMethod) {
+      const resumeType = round.resumeMethod.type || "unknown";
+      const resumeDetail = round.resumeMethod.detail ? `: ${round.resumeMethod.detail}` : "";
+      lines.push(`  resume: ${resumeType}${resumeDetail}`);
+    }
+
+    // Probe results
+    const probes = round.probeResults || [];
+    if (probes.length > 0) {
+      for (const probe of probes) {
+        const status = probe.passed ? "PASS" : "FAIL";
+        let detailSuffix = "";
+        if (probe.detail) {
+          let parsed = null;
+          try { parsed = JSON.parse(probe.detail); } catch { /* plain text */ }
+          if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+            // JSON detail: extract structured fields
+            const parts = [];
+            if (parsed.gate_passed !== undefined) {
+              parts.push(`gate_passed=${parsed.gate_passed}`);
+            }
+            if (parsed.diff_summary && typeof parsed.diff_summary === "object") {
+              const ds = parsed.diff_summary;
+              const countParts = [];
+              if (ds.changed_files !== undefined) countParts.push(`changed=${ds.changed_files}`);
+              if (ds.untracked !== undefined) countParts.push(`untracked=${ds.untracked}`);
+              if (countParts.length > 0) parts.push(countParts.join(", "));
+            }
+            if (parts.length > 0) {
+              detailSuffix = ` (${parts.join(", ")})`;
+            }
+          } else {
+            // Plain text: show as-is, truncated for long strings
+            const text = String(probe.detail);
+            const truncated = text.length > 150 ? text.slice(0, 150) + "..." : text;
+            detailSuffix = ` (${truncated})`;
+          }
+        }
+        lines.push(`    ${probe.probe || "probe"} — ${status}${detailSuffix}`);
+      }
+    }
+
+    // findingsText verbatim, untruncated
+    if (round.findingsText) {
+      lines.push(`  findings:`);
+      const findingLines = round.findingsText.split("\n");
+      for (const fl of findingLines) {
+        // Indent each finding line with two spaces
+        lines.push(`  ${fl}`);
+      }
+    }
+
+    // Implement usage
+    if (round.implementUsage?.available) {
+      const u = round.implementUsage;
+      const parts = [`implement: ${u.input || 0} in / ${u.output || 0} out`];
+      if (u.reasoning) parts.push(`${u.reasoning} reasoning`);
+      if (u.cost !== undefined) parts.push(`cost=$${u.cost}`);
+      lines.push(`  ${parts.join(", ")}`);
+    }
+
+    // Review usage
+    if (round.reviewUsage?.available) {
+      const u = round.reviewUsage;
+      const parts = [`review: ${u.input || 0} in / ${u.output || 0} out`];
+      if (u.reasoning) parts.push(`${u.reasoning} reasoning`);
+      if (u.cost !== undefined) parts.push(`cost=$${u.cost}`);
+      lines.push(`  ${parts.join(", ")}`);
+    }
+
+    lines.push("");
+  }
+
+  // Chain-wide totals
+  if (chain?.chainTotals) {
+    const t = chain.chainTotals;
+    const parts = [`totals: ${t.input || 0} in / ${t.output || 0} out`];
+    if (t.reasoning) parts.push(`${t.reasoning} reasoning`);
+    if (t.cacheRead !== undefined || t.cacheWrite !== undefined) {
+      parts.push(`cacheRead=${t.cacheRead || 0} cacheWrite=${t.cacheWrite || 0}`);
+    }
+    if (t.cost !== undefined) parts.push(`cost=$${t.cost}`);
+    lines.push(parts.join(", "));
+  }
+
+  return lines.join("\n");
+}
+
 // ---------------------------------------------------------------------------
 // git context for review
 // ---------------------------------------------------------------------------
@@ -1914,7 +2074,89 @@ async function cmdChain(cwd, { flags, text }) {
       } catch { /* best-effort */ }
     }
   }
-}// ---------------------------------------------------------------------------
+}
+
+// ---------------------------------------------------------------------------
+// chain-show
+// ---------------------------------------------------------------------------
+
+/**
+ * Find the newest chain directory (by mtime) under a chains directory.
+ * Exported for testing.
+ *
+ * @param {string} chainsDir - Absolute path to the chains directory.
+ * @returns {string|null} The name of the newest chain dir, or null if none found.
+ */
+export function newestChainDir(chainsDir) {
+  if (!fs.existsSync(chainsDir)) return null;
+  const entries = fs.readdirSync(chainsDir)
+    .map((name) => {
+      try {
+        const fullPath = path.join(chainsDir, name);
+        const stat = fs.statSync(fullPath);
+        return { name, mtime: stat.mtimeMs, isDir: stat.isDirectory() };
+      } catch {
+        return null;
+      }
+    })
+    .filter(Boolean)
+    .filter((e) => e.isDir && e.name.startsWith("chain-"))
+    .sort((a, b) => {
+      const mtimeDiff = b.mtime - a.mtime;
+      if (mtimeDiff !== 0) return mtimeDiff;
+      // Tiebreaker: lexicographic by name for deterministic selection
+      return a.name.localeCompare(b.name);
+    });
+  return entries.length > 0 ? entries[0].name : null;
+}
+
+function cmdChainShow(cwd, { text }) {
+  const stateDir = stateDirFor(cwd);
+  const chainsDir = path.join(stateDir, "chains");
+
+  if (!fs.existsSync(chainsDir)) {
+    throw new Error("no chains directory found for this workspace");
+  }
+
+  let chainId = text.trim() || null;
+  if (!chainId) {
+    chainId = newestChainDir(chainsDir);
+    if (!chainId) {
+      throw new Error("no chains found for this workspace");
+    }
+  }
+
+  const chainDir = path.join(chainsDir, chainId);
+  if (!fs.existsSync(chainDir)) {
+    throw new Error(`chain not found: ${chainId}`);
+  }
+
+  const chainJson = readJson(path.join(chainDir, "chain.json"));
+  if (!chainJson) {
+    throw new Error(`chain.json not found or invalid for ${chainId}`);
+  }
+
+  // Read all round-*.json files sorted by round number (numeric sort)
+  const roundFiles = fs.readdirSync(chainDir)
+    .filter((f) => f.startsWith("round-") && f.endsWith(".json"))
+    .sort((a, b) => {
+      const na = Number(a.match(/round-(\d+)\.json$/)?.[1]) ?? 0;
+      const nb = Number(b.match(/round-(\d+)\.json$/)?.[1]) ?? 0;
+      return na - nb;
+    });
+
+  const rounds = [];
+  const unreadable = [];
+  for (const f of roundFiles) {
+    const data = readJson(path.join(chainDir, f));
+    if (data) rounds.push(data);
+    else unreadable.push(f);
+  }
+
+  return renderChainShow(chainJson, rounds, unreadable);
+}
+
+// ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
 
@@ -1927,6 +2169,7 @@ function usage() {
     "  task       Run an opencode task",
     "  review     Run an adversarial review of working-tree changes",
     "  chain      Run implement→review→rework chain until acceptance or escalate",
+    "  chain-show Print a compact plain-text digest of a chain (read-only, no LLM)",
     "  status     List recent jobs or show one by ID",
     "  result     Show completed job result (latest, or by ID)",
     "  cancel     Cancel a running job",
@@ -2009,10 +2252,13 @@ async function main() {
       return cmdSalvage(cwd, parsed);
     case "chain":
       return cmdChain(cwd, parsed);
+    case "chain-show":
+    case "chainShow":
+      return cmdChainShow(cwd, parsed);
     case "explain":
       return cmdExplain(cwd, parsed);
     default:
-      throw new Error(`unknown subcommand: ${subcommand ?? "(none)"}. Use setup|task|review|chain|status|result|cancel|serve-stop|install-agents|salvage|explain`);
+      throw new Error(`unknown subcommand: ${subcommand ?? "(none)"}. Use setup|task|review|chain|chain-show|status|result|cancel|serve-stop|install-agents|salvage|explain`);
   }
 }
 

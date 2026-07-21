@@ -8,7 +8,9 @@ import {
   decidePermission,
   extractJson,
   renderReview,
+  renderChainShow,
   renderJobLine,
+  newestChainDir,
   parseArgs,
   parseModel,
   parseOrchestratorSignature,
@@ -425,6 +427,310 @@ describe("renderReview discard token", () => {
     const result = renderReview(null, rawText);
     assert.match(result, /recovered from terminal token/);
     assert.match(result, /discard/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// renderChainShow — chain-show pure rendering helper
+// ---------------------------------------------------------------------------
+
+describe("renderChainShow", () => {
+  const sampleChain = {
+    chainId: "chain-abc123",
+    container: "test-container-one",
+    orchestrator: { model: "anthropic/claude-4", session: "ses_xyz", date: "2026-07-22" },
+    brief: "Implement feature X\n\nThis is a longer brief about feature X.",
+    chainTotals: { input: 730, output: 750, reasoning: 50, cacheRead: 1500, cacheWrite: 0, cost: 0.005 },
+  };
+
+  const sampleRounds = [
+    {
+      round: 1,
+      modelEntry: "opencode-go/deepseek-v4-flash",
+      verdict: "needs-attention",
+      disposition: { disposition: "rework", reason: "needs-attention" },
+      resumeMethod: { type: "continue_session" },
+      probeResults: [
+        { probe: "P1: HEAD clean", passed: true, detail: "HEAD matches base test-container-one" },
+        { probe: "P2: verify gate", passed: false, detail: JSON.stringify({ gate_passed: false }) },
+      ],
+      findingsText: "[low] Minor style issue (src/foo.js:10)\n[high] Missing error handling (src/bar.js:42)",
+      implementUsage: { available: true, input: 250, output: 300, reasoning: 50, cost: 0.002 },
+      reviewUsage: { available: true, input: 100, output: 200, cost: 0.001 },
+    },
+    {
+      round: 2,
+      modelEntry: "opencode-go/deepseek-v4-pro",
+      verdict: "approve",
+      disposition: { disposition: "accept" },
+      resumeMethod: { type: "continue_session" },
+      probeResults: [
+        { probe: "P1: HEAD clean", passed: true, detail: "HEAD matches base test-container-one" },
+        { probe: "P2: verify gate", passed: true, detail: JSON.stringify({ gate_passed: true, diff_summary: { changed_files: 3, untracked: 1 } }) },
+      ],
+      findingsText: "[low] Minor style issue (src/foo.js:10)",
+      implementUsage: { available: true, input: 300, output: 150, cost: 0.0015 },
+      reviewUsage: { available: true, input: 80, output: 100, cost: 0.0005 },
+    },
+  ];
+
+  it("surfaces unreadable round records instead of silently omitting them", () => {
+    const result = renderChainShow(sampleChain, sampleRounds, ["round-3.json"]);
+    assert.match(result, /!! unreadable round records \(excluded below\): round-3\.json/);
+    // absent by default
+    const clean = renderChainShow(sampleChain, sampleRounds);
+    assert.ok(!clean.includes("unreadable round records"));
+  });
+
+  it("renders header with chain id, status, orchestrator, brief, container", () => {
+    const result = renderChainShow(sampleChain, sampleRounds);
+    assert.match(result, /chain: chain-abc123/);
+    assert.match(result, /status: accepted at round 2/);
+    assert.match(result, /orchestrator: anthropic\/claude-4/);
+    assert.match(result, /brief: Implement feature X/);
+    assert.match(result, /container: test-container-one/);
+  });
+
+  it("renders per-round fields: model, verdict, disposition, resume, probes, usage", () => {
+    const result = renderChainShow(sampleChain, sampleRounds);
+    // Round 1
+    assert.match(result, /Round 1/);
+    assert.match(result, /model: opencode-go\/deepseek-v4-flash/);
+    assert.match(result, /verdict: needs-attention/);
+    assert.match(result, /disposition: rework \(needs-attention\)/);
+    assert.match(result, /resume: continue_session/);
+    assert.match(result, /P1: HEAD clean — PASS/);
+    assert.match(result, /P2: verify gate — FAIL/);
+    assert.match(result, /implement: 250 in \/ 300 out.*cost=\$0\.002/);
+    assert.match(result, /review: 100 in \/ 200 out.*cost=\$0\.001/);
+    // Round 2
+    assert.match(result, /Round 2/);
+    assert.match(result, /model: opencode-go\/deepseek-v4-pro/);
+    assert.match(result, /verdict: approve/);
+    assert.match(result, /disposition: accept/);
+    assert.match(result, /P2: verify gate — PASS.*gate_passed=true.*changed=3.*untracked=1/);
+  });
+
+  it("findingsText appears verbatim in the output", () => {
+    const result = renderChainShow(sampleChain, sampleRounds);
+    assert.ok(result.includes("[low] Minor style issue (src/foo.js:10)"));
+    assert.ok(result.includes("[high] Missing error handling (src/bar.js:42)"));
+  });
+
+  it("renders totals line", () => {
+    const result = renderChainShow(sampleChain, sampleRounds);
+    assert.match(result, /totals: 730 in \/ 750 out.*reasoning.*cacheRead=1500.*cost=\$0\.005/);
+  });
+
+  it("tolerates missing optional fields (no orchestrator, no usage, no probe detail)", () => {
+    const minimalChain = { chainId: "chain-min", brief: "Minimal chain" };
+    const minimalRounds = [
+      {
+        round: 1,
+        verdict: "approve",
+        disposition: { disposition: "accept" },
+        resumeMethod: { type: "continue_session" },
+        findingsText: "All good.",
+      },
+    ];
+    const result = renderChainShow(minimalChain, minimalRounds);
+    // Should not throw, should render basic info
+    assert.match(result, /chain: chain-min/);
+    assert.match(result, /status: accepted at round 1/);
+    assert.match(result, /Round 1/);
+    assert.ok(result.includes("findings:\n  All good."));
+    // No orchestrator line, no container line, no usage lines
+    assert.doesNotMatch(result, /orchestrator:/);
+    assert.doesNotMatch(result, /container:/);
+    assert.doesNotMatch(result, /implement:/);
+    assert.doesNotMatch(result, /review:/);
+  });
+
+  it("renders without probe results when probes are absent", () => {
+    const chain = { chainId: "chain-noprobe" };
+    const rounds = [
+      {
+        round: 1,
+        verdict: "needs-attention",
+        disposition: { disposition: "rework", reason: "needs-attention" },
+        resumeMethod: { type: "continue_session" },
+      },
+    ];
+    const result = renderChainShow(chain, rounds);
+    assert.match(result, /chain: chain-noprobe/);
+    assert.match(result, /Round 1/);
+    // No probes: no PASS/FAIL probe result lines should appear
+    assert.doesNotMatch(result, /— PASS/);
+    assert.doesNotMatch(result, /— FAIL/);
+  });
+
+  it("renders escalated status correctly", () => {
+    const chain = { chainId: "chain-escalated" };
+    const rounds = [
+      {
+        round: 1,
+        verdict: "discard",
+        disposition: { disposition: "escalate", reason: "reviewer discarded the work" },
+        resumeMethod: { type: "continue_session" },
+      },
+    ];
+    const result = renderChainShow(chain, rounds);
+    assert.match(result, /status: escalated at round 1 \(reviewer discarded the work\)/);
+  });
+
+  it("renders incomplete status when chain has no rounds", () => {
+    const result = renderChainShow({ chainId: "chain-empty" }, []);
+    assert.match(result, /chain: chain-empty/);
+    assert.match(result, /status: incomplete/);
+  });
+
+  it("probe detail with diff_summary shows counts", () => {
+    const chain = { chainId: "chain-diff" };
+    const rounds = [
+      {
+        round: 1,
+        verdict: "approve",
+        disposition: { disposition: "accept" },
+        resumeMethod: { type: "continue_session" },
+        probeResults: [
+          { probe: "P2: verify gate", passed: true, detail: JSON.stringify({
+            gate_passed: true,
+            diff_summary: { changed_files: 5, untracked: 2 },
+          })},
+        ],
+      },
+    ];
+    const result = renderChainShow(chain, rounds);
+    assert.match(result, /P2: verify gate — PASS.*changed=5.*untracked=2/);
+  });
+
+  it("probe detail as JSON without diff_summary shows gate_passed only", () => {
+    const chain = { chainId: "chain-gateonly" };
+    const rounds = [
+      {
+        round: 1,
+        verdict: "approve",
+        disposition: { disposition: "accept" },
+        resumeMethod: { type: "continue_session" },
+        probeResults: [
+          { probe: "P2: verify gate", passed: false, detail: JSON.stringify({ gate_passed: false }) },
+        ],
+      },
+    ];
+    const result = renderChainShow(chain, rounds);
+    assert.match(result, /P2: verify gate — FAIL.*gate_passed=false/);
+    // No count parts when diff_summary absent
+    assert.doesNotMatch(result, /changed=/);
+    assert.doesNotMatch(result, /untracked=/);
+  });
+
+  it("renders model with variant suffix when present", () => {
+    const chain = { chainId: "chain-variant" };
+    const rounds = [
+      {
+        round: 1,
+        modelEntry: "opencode-go/deepseek-v4-flash:max",
+        verdict: "approve",
+        disposition: { disposition: "accept" },
+        resumeMethod: { type: "continue_session" },
+      },
+    ];
+    const result = renderChainShow(chain, rounds);
+    assert.match(result, /model: opencode-go\/deepseek-v4-flash:max/);
+  });
+
+  it("does not throw when rounds is null", () => {
+    const chain = { chainId: "chain-nullrounds" };
+    const result = renderChainShow(chain, null);
+    assert.match(result, /chain: chain-nullrounds/);
+    assert.match(result, /status: incomplete/);
+  });
+
+  it("does not throw when rounds is undefined", () => {
+    const chain = { chainId: "chain-undefinedrounds" };
+    const result = renderChainShow(chain, undefined);
+    assert.match(result, /chain: chain-undefinedrounds/);
+    assert.match(result, /status: incomplete/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// newestChainDir — chain directory selection by mtime
+// ---------------------------------------------------------------------------
+
+describe("newestChainDir", () => {
+  let tmpDir;
+
+  beforeEach(() => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-test-chaindir-"));
+  });
+
+  afterEach(() => {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it("returns the newest chain dir by mtime", () => {
+    const oldDir = path.join(tmpDir, "chain-old");
+    const newDir = path.join(tmpDir, "chain-new");
+    fs.mkdirSync(oldDir, { recursive: true });
+    fs.mkdirSync(newDir, { recursive: true });
+    const oldTime = new Date("2020-01-01").getTime();
+    fs.utimesSync(oldDir, oldTime / 1000, oldTime / 1000);
+    const result = newestChainDir(tmpDir);
+    assert.equal(result, "chain-new");
+  });
+
+  it("returns null when chainsDir does not exist", () => {
+    const result = newestChainDir(path.join(tmpDir, "nonexistent"));
+    assert.equal(result, null);
+  });
+
+  it("returns null when no chain-* directories exist", () => {
+    fs.mkdirSync(path.join(tmpDir, "some-other-dir"), { recursive: true });
+    const result = newestChainDir(tmpDir);
+    assert.equal(result, null);
+  });
+
+  it("returns null for empty directory", () => {
+    const result = newestChainDir(tmpDir);
+    assert.equal(result, null);
+  });
+
+  it("only matches chain-* directories", () => {
+    fs.mkdirSync(path.join(tmpDir, "not_a_chain_dir"), { recursive: true });
+    fs.mkdirSync(path.join(tmpDir, "chain-real"), { recursive: true });
+    const result = newestChainDir(tmpDir);
+    assert.equal(result, "chain-real");
+  });
+
+  it("picks newest among multiple chain dirs", () => {
+    const c1 = path.join(tmpDir, "chain-001");
+    const c2 = path.join(tmpDir, "chain-002");
+    const c3 = path.join(tmpDir, "chain-003");
+    fs.mkdirSync(c1, { recursive: true });
+    fs.mkdirSync(c2, { recursive: true });
+    fs.mkdirSync(c3, { recursive: true });
+    const t1 = new Date("2020-06-01").getTime();
+    const t2 = new Date("2020-06-02").getTime();
+    const t3 = new Date("2020-06-03").getTime();
+    fs.utimesSync(c1, t1 / 1000, t1 / 1000);
+    fs.utimesSync(c2, t2 / 1000, t2 / 1000);
+    fs.utimesSync(c3, t3 / 1000, t3 / 1000);
+    const result = newestChainDir(tmpDir);
+    assert.equal(result, "chain-003");
+  });
+
+  it("uses lexicographic tiebreaker when mtimes are identical", () => {
+    const cA = path.join(tmpDir, "chain-aaa");
+    const cB = path.join(tmpDir, "chain-bbb");
+    fs.mkdirSync(cA, { recursive: true });
+    fs.mkdirSync(cB, { recursive: true });
+    const sameTime = new Date("2020-01-01").getTime();
+    fs.utimesSync(cA, sameTime / 1000, sameTime / 1000);
+    fs.utimesSync(cB, sameTime / 1000, sameTime / 1000);
+    const result = newestChainDir(tmpDir);
+    // Both have same mtime, "chain-aaa" sorts before "chain-bbb" lexicographically
+    assert.equal(result, "chain-aaa");
   });
 });
 
