@@ -1,7 +1,7 @@
 # kusabi Design Document
 
 Last updated: 2026-07-22
-Status: Design finalized + field-verified up to the phase chain, auto-chain (chain subcommand + sunaba-rpc) **implemented / reflected in main**. Decision 5 (accept-with-followup, §9.2) **implemented**. Decision 4 (strategist) + Stages C/D are planned (see #36).
+Status: Design finalized + field-verified up to the phase chain, auto-chain (chain subcommand + sunaba-rpc) **implemented / reflected in main**. Decision 5 (accept-with-followup, §9.2) **implemented**. Decision 4 (strategist, §9.1) **implemented**. Stages C/D are planned (see #36).
 
 ## 1. Purpose and positioning
 
@@ -141,7 +141,8 @@ Pure function `deriveDisposition({verdict, probesGreen, round, maxRounds, repeat
 | approve-partial | — | — | **escalate** | Unverified items remain, orchestrator decides |
 | needs-attention | true | all findings low/medium (no critical/high) | **accept-with-followup** | Economic cutoff: see Decision 5 (§9.2) |
 | needs-attention | — | repeatedAreas=false | rework | Fix and re-review |
-| needs-attention | — | repeatedAreas=true | **escalate** | Same file area flagged 2 rounds in a row = stalled |
+| needs-attention | — | repeatedAreas=true + strategizeEligible=true | **strategize** | First stall: structural re-diagnosis before next rework (§9.1) |
+| needs-attention | — | repeatedAreas=true + strategizeEligible≠true | **escalate** | Same file area flagged 2 rounds in a row = stalled |
 | discard | — | — | **escalate** | Reviewer deemed it discardable |
 | — | — | round ≥ maxRounds and not accepted | **escalate** | Max rounds reached |
 
@@ -149,8 +150,6 @@ accept-with-followup misuse guards:
 - Severity comes from the reviewer's separate session (not the implementer)
 - probesGreen must be true (mechanical checks passed)
 - The follow-up draft always surfaces to the orchestrator (never posted automatically)
-
-A strategist stage (§9.1) may be inserted between rework → escalate (Stage B, not implemented).
 
 #### 3.5.5 Restart method and recording
 
@@ -240,15 +239,20 @@ Container management tools (`sandbox_initialize` / `sandbox_stop`, etc.) are als
 2. **Real issue delegation (shiori#210)**: Flash identified root cause (rg omits `FILE:` prefix with a single file argument) → fix + regression test → checkpoint → verify → structured report in 343s. Inspection/acceptance by the orchestrator produced 3 findings (over-scoped verify report / hacky fix / user-input error with rel_path).
 3. **Pro finishing re-delegation**: Findings consolidated into a brief and re-delegated to Pro in 173s. Correctly implemented `rg -H`, path normalization, and repo-wide verify (422/422). Published as shiori PR #274.
 
-## 9. Auto-chain expansion plan (not implemented)
+## 9. Auto-chain expansion plan (implemented stages)
 
-The following content is a **plan** agreed in the "design confirmation before starting" comment (2026-07-19) on issue #36. **NOT implemented in current main.**
+The following content is derived from the design agreed in the "design confirmation before starting" comment (2026-07-19) on issue #36. Decisions 4 and 5 are implemented in current main; Stages C/D remain future work.
 
-### 9.1 Decision 4: strategist stage (stall countermeasure) — Stage B (planned)
+### 9.1 Decision 4: strategist stage (stall countermeasure) — **implemented**
 
-Add `strategize` to `deriveDisposition`: when repeatedAreas is detected, allow one strategist stage before escalate (second stall → escalate). Reuses kusabi-investigate with a dedicated template for root-cause diagnosis (1–3 sentences) + outputs "WHAT (acceptance criteria) stays the same, change HOW structurally — one concrete suggestion". That suggestion is passed to the next rework round together with findings.
+Implemented in `plugins/kusabi/scripts/kusabi-companion.mjs`:
 
-Reference: issue #36 comment "Decision 4: add strategist stage as an intermediate form of escalate in Stage B"
+- `deriveDisposition` accepts an optional `strategizeEligible` boolean. When `needs-attention` + `repeatedAreas` + `strategizeEligible === true`, returns `{ disposition: "strategize", reason: "same file area flagged twice; structural re-diagnosis before next rework" }`. On the second stagnation (strategized=true), escalates as before.
+- `renderStrategistPrompt` is an exported pure function that builds the prompt for the strategist: acceptance criteria + findings from the last two rounds + one-structural-change instruction.
+- On `strategize` disposition, the chain dispatches ONE extra job (kind: "strategist") with agent `kusabi-investigate` and `tools: reviewDenyTools()`. Records `strategistJobId`, `strategistUsage`, and `strategistRecommendation` on the round record.
+- Sets chain-level `strategized: true` persisted in `chain.json`. The next rework round includes the recommendation under `## Strategist recommendation (structural change for this rework)` and starts a FRESH session via checkpoint_restore (anchoring break per §3.4).
+- The strategist does not consume its own round number; normal round accounting applies to the rework. The max-rounds hard limit still applies unchanged.
+- `chain-show` renders the strategist round data: model/usage line and the recommendation verbatim.
 
 ### 9.2 Decision 5: accept-with-followup (economic cutoff) — **implemented**
 
@@ -276,7 +280,7 @@ Reference: issue #36 comment "Decision 5: accept-with-followup (economic cutoff 
 | Stage | Content | Prerequisite |
 |---|---|---|
 | **B** | Brief-declaration probes: `kind: refactor` / `baseline_collected: N` format. Migration byte identity (P5) | Stage A stable operation |
-| **B** | Implement Decision 5 (accept-with-followup) — **done**. Decision 4 (strategist stage) remains future work | Stage A |
+| **B** | Decision 5 (accept-with-followup) — **done**. Decision 4 (strategist stage) — **done** | Stage A |
 | **C** | Patch-target audit (future, unnumbered): mechanically classify patch/monkeypatch.setattr targets via AST. Use only for mock-target determination; exclude system-under-test tests | Stage B |
 | **D** | Connect discard path to #33 (best-of-N) | Stage C, awaiting real-world experience |
 

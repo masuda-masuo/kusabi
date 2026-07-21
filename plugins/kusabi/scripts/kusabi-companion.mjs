@@ -60,6 +60,61 @@ export function renderBaseFacts({ baseSha, baseLog, statusOutput } = {}) {
   return parts.join("\n");
 }
 
+/**
+ * Build the prompt text for the strategist job.
+ * The strategist is a non-writing investigate agent that performs a structural
+ * re-diagnosis when the same file area has been flagged for two consecutive rounds.
+ *
+ * @param {object} opts
+ * @param {string}  opts.brief       — The full brief text (acceptance criteria are inside)
+ * @param {Array<{round: number, findingsText: string}>} opts.rounds — The last two round records with findingsText
+ * @returns {string} The prompt text for the strategist.
+ */
+export function renderStrategistPrompt({ brief, rounds } = {}) {
+  const lines = [];
+
+  lines.push("## Acceptance criteria");
+  lines.push("");
+  lines.push(brief || "(not provided)");
+  lines.push("");
+
+  const safeRounds = Array.isArray(rounds) ? rounds : [];
+  for (const rnd of safeRounds) {
+    lines.push("## Findings from round " + (rnd.round || "?"));
+    lines.push("");
+    lines.push(rnd.findingsText || "(none)");
+    lines.push("");
+  }
+
+  lines.push("## Instruction");
+  lines.push("");
+  lines.push("The same file area has been flagged for two consecutive rounds — the current approach is stalled.");
+  lines.push("Recommend exactly ONE structural change: keep WHAT (the acceptance criteria) fixed, change HOW.");
+  lines.push("Reply with a short recommendation (goal-level, not a patch). Return it in your final report; you cannot post to issues in this mode.");
+  lines.push("");
+
+  return lines.join("\n");
+}
+
+/**
+ * Pure function: determine the resume method strategy for a chain round.
+ *
+ * Round 1 always continues fresh (no prior session).
+ * After a strategize intervention, the next rework must use a fresh session
+ * (checkpoint_restore) to break anchoring per §3.4.
+ * Otherwise: round 2 continues the same session; round 3+ forces fresh.
+ *
+ * @param {object} opts
+ * @param {number}  opts.round       — 1-based round number
+ * @param {boolean} opts.strategized — true when a strategize has occurred earlier in the chain
+ * @returns {{ type: "continue_session" | "fresh_session" }}
+ */
+export function resolveResumeMethod({ round, strategized }) {
+  if (round >= 3) return { type: "fresh_session" };
+  if (round > 1 && strategized) return { type: "fresh_session" };
+  return { type: "continue_session" };
+}
+
 export const PHASE_AGENTS = {
   draft: "kusabi-draft",
   investigate: "kusabi-investigate",
@@ -912,6 +967,23 @@ export function renderChainShow(chain, rounds, unreadable = []) {
       lines.push(`  ${parts.join(", ")}`);
     }
 
+    // Strategist data (Decision 4)
+    if (round.strategistUsage?.available) {
+      const u = round.strategistUsage;
+      const parts = [`strategist: ${u.input || 0} in / ${u.output || 0} out`];
+      if (u.reasoning) parts.push(`${u.reasoning} reasoning`);
+      if (u.cost !== undefined) parts.push(`cost=$${u.cost}`);
+      if (u.model) parts.push(`model=${u.model}`);
+      lines.push(`  ${parts.join(", ")}`);
+    }
+    if (round.strategistRecommendation) {
+      lines.push(`  strategist recommendation:`);
+      const recLines = round.strategistRecommendation.split("\n");
+      for (const rl of recLines) {
+        lines.push(`  ${rl}`);
+      }
+    }
+
     lines.push("");
   }
 
@@ -1466,9 +1538,10 @@ export function checkSmokeProbe(entries, observed) {
  * @param {number}  opts.maxRounds
  * @param {boolean} opts.repeatedAreas — same file area flagged 2+ rounds
  * @param {string[]} [opts.findingSeverities] — severity strings from the round's review findings
- * @returns {{ disposition: "accept"|"accept-with-followup"|"rework"|"escalate", reason?: string }}
+ * @param {boolean} [opts.strategizeEligible] — true on first stagnation to get strategize instead of escalate
+ * @returns {{ disposition: "accept"|"accept-with-followup"|"strategize"|"rework"|"escalate", reason?: string }}
  */
-export function deriveDisposition({ verdict, probesGreen, round, maxRounds, repeatedAreas, findingSeverities }) {
+export function deriveDisposition({ verdict, probesGreen, round, maxRounds, repeatedAreas, findingSeverities, strategizeEligible }) {
   // Decision 5: accept-with-followup (economic cutoff)
   // Checked BEFORE max-rounds escalate so it takes precedence for the needs-attention case.
   if (probesGreen && verdict === "needs-attention" && Array.isArray(findingSeverities) && findingSeverities.length > 0 && findingSeverities.every(function (s) { return s === "low" || s === "medium"; })) {
@@ -1501,8 +1574,13 @@ export function deriveDisposition({ verdict, probesGreen, round, maxRounds, repe
 
     case "needs-attention": {
       if (repeatedAreas) {
-        disposition = "escalate";
-        reason = "same file area flagged for two consecutive rounds";
+        if (strategizeEligible === true) {
+          disposition = "strategize";
+          reason = "same file area flagged twice; structural re-diagnosis before next rework";
+        } else {
+          disposition = "escalate";
+          reason = "same file area flagged for two consecutive rounds";
+        }
       } else {
         disposition = "rework";
         reason = "needs-attention";
@@ -2258,15 +2336,16 @@ async function cmdChain(cwd, { flags, text }) {
   }
 
   const records = [];
+  let strategized = false;
 
   for (let round = 1; round <= maxRounds; round += 1) {
     const isFirstRound = round === 1;
     const hasPreviousRound = round > 1 && records.length > 0;
     const previousRecord = hasPreviousRound ? records[records.length - 1] : null;
 
-    // Round 2: same session continue (rework 1st attempt)
-    // Round 3+: checkpoint_restore(chain-base) -> new session
-    const useNewSession = round >= 3;
+    // Resume strategy: pure function decides continue vs fresh session
+    const resumeStrategy = resolveResumeMethod({ round, strategized });
+    const useNewSession = resumeStrategy.type === "fresh_session";
     let resumeMethod;
     if (useNewSession) {
       // Actually attempt checkpoint_restore; record outcome honestly
@@ -2315,7 +2394,11 @@ async function cmdChain(cwd, { flags, text }) {
     if (isFirstRound) {
       implementText = brief;
     } else if (previousRecord) {
-      implementText = "## Prior findings\n" + (previousRecord.findingsText || "(none)") + "\n\n## Acceptance criteria\n" + brief;
+      var strategistSection = "";
+      if (previousRecord.strategistRecommendation) {
+        strategistSection = "\n\n## Strategist recommendation (structural change for this rework)\n" + previousRecord.strategistRecommendation + "\n";
+      }
+      implementText = "## Prior findings\n" + (previousRecord.findingsText || "(none)") + strategistSection + "\n\n## Acceptance criteria\n" + brief;
     } else {
       implementText = brief;
     }
@@ -2406,13 +2489,6 @@ async function cmdChain(cwd, { flags, text }) {
       const p3Result = checkDeliverablesProbe(chainDeliverables, chainChangedPaths);
       probeResults.push(p3Result);
 
-      // Base log for review context (reuse P3's sunaba-rpc call, collect once per round)
-      const baseLogResult = await callTool("sandbox_exec", {
-        container_id: container,
-        commands: ["git log --oneline -5"],
-      });
-      chainBaseLog = baseLogResult?.output ?? "";
-
       // P4: smoke probe
       const chainSmokeEntries = parseSmoke(brief);
       if (chainSmokeEntries.length > 0) {
@@ -2449,6 +2525,17 @@ async function cmdChain(cwd, { flags, text }) {
       probeResults.push({ probe: "sunaba-rpc", passed: false, detail: String(probeErr) });
       probesGreen = false;
     }
+
+    // Base log for review context (own try/catch so a collection failure does not
+    // affect probe results or probesGreen; chainBaseLog stays "" on failure).
+    try {
+      const { callTool } = await import("./sunaba-rpc.mjs");
+      const baseLogResult = await callTool("sandbox_exec", {
+        container_id: container,
+        commands: ["git log --oneline -5"],
+      });
+      chainBaseLog = baseLogResult?.output ?? "";
+    } catch { /* chainBaseLog stays "" */ }
 
     roundRecord.probesGreen = probesGreen;
     roundRecord.probeResults = probeResults;
@@ -2545,6 +2632,7 @@ async function cmdChain(cwd, { flags, text }) {
       maxRounds: maxRounds,
       repeatedAreas: chainRepeatedAreas,
       findingSeverities: chainFindingSeverities,
+      strategizeEligible: !strategized,
     });
     roundRecord.disposition = disposition;
 
@@ -2594,6 +2682,7 @@ async function cmdChain(cwd, { flags, text }) {
       records: records,
       baseSha: baseSha,
       chainTotals: chainTotals,
+      strategized: strategized,
       followupIssueDraft: chainFollowupDraft,
     });
 
@@ -2635,6 +2724,60 @@ async function cmdChain(cwd, { flags, text }) {
       }
       lines.push("", "Hand over to orchestrator for final judgement.");
       return lines.join("\n");
+    }
+
+    // ---- strategize: structural re-diagnosis before next rework ----
+    if (disposition.disposition === "strategize") {
+      strategized = true;
+
+      // Build the strategist prompt from the brief's acceptance criteria and
+      // the last two rounds' findings.
+      const strategistRounds = [];
+      if (previousRecord) {
+        strategistRounds.push({ round: previousRecord.round, findingsText: previousRecord.findingsText || "" });
+      }
+      strategistRounds.push({ round: round, findingsText: roundRecord.findingsText || "" });
+
+      const strategistPromptText = renderStrategistPrompt({
+        brief: brief,
+        rounds: strategistRounds,
+      });
+
+      const strategistJob = await runPrompt({
+        cwd,
+        kind: "strategist",
+        title: "chain: " + chainId + " round " + round + " strategist",
+        promptText: strategistPromptText,
+        agent: "kusabi-investigate",
+        tools: reviewDenyTools(),
+        timeoutS: 1800,
+        watchdogS: 900,
+      });
+      roundRecord.strategistJobId = strategistJob.job.id;
+      roundRecord.strategistUsage = strategistJob.job.usage || null;
+      roundRecord.strategistRecommendation = strategistJob.resultText || "(no recommendation)";
+
+      // Re-persist the updated round record and chain.json with strategized flag
+      writeJson(path.join(chainDir, "round-" + round + ".json"), roundRecord);
+      writeJson(path.join(chainDir, "chain.json"), {
+        chainId: chainId,
+        container: container,
+        model: model,
+        modelChain: modelChain,
+        maxRounds: maxRounds,
+        brief: brief,
+        orchestrator: orchestrator,
+        records: records,
+        baseSha: baseSha,
+        chainTotals: chainTotals,
+        strategized: strategized,
+        followupIssueDraft: chainFollowupDraft,
+      });
+
+      // Continue to next round (does not consume the strategist's own round number;
+      // normal round accounting applies to the rework).  The max-rounds hard limit
+      // still applies unchanged — if the next rework would exceed maxRounds, escalate.
+      continue;
     }
   }
 

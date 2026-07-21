@@ -34,6 +34,8 @@ import {
   reviewDenyTools,
   renderBaseFacts,
   renderFollowupDraft,
+  renderStrategistPrompt,
+  resolveResumeMethod,
 } from "./kusabi-companion.mjs";
 
 // ---------------------------------------------------------------------------
@@ -485,6 +487,40 @@ describe("deriveDisposition", () => {
     const result = deriveDisposition({ verdict: "needs-attention", probesGreen: true, round: 1, maxRounds: 3, repeatedAreas: false, findingSeverities: ["low", "info", "low"] });
     assert.deepEqual(result, { disposition: "rework", reason: "needs-attention" });
   });
+
+  // ---- Decision 4 strategize tests ----
+
+  it("strategize: repeatedAreas + strategizeEligible true", () => {
+    const result = deriveDisposition({ verdict: "needs-attention", probesGreen: true, round: 2, maxRounds: 3, repeatedAreas: true, strategizeEligible: true });
+    assert.equal(result.disposition, "strategize");
+    assert.match(result.reason, /same file area flagged twice/);
+  });
+
+  it("escalate (unchanged): repeatedAreas + strategizeEligible false", () => {
+    const result = deriveDisposition({ verdict: "needs-attention", probesGreen: true, round: 2, maxRounds: 3, repeatedAreas: true, strategizeEligible: false });
+    assert.deepEqual(result, { disposition: "escalate", reason: "same file area flagged for two consecutive rounds" });
+  });
+
+  it("escalate (unchanged): repeatedAreas + strategizeEligible undefined", () => {
+    const result = deriveDisposition({ verdict: "needs-attention", probesGreen: true, round: 2, maxRounds: 3, repeatedAreas: true });
+    // No strategizeEligible passed = undefined, should escalate
+    assert.deepEqual(result, { disposition: "escalate", reason: "same file area flagged for two consecutive rounds" });
+  });
+
+  it("accept-with-followup takes precedence over strategize: repeatedAreas + all-minor", () => {
+    const result = deriveDisposition({ verdict: "needs-attention", probesGreen: true, round: 2, maxRounds: 3, repeatedAreas: true, findingSeverities: ["low", "medium"], strategizeEligible: true });
+    assert.deepEqual(result, { disposition: "accept-with-followup", reason: "probes green; remaining findings all minor" });
+  });
+
+  it("approve unaffected by strategizeEligible", () => {
+    const result = deriveDisposition({ verdict: "approve", probesGreen: true, round: 2, maxRounds: 3, repeatedAreas: true, strategizeEligible: true });
+    assert.deepEqual(result, { disposition: "accept" });
+  });
+
+  it("discard unaffected by strategizeEligible", () => {
+    const result = deriveDisposition({ verdict: "discard", probesGreen: true, round: 2, maxRounds: 3, repeatedAreas: true, strategizeEligible: true });
+    assert.deepEqual(result, { disposition: "escalate", reason: "reviewer discarded the work" });
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -817,6 +853,39 @@ describe("renderChainShow", () => {
     ];
     const result = renderChainShow(chain, rounds);
     assert.match(result, /status: accepted-with-followup at round 1/);
+  });
+
+  it("renders strategist usage and recommendation verbatim", () => {
+    const chain = { chainId: "chain-strategist" };
+    const rounds = [
+      {
+        round: 1,
+        verdict: "needs-attention",
+        disposition: { disposition: "strategize", reason: "same file area flagged twice; structural re-diagnosis before next rework" },
+        resumeMethod: { type: "continue_session" },
+        strategistUsage: { available: true, input: 150, output: 80, cost: 0.001, model: "opencode-go/deepseek-v4-flash" },
+        strategistRecommendation: "Switch from grep-based approach to AST-based matching to avoid false positives.",
+      },
+    ];
+    const result = renderChainShow(chain, rounds);
+    assert.match(result, /strategist: 150 in \/ 80 out.*cost=\$0\.001.*model=opencode-go\/deepseek-v4-flash/);
+    assert.ok(result.includes("strategist recommendation:"));
+    assert.ok(result.includes("Switch from grep-based approach to AST-based matching to avoid false positives."));
+  });
+
+  it("skips strategist section when no strategist data on round", () => {
+    const chain = { chainId: "chain-no-strategist" };
+    const rounds = [
+      {
+        round: 1,
+        verdict: "approve",
+        disposition: { disposition: "accept" },
+        resumeMethod: { type: "continue_session" },
+      },
+    ];
+    const result = renderChainShow(chain, rounds);
+    assert.doesNotMatch(result, /strategist:/);
+    assert.doesNotMatch(result, /strategist recommendation:/);
   });
 });
 
@@ -3191,5 +3260,112 @@ describe("renderBaseFacts", () => {
     assert.match(result, /Base commit: \(unavailable\)/);
     assert.match(result, /empty change set/);
     assert.match(result, /Review ONLY this change set/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// renderStrategistPrompt — Decision 4 strategist prompt builder
+// ---------------------------------------------------------------------------
+
+describe("renderStrategistPrompt", () => {
+  const sampleBrief = "Implement feature X\n\nAcceptance criteria:\n- Works on all platforms\n- Performance within limits";
+
+  it("includes acceptance criteria verbatim", () => {
+    const result = renderStrategistPrompt({
+      brief: sampleBrief,
+      rounds: [
+        { round: 1, findingsText: "[low] Style issue (src/a.js:10)" },
+        { round: 2, findingsText: "[low] Same style issue (src/a.js:10)" },
+      ],
+    });
+    assert.ok(result.includes("Implement feature X"));
+    assert.ok(result.includes("Works on all platforms"));
+  });
+
+  it("includes both rounds' findings verbatim", () => {
+    const result = renderStrategistPrompt({
+      brief: sampleBrief,
+      rounds: [
+        { round: 1, findingsText: "[low] Style issue (src/a.js:10)" },
+        { round: 2, findingsText: "[low] Same style issue (src/a.js:10)" },
+      ],
+    });
+    assert.ok(result.includes("Findings from round 1"));
+    assert.ok(result.includes("Findings from round 2"));
+    assert.ok(result.includes("[low] Style issue (src/a.js:10)"));
+    assert.ok(result.includes("[low] Same style issue (src/a.js:10)"));
+  });
+
+  it("contains the one-structural-change instruction", () => {
+    const result = renderStrategistPrompt({
+      brief: sampleBrief,
+      rounds: [
+        { round: 1, findingsText: "finding" },
+        { round: 2, findingsText: "finding" },
+      ],
+    });
+    assert.ok(result.includes("Recommend exactly ONE structural change"));
+    assert.ok(result.includes("keep WHAT (the acceptance criteria) fixed, change HOW"));
+    assert.ok(result.includes("you cannot post to issues in this mode"));
+  });
+
+  it("handles missing brief gracefully", () => {
+    const result = renderStrategistPrompt({
+      rounds: [{ round: 1, findingsText: "finding" }],
+    });
+    assert.ok(result.includes("Acceptance criteria"));
+    assert.ok(result.includes("(not provided)"));
+  });
+
+  it("handles missing rounds gracefully (never throws)", () => {
+    const result = renderStrategistPrompt({ brief: "test" });
+    assert.ok(result.includes("Acceptance criteria"));
+    assert.ok(result.includes("test"));
+  });
+
+  it("handles no arguments gracefully (never throws)", () => {
+    const result = renderStrategistPrompt();
+    assert.ok(result.includes("Acceptance criteria"));
+  });
+});
+
+// ---------------------------------------------------------------------------
+// resolveResumeMethod — pure function for resume strategy decisions
+// ---------------------------------------------------------------------------
+
+describe("resolveResumeMethod", () => {
+  it("round 1 returns continue_session", () => {
+    const result = resolveResumeMethod({ round: 1, strategized: false });
+    assert.deepEqual(result, { type: "continue_session" });
+  });
+
+  it("round 1 returns continue_session even when strategized is true (impossible but defensive)", () => {
+    const result = resolveResumeMethod({ round: 1, strategized: true });
+    assert.deepEqual(result, { type: "continue_session" });
+  });
+
+  it("round 2 with strategized=false returns continue_session", () => {
+    const result = resolveResumeMethod({ round: 2, strategized: false });
+    assert.deepEqual(result, { type: "continue_session" });
+  });
+
+  it("round 2 with strategized=true returns fresh_session (after strategize, force new session)", () => {
+    const result = resolveResumeMethod({ round: 2, strategized: true });
+    assert.deepEqual(result, { type: "fresh_session" });
+  });
+
+  it("round 3 with strategized=false returns fresh_session", () => {
+    const result = resolveResumeMethod({ round: 3, strategized: false });
+    assert.deepEqual(result, { type: "fresh_session" });
+  });
+
+  it("round 3 with strategized=true returns fresh_session", () => {
+    const result = resolveResumeMethod({ round: 3, strategized: true });
+    assert.deepEqual(result, { type: "fresh_session" });
+  });
+
+  it("round 4+ always returns fresh_session", () => {
+    assert.deepEqual(resolveResumeMethod({ round: 4, strategized: false }), { type: "fresh_session" });
+    assert.deepEqual(resolveResumeMethod({ round: 5, strategized: true }), { type: "fresh_session" });
   });
 });
