@@ -24,6 +24,12 @@ const DEFAULT_WATCHDOG_S = 900; // must be > opencode mcp_timeout (600s) so inne
 const REVIEW_DIFF_LIMIT = 200_000;
 const WRITE_TOOL_NAMES = ["bash", "edit", "write", "patch", "task"];
 
+export function implementDenyTools() {
+  return Object.fromEntries(
+    [...WRITE_TOOL_NAMES, "sunaba_copy_project", "sunaba_copy_file"].map((t) => [t, false]),
+  );
+}
+
 const PHASE_AGENTS = {
   draft: "kusabi-draft",
   investigate: "kusabi-investigate",
@@ -2084,6 +2090,7 @@ async function cmdChain(cwd, { flags, text }) {
       phase: "implement",
       model: roundModel,
       session: useNewSession ? undefined : session,
+      tools: implementDenyTools(),
       timeoutS: 3600,
       watchdogS: 900,
     });

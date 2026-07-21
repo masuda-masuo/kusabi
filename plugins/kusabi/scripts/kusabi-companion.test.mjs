@@ -27,6 +27,7 @@ import {
   parseDeliverables,
   parseChangedPaths,
   checkDeliverablesProbe,
+  implementDenyTools,
 } from "./kusabi-companion.mjs";
 
 // ---------------------------------------------------------------------------
@@ -2601,5 +2602,59 @@ describe("checkDeliverablesProbe", () => {
     assert.doesNotThrow(() => checkDeliverablesProbe(undefined, undefined));
     assert.doesNotThrow(() => checkDeliverablesProbe([], null));
     assert.doesNotThrow(() => checkDeliverablesProbe("not-array", "not-array"));
+  });
+});
+
+// ---------------------------------------------------------------------------
+// implementDenyTools — deny map for implement-phase sessions
+// ---------------------------------------------------------------------------
+
+describe("implementDenyTools", () => {
+  it("returns a plain object", () => {
+    const result = implementDenyTools();
+    assert.equal(typeof result, "object");
+    assert.notEqual(result, null);
+    assert.equal(Array.isArray(result), false);
+  });
+
+  it("denies bash, edit, write, patch, task", () => {
+    const result = implementDenyTools();
+    assert.equal(result.bash, false);
+    assert.equal(result.edit, false);
+    assert.equal(result.write, false);
+    assert.equal(result.patch, false);
+    assert.equal(result.task, false);
+  });
+
+  it("denies sunaba_copy_project and sunaba_copy_file", () => {
+    const result = implementDenyTools();
+    assert.equal(result.sunaba_copy_project, false);
+    assert.equal(result.sunaba_copy_file, false);
+  });
+
+  it("contains exactly 7 keys", () => {
+    const result = implementDenyTools();
+    const keys = Object.keys(result);
+    assert.equal(keys.length, 7);
+    assert.ok(keys.includes("bash"));
+    assert.ok(keys.includes("edit"));
+    assert.ok(keys.includes("write"));
+    assert.ok(keys.includes("patch"));
+    assert.ok(keys.includes("task"));
+    assert.ok(keys.includes("sunaba_copy_project"));
+    assert.ok(keys.includes("sunaba_copy_file"));
+  });
+
+  it("all values are false", () => {
+    const result = implementDenyTools();
+    const allFalse = Object.values(result).every((v) => v === false);
+    assert.equal(allFalse, true);
+  });
+
+  it("returns a fresh object on each call", () => {
+    const a = implementDenyTools();
+    const b = implementDenyTools();
+    assert.notEqual(a, b);
+    assert.deepEqual(a, b);
   });
 });

@@ -19,7 +19,7 @@ The companion script is a context firewall: opencode's narration, tool logs, and
 Key mechanics:
 
 - **On-demand server** — `opencode serve` is started per project directory when first needed, bound to `127.0.0.1` with a random port and a generated `OPENCODE_SERVER_PASSWORD`. Healthy servers are reused; nothing needs to run 24/7.
-- **Automatic permission replies** — permission asks from opencode are automatically answered with `"once"` over SSE. Unprivileged write tools (bash, edit, write, patch) are proactively blocked at the session level via `--deny` / `--read-only`; MCP tools are silently allowed by opencode. This avoids the headless "ask hangs forever" problem.
+- **Automatic permission replies** — permission asks from opencode are automatically answered with `"once"` over SSE. Write tools are denied according to the phase: implement sessions deny host write tools (bash, edit, write, patch) plus `sunaba_copy_project`/`sunaba_copy_file` at both the agent-definition level and the chain session level; review sessions deny the same set via a `tools` deny map; plain `task` only denies write tools when `--read-only`/`--deny` is passed. This avoids the headless "ask hangs forever" problem.
 - **Structured review output** — reviews use a JSON schema that is **embedded in the prompt** (not passed as opencode's `format: json_schema`, which triggers a provider bug in opencode 1.17.x). The companion then parses the structured JSON from the model's response and renders it to readable markdown.
 
 ## Requirements
@@ -44,7 +44,7 @@ kusabi ships 6 agent definitions (`plugins/kusabi/opencode-agents/`) that are au
 |---|---|---|
 | `kusabi-draft` | Draft — research + issue creation | read-only + shiori + issue_write |
 | `kusabi-investigate` | investigate — deep dive, root cause | read-only + shiori + issue_write |
-| `kusabi-implement` | implement — code + verify | code write + verify; publish / issue_write / sandbox lifecycle **deny** |
+| `kusabi-implement` | implement — code + verify | writes happen only via sunaba container tools (sunaba_edit_file/write_file); host bash/edit/write/patch and sunaba_copy_project/sunaba_copy_file **deny** |
 | `kusabi-review` | review — adversarial review | verify/lint/type_check **allow**, sandbox_exec/sandbox_write **deny** |
 | `kusabi-respond` | respond — address review findings | code write; issue_write **deny** |
 | `kusabi-salvage` | salvage — recover stalled / dead jobs | read-only + structured report |
