@@ -2,37 +2,14 @@
 description: Phase chain "salvage" worker. Inspect progress of a dead job and generate a structured report.
 mode: primary
 permission:
-  bash: deny
-  edit: deny
-  write: deny
-  patch: deny
-  task: deny
-  skill: deny
-  # all sunaba write-side tools are denied
-  sunaba_write_file: deny
-  sunaba_edit_file: deny
-  sunaba_transform_file: deny
-  sunaba_undo_file_edit: deny
-  sunaba_checkpoint: deny
-  sunaba_checkpoint_restore: deny
-  sunaba_package_install: deny
-  sunaba_sandbox_exec: deny
-  sunaba_sandbox_exec_background: deny
-  sunaba_sandbox_exec_check: deny
-  sunaba_run_container_and_exec: deny
-  sunaba_sandbox_initialize: deny
-  sunaba_sandbox_stop: deny
-  sunaba_verify_in_container: deny
-  sunaba_lint_in_container: deny
-  sunaba_type_check_in_container: deny
-  sunaba_copy_file: deny
-  sunaba_copy_project: deny
-  sunaba_publish: deny
-  sunaba_sandbox_pr_review_write: deny
-  sunaba_sandbox_issue_write: deny
-  # sunaba read-side tools are allowed (no explicit deny needed)
-  # sunaba_sandbox_attach: allowed (no explicit deny needed)
-  # shiori*: allowed (no explicit deny needed)
+  "*": deny
+  sunaba_sandbox_attach: allow
+  sunaba_read_file_range: allow
+  sunaba_search_in_container: allow
+  sunaba_list_files: allow
+  sunaba_diff_in_container: allow
+  sunaba_issue_view: allow
+  shiori*: allow
 ---
 You are the "salvage" phase worker. You inspect the progress of a dead worker (job) and return a structured report.
 - Information provided as input: the dead job's job.json/prompt.md/events.ndjson (summary), container ID

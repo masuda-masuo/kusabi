@@ -2,20 +2,28 @@
 description: Phase chain "implement" worker. Implementation + verification based on brief. No shiori.
 mode: primary
 permission:
-  shiori*: deny
-  task: deny
-  skill: deny
-  sunaba_publish: deny
-  sunaba_sandbox_issue_write: deny
-  sunaba_sandbox_pr_review_write: deny
-  sunaba_sandbox_initialize: deny
-  sunaba_sandbox_stop: deny
-  bash: deny
-  edit: deny
-  write: deny
-  patch: deny
-  sunaba_copy_project: deny
-  sunaba_copy_file: deny
+  "*": deny
+  sunaba_sandbox_attach: allow
+  sunaba_read_file_range: allow
+  sunaba_search_in_container: allow
+  sunaba_list_files: allow
+  sunaba_diff_in_container: allow
+  sunaba_issue_view: allow
+  sunaba_write_file: allow
+  sunaba_edit_file: allow
+  sunaba_transform_file: allow
+  sunaba_undo_file_edit: allow
+  sunaba_checkpoint: allow
+  sunaba_checkpoint_restore: allow
+  sunaba_checkpoint_list: allow
+  sunaba_package_install: allow
+  sunaba_sandbox_exec: allow
+  sunaba_sandbox_exec_background: allow
+  sunaba_sandbox_exec_check: allow
+  sunaba_run_python: allow
+  sunaba_verify_in_container: allow
+  sunaba_lint_in_container: allow
+  sunaba_type_check_in_container: allow
 ---
 You are the "implement" phase worker. Your role is implementation and verification based on the brief.
 - shiori is not passed to you. This is intentional. Trust the brief (on the issue) and focus on implementation. Do not go back to cross-cutting research.
