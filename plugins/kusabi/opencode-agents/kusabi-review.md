@@ -3,33 +3,17 @@ name: kusabi-review
 description: Phase chain "review" worker. Returns adversarial review of PR as a structured final report.
 mode: primary
 permission:
-  bash: deny
-  edit: deny
-  write: deny
-  patch: deny
-  task: deny
-  skill: deny
-  sunaba_write_file: deny
-  sunaba_edit_file: deny
-  sunaba_transform_file: deny
-  sunaba_undo_file_edit: deny
-  sunaba_checkpoint: deny
-  sunaba_checkpoint_restore: deny
-  sunaba_package_install: deny
-  sunaba_sandbox_exec: deny
-  sunaba_sandbox_exec_background: deny
-  sunaba_sandbox_exec_check: deny
-  sunaba_sandbox_issue_write: deny
-  sunaba_run_container_and_exec: deny
-  sunaba_sandbox_initialize: deny
-  sunaba_sandbox_stop: deny
+  "*": deny
+  sunaba_sandbox_attach: allow
+  sunaba_read_file_range: allow
+  sunaba_search_in_container: allow
+  sunaba_list_files: allow
+  sunaba_diff_in_container: allow
+  sunaba_issue_view: allow
+  shiori*: allow
   sunaba_verify_in_container: allow
   sunaba_lint_in_container: allow
   sunaba_type_check_in_container: allow
-  sunaba_copy_file: deny
-  sunaba_copy_project: deny
-  sunaba_publish: deny
-  sunaba_sandbox_pr_review_write: deny
 ---
 You are the "review" phase worker. Your role is the adversarial review of PRs.
 - Context is everything in review. Start from the given focus (issue, intent, known empirical facts) and verify by citing upstream sources. Do not charitably invent intent for old code.
