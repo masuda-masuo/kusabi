@@ -1553,6 +1553,7 @@ export function parseSmoke(briefText) {
  *   Declared smoke entries (parseSmoke output).
  * @param {Array<{command: string, observed: number|string}>} observed
  *   Observed results.  Use the string "timeout" for timed-out commands,
+ *   the string "unobservable" when the exit code could not be determined,
  *   or the numeric exit code for executed commands.
  * @param {boolean}  [headingPresent=false]  True when the ## Smoke heading
  *                      was found in the brief, even if zero entries were parseable.
@@ -1582,12 +1583,29 @@ export function checkSmokeProbe(entries, observed, headingPresent = false) {
       continue;
     }
     if (obs.observed === "timeout") {
-      details.push(entry.command + ": expected exit " + entry.expectedExit + ", observed timeout");
+      let msg = entry.command + ": expected exit " + entry.expectedExit + ", observed timeout";
+      if (obs.diagnostic) {
+        msg += "\n  \u2500\u2500 output tail \u2500\u2500\n" + obs.diagnostic;
+      }
+      details.push(msg);
+      allPassed = false;
+      continue;
+    }
+    if (obs.observed === "unobservable") {
+      let msg = entry.command + ": exit code could not be observed";
+      if (obs.diagnostic) {
+        msg += "\n  \u2500\u2500 output tail \u2500\u2500\n" + obs.diagnostic;
+      }
+      details.push(msg);
       allPassed = false;
       continue;
     }
     if (obs.observed !== entry.expectedExit) {
-      details.push(entry.command + ": expected exit " + entry.expectedExit + ", observed exit " + obs.observed);
+      let msg = entry.command + ": expected exit " + entry.expectedExit + ", observed exit " + obs.observed;
+      if (obs.diagnostic) {
+        msg += "\n  \u2500\u2500 output tail \u2500\u2500\n" + obs.diagnostic;
+      }
+      details.push(msg);
       allPassed = false;
       continue;
     }
@@ -1602,6 +1620,135 @@ export function checkSmokeProbe(entries, observed, headingPresent = false) {
   }
 
   return { probe, passed: false, detail: "smoke check failed: " + details.join("; ") };
+}
+
+// ---------------------------------------------------------------------------
+// runSmokeEntry / runSmokeProbe  —  executes smoke commands via output
+// redirection so the exit-code marker is never subject to sandbox_exec's
+// pagination truncation.  callTool is injectable for testing.
+// ---------------------------------------------------------------------------
+
+/**
+ * Read a bounded tail of a smoke command's captured output for diagnostics.
+ *
+ * @param {Function} callTool   The RPC callTool function.
+ * @param {string}   container  Container ID.
+ * @param {string}   outfile    Path to the captured-output file.
+ * @returns {Promise<string>}  At most ~2000 bytes of tail text.
+ */
+async function readSmokeOutputTail(callTool, container, outfile) {
+  try {
+    const result = await callTool("sandbox_exec", {
+      container_id: container,
+      commands: [
+        // Bounded by lines *and* bytes: this diagnostic read goes through the
+        // same paginated sandbox_exec, so a file of very short lines could
+        // otherwise be re-truncated by the very mechanism this probe avoids.
+        `if [ -f "${outfile}" ]; then tail -n 40 "${outfile}" | tail -c 2000; else echo '(no output)'; fi`,
+      ],
+    });
+    const output = ((result?.output ?? "") + (result?.stderr ?? "")).trim();
+    return output || "(empty)";
+  } catch {
+    return "(diagnostics unavailable)";
+  }
+}
+
+/**
+ * Run a single smoke command entry and observe its exit code.
+ *
+ * The command's stdout/stderr is redirected to a file inside the container so
+ * that the **only** text returned by sandbox_exec is the `SMOKE_EXIT=N` marker
+ * line — never subject to pagination truncation regardless of how much output
+ * the command produces.
+ *
+ * @param {object}   opts
+ * @param {{command: string, expectedExit: number}} opts.entry
+ * @param {Function} opts.callTool    The RPC callTool function (injectable).
+ * @param {string}   opts.container   Container ID.
+ * @param {number}   opts.entryIndex  Index within the entries array (for unique filename).
+ * @returns {Promise<{command: string, observed: number|string, diagnostic?: string}>}
+ */
+export async function runSmokeEntry({ entry, callTool, container, entryIndex }) {
+  const outfile = `/tmp/kusabi-smoke-${Date.now()}-${entryIndex}.log`;
+  // Wrap in a subshell so redirection applies to the entire declared command,
+  // including pipelines, &&/|| chains, semicolons, and quoted shell invocations.
+  const wrappedCommand = `( ${entry.command} ) >${outfile} 2>&1; echo SMOKE_EXIT=$?`;
+
+  try {
+    const smokeResult = await callTool("sandbox_exec", {
+      container_id: container,
+      commands: [wrappedCommand],
+      timeout: 300,
+    });
+
+    // A command timeout comes back as *data*, not as a thrown error:
+    // sandbox_exec returns {status:"timeout", exit_code:124} and the shell is
+    // killed before it can echo the marker.  Without this check a timeout
+    // would be misreported as "could not be observed" — the same category
+    // error (probe outcome vs command outcome) this probe exists to avoid.
+    if (smokeResult?.status === "timeout") {
+      const diagnostic = await readSmokeOutputTail(callTool, container, outfile);
+      return { command: entry.command, observed: "timeout", diagnostic };
+    }
+
+    const smokeOutput = (smokeResult?.output ?? "") + (smokeResult?.stderr ?? "");
+    const exitMatches = [...smokeOutput.matchAll(/SMOKE_EXIT=(\d+)/g)];
+    const lastMatch = exitMatches.length > 0 ? exitMatches[exitMatches.length - 1] : null;
+
+    if (!lastMatch) {
+      // Marker not found in sandbox_exec output — observation failed.
+      const diagnostic = await readSmokeOutputTail(callTool, container, outfile);
+      return { command: entry.command, observed: "unobservable", diagnostic };
+    }
+
+    const exitCode = parseInt(lastMatch[1], 10);
+
+    // Only fetch diagnostic on failure (mismatch)
+    if (exitCode !== entry.expectedExit) {
+      const diagnostic = await readSmokeOutputTail(callTool, container, outfile);
+      return { command: entry.command, observed: exitCode, diagnostic };
+    }
+
+    return { command: entry.command, observed: exitCode };
+  } catch (smokeErr) {
+    const isTimeout = String(smokeErr).includes("timeout");
+    const diagnostic = isTimeout
+      ? await readSmokeOutputTail(callTool, container, outfile).catch(() => "")
+      : undefined;
+    return {
+      command: entry.command,
+      observed: isTimeout ? "timeout" : String(smokeErr),
+      diagnostic,
+    };
+  }
+}
+
+/**
+ * Run all smoke entries and return the P4 probe result.
+ *
+ * @param {object}   opts
+ * @param {Array<{command: string, expectedExit: number}>} opts.entries
+ * @param {Function} opts.callTool       The RPC callTool function (injectable).
+ * @param {string}   opts.container      Container ID.
+ * @param {boolean}  opts.headingPresent Whether the ## Smoke heading was found.
+ * @returns {Promise<{probe: string, passed: boolean, detail: string}>}
+ */
+export async function runSmokeProbe({ entries, callTool, container, headingPresent }) {
+  const entriesArr = Array.isArray(entries) ? entries : [];
+  const hdgPresent = !!headingPresent;
+
+  if (entriesArr.length === 0) {
+    return checkSmokeProbe([], [], hdgPresent);
+  }
+
+  const observed = [];
+  for (let i = 0; i < entriesArr.length; i++) {
+    const result = await runSmokeEntry({ entry: entriesArr[i], callTool, container, entryIndex: i });
+    observed.push(result);
+  }
+
+  return checkSmokeProbe(entriesArr, observed, true);
 }
 
 // ---------------------------------------------------------------------------
@@ -2092,33 +2239,13 @@ async function cmdTask(cwd, { flags, text }) {
       // P4: smoke probe
       const smokeEntries = parseSmoke(text);
       const smokeHeadingPresent = hasSectionHeading(text, "Smoke");
-      if (smokeEntries.length > 0) {
-        const smokeObserved = [];
-        for (const entry of smokeEntries) {
-          let observed;
-          try {
-            const smokeResult = await callTool("sandbox_exec", {
-              container_id: container,
-              commands: [entry.command + "; echo SMOKE_EXIT=$?"],
-              timeout: 300,
-            });
-            const smokeOutput = (smokeResult?.output ?? "") + (smokeResult?.stderr ?? "");
-            // Capture the *last* SMOKE_EXIT match — the wrapper appends it at
-            // end of output, so it's the authoritative marker.  Using matchAll
-            // avoids false positives from earlier instances inside command output.
-            const exitMatches = [...smokeOutput.matchAll(/SMOKE_EXIT=(\d+)/g)];
-            const lastMatch = exitMatches.length > 0 ? exitMatches[exitMatches.length - 1] : null;
-            observed = lastMatch ? parseInt(lastMatch[1], 10) : "unknown";
-          } catch (smokeErr) {
-            observed = String(smokeErr).includes("timeout") ? "timeout" : String(smokeErr);
-          }
-          smokeObserved.push({ command: entry.command, observed: observed });
-        }
-        const p4Result = checkSmokeProbe(smokeEntries, smokeObserved, true);
-        probeResults.push(p4Result);
-      } else {
-        probeResults.push(checkSmokeProbe([], [], smokeHeadingPresent));
-      }
+      const p4Result = await runSmokeProbe({
+        entries: smokeEntries,
+        callTool,
+        container,
+        headingPresent: smokeHeadingPresent,
+      });
+      probeResults.push(p4Result);
 
       job.probeResults = probeResults;
       job.probesGreen = probeResults.every(function (p) { return p.passed; });
@@ -2573,33 +2700,13 @@ async function cmdChain(cwd, { flags, text }) {
       // P4: smoke probe
       const chainSmokeEntries = parseSmoke(brief);
       const chainSmokeHeadingPresent = hasSectionHeading(brief, "Smoke");
-      if (chainSmokeEntries.length > 0) {
-        const chainSmokeObserved = [];
-        for (const entry of chainSmokeEntries) {
-          let observed;
-          try {
-            const smokeResult = await callTool("sandbox_exec", {
-              container_id: container,
-              commands: [entry.command + "; echo SMOKE_EXIT=$?"],
-              timeout: 300,
-            });
-            const smokeOutput = (smokeResult?.output ?? "") + (smokeResult?.stderr ?? "");
-            // Capture the *last* SMOKE_EXIT match — the wrapper appends it at
-            // end of output, so it's the authoritative marker.  Using matchAll
-            // avoids false positives from earlier instances inside command output.
-            const exitMatches = [...smokeOutput.matchAll(/SMOKE_EXIT=(\d+)/g)];
-            const lastMatch = exitMatches.length > 0 ? exitMatches[exitMatches.length - 1] : null;
-            observed = lastMatch ? parseInt(lastMatch[1], 10) : "unknown";
-          } catch (smokeErr) {
-            observed = String(smokeErr).includes("timeout") ? "timeout" : String(smokeErr);
-          }
-          chainSmokeObserved.push({ command: entry.command, observed: observed });
-        }
-        const p4Result = checkSmokeProbe(chainSmokeEntries, chainSmokeObserved, true);
-        probeResults.push(p4Result);
-      } else {
-        probeResults.push(checkSmokeProbe([], [], chainSmokeHeadingPresent));
-      }
+      const p4Result = await runSmokeProbe({
+        entries: chainSmokeEntries,
+        callTool,
+        container,
+        headingPresent: chainSmokeHeadingPresent,
+      });
+      probeResults.push(p4Result);
 
       probesGreen = probeResults.every(function(p) { return p.passed; });
     } catch (probeErr) {

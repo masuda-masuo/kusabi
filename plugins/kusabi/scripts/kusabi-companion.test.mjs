@@ -31,6 +31,7 @@ import {
   parseChangedPaths,
   checkDeliverablesProbe,
   checkSmokeProbe,
+  runSmokeProbe,
   implementDenyTools,
   reviewDenyTools,
   renderBaseFacts,
@@ -3187,6 +3188,344 @@ describe("checkSmokeProbe", () => {
     assert.doesNotThrow(() => checkSmokeProbe([], null));
     assert.doesNotThrow(() => checkSmokeProbe(null, []));
     assert.doesNotThrow(() => checkSmokeProbe("not-array", "not-array"));
+  });
+});
+
+// ---------------------------------------------------------------------------
+// runSmokeProbe — P4 smoke probe execution with output redirection
+// ---------------------------------------------------------------------------
+
+/**
+ * Build a fake callTool function for testing runSmokeProbe.
+ *
+ * The fake decides what the command emits to stdout from the command string
+ * itself — a redirected command emits only the marker, an unredirected one
+ * emits its own output first — and then truncates to one page, exactly as
+ * sunaba's sandbox_exec does.  Truncation is therefore reproduced, not
+ * assumed away: run the pre-fix wrapping through this fake and the marker is
+ * lost, which is the bug #91 recorded.
+ *
+ * For diagnostic reads (tail of the output file), it returns the supplied
+ * capturedOutput.
+ *
+ * @param {number}   [exitCode]        Simulated exit code.
+ * @param {string}   [capturedOutput]  Simulated captured output content.
+ * @param {boolean}  [simulateTimeout] If true, the smoke execution call throws.
+ * @param {boolean}  [timeoutAsData]   If true, it returns {status:"timeout"} —
+ *                                     how a real command timeout arrives.
+ * @param {boolean}  [omitMarker]      If true, the marker is never emitted.
+ * @param {number}   [rawOutputLines]  Lines an unredirected command would emit.
+ * @returns {Function} A fake callTool(async (toolName, params) => ...).
+ */
+// sunaba's sandbox_exec paginates by default (verbose="summary", limit=50):
+// only the first page of the command's stdout is returned.  This is the exact
+// mechanism that broke the probe, so the fake reproduces it rather than
+// assuming it away.
+const FAKE_PAGE_LIMIT = 50;
+
+// Matches the wrapping runSmokeEntry applies: the whole declared command in a
+// subshell, with stdout+stderr redirected to a file, marker echoed after.
+const REDIRECT_RE = /^\( [\s\S]* \) >\/tmp\/kusabi-smoke-\d+-\d+\.log 2>&1; echo SMOKE_EXIT=\$\?$/;
+
+function createFakeCallTool({
+  exitCode = 0,
+  capturedOutput = "",
+  simulateTimeout = false,
+  timeoutAsData = false,
+  omitMarker = false,
+  rawOutputLines = 2025,
+} = {}) {
+  return async (toolName, params) => {
+    if (toolName !== "sandbox_exec") return { output: "" };
+    const cmd = params.commands[0];
+
+    // Smoke execution call — wrapped in "( ... ) >/tmp/kusabi-smoke-*.log 2>&1; echo SMOKE_EXIT=$?"
+    if (cmd.includes("SMOKE_EXIT=")) {
+      if (simulateTimeout) {
+        const err = new Error("timeout: operation timed out");
+        err.name = "TimeoutError";
+        throw err;
+      }
+      // A real command timeout arrives as data, not as a thrown error: the
+      // shell is killed before the marker can be echoed.
+      if (timeoutAsData) {
+        return { status: "timeout", output: "", exit_code: 124 };
+      }
+
+      // Model what actually reaches sandbox_exec's stdout.  A redirected
+      // command emits only the marker; an unredirected one (the pre-fix
+      // wrapping) emits its own output first and the marker last.
+      const emitted = [];
+      if (!REDIRECT_RE.test(cmd)) {
+        for (let i = 0; i < rawOutputLines; i++) {
+          emitted.push("ok " + (i + 1) + " - simulated TAP line");
+        }
+      }
+      if (!omitMarker) {
+        emitted.push("SMOKE_EXIT=" + exitCode);
+      } else {
+        emitted.push("some unrelated output");
+      }
+
+      // Truncate to the first page, exactly as sunaba does.
+      return {
+        output: emitted.slice(0, FAKE_PAGE_LIMIT).join("\n") + "\n",
+        truncated: emitted.length > FAKE_PAGE_LIMIT,
+      };
+    }
+
+    // Diagnostic read call (tail of the output file)
+    if (cmd.includes("tail ") || cmd.includes("tail -c") || cmd.includes("cat ")) {
+      return { output: capturedOutput };
+    }
+
+    return { output: "" };
+  };
+}
+
+describe("createFakeCallTool (test fixture self-check)", () => {
+  // Guards the guard: if the fake stopped reproducing truncation, every
+  // runSmokeProbe test below would pass against the pre-fix implementation
+  // and prove nothing.
+  it("hides the marker when the command is not redirected (the pre-fix bug)", async () => {
+    const fakeTool = createFakeCallTool({ exitCode: 0 });
+    const legacy = await fakeTool("sandbox_exec", {
+      container_id: "fake-cid",
+      commands: ["npm test; echo SMOKE_EXIT=$?"],
+    });
+
+    assert.equal(legacy.truncated, true);
+    assert.ok(!legacy.output.includes("SMOKE_EXIT="));
+  });
+
+  it("keeps the marker when the command is redirected (the fix)", async () => {
+    const fakeTool = createFakeCallTool({ exitCode: 0 });
+    const fixed = await fakeTool("sandbox_exec", {
+      container_id: "fake-cid",
+      commands: ["( npm test ) >/tmp/kusabi-smoke-1234567890-0.log 2>&1; echo SMOKE_EXIT=$?"],
+    });
+
+    assert.equal(fixed.truncated, false);
+    assert.ok(fixed.output.includes("SMOKE_EXIT=0"));
+  });
+});
+
+describe("runSmokeProbe", () => {
+  it("observes exit 0 for a command whose output far exceeds page size", async () => {
+    // Simulate a command that produces 2025 lines of TAP output — the old code
+    // would see only the first ~50 lines and miss the SMOKE_EXIT marker at the
+    // very end.  With output redirection, only the marker appears in the
+    // sandbox_exec return text, so pagination cannot hide it.
+    const fakeTool = createFakeCallTool({ exitCode: 0 });
+
+    const result = await runSmokeProbe({
+      entries: [{ command: "npm test", expectedExit: 0 }],
+      callTool: fakeTool,
+      container: "fake-cid",
+      headingPresent: true,
+    });
+
+    assert.equal(result.passed, true);
+    assert.match(result.probe, /P4: smoke/);
+  });
+
+  it("observes exit 1 for a command that exits non-zero", async () => {
+    const fakeTool = createFakeCallTool({ exitCode: 1 });
+
+    const result = await runSmokeProbe({
+      entries: [{ command: "npm test", expectedExit: 0 }],
+      callTool: fakeTool,
+      container: "fake-cid",
+      headingPresent: true,
+    });
+
+    assert.equal(result.passed, false);
+    assert.match(result.detail, /expected exit 0/);
+    assert.match(result.detail, /observed exit 1/);
+  });
+
+  it("compares against declared exit <N> annotation", async () => {
+    // A non-zero N, so the assertion actually exercises the annotation rather
+    // than coinciding with the default of 0.
+    const matching = await runSmokeProbe({
+      entries: [{ command: "bash -c 'exit 2'", expectedExit: 2 }],
+      callTool: createFakeCallTool({ exitCode: 2 }),
+      container: "fake-cid",
+      headingPresent: true,
+    });
+    assert.equal(matching.passed, true);
+
+    // Exit 0 against a declared exit 2 must fail: "succeeded" is not "expected".
+    const mismatching = await runSmokeProbe({
+      entries: [{ command: "bash -c 'exit 2'", expectedExit: 2 }],
+      callTool: createFakeCallTool({ exitCode: 0 }),
+      container: "fake-cid",
+      headingPresent: true,
+    });
+    assert.equal(mismatching.passed, false);
+    assert.match(mismatching.detail, /expected exit 2, observed exit 0/);
+  });
+
+  it("reports unobservable when the marker is absent from result", async () => {
+    const fakeTool = createFakeCallTool({ omitMarker: true });
+
+    const result = await runSmokeProbe({
+      entries: [{ command: "some-command", expectedExit: 0 }],
+      callTool: fakeTool,
+      container: "fake-cid",
+      headingPresent: true,
+    });
+
+    assert.equal(result.passed, false);
+    // Must NOT read like an exit-code mismatch
+    assert.ok(!result.detail.includes("expected exit 0, observed exit"));
+    assert.ok(result.detail.includes("exit code could not be observed"));
+  });
+
+  it("reports timeout when the RPC call throws", async () => {
+    const fakeTool = createFakeCallTool({ simulateTimeout: true });
+
+    const result = await runSmokeProbe({
+      entries: [{ command: "npm test", expectedExit: 0 }],
+      callTool: fakeTool,
+      container: "fake-cid",
+      headingPresent: true,
+    });
+
+    assert.equal(result.passed, false);
+    assert.match(result.detail, /timeout/);
+  });
+
+  it("reports timeout when sandbox_exec returns status:timeout as data", async () => {
+    // This is how a real command timeout arrives (status:"timeout",
+    // exit_code:124) — no exception, and no marker because the shell was
+    // killed before echoing it.  It must not be reported as "could not be
+    // observed": a timeout is a known outcome of the command, not a failure
+    // of the probe to look.
+    const fakeTool = createFakeCallTool({ timeoutAsData: true });
+
+    const result = await runSmokeProbe({
+      entries: [{ command: "npm test", expectedExit: 0 }],
+      callTool: fakeTool,
+      container: "fake-cid",
+      headingPresent: true,
+    });
+
+    assert.equal(result.passed, false);
+    assert.match(result.detail, /observed timeout/);
+    assert.ok(!result.detail.includes("could not be observed"));
+  });
+
+  it("includes diagnostic excerpt for failing entries", async () => {
+    const fakeTool = createFakeCallTool({
+      exitCode: 1,
+      capturedOutput: "TAP version 13\n# Subtest: something\nnot ok 1 - something\n# fail 1\n",
+    });
+
+    const result = await runSmokeProbe({
+      entries: [{ command: "npm test", expectedExit: 0 }],
+      callTool: fakeTool,
+      container: "fake-cid",
+      headingPresent: true,
+    });
+
+    assert.equal(result.passed, false);
+    assert.match(result.detail, /output tail/);
+    assert.match(result.detail, /TAP version 13/);
+  });
+
+  it("diagnostic excerpt is bounded (not a runaway log)", async () => {
+    // Simulate a massive output file — the diagnostic should only contain
+    // the last 2000 bytes (simulated by the fake returning the tail truncated
+    // by the tail -c 2000 command).
+    const fakeTool = createFakeCallTool({
+      exitCode: 1,
+      capturedOutput: "# final error line",
+    });
+
+    const result = await runSmokeProbe({
+      entries: [{ command: "huge-output", expectedExit: 0 }],
+      callTool: fakeTool,
+      container: "fake-cid",
+      headingPresent: true,
+    });
+
+    assert.equal(result.passed, false);
+    assert.match(result.detail, /output tail/);
+    // The detail should contain the tail excerpt, not the full 10000 A's
+    assert.ok(!result.detail.includes("A".repeat(10000)));
+  });
+
+  it("trivial passes (no entries) still work through runSmokeProbe", async () => {
+    const result = await runSmokeProbe({
+      entries: [],
+      callTool: null,
+      container: "fake-cid",
+      headingPresent: false,
+    });
+
+    assert.equal(result.passed, true);
+    assert.match(result.detail, /no Smoke declared/);
+  });
+
+  it("heading-present-no-entries still fails through runSmokeProbe", async () => {
+    const result = await runSmokeProbe({
+      entries: [],
+      callTool: null,
+      container: "fake-cid",
+      headingPresent: true,
+    });
+
+    assert.equal(result.passed, false);
+    assert.match(result.detail, /heading present but no entries parsed/);
+  });
+
+  it("multiple entries: all pass -> probe passes", async () => {
+    let callCount = 0;
+    const fakeTool = createFakeCallTool({ exitCode: 0, capturedOutput: "" });
+
+    const result = await runSmokeProbe({
+      entries: [
+        { command: "cmd-a", expectedExit: 0 },
+        { command: "cmd-b", expectedExit: 0 },
+      ],
+      callTool: fakeTool,
+      container: "fake-cid",
+      headingPresent: true,
+    });
+
+    assert.equal(result.passed, true);
+  });
+
+  it("multiple entries: one fails -> probe fails", async () => {
+    let callIndex = 0;
+    const fakeTool = async (toolName, params) => {
+      if (toolName !== "sandbox_exec") return { output: "" };
+      const cmd = params.commands[0];
+      if (cmd.includes("SMOKE_EXIT=")) {
+        callIndex++;
+        // cmd-a exits 0, cmd-b exits 1
+        const code = callIndex === 1 ? 0 : 1;
+        return { output: "SMOKE_EXIT=" + code + "\n" };
+      }
+      if (cmd.includes("tail -c")) {
+        return { output: "error detail" };
+      }
+      return { output: "" };
+    };
+
+    const result = await runSmokeProbe({
+      entries: [
+        { command: "cmd-a", expectedExit: 0 },
+        { command: "cmd-b", expectedExit: 0 },
+      ],
+      callTool: fakeTool,
+      container: "fake-cid",
+      headingPresent: true,
+    });
+
+    assert.equal(result.passed, false);
+    assert.match(result.detail, /cmd-b/);
   });
 });
 
