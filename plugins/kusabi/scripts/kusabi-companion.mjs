@@ -6,10 +6,10 @@
 // stdout only ever carries the rendered final result, so the calling Claude
 // session never sees intermediate narration, tool logs, or raw events.
 
-import crypto from "node:crypto";
-import { parseArgs, parseModel, resolveModel, implementDenyTools, reviewDenyTools, WRITE_TOOL_NAMES } from "./cli.mjs";
-import { renderReview, renderChainShow, renderJobLine, renderHeader, durationS, extractJson, renderFollowupDraft } from "./render.mjs";
-import { hasSectionHeading, parseDeliverables, parseSmoke, parseChangedPaths, parseOrchestratorSignature } from "./brief-parsing.mjs";
+
+import { parseArgs, parseModel, resolveModel, reviewDenyTools, WRITE_TOOL_NAMES } from "./cli.mjs";
+import { renderReview, renderChainShow, renderJobLine, renderHeader, extractJson, renderFollowupDraft } from "./render.mjs";
+import { hasSectionHeading, parseDeliverables, parseSmoke, parseOrchestratorSignature } from "./brief-parsing.mjs";
 import { deriveDisposition } from "./disposition.mjs";
 import fs from "node:fs";
 import os from "node:os";
@@ -18,14 +18,14 @@ import process from "node:process";
 import { execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
-import { stateRoot, stateDirFor, readJson, writeJson } from "./state-paths.mjs";
+import { stateRoot, stateDirFor, readJson } from "./state-paths.mjs";
 import { jobDir, saveJob, loadJob, listJobs, latestJob } from "./job-store.mjs";
 import { opencodeBin, serverHealthy, ensureServer, reapIdleServes, api } from "./serve-lifecycle.mjs";
 import { runPrompt } from "./prompt-execution.mjs";
 
-// Chain round-phases module — imported here for cmdChain, re-exported for
-// probe functions so existing test imports in kusabi-companion.test.mjs
-// continue to work without modification.
+// Chain round-phases module — imported here for cmdChain.
+// Probe functions are imported separately below with local bindings so
+// cmdTask can call them directly, and re-exported for test compatibility.
 import {
   createChainDir,
   captureBaseSha,
@@ -44,14 +44,41 @@ import {
   renderMaxRoundsOutcome,
 } from "./chain-phases.mjs";
 
-// Re-export probe functions so tests that import them from kusabi-companion.mjs
-// continue to resolve correctly.  cmdTask also imports them from here.
-export {
+// Import the probe functions locally so cmdTask can call them directly.
+// `export { X } from "..."` creates no local binding, so without a local
+// import the names are not in the module scope — cmdTask's calls to
+// runHeadCleanProbe / runVerifyProbe / runDeliverablesProbe / runSmokeProbe
+// would throw ReferenceError.
+import {
   runSmokeProbe,
   runHeadCleanProbe,
   runVerifyProbe,
   runDeliverablesProbe,
 } from "./chain-phases.mjs";
+
+// Re-export so external consumers (tests) that import these functions
+// from kusabi-companion.mjs continue to resolve correctly.
+export {
+  runSmokeProbe,
+  runHeadCleanProbe,
+  runVerifyProbe,
+  runDeliverablesProbe,
+};
+
+/**
+ * INTERNAL — exported for regression testing only.
+ * Verifies that the probe functions are locally bound in this module,
+ * so cmdTask (which is not exported) can call them without ReferenceError.
+ * Would have thrown before the fix that added local imports above.
+ */
+export function __testProbeBindings() {
+  return {
+    runSmokeProbe: typeof runSmokeProbe,
+    runHeadCleanProbe: typeof runHeadCleanProbe,
+    runVerifyProbe: typeof runVerifyProbe,
+    runDeliverablesProbe: typeof runDeliverablesProbe,
+  };
+}
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const PLUGIN_ROOT = path.resolve(HERE, "..");

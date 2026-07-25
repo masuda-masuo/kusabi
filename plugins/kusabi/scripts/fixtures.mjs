@@ -148,10 +148,10 @@ export function fakeCallToolForP1({ headSha, resetOk = true } = {}) {
  *
  * @param {object}   opts
  * @param {boolean}  [opts.gatePassed]  Whether gate_passed is true.
- * @returns {Function} A fake callTool(async (toolName, params) => ...).
+ * @returns {Function} A fake callTool(async (toolName) => ...).
  */
 export function fakeCallToolForP2({ gatePassed = true } = {}) {
-  return async (toolName, params) => {
+  return async (toolName) => {
     if (toolName !== "verify_in_container") return { output: "" };
     const result = { gate_passed: gatePassed, output: "(mock output)" };
     if (gatePassed) {

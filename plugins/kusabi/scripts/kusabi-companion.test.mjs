@@ -12,6 +12,7 @@ import {
   findTranscriptFile,
   extractAssistantText,
   resolveExplainPassage,
+  __testProbeBindings,
 } from "./kusabi-companion.mjs";
 import {
   parseOrchestratorSignature,
@@ -779,6 +780,23 @@ describe("orchestrator recording", () => {
   });
 });
 
+// cmdTask probe binding regression test
+// ---------------------------------------------------------------------------
+// Verifies that the probe functions are locally bound in kusabi-companion.mjs
+// so cmdTask (internal function, not exported) can call them without
+// ReferenceError.  Before the fix, they were only re-exported via
+// `export { X } from "..."` which creates NO local binding.
+
+describe("probe function local bindings", () => {
+  it("returns 'function' for all four probe bindings (regression: would have been 'undefined' before fix)", () => {
+    const bindings = __testProbeBindings();
+    assert.equal(bindings.runSmokeProbe, "function");
+    assert.equal(bindings.runHeadCleanProbe, "function");
+    assert.equal(bindings.runVerifyProbe, "function");
+    assert.equal(bindings.runDeliverablesProbe, "function");
+  });
+});
+
 // PHASE_AGENTS — maps phase names to agent definition filenames
 // ---------------------------------------------------------------------------
 
@@ -802,7 +820,7 @@ describe("PHASE_AGENTS", () => {
 
   it("every phase value ends with a .md file in opencode-agents directory", () => {
     const agentsDir = path.resolve(import.meta.dirname, "..", "opencode-agents");
-    for (const [phase, agentName] of Object.entries(PHASE_AGENTS)) {
+    for (const [, agentName] of Object.entries(PHASE_AGENTS)) {
       const filePath = path.join(agentsDir, `${agentName}.md`);
       assert.ok(fs.existsSync(filePath), `agent file missing: ${filePath}`);
     }

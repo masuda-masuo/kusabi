@@ -1,6 +1,5 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { callTool, unwrapResult, parseSseResponse } from "./sunaba-rpc.mjs";
 
 // sunaba-rpc — module exports and allowlist enforcement
 // ---------------------------------------------------------------------------
