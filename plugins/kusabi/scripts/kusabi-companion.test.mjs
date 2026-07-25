@@ -6,42 +6,52 @@ import fs from "node:fs";
 import {
   accumulateUsage,
   decidePermission,
-  extractJson,
-  renderReview,
-  renderChainShow,
-  renderJobLine,
   newestChainDir,
-  parseArgs,
-  parseModel,
-  parseOrchestratorSignature,
   PHASE_AGENTS,
   stateRoot,
-  deriveDisposition,
   loadConfig,
-  resolveModel,
   readBriefFile,
   shouldReapServer,
   cwdSlug,
   findTranscriptFile,
   extractAssistantText,
   resolveExplainPassage,
-  parseDeliverables,
-  parseSmoke,
-  hasSectionHeading,
-  parseChangedPaths,
-  checkDeliverablesProbe,
-  checkSmokeProbe,
   runSmokeProbe,
   runHeadCleanProbe,
   runVerifyProbe,
   runDeliverablesProbe,
-  implementDenyTools,
-  reviewDenyTools,
+} from "./kusabi-companion.mjs";
+import {
+  extractJson,
+  renderReview,
+  renderChainShow,
+  renderJobLine,
   renderBaseFacts,
   renderFollowupDraft,
   renderStrategistPrompt,
+} from "./render.mjs";
+import {
+  parseArgs,
+  parseModel,
+  resolveModel,
+  implementDenyTools,
+  reviewDenyTools,
+} from "./cli.mjs";
+import {
+  parseOrchestratorSignature,
+  parseDeliverables,
+  parseSmoke,
+  hasSectionHeading,
+  parseChangedPaths,
+} from "./brief-parsing.mjs";
+import {
+  checkDeliverablesProbe,
+  checkSmokeProbe,
+} from "./probe-decisions.mjs";
+import {
+  deriveDisposition,
   resolveResumeMethod,
-} from "./kusabi-companion.mjs";
+} from "./disposition.mjs";
 
 // ---------------------------------------------------------------------------
 // decidePermission — always returns "once"
