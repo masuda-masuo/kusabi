@@ -58,6 +58,16 @@ import {
   deriveDisposition,
   resolveResumeMethod,
 } from "./disposition.mjs";
+import {
+  selectRoundModel,
+  buildImplementText,
+  shouldSkipReview,
+  computeChainTotals,
+  renderAcceptOutcome,
+  renderAcceptWithFollowupOutcome,
+  renderEscalateOutcome,
+  renderMaxRoundsOutcome,
+} from "./chain-phases.mjs";
 
 // ---------------------------------------------------------------------------
 // decidePermission — always returns "once"
@@ -4110,5 +4120,375 @@ describe("runDeliverablesProbe", () => {
     assert.equal(result.changedPaths.length, 1);
     assert.equal(result.changedPaths[0], "src/foo.js");
     assert.equal(result.statusOutput, " M src/foo.js\n");
+  });
+});
+
+// =========================================================================
+// selectRoundModel  —  pure, extracted from cmdChain (chain-phases.mjs)
+// =========================================================================
+
+describe("selectRoundModel", () => {
+  const baseModel = { providerID: "test", modelID: "gpt-4", variant: null };
+  const modelChain = ["test/gpt-4", "test/gpt-4o", "test/claude"];
+
+  it("round 1 with --model flag uses the provided model directly", () => {
+    const result = selectRoundModel({ round: 1, isFirstRound: true, flagsModel: "test/gpt-4", model: baseModel, modelChain });
+    assert.equal(result.roundModel, baseModel);
+    assert.equal(result.roundModelEntry, "test/gpt-4");
+  });
+
+  it("round 1 without --model flag uses chain entry 0 via parseModel", () => {
+    const result = selectRoundModel({ round: 1, isFirstRound: true, flagsModel: null, model: baseModel, modelChain });
+    assert.ok(result.roundModel !== null);
+    assert.equal(result.roundModel.providerID, "test");
+    assert.equal(result.roundModel.modelID, "gpt-4");
+    assert.equal(result.roundModelEntry, "test/gpt-4");
+  });
+
+  it("round 2 uses chain entry 1", () => {
+    const result = selectRoundModel({ round: 2, isFirstRound: false, flagsModel: null, model: baseModel, modelChain });
+    assert.equal(result.roundModel.providerID, "test");
+    assert.equal(result.roundModel.modelID, "gpt-4o");
+    assert.equal(result.roundModelEntry, "test/gpt-4o");
+  });
+
+  it("round beyond chain length clamps to last entry", () => {
+    const result = selectRoundModel({ round: 5, isFirstRound: false, flagsModel: null, model: baseModel, modelChain });
+    assert.equal(result.roundModel.providerID, "test");
+    assert.equal(result.roundModel.modelID, "claude");
+    assert.equal(result.roundModelEntry, "test/claude");
+  });
+
+  it("roundModelEntry includes variant when present", () => {
+    const modelWithVariant = { providerID: "test", modelID: "gpt-4", variant: "turbo" };
+    const result = selectRoundModel({ round: 1, isFirstRound: true, flagsModel: "test/gpt-4", model: modelWithVariant, modelChain });
+    assert.equal(result.roundModelEntry, "test/gpt-4:turbo");
+  });
+
+  it("returns null roundModelEntry when roundModel is null", () => {
+    // Empty model chain → parseModel returns null for the first entry
+    const result = selectRoundModel({ round: 1, isFirstRound: true, flagsModel: null, model: baseModel, modelChain: [""] });
+    assert.equal(result.roundModelEntry, null);
+  });
+});
+
+// =========================================================================
+// buildImplementText  —  pure, extracted from cmdChain (chain-phases.mjs)
+// =========================================================================
+
+describe("buildImplementText", () => {
+  const brief = "# Fix the bug\n\nMake foo return bar.";
+
+  it("round 1 returns the brief as-is", () => {
+    const result = buildImplementText({ round: 1, brief, previousRecord: null });
+    assert.equal(result, brief);
+  });
+
+  it("round 2+ includes prior findings and acceptance criteria", () => {
+    const prev = { findingsText: "file: src/foo.js:42 — missing null check" };
+    const result = buildImplementText({ round: 2, brief, previousRecord: prev });
+    assert.ok(result.includes("## Prior findings"));
+    assert.ok(result.includes("file: src/foo.js:42"));
+    assert.ok(result.includes("## Acceptance criteria"));
+    assert.ok(result.includes(brief));
+  });
+
+  it("round 2+ shows (none) when no prior findings", () => {
+    const prev = {};
+    const result = buildImplementText({ round: 3, brief, previousRecord: prev });
+    assert.ok(result.includes("(none)"));
+    assert.ok(result.includes("## Acceptance criteria"));
+  });
+
+  it("round 2+ includes strategist recommendation when present", () => {
+    const prev = {
+      findingsText: "findings...",
+      strategistRecommendation: "Use a Map instead of indexing a list",
+    };
+    const result = buildImplementText({ round: 2, brief, previousRecord: prev });
+    assert.ok(result.includes("Strategist recommendation"));
+    assert.ok(result.includes("Use a Map instead of indexing a list"));
+  });
+
+  it("round 2+ with no previousRecord returns brief", () => {
+    const result = buildImplementText({ round: 2, brief, previousRecord: null });
+    assert.equal(result, brief);
+  });
+
+  it("round 2+ without strategistRecommendation omits the section", () => {
+    const prev = { findingsText: "some findings" };
+    const result = buildImplementText({ round: 2, brief, previousRecord: prev });
+    assert.ok(!result.includes("Strategist recommendation"));
+  });
+});
+
+// =========================================================================
+// shouldSkipReview  —  pure, extracted from cmdChain (chain-phases.mjs)
+// =========================================================================
+
+describe("shouldSkipReview", () => {
+  it("returns true when status observed, no changes, and deliverables declared", () => {
+    const result = shouldSkipReview({
+      chainStatusObserved: true,
+      chainChangedPaths: [],
+      chainDeliverables: ["src/foo.js"],
+    });
+    assert.equal(result, true);
+  });
+
+  it("returns false when changes are present", () => {
+    const result = shouldSkipReview({
+      chainStatusObserved: true,
+      chainChangedPaths: ["src/foo.js"],
+      chainDeliverables: ["src/foo.js"],
+    });
+    assert.equal(result, false);
+  });
+
+  it("returns false when status was never observed", () => {
+    const result = shouldSkipReview({
+      chainStatusObserved: false,
+      chainChangedPaths: [],
+      chainDeliverables: ["src/foo.js"],
+    });
+    assert.equal(result, false);
+  });
+
+  it("returns false when no deliverables declared", () => {
+    const result = shouldSkipReview({
+      chainStatusObserved: true,
+      chainChangedPaths: [],
+      chainDeliverables: [],
+    });
+    assert.equal(result, false);
+  });
+
+  it("returns false when empty paths but no deliverables (both arrays empty)", () => {
+    const result = shouldSkipReview({
+      chainStatusObserved: true,
+      chainChangedPaths: [],
+      chainDeliverables: [],
+    });
+    assert.equal(result, false);
+  });
+});
+
+// =========================================================================
+// computeChainTotals  —  pure, extracted from cmdChain (chain-phases.mjs)
+// =========================================================================
+
+describe("computeChainTotals", () => {
+  it("returns zero totals for empty records", () => {
+    const result = computeChainTotals([]);
+    assert.deepEqual(result, { input: 0, output: 0, reasoning: 0, cacheRead: 0, cacheWrite: 0, cost: 0 });
+  });
+
+  it("sums implement usage across a single record", () => {
+    const rec = {
+      implementUsage: { available: true, input: 100, output: 200, reasoning: 30, cacheRead: 50, cacheWrite: 10, cost: 0.001 },
+    };
+    const result = computeChainTotals([rec]);
+    assert.equal(result.input, 100);
+    assert.equal(result.output, 200);
+    assert.equal(result.reasoning, 30);
+    assert.equal(result.cacheRead, 50);
+    assert.equal(result.cacheWrite, 10);
+    assert.equal(result.cost, 0.001);
+  });
+
+  it("sums implement + review usage across multiple records", () => {
+    const records = [
+      {
+        implementUsage: { available: true, input: 50, output: 60, reasoning: 0, cacheRead: 0, cacheWrite: 0, cost: 0.001 },
+        reviewUsage: { available: true, input: 30, output: 40, reasoning: 10, cacheRead: 20, cacheWrite: 0, cost: 0.002 },
+      },
+      {
+        implementUsage: { available: true, input: 70, output: 80, reasoning: 5, cacheRead: 0, cacheWrite: 0, cost: 0.001 },
+        // review was skipped (no reviewUsage field)
+      },
+    ];
+    const result = computeChainTotals(records);
+    assert.equal(result.input, 150);   // 50+30+70
+    assert.equal(result.output, 180);  // 60+40+80
+    assert.equal(result.reasoning, 15); // 0+10+5
+    assert.equal(result.cacheRead, 20); // 0+20+0
+    assert.equal(result.cacheWrite, 0);
+    assert.equal(result.cost, 0.004);  // 0.001+0.002+0.001
+  });
+
+  it("skips usage entries where available is false", () => {
+    const records = [{
+      implementUsage: { available: false, input: 999, output: 999 },
+      reviewUsage: { available: true, input: 10, output: 20, reasoning: 0, cacheRead: 0, cacheWrite: 0, cost: 0.001 },
+    }];
+    const result = computeChainTotals(records);
+    assert.equal(result.input, 10);
+    assert.equal(result.output, 20);
+  });
+
+  it("handles missing usage fields as zeros", () => {
+    const records = [
+      { implementUsage: { available: true, input: 10, output: 20, reasoning: 0, cacheRead: 0, cacheWrite: 0, cost: 0.001 } },
+      {}, // no usage fields at all
+    ];
+    const result = computeChainTotals([records[0]]);
+    assert.equal(result.input, 10);
+    assert.equal(result.output, 20);
+  });
+});
+
+// =========================================================================
+// renderAcceptOutcome  —  pure, extracted from cmdChain (chain-phases.mjs)
+// =========================================================================
+
+describe("renderAcceptOutcome", () => {
+  const chainId = "chain-test123";
+
+  it("renders accepted message with chain ID and round", () => {
+    const result = renderAcceptOutcome({ chainId, round: 1, chainParsedReview: null, chainFindingsText: "" });
+    assert.ok(result.includes("Chain chain-test123 accepted at round 1"));
+  });
+
+  it("renders review text when parsed review is present", () => {
+    const review = { verdict: "approve", summary: "Looks good" };
+    const result = renderAcceptOutcome({ chainId, round: 2, chainParsedReview: review, chainFindingsText: "no issues" });
+    assert.ok(result.includes("Chain chain-test123 accepted at round 2"));
+    // renderReview contributes the verdict line
+    assert.ok(result.includes("approve"));
+  });
+
+  it("renders fallback when no review is available", () => {
+    const result = renderAcceptOutcome({ chainId, round: 1, chainParsedReview: null, chainFindingsText: "" });
+    assert.ok(result.includes("(no review text available)"));
+  });
+});
+
+// =========================================================================
+// renderAcceptWithFollowupOutcome  —  pure
+// =========================================================================
+
+describe("renderAcceptWithFollowupOutcome", () => {
+  const chainId = "chain-test456";
+  const brief = "# Fix the bug\n\nDescription here.";
+
+  it("renders accept-with-followup message", () => {
+    const result = renderAcceptWithFollowupOutcome({
+      chainId, round: 1, chainParsedReview: null, chainFindingsText: "minor issues",
+      chainFollowupDraft: null, brief,
+    });
+    assert.ok(result.includes("Chain chain-test456 accepted-with-followup at round 1"));
+    assert.ok(result.includes("(no review text available)"));
+  });
+
+  it("renders review text and followup draft when both present", () => {
+    const review = { verdict: "needs-attention", findings: [{ file: "src/foo.js", title: "missing null check", severity: "low", line_start: 42 }] };
+    const result = renderAcceptWithFollowupOutcome({
+      chainId, round: 2, chainParsedReview: review, chainFindingsText: "findings",
+      chainFollowupDraft: "# Followup issue draft\n\n## Findings\n- [low] missing null check (src/foo.js:42)",
+      brief,
+    });
+    assert.ok(result.includes("accepted-with-followup at round 2"));
+    assert.ok(result.includes("# Followup issue draft"));
+  });
+
+  it("generates followup draft from findings when chainFollowupDraft is null", () => {
+    const review = {
+      verdict: "needs-attention",
+      findings: [{ file: "src/foo.js", title: "missing null check", severity: "low", line_start: 42 }],
+    };
+    const result = renderAcceptWithFollowupOutcome({
+      chainId, round: 1, chainParsedReview: review, chainFindingsText: "findings",
+      chainFollowupDraft: null, brief,
+    });
+    assert.ok(result.includes("missing null check"));
+    assert.ok(result.includes("src/foo.js"));
+  });
+});
+
+// =========================================================================
+// renderEscalateOutcome  —  pure
+// =========================================================================
+
+describe("renderEscalateOutcome", () => {
+  const chainId = "chain-esc789";
+
+  it("renders escalate message with reason and orchestrator line", () => {
+    const roundRecord = { findingsText: "critical issue in src/main.js" };
+    const records = [
+      {
+        resumeMethod: { type: "checkpoint_restore", base: "abc123", detail: null },
+        modelEntry: "test/gpt-4",
+        verdict: "needs-attention",
+        probesGreen: true,
+      },
+    ];
+    const disposition = { disposition: "escalate", reason: "max rounds (3) reached without acceptance" };
+    const orchestrator = { model: "claude-opus" };
+
+    const result = renderEscalateOutcome({ chainId, round: 3, disposition, orchestrator, roundRecord, records });
+    assert.ok(result.includes("Chain chain-esc789 escalated at round 3"));
+    assert.ok(result.includes("max rounds (3) reached without acceptance"));
+    assert.ok(result.includes("orchestrator=claude-opus"));
+    assert.ok(result.includes("Remaining findings:"));
+    assert.ok(result.includes("critical issue in src/main.js"));
+    assert.ok(result.includes("Hand over to orchestrator for final judgement."));
+  });
+
+  it("renders round summaries with resume details", () => {
+    const roundRecord = { findingsText: "issue" };
+    const records = [
+      { resumeMethod: { type: "checkpoint_restore", detail: null }, modelEntry: "test/gpt-4", verdict: "needs-attention", probesGreen: false },
+      { resumeMethod: { type: "checkpoint_restore_failed", detail: "network error" }, modelEntry: "test/gpt-4o", verdict: "needs-attention", probesGreen: true },
+    ];
+    const disposition = { disposition: "escalate", reason: "repeated areas" };
+    const result = renderEscalateOutcome({ chainId, round: 2, disposition, orchestrator: null, roundRecord, records });
+    assert.ok(result.includes("Round 1: model=test/gpt-4, verdict=needs-attention, probesGreen=false, resume=checkpoint_restore"));
+    assert.ok(result.includes("Round 2: model=test/gpt-4o, verdict=needs-attention, probesGreen=true, resume=checkpoint_restore_failed: network error"));
+  });
+
+  it("renders 'unknown' when reason is missing", () => {
+    const roundRecord = { findingsText: "issue" };
+    const records = [{ resumeMethod: { type: "continue_session" }, modelEntry: "x", verdict: "discard", probesGreen: false }];
+    const result = renderEscalateOutcome({ chainId, round: 1, disposition: { disposition: "escalate" }, orchestrator: null, roundRecord, records });
+    assert.ok(result.includes("unknown"));
+  });
+});
+
+// =========================================================================
+// renderMaxRoundsOutcome  —  pure
+// =========================================================================
+
+describe("renderMaxRoundsOutcome", () => {
+  const chainId = "chain-max123";
+
+  it("renders max rounds message", () => {
+    const records = [
+      { resumeMethod: { type: "continue_session" }, modelEntry: "test/gpt-4", verdict: "needs-attention", probesGreen: false },
+      { resumeMethod: { type: "checkpoint_restore" }, modelEntry: "test/gpt-4o", verdict: "needs-attention", probesGreen: true, findingsText: "still has bugs" },
+    ];
+    const orchestrator = { model: "gpt-5" };
+
+    const result = renderMaxRoundsOutcome({ chainId, maxRounds: 3, records, orchestrator });
+    assert.ok(result.includes("Chain chain-max123 reached max rounds (3) without acceptance"));
+    assert.ok(result.includes("orchestrator=gpt-5"));
+    assert.ok(result.includes("Remaining findings:"));
+    assert.ok(result.includes("still has bugs"));
+    assert.ok(result.includes("Round 1: model=test/gpt-4, verdict=needs-attention, probesGreen=false, resume=continue_session"));
+    assert.ok(result.includes("Round 2: model=test/gpt-4o, verdict=needs-attention, probesGreen=true, resume=checkpoint_restore"));
+    assert.ok(result.includes("Hand over to orchestrator for final judgement."));
+  });
+
+  it("renders (none) for findings when last record has none", () => {
+    const records = [
+      { resumeMethod: { type: "continue_session" }, modelEntry: "x", verdict: "discard", probesGreen: false },
+    ];
+    const result = renderMaxRoundsOutcome({ chainId, maxRounds: 1, records, orchestrator: null });
+    assert.ok(result.includes("(none)"));
+  });
+
+  it("renders fallback for empty records", () => {
+    const result = renderMaxRoundsOutcome({ chainId, maxRounds: 3, records: [], orchestrator: null });
+    assert.ok(result.includes("(none)"));
+    assert.ok(result.includes("reached max rounds (3)"));
   });
 });
