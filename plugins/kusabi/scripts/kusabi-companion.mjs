@@ -8,10 +8,9 @@
 
 import crypto from "node:crypto";
 import { parseArgs, parseModel, resolveModel, implementDenyTools, reviewDenyTools, WRITE_TOOL_NAMES } from "./cli.mjs";
-import { renderBaseFacts, renderStrategistPrompt, renderReview, renderChainShow, renderJobLine, renderFollowupDraft, renderHeader, durationS, extractJson } from "./render.mjs";
+import { renderReview, renderChainShow, renderJobLine, renderHeader, durationS, extractJson, renderFollowupDraft } from "./render.mjs";
 import { hasSectionHeading, parseDeliverables, parseSmoke, parseChangedPaths, parseOrchestratorSignature } from "./brief-parsing.mjs";
-import { checkDeliverablesProbe, checkSmokeProbe } from "./probe-decisions.mjs";
-import { deriveDisposition, resolveResumeMethod } from "./disposition.mjs";
+import { deriveDisposition } from "./disposition.mjs";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -23,6 +22,36 @@ import { stateRoot, stateDirFor, readJson, writeJson } from "./state-paths.mjs";
 import { jobDir, saveJob, loadJob, listJobs, latestJob } from "./job-store.mjs";
 import { opencodeBin, serverHealthy, ensureServer, reapIdleServes, api } from "./serve-lifecycle.mjs";
 import { runPrompt } from "./prompt-execution.mjs";
+
+// Chain round-phases module — imported here for cmdChain, re-exported for
+// probe functions so existing test imports in kusabi-companion.test.mjs
+// continue to work without modification.
+import {
+  createChainDir,
+  captureBaseSha,
+  resolveRoundResume,
+  selectRoundModel,
+  buildImplementText,
+  runImplementPhase,
+  runProbePhase,
+  runReviewPhase,
+  computeChainTotals,
+  persistChainState,
+  runStrategizePhase,
+  renderAcceptOutcome,
+  renderAcceptWithFollowupOutcome,
+  renderEscalateOutcome,
+  renderMaxRoundsOutcome,
+} from "./chain-phases.mjs";
+
+// Re-export probe functions so tests that import them from kusabi-companion.mjs
+// continue to resolve correctly.  cmdTask also imports them from here.
+export {
+  runSmokeProbe,
+  runHeadCleanProbe,
+  runVerifyProbe,
+  runDeliverablesProbe,
+} from "./chain-phases.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const PLUGIN_ROOT = path.resolve(HERE, "..");
@@ -166,231 +195,6 @@ export function readBriefFile(flags, text) {
   return text;
 }
 
-// ---------------------------------------------------------------------------
-// runSmokeEntry / runSmokeProbe  —  executes smoke commands via output
-// redirection so the exit-code marker is never subject to sandbox_exec's
-// pagination truncation.  callTool is injectable for testing.
-// ---------------------------------------------------------------------------
-
-/**
- * Read a bounded tail of a smoke command's captured output for diagnostics.
- *
- * @param {Function} callTool   The RPC callTool function.
- * @param {string}   container  Container ID.
- * @param {string}   outfile    Path to the captured-output file.
- * @returns {Promise<string>}  At most ~2000 bytes of tail text.
- */
-async function readSmokeOutputTail(callTool, container, outfile) {
-  try {
-    const result = await callTool("sandbox_exec", {
-      container_id: container,
-      commands: [
-        // Bounded by lines *and* bytes: this diagnostic read goes through the
-        // same paginated sandbox_exec, so a file of very short lines could
-        // otherwise be re-truncated by the very mechanism this probe avoids.
-        `if [ -f "${outfile}" ]; then tail -n 40 "${outfile}" | tail -c 2000; else echo '(no output)'; fi`,
-      ],
-    });
-    const output = ((result?.output ?? "") + (result?.stderr ?? "")).trim();
-    return output || "(empty)";
-  } catch {
-    return "(diagnostics unavailable)";
-  }
-}
-
-/**
- * Run a single smoke command entry and observe its exit code.
- *
- * The command's stdout/stderr is redirected to a file inside the container so
- * that the **only** text returned by sandbox_exec is the `SMOKE_EXIT=N` marker
- * line — never subject to pagination truncation regardless of how much output
- * the command produces.
- *
- * @param {object}   opts
- * @param {{command: string, expectedExit: number}} opts.entry
- * @param {Function} opts.callTool    The RPC callTool function (injectable).
- * @param {string}   opts.container   Container ID.
- * @param {number}   opts.entryIndex  Index within the entries array (for unique filename).
- * @returns {Promise<{command: string, observed: number|string, diagnostic?: string}>}
- */
-export async function runSmokeEntry({ entry, callTool, container, entryIndex }) {
-  const outfile = `/tmp/kusabi-smoke-${Date.now()}-${entryIndex}.log`;
-  // Wrap in a subshell so redirection applies to the entire declared command,
-  // including pipelines, &&/|| chains, semicolons, and quoted shell invocations.
-  const wrappedCommand = `( ${entry.command} ) >${outfile} 2>&1; echo SMOKE_EXIT=$?`;
-
-  try {
-    const smokeResult = await callTool("sandbox_exec", {
-      container_id: container,
-      commands: [wrappedCommand],
-      timeout: 300,
-    });
-
-    // A command timeout comes back as *data*, not as a thrown error:
-    // sandbox_exec returns {status:"timeout", exit_code:124} and the shell is
-    // killed before it can echo the marker.  Without this check a timeout
-    // would be misreported as "could not be observed" — the same category
-    // error (probe outcome vs command outcome) this probe exists to avoid.
-    if (smokeResult?.status === "timeout") {
-      const diagnostic = await readSmokeOutputTail(callTool, container, outfile);
-      return { command: entry.command, observed: "timeout", diagnostic };
-    }
-
-    const smokeOutput = (smokeResult?.output ?? "") + (smokeResult?.stderr ?? "");
-    const exitMatches = [...smokeOutput.matchAll(/SMOKE_EXIT=(\d+)/g)];
-    const lastMatch = exitMatches.length > 0 ? exitMatches[exitMatches.length - 1] : null;
-
-    if (!lastMatch) {
-      // Marker not found in sandbox_exec output — observation failed.
-      const diagnostic = await readSmokeOutputTail(callTool, container, outfile);
-      return { command: entry.command, observed: "unobservable", diagnostic };
-    }
-
-    const exitCode = parseInt(lastMatch[1], 10);
-
-    // Only fetch diagnostic on failure (mismatch)
-    if (exitCode !== entry.expectedExit) {
-      const diagnostic = await readSmokeOutputTail(callTool, container, outfile);
-      return { command: entry.command, observed: exitCode, diagnostic };
-    }
-
-    return { command: entry.command, observed: exitCode };
-  } catch (smokeErr) {
-    const isTimeout = String(smokeErr).includes("timeout");
-    const diagnostic = isTimeout
-      ? await readSmokeOutputTail(callTool, container, outfile).catch(() => "")
-      : undefined;
-    return {
-      command: entry.command,
-      observed: isTimeout ? "timeout" : String(smokeErr),
-      diagnostic,
-    };
-  }
-}
-
-/**
- * Run all smoke entries and return the P4 probe result.
- *
- * @param {object}   opts
- * @param {Array<{command: string, expectedExit: number}>} opts.entries
- * @param {Function} opts.callTool       The RPC callTool function (injectable).
- * @param {string}   opts.container      Container ID.
- * @param {boolean}  opts.headingPresent Whether the ## Smoke heading was found.
- * @returns {Promise<{probe: string, passed: boolean, detail: string}>}
- */
-export async function runSmokeProbe({ entries, callTool, container, headingPresent }) {
-  const entriesArr = Array.isArray(entries) ? entries : [];
-  const hdgPresent = !!headingPresent;
-
-  if (entriesArr.length === 0) {
-    return checkSmokeProbe([], [], hdgPresent);
-  }
-
-  const observed = [];
-  for (let i = 0; i < entriesArr.length; i++) {
-    const result = await runSmokeEntry({ entry: entriesArr[i], callTool, container, entryIndex: i });
-    observed.push(result);
-  }
-
-  return checkSmokeProbe(entriesArr, observed, true);
-}
-
-// ---------------------------------------------------------------------------
-// runHeadCleanProbe / runVerifyProbe / runDeliverablesProbe  —  P1, P2, P3
-// deterministic probes extracted from cmdTask/cmdChain duplication.
-// callTool is injectable for testing.
-// ---------------------------------------------------------------------------
-
-/**
- * P1: Check that HEAD matches the recorded base SHA.
- * When HEAD differs, auto-reset via git reset --mixed.
- *
- * @param {object}   opts
- * @param {string}   opts.baseSha       The base SHA recorded at start.
- * @param {Function} opts.callTool      The RPC callTool function (injectable).
- * @param {string}   opts.container     Container ID.
- * @param {string}   [opts.sourceLabel] Label for "baseSha not recorded" message
- *                                       (e.g. "task" or "chain").
- * @returns {Promise<{probe: string, passed: boolean, detail: string}>}
- */
-export async function runHeadCleanProbe({ baseSha, callTool, container, sourceLabel = "task" }) {
-  let passed = false;
-  let detail = "";
-  if (baseSha) {
-    // A failing rev-parse is deliberately left to propagate: it means the
-    // container is not answering, which is an incident for the whole probe
-    // sequence to report, not a P1 opinion to record and carry on from.
-    const gitRev = await callTool("sandbox_exec", {
-      container_id: container,
-      commands: ["git rev-parse HEAD"],
-    });
-    const headSha = (gitRev?.output ?? "").trim();
-    if (headSha !== baseSha) {
-      detail = "HEAD " + headSha + " != base " + baseSha + "; auto reset";
-      try {
-        await callTool("sandbox_exec", {
-          container_id: container,
-          commands: ["git reset --mixed " + baseSha],
-        });
-        passed = true;
-        detail += " - reset OK";
-      } catch (resetErr) {
-        detail += " - reset FAILED: " + String(resetErr);
-      }
-    } else {
-      passed = true;
-      detail = "HEAD matches base " + baseSha;
-    }
-  } else {
-    detail = "baseSha not recorded at " + sourceLabel + " start; cannot check HEAD";
-  }
-  return { probe: "P1: HEAD clean", passed, detail };
-}
-
-/**
- * P2: Run the verify gate (verify_in_container) with no skip flags.
- *
- * @param {object}   opts
- * @param {Function} opts.callTool      The RPC callTool function (injectable).
- * @param {string}   opts.container     Container ID.
- * @returns {Promise<{probe: string, passed: boolean, detail: string}>}
- */
-export async function runVerifyProbe({ callTool, container }) {
-  const verifyResult = await callTool("verify_in_container", {
-    container_id: container,
-    path: ".",
-  });
-  const passed = verifyResult?.gate_passed === true;
-  return { probe: "P2: verify gate", passed, detail: JSON.stringify(verifyResult) };
-}
-
-/**
- * P3: Check that changed files touch declared deliverables.
- *
- * Returns the probe result with extra properties `changedPaths` and
- * `statusOutput` attached for the chain call site which needs the raw
- * change set data for the reviewer.
- *
- * @param {object}   opts
- * @param {string[]} opts.deliverables      Parsed deliverable paths.
- * @param {boolean}  opts.headingPresent    Whether ## Deliverables heading found.
- * @param {Function} opts.callTool          The RPC callTool function (injectable).
- * @param {string}   opts.container         Container ID.
- * @returns {Promise<{probe: string, passed: boolean, detail: string, changedPaths: string[], statusOutput: string}>}
- */
-export async function runDeliverablesProbe({ deliverables, headingPresent, callTool, container }) {
-  const statusResult = await callTool("sandbox_exec", {
-    container_id: container,
-    commands: ["git status --porcelain"],
-  });
-  const statusOutput = statusResult?.output ?? "";
-  const changedPaths = parseChangedPaths(statusOutput);
-  const probeResult = checkDeliverablesProbe(deliverables, changedPaths, headingPresent);
-  // Attach side data for chain's use (the reviewer needs change set info)
-  probeResult.changedPaths = changedPaths;
-  probeResult.statusOutput = statusOutput;
-  return probeResult;
-}
 
 // ---------------------------------------------------------------------------
 // explain helpers — pure functions, exported for testing
@@ -966,448 +770,139 @@ async function cmdChain(cwd, { flags, text }) {
   text = readBriefFile(flags, text);
   if (!text) throw new Error("chain requires a brief description (inline or via --brief-file)");
   const orchestrator = parseOrchestratorSignature(text);
-  try {
-    const stateDir = stateDirFor(cwd);
-    const config = loadConfig(stateRoot());
-  const resolved = resolveModel({ flag: flags.model, phase: "implement", config });
-  const model = resolved.model;
-  const modelChain = resolved.chain;
 
-  const chainId = `chain-${Date.now().toString(36)}${crypto.randomBytes(2).toString("hex")}`;
-  const chainDir = path.join(stateDir, "chains", chainId);
-  fs.mkdirSync(chainDir, { recursive: true });
-
+  // ---- setup ----
+  const stateDir = stateDirFor(cwd);
+  const config = loadConfig(stateRoot());
+  const { model, chain: modelChain } = resolveModel({ flag: flags.model, phase: "implement", config });
+  const { chainId, chainDir } = createChainDir(stateDir);
   const container = flags.container;
   if (!container) throw new Error("chain requires --container <cid>");
   const maxRounds = Number(flags["max-rounds"] ?? 3);
   const brief = text;
 
-  // ---- chain initialisation: record base + checkpoint ----
-  let baseSha = null;
-  try {
-    const { callTool } = await import("./sunaba-rpc.mjs");
-    const gitRev = await callTool("sandbox_exec", {
-      container_id: container,
-      commands: ["git rev-parse HEAD"],
-    });
-    baseSha = (gitRev?.output ?? "").trim() || null;
-  } catch (initErr) {
-    // Record initialisation failure; probes will catch it per-round
-    baseSha = null;
-  }
+  // ---- import callTool once for all phases that need it ----
+  const { callTool } = await import("./sunaba-rpc.mjs");
 
+  // ---- chain initialisation: record base + checkpoint ----
+  const baseSha = await captureBaseSha(callTool, container);
+
+  // ---- round loop state (cross-round) ----
   const records = [];
   let strategized = false;
+  let session = flags.session;
 
-  for (let round = 1; round <= maxRounds; round += 1) {
-    const isFirstRound = round === 1;
-    const hasPreviousRound = round > 1 && records.length > 0;
-    const previousRecord = hasPreviousRound ? records[records.length - 1] : null;
+  try {
+    for (let round = 1; round <= maxRounds; round++) {
+      const isFirstRound = round === 1;
+      const hasPreviousRound = round > 1 && records.length > 0;
+      const previousRecord = hasPreviousRound ? records[records.length - 1] : null;
 
-    // Resume strategy: pure function decides continue vs fresh session
-    const resumeStrategy = resolveResumeMethod({ round, strategized });
-    const useNewSession = resumeStrategy.type === "fresh_session";
-    let resumeMethod;
-    if (useNewSession) {
-      // Actually attempt checkpoint_restore; record outcome honestly
-      let restoreOk = false;
-      let restoreDetail = null;
-      if (baseSha) {
-        try {
-          const { callTool } = await import("./sunaba-rpc.mjs");
-          await callTool("checkpoint_restore", {
-            container_id: container,
-            sha: baseSha,
-          });
-          restoreOk = true;
-        } catch (restoreErr) {
-          restoreDetail = String(restoreErr);
-        }
-      } else {
-        restoreDetail = "baseSha was never recorded at chain start";
+      // ---- phase 1: resume strategy (checkpoint_restore or continue) ----
+      const { resumeMethod, useNewSession } = await resolveRoundResume({ round, strategized, baseSha, container, callTool });
+
+      // ---- phase 2: round model selection ----
+      const { roundModel, roundModelEntry } = selectRoundModel({ round, isFirstRound, flagsModel: flags.model, model, modelChain });
+
+      // ---- phase 3: implement text + dispatch ----
+      const implementText = buildImplementText({ round, brief, previousRecord });
+      const { roundRecord, session: resolvedSession } = await runImplementPhase({
+        cwd, chainId, round, isFirstRound, implementText, roundModel,
+        useNewSession, session, previousRecord, roundModelEntry, resumeMethod,
+      });
+      session = resolvedSession;
+
+      // ---- phase 4: deterministic probes (P1–P4) ----
+      const {
+        probesGreen, probeResults, chainChangedPaths, chainStatusObserved,
+        chainStatusOutput, chainBaseLog, chainDeliverables,
+      } = await runProbePhase({ baseSha, container, brief, callTool });
+      roundRecord.probesGreen = probesGreen;
+      roundRecord.probeResults = probeResults;
+
+      // ---- phase 5: review (or skip when change set empty) ----
+      const { chainVerdict, chainFindingsText, chainParsedReview, chainRepeatedAreas, skipReview } = await runReviewPhase({
+        container, brief, model, chainId, cwd, previousRecord, baseSha,
+        chainStatusOutput, chainBaseLog, roundRecord,
+        chainChangedPaths, chainStatusObserved, chainDeliverables,
+      });
+
+      // ---- phase 6: derive disposition ----
+      const findingSeverities = chainParsedReview?.findings
+        ? chainParsedReview.findings.map(function (f) { return f.severity; })
+        : undefined;
+
+      const disposition = deriveDisposition({
+        verdict: chainVerdict || "needs-attention",
+        probesGreen,
+        round,
+        maxRounds,
+        repeatedAreas: chainRepeatedAreas,
+        findingSeverities,
+        strategizeEligible: !strategized,
+      });
+      roundRecord.disposition = disposition;
+
+      // ---- phase 7: record keeping + persistence ----
+      records.push(roundRecord);
+
+      // Compute totals across all rounds so far
+      const chainTotals = computeChainTotals(records);
+
+      // When review was skipped, ensure findingsText is set
+      if (skipReview && !roundRecord.findingsText) {
+        roundRecord.findingsText = "(no review \u2014 change set was empty)";
       }
-      resumeMethod = {
-        type: restoreOk ? "checkpoint_restore" : "checkpoint_restore_failed",
-        base: baseSha,
-        detail: restoreDetail,
-      };
-    } else {
-      resumeMethod = { type: "continue_session" };
-    }
-    // ---- resolve round-specific model ----
-    // Round 1: use --model if provided, else chain entry 0 (already in `model`).
-    // Round 2+: use chain entry (round-1), clamped to last entry.
-    let roundModel;
-    if (isFirstRound && flags.model) {
-      roundModel = model;  // --model overrides round 1
-    } else {
-      const chainIdx = Math.min(round - 1, modelChain.length - 1);
-      const entry = modelChain[chainIdx];
-      roundModel = parseModel(entry);
-    }
-    const roundModelEntry = (roundModel && roundModel.variant)
-      ? roundModel.providerID + "/" + roundModel.modelID + ":" + roundModel.variant
-      : (roundModel ? roundModel.providerID + "/" + roundModel.modelID : null);
 
-    const roundRecord = { round, resumeMethod, startedAt: new Date().toISOString(), verdict: null, probesGreen: false, modelEntry: roundModelEntry, modelVariant: roundModel?.variant || null };
-
-    let implementText;
-    if (isFirstRound) {
-      implementText = brief;
-    } else if (previousRecord) {
-      var strategistSection = "";
-      if (previousRecord.strategistRecommendation) {
-        strategistSection = "\n\n## Strategist recommendation (structural change for this rework)\n" + previousRecord.strategistRecommendation + "\n";
+      // Followup draft for accept-with-followup
+      let chainFollowupDraft = null;
+      if (disposition.disposition === "accept-with-followup" && chainParsedReview?.findings) {
+        const briefTitle = brief ? brief.split("\n")[0].trim() : "";
+        chainFollowupDraft = renderFollowupDraft({
+          chainId,
+          briefTitle,
+          findings: chainParsedReview.findings,
+        });
+        roundRecord.followupIssueDraft = chainFollowupDraft;
       }
-      implementText = "## Prior findings\n" + (previousRecord.findingsText || "(none)") + strategistSection + "\n\n## Acceptance criteria\n" + brief;
-    } else {
-      implementText = brief;
-    }
 
-    // ---- implement phase ----
-    let session = flags.session;
-    if (!session && !isFirstRound && previousRecord?.sessionID) {
-      if (!useNewSession) {
-        session = previousRecord.sessionID;
+      persistChainState({
+        chainDir, round, roundRecord, chainId, container, model, modelChain,
+        maxRounds, brief, orchestrator, records, baseSha, chainTotals,
+        strategized, chainFollowupDraft,
+      });
+
+      // ---- phase 8: disposition handling ----
+      if (disposition.disposition === "accept") {
+        return renderAcceptOutcome({ chainId, round, chainParsedReview, chainFindingsText });
       }
-    }
 
-    const implementJob = await runPrompt({
-      cwd,
-      kind: "task",
-      title: "chain: " + chainId + " round " + round + " implement",
-      promptText: implementText,
-      agent: "kusabi-implement",
-      phase: "implement",
-      model: roundModel,
-      session: useNewSession ? undefined : session,
-      tools: implementDenyTools(),
-      timeoutS: 3600,
-      watchdogS: 900,
-    });
-    roundRecord.implementJobId = implementJob.job.id;
-    roundRecord.sessionID = implementJob.job.sessionID;
-    roundRecord.implementUsage = implementJob.job.usage || null;
+      if (disposition.disposition === "accept-with-followup") {
+        return renderAcceptWithFollowupOutcome({ chainId, round, chainParsedReview, chainFindingsText, chainFollowupDraft, brief });
+      }
 
-    // ---- deterministic probes (via sunaba-rpc) ----
-    let probesGreen = false;
-    const probeResults = [];
-    let chainChangedPaths = [];
-    let chainStatusObserved = false;
-    let chainStatusOutput = "";
-    let chainBaseLog = "";
-    const chainDeliverables = parseDeliverables(brief);
+      if (disposition.disposition === "escalate") {
+        return renderEscalateOutcome({ chainId, round, disposition, orchestrator, roundRecord, records });
+      }
 
-    try {
-      const { callTool } = await import("./sunaba-rpc.mjs");
+      // ---- phase 9: strategize (structural re-diagnosis before next rework) ----
+      if (disposition.disposition === "strategize") {
+        await runStrategizePhase({ cwd, chainId, round, brief, previousRecord, roundRecord });
+        strategized = true;
 
-      const p1Result = await runHeadCleanProbe({ baseSha, callTool, container, sourceLabel: "chain" });
-      probeResults.push(p1Result);
-
-      const p2Result = await runVerifyProbe({ callTool, container });
-      probeResults.push(p2Result);
-
-      const p3Result = await runDeliverablesProbe({
-        deliverables: chainDeliverables,
-        headingPresent: hasSectionHeading(brief, "Deliverables"),
-        callTool,
-        container,
-      });
-      chainChangedPaths = p3Result.changedPaths;
-      chainStatusOutput = p3Result.statusOutput;
-      chainStatusObserved = true;
-      probeResults.push(p3Result);
-
-      // P4: smoke probe
-      const chainSmokeEntries = parseSmoke(brief);
-      const chainSmokeHeadingPresent = hasSectionHeading(brief, "Smoke");
-      const p4Result = await runSmokeProbe({
-        entries: chainSmokeEntries,
-        callTool,
-        container,
-        headingPresent: chainSmokeHeadingPresent,
-      });
-      probeResults.push(p4Result);
-
-      probesGreen = probeResults.every(function(p) { return p.passed; });
-    } catch (probeErr) {
-      probeResults.push({ probe: "sunaba-rpc", passed: false, detail: String(probeErr) });
-      probesGreen = false;
-    }
-
-    // Base log for review context (own try/catch so a collection failure does not
-    // affect probe results or probesGreen; chainBaseLog stays "" on failure).
-    try {
-      const { callTool } = await import("./sunaba-rpc.mjs");
-      const baseLogResult = await callTool("sandbox_exec", {
-        container_id: container,
-        commands: ["git log --oneline -5"],
-      });
-      chainBaseLog = baseLogResult?.output ?? "";
-    } catch { /* chainBaseLog stays "" */ }
-
-    roundRecord.probesGreen = probesGreen;
-    roundRecord.probeResults = probeResults;
-
-    // ---- P3 empty-change: skip review, set probe-sourced discard verdict ----
-    let chainSkipReview = false;
-    if (chainStatusObserved && chainChangedPaths.length === 0 && chainDeliverables.length > 0) {
-      roundRecord.verdict = "discard";
-      roundRecord.verdictSource = "probe";
-      chainSkipReview = true;
-    }
-
-    // ---- review phase (skipped when change set empty) ----
-    let chainVerdict = roundRecord.verdict; // may already be set by probe skip above
-    let chainFindingsText = null;
-    let chainParsedReview = null;
-    let chainRepeatedAreas = false;
-
-    if (!chainSkipReview) {
-      const promptTemplate = fs.readFileSync(path.join(PLUGIN_ROOT, "prompts", "adversarial-review.md"), "utf8");
-      const schemaJson = JSON.parse(fs.readFileSync(path.join(PLUGIN_ROOT, "schemas", "review-output.schema.json"), "utf8"));
-      const reviewInputParts = [
-        "## Review target",
-        "",
-        "The artifact under review lives inside container `" + container + "`.",
-        "You may use the following Sunaba read/verify tools to inspect it:",
-        "- `read_file_range` - read file contents from the container",
-        "- `search_in_container` - grep/search within the container",
-        "- `verify_in_container` / `lint_in_container` / `type_check_in_container` - re-run the project's gates in the container",
-        "",
-        "Do NOT rely on host cwd git state; the actual changes are in the container.",
-      ];
-      const baseFactsBlock = renderBaseFacts({ baseSha, baseLog: chainBaseLog, statusOutput: chainStatusOutput });
-      reviewInputParts.push("", baseFactsBlock);
-      const reviewInput = reviewInputParts.join("\n");
-      const priorFindings = previousRecord?.findingsText || "(none -- first review round)";
-
-      const reviewPromptText = promptTemplate
-        .replaceAll("{{TARGET_LABEL}}", "container " + container + " changes")
-        .replaceAll("{{USER_FOCUS}}", brief)
-        .replaceAll("{{OUTPUT_SCHEMA}}", JSON.stringify(schemaJson))
-        .replaceAll("{{REVIEW_INPUT}}", reviewInput)
-        .replaceAll("{{PRIOR_FINDINGS}}", priorFindings);
-
-      const reviewJob = await runPrompt({
-        cwd,
-        kind: "review",
-        title: "chain: " + chainId + " round " + round + " review",
-        promptText: reviewPromptText,
-        model,
-        agent: "kusabi-review",
-        tools: reviewDenyTools(),
-        timeoutS: 1800,
-        watchdogS: 900,
-      });
-      roundRecord.reviewJobId = reviewJob.job.id;
-      roundRecord.reviewUsage = reviewJob.job.usage || null;
-
-      // ---- parse review result ----
-      const reviewResultText = reviewJob.resultText || "";
-      const stripped = reviewResultText.replace(/\s*VERDICT:\s*(approve-partial|approve|needs-attention|discard)\s*$/i, "");
-      chainParsedReview = extractJson(stripped);
-      chainVerdict = (chainParsedReview && chainParsedReview.verdict) || "needs-attention";
-      roundRecord.verdict = chainVerdict;
-      chainFindingsText = (chainParsedReview && chainParsedReview.findings)
-        ? chainParsedReview.findings.map(function(f) { return "[" + f.severity + "] " + f.title + " (" + f.file + ":" + f.line_start + ")"; }).join("\n")
-        : "(no structured findings)";
-      roundRecord.findingsText = chainFindingsText;
-
-      // ---- determine repeated areas ----
-      if (previousRecord?.findingsText && chainParsedReview?.findings) {
-        var prevFiles = new Set(
-          (previousRecord.findingsText.match(/\([^:]+/g) || []).map(function(s) { return s.slice(1); }),
-        );
-        for (var fi = 0; fi < chainParsedReview.findings.length; fi++) {
-          if (prevFiles.has(chainParsedReview.findings[fi].file)) {
-            chainRepeatedAreas = true;
-            break;
-          }
-        }
+        // Re-persist after strategize updates roundRecord and strategized flag
+        const updatedTotals = computeChainTotals(records);
+        persistChainState({
+          chainDir, round, roundRecord, chainId, container, model, modelChain,
+          maxRounds, brief, orchestrator, records, baseSha,
+          chainTotals: updatedTotals, strategized: true, chainFollowupDraft,
+        });
+        continue;
       }
     }
 
-    // ---- derive disposition ----
-    // Collect finding severities for the accept-with-followup check
-    var chainFindingSeverities = chainParsedReview?.findings
-      ? chainParsedReview.findings.map(function (f) { return f.severity; })
-      : undefined;
-
-    const disposition = deriveDisposition({
-      verdict: chainVerdict || "needs-attention",
-      probesGreen: probesGreen,
-      round: round,
-      maxRounds: maxRounds,
-      repeatedAreas: chainRepeatedAreas,
-      findingSeverities: chainFindingSeverities,
-      strategizeEligible: !strategized,
-    });
-    roundRecord.disposition = disposition;
-
-    // ---- persist record ----
-    records.push(roundRecord);
-    writeJson(path.join(chainDir, "round-" + round + ".json"), roundRecord);
-
-    // Compute chain-wide usage totals from all round records.
-    const chainTotals = { input: 0, output: 0, reasoning: 0, cacheRead: 0, cacheWrite: 0, cost: 0 };
-    for (const rec of records) {
-      for (const usage of [rec.implementUsage, rec.reviewUsage]) {
-        if (usage && usage.available) {
-          chainTotals.input += usage.input || 0;
-          chainTotals.output += usage.output || 0;
-          chainTotals.reasoning += usage.reasoning || 0;
-          chainTotals.cacheRead += usage.cacheRead || 0;
-          chainTotals.cacheWrite += usage.cacheWrite || 0;
-          chainTotals.cost += usage.cost || 0;
-        }
-      }
-    }
-
-    // When review was skipped, ensure findingsText is set
-    if (chainSkipReview && !roundRecord.findingsText) {
-      roundRecord.findingsText = "(no review — change set was empty)";
-    }
-
-    var chainFollowupDraft = null;
-    if (disposition.disposition === "accept-with-followup" && chainParsedReview?.findings) {
-      var briefTitle = brief ? brief.split("\n")[0].trim() : "";
-      chainFollowupDraft = renderFollowupDraft({
-        chainId: chainId,
-        briefTitle: briefTitle,
-        findings: chainParsedReview.findings,
-      });
-      roundRecord.followupIssueDraft = chainFollowupDraft;
-    }
-
-    writeJson(path.join(chainDir, "chain.json"), {
-      chainId: chainId,
-      container: container,
-      model: model,
-      modelChain: modelChain,
-      maxRounds: maxRounds,
-      brief: brief,
-      orchestrator: orchestrator,
-      records: records,
-      baseSha: baseSha,
-      chainTotals: chainTotals,
-      strategized: strategized,
-      followupIssueDraft: chainFollowupDraft,
-    });
-
-    if (disposition.disposition === "accept") {
-      const acceptReviewText = chainParsedReview
-        ? renderReview(chainParsedReview, chainFindingsText || "")
-        : "(no review text available)";
-      return "Chain " + chainId + " accepted at round " + round + ".\n\n" + acceptReviewText;
-    }
-
-    if (disposition.disposition === "accept-with-followup") {
-      var awfBriefTitle = brief ? brief.split("\n")[0].trim() : "";
-      var awfDraft = chainFollowupDraft || renderFollowupDraft({
-        chainId: chainId,
-        briefTitle: awfBriefTitle,
-        findings: chainParsedReview?.findings || [],
-      });
-      var awfReviewText = chainParsedReview
-        ? renderReview(chainParsedReview, chainFindingsText || "")
-        : "(no review text available)";
-      return "Chain " + chainId + " accepted-with-followup at round " + round + ".\n\n" + awfReviewText + "\n\n" + awfDraft;
-    }
-
-    if (disposition.disposition === "escalate") {
-      var reason = disposition.reason || "unknown";
-      var orchLine = orchestrator?.model ? "orchestrator=" + orchestrator.model : "";
-      var lines = [
-        "Chain " + chainId + " escalated at round " + round + ": " + reason,
-        orchLine,
-        "",
-        "Remaining findings:",
-        roundRecord.findingsText,
-        "",
-      ];
-      for (var ri = 0; ri < records.length; ri++) {
-        var r = records[ri];
-        var detail = r.resumeMethod.detail ? ": " + r.resumeMethod.detail : "";
-        lines.push("Round " + (ri + 1) + ": model=" + (r.modelEntry || "?") + ", verdict=" + r.verdict + ", probesGreen=" + r.probesGreen + ", resume=" + r.resumeMethod.type + detail);
-      }
-      lines.push("", "Hand over to orchestrator for final judgement.");
-      return lines.join("\n");
-    }
-
-    // ---- strategize: structural re-diagnosis before next rework ----
-    if (disposition.disposition === "strategize") {
-      strategized = true;
-
-      // Build the strategist prompt from the brief's acceptance criteria and
-      // the last two rounds' findings.
-      const strategistRounds = [];
-      if (previousRecord) {
-        strategistRounds.push({ round: previousRecord.round, findingsText: previousRecord.findingsText || "" });
-      }
-      strategistRounds.push({ round: round, findingsText: roundRecord.findingsText || "" });
-
-      const strategistPromptText = renderStrategistPrompt({
-        brief: brief,
-        rounds: strategistRounds,
-      });
-
-      const strategistJob = await runPrompt({
-        cwd,
-        kind: "strategist",
-        title: "chain: " + chainId + " round " + round + " strategist",
-        promptText: strategistPromptText,
-        agent: "kusabi-investigate",
-        tools: reviewDenyTools(),
-        timeoutS: 1800,
-        watchdogS: 900,
-      });
-      roundRecord.strategistJobId = strategistJob.job.id;
-      roundRecord.strategistUsage = strategistJob.job.usage || null;
-      roundRecord.strategistRecommendation = strategistJob.resultText || "(no recommendation)";
-
-      // Re-persist the updated round record and chain.json with strategized flag
-      writeJson(path.join(chainDir, "round-" + round + ".json"), roundRecord);
-      writeJson(path.join(chainDir, "chain.json"), {
-        chainId: chainId,
-        container: container,
-        model: model,
-        modelChain: modelChain,
-        maxRounds: maxRounds,
-        brief: brief,
-        orchestrator: orchestrator,
-        records: records,
-        baseSha: baseSha,
-        chainTotals: chainTotals,
-        strategized: strategized,
-        followupIssueDraft: chainFollowupDraft,
-      });
-
-      // Continue to next round (does not consume the strategist's own round number;
-      // normal round accounting applies to the rework).  The max-rounds hard limit
-      // still applies unchanged — if the next rework would exceed maxRounds, escalate.
-      continue;
-    }
-  }
-
-  var lastRecord = records.length > 0 ? records[records.length - 1] : {};
-  var finalFindings = lastRecord.findingsText || "(none)";
-  var orchLine = orchestrator?.model ? "orchestrator=" + orchestrator.model : "";
-  var lines = [
-    "Chain " + chainId + " reached max rounds (" + maxRounds + ") without acceptance.",
-    orchLine,
-    "",
-    "Remaining findings:",
-    finalFindings,
-    "",
-  ];
-  for (var ri2 = 0; ri2 < records.length; ri2++) {
-    var r2 = records[ri2];
-    var detail2 = r2.resumeMethod.detail ? ": " + r2.resumeMethod.detail : "";
-    lines.push("Round " + (ri2 + 1) + ": model=" + (r2.modelEntry || "?") + ", verdict=" + r2.verdict + ", probesGreen=" + r2.probesGreen + ", resume=" + r2.resumeMethod.type + detail2);
-  }
-  lines.push("", "Hand over to orchestrator for final judgement.");
-  return lines.join("\n");
+    // ---- max rounds reached without acceptance ----
+    return renderMaxRoundsOutcome({ chainId, maxRounds, records, orchestrator });
   } finally {
     // Stop the serve for this cwd unless --keep-serve or another job is running
     if (!flags.keepServe) {
@@ -1421,7 +916,6 @@ async function cmdChain(cwd, { flags, text }) {
     }
   }
 }
-
 // ---------------------------------------------------------------------------
 // chain-show
 // ---------------------------------------------------------------------------
