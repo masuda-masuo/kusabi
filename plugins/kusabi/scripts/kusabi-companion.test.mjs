@@ -27,6 +27,7 @@ import {
   resolveExplainPassage,
   parseDeliverables,
   parseSmoke,
+  hasSectionHeading,
   parseChangedPaths,
   checkDeliverablesProbe,
   checkSmokeProbe,
@@ -2694,6 +2695,59 @@ describe("parseDeliverables", () => {
     assert.deepEqual(parseDeliverables(text), ["output.txt"]);
   });
 
+  it("parses numbered list (1. and 1) syntax)", () => {
+    const text = "## Deliverables\n1. `file1.js`\n2) `file2.py`\n";
+    assert.deepEqual(parseDeliverables(text), ["file1.js", "file2.py"]);
+  });
+
+  it("parses + bullets", () => {
+    const text = "## Deliverables\n+ `file.js`\n";
+    assert.deepEqual(parseDeliverables(text), ["file.js"]);
+  });
+
+  it("parses indented bullets", () => {
+    const text = "## Deliverables\n  - `file.js`\n";
+    assert.deepEqual(parseDeliverables(text), ["file.js"]);
+  });
+
+  it("parses paths from a fenced code block", () => {
+    const text = "## Deliverables\n```\nfile1.js\nfile2.py\n```\n";
+    assert.deepEqual(parseDeliverables(text), ["file1.js", "file2.py"]);
+  });
+
+  it("parses indented lines inside a fenced code block", () => {
+    const text = "## Deliverables\n```\n  file1.js\n\tfile2.py\n```\n";
+    assert.deepEqual(parseDeliverables(text), ["file1.js", "file2.py"]);
+  });
+
+  it("a ## line inside a fenced code block does not end the section", () => {
+    // Inside a fence every non-blank line is an item, so the `## ` line itself
+    // yields a (nonsense) entry — the point is that file2.py after it is still
+    // collected rather than being cut off by a spurious section end.
+    const text = "## Deliverables\n```\nfile1.js\n## not a heading\nfile2.py\n```\n";
+    assert.deepEqual(parseDeliverables(text), ["file1.js", "##", "file2.py"]);
+  });
+
+  it("a fenced code block before the section does not open one", () => {
+    const text = "```\n## Deliverables\nnot-a-file.js\n```\n## Deliverables\n- `real.js`\n";
+    assert.deepEqual(parseDeliverables(text), ["real.js"]);
+  });
+
+  it("strips trailing slashes from declared paths (fixes #79)", () => {
+    const text = "## Deliverables\n- `src/`\n";
+    assert.deepEqual(parseDeliverables(text), ["src"]);
+  });
+
+  it("does not alter paths without trailing slashes", () => {
+    const text = "## Deliverables\n- `src`\n";
+    assert.deepEqual(parseDeliverables(text), ["src"]);
+  });
+
+  it("heading present but nothing parseable yields empty array", () => {
+    const text = "## Deliverables\njust prose, no bullet syntax\n";
+    assert.deepEqual(parseDeliverables(text), []);
+  });
+
   it("never throws on any input", () => {
     assert.doesNotThrow(() => parseDeliverables(null));
     assert.doesNotThrow(() => parseDeliverables(undefined));
@@ -2828,6 +2882,28 @@ describe("checkDeliverablesProbe", () => {
     assert.equal(result.probe, "P3: deliverables");
   });
 
+  it("fails when heading is present but no entries parseable", () => {
+    const result = checkDeliverablesProbe([], ["file.js"], true);
+    assert.equal(result.passed, false);
+    assert.match(result.detail, /heading present but no entries parsed/);
+  });
+
+  it("still passes when heading is absent and no entries (backward compat)", () => {
+    const result = checkDeliverablesProbe([], ["file.js"], false);
+    assert.equal(result.passed, true);
+    assert.match(result.detail, /no Deliverables declared/);
+  });
+
+  it("passes unchanged when heading present and entries parseable (directory match)", () => {
+    const result = checkDeliverablesProbe(
+      ["src"],
+      ["src/foo/bar.py"],
+      true,
+    );
+    assert.equal(result.passed, true);
+    assert.match(result.detail, /touches declared deliverables/);
+  });
+
   it("never throws on any input", () => {
     assert.doesNotThrow(() => checkDeliverablesProbe(null, null));
     assert.doesNotThrow(() => checkDeliverablesProbe(undefined, undefined));
@@ -2920,6 +2996,70 @@ describe("parseSmoke", () => {
     const result = parseSmoke(text);
     assert.equal(result.length, 1);
     assert.equal(result[0].command, "node test.js");
+  });
+
+  it("parses commands from a fenced code block (one per line, exit 0)", () => {
+    const text = "## Smoke\n```\nnpm test\necho hello\n```\n";
+    const result = parseSmoke(text);
+    assert.deepEqual(result, [
+      { command: "npm test", expectedExit: 0 },
+      { command: "echo hello", expectedExit: 0 },
+    ]);
+  });
+
+  it("parses indented commands inside a fenced code block", () => {
+    const text = "## Smoke\n```\n  npm test\n\techo hello\n```\n";
+    assert.deepEqual(parseSmoke(text), [
+      { command: "npm test", expectedExit: 0 },
+      { command: "echo hello", expectedExit: 0 },
+    ]);
+  });
+
+  it("a ## line inside a fenced code block does not end the section", () => {
+    const text = "## Smoke\n```\nnpm test\n## not a heading\necho hello\n```\n";
+    assert.deepEqual(parseSmoke(text), [
+      { command: "npm test", expectedExit: 0 },
+      { command: "## not a heading", expectedExit: 0 },
+      { command: "echo hello", expectedExit: 0 },
+    ]);
+  });
+
+  it("ignores blank lines inside fenced code block", () => {
+    const text = "## Smoke\n```\nnpm test\n\necho hello\n```\n";
+    const result = parseSmoke(text);
+    assert.deepEqual(result, [
+      { command: "npm test", expectedExit: 0 },
+      { command: "echo hello", expectedExit: 0 },
+    ]);
+  });
+
+  it("parses numbered-list smoke entries", () => {
+    const text = "## Smoke\n1. `npm test`\n2) `echo hello` exit 1\n";
+    const result = parseSmoke(text);
+    assert.deepEqual(result, [
+      { command: "npm test", expectedExit: 0 },
+      { command: "echo hello", expectedExit: 1 },
+    ]);
+  });
+
+  it("parses + bullet smoke entries", () => {
+    const text = "## Smoke\n+ `npm test`\n";
+    const result = parseSmoke(text);
+    assert.equal(result.length, 1);
+    assert.equal(result[0].command, "npm test");
+    assert.equal(result[0].expectedExit, 0);
+  });
+
+  it("parses indented bullet smoke entries", () => {
+    const text = "## Smoke\n  - `npm test`\n";
+    const result = parseSmoke(text);
+    assert.equal(result.length, 1);
+    assert.equal(result[0].command, "npm test");
+  });
+
+  it("heading present but nothing parseable yields empty array", () => {
+    const text = "## Smoke\njust prose, no bullet or code block\n";
+    assert.deepEqual(parseSmoke(text), []);
   });
 
   it("never throws on any input", () => {
@@ -3029,12 +3169,51 @@ describe("checkSmokeProbe", () => {
     assert.ok(result.detail.includes("3 smoke commands passed"));
   });
 
+  it("fails when heading is present but no entries parseable", () => {
+    const result = checkSmokeProbe([], [], true);
+    assert.equal(result.passed, false);
+    assert.match(result.detail, /heading present but no entries parsed/);
+  });
+
+  it("still passes when heading is absent and no entries (backward compat)", () => {
+    const result = checkSmokeProbe([], [], false);
+    assert.equal(result.passed, true);
+    assert.match(result.detail, /no Smoke declared/);
+  });
+
   it("never throws on any input", () => {
     assert.doesNotThrow(() => checkSmokeProbe(null, null));
     assert.doesNotThrow(() => checkSmokeProbe(undefined, undefined));
     assert.doesNotThrow(() => checkSmokeProbe([], null));
     assert.doesNotThrow(() => checkSmokeProbe(null, []));
     assert.doesNotThrow(() => checkSmokeProbe("not-array", "not-array"));
+  });
+});
+
+// ---------------------------------------------------------------------------
+// hasSectionHeading — heading-presence detection
+// ---------------------------------------------------------------------------
+
+describe("hasSectionHeading", () => {
+  it("returns true when heading is present", () => {
+    assert.equal(hasSectionHeading("## Deliverables\n- `file.js`\n", "Deliverables"), true);
+    assert.equal(hasSectionHeading("some text\n## Smoke\n- `cmd`\n", "Smoke"), true);
+  });
+
+  it("returns false when heading is absent", () => {
+    assert.equal(hasSectionHeading("no heading here\n", "Deliverables"), false);
+    assert.equal(hasSectionHeading("## Other\nstuff\n", "Smoke"), false);
+  });
+
+  it("returns false for null/undefined/empty", () => {
+    assert.equal(hasSectionHeading(null, "Deliverables"), false);
+    assert.equal(hasSectionHeading(undefined, "Smoke"), false);
+    assert.equal(hasSectionHeading("", "Deliverables"), false);
+  });
+
+  it("returns true even when section body is unparseable prose", () => {
+    assert.equal(hasSectionHeading("## Deliverables\njust prose\nno bullets\n", "Deliverables"), true);
+    assert.equal(hasSectionHeading("## Smoke\njust prose\n", "Smoke"), true);
   });
 });
 

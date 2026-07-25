@@ -1269,6 +1269,108 @@ export function parseOrchestratorSignature(briefText) {
   }
   return null;
 }
+// ---------------------------------------------------------------------------
+// parseSectionItems — shared section-item walker used by both
+// parseDeliverables and parseSmoke.  Internal; not exported.
+// ---------------------------------------------------------------------------
+
+/**
+ * Parse an optional named `## ` section from a brief text, returning every
+ * recognised item line together with a heading-found flag.
+ *
+ * Item recognition (shared):
+ *  - Unordered bullet: `-`, `*`, `+`  (leading indentation ignored)
+ *  - Ordered item: `1.`, `1)`, any number (leading indentation ignored)
+ *  - Lines inside a fenced code block (`` ``` `` … `` ``` ``) within the
+ *    section — one item per non-blank line, `source: "code-block"`.
+ *
+ * A `## ` heading ends the section.  Blank and prose lines are skipped.
+ *
+ * @param {string|null|undefined} briefText  The full brief text.
+ * @param {string}                headingName  e.g. "Deliverables" or "Smoke".
+ * @returns {{ items: Array<{content: string, source: "bullet"|"code-block"}>,
+ *             headingFound: boolean }}
+ */
+function parseSectionItems(briefText, headingName) {
+  if (!briefText || typeof briefText !== "string") return { items: [], headingFound: false };
+
+  const lines = briefText.split("\n");
+  let inSection = false;
+  let headingFound = false;
+  let inCodeBlock = false;
+  const items = [];
+
+  for (let li = 0; li < lines.length; li++) {
+    const line = lines[li];
+    const trimmed = line.trim();
+
+    // Code-block fences are tracked across the whole document, before the
+    // heading check, so a `## ` line inside a fence neither opens a section
+    // nor terminates the one being collected.
+    if (trimmed.startsWith("```")) {
+      inCodeBlock = !inCodeBlock;
+      continue;
+    }
+
+    // Section boundary: ## heading
+    if (!inCodeBlock && trimmed.startsWith("## ")) {
+      const heading = trimmed.slice(3).trim();
+      if (heading === headingName) {
+        inSection = true;
+        headingFound = true;
+        continue;
+      }
+      if (inSection) break; // next heading ends the section
+      continue;
+    }
+
+    if (!inSection) continue;
+
+    // Inside a code block: every non-blank line is an item.  Stored trimmed:
+    // consumers take the first whitespace-delimited token, so a raw indented
+    // line would yield an empty token and be dropped silently.
+    if (inCodeBlock) {
+      if (trimmed !== "") {
+        items.push({ content: trimmed, source: "code-block" });
+      }
+      continue;
+    }
+
+    // Unordered bullet: -, *, +
+    let bulletMatch = trimmed.match(/^[-*+]\s+(.*)/);
+    if (bulletMatch) {
+      const content = bulletMatch[1].trim();
+      if (content) items.push({ content, source: "bullet" });
+      continue;
+    }
+
+    // Ordered item: 1., 1), any number
+    bulletMatch = trimmed.match(/^\d+[.)]\s+(.*)/);
+    if (bulletMatch) {
+      const content = bulletMatch[1].trim();
+      if (content) items.push({ content, source: "bullet" });
+      continue;
+    }
+
+    // Non-item lines are ignored
+  }
+
+  return { items, headingFound };
+}
+
+/**
+ * Check whether a brief text contains a `## headingName` section at all
+ * (whether or not any entries are parseable from it).  Exported for use by
+ * probe callers.
+ *
+ * @param {string|null|undefined} briefText
+ * @param {string}                headingName
+ * @returns {boolean}
+ */
+export function hasSectionHeading(briefText, headingName) {
+  const { headingFound } = parseSectionItems(briefText, headingName);
+  return headingFound;
+}
 
 // ---------------------------------------------------------------------------
 // parseDeliverables — pure function parsing ## Deliverables section from a
@@ -1278,40 +1380,20 @@ export function parseOrchestratorSignature(briefText) {
 /**
  * Parse an optional `## Deliverables` section from a brief text.
  *
- * Section = lines after a `## Deliverables` heading up to the next `## `
- * heading or EOF.  From each bullet line (`- ` or `* `), extract the file
- * path: the first backtick-quoted token if present, else the first
- * whitespace-delimited token.  Strip surrounding backticks and trailing
- * punctuation.  Ignore bullet lines that yield nothing.
+ * Uses the shared section walker (parseSectionItems).  From each item,
+ * extract the file path: the first backtick-quoted token if present, else
+ * the first whitespace-delimited token.  Strip trailing punctuation AND
+ * trailing slashes (fixes #79).
  *
  * @param {string|null|undefined} briefText  The full brief text.
  * @returns {string[]}  Repo-relative path strings; [] when section absent or empty.
  *                      Never throws.
  */
 export function parseDeliverables(briefText) {
-  if (!briefText || typeof briefText !== "string") return [];
-  const lines = briefText.split("\n");
-  let inSection = false;
+  const { items } = parseSectionItems(briefText, "Deliverables");
   const deliverables = [];
-  for (let li = 0; li < lines.length; li++) {
-    const trimmed = lines[li].trim();
-    if (trimmed.startsWith("## ")) {
-      const heading = trimmed.slice(3).trim();
-      if (heading === "Deliverables") {
-        inSection = true;
-        continue;
-      }
-      if (inSection) break; // next heading ends the section
-      continue;
-    }
-    if (!inSection) continue;
-
-    // Bullet line?
-    const bulletMatch = trimmed.match(/^[-*]\s+(.*)/);
-    if (!bulletMatch) continue;
-    const content = bulletMatch[1].trim();
-    if (!content) continue;
-
+  for (const item of items) {
+    const content = item.content;
     // First backtick-quoted token, else first whitespace-delimited token
     let path = null;
     const backtickMatch = content.match(/`([^`]+)`/);
@@ -1323,8 +1405,8 @@ export function parseDeliverables(briefText) {
     }
     if (!path) continue;
 
-    // Strip trailing punctuation
-    path = path.replace(/[,;.:!?]+$/, "").trim();
+    // Strip trailing punctuation, then trailing slashes (fixes #79)
+    path = path.replace(/[,;.:!?]+$/, "").replace(/\/+$/, "").trim();
     if (path) deliverables.push(path);
   }
   return deliverables;
@@ -1369,15 +1451,20 @@ export function parseChangedPaths(output) {
  *
  * @param {string[]} deliverables  Declared deliverable paths (parseDeliverables output).
  * @param {string[]} changedPaths  Actual changed paths from git status --porcelain.
+ * @param {boolean}  [headingPresent=false]  True when the ## Deliverables heading
+ *                      was found in the brief, even if zero entries were parseable.
  * @returns {{ probe: string, passed: boolean, detail: string }}
  */
-export function checkDeliverablesProbe(deliverables, changedPaths) {
+export function checkDeliverablesProbe(deliverables, changedPaths, headingPresent = false) {
   const probe = "P3: deliverables";
   // Defensive: ensure array inputs
   const delArr = Array.isArray(deliverables) ? deliverables : [];
   const chArr = Array.isArray(changedPaths) ? changedPaths : [];
-  // No deliverables declared → trivially pass
+  // No deliverables declared
   if (delArr.length === 0) {
+    if (headingPresent) {
+      return { probe, passed: false, detail: "## Deliverables heading present but no entries parsed; check brief syntax" };
+    }
     return { probe, passed: true, detail: "no Deliverables declared; check skipped" };
   }
   // Change set empty
@@ -1415,42 +1502,29 @@ export function checkDeliverablesProbe(deliverables, changedPaths) {
 /**
  * Parse an optional `## Smoke` section from a brief text.
  *
- * Section = lines after a `## Smoke` heading up to the next `## ` heading
- * or EOF.  Each bullet line (`- ` or `* `) declares one smoke entry:
- * - The command is the first backtick-quoted token (backticks are REQUIRED;
- *   a bullet without backticks is ignored).
- * - An optional expected exit code is declared as `exit <N>` anywhere in the
- *   remainder of the line.  Default expected exit code is 0.
+ * Uses the shared section walker (parseSectionItems).  For bullet items a
+ * backtick-quoted command is REQUIRED (bullets without backticks are
+ * ignored); an optional `exit <N>` annotation after the closing backtick
+ * declares the expected exit code (default 0).  For code-block items each
+ * non-blank line becomes a command with exit 0 (no annotation possible).
  *
  * @param {string|null|undefined} briefText  The full brief text.
  * @returns {Array<{command: string, expectedExit: number}>}
  *   Parsed smoke entries; [] when absent/empty.  Never throws.
  */
 export function parseSmoke(briefText) {
-  if (!briefText || typeof briefText !== "string") return [];
-  const lines = briefText.split("\n");
-  let inSection = false;
+  const { items } = parseSectionItems(briefText, "Smoke");
   const entries = [];
-  for (let li = 0; li < lines.length; li++) {
-    const trimmed = lines[li].trim();
-    if (trimmed.startsWith("## ")) {
-      const heading = trimmed.slice(3).trim();
-      if (heading === "Smoke") {
-        inSection = true;
-        continue;
-      }
-      if (inSection) break; // next heading ends the section
+  for (const item of items) {
+    const content = item.content;
+    if (item.source === "code-block") {
+      // Code block: the line itself is the command, exit 0
+      const cmd = content.trim();
+      if (cmd) entries.push({ command: cmd, expectedExit: 0 });
       continue;
     }
-    if (!inSection) continue;
 
-    // Bullet line?
-    const bulletMatch = trimmed.match(/^[-*]\s+(.*)/);
-    if (!bulletMatch) continue;
-    const content = bulletMatch[1].trim();
-    if (!content) continue;
-
-    // First backtick-quoted token (REQUIRED; lines without are ignored)
+    // Bullet: first backtick-quoted token is REQUIRED; skip without
     const backtickMatch = content.match(/`([^`]+)`/);
     if (!backtickMatch) continue;
     const command = backtickMatch[1];
@@ -1480,15 +1554,20 @@ export function parseSmoke(briefText) {
  * @param {Array<{command: string, observed: number|string}>} observed
  *   Observed results.  Use the string "timeout" for timed-out commands,
  *   or the numeric exit code for executed commands.
+ * @param {boolean}  [headingPresent=false]  True when the ## Smoke heading
+ *                      was found in the brief, even if zero entries were parseable.
  * @returns {{ probe: string, passed: boolean, detail: string }}
  */
-export function checkSmokeProbe(entries, observed) {
+export function checkSmokeProbe(entries, observed, headingPresent = false) {
   const probe = "P4: smoke";
   const entriesArr = Array.isArray(entries) ? entries : [];
   const observedArr = Array.isArray(observed) ? observed : [];
 
-  // No entries declared → trivially pass
+  // No entries
   if (entriesArr.length === 0) {
+    if (headingPresent) {
+      return { probe, passed: false, detail: "## Smoke heading present but no entries parsed; check brief syntax" };
+    }
     return { probe, passed: true, detail: "no Smoke declared; check skipped" };
   }
 
@@ -2001,16 +2080,18 @@ async function cmdTask(cwd, { flags, text }) {
 
       // P3: deliverables
       const deliverables = parseDeliverables(text);
+      const deliverablesHeadingPresent = hasSectionHeading(text, "Deliverables");
       const statusResult = await callTool("sandbox_exec", {
         container_id: container,
         commands: ["git status --porcelain"],
       });
       const taskChangedPaths = parseChangedPaths(statusResult?.output ?? "");
-      const p3Result = checkDeliverablesProbe(deliverables, taskChangedPaths);
+      const p3Result = checkDeliverablesProbe(deliverables, taskChangedPaths, deliverablesHeadingPresent);
       probeResults.push(p3Result);
 
       // P4: smoke probe
       const smokeEntries = parseSmoke(text);
+      const smokeHeadingPresent = hasSectionHeading(text, "Smoke");
       if (smokeEntries.length > 0) {
         const smokeObserved = [];
         for (const entry of smokeEntries) {
@@ -2033,11 +2114,10 @@ async function cmdTask(cwd, { flags, text }) {
           }
           smokeObserved.push({ command: entry.command, observed: observed });
         }
-        const p4Result = checkSmokeProbe(smokeEntries, smokeObserved);
+        const p4Result = checkSmokeProbe(smokeEntries, smokeObserved, true);
         probeResults.push(p4Result);
       } else {
-        // No Smoke section → trivially pass, but always record the entry.
-        probeResults.push(checkSmokeProbe([], []));
+        probeResults.push(checkSmokeProbe([], [], smokeHeadingPresent));
       }
 
       job.probeResults = probeResults;
@@ -2479,6 +2559,7 @@ async function cmdChain(cwd, { flags, text }) {
       probeResults.push({ probe: "P2: verify gate", passed: verifyPassed, detail: JSON.stringify(verifyResult) });
 
       // P3: deliverables probe
+      const deliverablesHeadingPresent = hasSectionHeading(brief, "Deliverables");
       const statusResult = await callTool("sandbox_exec", {
         container_id: container,
         commands: ["git status --porcelain"],
@@ -2486,11 +2567,12 @@ async function cmdChain(cwd, { flags, text }) {
       chainStatusOutput = statusResult?.output ?? "";
       chainChangedPaths = parseChangedPaths(chainStatusOutput);
       chainStatusObserved = true;
-      const p3Result = checkDeliverablesProbe(chainDeliverables, chainChangedPaths);
+      const p3Result = checkDeliverablesProbe(chainDeliverables, chainChangedPaths, deliverablesHeadingPresent);
       probeResults.push(p3Result);
 
       // P4: smoke probe
       const chainSmokeEntries = parseSmoke(brief);
+      const chainSmokeHeadingPresent = hasSectionHeading(brief, "Smoke");
       if (chainSmokeEntries.length > 0) {
         const chainSmokeObserved = [];
         for (const entry of chainSmokeEntries) {
@@ -2513,11 +2595,10 @@ async function cmdChain(cwd, { flags, text }) {
           }
           chainSmokeObserved.push({ command: entry.command, observed: observed });
         }
-        const p4Result = checkSmokeProbe(chainSmokeEntries, chainSmokeObserved);
+        const p4Result = checkSmokeProbe(chainSmokeEntries, chainSmokeObserved, true);
         probeResults.push(p4Result);
       } else {
-        // No Smoke section → trivially pass, but always record the entry.
-        probeResults.push(checkSmokeProbe([], []));
+        probeResults.push(checkSmokeProbe([], [], chainSmokeHeadingPresent));
       }
 
       probesGreen = probeResults.every(function(p) { return p.passed; });

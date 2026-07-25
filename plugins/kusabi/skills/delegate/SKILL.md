@@ -64,10 +64,16 @@ end up re-running a doomed cheap round three times.
   and an empty change set becomes a discard. List the files that must change, and state
   that producing notes or summary files is not the task — cheap workers otherwise treat
   "fetch and save the issue" as completed work (real incident: a round returned a
-  markdown copy of the issue body and claimed done).
+  markdown copy of the issue body and claimed done). Accepted item syntaxes: unordered
+  bullets (`-`, `*`, `+`), ordered items (`1.`, `1)`), indented bullets, and lines inside
+  a fenced code block; the first backtick-quoted token (or first whitespace-delimited
+  token) is taken as the path.
 - **Declare `## Smoke` when runtime behaviour is the point.** The smoke probe runs those
   commands in the container and compares exit codes. A gate that only lints proves the
-  code parses, not that it runs.
+  code parses, not that it runs. Accepted item syntaxes: unordered bullets, ordered
+  items, indented bullets, or a fenced code block (one command per line, exit 0);
+  bullet entries require a backtick-quoted command with an optional `exit <N>`
+  annotation.
 - **Inline the whole spec. Never open with "read issue #N first."** The brief is the
   contract; a pointer is not.
 - **Freeze outcomes, not architecture.** Acceptance criteria must describe observable
