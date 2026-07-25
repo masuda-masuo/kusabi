@@ -32,6 +32,9 @@ import {
   checkDeliverablesProbe,
   checkSmokeProbe,
   runSmokeProbe,
+  runHeadCleanProbe,
+  runVerifyProbe,
+  runDeliverablesProbe,
   implementDenyTools,
   reviewDenyTools,
   renderBaseFacts,
@@ -3885,5 +3888,211 @@ describe("resolveResumeMethod", () => {
   it("round 4+ always returns fresh_session", () => {
     assert.deepEqual(resolveResumeMethod({ round: 4, strategized: false }), { type: "fresh_session" });
     assert.deepEqual(resolveResumeMethod({ round: 5, strategized: true }), { type: "fresh_session" });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// runHeadCleanProbe — P1 HEAD clean probe
+// ---------------------------------------------------------------------------
+
+/**
+ * Build a fake callTool function for testing runHeadCleanProbe.
+ * Simulates sandbox_exec responses for git rev-parse and git reset.
+ *
+ * @param {object}   opts
+ * @param {string}   [opts.headSha]   SHA that git rev-parse HEAD returns.
+ * @param {boolean}  [opts.resetOk]   Whether git reset succeeds.
+ * @returns {Function} A fake callTool(async (toolName, params) => ...).
+ */
+function fakeCallToolForP1({ headSha, resetOk = true } = {}) {
+  return async (toolName, params) => {
+    if (toolName !== "sandbox_exec") return { output: "" };
+    const cmd = params.commands[0];
+    if (cmd === "git rev-parse HEAD") {
+      return { output: (headSha ?? "abc123") + "\n" };
+    }
+    if (cmd.startsWith("git reset --mixed ")) {
+      if (resetOk) return { output: "" };
+      throw new Error("reset failed: path not clean");
+    }
+    return { output: "" };
+  };
+}
+
+describe("runHeadCleanProbe", () => {
+  it("passes when HEAD matches base SHA", async () => {
+    const fakeTool = fakeCallToolForP1({ headSha: "abc123" });
+    const result = await runHeadCleanProbe({ baseSha: "abc123", callTool: fakeTool, container: "fake-cid" });
+    assert.equal(result.probe, "P1: HEAD clean");
+    assert.equal(result.passed, true);
+    assert.equal(result.detail, "HEAD matches base abc123");
+  });
+
+  it("resets when HEAD differs, and passes when reset works", async () => {
+    const fakeTool = fakeCallToolForP1({ headSha: "def456" });
+    const result = await runHeadCleanProbe({ baseSha: "abc123", callTool: fakeTool, container: "fake-cid" });
+    assert.equal(result.probe, "P1: HEAD clean");
+    assert.equal(result.passed, true);
+    assert.ok(result.detail.startsWith("HEAD def456 != base abc123; auto reset"));
+    assert.ok(result.detail.includes("reset OK"));
+  });
+
+  it("records reset failure when reset throws", async () => {
+    const fakeTool = fakeCallToolForP1({ headSha: "def456", resetOk: false });
+    const result = await runHeadCleanProbe({ baseSha: "abc123", callTool: fakeTool, container: "fake-cid" });
+    assert.equal(result.passed, false);
+    assert.ok(result.detail.includes("reset FAILED"));
+  });
+
+  it("reports missing baseSha with default sourceLabel", async () => {
+    const fakeTool = fakeCallToolForP1();
+    const result = await runHeadCleanProbe({ baseSha: null, callTool: fakeTool, container: "fake-cid" });
+    assert.equal(result.passed, false);
+    assert.equal(result.detail, "baseSha not recorded at task start; cannot check HEAD");
+  });
+
+  it("uses sourceLabel in missing-baseSha detail", async () => {
+    const fakeTool = fakeCallToolForP1();
+    const result = await runHeadCleanProbe({ baseSha: null, callTool: fakeTool, container: "fake-cid", sourceLabel: "chain" });
+    assert.equal(result.passed, false);
+    assert.equal(result.detail, "baseSha not recorded at chain start; cannot check HEAD");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// runVerifyProbe — P2 verify gate probe
+// ---------------------------------------------------------------------------
+
+/**
+ * Build a fake callTool function for testing runVerifyProbe.
+ *
+ * @param {object}   opts
+ * @param {boolean}  [opts.gatePassed]  Whether gate_passed is true.
+ * @returns {Function} A fake callTool(async (toolName, params) => ...).
+ */
+function fakeCallToolForP2({ gatePassed = true } = {}) {
+  return async (toolName, params) => {
+    if (toolName !== "verify_in_container") return { output: "" };
+    const result = { gate_passed: gatePassed, output: "(mock output)" };
+    if (gatePassed) {
+      result.lint = [];
+      result.types = [];
+    }
+    return result;
+  };
+}
+
+describe("runVerifyProbe", () => {
+  it("passes when gate_passed is true", async () => {
+    const fakeTool = fakeCallToolForP2({ gatePassed: true });
+    const result = await runVerifyProbe({ callTool: fakeTool, container: "fake-cid" });
+    assert.equal(result.probe, "P2: verify gate");
+    assert.equal(result.passed, true);
+  });
+
+  it("fails when gate_passed is false", async () => {
+    const fakeTool = fakeCallToolForP2({ gatePassed: false });
+    const result = await runVerifyProbe({ callTool: fakeTool, container: "fake-cid" });
+    assert.equal(result.probe, "P2: verify gate");
+    assert.equal(result.passed, false);
+  });
+
+  it("fails when gate_passed is missing from result", async () => {
+    const fakeTool = async () => ({ output: "no gate field" });
+    const result = await runVerifyProbe({ callTool: fakeTool, container: "fake-cid" });
+    assert.equal(result.passed, false);
+  });
+
+  it("includes full verify result in detail as JSON", async () => {
+    const fakeTool = fakeCallToolForP2({ gatePassed: true });
+    const result = await runVerifyProbe({ callTool: fakeTool, container: "fake-cid" });
+    const parsed = JSON.parse(result.detail);
+    assert.equal(parsed.gate_passed, true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// runDeliverablesProbe — P3 deliverables probe
+// ---------------------------------------------------------------------------
+
+/**
+ * Build a fake callTool function for testing runDeliverablesProbe.
+ *
+ * @param {object}   opts
+ * @param {string}   [opts.statusOutput]  Output from git status --porcelain.
+ * @returns {Function} A fake callTool(async (toolName, params) => ...).
+ */
+function fakeCallToolForP3({ statusOutput = "" } = {}) {
+  return async (toolName, params) => {
+    if (toolName !== "sandbox_exec") return { output: "" };
+    if (params.commands[0] === "git status --porcelain") {
+      return { output: statusOutput };
+    }
+    return { output: "" };
+  };
+}
+
+describe("runDeliverablesProbe", () => {
+  it("passes when declared deliverable is touched", async () => {
+    const fakeTool = fakeCallToolForP3({ statusOutput: " M src/foo.js\n" });
+    const result = await runDeliverablesProbe({
+      deliverables: ["src/foo.js"],
+      headingPresent: true,
+      callTool: fakeTool,
+      container: "fake-cid",
+    });
+    assert.equal(result.probe, "P3: deliverables");
+    assert.equal(result.passed, true);
+    assert.equal(result.detail, "touches declared deliverables");
+  });
+
+  it("fails when declared deliverables are not touched", async () => {
+    const fakeTool = fakeCallToolForP3({ statusOutput: " M src/other.js\n" });
+    const result = await runDeliverablesProbe({
+      deliverables: ["src/foo.js"],
+      headingPresent: true,
+      callTool: fakeTool,
+      container: "fake-cid",
+    });
+    assert.equal(result.probe, "P3: deliverables");
+    assert.equal(result.passed, false);
+  });
+
+  it("fails when heading present but no deliverables parsed", async () => {
+    const fakeTool = fakeCallToolForP3();
+    const result = await runDeliverablesProbe({
+      deliverables: [],
+      headingPresent: true,
+      callTool: fakeTool,
+      container: "fake-cid",
+    });
+    assert.equal(result.passed, false);
+    assert.ok(result.detail.includes("heading present but no entries parsed"));
+  });
+
+  it("passes when no deliverables heading and no entries", async () => {
+    const fakeTool = fakeCallToolForP3();
+    const result = await runDeliverablesProbe({
+      deliverables: [],
+      headingPresent: false,
+      callTool: fakeTool,
+      container: "fake-cid",
+    });
+    assert.equal(result.passed, true);
+    assert.equal(result.detail, "no Deliverables declared; check skipped");
+  });
+
+  it("attaches changedPaths and statusOutput for chain's use", async () => {
+    const fakeTool = fakeCallToolForP3({ statusOutput: " M src/foo.js\n" });
+    const result = await runDeliverablesProbe({
+      deliverables: ["src/foo.js"],
+      headingPresent: true,
+      callTool: fakeTool,
+      container: "fake-cid",
+    });
+    assert.ok(Array.isArray(result.changedPaths));
+    assert.equal(result.changedPaths.length, 1);
+    assert.equal(result.changedPaths[0], "src/foo.js");
+    assert.equal(result.statusOutput, " M src/foo.js\n");
   });
 });

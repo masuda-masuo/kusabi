@@ -1752,6 +1752,103 @@ export async function runSmokeProbe({ entries, callTool, container, headingPrese
 }
 
 // ---------------------------------------------------------------------------
+// runHeadCleanProbe / runVerifyProbe / runDeliverablesProbe  —  P1, P2, P3
+// deterministic probes extracted from cmdTask/cmdChain duplication.
+// callTool is injectable for testing.
+// ---------------------------------------------------------------------------
+
+/**
+ * P1: Check that HEAD matches the recorded base SHA.
+ * When HEAD differs, auto-reset via git reset --mixed.
+ *
+ * @param {object}   opts
+ * @param {string}   opts.baseSha       The base SHA recorded at start.
+ * @param {Function} opts.callTool      The RPC callTool function (injectable).
+ * @param {string}   opts.container     Container ID.
+ * @param {string}   [opts.sourceLabel] Label for "baseSha not recorded" message
+ *                                       (e.g. "task" or "chain").
+ * @returns {Promise<{probe: string, passed: boolean, detail: string}>}
+ */
+export async function runHeadCleanProbe({ baseSha, callTool, container, sourceLabel = "task" }) {
+  let passed = false;
+  let detail = "";
+  if (baseSha) {
+    // A failing rev-parse is deliberately left to propagate: it means the
+    // container is not answering, which is an incident for the whole probe
+    // sequence to report, not a P1 opinion to record and carry on from.
+    const gitRev = await callTool("sandbox_exec", {
+      container_id: container,
+      commands: ["git rev-parse HEAD"],
+    });
+    const headSha = (gitRev?.output ?? "").trim();
+    if (headSha !== baseSha) {
+      detail = "HEAD " + headSha + " != base " + baseSha + "; auto reset";
+      try {
+        await callTool("sandbox_exec", {
+          container_id: container,
+          commands: ["git reset --mixed " + baseSha],
+        });
+        passed = true;
+        detail += " - reset OK";
+      } catch (resetErr) {
+        detail += " - reset FAILED: " + String(resetErr);
+      }
+    } else {
+      passed = true;
+      detail = "HEAD matches base " + baseSha;
+    }
+  } else {
+    detail = "baseSha not recorded at " + sourceLabel + " start; cannot check HEAD";
+  }
+  return { probe: "P1: HEAD clean", passed, detail };
+}
+
+/**
+ * P2: Run the verify gate (verify_in_container) with no skip flags.
+ *
+ * @param {object}   opts
+ * @param {Function} opts.callTool      The RPC callTool function (injectable).
+ * @param {string}   opts.container     Container ID.
+ * @returns {Promise<{probe: string, passed: boolean, detail: string}>}
+ */
+export async function runVerifyProbe({ callTool, container }) {
+  const verifyResult = await callTool("verify_in_container", {
+    container_id: container,
+    path: ".",
+  });
+  const passed = verifyResult?.gate_passed === true;
+  return { probe: "P2: verify gate", passed, detail: JSON.stringify(verifyResult) };
+}
+
+/**
+ * P3: Check that changed files touch declared deliverables.
+ *
+ * Returns the probe result with extra properties `changedPaths` and
+ * `statusOutput` attached for the chain call site which needs the raw
+ * change set data for the reviewer.
+ *
+ * @param {object}   opts
+ * @param {string[]} opts.deliverables      Parsed deliverable paths.
+ * @param {boolean}  opts.headingPresent    Whether ## Deliverables heading found.
+ * @param {Function} opts.callTool          The RPC callTool function (injectable).
+ * @param {string}   opts.container         Container ID.
+ * @returns {Promise<{probe: string, passed: boolean, detail: string, changedPaths: string[], statusOutput: string}>}
+ */
+export async function runDeliverablesProbe({ deliverables, headingPresent, callTool, container }) {
+  const statusResult = await callTool("sandbox_exec", {
+    container_id: container,
+    commands: ["git status --porcelain"],
+  });
+  const statusOutput = statusResult?.output ?? "";
+  const changedPaths = parseChangedPaths(statusOutput);
+  const probeResult = checkDeliverablesProbe(deliverables, changedPaths, headingPresent);
+  // Attach side data for chain's use (the reviewer needs change set info)
+  probeResult.changedPaths = changedPaths;
+  probeResult.statusOutput = statusOutput;
+  return probeResult;
+}
+
+// ---------------------------------------------------------------------------
 // deriveDisposition — pure function mapping review + probe results to
 // chain disposition.  Exported for testing.
 // ---------------------------------------------------------------------------
@@ -2187,53 +2284,18 @@ async function cmdTask(cwd, { flags, text }) {
       const container = flags.container;
       const probeResults = [];
 
-      // P1: HEAD clean
-      let p1Passed = false;
-      let p1Detail = "";
-      if (taskBaseSha) {
-        const gitRev = await callTool("sandbox_exec", {
-          container_id: container,
-          commands: ["git rev-parse HEAD"],
-        });
-        const headSha = (gitRev?.output ?? "").trim();
-        if (headSha !== taskBaseSha) {
-          p1Detail = "HEAD " + headSha + " != base " + taskBaseSha + "; auto reset";
-          try {
-            await callTool("sandbox_exec", {
-              container_id: container,
-              commands: ["git reset --mixed " + taskBaseSha],
-            });
-            p1Passed = true;
-            p1Detail += " - reset OK";
-          } catch (resetErr) {
-            p1Detail += " - reset FAILED: " + String(resetErr);
-          }
-        } else {
-          p1Passed = true;
-          p1Detail = "HEAD matches base " + taskBaseSha;
-        }
-      } else {
-        p1Detail = "baseSha not recorded at task start; cannot check HEAD";
-      }
-      probeResults.push({ probe: "P1: HEAD clean", passed: p1Passed, detail: p1Detail });
+      const p1Result = await runHeadCleanProbe({ baseSha: taskBaseSha, callTool, container, sourceLabel: "task" });
+      probeResults.push(p1Result);
 
-      // P2: verify gate (no skip flags)
-      const verifyResult = await callTool("verify_in_container", {
-        container_id: container,
-        path: ".",
-      });
-      const verifyPassed = verifyResult?.gate_passed === true;
-      probeResults.push({ probe: "P2: verify gate", passed: verifyPassed, detail: JSON.stringify(verifyResult) });
+      const p2Result = await runVerifyProbe({ callTool, container });
+      probeResults.push(p2Result);
 
-      // P3: deliverables
-      const deliverables = parseDeliverables(text);
-      const deliverablesHeadingPresent = hasSectionHeading(text, "Deliverables");
-      const statusResult = await callTool("sandbox_exec", {
-        container_id: container,
-        commands: ["git status --porcelain"],
+      const p3Result = await runDeliverablesProbe({
+        deliverables: parseDeliverables(text),
+        headingPresent: hasSectionHeading(text, "Deliverables"),
+        callTool,
+        container,
       });
-      const taskChangedPaths = parseChangedPaths(statusResult?.output ?? "");
-      const p3Result = checkDeliverablesProbe(deliverables, taskChangedPaths, deliverablesHeadingPresent);
       probeResults.push(p3Result);
 
       // P4: smoke probe
@@ -2647,54 +2709,21 @@ async function cmdChain(cwd, { flags, text }) {
     try {
       const { callTool } = await import("./sunaba-rpc.mjs");
 
-      // P1: HEAD clean - compare with baseSha recorded at chain start
-      let p1Passed = false;
-      let p1Detail = "";
-      if (baseSha) {
-        const gitRev = await callTool("sandbox_exec", {
-          container_id: container,
-          commands: ["git rev-parse HEAD"],
-        });
-        const headSha = (gitRev?.output ?? "").trim();
-        if (headSha !== baseSha) {
-          p1Detail = "HEAD " + headSha + " != base " + baseSha + "; auto reset";
-          try {
-            await callTool("sandbox_exec", {
-              container_id: container,
-              commands: ["git reset --mixed " + baseSha],
-            });
-            p1Passed = true;
-            p1Detail += " - reset OK";
-          } catch (resetErr) {
-            p1Detail += " - reset FAILED: " + String(resetErr);
-          }
-        } else {
-          p1Passed = true;
-          p1Detail = "HEAD matches base " + baseSha;
-        }
-      } else {
-        p1Detail = "baseSha not recorded at chain start; cannot check HEAD";
-      }
-      probeResults.push({ probe: "P1: HEAD clean", passed: p1Passed, detail: p1Detail });
+      const p1Result = await runHeadCleanProbe({ baseSha, callTool, container, sourceLabel: "chain" });
+      probeResults.push(p1Result);
 
-      // P2: verify gate (no skip flags)
-      const verifyResult = await callTool("verify_in_container", {
-        container_id: container,
-        path: ".",
-      });
-      const verifyPassed = verifyResult?.gate_passed === true;
-      probeResults.push({ probe: "P2: verify gate", passed: verifyPassed, detail: JSON.stringify(verifyResult) });
+      const p2Result = await runVerifyProbe({ callTool, container });
+      probeResults.push(p2Result);
 
-      // P3: deliverables probe
-      const deliverablesHeadingPresent = hasSectionHeading(brief, "Deliverables");
-      const statusResult = await callTool("sandbox_exec", {
-        container_id: container,
-        commands: ["git status --porcelain"],
+      const p3Result = await runDeliverablesProbe({
+        deliverables: chainDeliverables,
+        headingPresent: hasSectionHeading(brief, "Deliverables"),
+        callTool,
+        container,
       });
-      chainStatusOutput = statusResult?.output ?? "";
-      chainChangedPaths = parseChangedPaths(chainStatusOutput);
+      chainChangedPaths = p3Result.changedPaths;
+      chainStatusOutput = p3Result.statusOutput;
       chainStatusObserved = true;
-      const p3Result = checkDeliverablesProbe(chainDeliverables, chainChangedPaths, deliverablesHeadingPresent);
       probeResults.push(p3Result);
 
       // P4: smoke probe
