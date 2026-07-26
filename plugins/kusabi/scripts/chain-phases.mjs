@@ -45,6 +45,73 @@ import { dispatchWithFallback } from "./prompt-execution.mjs";
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const PLUGIN_ROOT = path.resolve(HERE, "..");
 
+/**
+ * Normalise a file path for cross-round file-path comparison.
+ *
+ * Strips leading/trailing whitespace so that minor formatting differences
+ * do not affect suffix matching.  Path-form equivalence (absolute vs
+ * relative) is handled by suffix-based matching in hasRepeatedAreas.
+ *
+ * @param {string} filePath
+ * @returns {string}
+ */
+export function normalizeFilePath(filePath) {
+  if (!filePath) return "";
+  if (typeof filePath !== "string") return String(filePath);
+  return filePath.trim();
+}
+
+/**
+ * Check whether any finding file from the current round matches a file
+ * that appeared in a previous round.
+ *
+ * Two paths match when one is a suffix of the other on path-segment
+ * boundaries (split by "/").  This handles the common case where one
+ * reviewer uses an absolute in-container path like
+ * "/workspace/src/a/b.py" and another uses the repository-relative
+ * "src/a/b.py" — the shorter path's segments are a suffix of the longer.
+ *
+ * Old records without the findingFiles field are handled gracefully
+ * (previousFindingFiles is undefined/null → no match).
+ *
+ * @param {string[]|undefined|null} previousFindingFiles
+ * @param {Array|undefined|null} currentFindings  — findings array from
+ *        the parsed review (each element has a .file property).
+ * @returns {boolean}
+ */
+export function hasRepeatedAreas(previousFindingFiles, currentFindings) {
+  if (!previousFindingFiles?.length) return false;
+  if (!currentFindings?.length) return false;
+
+  // Path-segment suffix match: split on "/" and check if one array
+  // of segments is a suffix of the other.
+  function suffixMatch(a, b) {
+    const segA = a.split("/");
+    const segB = b.split("/");
+    const shorter = segA.length <= segB.length ? segA : segB;
+    const longer = segA.length > segB.length ? segA : segB;
+    if (shorter.length === 0) return false;
+    const offset = longer.length - shorter.length;
+    for (let i = 0; i < shorter.length; i++) {
+      if (longer[offset + i] !== shorter[i]) return false;
+    }
+    return true;
+  }
+
+  for (let fi = 0; fi < currentFindings.length; fi++) {
+    const currentPath = normalizeFilePath(currentFindings[fi]?.file);
+    if (!currentPath) continue;
+    for (let pi = 0; pi < previousFindingFiles.length; pi++) {
+      const prevPath = normalizeFilePath(previousFindingFiles[pi]);
+      if (!prevPath) continue;
+      if (suffixMatch(currentPath, prevPath)) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
 // =========================================================================
 // Setup / initialisation
 // =========================================================================
@@ -377,18 +444,19 @@ export async function runReviewPhase({
     }
     roundRecord.findingsText = chainFindingsText;
 
-    // ---- determine repeated areas ----
-    if (previousRecord?.findingsText && chainParsedReview?.findings) {
-      const prevFiles = new Set(
-        (previousRecord.findingsText.match(/\([^:]+/g) || []).map(function (s) { return s.slice(1); }),
-      );
-      for (let fi = 0; fi < chainParsedReview.findings.length; fi++) {
-        if (prevFiles.has(chainParsedReview.findings[fi].file)) {
-          chainRepeatedAreas = true;
-          break;
-        }
-      }
-    }
+    // ---- store file paths for cross-round comparison ----
+    // Stores the raw finding file paths from the parsed review.
+    // Comparison uses path-segment suffix matching in hasRepeatedAreas,
+    // so absolute vs relative path differences are handled transparently.
+    roundRecord.findingFiles = chainParsedReview?.findings
+      ? chainParsedReview.findings.map(function (f) { return normalizeFilePath(f.file); })
+      : [];
+
+    // ---- determine repeated areas using hasRepeatedAreas ----
+    // Uses the stored findingFiles array instead of re-parsing the
+    // human-readable findingsText, which was fragile: it broke on
+    // finding titles containing parentheses and on path-form mismatches.
+    chainRepeatedAreas = hasRepeatedAreas(previousRecord?.findingFiles, chainParsedReview?.findings);
   }
 
   return { chainVerdict, chainFindingsText, chainParsedReview, chainRepeatedAreas, skipReview, reviewJobStatus, reviewJobError, reviewParseable };

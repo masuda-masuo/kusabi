@@ -15,6 +15,8 @@ import {
   runVerifyProbe,
   runDeliverablesProbe,
   parseReviewResult,
+  normalizeFilePath,
+  hasRepeatedAreas,
 } from "./chain-phases.mjs";
 import {
   createFakeCallTool,
@@ -811,6 +813,47 @@ describe("renderProviderExhaustedOutcome", () => {
 
     assert.ok(result.includes("strategize provider exhausted"));
   });
+
+  it("strategize provider-error: each round appears exactly once", () => {
+    // The strategize provider-error handler used to push the round record a
+    // second time, duplicating it in `records`.  The fix (removing that push)
+    // lives in cmdChain, which this test does NOT reach: cmdChain is not
+    // exported and driving it would require mocking every phase.  This test
+    // only covers the downstream half -- that the renderer does not itself
+    // duplicate rounds.  Re-introducing the duplicate push in cmdChain would
+    // still pass here.  Making that path testable is tracked separately.
+    const records = [
+      {
+        round: 1,
+        modelEntry: "provider/model-a",
+        verdict: "needs-attention",
+        probesGreen: true,
+        resumeMethod: { type: "continue_session" },
+      },
+      {
+        round: 2,
+        modelEntry: "provider/model-b",
+        verdict: "needs-attention",
+        probesGreen: true,
+        resumeMethod: { type: "continue_session" },
+      },
+    ];
+
+    const result = renderProviderExhaustedOutcome({
+      chainId,
+      round: 3,
+      phase: "strategize",
+      jobError: "All routes exhausted:\n  route/p — rate_limit at attempt 3",
+      records,
+    });
+
+    // Each prior round must appear exactly once in the rendered output.
+    // The current (aborted) round shows in the header as "stopped at round 3".
+    assert.equal((result.match(/Round 1/g) || []).length, 1);
+    assert.equal((result.match(/Round 2/g) || []).length, 1);
+    // The current round appears only in the header, not as a "Round 3:" line.
+    assert.ok(result.includes("stopped at round 3"));
+  });
 });
 
 // parseReviewResult — pure function for decision-path review parsing (AC3, AC4)
@@ -931,5 +974,131 @@ describe("parseReviewResult", () => {
 
     // The two produce different reviewParseable and different findingsText
     // despite having the same verdict string.
+  });
+});
+
+// normalizeFilePath — path normalisation for cross-round comparison
+// =========================================================================
+
+describe("normalizeFilePath", () => {
+  it("trims whitespace from paths", () => {
+    assert.equal(normalizeFilePath("  src/a/b.py  "), "src/a/b.py");
+  });
+
+  it("returns empty string for null / undefined", () => {
+    assert.equal(normalizeFilePath(null), "");
+    assert.equal(normalizeFilePath(undefined), "");
+  });
+
+  it("returns the path unchanged when there is no leading/trailing whitespace", () => {
+    assert.equal(normalizeFilePath("/workspace/src/a/b.py"), "/workspace/src/a/b.py");
+    assert.equal(normalizeFilePath("src/a/b.py"), "src/a/b.py");
+  });
+});
+
+// hasRepeatedAreas — cross-round file-path comparison.
+// =========================================================================
+
+describe("hasRepeatedAreas", () => {
+  it("detects repeat when absolute and relative paths refer to same file", () => {
+    // round 1 findingFiles stored /workspace/src/secret_scan.py;
+    // round 2 reports src/secret_scan.py — suffix match catches it.
+    const previousFindingFiles = ["/workspace/src/sunaba/tools/secret_scan.py"];
+    const currentFindings = [
+      { file: "src/sunaba/tools/secret_scan.py", severity: "high", title: "Issue", line_start: 10 },
+    ];
+    assert.equal(hasRepeatedAreas(previousFindingFiles, currentFindings), true);
+  });
+
+  it("does not false-positive on parentheses in finding titles", () => {
+    // The old regex-based approach parsed findingsText and would have
+    // matched "(src/helper.js)" from the title.  hasRepeatedAreas reads
+    // f.file from the structured data, which ignores the title entirely.
+    const previousFindingFiles = ["src/helper.js"];
+    const currentFindings = [
+      { file: "src/other.js", severity: "high", title: "The (src/helper.js) function is unused", line_start: 15 },
+    ];
+    assert.equal(hasRepeatedAreas(previousFindingFiles, currentFindings), false);
+  });
+
+  it("returns false for genuinely different files across rounds", () => {
+    const previousFindingFiles = ["src/alpha.js", "src/beta.js"];
+    const currentFindings = [
+      { file: "src/gamma.js", severity: "low", title: "Different file", line_start: 5 },
+    ];
+    assert.equal(hasRepeatedAreas(previousFindingFiles, currentFindings), false);
+  });
+
+  it("returns false when previousFindingFiles is missing (undefined, old records)", () => {
+    const currentFindings = [
+      { file: "src/file.js", severity: "high", title: "Something", line_start: 10 },
+    ];
+    assert.equal(hasRepeatedAreas(undefined, currentFindings), false);
+  });
+
+  it("returns false when previousFindingFiles is null (first round)", () => {
+    const currentFindings = [
+      { file: "src/file.js", severity: "low", title: "First issue", line_start: 1 },
+    ];
+    assert.equal(hasRepeatedAreas(null, currentFindings), false);
+  });
+
+  it("returns false when currentFindings is null (unparseable review)", () => {
+    // Critical regression: chainParsedReview is null when the review
+    // output could not be parsed — must not throw.
+    const previousFindingFiles = ["src/file.js"];
+    assert.equal(hasRepeatedAreas(previousFindingFiles, null), false);
+  });
+
+  it("returns false when currentFindings is empty array", () => {
+    const previousFindingFiles = ["src/file.js"];
+    assert.equal(hasRepeatedAreas(previousFindingFiles, []), false);
+  });
+
+  it("detects repeat when current round has a finding in a previously-flagged file", () => {
+    const previousFindingFiles = ["src/shared.js", "src/other.js"];
+    const currentFindings = [
+      { file: "/workspace/src/shared.js", severity: "high", title: "Same file", line_start: 42 },
+      { file: "src/new.js", severity: "low", title: "New file", line_start: 1 },
+    ];
+    assert.equal(hasRepeatedAreas(previousFindingFiles, currentFindings), true);
+  });
+
+  it("matches when one path is a suffix of the other on path-segment boundaries", () => {
+    // Round 1: absolute container path; Round 2: relative repo path
+    assert.equal(
+      hasRepeatedAreas(
+        ["/workspace/src/a/b/c.py"],
+        [{ file: "src/a/b/c.py" }],
+      ),
+      true,
+    );
+    // Round 1: relative; Round 2: absolute
+    assert.equal(
+      hasRepeatedAreas(
+        ["src/a/b/c.py"],
+        [{ file: "/workspace/src/a/b/c.py" }],
+      ),
+      true,
+    );
+    // Different segments, same suffix length
+    assert.equal(
+      hasRepeatedAreas(
+        ["/other/root/src/foo.py"],
+        [{ file: "src/foo.py" }],
+      ),
+      true,
+    );
+  });
+
+  it("does not match partial segment overlap", () => {
+    // "src/foo-bar.py" is NOT a suffix of "src/foo.py" on segment boundaries
+    assert.equal(
+      hasRepeatedAreas(
+        ["src/foo.py"],
+        [{ file: "src/foo-bar.py" }],
+      ),
+      false,
+    );
   });
 });
