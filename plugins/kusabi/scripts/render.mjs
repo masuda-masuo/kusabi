@@ -138,6 +138,7 @@ export function renderReview(parsed, rawText) {
 }
 
 const DIFF_BUDGET = 30000;
+const PRIOR_FINDINGS_BUDGET = 8000;
 
 export function renderBaseFacts({ baseSha, baseLog, statusOutput, diffContent, untrackedFiles } = {}) {
   const parts = [];
@@ -197,6 +198,62 @@ export function renderBaseFacts({ baseSha, baseLog, statusOutput, diffContent, u
 
   parts.push("Review ONLY this change set. Code that is already part of the base (see the log above) is NOT scope creep and must not be flagged as such.");
   return parts.join("\n");
+}
+
+/**
+ * Render the prior-findings block for a rework round's implement prompt.
+ *
+ * When the previous round record carries a structured `findings` array
+ * (severity, title, body, recommendation etc.), each finding is rendered
+ * in full.  The block is bounded by `PRIOR_FINDINGS_BUDGET` characters;
+ * when exceeded, a truncation note is appended.
+ *
+ * Old records without the `findings` array degrade gracefully to the
+ * current one-line `findingsText` format.
+ *
+ * @param {object|null|undefined} previousRecord
+ * @returns {string}
+ */
+export function renderPriorFindings(previousRecord) {
+  if (!previousRecord) {
+    return "(none)";
+  }
+
+  const findings = previousRecord.findings;
+  if (!findings || !Array.isArray(findings) || findings.length === 0) {
+    return previousRecord.findingsText || "(none)";
+  }
+
+  const parts = [];
+  for (const f of findings) {
+    const severity = f.severity || "unknown";
+    const title = f.title || "(untitled)";
+    const file = f.file || "?";
+    const lineStart = f.line_start !== undefined ? f.line_start : "?";
+
+    parts.push(`### [${severity}] ${title} (${file}:${lineStart})`);
+    parts.push("");
+    if (f.body) {
+      parts.push(f.body);
+      parts.push("");
+    }
+    if (f.recommendation) {
+      parts.push(`**Recommendation:** ${f.recommendation}`);
+      parts.push("");
+    }
+  }
+
+  let text = parts.join("\n");
+
+  if (text.length > PRIOR_FINDINGS_BUDGET) {
+    text = text.slice(0, PRIOR_FINDINGS_BUDGET);
+    // No tool can fetch the remainder: prior findings live in the chain record
+    // on the host, not in the container.  Say what is actually true and what to
+    // do about it, rather than pointing at a file that does not exist.
+    text += `\n\n**(Prior findings truncated to ${PRIOR_FINDINGS_BUDGET} characters. The remaining findings are not retrievable from inside the container — resolve the ones shown above and report in your final report that the list was truncated.)**`;
+  }
+
+  return text;
 }
 
 export function renderStrategistPrompt({ brief, rounds } = {}) {

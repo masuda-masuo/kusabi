@@ -20,6 +20,7 @@ import {
 } from "./cli.mjs";
 import {
   renderBaseFacts,
+  renderPriorFindings,
   renderStrategistPrompt,
   renderReview,
   renderFollowupDraft,
@@ -178,7 +179,8 @@ export function buildImplementText({ round, brief, previousRecord }) {
     if (previousRecord.strategistRecommendation) {
       strategistSection = "\n\n## Strategist recommendation (structural change for this rework)\n" + previousRecord.strategistRecommendation + "\n";
     }
-    return "## Prior findings\n" + (previousRecord.findingsText || "(none)") + strategistSection + "\n\n## Acceptance criteria\n" + brief;
+    const priorFindingsText = renderPriorFindings(previousRecord);
+    return "## Prior findings\n" + priorFindingsText + "\n\n## Instruction\nResolve each prior finding in this round. If a finding cannot be fully resolved, you must explain why and report what remains." + strategistSection + "\n\n## Acceptance criteria\n" + brief;
   }
   return brief;
 }
@@ -469,6 +471,7 @@ export async function runReviewPhase({
     roundRecord.findingFiles = chainParsedReview?.findings
       ? chainParsedReview.findings.map(function (f) { return normalizeFilePath(f.file); })
       : [];
+    roundRecord.findings = chainParsedReview?.findings || [];
 
     // ---- determine repeated areas using hasRepeatedAreas ----
     // Uses the stored findingFiles array instead of re-parsing the
