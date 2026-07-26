@@ -38,7 +38,6 @@ import {
 } from "./probe-decisions.mjs";
 import {
   resolveResumeMethod,
-  deriveDisposition,
 } from "./disposition.mjs";
 import { writeJson } from "./state-paths.mjs";
 import { runPrompt } from "./prompt-execution.mjs";

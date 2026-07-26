@@ -135,7 +135,7 @@ export function renderJobLine(job) {
   return `${job.id}  ${job.kind.padEnd(6)}  ${job.status.padEnd(9)}  ${durationS(job)}s${orch}  ${job.title ?? ""}`;
 }
 
-export function renderFollowupDraft({ chainId, briefTitle, findings, roundsSummary } = {}) {
+export function renderFollowupDraft({ chainId, briefTitle, findings } = {}) {
   const lines = [];
   lines.push("## Follow-up issue draft (not posted — orchestrator judgement required)");
   lines.push("");

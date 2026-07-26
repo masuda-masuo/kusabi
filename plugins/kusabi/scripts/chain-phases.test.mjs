@@ -284,7 +284,6 @@ describe("runSmokeProbe", () => {
   });
 
   it("multiple entries: all pass -> probe passes", async () => {
-    let callCount = 0;
     const fakeTool = createFakeCallTool({ exitCode: 0, capturedOutput: "" });
 
     const result = await runSmokeProbe({
