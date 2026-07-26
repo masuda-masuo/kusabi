@@ -5,34 +5,25 @@
  * Pure function: decide which levers to pull for a rework round.
  *
  * Receives evidence from the finished round and returns the tier delta,
- * whether to start a new session, whether to restore artifacts from base,
- * and a human-readable reason.
+ * whether to start a new session, and a human-readable reason.
+ *
+ * Artifacts are always carried over — the chain never rolls the worktree
+ * back.  A new session starts fresh on the existing worktree.
  *
  * Default ladder (when no countervailing evidence):
- *   | rework | tier   | session  | artifacts |
- *   |--------|--------|----------|-----------|
- *   | 1st    | same   | continue | keep      |
- *   | 2nd    | +1     | new      | keep      |
- *   | 3rd    | +1     | new      | keep      |
- *
- * checkpoint_restore fires only when the evidence says the current artifacts
- * are worth less than base. Round number alone must never trigger it.
- * Restore is suppressed when either:
- *   - the previous round resolved all of the findings it was given, or
- *   - the previous round's findings were unavailable (unparseable or empty).
+ *   | rework | tier   | session  |
+ *   |--------|--------|----------|
+ *   | 1st    | same   | continue |
+ *   | 2nd    | +1     | new      |
+ *   | 3rd    | +1     | new      |
  *
  * @param {object} opts
- * @param {number}  opts.reworkCount                — How many reworks have been done
- *                                                    so far (0 = first rework).
- * @param {boolean} opts.repeatedAreas              — Whether the same file areas are
- *                                                    still being flagged (proxy for
- *                                                    whether prior findings were resolved).
- * @param {boolean} opts.previousFindingsAvailable  — Whether the previous round had
- *                                                    parseable, non-empty findings.
- * @param {boolean} opts.strategized                — Whether a strategize was triggered.
- * @returns {{ tierDelta: number, newSession: boolean, restoreBase: boolean, reason: string }}
+ * @param {number}  opts.reworkCount   — How many reworks have been done
+ *                                       so far (0 = first rework).
+ * @param {boolean} opts.strategized   — Whether a strategize was triggered.
+ * @returns {{ tierDelta: number, newSession: boolean, reason: string }}
  */
-export function deriveReworkStrategy({ reworkCount, repeatedAreas, previousFindingsAvailable, strategized }) {
+export function deriveReworkStrategy({ reworkCount, strategized }) {
   // ---- Base values from the default ladder (B3) ----
   let tierDelta;
   let newSession;
@@ -61,25 +52,7 @@ export function deriveReworkStrategy({ reworkCount, repeatedAreas, previousFindi
     reason += " + new session (strategized)";
   }
 
-  // ---- Restore-base decision (B4) ----
-  // checkpoint_restore fires only when the current artifacts are worth less
-  // than base.  Round number alone never triggers it.
-  //
-  // Restore is suppressed when:
-  //   1. Previous round resolved all findings (no repeated areas)
-  //   2. Previous round's findings were unavailable (unparseable or empty)
-  //
-  // Therefore restore fires only when BOTH:
-  //   - previous findings were available (non-empty, parseable)
-  //   - AND the same areas are still being flagged (not resolved)
-  const priorFindingsResolved = !repeatedAreas && previousFindingsAvailable;
-  const shouldRestoreBase = previousFindingsAvailable && !priorFindingsResolved;
-
-  if (shouldRestoreBase) {
-    reason += " + restore base (prior findings unresolved)";
-  }
-
-  return { tierDelta, newSession, restoreBase: shouldRestoreBase, reason };
+  return { tierDelta, newSession, reason };
 }
 
 /**

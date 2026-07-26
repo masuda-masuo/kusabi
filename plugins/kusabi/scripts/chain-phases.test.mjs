@@ -4,6 +4,7 @@ import {
   buildImplementText,
   shouldSkipReview,
   computeChainTotals,
+  resolveRoundResume,
   renderAcceptOutcome,
   renderAcceptWithFollowupOutcome,
   renderEscalateOutcome,
@@ -536,6 +537,29 @@ describe("computeChainTotals", () => {
   });
 });
 
+// resolveRoundResume  —  pure, synchronous, no container-mutating calls
+// =========================================================================
+
+describe("resolveRoundResume", () => {
+  it("returns continue_session when useNewSession is false", () => {
+    const result = resolveRoundResume({ useNewSession: false });
+    assert.deepEqual(result, {
+      resumeMethod: { type: "continue_session" },
+      useNewSession: false,
+    });
+  });
+
+  // AC4: a new session yields fresh_session with no container-mutating call
+  it("returns fresh_session when useNewSession is true (no restore)", () => {
+    const result = resolveRoundResume({ useNewSession: true });
+    assert.equal(result.resumeMethod.type, "fresh_session");
+    assert.equal(result.useNewSession, true);
+    // No checkpoint_restore or checkpoint_restore_failed type
+    assert.notEqual(result.resumeMethod.type, "checkpoint_restore");
+    assert.notEqual(result.resumeMethod.type, "checkpoint_restore_failed");
+  });
+});
+
 // renderAcceptOutcome  —  pure, extracted from cmdChain (chain-phases.mjs)
 // =========================================================================
 
@@ -612,7 +636,7 @@ describe("renderEscalateOutcome", () => {
     const roundRecord = { findingsText: "critical issue in src/main.js" };
     const records = [
       {
-        resumeMethod: { type: "checkpoint_restore", base: "abc123", detail: null },
+        resumeMethod: { type: "fresh_session", base: "abc123" },
         modelEntry: "test/gpt-4",
         verdict: "needs-attention",
         probesGreen: true,
@@ -633,13 +657,13 @@ describe("renderEscalateOutcome", () => {
   it("renders round summaries with resume details", () => {
     const roundRecord = { findingsText: "issue" };
     const records = [
-      { resumeMethod: { type: "checkpoint_restore", detail: null }, modelEntry: "test/gpt-4", verdict: "needs-attention", probesGreen: false },
-      { resumeMethod: { type: "checkpoint_restore_failed", detail: "network error" }, modelEntry: "test/gpt-4o", verdict: "needs-attention", probesGreen: true },
+      { resumeMethod: { type: "continue_session" }, modelEntry: "test/gpt-4", verdict: "needs-attention", probesGreen: false },
+      { resumeMethod: { type: "fresh_session", detail: "new session" }, modelEntry: "test/gpt-4o", verdict: "needs-attention", probesGreen: true },
     ];
     const disposition = { disposition: "escalate", reason: "repeated areas" };
     const result = renderEscalateOutcome({ chainId, round: 2, disposition, orchestrator: null, roundRecord, records });
-    assert.ok(result.includes("Round 1: model=test/gpt-4, verdict=needs-attention, probesGreen=false, resume=checkpoint_restore"));
-    assert.ok(result.includes("Round 2: model=test/gpt-4o, verdict=needs-attention, probesGreen=true, resume=checkpoint_restore_failed: network error"));
+    assert.ok(result.includes("Round 1: model=test/gpt-4, verdict=needs-attention, probesGreen=false, resume=continue_session"));
+    assert.ok(result.includes("Round 2: model=test/gpt-4o, verdict=needs-attention, probesGreen=true, resume=fresh_session: new session"));
   });
 
   it("renders 'unknown' when reason is missing", () => {
@@ -659,7 +683,7 @@ describe("renderMaxRoundsOutcome", () => {
   it("renders max rounds message", () => {
     const records = [
       { resumeMethod: { type: "continue_session" }, modelEntry: "test/gpt-4", verdict: "needs-attention", probesGreen: false },
-      { resumeMethod: { type: "checkpoint_restore" }, modelEntry: "test/gpt-4o", verdict: "needs-attention", probesGreen: true, findingsText: "still has bugs" },
+      { resumeMethod: { type: "fresh_session" }, modelEntry: "test/gpt-4o", verdict: "needs-attention", probesGreen: true, findingsText: "still has bugs" },
     ];
     const orchestrator = { model: "gpt-5" };
 
@@ -669,7 +693,7 @@ describe("renderMaxRoundsOutcome", () => {
     assert.ok(result.includes("Remaining findings:"));
     assert.ok(result.includes("still has bugs"));
     assert.ok(result.includes("Round 1: model=test/gpt-4, verdict=needs-attention, probesGreen=false, resume=continue_session"));
-    assert.ok(result.includes("Round 2: model=test/gpt-4o, verdict=needs-attention, probesGreen=true, resume=checkpoint_restore"));
+    assert.ok(result.includes("Round 2: model=test/gpt-4o, verdict=needs-attention, probesGreen=true, resume=fresh_session"));
     assert.ok(result.includes("Hand over to orchestrator for final judgement."));
   });
 
@@ -746,7 +770,7 @@ describe("renderProviderExhaustedOutcome", () => {
         modelEntry: "provider/model-b",
         verdict: null,
         probesGreen: false,
-        resumeMethod: { type: "checkpoint_restore", base: "abc123" },
+        resumeMethod: { type: "fresh_session", base: "abc123" },
         fallbacks: [{ from: "route/x", to: null, reason: "rate_limit", attempt: 3, message: "overloaded" }],
       },
     ];
@@ -761,7 +785,7 @@ describe("renderProviderExhaustedOutcome", () => {
 
     assert.ok(result.includes("Prior rounds:"));
     assert.ok(result.includes("Round 1: model=provider/model-a, verdict=needs-attention, probesGreen=true, resume=continue_session"));
-    assert.ok(result.includes("Round 2: model=provider/model-b, verdict=n/a, probesGreen=false, resume=checkpoint_restore"));
+    assert.ok(result.includes("Round 2: model=provider/model-b, verdict=n/a, probesGreen=false, resume=fresh_session"));
   });
 
   it("handles null jobError gracefully", () => {

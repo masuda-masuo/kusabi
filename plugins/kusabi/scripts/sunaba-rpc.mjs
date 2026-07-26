@@ -4,12 +4,12 @@
 // This module is NOT an MCP client — it speaks plain HTTP POST + SSE
 // to the Sunaba MCP endpoint so the companion's non-LLM pipeline can
 // invoke a limited set of tools (verify_in_container, sandbox_exec,
-// checkpoint, checkpoint_list, checkpoint_restore) without going
-// through the LLM layer.
+// checkpoint, checkpoint_list) without going through the LLM layer.
 //
 // The tool allowlist is hardcoded — no configuration can widen it.
 // This is a deliberate design invariant: publish and issue write are
-// structurally uncallable from here.
+// structurally uncallable from here.  checkpoint_restore was removed
+// in issue #114 — the chain never rolls the worktree back.
 
 import { fileURLToPath } from "node:url";
 import process from "node:process";
@@ -23,7 +23,6 @@ const ALLOWED_TOOLS = new Set([
   "sandbox_exec",
   "checkpoint",
   "checkpoint_list",
-  "checkpoint_restore",
 ]);
 
 // 127.0.0.1 (not "localhost"): node fetch may resolve localhost to ::1 while
@@ -216,7 +215,7 @@ export async function callTool(toolName, args = {}) {
 }
 
 // ---------------------------------------------------------------------------
-// convenience wrappers
+// convenience wrappers (used by the companion's non-LLM pipeline)
 // ---------------------------------------------------------------------------
 
 export async function verifyInContainer(args = {}) {
@@ -225,18 +224,6 @@ export async function verifyInContainer(args = {}) {
 
 export async function sandboxExec(args = {}) {
   return callTool("sandbox_exec", args);
-}
-
-export async function checkpoint(args = {}) {
-  return callTool("checkpoint", args);
-}
-
-export async function checkpointList(args = {}) {
-  return callTool("checkpoint_list", args);
-}
-
-export async function checkpointRestore(args = {}) {
-  return callTool("checkpoint_restore", args);
 }
 
 // Exported for testing
