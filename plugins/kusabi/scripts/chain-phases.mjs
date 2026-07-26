@@ -379,7 +379,8 @@ export async function runReviewPhase({
   container, brief, modelChain, chainId, cwd, previousRecord, baseSha,
   chainStatusOutput, chainBaseLog, chainDiff, chainUntracked, roundRecord,
   chainChangedPaths, chainStatusObserved, chainDeliverables, flagsModel,
-}) {
+  _dispatchWithFallback: _dispatch = dispatchWithFallback,
+} = {}) {
   const skipReview = shouldSkipReview({ chainStatusObserved, chainChangedPaths, chainDeliverables });
 
   // ---- P3 empty-change: set probe-sourced discard verdict before review ----
@@ -430,7 +431,7 @@ export async function runReviewPhase({
     // passed so selectRoutes offers tier 1 onwards, and `explicitModel` keeps
     // `--model` in force for reviews of every round.
     // dispatchWithFallback handles capacity fallback transparently.
-    const { job: reviewJob, resultText: reviewResultText } = await dispatchWithFallback({
+    const { job: reviewJob, resultText: reviewResultText } = await _dispatch({
       cwd,
       kind: "review",
       title: "chain: " + chainId + " round " + roundRecord.round + " review",
@@ -445,6 +446,9 @@ export async function runReviewPhase({
     });
     roundRecord.reviewJobId = reviewJob.id;
     roundRecord.reviewUsage = reviewJob.usage || null;
+    roundRecord.reviewModelEntry = reviewJob.modelEntry || null;
+    roundRecord.reviewModelVariant = reviewJob.modelVariant || null;
+    roundRecord.reviewFallbacks = reviewJob.fallbacks || null;
     reviewJobStatus = reviewJob.status;
     reviewJobError = reviewJob.error || null;
 
@@ -537,7 +541,7 @@ export function persistChainState({
  * Uses dispatchWithFallback so capacity fallback applies to the strategist
  * dispatch as well.
  */
-export async function runStrategizePhase({ cwd, chainId, round, brief, previousRecord, roundRecord, modelChain }) {
+export async function runStrategizePhase({ cwd, chainId, round, brief, previousRecord, roundRecord, modelChain, _dispatchWithFallback: _dispatch = dispatchWithFallback } = {}) {
   // Build the strategist prompt from the brief's acceptance criteria and
   // the last two rounds' findings.
   const strategistRounds = [];
@@ -551,7 +555,7 @@ export async function runStrategizePhase({ cwd, chainId, round, brief, previousR
     rounds: strategistRounds,
   });
 
-  const { job: strategistJob, resultText: strategistResultText } = await dispatchWithFallback({
+  const { job: strategistJob, resultText: strategistResultText } = await _dispatch({
     cwd,
     kind: "strategist",
     title: "chain: " + chainId + " round " + round + " strategist",
@@ -569,6 +573,9 @@ export async function runStrategizePhase({ cwd, chainId, round, brief, previousR
 
   roundRecord.strategistJobId = strategistJob.id;
   roundRecord.strategistUsage = strategistJob.usage || null;
+  roundRecord.strategistModelEntry = strategistJob.modelEntry || null;
+  roundRecord.strategistModelVariant = strategistJob.modelVariant || null;
+  roundRecord.strategistFallbacks = strategistJob.fallbacks || null;
   roundRecord.strategistRecommendation = (strategistResultText || "").trim() || "(no recommendation)";
 
   return {

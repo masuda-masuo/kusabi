@@ -17,6 +17,7 @@ import {
   runDeliverablesProbe,
   runProbePhase,
   runReviewPhase,
+  runStrategizePhase,
   parseReviewResult,
   normalizeFilePath,
   hasRepeatedAreas,
@@ -1531,5 +1532,208 @@ describe("review input tool list", () => {
       runReviewPhase.toString().includes("diff_in_container"),
       "runReviewPhase should offer diff_in_container in the tool list",
     );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// runReviewPhase / runStrategizePhase — stubbed dispatch route recording
+// ---------------------------------------------------------------------------
+
+describe("runReviewPhase — stubbed dispatch route recording", () => {
+  it("records reviewModelEntry and reviewModelVariant on the roundRecord", async () => {
+    function stubbedDispatch() {
+      return {
+        job: {
+          id: "review-job-1",
+          status: "completed",
+          modelEntry: "test-org/test-review-model:variant",
+          modelVariant: "variant",
+          fallbacks: null,
+          usage: null,
+          error: null,
+        },
+        resultText: JSON.stringify({ verdict: "approve", findings: [] }),
+      };
+    }
+
+    const roundRecord = { round: 1 };
+
+    const result = await runReviewPhase({
+      container: "test",
+      brief: "test brief",
+      modelChain: ["test-org/test-flash", "test-org/test-pro"],
+      chainId: "test-chain",
+      cwd: process.cwd(),
+      previousRecord: null,
+      baseSha: "abc123",
+      chainStatusOutput: "",
+      chainBaseLog: "",
+      chainDiff: "",
+      chainUntracked: "",
+      roundRecord,
+      chainChangedPaths: [],
+      chainStatusObserved: false,
+      chainDeliverables: [],
+      flagsModel: null,
+      _dispatchWithFallback: stubbedDispatch,
+    });
+
+    assert.equal(roundRecord.reviewModelEntry, "test-org/test-review-model:variant");
+    assert.equal(roundRecord.reviewModelVariant, "variant");
+    assert.equal(roundRecord.reviewFallbacks, null);
+    assert.equal(result.reviewJobStatus, "completed");
+  });
+
+  it("records reviewFallbacks when dispatch had fallbacks", async () => {
+    function stubbedDispatch() {
+      return {
+        job: {
+          id: "review-job-2",
+          status: "completed",
+          modelEntry: "test-org/test-review-model",
+          modelVariant: null,
+          fallbacks: [
+            { from: "test-org/old-route", to: "test-org/test-review-model", reason: "capacity", attempt: 1, message: "busy" },
+          ],
+          usage: null,
+          error: null,
+        },
+        resultText: JSON.stringify({ verdict: "approve", findings: [] }),
+      };
+    }
+
+    const roundRecord = { round: 1 };
+
+    await runReviewPhase({
+      container: "test",
+      brief: "test brief",
+      modelChain: ["test-org/test-flash", "test-org/test-pro"],
+      chainId: "test-chain",
+      cwd: process.cwd(),
+      previousRecord: null,
+      baseSha: "abc123",
+      chainStatusOutput: "",
+      chainBaseLog: "",
+      chainDiff: "",
+      chainUntracked: "",
+      roundRecord,
+      chainChangedPaths: ["some/file"],
+      chainStatusObserved: true,
+      chainDeliverables: ["test/file"],
+      flagsModel: null,
+      _dispatchWithFallback: stubbedDispatch,
+    });
+
+    assert.ok(Array.isArray(roundRecord.reviewFallbacks));
+    assert.equal(roundRecord.reviewFallbacks.length, 1);
+    assert.equal(roundRecord.reviewFallbacks[0].from, "test-org/old-route");
+  });
+});
+
+describe("runStrategizePhase — stubbed dispatch route recording", () => {
+  it("records strategistModelEntry and strategistModelVariant on the roundRecord", async () => {
+    function stubbedDispatch() {
+      return {
+        job: {
+          id: "strat-job-1",
+          status: "completed",
+          modelEntry: "test-org/test-strategist-model:max",
+          modelVariant: "max",
+          fallbacks: null,
+          usage: null,
+          error: null,
+        },
+        resultText: "Switch to a Map data structure",
+      };
+    }
+
+    const roundRecord = { round: 1 };
+
+    await runStrategizePhase({
+      cwd: process.cwd(),
+      chainId: "test-chain",
+      round: 1,
+      brief: "test brief",
+      previousRecord: null,
+      roundRecord,
+      modelChain: ["test-org/test-flash", "test-org/test-pro"],
+      _dispatchWithFallback: stubbedDispatch,
+    });
+
+    assert.equal(roundRecord.strategistModelEntry, "test-org/test-strategist-model:max");
+    assert.equal(roundRecord.strategistModelVariant, "max");
+    assert.equal(roundRecord.strategistFallbacks, null);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Fallback trails: the three states must stay distinguishable on disk
+//
+// The stats layer separates three states — key absent (pre-feature record),
+// present-but-null (no fallback fired), present array (fallback fired) — and
+// reports the first as n/a rather than folding it into "no fallback".  These
+// tests lock the write side of that contract.
+//
+// Note for future readers: `|| null` is correct here.  An empty array is
+// *truthy* in JavaScript, so `[] || null` is `[]`, not `null`; `??` would be
+// equivalent for every value `fallbacks` can hold (undefined / null / array).
+// A review finding claiming otherwise was refuted by mutating the operator and
+// observing that no test changed colour.
+// ---------------------------------------------------------------------------
+
+describe("runReviewPhase fallback trail fidelity", () => {
+  function dispatchReturning(fallbacks) {
+    return function stubbedDispatch() {
+      return {
+        job: {
+          id: "job-1",
+          status: "completed",
+          modelEntry: "test-org/test-review-model",
+          modelVariant: null,
+          fallbacks,
+          usage: null,
+          error: null,
+        },
+        resultText: JSON.stringify({ verdict: "approve", findings: [] }),
+      };
+    };
+  }
+
+  async function runWith(fallbacks) {
+    const roundRecord = { round: 1 };
+    await runReviewPhase({
+      container: "test",
+      brief: "test brief",
+      modelChain: ["test-org/test-flash", "test-org/test-pro"],
+      chainId: "test-chain",
+      cwd: process.cwd(),
+      previousRecord: null,
+      baseSha: "abc123",
+      chainStatusOutput: "",
+      chainBaseLog: "",
+      chainDiff: "",
+      chainUntracked: "",
+      roundRecord,
+      chainChangedPaths: [],
+      chainStatusObserved: false,
+      chainDeliverables: [],
+      flagsModel: null,
+      _dispatchWithFallback: dispatchReturning(fallbacks),
+    });
+    return roundRecord;
+  }
+
+  it("preserves an empty fallback array instead of collapsing it to null", async () => {
+    const roundRecord = await runWith([]);
+    assert.ok(
+      Array.isArray(roundRecord.reviewFallbacks),
+      "empty array must survive as an array, not become null",
+    );
+    assert.equal(roundRecord.reviewFallbacks.length, 0);
+  });
+
+  it("still maps an absent fallback trail to null", async () => {
+    const roundRecord = await runWith(undefined);
+    assert.equal(roundRecord.reviewFallbacks, null);
   });
 });
