@@ -111,7 +111,7 @@ Direct container inspection via sunaba-rpc (§3.6). Does not involve the LLM:
 |---|---|---|
 | **P1: HEAD clean** | Record baseSha via `git rev-parse HEAD` at chain start. After implement, if HEAD≠base, auto-execute `git reset --mixed <base>` | Auto-fix (empirical: even when the brief explicitly prohibited it, it happened 2 out of 3 times). Record in metadata |
 | **P2: verify gate** | Run `verify_in_container` (no skip flags at all) | If gate_passed=false, skip review, turn results into findings, and rework (consumes a round) |
-| **P3: deliverables** | Parse `## Deliverables` section from the brief; check that at least one declared path appears in the change set (`git status --porcelain`). | Empty change set → review job NOT dispatched, round verdict set to `discard` with `verdictSource: "probe"` (follows the existing discard→escalate path). Deliverables declared but no match → P3 fails but review still runs; `deriveDisposition` handles the rest. No `## Deliverables` section → probe trivially passes. **Heading present but zero entries parsed → P3 fails** (author is told to fix brief syntax rather than believing the check ran). |
+| **P3: deliverables** | Parse `## Deliverables` section from the brief; check that at least one declared path appears in the change set (`git status --porcelain`). | Empty change set **and** a non-empty `## Deliverables` section (both conditions required by `shouldSkipReview` in `chain-phases.mjs`) → review job NOT dispatched, round verdict set to `discard` with `verdictSource: "probe"` (follows the existing discard→escalate path). When no `## Deliverables` section is declared, an empty change set still goes to review — with nothing declared there is no mechanical basis for calling an empty change set a failure, so the reviewer decides. Deliverables declared but no match → P3 fails but review still runs; `deriveDisposition` handles the rest. No `## Deliverables` section → probe trivially passes. **Heading present but zero entries parsed → P3 fails** (author is told to fix brief syntax rather than believing the check ran). |
 | **P4: smoke** | Parse `## Smoke` section from the brief (accepted syntaxes: unordered/ordered bullets with backtick-quoted command + optional `exit <N>` annotation, or fenced code block with one command per line/exit 0). Each declared command is executed inside the container via `sandbox_exec`; the command's stdout/stderr is redirected to a file so that the exit-code marker (`; echo SMOKE_EXIT=$?`) is the only text returned by `sandbox_exec` and is never subject to pagination truncation. The captured output file is available for diagnostic excerpts on failure (timeout: 300s). | Any entry whose observed exit code does not match the declared expected exit (or times out / cannot be executed) → P4 fails. An exit code that cannot be observed (marker absent from `sandbox_exec` return text) is reported distinctly from a command mismatch — the probe still fails but the wording says "could not be observed" rather than "observed exit unknown". A timeout arrives as data (`status: "timeout"`, `exit_code: 124`) rather than as a raised error, and is detected as such: a timeout is an outcome of the command, so it must not be reported as the probe failing to observe. No `## Smoke` section → probe trivially passes. **Heading present but zero entries parsed → P4 fails** (author is told to fix brief syntax rather than believing the check ran). |
 
 The same probes (P1–P4) also run for single `task --container <cid>` invocations, storing results on the job record and appending a probe summary to the task output.
@@ -234,6 +234,36 @@ Launched with `chain-stats [--since <ISO>] [--until <ISO>] [--compare <ISO>]`. R
 On escalate, include remaining findings + history (each round's verdict/probes/disposition/tier/resume method) in the final output. publish is never called from the chain (not on the allow list).
 
 The chain now defaults to 4 max rounds (was 3). With the default ladder, rework 1 stays on the cheapest tier, so a 4-round chain reaches the same top tier as the old 3-round chain while spending the same number of paid rounds.
+
+### 3.5.7 Chain lifecycle and stop lever — implemented
+
+A chain holds the container it was given (`--container <cid>`) for its entire run — from the first round's implement dispatch through the final verdict. There is no upstream enforcement inside sunaba (the container does not reject writes), so the orchestrator is the gatekeeper. The stop lever and status readout give the orchestrator the information needed to decide when it is safe to touch the container.
+
+**Control record (`control.json`).** Each chain directory contains a `control.json` file with its own single-writer rules:
+- The chain process writes: `pid`, `container`, `status` (`running` → `completed` / `cancelled` / `failed`), `round`, `startedAt`, `finishedAt`.
+- A stop-requesting process (a separate `chain-cancel` CLI invocation) writes only: `stopRequestedAt`, `stopRequestedBy`.
+- Exception: when the chain process is gone (its pid no longer exists), the stop-requesting process finalises the status to `cancelled` — otherwise no one ever will.
+
+**Stop predicate.** The chain process consults exactly one predicate, `shouldStopNow`, which returns true when either `stopRequestedAt` is present in `control.json` or a SIGTERM/SIGINT was received. Both paths feed the same predicate rather than having scattered exit paths.
+
+It is consulted at two points per round: at the round boundary, and after the deterministic probes but before the review dispatch. The second checkpoint exists because a stop requested during implement would otherwise still buy a review job and keep the chain working in the container while the orchestrator inspects it. It sits *after* the probes rather than before them so that P1 has restored the canonical worktree state (HEAD == base, changes unstaged) that the orchestrator publishes from.
+
+**Recorded statuses:**
+
+| Status | Meaning |
+|---|---|
+| `running` | The chain process is alive and has not finished. |
+| `completed` | The chain reached a terminal disposition (accept, accept-with-followup, escalate, or max-rounds). The container is no longer held. This status records *that* the chain ended, not *how*: `chain-show` therefore prints the round-derived disposition ("accepted at round 2") for a completed chain rather than the bare word. |
+| `cancelled` | The chain was stopped via `chain-cancel` or SIGTERM/SIGINT, or the process was already dead when the stop was requested (`stale` finalisation). |
+| `failed` | The chain stopped due to a provider-exhaustion error across all routes. |
+
+**Stale records.** A control record that says `running` but whose pid no longer exists is **stale**. It is reported as "stale" (not "running" and not silently as "finished"), and the container is not claimed as held. A stale record is finalised to `cancelled` when a `chain-cancel` is issued against it.
+
+**status output.** `kusabi-companion status` (no arguments) reports, for each chain of this workspace that is still running, the chain id, the round it is on, and the container it holds. A record whose pid is gone is reported as stale with an explicit note.
+
+**chain-show output.** `chain-show` reads `control.json` to determine the chain's status. The control record is authoritative for every lifecycle status except `completed`, which defers to the round-derived disposition (see the table above). When the control record is absent (old chains from before the stop lever), it falls back to the round's last disposition — and reports `incomplete` as before.
+
+**serve-stop protection.** `serve-stop` checks for running jobs before killing the serve. When jobs are running, it declines and points at `chain-cancel` as the correct way to stop a chain, because the chain spawns a new serve on its next dispatch. An explicit `--force` flag overrides this protection.
 
 ### 3.6 sunaba-rpc (raw JSON-RPC client) — implemented
 

@@ -153,5 +153,6 @@ is visible in `status` and `result` output for each round.
 ## Notes
 
 - Jobs, event logs, and results are stored per directory under `~/.kusabi/`.
-- `opencode serve` keeps running between jobs; stop it with `node plugins/kusabi/scripts/kusabi-companion.mjs serve-stop` if needed.
+- `opencode serve` keeps running between jobs; stop it with `node plugins/kusabi/scripts/kusabi-companion.mjs serve-stop` if needed. While jobs are running, `serve-stop` declines unless `--force` is passed — stopping the serve does not stop a chain, which spawns a new serve on its next dispatch.
+- A chain holds the container it was given for its whole run. `status` names the chains that are running and the containers they hold; `chain-cancel <chainId>` is the way to stop one.
 - The opencode HTTP API is mid-migration (v1 → v2); the companion targets the v1 surface present in opencode ≥ 1.17.

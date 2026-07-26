@@ -1,4 +1,8 @@
-// Rendering pure functions — no I/O, no imports from kusabi-companion.mjs.
+// Rendering functions — no I/O, no imports from kusabi-companion.mjs.
+// Imports from chain-control.mjs for liveness checks (process.kill with sig 0
+// is a pure observation, not a mutation).
+
+import { effectiveStatus } from "./chain-control.mjs";
 
 export function durationS(job) {
   if (!job.startedAt) return "?";
@@ -317,30 +321,65 @@ export function renderFollowupDraft({ chainId, briefTitle, findings } = {}) {
   return lines.join("\n");
 }
 
-export function renderChainShow(chain, rounds, unreadable = []) {
+/**
+ * Resolve the status label for a chain by combining the control record
+ * (explicit lifecycle status) with the round-derived disposition when the
+ * control record is absent (old chains from before stop-lever).
+ *
+ * @param {object|null} control
+ * @param {Array}       rounds
+ * @returns {string}
+ */
+function roundDerivedStatus(rounds) {
+  const safeRounds = rounds ?? [];
+  const lastRound = safeRounds.length > 0 ? safeRounds[safeRounds.length - 1] : null;
+  if (lastRound?.disposition?.disposition === "accept") {
+    return `accepted at round ${lastRound.round}`;
+  } else if (lastRound?.disposition?.disposition === "accept-with-followup") {
+    return `accepted-with-followup at round ${lastRound.round} (${lastRound.disposition.reason || "economic cutoff"})`;
+  } else if (lastRound?.disposition?.disposition === "escalate") {
+    return `escalated at round ${lastRound.round} (${lastRound.disposition.reason || "unknown"})`;
+  }
+  return null;
+}
+
+function resolveChainStatus(control, rounds) {
+  // The control record is authoritative about the chain's *lifecycle* —
+  // whether the process is alive, stopping, gone (stale), cancelled or failed.
+  // effectiveStatus detects stale records (running status with dead pid) and
+  // reports them as "stale" rather than "running".
+  //
+  // "completed" is the one lifecycle status that says nothing about the
+  // outcome, so it defers to the round-derived disposition: "accepted at
+  // round 2" is what the reader needs, and it is the label chain-show
+  // printed before the control record existed.
+  if (control) {
+    const { status } = effectiveStatus(control);
+    if (status !== "completed") return status;
+    return roundDerivedStatus(rounds) || "completed";
+  }
+
+  // No control file (chains from before the stop lever): round-derived only.
+  return roundDerivedStatus(rounds) || "incomplete";
+}
+
+export function renderChainShow(chain, rounds, unreadable = [], control = null) {
   const lines = [];
   // Tolerate null/undefined rounds — treat as empty
   const safeRounds = rounds ?? [];
+  const chainId = chain?.chainId || "(unknown)";
 
   // Header
-  lines.push(`chain: ${chain?.chainId || "(unknown)"}`);
+  lines.push(`chain: ${chainId}`);
   // Corrupt round records must be surfaced, never silently omitted —
   // a digest that hides evidence defeats its purpose.
   if (unreadable.length > 0) {
     lines.push(`!! unreadable round records (excluded below): ${unreadable.join(", ")}`);
   }
 
-  // Status/outcome
-  const lastRound = safeRounds.length > 0 ? safeRounds[safeRounds.length - 1] : null;
-  if (lastRound?.disposition?.disposition === "accept") {
-    lines.push(`status: accepted at round ${lastRound.round}`);
-  } else if (lastRound?.disposition?.disposition === "accept-with-followup") {
-    lines.push(`status: accepted-with-followup at round ${lastRound.round} (${lastRound.disposition.reason || "economic cutoff"})`);
-  } else if (lastRound?.disposition?.disposition === "escalate") {
-    lines.push(`status: escalated at round ${lastRound.round} (${lastRound.disposition.reason || "unknown"})`);
-  } else {
-    lines.push("status: incomplete");
-  }
+  // Status/outcome — from control record when present, else round-derived.
+  const statusLabel = resolveChainStatus(control, safeRounds);
+  lines.push(`status: ${statusLabel}`);
 
   // Orchestrator model when present
   if (chain?.orchestrator?.model) {
