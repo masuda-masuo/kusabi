@@ -4,7 +4,7 @@
 import path from "node:path";
 import fs from "node:fs";
 import process from "node:process";
-import { ensureServer, api, authHeader } from "./serve-lifecycle.mjs";
+import { ensureServer, api, authHeader, judgeServeDeath } from "./serve-lifecycle.mjs";
 import { newJobId, saveJob, jobDir, appendEvent } from "./job-store.mjs";
 import { writeJson } from "./state-paths.mjs";
 import { durationS } from "./render.mjs";
@@ -52,6 +52,80 @@ export function shouldFailFast({ reason, attempt, steps, retryCount }) {
   }
 
   return { stop: false };
+}
+
+// =========================================================================
+// job-outcome classification — pure, exported, unit-testable
+// =========================================================================
+
+/**
+ * Determine final job status and error message from observed outcomes.
+ *
+ * Precedence (first match wins):
+ *  1. `serve-dead` — the serve process disappeared.
+ *  2. `provider-error` — provider retries exhausted.
+ *  3. `stalled` — silence watchdog fired.
+ *  4. `timeout` — abort triggered with no idle / session-error.
+ *  5. `error` — session.error received.
+ *  6. `completed` — all fine.
+ *
+ * @param {object} outcomes
+ * @param {{ pid: number, port: number, since: string }|null} outcomes.serveDead
+ * @param {{ reason: string|null, attempt: number, terminal: boolean, message: string }|null} outcomes.providerError
+ * @param {boolean} outcomes.watchdogFired
+ * @param {boolean} outcomes.watchdogKilled
+ * @param {number} outcomes.watchdogS
+ * @param {boolean} outcomes.sawIdle
+ * @param {string|null} outcomes.sessionError
+ * @param {number} outcomes.timeoutS
+ * @returns {{ status: string, error: string|null }}
+ */
+export function classifyJobOutcome({
+  serveDead,
+  providerError,
+  watchdogFired,
+  watchdogKilled,
+  watchdogS,
+  sawIdle,
+  sessionError,
+  timeoutS,
+}) {
+  if (serveDead) {
+    return {
+      status: "serve-dead",
+      error: `serve process died: pid ${serveDead.pid}, port ${serveDead.port} (gone since ${serveDead.since})`,
+    };
+  }
+  if (providerError) {
+    return {
+      status: "provider-error",
+      error: `provider error: ${providerError.reason || "retry"} (attempt ${providerError.attempt})${providerError.terminal ? " [terminal]" : ""}: ${providerError.message}`,
+    };
+  }
+  if (watchdogFired) {
+    return {
+      status: "stalled",
+      error: `watchdog: no events for ${watchdogS}s` + (watchdogKilled ? " (process killed)" : ""),
+    };
+  }
+  // No idle and no session error means the watcher ended without the session
+  // ever finishing.  There is deliberately no `aborted` input here: the caller
+  // aborts during cleanup before classifying, so such a flag would always be
+  // true and would carry no information — while inviting tests to assert on a
+  // combination production can never produce.
+  if (!sawIdle && !sessionError) {
+    return {
+      status: "timeout",
+      error: `timed out after ${timeoutS}s`,
+    };
+  }
+  if (sessionError) {
+    return {
+      status: "error",
+      error: sessionError,
+    };
+  }
+  return { status: "completed", error: null };
 }
 
 // =========================================================================
@@ -297,10 +371,56 @@ export async function runPrompt({ cwd, kind, title, promptText, agent, model, se
   let watchdogFired = false;
   let watchdogKilled = false;
   let watchdogInterval = null;
+  let livenessInterval = null;
+  let serveDead = null; // { pid, port, since } | null
+
+  // Liveness interval — always runs (even when watchdogS === 0).
+  // Detects when the opencode serve process itself has disappeared so the
+  // job can be finished immediately rather than waiting for the silence
+  // threshold.
+  livenessInterval = setInterval(() => {
+    if (serveDead || job.status !== "running") return;
+
+    const death = judgeServeDeath(server.pid);
+    if (!death.dead) return;
+
+    serveDead = {
+      pid: server.pid,
+      port: server.port,
+      since: new Date().toISOString(),
+    };
+    clearInterval(livenessInterval);
+
+    // Record the event in the job's audit trail.
+    appendEvent(stateDir, job.id, {
+      type: "companion.serve-dead",
+      pid: server.pid,
+      port: server.port,
+      since: serveDead.since,
+    });
+
+    // Leave a trace in server.log.
+    try {
+      const line = `[${serveDead.since}] serve-dead: pid ${server.pid} port ${server.port} not found (liveness poll)\n`;
+      fs.appendFileSync(path.join(stateDir, "server.log"), line, "utf8");
+    } catch { /* best-effort */ }
+
+    // Remove stale server.json so the next dispatch spawns a fresh serve.
+    // Do NOT attempt to kill — the process is already gone.
+    try { fs.unlinkSync(path.join(stateDir, "server.json")); } catch { /* best-effort */ }
+
+    // Stop the watcher (no abort API call needed — serve is gone).
+    abort.abort();
+  }, 10000);
 
   if (watchdogS > 0) {
     watchdogInterval = setInterval(() => {
       if (watchdogFired) return;
+      // The liveness poll already established that the serve is gone.  Silence
+      // is then expected, not evidence of a stalled worker, and there is
+      // nothing left to kill — claiming otherwise would put a kill that never
+      // happened into the audit trail.
+      if (serveDead) return;
       const lastActivity = job.stats.lastActivity ?? job.startedAt;
       const silenceMs = Date.now() - Date.parse(lastActivity);
       if (silenceMs > watchdogS * 1000) {
@@ -326,7 +446,9 @@ export async function runPrompt({ cwd, kind, title, promptText, agent, model, se
             });
             healthOk = r.ok;
           } catch { /* health check timed out or failed */ }
-          if (!abortOk || !healthOk) {
+          // Re-checked here as well as at the top of the tick: the liveness
+          // poll can land while these two probes are in flight.
+          if (!serveDead && (!abortOk || !healthOk)) {
             try { process.kill(server.pid, "SIGKILL"); } catch { /* best-effort */ }
             watchdogKilled = true;
             try { fs.unlinkSync(path.join(stateDir, "server.json")); } catch { /* best-effort */ }
@@ -472,27 +594,29 @@ export async function runPrompt({ cwd, kind, title, promptText, agent, model, se
     await watcher;
   } finally {
     clearTimeout(timeout);
+    clearInterval(livenessInterval);
     clearInterval(watchdogInterval);
     abort.abort();
   }
 
   // ---- determine final status ----
-  if (providerError) {
-    job.status = "provider-error";
-    job.error = `provider error: ${providerError.reason || "retry"} (attempt ${providerError.attempt})${providerError.terminal ? " [terminal]" : ""}: ${providerError.message}`;
+  const outcome = classifyJobOutcome({
+    serveDead,
+    providerError,
+    watchdogFired,
+    watchdogKilled,
+    watchdogS,
+    sawIdle,
+    sessionError,
+    timeoutS,
+  });
+  job.status = outcome.status;
+  job.error = outcome.error;
+
+  if (outcome.status === "provider-error") {
     job.retry = providerError;
-  } else if (watchdogFired) {
-    job.status = "stalled";
-    job.error = `watchdog: no events for ${watchdogS}s` + (watchdogKilled ? " (process killed)" : "");
-  } else if (abort.signal.aborted && !sawIdle && !sessionError) {
-    job.status = "timeout";
-    job.error = `timed out after ${timeoutS}s`;
+  } else if (outcome.status === "timeout") {
     await api(server, "POST", `/session/${sessionID}/abort`).catch(() => {});
-  } else if (sessionError) {
-    job.status = "error";
-    job.error = sessionError;
-  } else {
-    job.status = "completed";
   }
   job.finishedAt = new Date().toISOString();
 

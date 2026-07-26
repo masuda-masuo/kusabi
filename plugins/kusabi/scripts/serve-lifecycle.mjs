@@ -59,6 +59,12 @@ export async function ensureServer(cwd) {
     env: { ...process.env, OPENCODE_SERVER_PASSWORD: password },
   });
   child.unref();
+  child.on("exit", (code, signal) => {
+    try {
+      const line = `[${new Date().toISOString()}] process exited: pid ${child.pid}, exit-code=${code}, signal=${signal}\n`;
+      fs.appendFileSync(logFile, line, "utf8");
+    } catch { /* best-effort */ }
+  });
   fs.closeSync(logFd);
 
   const server = { port, password, pid: child.pid, cwd, startedAt: new Date().toISOString() };
@@ -141,6 +147,33 @@ export function reapIdleServes(root, ttlMs) {
         try { fs.unlinkSync(serverFile); } catch { /* best-effort */ }
       }
     } catch { /* best-effort per hash dir */ }
+  }
+}
+
+/**
+ * Judge whether a serve process is dead based on its pid.
+ *
+ * Uses `process.kill(pid, 0)` which tests whether the process exists
+ * without sending a signal.  ESRCH means the process is definitively gone.
+ * EPERM means the process exists (we just cannot signal it), so that is
+ * treated as alive.
+ *
+ * @param {number|null} pid \u2014 The PID to check.
+ * @returns {{ dead: boolean, reason: string|null }}
+ *   - `dead`: true when the process is definitively gone (ESRCH).
+ *   - `reason`: a description of what was observed when dead.
+ */
+export function judgeServeDeath(pid) {
+  if (pid == null) return { dead: false, reason: null };
+  try {
+    process.kill(pid, 0);
+    return { dead: false, reason: null };
+  } catch (err) {
+    if (err && err.code === "ESRCH") {
+      return { dead: true, reason: `pid ${pid} not found (ESRCH)` };
+    }
+    // EPERM or other errors \u2014 process exists
+    return { dead: false, reason: null };
   }
 }
 

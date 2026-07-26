@@ -560,3 +560,189 @@ describe("dispatchWithFallback", () => {
     assert.equal(secondCalled, true); // only called once for the alive route
   });
 });
+
+// =========================================================================
+// classifyJobOutcome — pure function: outcome → status + error
+// =========================================================================
+
+import { classifyJobOutcome } from "./prompt-execution.mjs";
+
+describe("classifyJobOutcome", () => {
+  it("serve-dead takes precedence over all other outcomes", () => {
+    const result = classifyJobOutcome({
+      serveDead: { pid: 12345, port: 45063, since: "2026-07-26T12:00:00.000Z" },
+      providerError: { reason: "free_tier_limit", attempt: 1, terminal: true, message: "quota" },
+      watchdogFired: true,
+      watchdogKilled: false,
+      watchdogS: 900,
+      sawIdle: false,
+      sessionError: null,
+      timeoutS: 300,
+    });
+    assert.equal(result.status, "serve-dead");
+    assert.ok(result.error.includes("12345"));
+    assert.ok(result.error.includes("45063"));
+    assert.ok(result.error.includes("serve process died"));
+  });
+
+  it("provider-error is reported correctly", () => {
+    const result = classifyJobOutcome({
+      serveDead: null,
+      providerError: { reason: "free_tier_limit", attempt: 1, terminal: true, message: "quota exhausted" },
+      watchdogFired: false,
+      watchdogKilled: false,
+      watchdogS: 900,
+      sawIdle: false,
+      sessionError: null,
+      timeoutS: 300,
+    });
+    assert.equal(result.status, "provider-error");
+    assert.ok(result.error.includes("free_tier_limit"));
+    assert.ok(result.error.includes("attempt 1"));
+    assert.ok(result.error.includes("[terminal]"));
+    assert.ok(result.error.includes("quota exhausted"));
+  });
+
+  it("non-terminal provider error is reported without [terminal] tag", () => {
+    const result = classifyJobOutcome({
+      serveDead: null,
+      providerError: { reason: "rate_limit", attempt: 3, terminal: false, message: "try again" },
+      watchdogFired: false,
+      watchdogKilled: false,
+      watchdogS: 900,
+      sawIdle: false,
+      sessionError: null,
+      timeoutS: 300,
+    });
+    assert.equal(result.status, "provider-error");
+    assert.ok(!result.error.includes("[terminal]"));
+    assert.ok(result.error.includes("attempt 3"));
+  });
+
+  it("stalled (watchdog fired, process NOT killed)", () => {
+    const result = classifyJobOutcome({
+      serveDead: null,
+      providerError: null,
+      watchdogFired: true,
+      watchdogKilled: false,
+      watchdogS: 900,
+      sawIdle: false,
+      sessionError: null,
+      timeoutS: 300,
+    });
+    assert.equal(result.status, "stalled");
+    assert.ok(result.error.includes("no events for 900s"));
+    assert.ok(!result.error.includes("killed"));
+  });
+
+  it("stalled (watchdog fired, process killed)", () => {
+    const result = classifyJobOutcome({
+      serveDead: null,
+      providerError: null,
+      watchdogFired: true,
+      watchdogKilled: true,
+      watchdogS: 900,
+      sawIdle: false,
+      sessionError: null,
+      timeoutS: 300,
+    });
+    assert.equal(result.status, "stalled");
+    assert.ok(result.error.includes("process killed"));
+  });
+
+  it("timeout when aborted but no idle and no session error", () => {
+    const result = classifyJobOutcome({
+      serveDead: null,
+      providerError: null,
+      watchdogFired: false,
+      watchdogKilled: false,
+      watchdogS: 0,
+      sawIdle: false,
+      sessionError: null,
+      timeoutS: 120,
+    });
+    assert.equal(result.status, "timeout");
+    assert.ok(result.error.includes("timed out after 120s"));
+  });
+
+  it("session error", () => {
+    const result = classifyJobOutcome({
+      serveDead: null,
+      providerError: null,
+      watchdogFired: false,
+      watchdogKilled: false,
+      watchdogS: 0,
+      sawIdle: false,
+      sessionError: '{"message":"something broke"}',
+      timeoutS: 120,
+    });
+    assert.equal(result.status, "error");
+    assert.equal(result.error, '{"message":"something broke"}');
+  });
+
+  it("completed when sawIdle with no error", () => {
+    const result = classifyJobOutcome({
+      serveDead: null,
+      providerError: null,
+      watchdogFired: false,
+      watchdogKilled: false,
+      watchdogS: 0,
+      sawIdle: true,
+      sessionError: null,
+      timeoutS: 300,
+    });
+    assert.equal(result.status, "completed");
+    assert.equal(result.error, null);
+  });
+
+  it("no idle and no error is a timeout, not completed", () => {
+    // The session never reported idle, so the watcher ended without the
+    // session finishing.  This is the production shape of a timeout — the
+    // caller has always aborted by the time it classifies, so "did we abort"
+    // carries no information and is deliberately not an input.
+    const result = classifyJobOutcome({
+      serveDead: null,
+      providerError: null,
+      watchdogFired: false,
+      watchdogKilled: false,
+      watchdogS: 0,
+      sawIdle: false,
+      sessionError: null,
+      timeoutS: 300,
+    });
+    assert.equal(result.status, "timeout");
+  });
+
+  it("stalled cannot be confused with serve-dead — serve-dead wins", () => {
+    // Both conditions true: serve-dead must win.
+    const result = classifyJobOutcome({
+      serveDead: { pid: 999, port: 44444, since: "2026-07-26T12:00:00.000Z" },
+      providerError: null,
+      watchdogFired: true,
+      watchdogKilled: false,
+      watchdogS: 900,
+      sawIdle: false,
+      sessionError: null,
+      timeoutS: 300,
+    });
+    assert.equal(result.status, "serve-dead");
+    assert.ok(!result.error.includes("stalled"));
+    assert.ok(!result.error.includes("watchdog"));
+  });
+
+  it("sawIdle is completed, not timeout", () => {
+    // The session reported idle, so it finished — the cleanup abort that
+    // always precedes classification must not turn that into a timeout.
+    const result = classifyJobOutcome({
+      serveDead: null,
+      providerError: null,
+      watchdogFired: false,
+      watchdogKilled: false,
+      watchdogS: 0,
+      sawIdle: true,
+      sessionError: null,
+      timeoutS: 300,
+    });
+    assert.equal(result.status, "completed");
+  });
+});
