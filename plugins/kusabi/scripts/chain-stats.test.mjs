@@ -84,15 +84,20 @@ function chain({
   chainId = "chain-test-001",
   rounds = [],
   chainTotals = null,
+  modelChain,
 } = {}) {
   // Filter out undefined entries from rounds
   const safeRounds = rounds.filter(Boolean);
+  const meta = {
+    chainId,
+    chainTotals: chainTotals || undefined,
+  };
+  if (modelChain !== undefined) {
+    meta.modelChain = modelChain;
+  }
   return {
     chainId,
-    meta: {
-      chainId,
-      chainTotals: chainTotals || undefined,
-    },
+    meta,
     rounds: safeRounds,
   };
 }
@@ -655,5 +660,644 @@ describe("prior-unresolved heuristic", () => {
 
     const stats = computeStats(chains);
     assert.equal(stats.priorUnresolvedCount, 1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// resolveRoundTier — tier resolution
+// ---------------------------------------------------------------------------
+
+import { resolveRoundTier } from "./chain-stats.mjs";
+
+describe("resolveRoundTier", () => {
+  it("resolves on a flat chain to the tier index of the route (derived)", () => {
+    const round = { modelEntry: "p/pro" };
+    const modelChain = ["p/flash", "p/pro"];
+    const result = resolveRoundTier(round, modelChain);
+    assert.deepEqual(result, { tierIndex: 1, tierCount: 2, source: "derived" });
+  });
+
+  it("resolves on a tiered chain with second route in first tier to tier 0", () => {
+    const round = { modelEntry: "p/flash" };
+    const modelChain = [["p/free", "p/flash"], ["p/pro"]];
+    const result = resolveRoundTier(round, modelChain);
+    assert.deepEqual(result, { tierIndex: 0, tierCount: 2, source: "derived" });
+  });
+
+  it("uses tierBefore when present (recorded) even when derivation would differ", () => {
+    const round = { modelEntry: "p/flash", tierBefore: 1 };
+    const modelChain = ["p/flash", "p/pro"];
+    const result = resolveRoundTier(round, modelChain);
+    // tierBefore=1 wins even though modelEntry would derive tier 0
+    assert.deepEqual(result, { tierIndex: 1, tierCount: 2, source: "recorded" });
+  });
+
+  it("resolves after stripping :variant (derived-variant-insensitive)", () => {
+    const round = { modelEntry: "opencode-go/deepseek-v4-pro" };
+    const modelChain = ["opencode-go/deepseek-v4-flash:max", "opencode-go/deepseek-v4-pro:max"];
+    const result = resolveRoundTier(round, modelChain);
+    assert.deepEqual(result, { tierIndex: 1, tierCount: 2, source: "derived-variant-insensitive" });
+  });
+
+  it("returns unknown when route does not appear in the chain", () => {
+    const round = { modelEntry: "p/unknown" };
+    const modelChain = ["p/flash", "p/pro"];
+    const result = resolveRoundTier(round, modelChain);
+    assert.equal(result.source, "unknown");
+    assert.equal(result.tierIndex, -1);
+  });
+
+  it("returns unknown and throws nothing when modelChain is absent", () => {
+    const result = resolveRoundTier({ modelEntry: "p/flash" }, undefined);
+    assert.equal(result.source, "unknown");
+    assert.equal(result.tierIndex, -1);
+    assert.equal(result.tierCount, 0);
+  });
+
+  it("returns unknown and throws nothing when modelChain is not an array", () => {
+    const result = resolveRoundTier({ modelEntry: "p/flash" }, null);
+    assert.equal(result.source, "unknown");
+    assert.equal(result.tierIndex, -1);
+    assert.equal(result.tierCount, 0);
+
+    const result2 = resolveRoundTier({ modelEntry: "p/flash" }, "not-an-array");
+    assert.equal(result2.source, "unknown");
+  });
+
+  it("returns unknown and throws nothing when modelEntry is absent", () => {
+    const result = resolveRoundTier({}, ["p/flash", "p/pro"]);
+    assert.equal(result.source, "unknown");
+    assert.equal(result.tierIndex, -1);
+    assert.equal(result.tierCount, 2);
+  });
+
+  it("returns unknown and throws nothing when modelEntry is null", () => {
+    const result = resolveRoundTier({ modelEntry: null }, ["p/flash", "p/pro"]);
+    assert.equal(result.source, "unknown");
+  });
+
+  it("returns unknown and throws nothing when modelEntry is not a string", () => {
+    const result = resolveRoundTier({ modelEntry: 42 }, ["p/flash", "p/pro"]);
+    assert.equal(result.source, "unknown");
+  });
+
+  it("handles modelChain entries that are numbers or null without throwing", () => {
+    const round = { modelEntry: "p/flash" };
+    const modelChain = [42, null, ["p/flash", "p/pro"]];
+    const result = resolveRoundTier(round, modelChain);
+    assert.equal(result.source, "derived");
+    assert.equal(result.tierIndex, 2);
+    assert.equal(result.tierCount, 3);
+  });
+
+  it("returns unknown when modelChain array is empty", () => {
+    const result = resolveRoundTier({ modelEntry: "p/flash" }, []);
+    assert.equal(result.source, "unknown");
+    assert.equal(result.tierIndex, -1);
+    assert.equal(result.tierCount, 0);
+  });
+
+  // `typeof NaN === "number"`, so a bare typeof check would report a NaN
+  // tierBefore as authoritative ("recorded") while the round vanished from
+  // tierCounts and the peak-tier scan -- a count over a round that appears
+  // nowhere.  Falling through to derivation keeps the two views consistent.
+  it("does not treat a NaN tierBefore as recorded", () => {
+    const result = resolveRoundTier(
+      { tierBefore: NaN, modelEntry: "p/pro" },
+      ["p/flash", "p/pro"],
+    );
+    assert.notEqual(result.source, "recorded");
+    assert.equal(result.source, "derived");
+    assert.equal(result.tierIndex, 1);
+    assert.ok(Number.isFinite(result.tierIndex));
+  });
+
+  it("does not treat an Infinity tierBefore as recorded", () => {
+    const result = resolveRoundTier(
+      { tierBefore: Infinity, modelEntry: "nope/unmatched" },
+      ["p/flash", "p/pro"],
+    );
+    assert.equal(result.source, "unknown");
+    assert.equal(result.tierIndex, -1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// computeStats — model and tier aggregates
+// ---------------------------------------------------------------------------
+
+describe("computeStats — model and tier", () => {
+  it("produces model counts for a mixed set of chains", () => {
+    const chains = [
+      chain({
+        chainId: "c1",
+        rounds: [
+          Object.assign(round({ round: 1 }), { modelEntry: "p/flash" }),
+        ],
+        modelChain: ["p/flash"],
+      }),
+      chain({
+        chainId: "c2",
+        rounds: [
+          Object.assign(round({ round: 1 }), { modelEntry: "p/flash" }),
+          Object.assign(round({ round: 2 }), { modelEntry: "p/pro" }),
+        ],
+        modelChain: ["p/flash", "p/pro"],
+      }),
+      chain({
+        chainId: "c3",
+        rounds: [
+          Object.assign(round({ round: 1 }), { modelEntry: "p/pro" }),
+        ],
+        modelChain: ["p/flash", "p/pro"],
+      }),
+    ];
+
+    const stats = computeStats(chains);
+    assert.deepEqual(stats.modelCounts, { "p/flash": 2, "p/pro": 2 });
+    assert.equal(stats.modelEntryNA, 0);
+  });
+
+  it("counts rounds missing modelEntry separately", () => {
+    const chains = [
+      chain({
+        chainId: "c1",
+        rounds: [
+          round({ round: 1 }),  // no modelEntry
+        ],
+        modelChain: ["p/flash"],
+      }),
+    ];
+    // Remove modelEntry to ensure it's missing
+    delete chains[0].rounds[0].modelEntry;
+
+    const stats = computeStats(chains);
+    assert.equal(stats.modelEntryNA, 1);
+    assert.deepEqual(stats.modelCounts, {});
+  });
+
+  it("tier counts match hand-computed values", () => {
+    const chains = [
+      chain({
+        chainId: "c1",
+        rounds: [
+          Object.assign(round({ round: 1 }), { modelEntry: "p/flash" }),
+        ],
+        modelChain: ["p/flash", "p/pro"],
+      }),
+      chain({
+        chainId: "c2",
+        rounds: [
+          Object.assign(round({ round: 1 }), { modelEntry: "p/flash" }),
+          Object.assign(round({ round: 2 }), { modelEntry: "p/pro" }),
+        ],
+        modelChain: ["p/flash", "p/pro"],
+      }),
+      chain({
+        chainId: "c3",
+        rounds: [
+          Object.assign(round({ round: 1 }), { modelEntry: "p/pro" }),
+        ],
+        modelChain: ["p/flash", "p/pro"],
+      }),
+    ];
+
+    const stats = computeStats(chains);
+    // tier 0: c1r1 (p/flash), c2r1 (p/flash) -> 2
+    // tier 1: c2r2 (p/pro), c3r1 (p/pro) -> 2
+    assert.deepEqual(stats.tierCounts, { "0": 2, "1": 2 });
+    assert.equal(stats.tierSourceBreakdown.derived, 4);
+    assert.equal(stats.tierSourceBreakdown.unknown, 0);
+  });
+
+  it("source breakdown sums to the number of rounds counted", () => {
+    const chains = [
+      chain({
+        chainId: "c1",
+        rounds: [
+          Object.assign(round({ round: 1 }), { modelEntry: "p/flash" }),
+        ],
+        modelChain: ["p/flash", "p/pro"],
+      }),
+      chain({
+        chainId: "c2",
+        rounds: [
+          Object.assign(round({ round: 1 }), { modelEntry: "p/unknown" }),
+        ],
+        modelChain: ["p/flash", "p/pro"],
+      }),
+      chain({
+        chainId: "c3",
+        rounds: [
+          Object.assign(round({ round: 1 }), { modelEntry: "p/pro", tierBefore: 0 }),
+        ],
+        modelChain: ["p/flash", "p/pro"],
+      }),
+    ];
+
+    const stats = computeStats(chains);
+    const sourceTotal = Object.values(stats.tierSourceBreakdown).reduce((s, c) => s + c, 0);
+    assert.equal(sourceTotal, stats.roundCount);
+    assert.equal(stats.tierSourceBreakdown.derived, 1);
+    assert.equal(stats.tierSourceBreakdown.recorded, 1);
+    assert.equal(stats.tierSourceBreakdown.unknown, 1);
+  });
+
+  it("honours since/until for model and tier counts", () => {
+    const chains = [
+      chain({
+        chainId: "c1",
+        rounds: [
+          Object.assign(round({ round: 1, startedAt: "2026-01-01T00:00:00.000Z" }), { modelEntry: "p/flash" }),
+        ],
+        modelChain: ["p/flash", "p/pro"],
+      }),
+      chain({
+        chainId: "c2",
+        rounds: [
+          Object.assign(round({ round: 1, startedAt: "2026-06-01T00:00:00.000Z" }), { modelEntry: "p/pro" }),
+        ],
+        modelChain: ["p/flash", "p/pro"],
+      }),
+    ];
+
+    const stats = computeStats(chains, { since: "2026-03-01T00:00:00.000Z" });
+    // Only c2's round is within range
+    assert.equal(stats.roundCount, 1);
+    assert.deepEqual(stats.modelCounts, { "p/pro": 1 });
+    assert.deepEqual(stats.tierCounts, { "1": 1 });
+  });
+
+  it("peak-tier-per-chain counts only chains with rounds in range", () => {
+    const chains = [
+      chain({
+        chainId: "c1",
+        rounds: [
+          Object.assign(round({ round: 1, startedAt: "2026-01-01T00:00:00.000Z" }), { modelEntry: "p/flash" }),
+          Object.assign(round({ round: 2, startedAt: "2026-01-02T00:00:00.000Z" }), { modelEntry: "p/pro" }),
+        ],
+        modelChain: ["p/flash", "p/pro"],
+      }),
+      chain({
+        chainId: "c2",
+        rounds: [
+          Object.assign(round({ round: 1, startedAt: "2026-06-01T00:00:00.000Z" }), { modelEntry: "p/flash" }),
+        ],
+        modelChain: ["p/flash", "p/pro"],
+      }),
+    ];
+
+    // since=2026-03-01 excludes c1 entirely
+    const stats = computeStats(chains, { since: "2026-03-01T00:00:00.000Z" });
+    assert.equal(stats.chainCount, 1);
+    assert.equal(stats.chainPeakTiers.length, 1);
+    assert.equal(stats.chainPeakTiers[0].chainId, "c2");
+    assert.equal(stats.chainPeakTiers[0].peakTier, 0);
+    assert.equal(stats.chainPeakTiers[0].tierCount, 2);
+  });
+
+  it("peak tier report includes chainsReachedTopTier", () => {
+    const chains = [
+      chain({
+        chainId: "c1",
+        rounds: [
+          Object.assign(round({ round: 1 }), { modelEntry: "p/flash" }),
+          Object.assign(round({ round: 2 }), { modelEntry: "p/pro" }),
+        ],
+        modelChain: ["p/flash", "p/pro"],
+      }),
+      chain({
+        chainId: "c2",
+        rounds: [
+          Object.assign(round({ round: 1 }), { modelEntry: "p/flash" }),
+        ],
+        modelChain: ["p/flash", "p/pro"],
+      }),
+    ];
+
+    const stats = computeStats(chains);
+    // c1 reached tier 1 of 2 (top), c2 reached tier 0 of 2 (not top)
+    assert.equal(stats.chainsReachedTopTier, 1);
+  });
+
+  it("chain shape distribution reports how many chains per tier count", () => {
+    const chains = [
+      chain({
+        chainId: "c1",
+        rounds: [Object.assign(round({ round: 1 }), { modelEntry: "p/flash" })],
+        modelChain: ["p/flash", "p/pro"],
+      }),
+      chain({
+        chainId: "c2",
+        rounds: [Object.assign(round({ round: 1 }), { modelEntry: "p/a" })],
+        modelChain: ["p/a", "p/b", "p/c"],
+      }),
+      chain({
+        chainId: "c3",
+        rounds: [Object.assign(round({ round: 1 }), { modelEntry: "p/flash" })],
+        modelChain: ["p/flash", "p/pro"],
+      }),
+    ];
+
+    const stats = computeStats(chains);
+    assert.deepEqual(stats.chainShapeDistribution, { "2": 2, "3": 1 });
+  });
+
+  it("distinguishes fallbacks absent from fallbacks null in the stats", () => {
+    const chains = [
+      chain({
+        chainId: "c1",
+        rounds: [
+          Object.assign(round({ round: 1 }), {
+            modelEntry: "p/flash",
+          }),
+        ],
+        modelChain: ["p/flash"],
+      }),
+      chain({
+        chainId: "c2",
+        rounds: [
+          Object.assign(round({ round: 1 }), {
+            modelEntry: "p/flash",
+            fallbacks: null,
+          }),
+        ],
+        modelChain: ["p/flash"],
+      }),
+      chain({
+        chainId: "c3",
+        rounds: [
+          Object.assign(round({ round: 1 }), {
+            modelEntry: "p/flash",
+            fallbacks: [{ from: "p/old", to: "p/flash", reason: "capacity", attempt: 1, message: null }],
+          }),
+        ],
+        modelChain: ["p/flash"],
+      }),
+    ];
+
+    // Remove the fallbacks key entirely from c1 round (simulate old records)
+    delete chains[0].rounds[0].fallbacks;
+
+    const stats = computeStats(chains);
+    assert.equal(stats.fallbacksAbsent, 1, "key absent must be counted separately");
+    assert.equal(stats.fallbacksNone, 1, "key present but null must be counted");
+    assert.equal(Object.keys(stats.fallbackCounts).length, 1);
+    assert.equal(stats.fallbackCounts["p/old → p/flash"], 1);
+  });
+
+  it("tierCount is correctly derived for tiered chains", () => {
+    const chains = [
+      chain({
+        chainId: "c1",
+        rounds: [
+          Object.assign(round({ round: 1 }), { modelEntry: "p/free" }),
+        ],
+        modelChain: [["p/free", "p/flash"], ["p/pro"]],
+      }),
+    ];
+
+    const stats = computeStats(chains);
+    // Tier 0, tierCount 2
+    assert.deepEqual(stats.tierCounts, { "0": 1 });
+    // chainPeakTiers should have tierCount=2
+    assert.equal(stats.chainPeakTiers[0].tierCount, 2);
+  });
+
+  it("computes chain shape distribution correctly for chains without modelChain", () => {
+    const chains = [
+      chain({
+        chainId: "c1",
+        rounds: [Object.assign(round({ round: 1 }), { modelEntry: "p/flash" })],
+        modelChain: ["p/flash", "p/pro"],
+      }),
+      // c2 has no modelChain at all
+      chain({
+        chainId: "c2",
+        rounds: [Object.assign(round({ round: 1 }), { modelEntry: "p/flash" })],
+        modelChain: undefined,
+      }),
+    ];
+
+    const stats = computeStats(chains);
+    assert.deepEqual(stats.chainShapeDistribution, { "2": 1 });
+    // c2 should NOT appear in chainShapeDistribution since it has no modelChain
+    assert.equal(stats.chainPeakTiers.length, 2);
+    // c2's peakTier should be -1 and tierCount 0
+    const c2 = stats.chainPeakTiers.find((c) => c.chainId === "c2");
+    assert.equal(c2.peakTier, -1);
+    assert.equal(c2.tierCount, 0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// renderChainStats — new sections
+// ---------------------------------------------------------------------------
+
+describe("renderChainStats — model and tier sections", () => {
+  it("contains the model distribution section", () => {
+    const chains = [
+      chain({
+        chainId: "c1",
+        rounds: [
+          Object.assign(round({ round: 1 }), { modelEntry: "p/flash" }),
+          Object.assign(round({ round: 2 }), { modelEntry: "p/pro" }),
+        ],
+        modelChain: ["p/flash", "p/pro"],
+      }),
+    ];
+    const stats = computeStats(chains);
+    const output = renderChainStats(stats);
+    assert.ok(output.includes("Model distribution"));
+    assert.ok(output.includes("p/flash"));
+    assert.ok(output.includes("p/pro"));
+  });
+
+  it("contains the tier distribution section with source breakdown", () => {
+    const chains = [
+      chain({
+        chainId: "c1",
+        rounds: [
+          Object.assign(round({ round: 1 }), { modelEntry: "p/flash" }),
+        ],
+        modelChain: ["p/flash", "p/pro"],
+      }),
+    ];
+    const stats = computeStats(chains);
+    const output = renderChainStats(stats);
+    assert.ok(output.includes("Tier distribution"));
+    assert.ok(output.includes("Source breakdown"));
+    assert.ok(output.includes("derived"));
+  });
+
+  it("contains the peak tier per chain section", () => {
+    const chains = [
+      chain({
+        chainId: "c1",
+        rounds: [
+          Object.assign(round({ round: 1 }), { modelEntry: "p/flash" }),
+        ],
+        modelChain: ["p/flash", "p/pro"],
+      }),
+    ];
+    const stats = computeStats(chains);
+    const output = renderChainStats(stats);
+    assert.ok(output.includes("Peak tier per chain"));
+    assert.ok(output.includes("of"));
+  });
+
+  it("contains the chain shape distribution section", () => {
+    const chains = [
+      chain({
+        chainId: "c1",
+        rounds: [
+          Object.assign(round({ round: 1 }), { modelEntry: "p/flash" }),
+        ],
+        modelChain: ["p/flash", "p/pro"],
+      }),
+    ];
+    const stats = computeStats(chains);
+    const output = renderChainStats(stats);
+    assert.ok(output.includes("Chain shape distribution"));
+    assert.ok(output.includes("2-tier"));
+  });
+
+  it("contains the capacity fallbacks section", () => {
+    const chains = [
+      chain({
+        chainId: "c1",
+        rounds: [
+          Object.assign(round({ round: 1 }),
+            Object.assign(
+              { modelEntry: "p/flash" },
+              { fallbacks: [{ from: "p/old", to: "p/flash", reason: "capacity", attempt: 1, message: null }] },
+            )),
+        ],
+        modelChain: ["p/flash"],
+      }),
+    ];
+    const stats = computeStats(chains);
+    const output = renderChainStats(stats);
+    assert.ok(output.includes("Capacity fallbacks"));
+    assert.ok(output.includes("p/old"));
+  });
+
+  it("prints a message when all tiers are unknown and does not compute a percentage", () => {
+    const chains = [
+      chain({
+        chainId: "c1",
+        rounds: [
+          Object.assign(round({ round: 1 }), { modelEntry: "p/unknown" }),
+        ],
+        modelChain: ["p/flash", "p/pro"],
+      }),
+    ];
+    const stats = computeStats(chains);
+    const output = renderChainStats(stats);
+    assert.ok(output.includes("no round has a resolvable tier"));
+    // Must not contain a percentage computed over zero
+    assert.ok(!/tier 0/.test(output));
+  });
+});
+
+// ---------------------------------------------------------------------------
+// renderComparison — model and tier rows
+// ---------------------------------------------------------------------------
+
+describe("renderComparison — model and tier rows", () => {
+  it("shows model distribution in n/total form for both sides", () => {
+    const chainsBefore = [
+      chain({
+        chainId: "c1",
+        rounds: [Object.assign(round({ round: 1, startedAt: "2026-01-01T00:00:00.000Z" }), { modelEntry: "p/flash" })],
+        modelChain: ["p/flash", "p/pro"],
+      }),
+    ];
+    const chainsAfter = [
+      chain({
+        chainId: "c2",
+        rounds: [Object.assign(round({ round: 1, startedAt: "2026-07-01T00:00:00.000Z" }), { modelEntry: "p/pro" })],
+        modelChain: ["p/flash", "p/pro"],
+      }),
+    ];
+
+    const before = computeStats(chainsBefore, { until: "2026-06-01T00:00:00.000Z" });
+    const after = computeStats(chainsAfter, { since: "2026-06-01T00:00:00.000Z" });
+    const output = renderComparison(before, after, "2026-06-01T00:00:00.000Z");
+    assert.ok(output.includes("Models"));
+    assert.ok(output.includes("p/flash"));
+    assert.ok(output.includes("p/pro"));
+    assert.ok(output.includes("1/1")); // Before shows 1/1 for p/flash
+    assert.ok(output.includes("1/1")); // After shows 1/1 for p/pro
+  });
+
+  it("shows tier rows in n/total form for both sides", () => {
+    const chainsBefore = [
+      chain({
+        chainId: "c1",
+        rounds: [Object.assign(round({ round: 1, startedAt: "2026-01-01T00:00:00.000Z" }), { modelEntry: "p/flash" })],
+        modelChain: ["p/flash", "p/pro"],
+      }),
+    ];
+    const chainsAfter = [
+      chain({
+        chainId: "c2",
+        rounds: [Object.assign(round({ round: 1, startedAt: "2026-07-01T00:00:00.000Z" }), { modelEntry: "p/pro" })],
+        modelChain: ["p/flash", "p/pro"],
+      }),
+    ];
+
+    const before = computeStats(chainsBefore, { until: "2026-06-01T00:00:00.000Z" });
+    const after = computeStats(chainsAfter, { since: "2026-06-01T00:00:00.000Z" });
+    const output = renderComparison(before, after, "2026-06-01T00:00:00.000Z");
+    assert.ok(output.includes("Tiers"));
+    assert.ok(output.includes("tier 0"));
+    assert.ok(output.includes("tier 1"));
+    assert.ok(output.includes("1/1"));
+  });
+});
+
+// ---------------------------------------------------------------------------
+// renderComparison — tier positions carry their chain's tier count
+//
+// The comparison view is the whole point of the tier axis ("did the expensive
+// tier get used less between these two periods"), and a bare index cannot
+// answer it across differently-shaped chains: tier 1 of a 2-tier chain is the
+// top tier, tier 1 of a 3-tier chain is the middle one.
+// ---------------------------------------------------------------------------
+
+describe("renderComparison tier labelling", () => {
+  function chainOn(modelChain, modelEntries) {
+    return {
+      chainId: "c-" + modelEntries.join("-"),
+      meta: { modelChain },
+      rounds: modelEntries.map((m, i) => ({ round: i + 1, modelEntry: m })),
+    };
+  }
+
+  it("labels the tier with the tier count when both ranges share one shape", () => {
+    const two = ["p/flash", "p/pro"];
+    const before = computeStats([chainOn(two, ["p/flash", "p/pro"])]);
+    const after = computeStats([chainOn(two, ["p/flash"])]);
+
+    const out = renderComparison(before, after, "2026-07-26T00:00:00Z");
+
+    assert.match(out, /tier 0 of 2/);
+    assert.match(out, /tier 1 of 2/);
+    assert.doesNotMatch(out, /chain shapes differ/);
+  });
+
+  it("drops the count and says so when the two ranges have different shapes", () => {
+    const before = computeStats([chainOn(["p/flash", "p/pro"], ["p/pro"])]);
+    const after = computeStats([
+      chainOn(["p/free", "p/flash", "p/pro"], ["p/flash"]),
+    ]);
+
+    const out = renderComparison(before, after, "2026-07-26T00:00:00Z");
+
+    assert.match(out, /chain shapes differ/);
+    assert.match(out, /peak tier per chain/);
+    // Must not claim a single shared tier count when there isn't one.
+    assert.doesNotMatch(out, /tier \d+ of \d+/);
   });
 });
