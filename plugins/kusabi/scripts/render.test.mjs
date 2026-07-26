@@ -1049,3 +1049,86 @@ describe("renderBaseFacts untracked files", () => {
     assert.match(result, /read_file_range/);
   });
 });
+
+// renderChainShow — control record parameter (chain lifecycle stop lever)
+// ---------------------------------------------------------------------------
+
+describe("renderChainShow with control record", () => {
+  const minimalChain = { chainId: "chain-ctrltest", brief: "test" };
+  const emptyRounds = [];
+
+  it("status is 'running' when control says running and pid is alive", () => {
+    const control = { chainId: "chain-ctrltest", status: "running", pid: process.pid, round: 2 };
+    const result = renderChainShow(minimalChain, emptyRounds, [], control);
+    assert.match(result, /status: running/);
+  });
+
+  it("status is 'completed' when control says completed", () => {
+    const control = { chainId: "chain-ctrltest", status: "completed", pid: 0, round: 3, finishedAt: new Date().toISOString() };
+    const result = renderChainShow(minimalChain, emptyRounds, [], control);
+    assert.match(result, /status: completed/);
+  });
+
+  it("a completed control record still reports the disposition and round", () => {
+    // "completed" says the process ended, not how it ended.  The reader needs
+    // the disposition, which is what chain-show printed before control records
+    // existed; losing it to a bare "completed" would be a regression.
+    const control = { chainId: "chain-ctrltest", status: "completed", pid: 0, round: 2, finishedAt: new Date().toISOString() };
+    const rounds = [{ round: 2, disposition: { disposition: "accept" } }];
+    const result = renderChainShow(minimalChain, rounds, [], control);
+    assert.match(result, /status: accepted at round 2/);
+  });
+
+  it("renders a chain stopped before its first round persisted chain.json", () => {
+    // chain.json is written at the end of a round, so a chain cancelled during
+    // round 1 has none. cmdChainShow synthesises a minimal chain object from the
+    // control record; rendering must survive the missing brief/orchestrator.
+    const control = { chainId: "chain-early", status: "cancelled", pid: 0, round: 0 };
+    const synthesised = { chainId: "chain-early", container: "cid-under-test", brief: null, orchestrator: null };
+    const result = renderChainShow(synthesised, [], [], control);
+    assert.match(result, /chain: chain-early/);
+    assert.match(result, /status: cancelled/);
+    assert.match(result, /container: cid-under-test/);
+  });
+
+  it("a cancelled control record wins over the round disposition", () => {
+    // The lifecycle status is authoritative for every status except
+    // "completed": a chain stopped mid-flight must not read as accepted.
+    const control = { chainId: "chain-ctrltest", status: "cancelled", pid: 0, round: 2 };
+    const rounds = [{ round: 2, disposition: { disposition: "accept" } }];
+    const result = renderChainShow(minimalChain, rounds, [], control);
+    assert.match(result, /status: cancelled/);
+  });
+
+  it("status is 'failed' when control says failed", () => {
+    const control = { chainId: "chain-ctrltest", status: "failed", pid: 0, round: 1 };
+    const result = renderChainShow(minimalChain, emptyRounds, [], control);
+    assert.match(result, /status: failed/);
+  });
+
+  it("status is 'cancelled' when control says cancelled", () => {
+    const control = { chainId: "chain-ctrltest", status: "cancelled", pid: 0, round: 2, finishedAt: new Date().toISOString() };
+    const result = renderChainShow(minimalChain, emptyRounds, [], control);
+    assert.match(result, /status: cancelled/);
+  });
+
+  it("status is 'stale' when control says running but pid is dead (0)", () => {
+    // pid 0 is always dead — effectiveStatus returns "stale"
+    const control = { chainId: "chain-ctrltest", status: "running", pid: 0, round: 1 };
+    const result = renderChainShow(minimalChain, emptyRounds, [], control);
+    assert.match(result, /status: stale/);
+  });
+
+  it("status is 'incomplete' when no control record and no rounds", () => {
+    const result = renderChainShow(minimalChain, emptyRounds, [], null);
+    assert.match(result, /status: incomplete/);
+  });
+
+  it("status falls back to round-derived disposition when no control record", () => {
+    const rounds = [
+      { round: 1, verdict: "approve", disposition: { disposition: "accept" }, resumeMethod: { type: "continue_session" } },
+    ];
+    const result = renderChainShow(minimalChain, rounds, [], null);
+    assert.match(result, /status: accepted at round 1/);
+  });
+});

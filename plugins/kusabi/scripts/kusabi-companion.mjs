@@ -20,6 +20,18 @@ import { fileURLToPath } from "node:url";
 
 import { stateRoot, stateDirFor, readJson, writeJson } from "./state-paths.mjs";
 import { collectChainRecords, computeStats, renderChainStats, renderComparison } from "./chain-stats.mjs";
+import {
+  readChainControl,
+  writeChainControl,
+  createChainControl,
+  requestChainStop,
+  effectiveStatus,
+  shouldStopNow,
+  updateChainControlRound,
+  finalizeChainControl,
+  chainIdForJob,
+  collectChainStatuses,
+} from "./chain-control.mjs";
 import { jobDir, saveJob, loadJob, listJobs, latestJob } from "./job-store.mjs";
 import { opencodeBin, serverHealthy, ensureServer, reapIdleServes, api } from "./serve-lifecycle.mjs";
 import { runPrompt, dispatchWithFallback, resetFailedRoutes } from "./prompt-execution.mjs";
@@ -652,20 +664,53 @@ function cmdStatus(cwd, { text }) {
   if (jobId) {
     const job = loadJob(stateDir, jobId);
     if (!job) return `no such job: ${jobId}`;
+    // Check chain ownership for this job
     const s = job.stats ?? {};
-    return [
+    const lines = [
       renderHeader(job).trimEnd(),
       `events: ${s.events ?? 0}, steps: ${s.steps ?? 0}, last tool: ${s.lastTool ?? "-"}`,
       `permissions: ${s.permissionsAllowed ?? 0} allowed, ${s.permissionsRejected ?? 0} rejected`,
       `last activity: ${s.lastActivity ?? "-"}`,
       ...(job.error ? [`error: ${job.error}`] : []),
-    ].join("\n");
+    ];
+    const jobChain = chainIdForJob(job);
+    if (jobChain) {
+      lines.push(`chain: ${jobChain} (stop with: kusabi-companion chain-cancel ${jobChain})`);
+    }
+    return lines.join("\n");
   }
   const jobs = listJobs(stateDir).slice(0, 10);
-  if (jobs.length === 0) return "no opencode jobs for this directory yet.";
-  return jobs
-    .map((j) => renderJobLine(j))
-    .join("\n");
+  const lines = [];
+
+  // Job listing
+  if (jobs.length === 0) {
+    lines.push("no opencode jobs for this directory yet.");
+  } else {
+    lines.push(...jobs.map((j) => renderJobLine(j)));
+  }
+
+  // Chain ownership — show running chains
+  const chainStatuses = collectChainStatuses(stateDir);
+  const runningOrStale = chainStatuses.filter(function (s) {
+    return s.status === "running" || s.status === "stale" || s.status === "stopping";
+  });
+  if (runningOrStale.length > 0) {
+    if (lines.length > 0) lines.push("");
+    lines.push("chains:");
+    for (const cs of runningOrStale) {
+      const containerField = cs.container ? ` container=${cs.container}` : "";
+      let line = `  ${cs.chainId} round=${cs.round} status=${cs.status}${containerField}`;
+      if (cs.stale) {
+        line += " (process gone — record is stale)";
+      }
+      if (cs.status === "stopping") {
+        line += ` (stop requested, stopping…)`;
+      }
+      lines.push(line);
+    }
+  }
+
+  return lines.join("\n");
 }
 
 function cmdResult(cwd, { text }) {
@@ -691,11 +736,52 @@ async function cmdCancel(cwd, { text }) {
   job.status = "cancelled";
   job.finishedAt = new Date().toISOString();
   saveJob(stateDir, job);
+
+  // A job that belongs to a chain does not stop the chain: cancelling it only
+  // ends one phase, and the chain starts the next round.  Say so — but say what
+  // was actually observed, not an assumption about the chain's state.
+  const chainId = chainIdForJob(job);
+  if (chainId) {
+    const control = readChainControl(path.join(stateDir, "chains", chainId));
+    const { status } = effectiveStatus(control);
+    const lines = [`cancelled ${job.id} (session ${job.sessionID}).`];
+    if (status === "running" || status === "stopping") {
+      lines.push(`This job belongs to chain ${chainId}, which is still running — cancelling a job does not stop the chain.`);
+      lines.push(`To stop the chain itself: kusabi-companion chain-cancel ${chainId}`);
+    } else if (status === "stale") {
+      lines.push(`This job belongs to chain ${chainId}, whose process is gone (record is stale).`);
+      lines.push(`To finalise that record: kusabi-companion chain-cancel ${chainId}`);
+    } else if (status === "unknown") {
+      lines.push(`This job belongs to chain ${chainId}, whose state is unknown (no control record — chain predates the stop lever).`);
+      lines.push(`Cancelling a job does not stop a chain. To stop it: kusabi-companion chain-cancel ${chainId}`);
+    } else {
+      lines.push(`This job belongs to chain ${chainId}, which is already ${status}.`);
+    }
+    return lines.join("\n");
+  }
+
   return `cancelled ${job.id} (session ${job.sessionID}).`;
 }
 
-function cmdServeStop(cwd) {
+function cmdServeStop(cwd, { flags } = {}) {
   const stateDir = stateDirFor(cwd);
+
+  // Check for running jobs. If any exist, decline unless --force is passed.
+  const jobs = listJobs(stateDir);
+  const runningJobs = jobs.filter(function (j) { return j.status === "running"; });
+  if (runningJobs.length > 0) {
+    if (!flags?.force) {
+      const jobList = runningJobs.map(function (j) { return j.id; }).join(", ");
+      const messages = [
+        `${runningJobs.length} job(s) still running: ${jobList}`,
+        "serve-stop does not stop a running chain — the chain spawns a new serve on its next dispatch.",
+        "To stop a chain: kusabi-companion chain-cancel <chainId>",
+        "To force-stop the serve regardless: kusabi-companion serve-stop --force",
+      ];
+      return messages.join("\n");
+    }
+  }
+
   const serverFile = path.join(stateDir, "server.json");
   const server = readJson(serverFile);
   if (!server?.pid) return "no server recorded for this directory.";
@@ -707,6 +793,59 @@ function cmdServeStop(cwd) {
     try { fs.unlinkSync(serverFile); } catch { /* best-effort */ }
     return `server pid ${server.pid} was not running.`;
   }
+}
+
+async function cmdChainCancel(cwd, { text }) {
+  const stateDir = stateDirFor(cwd);
+  const chainId = text.split(/\s+/).filter(Boolean)[0];
+  if (!chainId) throw new Error("chain-cancel requires a chain id. Usage: chain-cancel <chainId>");
+
+  const chainsDir = path.join(stateDir, "chains");
+  const chainDir = path.join(chainsDir, chainId);
+  if (!fs.existsSync(chainDir)) {
+    throw new Error(`chain not found: ${chainId}`);
+  }
+
+  // Request the stop via the file-based protocol.
+  // requestChainStop handles the stale-pid exception internally.
+  const result = requestChainStop(chainDir, "cli");
+
+  if (result.wasStale) {
+    return `chain ${chainId} was stale (process gone) — status finalised to cancelled.`;
+  }
+
+  if (result.wasRunning) {
+    // Locate the chain's currently-running phase job and abort it via the opencode server API.
+    // This prevents the phase from burning down its timeout while the chain waits
+    // at the next round boundary to notice the stop request.
+    const jobPattern = new RegExp("^chain:\\s+" + chainId.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + "\\s+round\\s+\\d+");
+    const jobs = listJobs(stateDir);
+    const runningJob = jobs.find(function (j) {
+      return j.status === "running" && jobPattern.test(j.title || "");
+    });
+
+    let abortInfo = "";
+    if (runningJob && runningJob.sessionID) {
+      const server = readJson(path.join(stateDir, "server.json"));
+      if (await serverHealthy(server)) {
+        try {
+          await api(server, "POST", `/session/${runningJob.sessionID}/abort`);
+          abortInfo = ` Aborted job ${runningJob.id} (session ${runningJob.sessionID}).`;
+        } catch {
+          abortInfo = ` (failed to abort job ${runningJob.id} — server may be unavailable).`;
+        }
+      } else {
+        abortInfo = ` (server not available — job ${runningJob.id} will burn down its timeout).`;
+      }
+    }
+
+    return `stop requested for chain ${chainId}. It will not start a new round.${abortInfo}`;
+  }
+
+  // Chain was not running — still tried to honour the request.
+  const control = readChainControl(chainDir);
+  const status = control ? (effectiveStatus(control).status) : "unknown";
+  return `chain ${chainId} is not running (status: ${status}). Stop request recorded anyway.`;
 }
 
 function cmdInstallAgents() {
@@ -804,6 +943,19 @@ async function cmdChain(cwd, { flags, text }) {
   const maxRounds = Number(flags["max-rounds"] ?? 4); // B6: default maxRounds is 4
   const brief = text;
 
+  // ---- initialise chain control record (file-based stop lever) ----
+  writeChainControl(chainDir, createChainControl({
+    chainId,
+    container,
+    pid: process.pid,
+  }));
+
+  // ---- SIGTERM/SIGINT handler feeds the same predicate as the file-based stop ----
+  let signalReceived = false;
+  const onSignal = () => { signalReceived = true; };
+  process.on("SIGTERM", onSignal);
+  process.on("SIGINT", onSignal);
+
   // ---- import callTool once for all phases that need it ----
   const { callTool } = await import("./sunaba-rpc.mjs");
 
@@ -837,6 +989,12 @@ async function cmdChain(cwd, { flags, text }) {
 
   try {
     for (let round = 1; round <= maxRounds; round++) {
+      // ---- stop check: honour file-based stop request or signal ----
+      if (shouldStopNow({ chainDir, signalReceived })) {
+        finalizeChainControl({ chainDir, status: "cancelled", round: round - 1 });
+        return `Chain ${chainId} cancelled at round ${round} (stop requested).`;
+      }
+
       const isFirstRound = round === 1;
       const hasPreviousRound = round > 1 && records.length > 0;
       const previousRecord = hasPreviousRound ? records[records.length - 1] : null;
@@ -893,6 +1051,7 @@ async function cmdChain(cwd, { flags, text }) {
         });
         writeJson(path.join(chainDir, "round-" + round + ".json"), roundRecord);
         writeJson(path.join(chainDir, "chain.json"), chainState);
+        finalizeChainControl({ chainDir, status: "failed", round });
         return outcome;
       }
 
@@ -903,6 +1062,16 @@ async function cmdChain(cwd, { flags, text }) {
       } = await runProbePhase({ baseSha, container, brief, callTool });
       roundRecord.probesGreen = probesGreen;
       roundRecord.probeResults = probeResults;
+
+      // ---- stop check: a stop requested during implement must not buy a
+      // review job, and must not leave the container busy while the
+      // orchestrator inspects it.  Placed after the probes rather than
+      // before them so the worktree is left in the canonical post-P1 state
+      // (HEAD == base, changes unstaged) that the orchestrator publishes from.
+      if (shouldStopNow({ chainDir, signalReceived })) {
+        finalizeChainControl({ chainDir, status: "cancelled", round: round - 1 });
+        return `Chain ${chainId} cancelled during round ${round} (stop requested after probes, before review).`;
+      }
 
       // ---- phase 5: review (or skip when change set empty) ----
       const {
@@ -926,6 +1095,7 @@ async function cmdChain(cwd, { flags, text }) {
         });
         writeJson(path.join(chainDir, "round-" + round + ".json"), roundRecord);
         writeJson(path.join(chainDir, "chain.json"), chainState);
+        finalizeChainControl({ chainDir, status: "failed", round });
         return outcome;
       }
 
@@ -995,16 +1165,22 @@ async function cmdChain(cwd, { flags, text }) {
         strategized, chainFollowupDraft,
       });
 
+      // Update the chain control round counter
+      updateChainControlRound({ chainDir, round });
+
       // ---- phase 8: disposition handling ----
       if (disposition.disposition === "accept") {
+        finalizeChainControl({ chainDir, status: "completed", round });
         return renderAcceptOutcome({ chainId, round, chainParsedReview, chainFindingsText });
       }
 
       if (disposition.disposition === "accept-with-followup") {
+        finalizeChainControl({ chainDir, status: "completed", round });
         return renderAcceptWithFollowupOutcome({ chainId, round, chainParsedReview, chainFindingsText, chainFollowupDraft, brief });
       }
 
       if (disposition.disposition === "escalate") {
+        finalizeChainControl({ chainDir, status: "completed", round });
         return renderEscalateOutcome({ chainId, round, disposition, orchestrator, roundRecord, records });
       }
 
@@ -1025,6 +1201,7 @@ async function cmdChain(cwd, { flags, text }) {
           });
           writeJson(path.join(chainDir, "round-" + round + ".json"), roundRecord);
           writeJson(path.join(chainDir, "chain.json"), chainState);
+          finalizeChainControl({ chainDir, status: "failed", round });
           return outcome;
         }
 
@@ -1050,8 +1227,17 @@ async function cmdChain(cwd, { flags, text }) {
     }
 
     // ---- max rounds reached without acceptance ----
+    finalizeChainControl({ chainDir, status: "completed", round: maxRounds });
     return renderMaxRoundsOutcome({ chainId, maxRounds, records, orchestrator });
+  } catch (err) {
+    // Exception thrown mid-round — record failure and rethrow
+    finalizeChainControl({ chainDir, status: "failed", round: records.length });
+    throw err;
   } finally {
+    // Remove signal handlers
+    process.removeListener("SIGTERM", onSignal);
+    process.removeListener("SIGINT", onSignal);
+
     // Stop the serve for this cwd unless --keep-serve or another job is running
     if (!flags.keepServe) {
       try {
@@ -1119,7 +1305,15 @@ function cmdChainShow(cwd, { text }) {
     throw new Error(`chain not found: ${chainId}`);
   }
 
-  const chainJson = readJson(path.join(chainDir, "chain.json"));
+  // chain.json is written at the end of a round, so a chain stopped during its
+  // first round never has one — and stopping early is the common case for the
+  // stop lever.  The control record carries enough (id, container, status) to
+  // render a digest, so fall back to it rather than refusing to report.
+  const chainControlEarly = readChainControl(chainDir);
+  const chainJson = readJson(path.join(chainDir, "chain.json"))
+    || (chainControlEarly
+      ? { chainId, container: chainControlEarly.container, brief: null, orchestrator: null }
+      : null);
   if (!chainJson) {
     throw new Error(`chain.json not found or invalid for ${chainId}`);
   }
@@ -1141,7 +1335,8 @@ function cmdChainShow(cwd, { text }) {
     else unreadable.push(f);
   }
 
-  return renderChainShow(chainJson, rounds, unreadable);
+  // The control record carries the status (absent for old chains — treated as unknown)
+  return renderChainShow(chainJson, rounds, unreadable, chainControlEarly);
 }
 
 // ---------------------------------------------------------------------------
@@ -1208,6 +1403,7 @@ function usage() {
     "  chain      Run implement→review→rework chain until acceptance or escalate",
     "  chain-show Print a compact plain-text digest of a chain (read-only, no LLM)",
     "  chain-stats Aggregate every chain record and print a summary (read-only, no LLM)",
+    "  chain-cancel  Request a running chain to stop (file-based, works across processes)",
     "  status     List recent jobs or show one by ID",
     "  result     Show completed job result (latest, or by ID)",
     "  cancel     Cancel a running job",
@@ -1224,6 +1420,7 @@ function usage() {
     "  --brief-file <path> (task / chain: read the brief from a file; exclusive with inline text)",
     "  --container <cid> (chain/task: container to run deterministic probes in)",
     "  --keep-serve (chain: keep the serve alive after chain finishes)",
+    "  --force (serve-stop: force kill the serve even when jobs are running)",
     "  --prior <text> (review: prior findings for anti-ratchet)",
     "  --max-rounds <N> (chain: max rounds, default 4)",
     "  --last <N> (explain: include last N assistant/user exchanges, default 1)",
@@ -1239,6 +1436,7 @@ function usage() {
     "Serve lifecycle:",
     "  - chain stops its serve on completion unless --keep-serve is passed.",
     "  - serve-stop kills the serve and removes its server.json.",
+    "  - serve-stop with running jobs declines and points at chain-cancel unless --force is passed.",
     "  - Idle serves without running jobs are reaped on next invocation after",
     "    KUSABI_SERVE_TTL_MS (default 30 min).",
   ].join("\n");
@@ -1286,7 +1484,10 @@ async function main() {
     case "cancel":
       return cmdCancel(cwd, parsed);
     case "serve-stop":
-      return cmdServeStop(cwd);
+      return cmdServeStop(cwd, parsed);
+    case "chain-cancel":
+    case "chainCancel":
+      return cmdChainCancel(cwd, parsed);
     case "install-agents":
       return cmdInstallAgents();
     case "salvage":
@@ -1302,7 +1503,7 @@ async function main() {
     case "explain":
       return cmdExplain(cwd, parsed);
     default:
-      throw new Error(`unknown subcommand: ${subcommand ?? "(none)"}. Use setup|task|review|chain|chain-show|chain-stats|status|result|cancel|serve-stop|install-agents|salvage|explain`);
+      throw new Error(`unknown subcommand: ${subcommand ?? "(none)"}. Use setup|task|review|chain|chain-show|chain-stats|chain-cancel|status|result|cancel|serve-stop|install-agents|salvage|explain`);
   }
 }
 

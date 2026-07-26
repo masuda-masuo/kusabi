@@ -28,7 +28,7 @@ export function parseArgs(argv) {
     } else if (
       arg === "--auto" || arg === "--read-only" || arg === "--resume-last" ||
       arg === "--wait" || arg === "--background" || arg === "--keep-serve" || arg === "--help" || arg === "-h" ||
-      arg === "--tools"
+      arg === "--tools" || arg === "--force"
     ) {
       const key = arg.startsWith("--")
         ? arg.slice(2).replace(/-([a-z])/g, (_, c) => c.toUpperCase())
