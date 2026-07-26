@@ -223,6 +223,16 @@ export function computeStats(chains, opts = {}) {
   const { since, until } = opts;
   const hasTimeFilter = since !== undefined || until !== undefined;
 
+  // Parse the bounds once. `null` means "not given, or not parseable as an
+  // instant" -- the per-round comparison falls back to string ordering then.
+  const parseBound = (v) => {
+    if (v === undefined) return null;
+    const ms = Date.parse(v);
+    return Number.isFinite(ms) ? ms : null;
+  };
+  const sinceMs = parseBound(since);
+  const untilMs = parseBound(until);
+
   // Collect all rounds with their chain index for provenance.
   // Rounds without startedAt are excluded when time filtering is active,
   // and counted separately so the user is informed.
@@ -237,8 +247,19 @@ export function computeStats(chains, opts = {}) {
         noTimestampCount += 1;
         continue;
       }
-      if (since !== undefined && r.startedAt && r.startedAt < since) continue;
-      if (until !== undefined && r.startedAt && r.startedAt >= until) continue;
+      // Compare as instants, not as strings.  `startedAt` is always written as
+      // UTC (`...Z`), but a human writing `--since` / `--compare` naturally
+      // reaches for local time (`2026-07-26T10:53:49+09:00`).  Lexicographic
+      // comparison puts that same instant on the wrong side of the cutoff --
+      // silently, with a plausible-looking table.  Unparseable bounds fall back
+      // to string comparison so a malformed flag degrades no worse than before.
+      const at = Date.parse(r.startedAt);
+      if (sinceMs !== null && Number.isFinite(at)) {
+        if (at < sinceMs) continue;
+      } else if (since !== undefined && r.startedAt && r.startedAt < since) continue;
+      if (untilMs !== null && Number.isFinite(at)) {
+        if (at >= untilMs) continue;
+      } else if (until !== undefined && r.startedAt && r.startedAt >= until) continue;
       allRounds.push({ chainIndex: ci, round: r });
     }
   }

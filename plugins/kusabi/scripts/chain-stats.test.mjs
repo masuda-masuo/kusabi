@@ -1301,3 +1301,54 @@ describe("renderComparison tier labelling", () => {
     assert.doesNotMatch(out, /tier \d+ of \d+/);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Time filtering compares instants, not strings
+//
+// `startedAt` is always written as UTC (`...Z`), but a cutoff typed by a human
+// is naturally local time.  Under lexicographic comparison the same instant
+// lands on the wrong side and the table looks plausible while being wrong --
+// which matters most for --compare, whose whole job is the split.
+// ---------------------------------------------------------------------------
+
+describe("computeStats time-filter timezone handling", () => {
+  // 2026-07-26T01:53:49Z === 2026-07-26T10:53:49+09:00
+  const UTC_CUT = "2026-07-26T01:53:49Z";
+  const OFFSET_CUT = "2026-07-26T10:53:49+09:00";
+
+  const chains = [{
+    chainId: "c1",
+    meta: { modelChain: ["p/flash", "p/pro"] },
+    rounds: [
+      { round: 1, modelEntry: "p/flash", startedAt: "2026-07-25T23:00:00.000Z" }, // before
+      { round: 2, modelEntry: "p/pro", startedAt: "2026-07-26T07:58:58.825Z" },   // after
+    ],
+  }];
+
+  it("splits identically for a UTC cutoff and the same instant with an offset", () => {
+    const utcAfter = computeStats(chains, { since: UTC_CUT });
+    const offsetAfter = computeStats(chains, { since: OFFSET_CUT });
+    assert.equal(utcAfter.roundCount, 1, "UTC cutoff should keep the later round");
+    assert.equal(
+      offsetAfter.roundCount, utcAfter.roundCount,
+      "an offset-form cutoff must not change which rounds are in range",
+    );
+
+    const utcBefore = computeStats(chains, { until: UTC_CUT });
+    const offsetBefore = computeStats(chains, { until: OFFSET_CUT });
+    assert.equal(utcBefore.roundCount, 1);
+    assert.equal(offsetBefore.roundCount, utcBefore.roundCount);
+  });
+
+  it("still partitions every round into exactly one side of the cutoff", () => {
+    const before = computeStats(chains, { until: OFFSET_CUT });
+    const after = computeStats(chains, { since: OFFSET_CUT });
+    assert.equal(before.roundCount + after.roundCount, 2);
+  });
+
+  it("falls back to string ordering for an unparseable bound", () => {
+    // Degrades no worse than the previous behaviour rather than throwing.
+    const stats = computeStats(chains, { since: "not-a-timestamp" });
+    assert.ok(Number.isFinite(stats.roundCount));
+  });
+});
