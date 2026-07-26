@@ -34,7 +34,7 @@ export function parseArgs(argv) {
         ? arg.slice(2).replace(/-([a-z])/g, (_, c) => c.toUpperCase())
         : arg.slice(1);
       flags[key] = true;
-    } else if (arg === "--base" || arg === "--model" || arg === "--agent" || arg === "--session" || arg === "--timeout" || arg === "--deny" || arg === "--watchdog" || arg === "--phase" || arg === "--container" || arg === "--prior" || arg === "--max-rounds" || arg === "--brief-file" || arg === "--last" || arg === "--quote") {
+    } else if (arg === "--base" || arg === "--model" || arg === "--agent" || arg === "--session" || arg === "--timeout" || arg === "--deny" || arg === "--watchdog" || arg === "--phase" || arg === "--container" || arg === "--prior" || arg === "--max-rounds" || arg === "--brief-file" || arg === "--last" || arg === "--quote" || arg === "--since" || arg === "--until" || arg === "--compare") {
       const flagName = arg.slice(2);
       const val = argv[++i];
       if (val === undefined || (typeof val === "string" && val.startsWith("--"))) {

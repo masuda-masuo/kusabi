@@ -1,7 +1,7 @@
 # kusabi Design Document
 
 Last updated: 2026-07-26
-Status: Design finalized + field-verified up to the phase chain, auto-chain (chain subcommand + sunaba-rpc) **implemented / reflected in main**. Decision 5 (accept-with-followup, §9.2) **implemented**. Decision 4 (strategist, §9.1) **implemented**. Fail-fast retry detection, tiered chain entries, and capacity fallback (issue #50) **implemented**. Stages C/D are planned (see #36).
+Status: Design finalized + field-verified up to the phase chain, auto-chain (chain subcommand + sunaba-rpc) **implemented / reflected in main**. Decision 5 (accept-with-followup, §9.2) **implemented**. Decision 4 (strategist, §9.1) **implemented**. Fail-fast retry detection, tiered chain entries, and capacity fallback (issue #50) **implemented**. chain-stats (issue #124) **implemented**. Stages C/D are planned (see #36).
 
 ## 1. Purpose and positioning
 
@@ -187,6 +187,40 @@ The function returns:
 3. If even that fails, recording `reviewParseable: false` on the round record with verdict `"unparseable"` — a state distinct from `needs-attention`
 
 The shared function `recoverVerdictFromText` in `render.mjs` powers both the display layer (`renderReview`) and the decision layer (`runReviewPhase`), avoiding duplication.
+
+### 3.5.6 chain-stats (read-only aggregation)
+
+Launched with `chain-stats [--since <ISO>] [--until <ISO>] [--compare <ISO>]`. Reads every `chain.json` from `<stateDir>/chains/chain-*/` and prints a human-readable terminal summary. Calls no LLM, starts no container, never modifies or deletes a record. Implementation is `plugins/kusabi/scripts/chain-stats.mjs` with pure-function statistics in `computeStats` and rendering in `renderChainStats` / `renderComparison`.
+
+**Flags:**
+
+| Flag | Description |
+|---|---|
+| (none) | Lifetime totals for all chains |
+| `--since <ISO>` | Include only rounds with `startedAt >= ISO` |
+| `--until <ISO>` | Include only rounds with `startedAt < ISO` |
+| `--compare <ISO>` | Two-column side-by-side: before vs. at/after the cutoff |
+
+**Summary includes:**
+
+- Number of chains and rounds, distribution of rounds per chain
+- Final dispositions (last round of each chain): `accept`, `accept-with-followup`, `rework`, `strategize`, `escalate`, `discard`
+- Review verdict distribution across all rounds
+- Deterministic probe pass/fail counts
+- `repeatedAreas` computed via `hasRepeatedAreas` from `chain-phases.mjs` (re-imported, never reimplemented). Rounds without a previous round are excluded from the denominator. Rounds missing `findingFiles` or `findings` are counted in a separate "n/a" figure.
+- Prior-finding-unresolved heuristic: textual match against patterns like `(prior finding, not addressed)` and `Prior finding #N unresolved:` in `findingsText` / finding titles. **Explicitly labelled as heuristic/approximate** — there is no structured field for it.
+- Token and cost totals: per-chain from `chainTotals`, overall from per-round usage sums. Per-chain min/median/max shown for multi-chain workspaces.
+- Chains with unreadable `chain.json` are skipped and the count is reported.
+
+**Missing-field handling:** A record without the `findings` or `findingFiles` array (older records from before PR #119 / #125) is counted as "not available". The excluded count appears in the output so rates are never silently computed over a smaller denominator.
+
+**Prior-unresolved label:** The figure is printed with the annotation "(heuristic: textual match in findings text — approximate)" to make clear it is not a structured measurement.
+
+**Design invariants:**
+- No LLM call, no container start, no record mutation
+- Malformed `chain.json` is skipped, not fatal; count reported
+- `hasRepeatedAreas` is imported and used rather than reimplemented
+- All pure-function logic is testable without a state directory
 
 **Round record fields** (B8):
 - `tierBefore`, `tierAfter` — the tier index before and after the round
