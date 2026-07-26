@@ -1019,7 +1019,10 @@ async function cmdChain(cwd, { flags, text }) {
 
         // ---- stop on strategize provider exhaustion ----
         if (strategistJobStatus === "provider-error") {
-          records.push(roundRecord);
+          // roundRecord was already pushed onto records during phase 7,
+          // so we must NOT push it again -- implement and review
+          // provider-error handlers push before phase 7 runs, but
+          // strategize runs after phase 7 (which already pushed).
           const chainTotals = computeChainTotals(records);
           persistChainState({
             chainDir, round, roundRecord, chainId, container, model, modelChain,
