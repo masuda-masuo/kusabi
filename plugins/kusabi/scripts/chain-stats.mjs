@@ -28,11 +28,15 @@ import { hasRepeatedAreas } from "./chain-phases.mjs";
 export function collectChainRecords(stateDir) {
   const chainsDir = path.join(stateDir, "chains");
   if (!fs.existsSync(chainsDir)) {
-    return { chains: [], skipped: 0 };
+    return { chains: [], skipped: 0, noRecord: 0 };
   }
 
   const entries = fs.readdirSync(chainsDir);
   let skipped = 0;
+  // A chain directory with no chain.json at all is not a corrupt record: the
+  // chain died before it ever persisted one.  Those are worth knowing about
+  // separately -- they are the runs that crashed or were cancelled.
+  let noRecord = 0;
   const chains = [];
 
   for (const name of entries) {
@@ -42,7 +46,10 @@ export function collectChainRecords(stateDir) {
     try { stat = fs.statSync(dir); } catch { skipped += 1; continue; }
     if (!stat.isDirectory()) { skipped += 1; continue; }
 
-    const chainJson = readJson(path.join(dir, "chain.json"));
+    const chainJsonPath = path.join(dir, "chain.json");
+    if (!fs.existsSync(chainJsonPath)) { noRecord += 1; continue; }
+
+    const chainJson = readJson(chainJsonPath);
     if (!chainJson) { skipped += 1; continue; }
 
     // chain.json has a `records` array — the most authoritative source of
@@ -56,7 +63,7 @@ export function collectChainRecords(stateDir) {
     });
   }
 
-  return { chains, skipped };
+  return { chains, skipped, noRecord };
 }
 
 // =========================================================================
@@ -643,13 +650,15 @@ export function renderComparison(statsBefore, statsAfter, cutoff) {
   lines.push("  ── Repeated areas ──");
   lines.push(col("  Eligible pairs", statsBefore.eligiblePairs, statsAfter.eligiblePairs));
   if (statsBefore.eligiblePairs > 0 || statsAfter.eligiblePairs > 0) {
-    const rB = statsBefore.repeatedNA > 0
-      ? `${statsBefore.repeatedTrue}/${statsBefore.eligiblePairs}`
-      : statsBefore.repeatedTrue;
-    const rA = statsAfter.repeatedNA > 0
-      ? `${statsAfter.repeatedTrue}/${statsAfter.eligiblePairs}`
-      : statsAfter.repeatedTrue;
-    lines.push(col("  repeatedAreas true", rB, rA));
+    // Same rule as the single-range view: report over the pairs that could be
+    // judged.  Showing "0/11" when all 11 lack `findingFiles` reads as "the
+    // detector never fired" rather than "nothing was measurable".
+    const repeated = (s) => {
+      const decidable = s.eligiblePairs - s.repeatedNA;
+      if (decidable <= 0) return "no data";
+      return s.repeatedNA > 0 ? `${s.repeatedTrue}/${decidable}` : String(s.repeatedTrue);
+    };
+    lines.push(col("  repeatedAreas true", repeated(statsBefore), repeated(statsAfter)));
   }
 
   // Prior unresolved

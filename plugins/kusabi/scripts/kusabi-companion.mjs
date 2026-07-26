@@ -1159,9 +1159,15 @@ function cmdChainShow(cwd, { text }) {
 
 function cmdChainStats(cwd, { flags }) {
   const stateDir = stateDirFor(cwd);
-  const { chains, skipped } = collectChainRecords(stateDir);
+  const { chains, skipped, noRecord } = collectChainRecords(stateDir);
 
-  if (chains.length === 0 && skipped === 0) {
+  // Notes appended to either view.  A chain directory with no chain.json is
+  // a run that died before persisting -- reported separately from corruption.
+  const notes = [];
+  if (skipped > 0) notes.push(`(unreadable chain.json files skipped: ${skipped})`);
+  if (noRecord > 0) notes.push(`(chains that never persisted a chain.json: ${noRecord})`);
+
+  if (chains.length === 0 && skipped === 0 && noRecord === 0) {
     throw new Error("no chain records found for this workspace");
   }
 
@@ -1183,10 +1189,7 @@ function cmdChainStats(cwd, { flags }) {
     const afterStats = computeStats(chains, { since: compare, until: undefined });
     const lines = [renderComparison(beforeStats, afterStats, compare)];
 
-    if (skipped > 0) {
-      lines.push("");
-      lines.push(`(unreadable chain.json files skipped: ${skipped})`);
-    }
+    if (notes.length) lines.push("", ...notes);
 
     return lines.join("\n");
   }
@@ -1194,9 +1197,7 @@ function cmdChainStats(cwd, { flags }) {
   const stats = computeStats(chains, { since, until });
   const lines = [renderChainStats(stats, { since, until })];
 
-  if (skipped > 0) {
-    lines.push(`(unreadable chain.json files skipped: ${skipped})`);
-  }
+  if (notes.length) lines.push(...notes);
 
   return lines.join("\n");
 }
