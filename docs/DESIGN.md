@@ -1,7 +1,7 @@
 # kusabi Design Document
 
-Last updated: 2026-07-22
-Status: Design finalized + field-verified up to the phase chain, auto-chain (chain subcommand + sunaba-rpc) **implemented / reflected in main**. Decision 5 (accept-with-followup, §9.2) **implemented**. Decision 4 (strategist, §9.1) **implemented**. Stages C/D are planned (see #36).
+Last updated: 2026-07-26
+Status: Design finalized + field-verified up to the phase chain, auto-chain (chain subcommand + sunaba-rpc) **implemented / reflected in main**. Decision 5 (accept-with-followup, §9.2) **implemented**. Decision 4 (strategist, §9.1) **implemented**. Fail-fast retry detection, tiered chain entries, and capacity fallback (issue #50) **implemented**. Stages C/D are planned (see #36).
 
 ## 1. Purpose and positioning
 
@@ -94,8 +94,9 @@ Launched with `chain --container <cid> --model <m> [--max-rounds N] "<brief>"`. 
 Each round r (1..maxRounds, default 3) flows as follows:
 
 1. **implement**: implement with the `kusabi-implement` agent. r=1 gets the full brief; r≥2 gets only the previous round's findings + the brief's acceptance criteria. The previous session's trial-and-error log is not carried over.
+   - Every dispatch in the chain (implement, review, strategist) goes through `dispatchWithFallback`. When a dispatch ends as `provider-error`, the companion re-dispatches on the next unused route of the same tier — same round, same container, same brief. Routes that fail with a capacity reason are remembered for the rest of the process. Fallbacks do not consume rounds.
 2. **Deterministic probes** (§3.5.2): non-LLM checks inside the container via sunaba-rpc.
-3. **review**: adversarial review with the `kusabi-review` agent. Carries over previous round findings via `--prior`.
+3. **review**: adversarial review with the `kusabi-review` agent. Carries over previous round findings via `--prior`. The reviewer does not climb the round ladder: it stays on `--model` when given, otherwise on tier 0, for every round — the same route the pre-fallback implementation used. When those routes are dead it falls through to later tiers via the same `dispatchWithFallback` mechanism. Note that tier 0 is the *cheapest* tier, not the strongest; raising the reviewer's model is done with `--model`.
 4. **Derive disposition** (§3.5.4): mechanically determine the disposition.
 
 #### 3.5.2 Deterministic probes (P1–P4, non-LLM)
@@ -183,8 +184,34 @@ publish / issue_write / sandbox_initialize etc. are **structurally uncallable** 
 
 - **Default is Flash**: zen's deepseek-v4-flash-free (daily free tier) → go's deepseek v4 Flash.
 - **Quality upgrades are not automated**: The inspection/acceptance by the orchestrator collects findings into a brief and explicitly re-delegates to Pro. The loop "Flash 80% (free) → inspection/acceptance by the orchestrator → Pro finishing (small cost)" has been empirically validated.
-- **Auto-fallback only on quota errors**. When triggered, indicate it in the result.
-- **Always display the provider/model actually used** (issue #7). Silent fallback from zen free tier to paid go would silently break the cost structure, so visibility is mandatory.
+- **Auto-fallback only on quota errors**: When a dispatch fails with a capacity or quota reason, the companion re-dispatches on the next unused route of the same tier automatically, without consuming a round. The fallback event is recorded on the job record and rendered in the job output. Routes that failed with a capacity reason are remembered (process-scoped) for subsequent dispatches.
+- **Always display the provider/model actually used** (issue #7). Silent fallback from zen free tier to paid go would silently break the cost structure, so visibility is mandatory. The rendered output always names the route actually used (`route: provider/model:variant`) and lists any fallbacks that occurred.
+
+### 4.1 Tiered chain entries
+
+Entries in `models.chain` and `models.phases.<phase>` may be **either a string or a non-empty array of strings**. A string is a tier with one route; an array is one tier whose entries are alternate routes of equivalent quality, in preference order. Round → tier mapping uses clamp semantics over tiers: round N uses tier `min(N - 1, tierCount - 1)`.
+
+The built-in default chain is two tiers (matching DESIGN.md §4's "free → flash → pro" capacity path), with the reasoning variant pinned to `max` on every route:
+
+```
+[["opencode/deepseek-v4-flash-free:max", "opencode-go/deepseek-v4-flash:max"],
+ ["opencode-go/deepseek-v4-pro:max"]]
+```
+
+Existing flat all-string configs keep working (each string is a single-route tier).
+
+### 4.2 Provider/model:variant syntax
+
+Every route string follows the format `provider/model` with an optional `:variant` suffix (e.g. `opencode-go/deepseek-v4-flash:max`). The variant is parsed by `parseModel` and passed to opencode's `prompt_async` API as the `variant` field. On flash-free, `:max` enables reasoning (measured: 0 vs 1075 reasoning tokens on the same prompt without it, because `reasoning_options` includes a `toggle` that defaults to OFF). The variant actually used is recorded on every job record (`modelVariant` field) and appears in rendered output alongside the route.
+
+### 4.3 Fail-fast retry detection
+
+The SSE watcher inside `runPrompt` detects `session.status` events with `type: "retry"`. The decision to stop is made by the pure function `shouldFailFast({ reason, attempt, steps })`:
+
+- **Capacity/quota reasons** (`free_tier_limit` today): dispatch ends on the **first** occurrence. The provider has stated retrying cannot succeed, so no threshold is applied.
+- **Other retry reasons**: dispatch ends when `attempt >= 3` **while** `steps === 0` (no work completed). If at least one step was recorded, retries do NOT end the dispatch — real work is in progress, and the existing watchdog/timeout keep their current role.
+
+When fail-fast triggers, the session is aborted immediately and the job's status is set to `provider-error` — a new status distinct from `completed`, `stalled`, `timeout`, and `error`. The job record carries structured retry information (`job.retry`) so callers never need to parse prose or open `events.ndjson` for triage. `stalled` keeps its meaning ("silence watchdog fired") unchanged.
 
 ## 5. Inspection/acceptance by the orchestrator (orchestrator's responsibility)
 

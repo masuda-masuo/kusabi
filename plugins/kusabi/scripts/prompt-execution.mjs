@@ -1,4 +1,6 @@
-// prompt-execution.mjs — SSE event stream, permission handling, and runPrompt
+// prompt-execution.mjs — SSE event stream, permission handling, runPrompt,
+// fail-fast retry detection, and dispatchWithFallback.
+
 import path from "node:path";
 import fs from "node:fs";
 import process from "node:process";
@@ -6,6 +8,67 @@ import { ensureServer, api, authHeader } from "./serve-lifecycle.mjs";
 import { newJobId, saveJob, jobDir, appendEvent } from "./job-store.mjs";
 import { writeJson } from "./state-paths.mjs";
 import { durationS } from "./render.mjs";
+import { parseModel, selectRoutes } from "./cli.mjs";
+
+// =========================================================================
+// fail-fast retry decision — pure, exported, unit-testable
+// =========================================================================
+
+/**
+ * Decide whether a provider-retry loop should be stopped immediately.
+ *
+ * @param {object}       opts
+ * @param {string|null}  opts.reason      — `action.reason` from the retry status event
+ *                                          (e.g. "free_tier_limit").
+ * @param {number}       opts.attempt     — Current retry attempt number (1-based),
+ *                                          or 0 when the provider does not number
+ *                                          its attempts.
+ * @param {number}       opts.steps       — Number of steps completed so far.
+ * @param {number}       [opts.retryCount] — Observed number of retry events; used
+ *                                           as a fallback when attempt is absent.
+ * @returns {{ stop: boolean, terminal: boolean }}
+ *   - `stop`: end the dispatch now.
+ *   - `terminal`: the provider has reported that retrying CANNOT succeed
+ *     (capacity/quota permanently exhausted).
+ */
+export function shouldFailFast({ reason, attempt, steps, retryCount }) {
+  // Capacity / quota reasons: the provider has stated retrying will never succeed.
+  // Fire on the FIRST occurrence — no threshold.
+  const capacityReasons = ["free_tier_limit"];
+  if (reason && capacityReasons.includes(reason)) {
+    return { stop: true, terminal: true };
+  }
+
+  // When the provider does not number its attempts (attempt is 0 / falsy),
+  // the observed retry count stands in so the threshold still trips after
+  // three retries with zero completed steps.
+  const effectiveAttempt = (attempt && attempt >= 1) ? attempt : (retryCount || 0);
+
+  // Generic retry: stop when we have reached attempt 3 with ZERO completed steps.
+  // Real work (steps > 0) means the model IS producing output; retries are
+  // internal provider hiccups that the existing watchdog/timeout handle.
+  if (effectiveAttempt >= 3 && steps === 0) {
+    return { stop: true, terminal: false };
+  }
+
+  return { stop: false };
+}
+
+// =========================================================================
+// failed-route memo — process-scoped, survives rounds of one chain run
+// =========================================================================
+
+/** @type {Set<string>} */
+export const failedRoutes = new Set();
+
+/** Reset the failed-route set (for tests). */
+export function resetFailedRoutes() {
+  failedRoutes.clear();
+}
+
+// =========================================================================
+// SSE helpers
+// =========================================================================
 
 async function* sseEvents(res) {
   let buffer = "";
@@ -183,6 +246,17 @@ async function fetchFinalMessage(server, sessionID) {
     .trim();
 }
 
+/**
+ * Core prompt-execution primitive.
+ *
+ * Creates an opencode session, dispatches a prompt via SSE, handles
+ * permission auto-replies, and detects retry loops that trigger fail-fast.
+ *
+ * On fail-fast, the job status is set to "provider-error" and the session
+ * is aborted promptly.
+ *
+ * @returns {Promise<{ job: object, resultText: string, stateDir: string }>}
+ */
 export async function runPrompt({ cwd, kind, title, promptText, agent, model, session, tools, format, timeoutS, watchdogS, phase }) {
   const server = await ensureServer(cwd);
   const { stateDir } = server;
@@ -202,10 +276,14 @@ export async function runPrompt({ cwd, kind, title, promptText, agent, model, se
     sessionID,
     cwd,
     phase: phase ?? null,
+    modelEntry: model ? `${model.providerID}/${model.modelID}` + (model.variant ? `:${model.variant}` : "") : null,
+    modelVariant: model?.variant || null,
     startedAt: new Date().toISOString(),
     finishedAt: null,
     stats: { events: 0, steps: 0, lastTool: null, permissionsAllowed: 0, permissionsRejected: 0, lastActivity: null, models: [] },
     error: null,
+    retry: null,
+    fallbacks: null,
   };
   saveJob(stateDir, job);
   fs.writeFileSync(path.join(jobDir(stateDir, job.id), "prompt.md"), promptText, "utf8");
@@ -215,6 +293,7 @@ export async function runPrompt({ cwd, kind, title, promptText, agent, model, se
   const replied = new Set();
   let sawIdle = false;
   let sessionError = null;
+  let providerError = null;
   let watchdogFired = false;
   let watchdogKilled = false;
   let watchdogInterval = null;
@@ -271,7 +350,7 @@ export async function runPrompt({ cwd, kind, title, promptText, agent, model, se
 
   const watcher = (async () => {
     let backoff = 250;
-    while (!abort.signal.aborted && !sawIdle && !sessionError) {
+    while (!abort.signal.aborted && !sawIdle && !sessionError && !providerError) {
       try {
         const stream = await openSse(server, abort.signal);
         markConnected();
@@ -288,6 +367,45 @@ export async function runPrompt({ cwd, kind, title, promptText, agent, model, se
           // Harvest usage-relevant events for post-job accumulation.
           if (type === "message.updated" || type === "session.updated") {
             usageEvents.push(event);
+          }
+
+          // ---- fail-fast: detect provider retry loops ----
+          if (type === "session.status") {
+            const status = event?.properties?.status;
+            if (status?.type === "retry") {
+              const reason = status?.action?.reason || null;
+              const message = status?.message || "";
+              const attempt = status?.attempt || 0;
+
+              job.stats.retryCount = (job.stats.retryCount || 0) + 1;
+              job.retry = {
+                reason,
+                message,
+                attempt,
+                count: job.stats.retryCount,
+              };
+
+              const ff = shouldFailFast({ reason, attempt, steps: job.stats.steps, retryCount: job.stats.retryCount });
+              if (ff.stop) {
+                providerError = {
+                  reason,
+                  message,
+                  attempt,
+                  count: job.stats.retryCount,
+                  terminal: ff.terminal,
+                };
+                // Abort the session promptly.
+                await api(server, "POST", `/session/${sessionID}/abort`).catch(() => {});
+                appendEvent(stateDir, job.id, {
+                  type: "companion.provider-error",
+                  reason,
+                  attempt,
+                  message,
+                  terminal: ff.terminal,
+                });
+                break;
+              }
+            }
           }
 
           if (type.startsWith("permission.") && type.endsWith("asked")) {
@@ -330,7 +448,7 @@ export async function runPrompt({ cwd, kind, title, promptText, agent, model, se
             sessionError = JSON.stringify(event?.properties?.error ?? event?.properties ?? {}).slice(0, 500);
           }
           saveJob(stateDir, job);
-          if (sawIdle || sessionError) break;
+          if (sawIdle || sessionError || providerError) break;
         }
       } catch (err) {
         if (abort.signal.aborted) break;
@@ -358,7 +476,12 @@ export async function runPrompt({ cwd, kind, title, promptText, agent, model, se
     abort.abort();
   }
 
-  if (watchdogFired) {
+  // ---- determine final status ----
+  if (providerError) {
+    job.status = "provider-error";
+    job.error = `provider error: ${providerError.reason || "retry"} (attempt ${providerError.attempt})${providerError.terminal ? " [terminal]" : ""}: ${providerError.message}`;
+    job.retry = providerError;
+  } else if (watchdogFired) {
     job.status = "stalled";
     job.error = `watchdog: no events for ${watchdogS}s` + (watchdogKilled ? " (process killed)" : "");
   } else if (abort.signal.aborted && !sawIdle && !sessionError) {
@@ -389,4 +512,140 @@ export async function runPrompt({ cwd, kind, title, promptText, agent, model, se
   }
   saveJob(stateDir, job);
   return { job, resultText, stateDir };
+}
+
+// =========================================================================
+// dispatchWithFallback — single wrapper above runPrompt, below callers
+// =========================================================================
+
+/**
+ * Dispatch a prompt with automatic capacity fallback over the tiered chain.
+ *
+ * Calls `runPrompt` (or the injected `_runPrompt`) for the first available
+ * route.  On `provider-error`, records the failure and immediately re-dispatches
+ * on the next unused route of the same tier (then later tiers).  Routes that
+ * fail with a terminal capacity reason are remembered in the process-scoped
+ * `failedRoutes` set.
+ *
+ * Callers must NOT re-implement the fallback walk — every dispatch site
+ * calls this wrapper.
+ *
+ * @param {object}              opts
+ * @param {(string|string[])[]} opts.tiers         — Tiered chain entries.
+ * @param {number}              opts.round         — 1-based round number.
+ * @param {string|null}         [opts.explicitModel] — --model flag value.
+ * @param {Function}            [opts._runPrompt]  — Injection seam for tests;
+ *                                                   defaults to `runPrompt`.
+ * @param {...*}                opts               — All other `runPrompt` options.
+ * @returns {Promise<{ job: object, resultText: string, stateDir: string }>}
+ */
+export async function dispatchWithFallback(opts) {
+  const { tiers, round, explicitModel, _runPrompt, ...runPromptOpts } = opts;
+  const doPrompt = _runPrompt || runPrompt;
+  const candidates = selectRoutes({ tiers, round, explicitModel, failedRoutes });
+
+  if (candidates.length === 0) {
+    // Should only occur if the chain is empty AND no explicit model.
+    const errorJob = {
+      id: "no-route-" + Date.now(),
+      kind: runPromptOpts.kind || "task",
+      status: "provider-error",
+      error: "No available routes: all routes have failed or the chain is empty.",
+      fallbacks: [],
+      retry: null,
+      modelEntry: null,
+      modelVariant: null,
+      usage: null,
+      startedAt: new Date().toISOString(),
+      finishedAt: new Date().toISOString(),
+      stats: {},
+    };
+    return { job: errorJob, resultText: "", stateDir: null };
+  }
+
+  let lastJob = null;
+  let lastResultText = "";
+  let lastStateDir = null;
+  /** @type {{ from: string, to: string|null, reason: string|null, attempt: number, message: string|null }[]} */
+  const fallbacks = [];
+
+  for (let i = 0; i < candidates.length; i++) {
+    const candidate = candidates[i];
+    const model = parseModel(candidate);
+
+    const result = await doPrompt({ ...runPromptOpts, model });
+    lastJob = result.job;
+    lastResultText = result.resultText;
+    lastStateDir = result.stateDir;
+
+    // Record the route that was actually used (overwrites what runPrompt set).
+    lastJob.modelEntry = candidate;
+    lastJob.modelVariant = model?.variant || null;
+
+    if (lastJob.status === "provider-error") {
+      const nextCandidate = i + 1 < candidates.length ? candidates[i + 1] : null;
+      const fb = {
+        from: candidate,
+        to: nextCandidate,
+        reason: lastJob.retry?.reason || null,
+        attempt: lastJob.retry?.attempt || 0,
+        message: lastJob.retry?.message || null,
+      };
+      fallbacks.push(fb);
+
+      // Remember the dead route for future dispatches (process scope).
+      // Only terminal failures (capacity/quota permanently exhausted) are
+      // remembered across dispatches.  A transient blip (HTTP 500, non-terminal)
+      // still falls back within the current dispatch but is not poisoned for
+      // later rounds.
+      if (lastJob.retry?.terminal) {
+        failedRoutes.add(candidate);
+      }
+
+      // Append a fallback event to the job log.
+      if (lastStateDir) {
+        appendEvent(lastStateDir, lastJob.id, {
+          type: "companion.fallback",
+          ...fb,
+        });
+      }
+
+      continue;
+    }
+
+    // Success or non-provider-error failure (timeout, stalled, error).
+    // Carry fallback trail on the job so renderers can show it.
+    if (fallbacks.length > 0) {
+      lastJob.fallbacks = fallbacks;
+    }
+    return result;
+  }
+
+  // ---- all routes exhausted ----
+  lastJob.fallbacks = fallbacks;
+  lastJob.status = "provider-error";
+  lastJob.error = renderAllExhaustedError({ candidates, fallbacks });
+  if (lastStateDir) saveJob(lastStateDir, lastJob);
+  return { job: lastJob, resultText: lastResultText, stateDir: lastStateDir };
+}
+
+/**
+ * Render a structured error message when all routes have been exhausted.
+ *
+ * @param {object}   opts
+ * @param {string[]} opts.candidates
+ * @param {{ from: string, reason: string|null, attempt: number, message: string|null }[]} opts.fallbacks
+ * @returns {string}
+ */
+function renderAllExhaustedError({ candidates, fallbacks }) {
+  const parts = ["All routes exhausted:"];
+  for (const c of candidates) {
+    const fb = fallbacks.find(function (f) { return f.from === c; });
+    if (fb) {
+      parts.push(`  ${c} — ${fb.reason || "retry"} at attempt ${fb.attempt}${fb.message ? ": " + fb.message : ""}`);
+    } else {
+      parts.push(`  ${c} — (not attempted)`);
+    }
+  }
+  return parts.join("\n");
 }

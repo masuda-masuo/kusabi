@@ -15,7 +15,6 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import {
-  parseModel,
   implementDenyTools,
   reviewDenyTools,
 } from "./cli.mjs";
@@ -40,7 +39,7 @@ import {
   resolveResumeMethod,
 } from "./disposition.mjs";
 import { writeJson } from "./state-paths.mjs";
-import { runPrompt } from "./prompt-execution.mjs";
+import { dispatchWithFallback } from "./prompt-execution.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const PLUGIN_ROOT = path.resolve(HERE, "..");
@@ -122,31 +121,7 @@ export async function resolveRoundResume({ round, strategized, baseSha, containe
   return { resumeMethod, useNewSession };
 }
 
-/**
- * Select the model for a given round based on the model chain index.
- *
- * @param {object}  opts
- * @param {number}  opts.round        — 1-based round number
- * @param {boolean} opts.isFirstRound
- * @param {string|null} opts.flagsModel — explicit --model flag value
- * @param {object}  opts.model        — resolved model from setup
- * @param {string[]} opts.modelChain  — model chain entries
- * @returns {{ roundModel: object|null, roundModelEntry: string|null }}
- */
-export function selectRoundModel({ round, isFirstRound, flagsModel, model, modelChain }) {
-  let roundModel;
-  if (isFirstRound && flagsModel) {
-    roundModel = model; // --model overrides round 1
-  } else {
-    const chainIdx = Math.min(round - 1, modelChain.length - 1);
-    const entry = modelChain[chainIdx];
-    roundModel = parseModel(entry);
-  }
-  const roundModelEntry = (roundModel && roundModel.variant)
-    ? roundModel.providerID + "/" + roundModel.modelID + ":" + roundModel.variant
-    : (roundModel ? roundModel.providerID + "/" + roundModel.modelID : null);
-  return { roundModel, roundModelEntry };
-}
+
 
 /**
  * Build the implement prompt text for a chain round.
@@ -164,15 +139,15 @@ export function buildImplementText({ round, brief, previousRecord }) {
 }
 
 /**
- * Run the implement phase: dispatch the implement job and return the initial
- * round record with implement-related fields.
+ * Run the implement phase: dispatch the implement job via dispatchWithFallback
+ * and return the initial round record with implement-related fields.
  *
  * The returned roundRecord is a partial record; subsequent phases add more
  * fields (probes, review, disposition).
  */
 export async function runImplementPhase({
-  cwd, chainId, round, isFirstRound, implementText, roundModel,
-  useNewSession, session, previousRecord, roundModelEntry, resumeMethod,
+  cwd, chainId, round, isFirstRound, implementText, modelChain,
+  useNewSession, session, previousRecord, resumeMethod, flagsModel,
 }) {
   let resolvedSession = session;
   if (!resolvedSession && !isFirstRound && previousRecord?.sessionID) {
@@ -181,19 +156,25 @@ export async function runImplementPhase({
     }
   }
 
-  const implementJob = await runPrompt({
+  const { job, resultText } = await dispatchWithFallback({
     cwd,
     kind: "task",
     title: "chain: " + chainId + " round " + round + " implement",
     promptText: implementText,
     agent: "kusabi-implement",
     phase: "implement",
-    model: roundModel,
     session: useNewSession ? undefined : resolvedSession,
     tools: implementDenyTools(),
     timeoutS: 3600,
     watchdogS: 900,
+    tiers: modelChain,
+    round,
+    explicitModel: isFirstRound ? flagsModel : null,
   });
+
+  // Ignore resultText from non-completed jobs; the chain reads the result
+  // from the job store.
+  void resultText;
 
   return {
     roundRecord: {
@@ -202,12 +183,15 @@ export async function runImplementPhase({
       startedAt: new Date().toISOString(),
       verdict: null,
       probesGreen: false,
-      modelEntry: roundModelEntry,
-      modelVariant: roundModel?.variant || null,
-      implementJobId: implementJob.job.id,
-      sessionID: implementJob.job.sessionID,
-      implementUsage: implementJob.job.usage || null,
+      modelEntry: job.modelEntry || null,
+      modelVariant: job.modelVariant || null,
+      fallbacks: job.fallbacks || null,
+      implementJobId: job.id,
+      sessionID: job.sessionID,
+      implementUsage: job.usage || null,
     },
+    implementJobStatus: job.status,
+    implementJobError: job.error || null,
     session: resolvedSession,
   };
 }
@@ -286,9 +270,9 @@ export function shouldSkipReview({ chainStatusObserved, chainChangedPaths, chain
  * Returns review results needed by the disposition phase.
  */
 export async function runReviewPhase({
-  container, brief, model, chainId, cwd, previousRecord, baseSha,
+  container, brief, modelChain, chainId, cwd, previousRecord, baseSha,
   chainStatusOutput, chainBaseLog, roundRecord,
-  chainChangedPaths, chainStatusObserved, chainDeliverables,
+  chainChangedPaths, chainStatusObserved, chainDeliverables, flagsModel,
 }) {
   const skipReview = shouldSkipReview({ chainStatusObserved, chainChangedPaths, chainDeliverables });
 
@@ -302,6 +286,8 @@ export async function runReviewPhase({
   let chainFindingsText = null;
   let chainParsedReview = null;
   let chainRepeatedAreas = false;
+  let reviewJobStatus = undefined;
+  let reviewJobError = null;
 
   if (!skipReview) {
     const promptTemplate = fs.readFileSync(path.join(PLUGIN_ROOT, "prompts", "adversarial-review.md"), "utf8");
@@ -329,22 +315,31 @@ export async function runReviewPhase({
       .replaceAll("{{REVIEW_INPUT}}", reviewInput)
       .replaceAll("{{PRIOR_FINDINGS}}", priorFindings);
 
-    const reviewJob = await runPrompt({
+    // The reviewer's route does not follow the round ladder: it stays on the
+    // same route for every round, which is what the pre-fallback code did
+    // (`--model` when given, otherwise the chain's first entry).  Round 1 is
+    // passed so selectRoutes offers tier 1 onwards, and `explicitModel` keeps
+    // `--model` in force for reviews of every round.
+    // dispatchWithFallback handles capacity fallback transparently.
+    const { job: reviewJob, resultText: reviewResultText } = await dispatchWithFallback({
       cwd,
       kind: "review",
       title: "chain: " + chainId + " round " + roundRecord.round + " review",
       promptText: reviewPromptText,
-      model,
       agent: "kusabi-review",
       tools: reviewDenyTools(),
       timeoutS: 1800,
       watchdogS: 900,
+      tiers: modelChain,
+      round: 1,
+      explicitModel: flagsModel || null,
     });
-    roundRecord.reviewJobId = reviewJob.job.id;
-    roundRecord.reviewUsage = reviewJob.job.usage || null;
+    roundRecord.reviewJobId = reviewJob.id;
+    roundRecord.reviewUsage = reviewJob.usage || null;
+    reviewJobStatus = reviewJob.status;
+    reviewJobError = reviewJob.error || null;
 
     // ---- parse review result ----
-    const reviewResultText = reviewJob.resultText || "";
     const stripped = reviewResultText.replace(/\s*VERDICT:\s*(approve-partial|approve|needs-attention|discard)\s*$/i, "");
     chainParsedReview = extractJson(stripped);
     chainVerdict = (chainParsedReview && chainParsedReview.verdict) || "needs-attention";
@@ -368,7 +363,7 @@ export async function runReviewPhase({
     }
   }
 
-  return { chainVerdict, chainFindingsText, chainParsedReview, chainRepeatedAreas, skipReview };
+  return { chainVerdict, chainFindingsText, chainParsedReview, chainRepeatedAreas, skipReview, reviewJobStatus, reviewJobError };
 }
 
 /**
@@ -421,8 +416,11 @@ export function persistChainState({
 /**
  * Run the strategize sub-phase: build prompt, dispatch strategist job,
  * and update the roundRecord with strategist findings.
+ *
+ * Uses dispatchWithFallback so capacity fallback applies to the strategist
+ * dispatch as well.
  */
-export async function runStrategizePhase({ cwd, chainId, round, brief, previousRecord, roundRecord }) {
+export async function runStrategizePhase({ cwd, chainId, round, brief, previousRecord, roundRecord, modelChain }) {
   // Build the strategist prompt from the brief's acceptance criteria and
   // the last two rounds' findings.
   const strategistRounds = [];
@@ -436,7 +434,7 @@ export async function runStrategizePhase({ cwd, chainId, round, brief, previousR
     rounds: strategistRounds,
   });
 
-  const strategistJob = await runPrompt({
+  const { job: strategistJob, resultText: strategistResultText } = await dispatchWithFallback({
     cwd,
     kind: "strategist",
     title: "chain: " + chainId + " round " + round + " strategist",
@@ -445,11 +443,21 @@ export async function runStrategizePhase({ cwd, chainId, round, brief, previousR
     tools: reviewDenyTools(),
     timeoutS: 1800,
     watchdogS: 900,
+    tiers: modelChain,
+    // Tier 1, not the round's tier: the strategist runs once per chain and is
+    // not part of the quality ladder.  (Before fallback existed this dispatch
+    // passed no model at all and took opencode's default.)
+    round: 1,
   });
 
-  roundRecord.strategistJobId = strategistJob.job.id;
-  roundRecord.strategistUsage = strategistJob.job.usage || null;
-  roundRecord.strategistRecommendation = strategistJob.resultText || "(no recommendation)";
+  roundRecord.strategistJobId = strategistJob.id;
+  roundRecord.strategistUsage = strategistJob.usage || null;
+  roundRecord.strategistRecommendation = (strategistResultText || "").trim() || "(no recommendation)";
+
+  return {
+    strategistJobStatus: strategistJob.status,
+    strategistJobError: strategistJob.error || null,
+  };
 }
 
 // =========================================================================
@@ -526,6 +534,49 @@ export function renderMaxRoundsOutcome({ chainId, maxRounds, records, orchestrat
     lines.push("Round " + (ri2 + 1) + ": model=" + (r2.modelEntry || "?") + ", verdict=" + r2.verdict + ", probesGreen=" + r2.probesGreen + ", resume=" + r2.resumeMethod.type + detail2);
   }
   lines.push("", "Hand over to orchestrator for final judgement.");
+  return lines.join("\n");
+}
+
+/**
+ * Render the outcome string when a dispatch has exhausted every route
+ * (provider/capacity failure, distinct from escalate or quality failure).
+ *
+ * @param {object}   opts
+ * @param {string}   opts.chainId       — Chain identifier.
+ * @param {number}   opts.round         — Round number where exhaustion occurred.
+ * @param {string}   opts.phase         — Phase name: "implement", "review", "strategize".
+ * @param {string}   opts.jobError      — Error message from the exhausted job
+ *                                        (already contains the "All routes
+ *                                        exhausted:" text from the wrapper).
+ * @param {object[]} opts.records       — Round records so far (includes the
+ *                                        aborted partial round).
+ * @returns {string}
+ */
+export function renderProviderExhaustedOutcome({ chainId, round, phase, jobError, records }) {
+  const lines = [
+    "Chain " + chainId + " stopped at round " + round + ": " + phase + " provider exhausted.",
+    "",
+    jobError || "(no error detail)",
+    "",
+  ];
+
+  // Include prior round summaries so the operator sees what was attempted.
+  if (records.length > 0) {
+    lines.push("Prior rounds:");
+    for (let ri = 0; ri < records.length; ri++) {
+      const r = records[ri];
+      const detail = r.resumeMethod?.detail ? ": " + r.resumeMethod.detail : "";
+      lines.push(
+        "  Round " + (ri + 1) + ": model=" + (r.modelEntry || "?") +
+        ", verdict=" + (r.verdict || "n/a") +
+        ", probesGreen=" + (r.probesGreen ?? "n/a") +
+        ", resume=" + (r.resumeMethod?.type || "?") + detail,
+      );
+    }
+    lines.push("");
+  }
+
+  lines.push("Capacity problem — not a quality failure. Retry when provider is available.");
   return lines.join("\n");
 }
 

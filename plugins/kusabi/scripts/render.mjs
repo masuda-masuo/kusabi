@@ -14,12 +14,44 @@ export function renderHeader(job) {
     if (u.reasoning) parts.push(`${u.reasoning} reasoning`);
     return [`tokens: ${parts.join(", ")}`];
   })();
+
+  // Model route + variant line (always shown when available).
+  const routeLine = [];
+  if (job.modelEntry) {
+    routeLine.push(`route: ${job.modelEntry}`);
+  } else if (job.stats?.models?.length) {
+    routeLine.push(`model: ${job.stats.models.join(" → ")}`);
+  }
+
+  // Provider-error: show error details first.
+  const errorLines = [];
+  if (job.status === "provider-error") {
+    errorLines.push(`provider-error: ${job.error || "unknown provider error"}`);
+    if (job.retry) {
+      const r = job.retry;
+      errorLines.push(`  reason: ${r.reason || "unknown"}, attempt: ${r.attempt}, terminal: ${r.terminal || false}`);
+      if (r.message) errorLines.push(`  provider message: ${r.message}`);
+    }
+  }
+
+  // Fallbacks: show every fallback step.
+  const fallbackLines = [];
+  if (job.fallbacks && job.fallbacks.length > 0) {
+    for (const fb of job.fallbacks) {
+      let fbLine = `  fallback: ${fb.from} → ${fb.to || "(none)"} (${fb.reason || "retry"} at attempt ${fb.attempt})`;
+      if (fb.message) fbLine += `: ${fb.message}`;
+      fallbackLines.push(fbLine);
+    }
+  }
+
   return [
     `opencode ${job.kind} ${job.id} — ${job.status} (${durationS(job)}s)`,
     `session: ${job.sessionID} (continue in opencode: \`opencode -s ${job.sessionID}\`)`,
     ...(job.phase ? [`phase: ${job.phase}`] : []),
-    ...(job.stats?.models?.length ? [`model: ${job.stats.models.join(" → ")}`] : []),
+    ...(routeLine.length ? routeLine : []),
     ...usageLine,
+    ...errorLines,
+    ...fallbackLines,
     "",
   ].join("\n");
 }
@@ -215,6 +247,16 @@ export function renderChainShow(chain, rounds, unreadable = []) {
     // Model entry(+variant)
     if (round.modelEntry) {
       lines.push(`  model: ${round.modelEntry}`);
+    }
+
+    // Fallbacks that occurred during this round's dispatches
+    if (round.fallbacks && round.fallbacks.length > 0) {
+      lines.push(`  fallbacks:`);
+      for (const fb of round.fallbacks) {
+        let fbLine = `    ${fb.from} → ${fb.to || "(none)"} (${fb.reason || "retry"} at attempt ${fb.attempt})`;
+        if (fb.message) fbLine += `: ${fb.message}`;
+        lines.push(fbLine);
+      }
     }
 
     // Verdict

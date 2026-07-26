@@ -1,8 +1,11 @@
-import { describe, it } from "node:test";
+import { describe, it, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import {
   accumulateUsage,
   decidePermission,
+  dispatchWithFallback,
+  failedRoutes,
+  resetFailedRoutes,
 } from "./prompt-execution.mjs";
 
 // decidePermission — always returns "once"
@@ -232,3 +235,328 @@ describe("accumulateUsage", () => {
   });
 });
 
+// shouldFailFast — fail-fast decision for provider retry loops
+// =========================================================================
+
+import { shouldFailFast } from "./prompt-execution.mjs";
+
+describe("shouldFailFast", () => {
+  it("capacity reason free_tier_limit at attempt 1 → stop + terminal", () => {
+    const result = shouldFailFast({ reason: "free_tier_limit", attempt: 1, steps: 0 });
+    assert.equal(result.stop, true);
+    assert.equal(result.terminal, true);
+  });
+
+  it("capacity reason free_tier_limit at attempt 2 → stop + terminal (no threshold)", () => {
+    const result = shouldFailFast({ reason: "free_tier_limit", attempt: 2, steps: 0 });
+    assert.equal(result.stop, true);
+    assert.equal(result.terminal, true);
+  });
+
+  it("non-capacity reason at attempt 3 with steps=0 → stop", () => {
+    const result = shouldFailFast({ reason: "rate_limit", attempt: 3, steps: 0 });
+    assert.equal(result.stop, true);
+    assert.equal(result.terminal, false);
+  });
+
+  it("non-capacity reason at attempt 3 with steps=0 and null reason → stop", () => {
+    const result = shouldFailFast({ reason: null, attempt: 3, steps: 0 });
+    assert.equal(result.stop, true);
+    assert.equal(result.terminal, false);
+  });
+
+  it("non-capacity reason at attempt 3 with steps=0 and undefined reason → stop", () => {
+    const result = shouldFailFast({ reason: undefined, attempt: 3, steps: 0 });
+    assert.equal(result.stop, true);
+    assert.equal(result.terminal, false);
+  });
+
+  it("non-capacity reason at attempt 2 with steps=0 → no stop (below threshold)", () => {
+    const result = shouldFailFast({ reason: "rate_limit", attempt: 2, steps: 0 });
+    assert.equal(result.stop, false);
+  });
+
+  it("non-capacity reason at attempt 1 with steps=0 → no stop", () => {
+    const result = shouldFailFast({ reason: "rate_limit", attempt: 1, steps: 0 });
+    assert.equal(result.stop, false);
+  });
+
+  it("non-capacity reason at attempt 5 with steps > 0 → no stop (real work in progress)", () => {
+    const result = shouldFailFast({ reason: "rate_limit", attempt: 5, steps: 3 });
+    assert.equal(result.stop, false);
+  });
+
+  it("no reason at attempt 4 with steps > 0 → no stop", () => {
+    const result = shouldFailFast({ reason: null, attempt: 4, steps: 1 });
+    assert.equal(result.stop, false);
+  });
+
+  it("capacity reason still fires even when steps > 0", () => {
+    // Capacity is terminal regardless of progress.
+    const result = shouldFailFast({ reason: "free_tier_limit", attempt: 1, steps: 5 });
+    assert.equal(result.stop, true);
+    assert.equal(result.terminal, true);
+  });
+
+  it("empty reason string is not treated as capacity", () => {
+    const result = shouldFailFast({ reason: "", attempt: 3, steps: 0 });
+    assert.equal(result.stop, true);  // attempt >= 3 + steps === 0
+    assert.equal(result.terminal, false);  // NOT capacity
+  });
+
+  it("uses retryCount as fallback when attempt is absent (0)", () => {
+    // Provider emits retry events but never numbers attempts — attempt is
+    // always 0.  retryCount=3 should trip the threshold.
+    const result = shouldFailFast({ reason: "rate_limit", attempt: 0, steps: 0, retryCount: 3 });
+    assert.equal(result.stop, true);
+    assert.equal(result.terminal, false);
+  });
+
+  it("retryCount fallback does not fire below threshold", () => {
+    const result = shouldFailFast({ reason: "rate_limit", attempt: 0, steps: 0, retryCount: 2 });
+    assert.equal(result.stop, false);
+  });
+
+  it("retryCount fallback works when attempt is undefined", () => {
+    const result = shouldFailFast({ reason: "rate_limit", attempt: undefined, steps: 0, retryCount: 3 });
+    assert.equal(result.stop, true);
+    assert.equal(result.terminal, false);
+  });
+
+  it("attempt takes priority over retryCount when both are present", () => {
+    // If the provider DOES number attempts, use that value, not retryCount.
+    const result = shouldFailFast({ reason: "rate_limit", attempt: 1, steps: 0, retryCount: 10 });
+    assert.equal(result.stop, false);  // attempt=1 < 3, even with high retryCount
+  });
+});
+
+// =========================================================================
+// dispatchWithFallback — integration tests with injected fake prompt runner
+// =========================================================================
+
+/**
+ * Build a fake prompt-runner result object.
+ */
+function fakeResult(status, overrides = {}) {
+  return {
+    job: {
+      id: overrides.id || "job-" + Math.random().toString(36).slice(2, 8),
+      kind: "task",
+      status,
+      sessionID: overrides.sessionID || "sess-1",
+      modelEntry: null,
+      modelVariant: null,
+      error: overrides.error || null,
+      retry: overrides.retry || null,
+      fallbacks: null,
+      usage: null,
+      startedAt: new Date().toISOString(),
+      finishedAt: new Date().toISOString(),
+      stats: { steps: overrides.steps || 0 },
+    },
+    resultText: overrides.resultText || "",
+    stateDir: overrides.stateDir || null,
+  };
+}
+
+describe("dispatchWithFallback", () => {
+  // Each test resets failedRoutes so tests do not interfere.
+  beforeEach(() => {
+    resetFailedRoutes();
+  });
+
+  afterEach(() => {
+    resetFailedRoutes();
+  });
+
+  it("first route terminal failure → next tier route succeeds with fallbacks trail", async () => {
+    let callCount = 0;
+    const fakeRunner = async () => {
+      callCount++;
+      if (callCount === 1) {
+        // First route (flash-free) fails with a terminal reason.
+        return fakeResult("provider-error", {
+          retry: { reason: "free_tier_limit", message: "quota exhausted", attempt: 1, count: 1, terminal: true },
+        });
+      }
+      // Second route (flash) succeeds.
+      return fakeResult("completed", { resultText: "done" });
+    };
+
+    const { job, resultText } = await dispatchWithFallback({
+      _runPrompt: fakeRunner,
+      tiers: [["route/flash-free", "route/flash"], ["route/pro"]],
+      round: 1,
+      kind: "task",
+      promptText: "test",
+    });
+
+    assert.equal(job.status, "completed");
+    assert.equal(resultText, "done");
+    // The job should name the route that actually succeeded.
+    assert.equal(job.modelEntry, "route/flash");
+    // Fallbacks trail should record the first route's failure.
+    assert.ok(Array.isArray(job.fallbacks));
+    assert.equal(job.fallbacks.length, 1);
+    assert.equal(job.fallbacks[0].from, "route/flash-free");
+    assert.equal(job.fallbacks[0].to, "route/flash");
+    assert.equal(job.fallbacks[0].reason, "free_tier_limit");
+    assert.equal(job.fallbacks[0].terminal, undefined); // not stored on fallback entry directly
+    // Terminal failure is remembered.
+    assert.ok(failedRoutes.has("route/flash-free"));
+  });
+
+  it("every route fails → returns provider-error with exhaustive error", async () => {
+    let callCount = 0;
+    const fakeRunner = async () => {
+      callCount++;
+      return fakeResult("provider-error", {
+        retry: { reason: "rate_limit", message: "try again later", attempt: 3, count: 3, terminal: false },
+      });
+    };
+
+    const { job } = await dispatchWithFallback({
+      _runPrompt: fakeRunner,
+      tiers: [["route/a", "route/b"], ["route/c"]],
+      round: 1,
+      kind: "task",
+      promptText: "test",
+    });
+
+    assert.equal(job.status, "provider-error");
+    assert.ok(job.error.includes("All routes exhausted:"));
+    assert.ok(job.error.includes("route/a"));
+    assert.ok(job.error.includes("route/b"));
+    assert.ok(job.error.includes("route/c"));
+    assert.ok(Array.isArray(job.fallbacks));
+    assert.equal(job.fallbacks.length, 3);
+    assert.equal(callCount, 3);
+  });
+
+  it("does not throw and does not loop forever on all-exhausted", async () => {
+    const fakeRunner = async () => {
+      return fakeResult("provider-error", {
+        retry: { reason: "rate_limit", attempt: 1, count: 1, terminal: false },
+      });
+    };
+
+    // Only one candidate — should return immediately.
+    const { job } = await dispatchWithFallback({
+      _runPrompt: fakeRunner,
+      tiers: [["route/only"]],
+      round: 1,
+      kind: "task",
+      promptText: "test",
+    });
+
+    assert.equal(job.status, "provider-error");
+  });
+
+  it("--model override producing provider-error falls back to tier routes", async () => {
+    let callCount = 0;
+    const fakeRunner = async () => {
+      callCount++;
+      if (callCount === 1) {
+        // The explicit model fails.
+        return fakeResult("provider-error", {
+          retry: { reason: "rate_limit", message: "overloaded", attempt: 3, count: 3, terminal: false },
+        });
+      }
+      return fakeResult("completed", { resultText: "ok" });
+    };
+
+    const { job } = await dispatchWithFallback({
+      _runPrompt: fakeRunner,
+      tiers: [["route/default"], ["route/fallback"]],
+      round: 1,
+      explicitModel: "custom/override-model",
+      kind: "task",
+      promptText: "test",
+    });
+
+    assert.equal(job.status, "completed");
+    // The explicit model should have been tried first, then tier routes.
+    assert.ok(Array.isArray(job.fallbacks));
+    assert.equal(job.fallbacks[0].from, "custom/override-model");
+    // The succeeded route is from the tier.
+    assert.equal(job.modelEntry, "route/default");
+    assert.equal(callCount, 2);
+  });
+
+  it("non-terminal failure is NOT added to failedRoutes", async () => {
+    let callCount = 0;
+    const fakeRunner = async () => {
+      callCount++;
+      if (callCount === 1) {
+        return fakeResult("provider-error", {
+          retry: { reason: "rate_limit", message: "transient", attempt: 3, count: 3, terminal: false },
+        });
+      }
+      return fakeResult("completed", { resultText: "ok" });
+    };
+
+    await dispatchWithFallback({
+      _runPrompt: fakeRunner,
+      tiers: [["route/a", "route/b"]],
+      round: 1,
+      kind: "task",
+      promptText: "test",
+    });
+
+    // The first route failed with a non-terminal reason — should NOT be
+    // remembered for later dispatches.
+    assert.equal(failedRoutes.has("route/a"), false);
+  });
+
+  it("terminal failure IS added to failedRoutes", async () => {
+    const fakeRunner = async () => {
+      return fakeResult("provider-error", {
+        retry: { reason: "free_tier_limit", message: "quota", attempt: 1, count: 1, terminal: true },
+      });
+    };
+
+    await dispatchWithFallback({
+      _runPrompt: fakeRunner,
+      tiers: [["route/doomed"]],
+      round: 1,
+      kind: "task",
+      promptText: "test",
+    });
+
+    assert.ok(failedRoutes.has("route/doomed"));
+  });
+
+  it("terminal failure remembered across dispatches", async () => {
+    // First dispatch: terminal failure on a route.
+    await dispatchWithFallback({
+      _runPrompt: async () => fakeResult("provider-error", {
+        retry: { reason: "free_tier_limit", message: "gone", attempt: 1, count: 1, terminal: true },
+      }),
+      tiers: [["route/dead"]],
+      round: 1,
+      kind: "task",
+      promptText: "test",
+    });
+
+    assert.ok(failedRoutes.has("route/dead"));
+
+    // Second dispatch: the dead route should be skipped by selectRoutes.
+    let secondCalled = false;
+    const fakeRunner2 = async () => {
+      secondCalled = true;
+      return fakeResult("completed", { resultText: "ok" });
+    };
+
+    const { job } = await dispatchWithFallback({
+      _runPrompt: fakeRunner2,
+      tiers: [["route/dead", "route/alive"]],
+      round: 1,
+      kind: "task",
+      promptText: "test",
+    });
+
+    // The alive route should have been selected (dead route skipped).
+    assert.equal(job.modelEntry, "route/alive");
+    assert.equal(secondCalled, true); // only called once for the alive route
+  });
+});
