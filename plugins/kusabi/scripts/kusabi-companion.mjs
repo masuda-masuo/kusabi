@@ -10,7 +10,7 @@
 import { parseArgs, parseModel, resolveModel, reviewDenyTools, WRITE_TOOL_NAMES, validateChainEntries } from "./cli.mjs";
 import { renderReview, renderChainShow, renderJobLine, renderHeader, extractJson, renderFollowupDraft } from "./render.mjs";
 import { hasSectionHeading, parseDeliverables, parseSmoke, parseOrchestratorSignature } from "./brief-parsing.mjs";
-import { deriveDisposition } from "./disposition.mjs";
+import { deriveDisposition, deriveReworkStrategy } from "./disposition.mjs";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -806,7 +806,7 @@ async function cmdChain(cwd, { flags, text }) {
   const { chainId, chainDir } = createChainDir(stateDir);
   const container = flags.container;
   if (!container) throw new Error("chain requires --container <cid>");
-  const maxRounds = Number(flags["max-rounds"] ?? 3);
+  const maxRounds = Number(flags["max-rounds"] ?? 4); // B6: default maxRounds is 4
   const brief = text;
 
   // ---- import callTool once for all phases that need it ----
@@ -818,10 +818,27 @@ async function cmdChain(cwd, { flags, text }) {
   // ---- chain initialisation: record base + checkpoint ----
   const baseSha = await captureBaseSha(callTool, container);
 
+  // ---- chain-start output: state tiers, maxRounds, and ladder info (B7) ----
+  const tierCount = modelChain ? modelChain.length : 0;
+  if (tierCount > 0) {
+    // The ladder can climb to tier (tierCount - 1). With the default ladder,
+    // the 1st rework uses tier 0 (same), 2nd uses tier 1 (+1), 3rd uses tier 2 (+1).
+    // The top tier is reached at round: 1 (initial) + (tierCount) reworks.
+    const roundsToTopTier = 1 + tierCount; // initial + one rework per tier beyond 0
+    const canReachTop = maxRounds >= roundsToTopTier;
+    process.stdout.write(
+      "Chain " + chainId + ": tiers=" + tierCount + ", maxRounds=" + maxRounds +
+      (canReachTop ? " (can reach top tier)" : " (maxRounds insufficient to reach top tier)") +
+      "\n"
+    );
+  }
+
   // ---- round loop state (cross-round) ----
   const records = [];
   let strategized = false;
   let session = flags.session;
+  let reworkCount = 0; // how many reworks have been done (B2: tier/session/artifacts)
+  let currentTierIndex = 0; // cumulative tier index (starts at 0)
 
   try {
     for (let round = 1; round <= maxRounds; round++) {
@@ -829,10 +846,29 @@ async function cmdChain(cwd, { flags, text }) {
       const hasPreviousRound = round > 1 && records.length > 0;
       const previousRecord = hasPreviousRound ? records[records.length - 1] : null;
 
-      // ---- phase 1: resume strategy (checkpoint_restore or continue) ----
-      const { resumeMethod, useNewSession } = await resolveRoundResume({ round, strategized, baseSha, container, callTool });
+      // ---- phase 1: resume strategy (B2: derive rework levers when rework) ----
+      let useNewSession = false;
+      let restoreBase = false;
+      let reworkStrategyReason = null;
+      let reworkStrategy = null;
 
-      // ---- phase 2: round model selection is now inside dispatchWithFallback ----
+      if (isFirstRound) {
+        // First round always uses a fresh session (no prior session).
+        useNewSession = false; // no session to continue from, and no restore
+      } else if (previousRecord?.pendingReworkStrategy) {
+        // Use the rework strategy computed at the end of the previous round.
+        reworkStrategy = previousRecord.pendingReworkStrategy;
+        useNewSession = reworkStrategy.newSession;
+        restoreBase = reworkStrategy.restoreBase;
+        reworkStrategyReason = reworkStrategy.reason;
+      }
+
+      const { resumeMethod } = await resolveRoundResume({ useNewSession, restoreBase, baseSha, container, callTool });
+
+      // ---- phase 2: round model selection ----
+      // Use currentTierIndex (never round) so tier is decoupled from the round counter.
+      // For review, the reviewer stays on tier 0 (round 1) \u2014 that's handled in
+      // runReviewPhase which passes round=1 to dispatchWithFallback.
 
       // ---- phase 3: implement text + dispatch ----
       const implementText = buildImplementText({ round, brief, previousRecord });
@@ -843,12 +879,19 @@ async function cmdChain(cwd, { flags, text }) {
         implementJobError,
       } = await runImplementPhase({
         cwd, chainId, round, isFirstRound, implementText, modelChain,
+        tierIndex: currentTierIndex,
         useNewSession, session, previousRecord, resumeMethod, flagsModel: flags.model,
       });
       session = resolvedSession;
 
+      // Record lever info on the round record (B8)
+      roundRecord.tierBefore = currentTierIndex;
+      roundRecord.reworkStrategyReason = reworkStrategyReason;
+      roundRecord.reworkCount = reworkCount;
+
       // ---- stop on implement provider exhaustion ----
       if (implementJobStatus === "provider-error") {
+        roundRecord.tierAfter = currentTierIndex;
         records.push(roundRecord);
         const chainTotals = computeChainTotals(records);
         persistChainState({
@@ -874,7 +917,7 @@ async function cmdChain(cwd, { flags, text }) {
       // ---- phase 5: review (or skip when change set empty) ----
       const {
         chainVerdict, chainFindingsText, chainParsedReview, chainRepeatedAreas, skipReview,
-        reviewJobStatus, reviewJobError,
+        reviewJobStatus, reviewJobError, reviewParseable,
       } = await runReviewPhase({
         container, brief, modelChain, chainId, cwd, previousRecord, baseSha,
         chainStatusOutput, chainBaseLog, roundRecord,
@@ -884,6 +927,7 @@ async function cmdChain(cwd, { flags, text }) {
 
       // ---- stop on review provider exhaustion ----
       if (reviewJobStatus === "provider-error") {
+        roundRecord.tierAfter = currentTierIndex;
         records.push(roundRecord);
         const chainTotals = computeChainTotals(records);
         persistChainState({
@@ -937,6 +981,36 @@ async function cmdChain(cwd, { flags, text }) {
         roundRecord.followupIssueDraft = chainFollowupDraft;
       }
 
+      // ---- Compute rework strategy for the NEXT round (if rework needed) ----
+      let pendingReworkStrategy = null;
+      if (disposition.disposition === "rework") {
+        // Determine whether the previous round's findings were available (B2/B4).
+        // Findings are "available" when the review was parseable and non-empty.
+        const previousFindingsAvailable = reviewParseable &&
+          chainFindingsText != null &&
+          chainFindingsText !== "(no structured findings)" &&
+          chainFindingsText !== "(review output could not be parsed)";
+
+        pendingReworkStrategy = deriveReworkStrategy({
+          reworkCount,
+          repeatedAreas: chainRepeatedAreas,
+          previousFindingsAvailable,
+          strategized,
+        });
+
+        // Update cross-round state for the next iteration
+        reworkCount += 1;
+        currentTierIndex += pendingReworkStrategy.tierDelta;
+      } else if (disposition.disposition === "strategize") {
+        // Strategize doesn't consume a rework count, but it sets strategized=true
+        // which affects the next rework strategy.
+      }
+
+      // Record the pending rework strategy on the round record so the next
+      // round can read it, and so chain-show can display what levers were pulled.
+      roundRecord.pendingReworkStrategy = pendingReworkStrategy;
+      roundRecord.tierAfter = currentTierIndex;
+
       persistChainState({
         chainDir, round, roundRecord, chainId, container, model, modelChain,
         maxRounds, brief, orchestrator, records, baseSha, chainTotals,
@@ -977,6 +1051,15 @@ async function cmdChain(cwd, { flags, text }) {
         }
 
         strategized = true;
+
+        // The next round must use a fresh session to break anchoring (§3.4).
+        // Set a pendingReworkStrategy so the loop picks it up at phase 1.
+        roundRecord.pendingReworkStrategy = {
+          tierDelta: 0,
+          newSession: true,
+          restoreBase: false,
+          reason: "strategized: new session (anchoring break per §3.4)",
+        };
 
         // Re-persist after strategize updates roundRecord and strategized flag
         const updatedTotals = computeChainTotals(records);
@@ -1115,7 +1198,7 @@ function usage() {
     "  --container <cid> (chain/task: container to run deterministic probes in)",
     "  --keep-serve (chain: keep the serve alive after chain finishes)",
     "  --prior <text> (review: prior findings for anti-ratchet)",
-    "  --max-rounds <N> (chain: max rounds, default 3)",
+    "  --max-rounds <N> (chain: max rounds, default 4)",
     "  --last <N> (explain: include last N assistant/user exchanges, default 1)",
     "  --tools (explain: also include tool results in context)",
     "  --quote <text> (explain: use explicit passage instead of transcript extraction)",

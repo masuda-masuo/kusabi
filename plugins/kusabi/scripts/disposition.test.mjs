@@ -2,7 +2,7 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import {
   deriveDisposition,
-  resolveResumeMethod,
+  deriveReworkStrategy,
 } from "./disposition.mjs";
 
 // deriveDisposition — all branches
@@ -135,43 +135,156 @@ describe("deriveDisposition", () => {
   });
 });
 
-// resolveResumeMethod — pure function for resume strategy decisions
+// deriveReworkStrategy — default ladder and evidence rules (B2/B3/B4/B5)
 // ---------------------------------------------------------------------------
 
-describe("resolveResumeMethod", () => {
-  it("round 1 returns continue_session", () => {
-    const result = resolveResumeMethod({ round: 1, strategized: false });
-    assert.deepEqual(result, { type: "continue_session" });
+describe("deriveReworkStrategy", () => {
+  // B3: Default ladder
+  it("1st rework: same tier, continue session, keep artifacts", () => {
+    const result = deriveReworkStrategy({
+      reworkCount: 0,
+      repeatedAreas: false,
+      previousFindingsAvailable: true,
+      strategized: false,
+    });
+    assert.equal(result.tierDelta, 0);
+    assert.equal(result.newSession, false);
+    assert.equal(result.restoreBase, false);
+    assert.match(result.reason, /1st rework/);
+    assert.match(result.reason, /same tier/);
+    assert.match(result.reason, /continue session/);
   });
 
-  it("round 1 returns continue_session even when strategized is true (impossible but defensive)", () => {
-    const result = resolveResumeMethod({ round: 1, strategized: true });
-    assert.deepEqual(result, { type: "continue_session" });
+  it("2nd rework: +1 tier, new session, keep artifacts", () => {
+    const result = deriveReworkStrategy({
+      reworkCount: 1,
+      repeatedAreas: false,
+      previousFindingsAvailable: true,
+      strategized: false,
+    });
+    assert.equal(result.tierDelta, 1);
+    assert.equal(result.newSession, true);
+    assert.equal(result.restoreBase, false);
+    assert.match(result.reason, /2nd rework/);
+    assert.match(result.reason, /escalate tier/);
+    assert.match(result.reason, /new session/);
   });
 
-  it("round 2 with strategized=false returns continue_session", () => {
-    const result = resolveResumeMethod({ round: 2, strategized: false });
-    assert.deepEqual(result, { type: "continue_session" });
+  it("3rd rework: +1 tier, new session, keep artifacts", () => {
+    const result = deriveReworkStrategy({
+      reworkCount: 2,
+      repeatedAreas: false,
+      previousFindingsAvailable: true,
+      strategized: false,
+    });
+    assert.equal(result.tierDelta, 1);
+    assert.equal(result.newSession, true);
+    assert.equal(result.restoreBase, false);
+    assert.match(result.reason, /3th rework/);
+    assert.match(result.reason, /escalate tier/);
+    assert.match(result.reason, /new session/);
   });
 
-  it("round 2 with strategized=true returns fresh_session (after strategize, force new session)", () => {
-    const result = resolveResumeMethod({ round: 2, strategized: true });
-    assert.deepEqual(result, { type: "fresh_session" });
+  // B4: Restore suppression rules
+  it("restore suppressed when previous round resolved all findings (no repeated areas)", () => {
+    // previousFindingsAvailable=true but !repeatedAreas => priorFindingsResolved => restore=false
+    const result = deriveReworkStrategy({
+      reworkCount: 1,
+      repeatedAreas: false,
+      previousFindingsAvailable: true,
+      strategized: false,
+    });
+    assert.equal(result.restoreBase, false);
+    assert.ok(!result.reason.includes("restore base"));
   });
 
-  it("round 3 with strategized=false returns fresh_session", () => {
-    const result = resolveResumeMethod({ round: 3, strategized: false });
-    assert.deepEqual(result, { type: "fresh_session" });
+  it("restore suppressed when previous findings unavailable (unparseable)", () => {
+    const result = deriveReworkStrategy({
+      reworkCount: 1,
+      repeatedAreas: true,
+      previousFindingsAvailable: false,
+      strategized: false,
+    });
+    assert.equal(result.restoreBase, false);
+    assert.ok(!result.reason.includes("restore base"));
   });
 
-  it("round 3 with strategized=true returns fresh_session", () => {
-    const result = resolveResumeMethod({ round: 3, strategized: true });
-    assert.deepEqual(result, { type: "fresh_session" });
+  it("restore suppressed when previous findings empty", () => {
+    const result = deriveReworkStrategy({
+      reworkCount: 1,
+      repeatedAreas: false,
+      previousFindingsAvailable: false,
+      strategized: false,
+    });
+    assert.equal(result.restoreBase, false);
   });
 
-  it("round 4+ always returns fresh_session", () => {
-    assert.deepEqual(resolveResumeMethod({ round: 4, strategized: false }), { type: "fresh_session" });
-    assert.deepEqual(resolveResumeMethod({ round: 5, strategized: true }), { type: "fresh_session" });
+  it("restore fires when previous findings available and unresolved (repeated areas)", () => {
+    const result = deriveReworkStrategy({
+      reworkCount: 1,
+      repeatedAreas: true,
+      previousFindingsAvailable: true,
+      strategized: false,
+    });
+    assert.equal(result.restoreBase, true);
+    assert.match(result.reason, /restore base/);
+    assert.match(result.reason, /prior findings unresolved/);
+  });
+
+  // B5: New session does not imply restoring artifacts
+  it("new session with artifacts kept: restoreBase=false, newSession=true", () => {
+    const result = deriveReworkStrategy({
+      reworkCount: 1,
+      repeatedAreas: false,
+      previousFindingsAvailable: true,
+      strategized: false,
+    });
+    // Default 2nd rework: new session, keep artifacts
+    assert.equal(result.newSession, true);
+    assert.equal(result.restoreBase, false);
+  });
+
+  // Strategized forces fresh session
+  it("strategized forces new session on 1st rework", () => {
+    const result = deriveReworkStrategy({
+      reworkCount: 0,
+      repeatedAreas: false,
+      previousFindingsAvailable: true,
+      strategized: true,
+    });
+    assert.equal(result.newSession, true); // Would be false without strategized
+    assert.equal(result.tierDelta, 0);
+    assert.match(result.reason, /new session.*strategized/);
+  });
+
+  // B4 guarantee: no call path in which a round both lacks prior findings and restores artifacts
+  it("AC5: no restore when previous findings unavailable", () => {
+    const result = deriveReworkStrategy({
+      reworkCount: 0,
+      repeatedAreas: true,
+      previousFindingsAvailable: false,
+      strategized: false,
+    });
+    assert.equal(result.restoreBase, false);
+  });
+
+  it("AC5: no restore when previous findings resolved", () => {
+    const result = deriveReworkStrategy({
+      reworkCount: 1,
+      repeatedAreas: false,
+      previousFindingsAvailable: true,
+      strategized: false,
+    });
+    assert.equal(result.restoreBase, false);
+  });
+
+  it("AC5: no restore when both conditions (unavailable + resolved) hold", () => {
+    const result = deriveReworkStrategy({
+      reworkCount: 1,
+      repeatedAreas: false,
+      previousFindingsAvailable: false,
+      strategized: false,
+    });
+    assert.equal(result.restoreBase, false);
   });
 });
-

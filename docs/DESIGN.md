@@ -152,15 +152,55 @@ accept-with-followup misuse guards:
 - probesGreen must be true (mechanical checks passed)
 - The follow-up draft always surfaces to the orchestrator (never posted automatically)
 
-#### 3.5.5 Restart method and recording
+#### 3.5.5 Restart method and recording — three-lever separation
 
-Rework restart methods:
-- **1st time**: Continue the same implement session (feed only findings)
-- **2nd time onward**: `checkpoint_restore(baseSha)` → **new session** (re-challenge with fresh context). If restore is not possible, record that fact in resumeMethod (do not record something that was not actually done)
+Three independent progression mechanisms (budget, model tier, session/artifact lifecycle) are now **separate**. The round number (`1..maxRounds`) is only the budget counter. Model tier escalation and session/artifact decisions are governed by a pure function `deriveReworkStrategy` in `disposition.mjs`:
 
-Which method was used is recorded in each round's metadata. Persisted per-round as JSON (`round-N.json`) + aggregate JSON (`chain.json`) in state dir `chains/<chain-id>/`.
+**Default ladder** (no countervailing evidence):
 
-On escalate, include remaining findings + history (each round's verdict/probes/disposition/resume method) in the final output. publish is never called from the chain (not on the allow list).
+| rework | tier  | session  | artifacts |
+|--------|-------|----------|-----------|
+| 1st    | same  | continue | keep      |
+| 2nd    | +1    | new      | keep      |
+| 3rd+   | +1    | new      | keep      |
+
+**checkpoint_restore** fires only when the evidence says the current artifacts are worth less than base. Round number alone must never trigger it. Restore is suppressed when either:
+- the previous round resolved all of the findings it was given, or
+- the previous round's findings were unavailable (unparseable or empty).
+
+The two must be independently selectable: "new session but keep artifacts" is a reachable state.
+
+Evidence inputs to `deriveReworkStrategy`:
+- `reworkCount` (0-indexed: 0 = first rework)
+- `repeatedAreas` — whether the same files are still being flagged (proxy for "prior findings unresolved")
+- `previousFindingsAvailable` — whether the previous round's review was parseable and non-empty
+- `strategized` — whether a strategize has occurred
+
+The function returns:
+- `tierDelta` — how many tiers to advance (0 = same tier)
+- `newSession` — whether to start a fresh session
+- `restoreBase` — whether to `checkpoint_restore(baseSha)`
+- `reason` — human-readable explanation of the decision
+
+**Review parsing** distinguishes parseable from unparseable output. When a review response is not valid JSON (e.g., the `VERDICT:` token appears inside the JSON fence rather than outside), the companion recovers by:
+1. First stripping a trailing `VERDICT:` token (standard location after the fence)
+2. If extractJson still fails, calling `recoverVerdictFromText` to find the token anywhere in the text, stripping it globally, and re-parsing
+3. If even that fails, recording `reviewParseable: false` on the round record with verdict `"unparseable"` — a state distinct from `needs-attention`
+
+The shared function `recoverVerdictFromText` in `render.mjs` powers both the display layer (`renderReview`) and the decision layer (`runReviewPhase`), avoiding duplication.
+
+**Round record fields** (B8):
+- `tierBefore`, `tierAfter` — the tier index before and after the round
+- `reworkCount` — how many reworks had been done prior to this round
+- `reworkStrategyReason` — the reason string from `deriveReworkStrategy`
+- `pendingReworkStrategy` — the full strategy object stored on the round record and consumed by the next iteration
+- `reviewParseable` — whether the review output was parseable as JSON
+
+**Chain-start output** (B7): the chain emits a line showing `tiers=N`, `maxRounds=M`, and whether the budget can reach the top tier.
+
+On escalate, include remaining findings + history (each round's verdict/probes/disposition/tier/resume method) in the final output. publish is never called from the chain (not on the allow list).
+
+The chain now defaults to 4 max rounds (was 3). With the default ladder, rework 1 stays on the cheapest tier, so a 4-round chain reaches the same top tier as the old 3-round chain while spending the same number of paid rounds.
 
 ### 3.6 sunaba-rpc (raw JSON-RPC client) — implemented
 
@@ -189,7 +229,9 @@ publish / issue_write / sandbox_initialize etc. are **structurally uncallable** 
 
 ### 4.1 Tiered chain entries
 
-Entries in `models.chain` and `models.phases.<phase>` may be **either a string or a non-empty array of strings**. A string is a tier with one route; an array is one tier whose entries are alternate routes of equivalent quality, in preference order. Round → tier mapping uses clamp semantics over tiers: round N uses tier `min(N - 1, tierCount - 1)`.
+Entries in `models.chain` and `models.phases.<phase>` may be **either a string or a non-empty array of strings**. A string is a tier with one route; an array is one tier whose entries are alternate routes of equivalent quality, in preference order.
+
+Tier selection is decoupled from the round counter. `selectRoutes` in `cli.mjs` accepts an optional `tierIndex` parameter; when provided, it is used directly (clamped to the tier count). When absent, the old `min(round - 1, tierCount - 1)` fallback applies for backward compatibility. The chain passes `tierIndex` derived from `deriveReworkStrategy`'s cumulative tier delta, so the model tier is independent of the round budget counter.
 
 The built-in default chain is two tiers (matching DESIGN.md §4's "free → flash → pro" capacity path), with the reasoning variant pinned to `max` on every route:
 

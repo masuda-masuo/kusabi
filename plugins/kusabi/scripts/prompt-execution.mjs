@@ -540,9 +540,9 @@ export async function runPrompt({ cwd, kind, title, promptText, agent, model, se
  * @returns {Promise<{ job: object, resultText: string, stateDir: string }>}
  */
 export async function dispatchWithFallback(opts) {
-  const { tiers, round, explicitModel, _runPrompt, ...runPromptOpts } = opts;
+  const { tiers, round, tierIndex, explicitModel, _runPrompt, ...runPromptOpts } = opts;
   const doPrompt = _runPrompt || runPrompt;
-  const candidates = selectRoutes({ tiers, round, explicitModel, failedRoutes });
+  const candidates = selectRoutes({ tiers, round, tierIndex, explicitModel, failedRoutes });
 
   if (candidates.length === 0) {
     // Should only occur if the chain is empty AND no explicit model.
