@@ -19,6 +19,7 @@ import { execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 import { stateRoot, stateDirFor, readJson } from "./state-paths.mjs";
+import { collectChainRecords, computeStats, renderChainStats, renderComparison } from "./chain-stats.mjs";
 import { jobDir, saveJob, loadJob, listJobs, latestJob } from "./job-store.mjs";
 import { opencodeBin, serverHealthy, ensureServer, reapIdleServes, api } from "./serve-lifecycle.mjs";
 import { runPrompt, dispatchWithFallback, resetFailedRoutes } from "./prompt-execution.mjs";
@@ -1153,6 +1154,54 @@ function cmdChainShow(cwd, { text }) {
 }
 
 // ---------------------------------------------------------------------------
+// chain-stats
+// ---------------------------------------------------------------------------
+
+function cmdChainStats(cwd, { flags }) {
+  const stateDir = stateDirFor(cwd);
+  const { chains, skipped } = collectChainRecords(stateDir);
+
+  if (chains.length === 0 && skipped === 0) {
+    throw new Error("no chain records found for this workspace");
+  }
+
+  // Resolve time ranges
+  const since = flags.since || undefined;
+  const until = flags.until || undefined;
+  const compare = flags.compare || undefined;
+
+  if (compare && (since || until)) {
+    // --compare derives both ranges from the cutoff alone.  Accepting
+    // --since/--until here and ignoring them would silently answer a
+    // different question than the one asked.
+    throw new Error("--compare is incompatible with --since/--until: it derives both ranges from the cutoff");
+  }
+
+  if (compare) {
+    // Side-by-side comparison: before and after the cutoff
+    const beforeStats = computeStats(chains, { since: undefined, until: compare });
+    const afterStats = computeStats(chains, { since: compare, until: undefined });
+    const lines = [renderComparison(beforeStats, afterStats, compare)];
+
+    if (skipped > 0) {
+      lines.push("");
+      lines.push(`(unreadable chain.json files skipped: ${skipped})`);
+    }
+
+    return lines.join("\n");
+  }
+
+  const stats = computeStats(chains, { since, until });
+  const lines = [renderChainStats(stats, { since, until })];
+
+  if (skipped > 0) {
+    lines.push(`(unreadable chain.json files skipped: ${skipped})`);
+  }
+
+  return lines.join("\n");
+}
+
+// ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
 
@@ -1166,6 +1215,7 @@ function usage() {
     "  review     Run an adversarial review of working-tree changes",
     "  chain      Run implement→review→rework chain until acceptance or escalate",
     "  chain-show Print a compact plain-text digest of a chain (read-only, no LLM)",
+    "  chain-stats Aggregate every chain record and print a summary (read-only, no LLM)",
     "  status     List recent jobs or show one by ID",
     "  result     Show completed job result (latest, or by ID)",
     "  cancel     Cancel a running job",
@@ -1187,6 +1237,9 @@ function usage() {
     "  --last <N> (explain: include last N assistant/user exchanges, default 1)",
     "  --tools (explain: also include tool results in context)",
     "  --quote <text> (explain: use explicit passage instead of transcript extraction)",
+    "  --since <ISO> (chain-stats: start of time range, inclusive)",
+    "  --until <ISO> (chain-stats: end of time range, exclusive)",
+    "  --compare <ISO> (chain-stats: show before/after comparison at cutoff)",
     "  -h, --help",
     "",
     "Unknown flags cause an error. Use -- to treat subsequent tokens as literal text.",
@@ -1251,10 +1304,13 @@ async function main() {
     case "chain-show":
     case "chainShow":
       return cmdChainShow(cwd, parsed);
+    case "chain-stats":
+    case "chainStats":
+      return cmdChainStats(cwd, parsed);
     case "explain":
       return cmdExplain(cwd, parsed);
     default:
-      throw new Error(`unknown subcommand: ${subcommand ?? "(none)"}. Use setup|task|review|chain|chain-show|status|result|cancel|serve-stop|install-agents|salvage|explain`);
+      throw new Error(`unknown subcommand: ${subcommand ?? "(none)"}. Use setup|task|review|chain|chain-show|chain-stats|status|result|cancel|serve-stop|install-agents|salvage|explain`);
   }
 }
 
