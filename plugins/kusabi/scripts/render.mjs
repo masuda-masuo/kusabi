@@ -72,14 +72,39 @@ export function extractJson(text) {
   }
 }
 
+/**
+ * Attempt to recover a verdict from the raw review text by finding a
+ * VERDICT: token anywhere in the text (including inside a JSON fence).
+ *
+ * Returns null when no token is found.
+ * Exported for sharing between the chain's parsing path and renderReview.
+ *
+ * @param {string} rawText
+ * @returns {{ verdict: string }|null}
+ */
+export function recoverVerdictFromText(rawText) {
+  // First try: trailing token after a JSON fence (token is on its own line)
+  const lines = rawText.split("\n").filter((l) => l.trim() !== "");
+  const lastLine = lines.length > 0 ? lines[lines.length - 1].trim() : "";
+  let tokenMatch = lastLine.match(/^VERDICT:\s*(approve-partial|approve|needs-attention|discard)\s*$/i);
+  if (tokenMatch) {
+    return { verdict: tokenMatch[1].toLowerCase() };
+  }
+
+  // Second try: token anywhere in the text (inside JSON fence, mid-text, etc.)
+  const anyMatch = rawText.match(/VERDICT:\s*(approve-partial|approve|needs-attention|discard)/i);
+  if (anyMatch) {
+    return { verdict: anyMatch[1].toLowerCase() };
+  }
+
+  return null;
+}
+
 export function renderReview(parsed, rawText) {
   if (!parsed) {
-    const lines = rawText.split("\n").filter((l) => l.trim() !== "");
-    const lastLine = lines.length > 0 ? lines[lines.length - 1].trim() : "";
-    const tokenMatch = lastLine.match(/^VERDICT:\s*(approve-partial|approve|needs-attention|discard)\s*$/i);
-    if (tokenMatch) {
-      const verdict = tokenMatch[1].toLowerCase();
-      return `**Verdict: ${verdict}** (recovered from terminal token; JSON malformed)\n\n${rawText}`;
+    const recovered = recoverVerdictFromText(rawText);
+    if (recovered) {
+      return `**Verdict: ${recovered.verdict}** (recovered from terminal token; JSON malformed)\n\n${rawText}`;
     }
     return `(review output was not valid JSON; raw output below)\n\n${rawText}`;
   }
@@ -261,7 +286,8 @@ export function renderChainShow(chain, rounds, unreadable = []) {
 
     // Verdict
     if (round.verdict) {
-      lines.push(`  verdict: ${round.verdict}`);
+      const parseableNote = round.reviewParseable === false ? " (unparseable)" : "";
+      lines.push(`  verdict: ${round.verdict}${parseableNote}`);
     }
 
     // Disposition + reason
@@ -269,6 +295,21 @@ export function renderChainShow(chain, rounds, unreadable = []) {
       const disp = round.disposition.disposition || "unknown";
       const reason = round.disposition.reason ? ` (${round.disposition.reason})` : "";
       lines.push(`  disposition: ${disp}${reason}`);
+    }
+
+    // Tier info (B8: which levers were pulled)
+    if (round.tierBefore !== undefined) {
+      const tierAfter = round.tierAfter !== undefined ? round.tierAfter : round.tierBefore;
+      const tierArrow = round.tierBefore !== tierAfter ? ` ${round.tierBefore} \u2192 ${tierAfter}` : ` ${round.tierBefore}`;
+      lines.push(`  tier:${tierArrow}`);
+    }
+
+    // Rework strategy reason (B8: why these levers were pulled)
+    if (round.reworkStrategyReason) {
+      lines.push(`  rework strategy: ${round.reworkStrategyReason}`);
+    }
+    if (round.reworkCount !== undefined) {
+      lines.push(`  rework count: ${round.reworkCount}`);
     }
 
     // Resume method

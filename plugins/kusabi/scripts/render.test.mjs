@@ -9,6 +9,7 @@ import {
   renderBaseFacts,
   renderFollowupDraft,
   renderStrategistPrompt,
+  recoverVerdictFromText,
 } from "./render.mjs";
 import { sampleParsed } from "./fixtures.mjs";
 
@@ -40,6 +41,51 @@ describe("extractJson", () => {
   it("returns null for malformed JSON in fence", () => {
     const input = "```json\n{invalid}\n```";
     assert.equal(extractJson(input), null);
+  });
+});
+
+// recoverVerdictFromText — verdict recovery (A1/A3)
+// ---------------------------------------------------------------------------
+
+describe("recoverVerdictFromText", () => {
+  it("recovers token on last line (standard location)", () => {
+    const result = recoverVerdictFromText("Some text\nVERDICT: approve");
+    assert.deepEqual(result, { verdict: "approve" });
+  });
+
+  it("recovers token when it is on the last line outside JSON fence", () => {
+    // A1: VERDICT token appears after the JSON fence (normal position)
+    const text = '```json\n{\n  "verdict": "needs-attention",\n  "summary": "There is a bug",\n  "findings": [\n    { "severity": "high", "title": "Null pointer", "file": "src/main.js", "line_start": 42 }\n  ]\n}\n```\nVERDICT: needs-attention';
+    const result = recoverVerdictFromText(text);
+    assert.deepEqual(result, { verdict: "needs-attention" });
+  });
+
+  it("recovers token when there is no trailing token but token is inside the fence as a standalone line", () => {
+    // When the model puts the VERDICT token as a standalone construct inside
+    // the JSON fence block (the real-world incident scenario).
+    const text = '```json\n{\n  "verdict": "needs-attention",\n  "summary": "All five prior findings are genuinely fixed.",\n  "findings": []\n}\n```\n```\nVERDICT: needs-attention\n```';
+    const result = recoverVerdictFromText(text);
+    assert.deepEqual(result, { verdict: "needs-attention" });
+  });
+
+  it("returns null when no token present", () => {
+    const result = recoverVerdictFromText("Some random text without a verdict");
+    assert.equal(result, null);
+  });
+
+  it("recovers approve-partial", () => {
+    const result = recoverVerdictFromText("Some text\nVERDICT: approve-partial");
+    assert.deepEqual(result, { verdict: "approve-partial" });
+  });
+
+  it("recovers discard", () => {
+    const result = recoverVerdictFromText("Some text\nVERDICT: discard");
+    assert.deepEqual(result, { verdict: "discard" });
+  });
+
+  it("recovers needs-attention", () => {
+    const result = recoverVerdictFromText("Some text\nVERDICT: needs-attention");
+    assert.deepEqual(result, { verdict: "needs-attention" });
   });
 });
 
@@ -188,6 +234,24 @@ describe("renderReview discard token", () => {
     const result = renderReview(null, rawText);
     assert.match(result, /recovered from terminal token/);
     assert.match(result, /discard/);
+  });
+
+  // A1: VERDICT token inside the JSON fence
+  it("recovers verdict when token is inside the JSON fence (real-world incident)", () => {
+    // The model placed VERDICT inside the JSON fence, then the fence closed.
+    // Without trailing token, the old strip regex (anchored to $) missed it.
+    const rawText = '```json\n{\n  "verdict": "needs-attention",\n  "summary": "All five prior findings are genuinely fixed. However, one function is dead code."\n}\n```\nVERDICT: needs-attention';
+    const result = renderReview(null, rawText);
+    assert.match(result, /recovered from terminal token/);
+    assert.match(result, /needs-attention/);
+  });
+
+  // A1: token inside fence, no trailing token (the worst case)
+  it("recovers verdict when token is only inside the JSON fence", () => {
+    const rawText = 'Here is my review:\n\n```json\n{\n  "verdict": "needs-attention",\n  "findings": [\n    { "severity": "high", "title": "Bug", "file": "src/main.js", "line_start": 10, "line_end": 15 }\n  ]\n}\n```\nVERDICT: needs-attention';
+    const result = renderReview(null, rawText);
+    assert.match(result, /recovered from terminal token/);
+    assert.match(result, /needs-attention/);
   });
 });
 
@@ -480,6 +544,38 @@ describe("renderChainShow", () => {
     const result = renderChainShow(chain, rounds);
     assert.doesNotMatch(result, /strategist:/);
     assert.doesNotMatch(result, /strategist recommendation:/);
+  });
+
+  // AC4: an unparseable review must be distinguishable from a genuine
+  // needs-attention in the chain-show rendering, not only on the round record.
+  it("marks an unparseable review distinctly in the rendered verdict line", () => {
+    const chain = { chainId: "chain-unparseable" };
+    const rounds = [
+      {
+        round: 1,
+        verdict: "needs-attention",
+        reviewParseable: false,
+        disposition: { disposition: "rework", reason: "review output could not be parsed" },
+        resumeMethod: { type: "continue_session" },
+      },
+    ];
+    const result = renderChainShow(chain, rounds);
+    assert.match(result, /verdict: needs-attention \(unparseable\)/);
+  });
+
+  it("does not mark a parseable needs-attention review as unparseable", () => {
+    const chain = { chainId: "chain-parseable" };
+    const rounds = [
+      {
+        round: 1,
+        verdict: "needs-attention",
+        reviewParseable: true,
+        disposition: { disposition: "rework" },
+        resumeMethod: { type: "continue_session" },
+      },
+    ];
+    const result = renderChainShow(chain, rounds);
+    assert.doesNotMatch(result, /\(unparseable\)/);
   });
 });
 

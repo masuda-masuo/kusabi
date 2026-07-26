@@ -13,6 +13,7 @@ import {
   runHeadCleanProbe,
   runVerifyProbe,
   runDeliverablesProbe,
+  parseReviewResult,
 } from "./chain-phases.mjs";
 import {
   createFakeCallTool,
@@ -788,3 +789,123 @@ describe("renderProviderExhaustedOutcome", () => {
   });
 });
 
+// parseReviewResult — pure function for decision-path review parsing (AC3, AC4)
+// =========================================================================
+
+describe("parseReviewResult", () => {
+  // AC3: VERDICT token inside JSON fence with findings recovery
+  it("recovers verdict AND findings when VERDICT token appears inside JSON fence", () => {
+    // Real-world incident: model emitted VERDICT: needs-attention inside the
+    // JSON fence block, and the old strip regex (anchored to $) missed it.
+    const payload = [
+      "```json",
+      "{",
+      '  "verdict": "needs-attention",',
+      '  "summary": "All five prior findings are genuinely fixed. The gate passes (451/451, zero lint/type issues). However, one function is dead code.",',
+      '  "findings": [',
+      '    { "severity": "low", "title": "Dead code in helper", "file": "src/utils.js", "line_start": 42 }',
+      "  ]",
+      "}",
+      "```",
+      "",
+      "VERDICT: needs-attention",
+    ].join("\n");
+
+    const result = parseReviewResult(payload);
+
+    assert.equal(result.reviewParseable, true);
+    assert.equal(result.chainVerdict, "needs-attention");
+    // AC3: findings must be recovered, not replaced with "(no structured findings)"
+    assert.ok(result.chainFindingsText.includes("Dead code in helper"));
+    assert.ok(result.chainFindingsText.includes("src/utils.js:42"));
+    assert.ok(!result.chainFindingsText.includes("(no structured findings)"));
+  });
+
+  it("recovers findings when VERDICT token appears after secondary fence", () => {
+    // Another variant: token is between fences
+    const payload = [
+      "Here is my review:",
+      "",
+      "```json",
+      "{",
+      '  "verdict": "needs-attention",',
+      '  "summary": "Looks ok",',
+      '  "findings": [',
+      '    { "severity": "medium", "title": "Magic number", "file": "src/calc.js", "line_start": 7 }',
+      "  ]",
+      "}",
+      "```",
+      "```",
+      "VERDICT: needs-attention",
+      "```",
+    ].join("\n");
+
+    const result = parseReviewResult(payload);
+
+    assert.equal(result.reviewParseable, true);
+    assert.equal(result.chainVerdict, "needs-attention");
+    assert.ok(result.chainFindingsText.includes("Magic number"));
+    assert.ok(result.chainFindingsText.includes("src/calc.js:7"));
+  });
+
+  it("recovers approve verdict with empty findings", () => {
+    const payload = "```json\n{\n  \"verdict\": \"approve\",\n  \"summary\": \"LGTM\",\n  \"findings\": []\n}\n```";
+    const result = parseReviewResult(payload);
+
+    assert.equal(result.reviewParseable, true);
+    assert.equal(result.chainVerdict, "approve");
+    assert.equal(result.chainFindingsText, "(no structured findings)");
+  });
+
+  // AC4: unparseable review produces distinguishable state
+  it("unparseable review: verdict recovered from token but findings unavailable", () => {
+    const payload = [
+      "Here is some text that is definitely not JSON.",
+      "It doesn't have any structure at all.",
+      "VERDICT: needs-attention",
+    ].join("\n");
+
+    const result = parseReviewResult(payload);
+
+    // AC4: reviewParseable is false, verdict is recovered from token
+    assert.equal(result.reviewParseable, false);
+    assert.equal(result.chainVerdict, "needs-attention");
+    // AC4: findingsText is distinct from "(no structured findings)" — it
+    // explicitly states the review was unparseable
+    assert.equal(result.chainFindingsText, "(review output could not be parsed)");
+    assert.ok(result.chainFindingsText !== "(no structured findings)");
+    assert.equal(result.chainParsedReview, null);
+  });
+
+  it("unparseable review without any token gives 'unparseable' verdict", () => {
+    const payload = "gibberish without any verdict token at all";
+
+    const result = parseReviewResult(payload);
+
+    assert.equal(result.reviewParseable, false);
+    assert.equal(result.chainVerdict, "unparseable");
+    assert.equal(result.chainFindingsText, "(review output could not be parsed)");
+    assert.equal(result.chainParsedReview, null);
+  });
+
+  it("unparseable review is distinguishable from genuine needs-attention", () => {
+    // A genuine needs-attention review is parseable but has that verdict
+    const genuinePayload = "```json\n{\n  \"verdict\": \"needs-attention\",\n  \"summary\": \"Issues found\",\n  \"findings\": [\n    { \"severity\": \"high\", \"title\": \"Bug\", \"file\": \"src/main.js\", \"line_start\": 1 }\n  ]\n}\n```\nVERDICT: needs-attention";
+    const genuine = parseReviewResult(genuinePayload);
+
+    assert.equal(genuine.reviewParseable, true);
+    assert.equal(genuine.chainVerdict, "needs-attention");
+    assert.ok(genuine.chainFindingsText.includes("Bug"));
+
+    // An unparseable review that happened to have VERDICT: needs-attention token
+    const unparseablePayload = "Not JSON at all.\nVERDICT: needs-attention";
+    const unparseable = parseReviewResult(unparseablePayload);
+
+    assert.equal(unparseable.reviewParseable, false);
+    assert.equal(unparseable.chainVerdict, "needs-attention");
+    assert.equal(unparseable.chainFindingsText, "(review output could not be parsed)");
+
+    // The two produce different reviewParseable and different findingsText
+    // despite having the same verdict string.
+  });
+});

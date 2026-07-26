@@ -81,20 +81,27 @@ export const BUILTIN_DEFAULT_CHAIN = [
  * Pure function: select ordered route candidates from the tiered chain.
  *
  * Converts each tier entry (string → single-route tier, array → multi-route
- * tier) to a uniform shape, clamps `round` to the tier count, and returns
- * an ordered list of candidate route strings: remaining routes of the current
- * tier first, then later tiers, skipping routes present in `failedRoutes`.
+ * tier) to a uniform shape, clamps `round` (or explicit `tierIndex`) to the
+ * tier count, and returns an ordered list of candidate route strings:
+ * remaining routes of the current tier first, then later tiers, skipping
+ * routes present in `failedRoutes`.
  * An `explicitModel` (e.g. `--model <entry>`) is prepended when provided
  * and not already failed.
  *
+ * When `tierIndex` is provided it takes precedence over `round` — this is
+ * used by the chain to decouple model tier from the round counter.
+ *
  * @param {object}   opts
  * @param {(string|string[])[]} opts.tiers        — Tiered chain entries.
- * @param {number}             opts.round        — 1-based round number.
+ * @param {number}             [opts.round]       — 1-based round number (used
+ *                                                  when tierIndex is not given).
+ * @param {number}             [opts.tierIndex]   — Explicit 0-based tier index.
+ *                                                  Overrides round when set.
  * @param {string|null}        [opts.explicitModel] — --model flag value.
  * @param {Set<string>}        [opts.failedRoutes]  — Routes already known dead.
  * @returns {string[]} Ordered candidate route strings.
  */
-export function selectRoutes({ tiers, round, explicitModel, failedRoutes }) {
+export function selectRoutes({ tiers, round, tierIndex, explicitModel, failedRoutes }) {
   const failed = failedRoutes ?? new Set();
   // Normalise: string → [string]; array → its own copy.
   const normalized = tiers.map(function (t) {
@@ -102,7 +109,10 @@ export function selectRoutes({ tiers, round, explicitModel, failedRoutes }) {
   });
   if (normalized.length === 0) return [];
 
-  const tierIndex = Math.min(round - 1, normalized.length - 1);
+  // Use explicit tierIndex when given, otherwise derive from round.
+  const effectiveTierIndex = tierIndex !== undefined
+    ? Math.min(tierIndex, normalized.length - 1)
+    : Math.min(round - 1, normalized.length - 1);
 
   /** @type {string[]} */
   const candidates = [];
@@ -113,7 +123,7 @@ export function selectRoutes({ tiers, round, explicitModel, failedRoutes }) {
   }
 
   // Current tier first, then latent tiers.
-  for (let i = tierIndex; i < normalized.length; i++) {
+  for (let i = effectiveTierIndex; i < normalized.length; i++) {
     for (const route of normalized[i]) {
       if (route !== explicitModel && !failed.has(route) && !candidates.includes(route)) {
         candidates.push(route);

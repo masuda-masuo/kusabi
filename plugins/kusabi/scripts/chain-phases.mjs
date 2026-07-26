@@ -24,6 +24,7 @@ import {
   renderReview,
   renderFollowupDraft,
   extractJson,
+  recoverVerdictFromText,
 } from "./render.mjs";
 import {
   hasSectionHeading,
@@ -35,9 +36,9 @@ import {
   checkDeliverablesProbe,
   checkSmokeProbe,
 } from "./probe-decisions.mjs";
-import {
-  resolveResumeMethod,
-} from "./disposition.mjs";
+// resolveResumeMethod was previously imported here but is no longer needed
+// since resolveRoundResume now takes explicit lever flags instead of
+// deriving them from the round number.
 import { writeJson } from "./state-paths.mjs";
 import { dispatchWithFallback } from "./prompt-execution.mjs";
 
@@ -82,22 +83,24 @@ export async function captureBaseSha(callTool, container) {
  * Resolve the resume method for a round, executing checkpoint_restore when
  * a fresh session is required.
  *
+ * Unlike the old implementation which derived session/restore from the round
+ * number, this function receives explicit lever flags from deriveReworkStrategy
+ * so that the three mechanisms (tier, session, artifacts) are independent.
+ *
  * @param {object}   opts
- * @param {number}   opts.round        — 1-based round number
- * @param {boolean}  opts.strategized  — true if a strategize has occurred
- * @param {string|null} opts.baseSha   — base SHA captured at chain start
- * @param {string}   opts.container    — container ID
- * @param {Function} opts.callTool     — sunaba-rpc callTool function
+ * @param {boolean}  opts.useNewSession  — whether to start a new session
+ * @param {boolean}  opts.restoreBase    — whether to restore artifacts from base
+ * @param {string|null} opts.baseSha     — base SHA captured at chain start
+ * @param {string}   opts.container      — container ID
+ * @param {Function} opts.callTool       — sunaba-rpc callTool function
  * @returns {{ resumeMethod: object, useNewSession: boolean }}
  */
-export async function resolveRoundResume({ round, strategized, baseSha, container, callTool }) {
-  const resumeStrategy = resolveResumeMethod({ round, strategized });
-  const useNewSession = resumeStrategy.type === "fresh_session";
+export async function resolveRoundResume({ useNewSession, restoreBase, baseSha, container, callTool }) {
   let resumeMethod;
   if (useNewSession) {
     let restoreOk = false;
     let restoreDetail = null;
-    if (baseSha) {
+    if (restoreBase && baseSha) {
       try {
         await callTool("checkpoint_restore", {
           container_id: container,
@@ -107,11 +110,11 @@ export async function resolveRoundResume({ round, strategized, baseSha, containe
       } catch (restoreErr) {
         restoreDetail = String(restoreErr);
       }
-    } else {
+    } else if (!baseSha) {
       restoreDetail = "baseSha was never recorded at chain start";
     }
     resumeMethod = {
-      type: restoreOk ? "checkpoint_restore" : "checkpoint_restore_failed",
+      type: restoreOk ? "checkpoint_restore" : restoreBase && restoreDetail ? "checkpoint_restore_failed" : "fresh_session",
       base: baseSha,
       detail: restoreDetail,
     };
@@ -146,7 +149,7 @@ export function buildImplementText({ round, brief, previousRecord }) {
  * fields (probes, review, disposition).
  */
 export async function runImplementPhase({
-  cwd, chainId, round, isFirstRound, implementText, modelChain,
+  cwd, chainId, round, isFirstRound, implementText, modelChain, tierIndex,
   useNewSession, session, previousRecord, resumeMethod, flagsModel,
 }) {
   let resolvedSession = session;
@@ -168,6 +171,7 @@ export async function runImplementPhase({
     timeoutS: 3600,
     watchdogS: 900,
     tiers: modelChain,
+    tierIndex, // decoupled from round counter (B1)
     round,
     explicitModel: isFirstRound ? flagsModel : null,
   });
@@ -256,6 +260,47 @@ export async function runProbePhase({ baseSha, container, brief, callTool }) {
   return { probesGreen, probeResults, chainChangedPaths, chainStatusObserved, chainStatusOutput, chainBaseLog, chainDeliverables };
 }
 
+
+export function parseReviewResult(reviewResultText) {
+  // ---- parse review result ----
+  // Part A: handle VERDICT token inside the JSON fence.
+  // First try stripping a trailing VERDICT token, then try extractJson.
+  // If that fails, try recovering the verdict from anywhere in the text
+  // and re-extract JSON after stripping the token from anywhere.
+  const trailingStripped = reviewResultText.replace(/\s*VERDICT:\s*(approve-partial|approve|needs-attention|discard)\s*$/i, "");
+  let parsed = extractJson(trailingStripped);
+
+  if (!parsed) {
+    // The trailing-strip didn't work (token may be inside the fence).
+    // Try recovering the verdict from anywhere in the text.
+    const recovered = recoverVerdictFromText(reviewResultText);
+    if (recovered) {
+      // Strip the token from everywhere and re-parse.
+      // Safety: if the global strip joins lines in a way that breaks JSON,
+      // extractJson returns null and we fall through to unparseable —
+      // no malformed JSON is ever accepted.
+      const anywhereStripped = reviewResultText.replace(/\s*VERDICT:\s*(approve-partial|approve|needs-attention|discard)\s*/gi, "");
+      parsed = extractJson(anywhereStripped);
+    }
+  }
+
+  const reviewParseable = parsed !== null;
+
+  if (reviewParseable) {
+    const chainVerdict = parsed.verdict || "needs-attention";
+    const chainFindingsText = parsed.findings && parsed.findings.length > 0
+      ? parsed.findings.map(function (f) { return "[" + f.severity + "] " + f.title + " (" + f.file + ":" + f.line_start + ")"; }).join("\n")
+      : "(no structured findings)";
+    return { chainParsedReview: parsed, chainVerdict, chainFindingsText, reviewParseable };
+  }
+
+  // A2: unparseable review is recorded as a distinct state
+  const recoveredV = recoverVerdictFromText(reviewResultText);
+  const chainVerdict = recoveredV ? recoveredV.verdict : "unparseable";
+  const chainFindingsText = "(review output could not be parsed)";
+  return { chainParsedReview: null, chainVerdict, chainFindingsText, reviewParseable };
+}
+
 /**
  * Determine whether the review should be skipped (probe-driven discard).
  */
@@ -280,6 +325,7 @@ export async function runReviewPhase({
   if (skipReview) {
     roundRecord.verdict = "discard";
     roundRecord.verdictSource = "probe";
+    roundRecord.reviewParseable = false;
   }
 
   let chainVerdict = roundRecord.verdict; // may already be set by probe skip above
@@ -288,6 +334,7 @@ export async function runReviewPhase({
   let chainRepeatedAreas = false;
   let reviewJobStatus = undefined;
   let reviewJobError = null;
+  let reviewParseable = false;
 
   if (!skipReview) {
     const promptTemplate = fs.readFileSync(path.join(PLUGIN_ROOT, "prompts", "adversarial-review.md"), "utf8");
@@ -340,13 +387,19 @@ export async function runReviewPhase({
     reviewJobError = reviewJob.error || null;
 
     // ---- parse review result ----
-    const stripped = reviewResultText.replace(/\s*VERDICT:\s*(approve-partial|approve|needs-attention|discard)\s*$/i, "");
-    chainParsedReview = extractJson(stripped);
-    chainVerdict = (chainParsedReview && chainParsedReview.verdict) || "needs-attention";
+    const {
+      chainParsedReview: _parsed, chainVerdict: _verdict,
+      chainFindingsText: _findings, reviewParseable: _parseable,
+    } = parseReviewResult(reviewResultText);
+    chainParsedReview = _parsed;
+    chainVerdict = _verdict;
+    chainFindingsText = _findings;
+    reviewParseable = _parseable;
+    roundRecord.reviewParseable = reviewParseable;
     roundRecord.verdict = chainVerdict;
-    chainFindingsText = (chainParsedReview && chainParsedReview.findings)
-      ? chainParsedReview.findings.map(function (f) { return "[" + f.severity + "] " + f.title + " (" + f.file + ":" + f.line_start + ")"; }).join("\n")
-      : "(no structured findings)";
+    if (!reviewParseable) {
+      roundRecord.verdictSource = "recovered-from-token";
+    }
     roundRecord.findingsText = chainFindingsText;
 
     // ---- determine repeated areas ----
@@ -363,7 +416,7 @@ export async function runReviewPhase({
     }
   }
 
-  return { chainVerdict, chainFindingsText, chainParsedReview, chainRepeatedAreas, skipReview, reviewJobStatus, reviewJobError };
+  return { chainVerdict, chainFindingsText, chainParsedReview, chainRepeatedAreas, skipReview, reviewJobStatus, reviewJobError, reviewParseable };
 }
 
 /**
