@@ -36,9 +36,9 @@ import {
   checkDeliverablesProbe,
   checkSmokeProbe,
 } from "./probe-decisions.mjs";
-// resolveResumeMethod was previously imported here but is no longer needed
-// since resolveRoundResume now takes explicit lever flags instead of
-// deriving them from the round number.
+// resolveRoundResume is defined below and is the only resume-resolution
+// mechanism.  checkpoint_restore was removed in issue #114 — the chain
+// never rolls the worktree back.
 import { writeJson } from "./state-paths.mjs";
 import { dispatchWithFallback } from "./prompt-execution.mjs";
 
@@ -80,48 +80,23 @@ export async function captureBaseSha(callTool, container) {
 // =========================================================================
 
 /**
- * Resolve the resume method for a round, executing checkpoint_restore when
- * a fresh session is required.
+ * Resolve the resume method for a round.
  *
- * Unlike the old implementation which derived session/restore from the round
- * number, this function receives explicit lever flags from deriveReworkStrategy
- * so that the three mechanisms (tier, session, artifacts) are independent.
+ * This is now a pure synchronous function.  The chain never rolls the
+ * worktree back (checkpoint_restore was removed in issue #114).
+ * A new session starts fresh on the existing worktree.
  *
- * @param {object}   opts
- * @param {boolean}  opts.useNewSession  — whether to start a new session
- * @param {boolean}  opts.restoreBase    — whether to restore artifacts from base
- * @param {string|null} opts.baseSha     — base SHA captured at chain start
- * @param {string}   opts.container      — container ID
- * @param {Function} opts.callTool       — sunaba-rpc callTool function
- * @returns {{ resumeMethod: object, useNewSession: boolean }}
+ * @param {object}  opts
+ * @param {boolean} opts.useNewSession  — whether to start a new session
+ * @returns {{ resumeMethod: { type: "continue_session"|"fresh_session" }, useNewSession: boolean }}
  */
-export async function resolveRoundResume({ useNewSession, restoreBase, baseSha, container, callTool }) {
-  let resumeMethod;
-  if (useNewSession) {
-    let restoreOk = false;
-    let restoreDetail = null;
-    if (restoreBase && baseSha) {
-      try {
-        await callTool("checkpoint_restore", {
-          container_id: container,
-          sha: baseSha,
-        });
-        restoreOk = true;
-      } catch (restoreErr) {
-        restoreDetail = String(restoreErr);
-      }
-    } else if (!baseSha) {
-      restoreDetail = "baseSha was never recorded at chain start";
-    }
-    resumeMethod = {
-      type: restoreOk ? "checkpoint_restore" : restoreBase && restoreDetail ? "checkpoint_restore_failed" : "fresh_session",
-      base: baseSha,
-      detail: restoreDetail,
-    };
-  } else {
-    resumeMethod = { type: "continue_session" };
-  }
-  return { resumeMethod, useNewSession };
+export function resolveRoundResume({ useNewSession }) {
+  return {
+    resumeMethod: {
+      type: useNewSession ? "fresh_session" : "continue_session",
+    },
+    useNewSession,
+  };
 }
 
 

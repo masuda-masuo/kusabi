@@ -13,6 +13,14 @@ describe("sunaba-rpc allowlist", () => {
     );
   });
 
+  it("throws when removed checkpoint_restore is called", async () => {
+    const { callTool } = await import("./sunaba-rpc.mjs");
+    await assert.rejects(
+      () => callTool("checkpoint_restore", {}),
+      /not in the allowed list/,
+    );
+  });
+
   it("throws for sandbox_exec string commands (must be array)", async () => {
     const { callTool } = await import("./sunaba-rpc.mjs");
     await assert.rejects(
@@ -32,9 +40,9 @@ describe("sunaba-rpc allowlist", () => {
     }
   });
 
-  it("allows all 5 tools in the allowlist", async () => {
+  it("allows all 4 tools in the allowlist", async () => {
     const { callTool } = await import("./sunaba-rpc.mjs");
-    for (const tool of ["verify_in_container", "sandbox_exec", "checkpoint", "checkpoint_list", "checkpoint_restore"]) {
+    for (const tool of ["verify_in_container", "sandbox_exec", "checkpoint", "checkpoint_list"]) {
       try {
         await callTool(tool, {});
       } catch (err) {
@@ -43,13 +51,17 @@ describe("sunaba-rpc allowlist", () => {
     }
   });
 
-  it("exports all convenience wrappers", async () => {
+  it("exports verifyInContainer and sandboxExec convenience wrappers", async () => {
     const mod = await import("./sunaba-rpc.mjs");
     assert.ok(typeof mod.verifyInContainer === "function");
     assert.ok(typeof mod.sandboxExec === "function");
-    assert.ok(typeof mod.checkpoint === "function");
-    assert.ok(typeof mod.checkpointList === "function");
-    assert.ok(typeof mod.checkpointRestore === "function");
+  });
+
+  it("does not export removed convenience wrappers", async () => {
+    const mod = await import("./sunaba-rpc.mjs");
+    assert.equal(mod.checkpoint, undefined);
+    assert.equal(mod.checkpointList, undefined);
+    assert.equal(mod.checkpointRestore, undefined);
   });
 });
 
@@ -110,4 +122,3 @@ describe("sunaba-rpc SSE and unwrap", () => {
     assert.equal(result, "plain string output");
   });
 });
-

@@ -82,8 +82,12 @@ Whichever path is taken, agent definitions remain the receiving end unchanged.
 
 ### 3.4 Retry on failure
 
-**checkpoint_restore + same brief + new session (or model upgrade).**
+**Same brief + new session on the existing worktree (or model upgrade).**
 Structurally prevents anchoring to a failed approach. Measured: Flash, stuck in a rut for 343s, produced a first-pass implementation. With a brief-attached new session, Pro polished it in 173s.
+
+The anchoring break now happens through a fresh session on the existing worktree — the
+chain never rolls the worktree back via `checkpoint_restore`. Artifacts from prior
+rounds are always carried forward.
 
 ### 3.5 Auto-chain (chain subcommand) — implemented
 
@@ -154,32 +158,27 @@ accept-with-followup misuse guards:
 
 #### 3.5.5 Restart method and recording — three-lever separation
 
-Three independent progression mechanisms (budget, model tier, session/artifact lifecycle) are now **separate**. The round number (`1..maxRounds`) is only the budget counter. Model tier escalation and session/artifact decisions are governed by a pure function `deriveReworkStrategy` in `disposition.mjs`:
+Three independent progression mechanisms (budget, model tier, session lifecycle) are now **separate**. The round number (`1..maxRounds`) is only the budget counter. Model tier escalation and session decisions are governed by a pure function `deriveReworkStrategy` in `disposition.mjs`:
 
 **Default ladder** (no countervailing evidence):
 
-| rework | tier  | session  | artifacts |
-|--------|-------|----------|-----------|
-| 1st    | same  | continue | keep      |
-| 2nd    | +1    | new      | keep      |
-| 3rd+   | +1    | new      | keep      |
+| rework | tier  | session  |
+|--------|-------|----------|
+| 1st    | same  | continue |
+| 2nd    | +1    | new      |
+| 3rd+   | +1    | new      |
 
-**checkpoint_restore** fires only when the evidence says the current artifacts are worth less than base. Round number alone must never trigger it. Restore is suppressed when either:
-- the previous round resolved all of the findings it was given, or
-- the previous round's findings were unavailable (unparseable or empty).
-
-The two must be independently selectable: "new session but keep artifacts" is a reachable state.
+Artifacts are always carried over — the chain never rolls the worktree back.
+`checkpoint_restore` has been removed from the chain (issue #114). A new session
+starts fresh on the existing worktree.
 
 Evidence inputs to `deriveReworkStrategy`:
 - `reworkCount` (0-indexed: 0 = first rework)
-- `repeatedAreas` — whether the same files are still being flagged (proxy for "prior findings unresolved")
-- `previousFindingsAvailable` — whether the previous round's review was parseable and non-empty
 - `strategized` — whether a strategize has occurred
 
 The function returns:
 - `tierDelta` — how many tiers to advance (0 = same tier)
 - `newSession` — whether to start a fresh session
-- `restoreBase` — whether to `checkpoint_restore(baseSha)`
 - `reason` — human-readable explanation of the decision
 
 **Review parsing** distinguishes parseable from unparseable output. When a review response is not valid JSON (e.g., the `VERDICT:` token appears inside the JSON fence rather than outside), the companion recovers by:
@@ -209,12 +208,14 @@ The chain now defaults to 4 max rounds (was 3). With the default ladder, rework 
 - **Endpoint**: env `KUSABI_SUNABA_URL`, default `http://127.0.0.1:8750/mcp`. 127.0.0.1 (fixed, avoids IPv6 name resolution issues with localhost)
 - **Protocol**: Streamable HTTP. `initialize` POST → save `mcp-session-id` from response header → `notifications/initialized` → `tools/call`
 - **Response format**: SSE (`data:` lines). The last line's JSON is the result. Auto-unwraps MCP's `content[0].text` wrapper (`unwrapResult`)
-- **Tool allow list (hardcoded)** — only the following 5 tools. Calling anything outside the list throws a pre-call validation error:
+- **Tool allow list (hardcoded)** — only the following 4 tools. Calling anything outside the list throws a pre-call validation error:
   - `verify_in_container`
   - `sandbox_exec`
   - `checkpoint`
   - `checkpoint_list`
-  - `checkpoint_restore`
+
+  `checkpoint_restore` was removed in issue #114 — the chain never rolls the
+  worktree back, so the tool is structurally uncallable from here.
 
 publish / issue_write / sandbox_initialize etc. are **structurally uncallable** (design invariant: network exit is orchestrator-exclusive).
 
@@ -319,7 +320,7 @@ Implemented in `plugins/kusabi/scripts/kusabi-companion.mjs`:
 - `deriveDisposition` accepts an optional `strategizeEligible` boolean. When `needs-attention` + `repeatedAreas` + `strategizeEligible === true`, returns `{ disposition: "strategize", reason: "same file area flagged twice; structural re-diagnosis before next rework" }`. On the second stagnation (strategized=true), escalates as before.
 - `renderStrategistPrompt` is an exported pure function that builds the prompt for the strategist: acceptance criteria + findings from the last two rounds + one-structural-change instruction.
 - On `strategize` disposition, the chain dispatches ONE extra job (kind: "strategist") with agent `kusabi-investigate` and `tools: reviewDenyTools()`. Records `strategistJobId`, `strategistUsage`, and `strategistRecommendation` on the round record.
-- Sets chain-level `strategized: true` persisted in `chain.json`. The next rework round includes the recommendation under `## Strategist recommendation (structural change for this rework)` and starts a FRESH session via checkpoint_restore (anchoring break per §3.4).
+- Sets chain-level `strategized: true` persisted in `chain.json`. The next rework round includes the recommendation under `## Strategist recommendation (structural change for this rework)` and starts a FRESH session on the existing worktree (anchoring break per §3.4 — the conversation is discarded, the work is not).
 - The strategist does not consume its own round number; normal round accounting applies to the rework. The max-rounds hard limit still applies unchanged.
 - `chain-show` renders the strategist round data: model/usage line and the recommendation verbatim.
 

@@ -90,17 +90,11 @@ const REVIEW_DIFF_LIMIT = 200_000;
 
 
 /**
- * Pure function: determine the resume method strategy for a chain round.
- *
- * Round 1 always continues fresh (no prior session).
- * After a strategize intervention, the next rework must use a fresh session
- * (checkpoint_restore) to break anchoring per §3.4.
- * Otherwise: round 2 continues the same session; round 3+ forces fresh.
- *
- * @param {object} opts
- * @param {number}  opts.round       — 1-based round number
- * @param {boolean} opts.strategized — true when a strategize has occurred earlier in the chain
- * @returns {{ type: "continue_session" | "fresh_session" }}
+ * Resume strategy for a chain round: now handled by
+ * resolveRoundResume in chain-phases.mjs which is a pure synchronous
+ * function.  checkpoint_restore was removed in issue #114 — the chain
+ * never rolls the worktree back.  A new session starts fresh on the
+ * existing worktree.
  */
 
 export const PHASE_AGENTS = {
@@ -848,22 +842,20 @@ async function cmdChain(cwd, { flags, text }) {
 
       // ---- phase 1: resume strategy (B2: derive rework levers when rework) ----
       let useNewSession = false;
-      let restoreBase = false;
       let reworkStrategyReason = null;
       let reworkStrategy = null;
 
       if (isFirstRound) {
-        // First round always uses a fresh session (no prior session).
-        useNewSession = false; // no session to continue from, and no restore
+        // First round: no session to continue from.
+        useNewSession = false;
       } else if (previousRecord?.pendingReworkStrategy) {
         // Use the rework strategy computed at the end of the previous round.
         reworkStrategy = previousRecord.pendingReworkStrategy;
         useNewSession = reworkStrategy.newSession;
-        restoreBase = reworkStrategy.restoreBase;
         reworkStrategyReason = reworkStrategy.reason;
       }
 
-      const { resumeMethod } = await resolveRoundResume({ useNewSession, restoreBase, baseSha, container, callTool });
+      const { resumeMethod } = resolveRoundResume({ useNewSession });
 
       // ---- phase 2: round model selection ----
       // Use currentTierIndex (never round) so tier is decoupled from the round counter.
@@ -917,7 +909,7 @@ async function cmdChain(cwd, { flags, text }) {
       // ---- phase 5: review (or skip when change set empty) ----
       const {
         chainVerdict, chainFindingsText, chainParsedReview, chainRepeatedAreas, skipReview,
-        reviewJobStatus, reviewJobError, reviewParseable,
+        reviewJobStatus, reviewJobError,
       } = await runReviewPhase({
         container, brief, modelChain, chainId, cwd, previousRecord, baseSha,
         chainStatusOutput, chainBaseLog, roundRecord,
@@ -984,17 +976,8 @@ async function cmdChain(cwd, { flags, text }) {
       // ---- Compute rework strategy for the NEXT round (if rework needed) ----
       let pendingReworkStrategy = null;
       if (disposition.disposition === "rework") {
-        // Determine whether the previous round's findings were available (B2/B4).
-        // Findings are "available" when the review was parseable and non-empty.
-        const previousFindingsAvailable = reviewParseable &&
-          chainFindingsText != null &&
-          chainFindingsText !== "(no structured findings)" &&
-          chainFindingsText !== "(review output could not be parsed)";
-
         pendingReworkStrategy = deriveReworkStrategy({
           reworkCount,
-          repeatedAreas: chainRepeatedAreas,
-          previousFindingsAvailable,
           strategized,
         });
 
@@ -1057,7 +1040,6 @@ async function cmdChain(cwd, { flags, text }) {
         roundRecord.pendingReworkStrategy = {
           tierDelta: 0,
           newSession: true,
-          restoreBase: false,
           reason: "strategized: new session (anchoring break per §3.4)",
         };
 
