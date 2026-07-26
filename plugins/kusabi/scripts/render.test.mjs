@@ -921,3 +921,131 @@ describe("renderChainShow fallbacks", () => {
     assert.doesNotMatch(result, /fallbacks:/);
   });
 });
+
+// renderBaseFacts diff content — new block-level diff rendering
+// ---------------------------------------------------------------------------
+
+describe("renderBaseFacts diff content", () => {
+  it("renders diff content when diffContent is supplied", () => {
+    const result = renderBaseFacts({
+      baseSha: "abc",
+      baseLog: "log",
+      statusOutput: " M src/foo.js",
+      diffContent: "diff --git a/src/foo.js b/src/foo.js\nindex abc..def 100644\n--- a/src/foo.js\n+++ b/src/foo.js\n@@ -1 +1 @@\n-old\n+new",
+    });
+    assert.match(result, /Diff content:/);
+    assert.match(result, /```diff/);
+    assert.match(result, /diff --git a\/src\/foo.js/);
+    assert.match(result, /\+new/);
+    assert.doesNotMatch(result, /truncated/);
+    assert.doesNotMatch(result, /\(unavailable\)/);
+  });
+
+  it("marks diff as unavailable when diffContent is absent", () => {
+    const result = renderBaseFacts({
+      baseSha: "abc",
+      baseLog: "log",
+      statusOutput: " M src/foo.js",
+    });
+    assert.match(result, /Diff content: \(unavailable\)/);
+  });
+
+  it("marks diff as unavailable when diffContent is empty string", () => {
+    const result = renderBaseFacts({
+      diffContent: "",
+    });
+    assert.match(result, /Diff content: \(unavailable\)/);
+  });
+
+  it("marks diff as unavailable when diffContent is only whitespace", () => {
+    const result = renderBaseFacts({
+      diffContent: "   ",
+    });
+    assert.match(result, /Diff content: \(unavailable\)/);
+  });
+
+  it("marks truncation when diff exceeds the budget", () => {
+    // DIFF_BUDGET is 30000; create content larger than that
+    const bigContent = "diff --git a/x b/x\n" + "x\n".repeat(30000);
+    const result = renderBaseFacts({
+      diffContent: bigContent,
+    });
+    assert.match(result, /Diff content \(truncated to 30000 characters\):/);
+    assert.match(result, /Diff truncated/);
+  });
+
+  it("does not mark truncation when diff is under the budget", () => {
+    const smallContent = "diff --git a/x b/x\n+small change";
+    const result = renderBaseFacts({
+      diffContent: smallContent,
+    });
+    assert.match(result, /Diff content:/);
+    assert.doesNotMatch(result, /truncated/);
+    assert.doesNotMatch(result, /Diff truncated/);
+  });
+
+  it("joins existing fields with diff content", () => {
+    const result = renderBaseFacts({
+      baseSha: "sha1",
+      baseLog: "logline",
+      statusOutput: " M src/bar.js",
+      diffContent: "diff --git a/src/bar.js b/src/bar.js\n+new",
+    });
+    // Existing fields still present
+    assert.match(result, /Base commit: `sha1`/);
+    assert.match(result, /logline/);
+    assert.match(result, /src\/bar\.js/);
+    // Diff present
+    assert.match(result, /Diff content:/);
+    assert.match(result, /\+new/);
+  });
+});
+
+// renderBaseFacts untracked files — new file representation
+// ---------------------------------------------------------------------------
+
+describe("renderBaseFacts untracked files", () => {
+  it("renders untracked files list when untrackedFiles is supplied", () => {
+    const result = renderBaseFacts({
+      untrackedFiles: "newfile.js\nanother/new.ts",
+    });
+    assert.match(result, /New \(untracked\) files:/);
+    assert.match(result, /`newfile\.js`/);
+    assert.match(result, /`another\/new\.ts`/);
+    assert.match(result, /read_file_range/);
+  });
+
+  it("omits untracked section when untrackedFiles is absent", () => {
+    const result = renderBaseFacts({});
+    assert.doesNotMatch(result, /New \(untracked\) files:/);
+  });
+
+  it("omits untracked section when untrackedFiles is empty string", () => {
+    const result = renderBaseFacts({
+      untrackedFiles: "",
+    });
+    assert.doesNotMatch(result, /New \(untracked\) files:/);
+  });
+
+  it("omits untracked section when untrackedFiles is only whitespace", () => {
+    const result = renderBaseFacts({
+      untrackedFiles: "   \n  \n",
+    });
+    assert.doesNotMatch(result, /New \(untracked\) files:/);
+  });
+
+  it("works together with diffContent", () => {
+    const result = renderBaseFacts({
+      baseSha: "abc",
+      baseLog: "log",
+      statusOutput: " M src/foo.js\n?? newfile.ts",
+      diffContent: "diff --git a/src/foo.js b/src/foo.js\n+change",
+      untrackedFiles: "newfile.ts",
+    });
+    assert.match(result, /Diff content:/);
+    assert.match(result, /\+change/);
+    assert.match(result, /New \(untracked\) files:/);
+    assert.match(result, /`newfile\.ts`/);
+    assert.match(result, /read_file_range/);
+  });
+});

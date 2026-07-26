@@ -71,7 +71,7 @@ when: (1) acceptance criteria wording is met but the intent is not, (2) the
 fix would affect more than half of the artifact, (3) the same area of findings
 persists for two consecutive rounds without resolution.
 Every finding must include:
-- the affected file
+- the affected file (as a repository-relative path, e.g. `src/foo.js` not `/workspace/src/foo.js`)
 - `line_start` and `line_end`
 - a confidence score from 0 to 1
 - a concrete recommendation

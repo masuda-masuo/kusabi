@@ -57,7 +57,8 @@
           },
           "file": {
             "type": "string",
-            "minLength": 1
+            "minLength": 1,
+            "description": "Repository-relative path to the affected file, e.g. \"src/foo.js\" not \"/workspace/src/foo.js\""
           },
           "line_start": {
             "type": "integer",

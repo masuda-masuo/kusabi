@@ -14,6 +14,8 @@ import {
   runHeadCleanProbe,
   runVerifyProbe,
   runDeliverablesProbe,
+  runProbePhase,
+  runReviewPhase,
   parseReviewResult,
   normalizeFilePath,
   hasRepeatedAreas,
@@ -1099,6 +1101,79 @@ describe("hasRepeatedAreas", () => {
         [{ file: "src/foo-bar.py" }],
       ),
       false,
+    );
+  });
+});
+
+// runProbePhase diff capture — new diff and untracked fields
+// ---------------------------------------------------------------------------
+
+describe("runProbePhase return value", () => {
+  // runProbePhase takes callTool as a parameter, so the capture is driven with
+  // a stub that answers the two git commands with known output.
+  function captureCallTool({ diff = "", untracked = "", throwOn = null } = {}) {
+    const commands = [];
+    return {
+      commands,
+      callTool: async (toolName, params) => {
+        if (toolName !== "sandbox_exec") return { output: "" };
+        const cmd = params.commands[0];
+        commands.push(cmd);
+        if (throwOn && cmd.startsWith(throwOn)) throw new Error("container is gone");
+        if (cmd === "git diff") return { output: diff };
+        if (cmd.startsWith("git ls-files --others")) return { output: untracked };
+        return { output: "" };
+      },
+    };
+  }
+
+  it("returns the captured diff content and untracked file list", async () => {
+    const diff = "diff --git a/src/a.js b/src/a.js\n@@ -1 +1,2 @@\n+const added = 1;\n";
+    const { commands, callTool } = captureCallTool({ diff, untracked: "src/brand-new.js\n" });
+
+    const result = await runProbePhase({
+      baseSha: "abc1234",
+      container: "fake-cid",
+      brief: "## Deliverables\n\n- `src/a.js`\n",
+      callTool,
+    });
+
+    assert.match(result.chainDiff, /\+const added = 1;/);
+    assert.equal(result.chainUntracked.trim(), "src/brand-new.js");
+    assert.ok(commands.includes("git diff"), "capture must run `git diff`");
+    assert.ok(
+      commands.some((c) => c.startsWith("git ls-files --others")),
+      "capture must list untracked files",
+    );
+  });
+
+  it("leaves both fields empty when the capture call throws", async () => {
+    const { callTool } = captureCallTool({ throwOn: "git diff" });
+
+    const result = await runProbePhase({
+      baseSha: "abc1234",
+      container: "fake-cid",
+      brief: "",
+      callTool,
+    });
+
+    // Degrades rather than throwing: renderBaseFacts then says "(unavailable)".
+    assert.equal(result.chainDiff, "");
+    assert.equal(result.chainUntracked, "");
+  });
+});
+
+// diff_in_container in review input tool list
+// ---------------------------------------------------------------------------
+
+describe("review input tool list", () => {
+  // Source-level guard, not a behavioural test: the tool list is built inline
+  // inside runReviewPhase, and reaching it means dispatching a real review job.
+  // This only catches the line being deleted, which is what it is for.
+  it("names diff_in_container in the review input tool list (source guard)", () => {
+    assert.ok(
+      runReviewPhase.toString().includes("diff_in_container"),
+      "runReviewPhase should offer diff_in_container in the tool list",
     );
   });
 });

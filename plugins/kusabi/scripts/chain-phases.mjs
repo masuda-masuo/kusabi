@@ -299,7 +299,24 @@ export async function runProbePhase({ baseSha, container, brief, callTool }) {
     chainBaseLog = baseLogResult?.output ?? "";
   } catch { /* chainBaseLog stays "" */ }
 
-  return { probesGreen, probeResults, chainChangedPaths, chainStatusObserved, chainStatusOutput, chainBaseLog, chainDeliverables };
+  // Diff content and untracked files for review context (own try/catch)
+  let chainDiff = "";
+  let chainUntracked = "";
+  try {
+    const diffResult = await callTool("sandbox_exec", {
+      container_id: container,
+      commands: ["git diff"],
+    });
+    chainDiff = diffResult?.output ?? "";
+
+    const untrackedResult = await callTool("sandbox_exec", {
+      container_id: container,
+      commands: ["git ls-files --others --exclude-standard"],
+    });
+    chainUntracked = untrackedResult?.output ?? "";
+  } catch { /* chainDiff and chainUntracked stay "" */ }
+
+  return { probesGreen, probeResults, chainChangedPaths, chainStatusObserved, chainStatusOutput, chainBaseLog, chainDeliverables, chainDiff, chainUntracked };
 }
 
 
@@ -358,7 +375,7 @@ export function shouldSkipReview({ chainStatusObserved, chainChangedPaths, chain
  */
 export async function runReviewPhase({
   container, brief, modelChain, chainId, cwd, previousRecord, baseSha,
-  chainStatusOutput, chainBaseLog, roundRecord,
+  chainStatusOutput, chainBaseLog, chainDiff, chainUntracked, roundRecord,
   chainChangedPaths, chainStatusObserved, chainDeliverables, flagsModel,
 }) {
   const skipReview = shouldSkipReview({ chainStatusObserved, chainChangedPaths, chainDeliverables });
@@ -388,11 +405,12 @@ export async function runReviewPhase({
       "You may use the following Sunaba read/verify tools to inspect it:",
       "- `read_file_range` - read file contents from the container",
       "- `search_in_container` - grep/search within the container",
+      "- `diff_in_container` - inspect the actual diff in the container",
       "- `verify_in_container` / `lint_in_container` / `type_check_in_container` - re-run the project's gates in the container",
       "",
       "Do NOT rely on host cwd git state; the actual changes are in the container.",
     ];
-    const baseFactsBlock = renderBaseFacts({ baseSha, baseLog: chainBaseLog, statusOutput: chainStatusOutput });
+    const baseFactsBlock = renderBaseFacts({ baseSha, baseLog: chainBaseLog, statusOutput: chainStatusOutput, diffContent: chainDiff, untrackedFiles: chainUntracked });
     reviewInputParts.push("", baseFactsBlock);
     const reviewInput = reviewInputParts.join("\n");
     const priorFindings = previousRecord?.findingsText || "(none -- first review round)";

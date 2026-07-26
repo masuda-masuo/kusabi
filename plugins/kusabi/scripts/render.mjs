@@ -137,7 +137,9 @@ export function renderReview(parsed, rawText) {
   return lines.join("\n");
 }
 
-export function renderBaseFacts({ baseSha, baseLog, statusOutput } = {}) {
+const DIFF_BUDGET = 30000;
+
+export function renderBaseFacts({ baseSha, baseLog, statusOutput, diffContent, untrackedFiles } = {}) {
   const parts = [];
   parts.push("### Base change-set context (machine-recorded)");
   parts.push("");
@@ -157,6 +159,42 @@ export function renderBaseFacts({ baseSha, baseLog, statusOutput } = {}) {
   parts.push(statusOutput || "(empty change set)");
   parts.push("```");
   parts.push("");
+
+  // Diff content (with character budget)
+  if (diffContent && diffContent.trim()) {
+    const truncated = diffContent.length > DIFF_BUDGET;
+    const content = truncated ? diffContent.slice(0, DIFF_BUDGET) : diffContent;
+    const budgetNote = truncated
+      ? " (truncated to " + DIFF_BUDGET + " characters)"
+      : "";
+    parts.push("Diff content" + budgetNote + ":");
+    parts.push("```diff");
+    parts.push(content);
+    parts.push("```");
+    parts.push("");
+    if (truncated) {
+      parts.push("**Diff truncated.** Use `diff_in_container` to see the full diff.");
+      parts.push("");
+    }
+  } else {
+    parts.push("Diff content: (unavailable)");
+    parts.push("");
+  }
+
+  // Untracked files
+  if (untrackedFiles && untrackedFiles.trim()) {
+    const untrackedList = untrackedFiles.split("\n").filter(function (l) { return l.trim(); }).map(function (l) { return l.trim(); });
+    if (untrackedList.length > 0) {
+      parts.push("New (untracked) files:");
+      for (const f of untrackedList) {
+        parts.push("- `" + f + "`");
+      }
+      parts.push("");
+      parts.push("Use `read_file_range` to inspect these new files.");
+      parts.push("");
+    }
+  }
+
   parts.push("Review ONLY this change set. Code that is already part of the base (see the log above) is NOT scope creep and must not be flagged as such.");
   return parts.join("\n");
 }

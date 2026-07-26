@@ -901,7 +901,7 @@ async function cmdChain(cwd, { flags, text }) {
       // ---- phase 4: deterministic probes (P1–P4) ----
       const {
         probesGreen, probeResults, chainChangedPaths, chainStatusObserved,
-        chainStatusOutput, chainBaseLog, chainDeliverables,
+        chainStatusOutput, chainBaseLog, chainDeliverables, chainDiff, chainUntracked,
       } = await runProbePhase({ baseSha, container, brief, callTool });
       roundRecord.probesGreen = probesGreen;
       roundRecord.probeResults = probeResults;
@@ -912,7 +912,7 @@ async function cmdChain(cwd, { flags, text }) {
         reviewJobStatus, reviewJobError,
       } = await runReviewPhase({
         container, brief, modelChain, chainId, cwd, previousRecord, baseSha,
-        chainStatusOutput, chainBaseLog, roundRecord,
+        chainStatusOutput, chainBaseLog, chainDiff, chainUntracked, roundRecord,
         chainChangedPaths, chainStatusObserved, chainDeliverables,
         flagsModel: flags.model,
       });
