@@ -1,5 +1,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
+import process from "node:process";
 import {
   shouldReapServer,
 } from "./serve-lifecycle.mjs";
@@ -141,3 +143,81 @@ describe("shouldReapServer", () => {
   });
 });
 
+// judgeServeDeath — liveness decision for serve process
+// ---------------------------------------------------------------------------
+
+import { judgeServeDeath } from "./serve-lifecycle.mjs";
+
+describe("judgeServeDeath", () => {
+  it("null pid is not dead (no pid to check)", () => {
+    const result = judgeServeDeath(null);
+    assert.equal(result.dead, false);
+    assert.equal(result.reason, null);
+  });
+
+  it("undefined pid is not dead", () => {
+    const result = judgeServeDeath(undefined);
+    assert.equal(result.dead, false);
+    assert.equal(result.reason, null);
+  });
+
+  it("our own process is alive → not dead", () => {
+    const result = judgeServeDeath(process.pid);
+    assert.equal(result.dead, false);
+    assert.equal(result.reason, null);
+  });
+
+  it("non-existent pid is dead", () => {
+    // 2**31-1 is the maximum pid_t value on Linux — any number in this
+    // range that is > pid_max is guaranteed to throw ESRCH.
+    const result = judgeServeDeath(2_147_483_647);
+    assert.equal(result.dead, true);
+    assert.ok(result.reason.includes("2147483647"));
+    assert.ok(result.reason.includes("not found"));
+  });
+
+  it("a real child process flips from alive to dead when it exits", async () => {
+    // The constant-pid tests above never exercise the transition this function
+    // exists to observe.  Spawn a real process, confirm it reads as alive,
+    // kill it, and confirm the same pid then reads as dead.  No opencode and
+    // no container involved.
+    const child = spawn(process.execPath, ["-e", "setTimeout(() => {}, 60000)"], {
+      stdio: "ignore",
+    });
+    try {
+      const exited = new Promise((resolve) => child.once("exit", resolve));
+
+      const whileAlive = judgeServeDeath(child.pid);
+      assert.equal(whileAlive.dead, false, "a running child must not read as dead");
+
+      child.kill("SIGKILL");
+      await exited;
+
+      const afterExit = judgeServeDeath(child.pid);
+      assert.equal(afterExit.dead, true, "an exited child must read as dead");
+      assert.ok(afterExit.reason.includes(String(child.pid)));
+      assert.ok(afterExit.reason.includes("ESRCH"));
+    } finally {
+      try { child.kill("SIGKILL"); } catch { /* already gone */ }
+    }
+  });
+
+  it("EPERM is treated as alive — only ESRCH means dead", () => {
+    // EPERM (process exists, we may not signal it) cannot be forced portably
+    // in-process, so drive the branch directly with a stubbed thrower rather
+    // than asserting it by reading the source.
+    const realKill = process.kill;
+    process.kill = () => {
+      const err = new Error("operation not permitted");
+      err.code = "EPERM";
+      throw err;
+    };
+    try {
+      const result = judgeServeDeath(4242);
+      assert.equal(result.dead, false, "EPERM means the process exists");
+      assert.equal(result.reason, null);
+    } finally {
+      process.kill = realKill;
+    }
+  });
+});

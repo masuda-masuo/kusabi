@@ -118,7 +118,7 @@ A trailing colon (`p/a:`) or missing `/` are fatal parse errors.
 
 ### Resolution precedence (highest to lowest)
 
-1. **Explicit `--model` flag** — always wins when provided.
+1. **Explicit `--model` flag** — wins for the phases it applies to: a single `task` dispatch, a chain's round-1 implement, and every chain review. A chain's rework rounds follow the tier ladder instead (see "Chain round escalation" below).
 2. **Per-phase chain** — `models.phases.<phase>` first entry (e.g. a config with `"implement": ["m1"]` resolves to `m1` for implement-phase tasks).
 3. **Global chain** — `models.chain` first entry, or the built-in default chain when no config file exists.
 4. **Built-in default** — `opencode/deepseek-v4-flash-free` when no config file and no flag is set.
@@ -129,21 +129,30 @@ The full resolved chain is stored on every job record (`job.modelChain`) for use
 
 ### Chain round escalation
 
-When the `chain` subcommand reworks after a needs-attention review, each
-subsequent implement round escalates by moving down the model chain:
+The round number is only the budget counter — it does **not** index into the
+model chain. Model tier and session lifecycle are separate levers, decided by
+`deriveReworkStrategy` (`docs/DESIGN.md` §3.5.5).
 
-| Round | Entry selected |
-|---|---|
-| 1 | `--model` flag (if provided), otherwise chain[0] |
-| 2 | chain[1] (or last entry if chain has only 1 element) |
-| 3 | chain[2] (or last entry if shorter) |
-| N | chain[N-1], clamped to the last entry |
+`models.chain` is a list of **tiers**. Each tier holds interchangeable routes of
+the same quality, tried in order when one is unavailable — that is capacity
+fallback, and it does not consume a round.
 
-Rounds beyond the end of the chain keep using the last entry.
+Default ladder, absent countervailing evidence:
 
-The review phase always uses the same model as round 1 (the model resolved
-from `--model` or the first chain entry); escalation applies only to the
-implementer role.
+| Rework | Tier | Session |
+|---|---|---|
+| 1st | same | continue |
+| 2nd | +1 | new |
+| 3rd+ | +1 | new |
+
+So with a two-tier chain, rounds 1 and 2 both run on tier 0 and the second tier
+is first reached at **round 3**.
+
+**`--model` does not raise the chain.** It applies to round 1's implement phase
+only — reworks return to the ladder — and to the review phase of *every* round,
+which then stays on that model instead of tier 0. Passing a top-tier model is
+therefore a decision to pay for every review in the chain, not a way to start
+the implementer higher for the whole run.
 
 If a chain entry carries a `:variant` suffix (e.g. `:max`), the `variant`
 field is included in the `prompt_async` request for that round and stored
