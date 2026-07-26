@@ -28,13 +28,13 @@ export function parseArgs(argv) {
     } else if (
       arg === "--auto" || arg === "--read-only" || arg === "--resume-last" ||
       arg === "--wait" || arg === "--background" || arg === "--keep-serve" || arg === "--help" || arg === "-h" ||
-      arg === "--tools" || arg === "--force"
+      arg === "--tools" || arg === "--force" || arg === "--dry-run"
     ) {
       const key = arg.startsWith("--")
         ? arg.slice(2).replace(/-([a-z])/g, (_, c) => c.toUpperCase())
         : arg.slice(1);
       flags[key] = true;
-    } else if (arg === "--base" || arg === "--model" || arg === "--agent" || arg === "--session" || arg === "--timeout" || arg === "--deny" || arg === "--watchdog" || arg === "--phase" || arg === "--container" || arg === "--prior" || arg === "--max-rounds" || arg === "--brief-file" || arg === "--last" || arg === "--quote" || arg === "--since" || arg === "--until" || arg === "--compare") {
+    } else if (arg === "--base" || arg === "--model" || arg === "--agent" || arg === "--session" || arg === "--timeout" || arg === "--deny" || arg === "--watchdog" || arg === "--phase" || arg === "--container" || arg === "--prior" || arg === "--max-rounds" || arg === "--brief-file" || arg === "--last" || arg === "--quote" || arg === "--since" || arg === "--until" || arg === "--compare" || arg === "--transcript-dir" || arg === "--state-root" || arg === "--db") {
       const flagName = arg.slice(2);
       const val = argv[++i];
       if (val === undefined || (typeof val === "string" && val.startsWith("--"))) {

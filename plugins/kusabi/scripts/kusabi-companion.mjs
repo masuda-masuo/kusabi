@@ -35,6 +35,9 @@ import {
 import { jobDir, saveJob, loadJob, listJobs, latestJob } from "./job-store.mjs";
 import { opencodeBin, serverHealthy, ensureServer, reapIdleServes, api } from "./serve-lifecycle.mjs";
 import { runPrompt, dispatchWithFallback, resetFailedRoutes } from "./prompt-execution.mjs";
+import { openMetricsDb } from "./metrics-db.mjs";
+import { ingestTranscriptDirectory } from "./transcript-ingest.mjs";
+import { ingestChainDirectory } from "./chain-ingest.mjs";
 
 // Chain round-phases module — imported here for cmdChain.
 // Probe functions are imported separately below with local bindings so
@@ -1396,6 +1399,82 @@ function cmdChainStats(cwd, { flags }) {
 }
 
 // ---------------------------------------------------------------------------
+// metrics-ingest
+// ---------------------------------------------------------------------------
+
+/**
+ * Ingest Claude Code transcripts and kusabi chain records into a durable
+ * SQLite metrics store.  This is the ingest + store step only (issues #83 /
+ * #81) -- no reporting/rendering here; that is a follow-up PR.
+ *
+ * `--dry-run` parses everything but writes to a throwaway in-memory
+ * database instead of the real one, so the target db path (and any file at
+ * it) is never touched -- not "parse and roll back", but "never opened".
+ */
+function cmdMetricsIngest(cwd, { flags }) {
+  const home = os.homedir();
+  const transcriptDir = flags["transcript-dir"] || path.join(home, ".claude", "projects");
+  const metricsStateRoot = flags["state-root"] || stateRoot();
+  const dryRun = !!flags.dryRun;
+  const dbPath = dryRun ? ":memory:" : (flags.db || path.join(metricsStateRoot, "metrics.db"));
+
+  const db = openMetricsDb(dbPath);
+
+  let transcriptSummary;
+  let chainSummary;
+  db.exec("BEGIN");
+  try {
+    transcriptSummary = ingestTranscriptDirectory(db, transcriptDir);
+    chainSummary = ingestChainDirectory(db, metricsStateRoot);
+    db.exec("COMMIT");
+  } catch (err) {
+    db.exec("ROLLBACK");
+    throw err;
+  }
+
+  const lines = [];
+  lines.push(`Metrics ingest${dryRun ? " (dry run — nothing written)" : ""}`);
+  lines.push(`  db: ${dryRun ? "(discarded, in-memory)" : dbPath}`);
+  lines.push("");
+  lines.push("Transcripts:");
+  lines.push(`  transcript dir:            ${transcriptDir}`);
+  lines.push(`  files scanned:             ${transcriptSummary.filesScanned}`);
+  lines.push(`  files skipped (unchanged): ${transcriptSummary.filesSkippedUnchanged}`);
+  lines.push(`  sessions:                  ${transcriptSummary.sessions}`);
+  lines.push(`  turns (deduped by requestId, across all files): ${transcriptSummary.turns}`);
+  lines.push(`  assistant records seen:    ${transcriptSummary.assistantRecords}`);
+  lines.push(`  <synthetic> records:       ${transcriptSummary.syntheticRecords}`);
+  // Three distinct, non-overlapping-except-as-noted counters -- deliberately
+  // not folded into one "failures" number (see transcript-ingest.mjs):
+  //  - ioFailures: a whole FILE unreadable (one increment == one file's
+  //    worth of records entirely absent from this run).
+  //  - parseFailures: a malformed JSON line/record within a file that WAS
+  //    read successfully.
+  //  - records skipped (no requestId): not a failure at all -- typically
+  //    <synthetic> placeholders that were never assigned one, so they
+  //    overlap with the <synthetic> count above rather than adding to it.
+  lines.push(`  I/O failures (whole file unreadable): ${transcriptSummary.ioFailures}`);
+  lines.push(`  parse failures (malformed JSON):       ${transcriptSummary.parseFailures}`);
+  lines.push(`  records skipped (no requestId):        ${transcriptSummary.noRequestIdRecords} (overlaps with <synthetic> above, not additional data loss)`);
+  lines.push("");
+  lines.push("Chains:");
+  lines.push(`  state root:                ${metricsStateRoot}`);
+  lines.push(`  files scanned:             ${chainSummary.filesScanned}`);
+  lines.push(`  files skipped (unchanged): ${chainSummary.filesSkippedUnchanged}`);
+  lines.push(`  I/O failures (whole file unreadable): ${chainSummary.ioFailures}`);
+  lines.push(`  parse failures (malformed JSON / no chainId): ${chainSummary.parseFailures}`);
+  lines.push(`  chains:                    ${chainSummary.chainsIngested}`);
+  lines.push(`  rounds:                    ${chainSummary.roundsIngested}`);
+  lines.push(`  findings:                  ${chainSummary.findingsIngested}`);
+  // Raw count, not a rate: generational gaps mean this is a coverage figure,
+  // not something to divide into a percentage here -- the follow-up
+  // query/report PR decides how (or whether) to qualify a rate over it.
+  lines.push(`  chains with structured findings (non-empty findings/findingFiles): ${chainSummary.chainsWithStructuredFindings} of ${chainSummary.chainsIngested}`);
+
+  return lines.join("\n");
+}
+
+// ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
 
@@ -1410,6 +1489,7 @@ function usage() {
     "  chain      Run implement→review→rework chain until acceptance or escalate",
     "  chain-show Print a compact plain-text digest of a chain (read-only, no LLM)",
     "  chain-stats Aggregate every chain record and print a summary (read-only, no LLM)",
+    "  metrics-ingest  Ingest transcripts + chain records into a durable SQLite store (read-only source, no LLM)",
     "  chain-cancel  Request a running chain to stop (file-based, works across processes)",
     "  status     List recent jobs or show one by ID",
     "  result     Show completed job result (latest, or by ID)",
@@ -1436,6 +1516,10 @@ function usage() {
     "  --since <ISO> (chain-stats: start of time range, inclusive)",
     "  --until <ISO> (chain-stats: end of time range, exclusive)",
     "  --compare <ISO> (chain-stats: show before/after comparison at cutoff)",
+    "  --transcript-dir <path> (metrics-ingest: default ~/.claude/projects)",
+    "  --state-root <path> (metrics-ingest: default the kusabi state root, ~/.kusabi)",
+    "  --db <path> (metrics-ingest: default <state-root>/metrics.db)",
+    "  --dry-run (metrics-ingest: parse and report counts, write nothing)",
     "  -h, --help",
     "",
     "Unknown flags cause an error. Use -- to treat subsequent tokens as literal text.",
@@ -1507,10 +1591,13 @@ async function main() {
     case "chain-stats":
     case "chainStats":
       return cmdChainStats(cwd, parsed);
+    case "metrics-ingest":
+    case "metricsIngest":
+      return cmdMetricsIngest(cwd, parsed);
     case "explain":
       return cmdExplain(cwd, parsed);
     default:
-      throw new Error(`unknown subcommand: ${subcommand ?? "(none)"}. Use setup|task|review|chain|chain-show|chain-stats|chain-cancel|status|result|cancel|serve-stop|install-agents|salvage|explain`);
+      throw new Error(`unknown subcommand: ${subcommand ?? "(none)"}. Use setup|task|review|chain|chain-show|chain-stats|metrics-ingest|chain-cancel|status|result|cancel|serve-stop|install-agents|salvage|explain`);
   }
 }
 
