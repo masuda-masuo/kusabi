@@ -114,7 +114,28 @@ describe("collectChainRecords", () => {
 
   it("returns empty when no chains directory exists", () => {
     const result = collectChainRecords(tmpDir);
-    assert.deepEqual(result, { chains: [], skipped: 0 });
+    assert.deepEqual(result, { chains: [], skipped: 0, noRecord: 0 });
+  });
+
+  it("counts a chain dir with no chain.json separately from corruption", () => {
+    // A chain that died before persisting is not a corrupt record, and
+    // conflating the two hides the runs that crashed.
+    const chainsDir = path.join(tmpDir, "chains");
+    fs.mkdirSync(path.join(chainsDir, "chain-never-wrote"), { recursive: true });
+    fs.mkdirSync(path.join(chainsDir, "chain-corrupt"), { recursive: true });
+    fs.mkdirSync(path.join(chainsDir, "chain-ok"), { recursive: true });
+
+    fs.writeFileSync(path.join(chainsDir, "chain-corrupt", "chain.json"), "{ not json", "utf8");
+    fs.writeFileSync(
+      path.join(chainsDir, "chain-ok", "chain.json"),
+      JSON.stringify({ chainId: "chain-ok", records: [] }),
+      "utf8",
+    );
+
+    const result = collectChainRecords(tmpDir);
+    assert.equal(result.chains.length, 1);
+    assert.equal(result.skipped, 1, "corrupt json counts as skipped");
+    assert.equal(result.noRecord, 1, "missing chain.json counts as noRecord");
   });
 
   it("reads chain.json records from each chain dir", () => {
@@ -366,6 +387,38 @@ describe("computeStats", () => {
     assert.ok(rendered.includes("Before"));
     assert.ok(rendered.includes("After"));
     assert.ok(rendered.includes("Cutoff"));
+  });
+
+  it("comparison reports 'no data' when every eligible pair lacks findingFiles", () => {
+    // Regression: the comparison view printed "0/11" in this case, which reads
+    // as "the detector never fired" rather than "nothing was measurable".
+    const chains = [
+      chain({
+        chainId: "old",
+        rounds: [
+          round({ round: 1, startedAt: "2026-01-01T00:00:00.000Z", verdict: "needs-attention", disposition: "rework" }),
+          round({ round: 2, startedAt: "2026-01-02T00:00:00.000Z", verdict: "needs-attention", disposition: "rework" }),
+        ],
+      }),
+    ];
+    for (const r of chains[0].rounds) {
+      delete r.findingFiles;
+      delete r.findings;
+    }
+
+    const cutoff = "2026-06-01T00:00:00.000Z";
+    const beforeStats = computeStats(chains, { until: cutoff });
+    const afterStats = computeStats(chains, { since: cutoff });
+
+    assert.ok(beforeStats.eligiblePairs > 0, "the fixture must produce an eligible pair");
+    assert.equal(beforeStats.repeatedNA, beforeStats.eligiblePairs, "every pair must be undecidable");
+
+    const rendered = renderComparison(beforeStats, afterStats, cutoff);
+    assert.ok(rendered.includes("no data"), "undecidable pairs must render as 'no data'");
+    assert.ok(
+      !/repeatedAreas true\s+0\/\d/.test(rendered),
+      "must not print a 0/N rate over undecidable pairs",
+    );
   });
 
   it("chainCount is zero when no chains have rounds in the time-filtered range", () => {
