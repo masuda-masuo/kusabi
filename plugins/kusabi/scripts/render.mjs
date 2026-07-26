@@ -431,6 +431,16 @@ export function renderChainShow(chain, rounds, unreadable = [], control = null) 
       lines.push(`  disposition: ${disp}${reason}`);
     }
 
+    // Worktree change status (baseline-aware)
+    // null and undefined both mean "unknown" — null happens when the per-round
+    // capture failed; undefined means the record predates the baseline feature.
+    if (round.worktreeChanged === undefined || round.worktreeChanged === null) {
+      lines.push(`  changed: unknown`);
+    } else {
+      const wc = round.worktreeChanged ? "yes" : "NO";
+      lines.push(`  changed: ${wc}`);
+    }
+
     // Tier info (B8: which levers were pulled)
     if (round.tierBefore !== undefined) {
       const tierAfter = round.tierAfter !== undefined ? round.tierAfter : round.tierBefore;

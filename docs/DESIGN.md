@@ -111,10 +111,60 @@ Direct container inspection via sunaba-rpc (§3.6). Does not involve the LLM:
 |---|---|---|
 | **P1: HEAD clean** | Record baseSha via `git rev-parse HEAD` at chain start. After implement, if HEAD≠base, auto-execute `git reset --mixed <base>` | Auto-fix (empirical: even when the brief explicitly prohibited it, it happened 2 out of 3 times). Record in metadata |
 | **P2: verify gate** | Run `verify_in_container` (no skip flags at all) | If gate_passed=false, skip review, turn results into findings, and rework (consumes a round) |
-| **P3: deliverables** | Parse `## Deliverables` section from the brief; check that at least one declared path appears in the change set (`git status --porcelain`). | Empty change set **and** a non-empty `## Deliverables` section (both conditions required by `shouldSkipReview` in `chain-phases.mjs`) → review job NOT dispatched, round verdict set to `discard` with `verdictSource: "probe"` (follows the existing discard→escalate path). When no `## Deliverables` section is declared, an empty change set still goes to review — with nothing declared there is no mechanical basis for calling an empty change set a failure, so the reviewer decides. Deliverables declared but no match → P3 fails but review still runs; `deriveDisposition` handles the rest. No `## Deliverables` section → probe trivially passes. **Heading present but zero entries parsed → P3 fails** (author is told to fix brief syntax rather than believing the check ran). |
+| **P3: deliverables** | Parse `## Deliverables` section from the brief; check that at least one declared path appears in the paths the *current round* actually changed (content-sensitive baseline comparison, not `git status --porcelain`). See "Worktree baseline" below. | Empty change set **and** a non-empty `## Deliverables` section (both conditions required by `shouldSkipReview` in `chain-phases.mjs`) → review job NOT dispatched, round verdict set to `discard` with `verdictSource: "probe"` (follows the existing discard→escalate path). When no `## Deliverables` section is declared, an empty change set still goes to review — with nothing declared there is no mechanical basis for calling an empty change set a failure, so the reviewer decides. Deliverables declared but no match → P3 fails but review still runs; `deriveDisposition` handles the rest. No `## Deliverables` section → probe trivially passes. **Heading present but zero entries parsed → P3 fails** (author is told to fix brief syntax rather than believing the check ran). |
 | **P4: smoke** | Parse `## Smoke` section from the brief (accepted syntaxes: unordered/ordered bullets with backtick-quoted command + optional `exit <N>` annotation, or fenced code block with one command per line/exit 0). Each declared command is executed inside the container via `sandbox_exec`; the command's stdout/stderr is redirected to a file so that the exit-code marker (`; echo SMOKE_EXIT=$?`) is the only text returned by `sandbox_exec` and is never subject to pagination truncation. The captured output file is available for diagnostic excerpts on failure (timeout: 300s). | Any entry whose observed exit code does not match the declared expected exit (or times out / cannot be executed) → P4 fails. An exit code that cannot be observed (marker absent from `sandbox_exec` return text) is reported distinctly from a command mismatch — the probe still fails but the wording says "could not be observed" rather than "observed exit unknown". A timeout arrives as data (`status: "timeout"`, `exit_code: 124`) rather than as a raised error, and is detected as such: a timeout is an outcome of the command, so it must not be reported as the probe failing to observe. No `## Smoke` section → probe trivially passes. **Heading present but zero entries parsed → P4 fails** (author is told to fix brief syntax rather than believing the check ran). |
 
 The same probes (P1–P4) also run for single `task --container <cid>` invocations, storing results on the job record and appending a probe summary to the task output.
+
+##### Worktree baseline
+
+A chain started on a dirty worktree (for example, on the second round of a
+multi-round chain) must not pass the deliverables probe on the strength of
+dirt that predates it.  To distinguish "this round changed something" from
+"the tree was already dirty" the chain records a content-sensitive baseline
+at chain start and measures each round against it.
+
+**Recording.**  At chain start (`captureBaseSha`), `captureWorktreeState` in
+`worktree-baseline.mjs` creates a temporary Git index (`GIT_INDEX_FILE`
+pointing at a scratch file) and runs `git write-tree` to produce a tree hash
+that covers the entire worktree — tracked files, modified tracked files, and
+untracked files alike.  The real index is never touched.  The manifest
+(`treeHash` + per-file content SHA map) is the baseline.
+
+**Per-round comparison.**  At each round’s probe phase, `runDeliverablesProbe`
+captures the worktree state again and calls `computeNewlyChanged` to produce
+the set of paths whose content hash differs from the baseline.  Only those
+paths are fed to `checkDeliverablesSinceBaseline`; paths that were already
+dirty at chain start are invisible to the probe unless the round modified
+them further.  The overall changed-nothing flag (`worktreeChanged`) is
+recorded on the round record and surfaced in every chain output (escalation,
+max-rounds, chain-show).
+
+**Content-sensitive, not path-sensitive.**  A round that modifies an
+already-dirty file is detected because the file’s content hash changes.  A
+round that leaves every file alone (even though paths registered as dirty at
+chain start) is correctly reported as having changed nothing.
+
+**Old records.**  Chain directories recorded before this change have no
+baseline.  Their round records lack the `worktreeChanged` field, which
+`renderChainShow` and the outcome renderers display as `changed: unknown`
+rather than incorrectly claiming nothing changed.
+
+**No worktree mutation.**  The measurement uses a temporary index file and
+`GIT_INDEX_FILE`; `git add -A` modifies only the scratch copy.  After the
+probe, `git status --porcelain` reports exactly what it did before, and HEAD
+has not moved.  `git add` does write blob objects and `write-tree` a tree
+object into the object store; they are unreferenced and `git gc` collects
+them.  The guarantee is that nothing the orchestrator would publish changes —
+not that the command writes nothing at all.
+
+**Unknown is not "unchanged".**  When no baseline exists (old chains) or a
+per-round capture fails, the comparison yields `null`, and every consumer
+falls back to the full `git status --porcelain` set — the behaviour that
+predates baselines.  It must never collapse to `[]`: an empty array asserts
+that the round changed nothing, and `shouldSkipReview` discards a round on
+that, so a failed measurement would throw away work that was actually done.
+
 
 #### 3.5.3 Review
 

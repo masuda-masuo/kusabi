@@ -178,3 +178,64 @@ export function fakeCallToolForP3({ statusOutput = "" } = {}) {
     return { output: "" };
   };
 }
+
+
+/**
+ * Build a fake callTool for testing runDeliverablesProbe with a baseline.
+ *
+ * Stubs both `git status --porcelain` and the `captureWorktreeState` shell
+ * command (detected by the "TMPIDX=" pattern).  The fake manifest content is
+ * driven by the `currentManifest` parameter so the test can control whether
+ * newlyChanged paths are found or not.
+ *
+ * @param {object}   opts
+ * @param {string}   [opts.statusOutput=""]         — Output from git status --porcelain.
+ * @param {object}   [opts.currentManifest=null]     — The current-state manifest to
+ *        return on capture.  When null, the call returns a string that makes
+ *        captureWorktreeState return null (simulating a capture failure).
+ * @returns {Function}
+ */
+export function fakeCallToolForP3WithBaseline({
+  statusOutput = "",
+  currentManifest = null,
+} = {}) {
+  const captureOutput = currentManifest
+    ? buildCaptureOutput(currentManifest)
+    : "ERROR_NO_INDEX\n";
+
+  return async (toolName, params) => {
+    if (toolName !== "sandbox_exec") return { output: "" };
+    const cmd = params.commands[0];
+
+    if (cmd === "git status --porcelain") {
+      return { output: statusOutput };
+    }
+
+    if (cmd.startsWith("cd /workspace &&") && cmd.includes("TMPIDX=")) {
+      return { output: captureOutput };
+    }
+
+    return { output: "" };
+  };
+}
+
+/**
+ * Format a manifest object into the text output that captureWorktreeState
+ * parses from the sandbox_exec stdout.
+ *
+ * @param {{ treeHash: string, files: Record<string,string> }} manifest
+ * @returns {string}
+ */
+export function buildCaptureOutput(manifest) {
+  if (!manifest) return "";
+  const lines = [];
+  lines.push("TREE_HASH=" + manifest.treeHash);
+  if (manifest.files) {
+    const entries = Object.entries(manifest.files);
+    entries.sort(function (a, b) { return a[0].localeCompare(b[0]); });
+    for (const [filePath, hash] of entries) {
+      lines.push(hash + "|" + filePath);
+    }
+  }
+  return lines.join("\n");
+}

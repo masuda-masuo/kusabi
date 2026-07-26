@@ -34,7 +34,6 @@ import {
   parseChangedPaths,
 } from "./brief-parsing.mjs";
 import {
-  checkDeliverablesProbe,
   checkSmokeProbe,
 } from "./probe-decisions.mjs";
 // resolveRoundResume is defined below and is the only resume-resolution
@@ -42,6 +41,12 @@ import {
 // never rolls the worktree back.
 import { writeJson } from "./state-paths.mjs";
 import { dispatchWithFallback } from "./prompt-execution.mjs";
+import {
+  captureWorktreeState,
+  computeNewlyChanged,
+  resolveWorktreeChanged,
+  checkDeliverablesSinceBaseline,
+} from "./worktree-baseline.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const PLUGIN_ROOT = path.resolve(HERE, "..");
@@ -249,11 +254,13 @@ export async function runImplementPhase({
  *
  * Returns probe results and side data needed by the review phase.
  */
-export async function runProbePhase({ baseSha, container, brief, callTool }) {
+export async function runProbePhase({ baseSha, container, brief, callTool, worktreeBaseline }) {
   const chainDeliverables = parseDeliverables(brief);
   let probesGreen = false;
   const probeResults = [];
   let chainChangedPaths = [];
+  let chainNewlyChanged = [];
+  let worktreeChanged = null;
   let chainStatusObserved = false;
   let chainStatusOutput = "";
   let chainBaseLog = "";
@@ -270,8 +277,17 @@ export async function runProbePhase({ baseSha, container, brief, callTool }) {
       headingPresent: hasSectionHeading(brief, "Deliverables"),
       callTool,
       container,
+      baseline: worktreeBaseline,
     });
     chainChangedPaths = p3Result.changedPaths;
+    // `newlyChangedPaths` is null when the comparison could not be made — the
+    // chain-start baseline is missing, or this round's capture failed.  Either
+    // way the answer is "unknown", and unknown must not be read as "nothing
+    // changed": that would discard a round because the measurement broke.  Fall
+    // back to the full changed set, which is what the probe used before
+    // baselines existed.
+    chainNewlyChanged = p3Result.newlyChangedPaths ?? chainChangedPaths;
+    worktreeChanged = p3Result.worktreeChanged;
     chainStatusOutput = p3Result.statusOutput;
     chainStatusObserved = true;
     probeResults.push(p3Result);
@@ -318,7 +334,7 @@ export async function runProbePhase({ baseSha, container, brief, callTool }) {
     chainUntracked = untrackedResult?.output ?? "";
   } catch { /* chainDiff and chainUntracked stay "" */ }
 
-  return { probesGreen, probeResults, chainChangedPaths, chainStatusObserved, chainStatusOutput, chainBaseLog, chainDeliverables, chainDiff, chainUntracked };
+  return { probesGreen, probeResults, chainChangedPaths, chainNewlyChanged, chainStatusObserved, chainStatusOutput, chainBaseLog, chainDeliverables, chainDiff, chainUntracked, worktreeChanged };
 }
 
 
@@ -365,8 +381,12 @@ export function parseReviewResult(reviewResultText) {
 /**
  * Determine whether the review should be skipped (probe-driven discard).
  */
-export function shouldSkipReview({ chainStatusObserved, chainChangedPaths, chainDeliverables }) {
-  return chainStatusObserved && chainChangedPaths.length === 0 && chainDeliverables.length > 0;
+export function shouldSkipReview({ chainStatusObserved, chainChangedPaths, chainNewlyChanged, chainDeliverables }) {
+  // Null means the since-baseline comparison could not be made.  Fall back to
+  // the full changed set rather than treating "unknown" as "nothing changed" —
+  // skipping review here turns a failed measurement into a discarded round.
+  const effectivePaths = chainNewlyChanged ?? chainChangedPaths;
+  return chainStatusObserved && effectivePaths.length === 0 && chainDeliverables.length > 0;
 }
 
 /**
@@ -378,10 +398,10 @@ export function shouldSkipReview({ chainStatusObserved, chainChangedPaths, chain
 export async function runReviewPhase({
   container, brief, modelChain, chainId, cwd, previousRecord, baseSha,
   chainStatusOutput, chainBaseLog, chainDiff, chainUntracked, roundRecord,
-  chainChangedPaths, chainStatusObserved, chainDeliverables, flagsModel,
+  chainChangedPaths, chainNewlyChanged, chainStatusObserved, chainDeliverables, flagsModel,
   _dispatchWithFallback: _dispatch = dispatchWithFallback,
 } = {}) {
-  const skipReview = shouldSkipReview({ chainStatusObserved, chainChangedPaths, chainDeliverables });
+  const skipReview = shouldSkipReview({ chainStatusObserved, chainChangedPaths, chainNewlyChanged, chainDeliverables });
 
   // ---- P3 empty-change: set probe-sourced discard verdict before review ----
   if (skipReview) {
@@ -631,7 +651,8 @@ export function renderEscalateOutcome({ chainId, round, disposition, orchestrato
   for (let ri = 0; ri < records.length; ri++) {
     const r = records[ri];
     const detail = r.resumeMethod.detail ? ": " + r.resumeMethod.detail : "";
-    lines.push("Round " + (ri + 1) + ": model=" + (r.modelEntry || "?") + ", verdict=" + r.verdict + ", probesGreen=" + r.probesGreen + ", resume=" + r.resumeMethod.type + detail);
+    const changed = (r.worktreeChanged === undefined || r.worktreeChanged === null) ? "unknown" : r.worktreeChanged ? "yes" : "NO";
+    lines.push("Round " + (ri + 1) + ": model=" + (r.modelEntry || "?") + ", verdict=" + r.verdict + ", probesGreen=" + r.probesGreen + ", changed=" + changed + ", resume=" + r.resumeMethod.type + detail);
   }
   lines.push("", "Hand over to orchestrator for final judgement.");
   return lines.join("\n");
@@ -655,7 +676,8 @@ export function renderMaxRoundsOutcome({ chainId, maxRounds, records, orchestrat
   for (let ri2 = 0; ri2 < records.length; ri2++) {
     const r2 = records[ri2];
     const detail2 = r2.resumeMethod.detail ? ": " + r2.resumeMethod.detail : "";
-    lines.push("Round " + (ri2 + 1) + ": model=" + (r2.modelEntry || "?") + ", verdict=" + r2.verdict + ", probesGreen=" + r2.probesGreen + ", resume=" + r2.resumeMethod.type + detail2);
+    const changed2 = (r2.worktreeChanged === undefined || r2.worktreeChanged === null) ? "unknown" : r2.worktreeChanged ? "yes" : "NO";
+    lines.push("Round " + (ri2 + 1) + ": model=" + (r2.modelEntry || "?") + ", verdict=" + r2.verdict + ", probesGreen=" + r2.probesGreen + ", changed=" + changed2 + ", resume=" + r2.resumeMethod.type + detail2);
   }
   lines.push("", "Hand over to orchestrator for final judgement.");
   return lines.join("\n");
@@ -690,11 +712,12 @@ export function renderProviderExhaustedOutcome({ chainId, round, phase, jobError
     for (let ri = 0; ri < records.length; ri++) {
       const r = records[ri];
       const detail = r.resumeMethod?.detail ? ": " + r.resumeMethod.detail : "";
+      const changed = (r.worktreeChanged === undefined || r.worktreeChanged === null) ? "unknown" : r.worktreeChanged ? "yes" : "NO";
       lines.push(
         "  Round " + (ri + 1) + ": model=" + (r.modelEntry || "?") +
         ", verdict=" + (r.verdict || "n/a") +
         ", probesGreen=" + (r.probesGreen ?? "n/a") +
-        ", resume=" + (r.resumeMethod?.type || "?") + detail,
+        ", changed=" + changed + ", resume=" + (r.resumeMethod?.type || "?") + detail,
       );
     }
     lines.push("");
@@ -863,16 +886,44 @@ export async function runVerifyProbe({ callTool, container }) {
  * Returns the probe result with `changedPaths` and `statusOutput` attached
  * for the chain call site.
  */
-export async function runDeliverablesProbe({ deliverables, headingPresent, callTool, container }) {
+export async function runDeliverablesProbe({ deliverables, headingPresent, callTool, container, baseline }) {
   const statusResult = await callTool("sandbox_exec", {
     container_id: container,
     commands: ["git status --porcelain"],
   });
   const statusOutput = statusResult?.output ?? "";
   const changedPaths = parseChangedPaths(statusOutput);
-  const probeResult = checkDeliverablesProbe(deliverables, changedPaths, headingPresent);
+
+  // When a baseline is provided, restrict the probe to paths newly changed
+  // since that baseline.  Captures current worktree state via GIT_INDEX_FILE
+  // temp index — does not modify the real index.
+  let effectiveChangedPaths = changedPaths;
+  let worktreeChanged = null;
+  // null = the since-baseline comparison could not be made.  It must NOT start
+  // as [], because [] asserts "nothing changed since the baseline" and callers
+  // discard a round on that: an unmeasurable round would be thrown away.  It
+  // becomes an array only when the comparison actually ran.
+  let newlyChangedPaths = null;
+
+  if (baseline) {
+    const currentState = await captureWorktreeState(callTool, container);
+    if (currentState) {
+      newlyChangedPaths = computeNewlyChanged(baseline, currentState);
+      worktreeChanged = resolveWorktreeChanged(baseline, currentState);
+      // computeNewlyChanged itself returns null when it cannot compare; only
+      // narrow the probe to the newly-changed set when it produced one.
+      if (newlyChangedPaths) effectiveChangedPaths = newlyChangedPaths;
+    }
+    // When currentState is null (per-round capture failed), effectiveChangedPaths
+    // stays as changedPaths — a graceful fallback that avoids falsely reporting
+    // an empty change set when we simply couldn't measure.
+  }
+
+  const probeResult = checkDeliverablesSinceBaseline(deliverables, effectiveChangedPaths, headingPresent);
   probeResult.changedPaths = changedPaths;
+  probeResult.newlyChangedPaths = newlyChangedPaths;
   probeResult.statusOutput = statusOutput;
+  probeResult.worktreeChanged = worktreeChanged;
   return probeResult;
 }
 
