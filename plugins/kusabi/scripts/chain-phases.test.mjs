@@ -1,7 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import {
-  selectRoundModel,
   buildImplementText,
   shouldSkipReview,
   computeChainTotals,
@@ -9,109 +8,18 @@ import {
   renderAcceptWithFollowupOutcome,
   renderEscalateOutcome,
   renderMaxRoundsOutcome,
+  renderProviderExhaustedOutcome,
   runSmokeProbe,
   runHeadCleanProbe,
   runVerifyProbe,
   runDeliverablesProbe,
 } from "./chain-phases.mjs";
 import {
-  parseModel,
-} from "./cli.mjs";
-import {
   createFakeCallTool,
   fakeCallToolForP1,
   fakeCallToolForP2,
   fakeCallToolForP3,
 } from "./fixtures.mjs";
-
-// Chain round-to-entry mapping — model variant escalation
-// ---------------------------------------------------------------------------
-
-describe("chain round model resolution", () => {
-  const chain = ["p/a", "p/a:max", "p/b"];
-
-  function resolveRoundModel(round, modelFlag) {
-    if (round === 1 && modelFlag) return parseModel(modelFlag);
-    const idx = Math.min(round - 1, chain.length - 1);
-    return parseModel(chain[idx]);
-  }
-
-  it("round 1 uses chain[0] when no --model", () => {
-    const result = resolveRoundModel(1, null);
-    assert.deepEqual(result, { providerID: "p", modelID: "a" });
-  });
-
-  it("round 2 uses chain[1] (:max variant)", () => {
-    const result = resolveRoundModel(2, null);
-    assert.deepEqual(result, { providerID: "p", modelID: "a", variant: "max" });
-  });
-
-  it("round 3 uses chain[2]", () => {
-    const result = resolveRoundModel(3, null);
-    assert.deepEqual(result, { providerID: "p", modelID: "b" });
-  });
-
-  it("rounds beyond chain length clamp to last entry", () => {
-    const result = resolveRoundModel(4, null);
-    assert.deepEqual(result, { providerID: "p", modelID: "b" });
-    const result5 = resolveRoundModel(5, null);
-    assert.deepEqual(result5, { providerID: "p", modelID: "b" });
-  });
-
-  it("--model overrides round 1 only", () => {
-    const result = resolveRoundModel(1, "p/c:high");
-    assert.deepEqual(result, { providerID: "p", modelID: "c", variant: "high" });
-  });
-
-  it("round 2+ ignores --model and follows chain", () => {
-    // Even with --model, round 2 follows the chain
-    const result = resolveRoundModel(2, "p/c:high");
-    assert.deepEqual(result, { providerID: "p", modelID: "a", variant: "max" });
-  });
-
-  it("single-entry chain clamps all rounds to that entry", () => {
-    const single = ["p/x"];
-    function resolveForRound(n) {
-      const idx = Math.min(n - 1, single.length - 1);
-      return parseModel(single[idx]);
-    }
-    assert.deepEqual(resolveForRound(1), { providerID: "p", modelID: "x" });
-    assert.deepEqual(resolveForRound(2), { providerID: "p", modelID: "x" });
-    assert.deepEqual(resolveForRound(5), { providerID: "p", modelID: "x" });
-  });
-
-  it("variant stored in round record is visible", () => {
-    // Simulate what cmdChain stores on roundRecord
-    const round = 2;
-    const idx = Math.min(round - 1, chain.length - 1);
-    const entry = chain[idx];
-    const roundModel = parseModel(entry);
-    const roundModelEntry = (roundModel && roundModel.variant)
-      ? roundModel.providerID + "/" + roundModel.modelID + ":" + roundModel.variant
-      : (roundModel ? roundModel.providerID + "/" + roundModel.modelID : null);
-    const roundRecord = {
-      round,
-      modelEntry: roundModelEntry,
-      modelVariant: roundModel?.variant || null,
-    };
-    assert.equal(roundRecord.modelEntry, "p/a:max");
-    assert.equal(roundRecord.modelVariant, "max");
-  });
-
-  it("round without variant has null variant in record", () => {
-    const round = 1;
-    const idx = Math.min(round - 1, chain.length - 1);
-    const entry = chain[idx];
-    const roundModel = parseModel(entry);
-    const roundRecord = {
-      round,
-      modelEntry: roundModel ? roundModel.providerID + "/" + roundModel.modelID : null,
-      modelVariant: roundModel?.variant || null,
-    };
-    assert.equal(roundRecord.modelEntry, "p/a");
-    assert.equal(roundRecord.modelVariant, null);
-  });
-});
 
 describe("runSmokeProbe", () => {
   it("observes exit 0 for a command whose output far exceeds page size", async () => {
@@ -465,54 +373,6 @@ describe("runDeliverablesProbe", () => {
   });
 });
 
-// selectRoundModel  —  pure, extracted from cmdChain (chain-phases.mjs)
-// =========================================================================
-
-describe("selectRoundModel", () => {
-  const baseModel = { providerID: "test", modelID: "gpt-4", variant: null };
-  const modelChain = ["test/gpt-4", "test/gpt-4o", "test/claude"];
-
-  it("round 1 with --model flag uses the provided model directly", () => {
-    const result = selectRoundModel({ round: 1, isFirstRound: true, flagsModel: "test/gpt-4", model: baseModel, modelChain });
-    assert.equal(result.roundModel, baseModel);
-    assert.equal(result.roundModelEntry, "test/gpt-4");
-  });
-
-  it("round 1 without --model flag uses chain entry 0 via parseModel", () => {
-    const result = selectRoundModel({ round: 1, isFirstRound: true, flagsModel: null, model: baseModel, modelChain });
-    assert.ok(result.roundModel !== null);
-    assert.equal(result.roundModel.providerID, "test");
-    assert.equal(result.roundModel.modelID, "gpt-4");
-    assert.equal(result.roundModelEntry, "test/gpt-4");
-  });
-
-  it("round 2 uses chain entry 1", () => {
-    const result = selectRoundModel({ round: 2, isFirstRound: false, flagsModel: null, model: baseModel, modelChain });
-    assert.equal(result.roundModel.providerID, "test");
-    assert.equal(result.roundModel.modelID, "gpt-4o");
-    assert.equal(result.roundModelEntry, "test/gpt-4o");
-  });
-
-  it("round beyond chain length clamps to last entry", () => {
-    const result = selectRoundModel({ round: 5, isFirstRound: false, flagsModel: null, model: baseModel, modelChain });
-    assert.equal(result.roundModel.providerID, "test");
-    assert.equal(result.roundModel.modelID, "claude");
-    assert.equal(result.roundModelEntry, "test/claude");
-  });
-
-  it("roundModelEntry includes variant when present", () => {
-    const modelWithVariant = { providerID: "test", modelID: "gpt-4", variant: "turbo" };
-    const result = selectRoundModel({ round: 1, isFirstRound: true, flagsModel: "test/gpt-4", model: modelWithVariant, modelChain });
-    assert.equal(result.roundModelEntry, "test/gpt-4:turbo");
-  });
-
-  it("returns null roundModelEntry when roundModel is null", () => {
-    // Empty model chain → parseModel returns null for the first entry
-    const result = selectRoundModel({ round: 1, isFirstRound: true, flagsModel: null, model: baseModel, modelChain: [""] });
-    assert.equal(result.roundModelEntry, null);
-  });
-});
-
 // buildImplementText  —  pure, extracted from cmdChain (chain-phases.mjs)
 // =========================================================================
 
@@ -824,6 +684,107 @@ describe("renderMaxRoundsOutcome", () => {
     const result = renderMaxRoundsOutcome({ chainId, maxRounds: 3, records: [], orchestrator: null });
     assert.ok(result.includes("(none)"));
     assert.ok(result.includes("reached max rounds (3)"));
+  });
+});
+
+// =========================================================================
+// renderProviderExhaustedOutcome  —  pure
+// =========================================================================
+
+describe("renderProviderExhaustedOutcome", () => {
+  const chainId = "chain-exhausted-1";
+
+  it("identifies provider/capacity exhaustion distinct from escalate and max rounds", () => {
+    const result = renderProviderExhaustedOutcome({
+      chainId,
+      round: 2,
+      phase: "implement",
+      jobError: "All routes exhausted:\n  route/a — rate_limit at attempt 3: overloaded\n  route/b — free_tier_limit at attempt 1: quota gone",
+      records: [],
+    });
+
+    assert.ok(result.includes("stopped at round 2: implement provider exhausted"));
+    assert.ok(result.includes("All routes exhausted:"));
+    assert.ok(result.includes("route/a"));
+    assert.ok(result.includes("route/b"));
+    assert.ok(result.includes("free_tier_limit"));
+    // Must NOT be confused with escalation or max rounds.
+    assert.ok(!result.includes("escalate"));
+    assert.ok(!result.includes("max rounds"));
+    // Capacity message is present.
+    assert.ok(result.includes("Capacity problem"));
+    assert.ok(result.includes("not a quality failure"));
+  });
+
+  it("surfaces the job error text directly (no re-derivation)", () => {
+    const jobError = "All routes exhausted:\n  only/route — rate_limit at attempt 3";
+    const result = renderProviderExhaustedOutcome({
+      chainId,
+      round: 1,
+      phase: "review",
+      jobError,
+      records: [],
+    });
+
+    assert.ok(result.includes(jobError));
+    assert.ok(result.includes("review provider exhausted"));
+  });
+
+  it("includes prior round records so chain-show can display aborted round", () => {
+    const records = [
+      {
+        round: 1,
+        modelEntry: "provider/model-a",
+        verdict: "needs-attention",
+        probesGreen: true,
+        resumeMethod: { type: "continue_session" },
+        fallbacks: [{ from: "route/dead", to: "route/alive", reason: "free_tier_limit", attempt: 1, message: "quota" }],
+      },
+      {
+        round: 2,
+        modelEntry: "provider/model-b",
+        verdict: null,
+        probesGreen: false,
+        resumeMethod: { type: "checkpoint_restore", base: "abc123" },
+        fallbacks: [{ from: "route/x", to: null, reason: "rate_limit", attempt: 3, message: "overloaded" }],
+      },
+    ];
+
+    const result = renderProviderExhaustedOutcome({
+      chainId,
+      round: 3,
+      phase: "implement",
+      jobError: "All routes exhausted:\n  route/x — rate_limit at attempt 3: overloaded",
+      records,
+    });
+
+    assert.ok(result.includes("Prior rounds:"));
+    assert.ok(result.includes("Round 1: model=provider/model-a, verdict=needs-attention, probesGreen=true, resume=continue_session"));
+    assert.ok(result.includes("Round 2: model=provider/model-b, verdict=n/a, probesGreen=false, resume=checkpoint_restore"));
+  });
+
+  it("handles null jobError gracefully", () => {
+    const result = renderProviderExhaustedOutcome({
+      chainId,
+      round: 1,
+      phase: "implement",
+      jobError: null,
+      records: [],
+    });
+
+    assert.ok(result.includes("(no error detail)"));
+  });
+
+  it("handles strategize phase exhaustion", () => {
+    const result = renderProviderExhaustedOutcome({
+      chainId,
+      round: 2,
+      phase: "strategize",
+      jobError: "All routes exhausted:\n  route/p — rate_limit at attempt 3",
+      records: [],
+    });
+
+    assert.ok(result.includes("strategize provider exhausted"));
   });
 });
 

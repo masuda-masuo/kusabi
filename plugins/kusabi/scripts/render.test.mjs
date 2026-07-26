@@ -5,6 +5,7 @@ import {
   renderReview,
   renderChainShow,
   renderJobLine,
+  renderHeader,
   renderBaseFacts,
   renderFollowupDraft,
   renderStrategistPrompt,
@@ -673,3 +674,154 @@ describe("renderStrategistPrompt", () => {
   });
 });
 
+
+// renderHeader — provider-error and fallback rendering
+// =========================================================================
+
+describe("renderHeader provider-error", () => {
+  it("shows route and variant when modelEntry is set", () => {
+    const job = {
+      id: "job-1",
+      kind: "task",
+      status: "completed",
+      sessionID: "ses_1",
+      startedAt: "2026-07-22T10:00:00.000Z",
+      finishedAt: "2026-07-22T10:01:00.000Z",
+      modelEntry: "opencode-go/deepseek-v4-flash:max",
+    };
+    const result = renderHeader(job);
+    assert.match(result, /route: opencode-go\/deepseek-v4-flash:max/);
+  });
+
+  it("shows provider-error details with retry info", () => {
+    const job = {
+      id: "job-pe",
+      kind: "task",
+      status: "provider-error",
+      sessionID: "ses_pe",
+      startedAt: "2026-07-22T10:00:00.000Z",
+      finishedAt: "2026-07-22T10:00:05.000Z",
+      error: "provider error: free_tier_limit (attempt 1) [terminal]: Free usage exceeded",
+      retry: { reason: "free_tier_limit", attempt: 1, terminal: true, message: "Free usage exceeded", count: 1 },
+    };
+    const result = renderHeader(job);
+    assert.match(result, /provider-error:/);
+    assert.match(result, /reason: free_tier_limit/);
+    assert.match(result, /attempt: 1/);
+    assert.match(result, /terminal: true/);
+    assert.match(result, /provider message: Free usage exceeded/);
+  });
+
+  it("shows provider-error without terminal when not terminal", () => {
+    const job = {
+      id: "job-pe2",
+      kind: "task",
+      status: "provider-error",
+      sessionID: "ses_pe2",
+      startedAt: "2026-07-22T10:00:00.000Z",
+      finishedAt: "2026-07-22T10:00:05.000Z",
+      error: "provider error: rate_limit (attempt 3): Too many requests",
+      retry: { reason: "rate_limit", attempt: 3, terminal: false, message: "Too many requests", count: 3 },
+    };
+    const result = renderHeader(job);
+    assert.match(result, /provider-error:/);
+    assert.match(result, /reason: rate_limit/);
+    assert.match(result, /attempt: 3/);
+    assert.doesNotMatch(result, /terminal: true/);
+  });
+
+  it("shows fallbacks when job has fallback trail", () => {
+    const job = {
+      id: "job-fb",
+      kind: "task",
+      status: "completed",
+      sessionID: "ses_fb",
+      startedAt: "2026-07-22T10:00:00.000Z",
+      finishedAt: "2026-07-22T10:01:00.000Z",
+      modelEntry: "opencode-go/deepseek-v4-flash:max",
+      fallbacks: [
+        { from: "opencode/deepseek-v4-flash-free:max", to: "opencode-go/deepseek-v4-flash:max", reason: "free_tier_limit", attempt: 1, message: "Free usage exceeded" },
+      ],
+    };
+    const result = renderHeader(job);
+    assert.match(result, /fallback:/);
+    assert.match(result, /opencode\/deepseek-v4-flash-free:max → opencode-go\/deepseek-v4-flash:max/);
+    assert.match(result, /free_tier_limit/);
+  });
+
+  it("shows multiple fallbacks in order", () => {
+    const job = {
+      id: "job-mfb",
+      kind: "task",
+      status: "completed",
+      sessionID: "ses_mfb",
+      startedAt: "2026-07-22T10:00:00.000Z",
+      finishedAt: "2026-07-22T10:02:00.000Z",
+      modelEntry: "opencode-go/deepseek-v4-pro:max",
+      fallbacks: [
+        { from: "opencode/deepseek-v4-flash-free:max", to: "opencode-go/deepseek-v4-flash:max", reason: "free_tier_limit", attempt: 1, message: "Free usage exceeded" },
+        { from: "opencode-go/deepseek-v4-flash:max", to: "opencode-go/deepseek-v4-pro:max", reason: "rate_limit", attempt: 3, message: "Too many requests" },
+      ],
+    };
+    const result = renderHeader(job);
+    // First fallback
+    assert.ok(result.includes("opencode/deepseek-v4-flash-free:max → opencode-go/deepseek-v4-flash:max"));
+    // Second fallback
+    assert.ok(result.includes("opencode-go/deepseek-v4-flash:max → opencode-go/deepseek-v4-pro:max"));
+  });
+
+  it("falls back to model line from stats when modelEntry is absent", () => {
+    const job = {
+      id: "job-nome",
+      kind: "task",
+      status: "completed",
+      sessionID: "ses_nome",
+      startedAt: "2026-07-22T10:00:00.000Z",
+      finishedAt: "2026-07-22T10:00:05.000Z",
+      stats: { models: ["opencode/deepseek-v4-flash-free"] },
+    };
+    const result = renderHeader(job);
+    assert.match(result, /model: opencode\/deepseek-v4-flash-free/);
+  });
+});
+
+// renderChainShow — fallback display on round records
+// =========================================================================
+
+describe("renderChainShow fallbacks", () => {
+  it("renders fallback lines on a round record", () => {
+    const chain = { chainId: "chain-fb" };
+    const rounds = [
+      {
+        round: 1,
+        modelEntry: "opencode-go/deepseek-v4-flash:max",
+        verdict: "approve",
+        disposition: { disposition: "accept" },
+        resumeMethod: { type: "continue_session" },
+        fallbacks: [
+          { from: "opencode/deepseek-v4-flash-free:max", to: "opencode-go/deepseek-v4-flash:max", reason: "free_tier_limit", attempt: 1, message: "Free usage exceeded" },
+        ],
+      },
+    ];
+    const result = renderChainShow(chain, rounds);
+    assert.match(result, /fallbacks:/);
+    assert.match(result, /opencode\/deepseek-v4-flash-free:max → opencode-go\/deepseek-v4-flash:max/);
+    assert.match(result, /free_tier_limit at attempt 1/);
+    assert.match(result, /Free usage exceeded/);
+  });
+
+  it("does not show fallbacks when none occurred", () => {
+    const chain = { chainId: "chain-no-fb" };
+    const rounds = [
+      {
+        round: 1,
+        modelEntry: "p/a",
+        verdict: "approve",
+        disposition: { disposition: "accept" },
+        resumeMethod: { type: "continue_session" },
+      },
+    ];
+    const result = renderChainShow(chain, rounds);
+    assert.doesNotMatch(result, /fallbacks:/);
+  });
+});

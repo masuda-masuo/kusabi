@@ -166,9 +166,12 @@ describe("resolveModel", () => {
     assert.ok(result.model, "should resolve a model");
     assert.equal(result.model.providerID, "opencode");
     assert.equal(result.model.modelID, "deepseek-v4-flash-free");
+    assert.equal(result.model.variant, "max");
     assert.ok(Array.isArray(result.chain));
-    assert.equal(result.chain.length, 3);
-    assert.equal(result.chain[0], "opencode/deepseek-v4-flash-free");
+    assert.equal(result.chain.length, 2);
+    assert.ok(Array.isArray(result.chain[0]));
+    assert.equal(result.chain[0][0], "opencode/deepseek-v4-flash-free:max");
+    assert.equal(result.chain[0][1], "opencode-go/deepseek-v4-flash:max");
   });
 
   it("uses explicit --model flag over everything", () => {
@@ -245,7 +248,7 @@ describe("resolveModel", () => {
     // No per-phase match for review, no global chain -> built-in
     assert.equal(result.model.providerID, "opencode");
     assert.equal(result.model.modelID, "deepseek-v4-flash-free");
-    assert.equal(result.chain.length, 3);
+    assert.equal(result.chain.length, 2);
   });
 
   it("explicit flag + no config still returns built-in chain", () => {
@@ -253,8 +256,8 @@ describe("resolveModel", () => {
     assert.equal(result.model.providerID, "explicit");
     assert.equal(result.model.modelID, "p");
     // chain should still be the built-in default when no config
-    assert.equal(result.chain.length, 3);
-    assert.equal(result.chain[0], "opencode/deepseek-v4-flash-free");
+    assert.equal(result.chain.length, 2);
+    assert.ok(Array.isArray(result.chain[0]));
   });
 });
 
@@ -454,3 +457,186 @@ describe("reviewDenyTools", () => {
   });
 });
 
+
+// selectRoutes — tiered chain route selection with clamp and failed-route memo
+// =========================================================================
+
+import { selectRoutes, validateChainEntries, firstRoute } from "./cli.mjs";
+
+describe("selectRoutes", () => {
+  const tiers = [
+    ["p/flash-free:max", "p/flash:max"],  // tier 0: capacity alternates
+    ["p/pro:max"],                         // tier 1: quality step
+  ];
+
+  it("round 1 returns tier-0 routes in order", () => {
+    const result = selectRoutes({ tiers, round: 1 });
+    assert.deepEqual(result, ["p/flash-free:max", "p/flash:max", "p/pro:max"]);
+  });
+
+  it("round 2 returns tier-1 routes (clamped to last tier)", () => {
+    const result = selectRoutes({ tiers, round: 2 });
+    assert.deepEqual(result, ["p/pro:max"]);
+  });
+
+  it("round 5 clamps to last tier", () => {
+    const result = selectRoutes({ tiers, round: 5 });
+    assert.deepEqual(result, ["p/pro:max"]);
+  });
+
+  it("explicitModel is prepended when not failed", () => {
+    const result = selectRoutes({ tiers, round: 1, explicitModel: "p/custom" });
+    assert.deepEqual(result, ["p/custom", "p/flash-free:max", "p/flash:max", "p/pro:max"]);
+  });
+
+  it("explicitModel is skipped when in failedRoutes", () => {
+    const failed = new Set(["p/custom"]);
+    const result = selectRoutes({ tiers, round: 1, explicitModel: "p/custom", failedRoutes: failed });
+    assert.deepEqual(result, ["p/flash-free:max", "p/flash:max", "p/pro:max"]);
+  });
+
+  it("failedRoutes skips dead routes", () => {
+    const failed = new Set(["p/flash-free:max"]);
+    const result = selectRoutes({ tiers, round: 1, failedRoutes: failed });
+    assert.deepEqual(result, ["p/flash:max", "p/pro:max"]);
+  });
+
+  it("all routes failed returns empty list", () => {
+    const failed = new Set(["p/flash-free:max", "p/flash:max", "p/pro:max"]);
+    const result = selectRoutes({ tiers, round: 1, failedRoutes: failed });
+    assert.deepEqual(result, []);
+  });
+
+  it("all tier-0 routes failed → falls through to tier 1", () => {
+    const failed = new Set(["p/flash-free:max", "p/flash:max"]);
+    const result = selectRoutes({ tiers, round: 1, failedRoutes: failed });
+    assert.deepEqual(result, ["p/pro:max"]);
+  });
+
+  it("round 2 with all tier-1 routes failed returns empty", () => {
+    const failed = new Set(["p/pro:max"]);
+    const result = selectRoutes({ tiers, round: 2, failedRoutes: failed });
+    assert.deepEqual(result, []);
+  });
+
+  it("flat string tiers work (backward compat)", () => {
+    const flatTiers = ["p/a", "p/b", "p/c"];
+    assert.deepEqual(selectRoutes({ tiers: flatTiers, round: 1 }), ["p/a", "p/b", "p/c"]);
+    assert.deepEqual(selectRoutes({ tiers: flatTiers, round: 2 }), ["p/b", "p/c"]);
+    assert.deepEqual(selectRoutes({ tiers: flatTiers, round: 3 }), ["p/c"]);
+    assert.deepEqual(selectRoutes({ tiers: flatTiers, round: 5 }), ["p/c"]);
+  });
+
+  it("explicitModel is not duplicated in candidates", () => {
+    // explicitModel already appears in tier 0
+    const result = selectRoutes({ tiers, round: 1, explicitModel: "p/flash-free:max" });
+    assert.deepEqual(result, ["p/flash-free:max", "p/flash:max", "p/pro:max"]);
+  });
+
+  it("empty tiers returns empty array", () => {
+    const result = selectRoutes({ tiers: [], round: 1 });
+    assert.deepEqual(result, []);
+  });
+
+  it("failedRoutes defaults to empty Set when not provided", () => {
+    const result = selectRoutes({ tiers, round: 1 });
+    assert.deepEqual(result, ["p/flash-free:max", "p/flash:max", "p/pro:max"]);
+  });
+});
+
+// validateChainEntries — config validation for tiered chains
+// =========================================================================
+
+describe("validateChainEntries", () => {
+  it("accepts a flat array of strings", () => {
+    assert.doesNotThrow(() => validateChainEntries(["p/a", "p/b"], "models.chain"));
+  });
+
+  it("accepts a tiered array of string-or-array", () => {
+    assert.doesNotThrow(() => validateChainEntries([["p/a", "p/b"], ["p/c"]], "models.chain"));
+  });
+
+  it("accepts mixed string and array entries", () => {
+    assert.doesNotThrow(() => validateChainEntries(["p/a", ["p/b", "p/c"]], "models.chain"));
+  });
+
+  it("rejects an empty chain array with path in message", () => {
+    assert.throws(
+      () => validateChainEntries([], "models.chain"),
+      /"models.chain" must not be empty/,
+    );
+  });
+
+  it("rejects an empty tier sub-array with path in message", () => {
+    assert.throws(
+      () => validateChainEntries([[]], "models.chain"),
+      /"models.chain\[0\]" must not be an empty array/,
+    );
+  });
+
+  it("rejects a non-string route with path in message", () => {
+    assert.throws(
+      () => validateChainEntries([[42]], "models.phases.implement"),
+      /"models.phases.implement\[0\]\[0\]" must be a string/,
+    );
+  });
+
+  it("rejects a non-array, non-string entry with path in message", () => {
+    assert.throws(
+      () => validateChainEntries([{ invalid: true }], "models.chain"),
+      /"models.chain\[0\]" must be a string or array of strings/,
+    );
+  });
+
+  it("rejects non-array input with path in message", () => {
+    assert.throws(
+      () => validateChainEntries("not-an-array", "models.chain"),
+      /"models.chain" must be an array/,
+    );
+  });
+
+  it("rejects an empty string route with path in message", () => {
+    assert.throws(
+      () => validateChainEntries([""], "models.chain"),
+      /"models.chain\[0\]" must not be an empty string/,
+    );
+  });
+
+  it("rejects an empty string inside a tier array", () => {
+    assert.throws(
+      () => validateChainEntries([["p/a", ""]], "models.chain"),
+      /"models.chain\[0\]\[1\]" must not be an empty string/,
+    );
+  });
+});
+
+// firstRoute — resolve the first usable route from a tiered chain
+// =========================================================================
+
+describe("firstRoute", () => {
+  it("returns the string from a flat chain", () => {
+    assert.equal(firstRoute(["p/a", "p/b"]), "p/a");
+  });
+
+  it("returns the first route from the first tier", () => {
+    assert.equal(firstRoute([["p/a", "p/b"], ["p/c"]]), "p/a");
+  });
+
+  it("returns the string when first entry is a string", () => {
+    assert.equal(firstRoute(["p/first", ["p/a", "p/b"]]), "p/first");
+  });
+
+  it("returns null for empty chain", () => {
+    assert.equal(firstRoute([]), null);
+  });
+
+  it("returns null for non-array input", () => {
+    assert.equal(firstRoute(null), null);
+    assert.equal(firstRoute(undefined), null);
+  });
+
+  it("returns null when first tier is empty", () => {
+    // This would be caught by validateChainEntries but firstRoute handles it gracefully.
+    assert.equal(firstRoute([[]]), null);
+  });
+});

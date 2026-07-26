@@ -7,7 +7,7 @@
 // session never sees intermediate narration, tool logs, or raw events.
 
 
-import { parseArgs, parseModel, resolveModel, reviewDenyTools, WRITE_TOOL_NAMES } from "./cli.mjs";
+import { parseArgs, parseModel, resolveModel, reviewDenyTools, WRITE_TOOL_NAMES, validateChainEntries } from "./cli.mjs";
 import { renderReview, renderChainShow, renderJobLine, renderHeader, extractJson, renderFollowupDraft } from "./render.mjs";
 import { hasSectionHeading, parseDeliverables, parseSmoke, parseOrchestratorSignature } from "./brief-parsing.mjs";
 import { deriveDisposition } from "./disposition.mjs";
@@ -21,7 +21,7 @@ import { fileURLToPath } from "node:url";
 import { stateRoot, stateDirFor, readJson } from "./state-paths.mjs";
 import { jobDir, saveJob, loadJob, listJobs, latestJob } from "./job-store.mjs";
 import { opencodeBin, serverHealthy, ensureServer, reapIdleServes, api } from "./serve-lifecycle.mjs";
-import { runPrompt } from "./prompt-execution.mjs";
+import { runPrompt, dispatchWithFallback, resetFailedRoutes } from "./prompt-execution.mjs";
 
 // Chain round-phases module — imported here for cmdChain.
 // Probe functions are imported separately below with local bindings so
@@ -30,7 +30,7 @@ import {
   createChainDir,
   captureBaseSha,
   resolveRoundResume,
-  selectRoundModel,
+
   buildImplementText,
   runImplementPhase,
   runProbePhase,
@@ -42,6 +42,7 @@ import {
   renderAcceptWithFollowupOutcome,
   renderEscalateOutcome,
   renderMaxRoundsOutcome,
+  renderProviderExhaustedOutcome,
 } from "./chain-phases.mjs";
 
 // Import the probe functions locally so cmdTask can call them directly.
@@ -175,11 +176,11 @@ export function loadConfig(stateRootDir) {
       throw new Error(`kusabi config file ${configPath}: "models" must be a JSON object`);
     }
     if (models.chain !== undefined) {
-      if (!Array.isArray(models.chain) || !models.chain.every((m) => typeof m === "string")) {
-        throw new Error(`kusabi config file ${configPath}: "models.chain" must be an array of strings`);
-      }
-      if (models.chain.length === 0) {
-        throw new Error(`kusabi config file ${configPath}: "models.chain" must not be empty (omit it to use the built-in default chain)`);
+      try {
+        validateChainEntries(models.chain, "models.chain");
+      } catch (err) {
+        // Prefix the config path for user-facing error messages.
+        throw new Error(`kusabi config file ${configPath}: ${err.message}`);
       }
     }
     if (models.phases !== undefined) {
@@ -187,11 +188,10 @@ export function loadConfig(stateRootDir) {
         throw new Error(`kusabi config file ${configPath}: "models.phases" must be a JSON object`);
       }
       for (const [phaseName, chain] of Object.entries(models.phases)) {
-        if (!Array.isArray(chain) || !chain.every((m) => typeof m === "string")) {
-          throw new Error(`kusabi config file ${configPath}: "models.phases.${phaseName}" must be an array of strings`);
-        }
-        if (chain.length === 0) {
-          throw new Error(`kusabi config file ${configPath}: "models.phases.${phaseName}" must not be empty (omit it to fall back to the global chain)`);
+        try {
+          validateChainEntries(chain, `models.phases.${phaseName}`);
+        } catch (err) {
+          throw new Error(`kusabi config file ${configPath}: ${err.message}`);
         }
       }
     }
@@ -444,7 +444,6 @@ async function cmdTask(cwd, { flags, text }) {
   const stateDir = stateDirFor(cwd);
   const config = loadConfig(stateRoot());
   const resolved = resolveModel({ flag: flags.model, phase, config });
-  const model = resolved.model;
   const modelChain = resolved.chain;
 
   let session = flags.session;
@@ -482,18 +481,20 @@ async function cmdTask(cwd, { flags, text }) {
   }
 
   const guardrails = fs.readFileSync(path.join(PLUGIN_ROOT, "prompts", "task-guardrails.md"), "utf8").trim();
-  const { job, resultText } = await runPrompt({
+  const { job, resultText } = await dispatchWithFallback({
     cwd,
     kind: "task",
     title: text.slice(0, 80),
     promptText: `${guardrails}\n\n<task>\n${text}\n</task>`,
     agent,
     phase,
-    model,
     session,
     tools,
     timeoutS: Number(flags.timeout ?? DEFAULT_TASK_TIMEOUT_S),
     watchdogS: Number(flags.watchdog ?? DEFAULT_WATCHDOG_S),
+    tiers: modelChain,
+    round: 1,
+    explicitModel: flags.model || null,
   });
 
   // Store the resolved model chain and orchestrator on the job record
@@ -811,6 +812,9 @@ async function cmdChain(cwd, { flags, text }) {
   // ---- import callTool once for all phases that need it ----
   const { callTool } = await import("./sunaba-rpc.mjs");
 
+  // ---- reset failed-route memo for a fresh chain run ----
+  resetFailedRoutes();
+
   // ---- chain initialisation: record base + checkpoint ----
   const baseSha = await captureBaseSha(callTool, container);
 
@@ -828,16 +832,36 @@ async function cmdChain(cwd, { flags, text }) {
       // ---- phase 1: resume strategy (checkpoint_restore or continue) ----
       const { resumeMethod, useNewSession } = await resolveRoundResume({ round, strategized, baseSha, container, callTool });
 
-      // ---- phase 2: round model selection ----
-      const { roundModel, roundModelEntry } = selectRoundModel({ round, isFirstRound, flagsModel: flags.model, model, modelChain });
+      // ---- phase 2: round model selection is now inside dispatchWithFallback ----
 
       // ---- phase 3: implement text + dispatch ----
       const implementText = buildImplementText({ round, brief, previousRecord });
-      const { roundRecord, session: resolvedSession } = await runImplementPhase({
-        cwd, chainId, round, isFirstRound, implementText, roundModel,
-        useNewSession, session, previousRecord, roundModelEntry, resumeMethod,
+      const {
+        roundRecord,
+        session: resolvedSession,
+        implementJobStatus,
+        implementJobError,
+      } = await runImplementPhase({
+        cwd, chainId, round, isFirstRound, implementText, modelChain,
+        useNewSession, session, previousRecord, resumeMethod, flagsModel: flags.model,
       });
       session = resolvedSession;
+
+      // ---- stop on implement provider exhaustion ----
+      if (implementJobStatus === "provider-error") {
+        records.push(roundRecord);
+        const chainTotals = computeChainTotals(records);
+        persistChainState({
+          chainDir, round, roundRecord, chainId, container, model, modelChain,
+          maxRounds, brief, orchestrator, records, baseSha, chainTotals,
+          strategized, chainFollowupDraft: null,
+        });
+        return renderProviderExhaustedOutcome({
+          chainId, round, phase: "implement",
+          jobError: implementJobError,
+          records,
+        });
+      }
 
       // ---- phase 4: deterministic probes (P1–P4) ----
       const {
@@ -848,11 +872,31 @@ async function cmdChain(cwd, { flags, text }) {
       roundRecord.probeResults = probeResults;
 
       // ---- phase 5: review (or skip when change set empty) ----
-      const { chainVerdict, chainFindingsText, chainParsedReview, chainRepeatedAreas, skipReview } = await runReviewPhase({
-        container, brief, model, chainId, cwd, previousRecord, baseSha,
+      const {
+        chainVerdict, chainFindingsText, chainParsedReview, chainRepeatedAreas, skipReview,
+        reviewJobStatus, reviewJobError,
+      } = await runReviewPhase({
+        container, brief, modelChain, chainId, cwd, previousRecord, baseSha,
         chainStatusOutput, chainBaseLog, roundRecord,
         chainChangedPaths, chainStatusObserved, chainDeliverables,
+        flagsModel: flags.model,
       });
+
+      // ---- stop on review provider exhaustion ----
+      if (reviewJobStatus === "provider-error") {
+        records.push(roundRecord);
+        const chainTotals = computeChainTotals(records);
+        persistChainState({
+          chainDir, round, roundRecord, chainId, container, model, modelChain,
+          maxRounds, brief, orchestrator, records, baseSha, chainTotals,
+          strategized, chainFollowupDraft: null,
+        });
+        return renderProviderExhaustedOutcome({
+          chainId, round, phase: "review",
+          jobError: reviewJobError,
+          records,
+        });
+      }
 
       // ---- phase 6: derive disposition ----
       const findingSeverities = chainParsedReview?.findings
@@ -914,7 +958,24 @@ async function cmdChain(cwd, { flags, text }) {
 
       // ---- phase 9: strategize (structural re-diagnosis before next rework) ----
       if (disposition.disposition === "strategize") {
-        await runStrategizePhase({ cwd, chainId, round, brief, previousRecord, roundRecord });
+        const { strategistJobStatus, strategistJobError } = await runStrategizePhase({ cwd, chainId, round, brief, previousRecord, roundRecord, modelChain });
+
+        // ---- stop on strategize provider exhaustion ----
+        if (strategistJobStatus === "provider-error") {
+          records.push(roundRecord);
+          const chainTotals = computeChainTotals(records);
+          persistChainState({
+            chainDir, round, roundRecord, chainId, container, model, modelChain,
+            maxRounds, brief, orchestrator, records, baseSha, chainTotals,
+            strategized, chainFollowupDraft,
+          });
+          return renderProviderExhaustedOutcome({
+            chainId, round, phase: "strategize",
+            jobError: strategistJobError,
+            records,
+          });
+        }
+
         strategized = true;
 
         // Re-persist after strategize updates roundRecord and strategized flag
