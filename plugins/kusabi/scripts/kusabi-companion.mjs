@@ -70,6 +70,10 @@ import {
   runDeliverablesProbe,
 } from "./chain-phases.mjs";
 
+// Worktree baseline module — content-sensitive measurement of what a round
+// actually changed, independent of pre-existing worktree dirt.
+import { captureWorktreeState } from "./worktree-baseline.mjs";
+
 // Re-export so external consumers (tests) that import these functions
 // from kusabi-companion.mjs continue to resolve correctly.
 export {
@@ -962,8 +966,9 @@ async function cmdChain(cwd, { flags, text }) {
   // ---- reset failed-route memo for a fresh chain run ----
   resetFailedRoutes();
 
-  // ---- chain initialisation: record base + checkpoint ----
+  // ---- chain initialisation: record base SHA + worktree baseline ----
   const baseSha = await captureBaseSha(callTool, container);
+  const worktreeBaseline = await captureWorktreeState(callTool, container);
 
   // ---- chain-start output: state tiers, maxRounds, and ladder info (B7) ----
   const tierCount = modelChain ? modelChain.length : 0;
@@ -1057,11 +1062,13 @@ async function cmdChain(cwd, { flags, text }) {
 
       // ---- phase 4: deterministic probes (P1–P4) ----
       const {
-        probesGreen, probeResults, chainChangedPaths, chainStatusObserved,
-        chainStatusOutput, chainBaseLog, chainDeliverables, chainDiff, chainUntracked,
-      } = await runProbePhase({ baseSha, container, brief, callTool });
+        probesGreen, probeResults, chainChangedPaths, chainNewlyChanged,
+        chainStatusObserved, chainStatusOutput, chainBaseLog,
+        chainDeliverables, chainDiff, chainUntracked, worktreeChanged,
+      } = await runProbePhase({ baseSha, container, brief, callTool, worktreeBaseline });
       roundRecord.probesGreen = probesGreen;
       roundRecord.probeResults = probeResults;
+      roundRecord.worktreeChanged = worktreeChanged;
 
       // ---- stop check: a stop requested during implement must not buy a
       // review job, and must not leave the container busy while the
@@ -1080,7 +1087,7 @@ async function cmdChain(cwd, { flags, text }) {
       } = await runReviewPhase({
         container, brief, modelChain, chainId, cwd, previousRecord, baseSha,
         chainStatusOutput, chainBaseLog, chainDiff, chainUntracked, roundRecord,
-        chainChangedPaths, chainStatusObserved, chainDeliverables,
+        chainChangedPaths, chainNewlyChanged, chainStatusObserved, chainDeliverables,
         flagsModel: flags.model,
       });
 

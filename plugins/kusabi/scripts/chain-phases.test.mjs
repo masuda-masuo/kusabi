@@ -27,6 +27,7 @@ import {
   fakeCallToolForP1,
   fakeCallToolForP2,
   fakeCallToolForP3,
+  fakeCallToolForP3WithBaseline,
 } from "./fixtures.mjs";
 import { renderPriorFindings } from "./render.mjs";
 
@@ -380,6 +381,141 @@ describe("runDeliverablesProbe", () => {
     assert.equal(result.changedPaths[0], "src/foo.js");
     assert.equal(result.statusOutput, " M src/foo.js\n");
   });
+
+  // === Baseline-aware tests ===
+
+  it("dirty baseline + round changed nothing → P3 fails", async () => {
+    const baseline = {
+      treeHash: "abc",
+      files: { "src/foo.js": "hash-v1" },
+    };
+    const currentManifest = {
+      treeHash: "abc",
+      files: { "src/foo.js": "hash-v1" },
+    };
+    const fakeTool = fakeCallToolForP3WithBaseline({
+      statusOutput: " M src/foo.js\n",
+      currentManifest,
+    });
+    const result = await runDeliverablesProbe({
+      deliverables: ["src/foo.js"],
+      headingPresent: true,
+      callTool: fakeTool,
+      container: "fake-cid",
+      baseline,
+    });
+    assert.equal(result.probe, "P3: deliverables");
+    assert.equal(result.passed, false);
+    assert.match(result.detail, /no paths changed since baseline/);
+    assert.equal(result.worktreeChanged, false);
+  });
+
+  it("dirty baseline + round modified a declared path → P3 passes", async () => {
+    const baseline = {
+      treeHash: "abc",
+      files: { "src/foo.js": "hash-v1" },
+    };
+    const currentManifest = {
+      treeHash: "def",
+      files: { "src/foo.js": "hash-v2" },
+    };
+    const fakeTool = fakeCallToolForP3WithBaseline({
+      statusOutput: " M src/foo.js\n",
+      currentManifest,
+    });
+    const result = await runDeliverablesProbe({
+      deliverables: ["src/foo.js"],
+      headingPresent: true,
+      callTool: fakeTool,
+      container: "fake-cid",
+      baseline,
+    });
+    assert.equal(result.probe, "P3: deliverables");
+    assert.equal(result.passed, true);
+    assert.match(result.detail, /touches declared deliverables/);
+    assert.equal(result.worktreeChanged, true);
+  });
+
+  it("baseline present but captureWorktreeState returns null → falls back to changedPaths", async () => {
+    const baseline = {
+      treeHash: "abc",
+      files: { "src/foo.js": "hash-v1" },
+    };
+    // currentManifest=null causes the fake to return ERROR_NO_INDEX
+    const fakeTool = fakeCallToolForP3WithBaseline({
+      statusOutput: " M src/foo.js\n",
+      currentManifest: null,
+    });
+    const result = await runDeliverablesProbe({
+      deliverables: ["src/foo.js"],
+      headingPresent: true,
+      callTool: fakeTool,
+      container: "fake-cid",
+      baseline,
+    });
+    assert.equal(result.probe, "P3: deliverables");
+    assert.equal(result.passed, true, "should fall back to changedPaths when capture fails");
+    assert.equal(result.worktreeChanged, null, "capture failure yields null worktreeChanged");
+  });
+
+  it("untracked file created by round is detected as newly changed", async () => {
+    const baseline = {
+      treeHash: "abc",
+      files: { "src/main.js": "hash-main" },
+    };
+    const currentManifest = {
+      treeHash: "def",
+      files: {
+        "src/main.js": "hash-main",
+        "plugins/new.js": "hash-new",
+      },
+    };
+    const fakeTool = fakeCallToolForP3WithBaseline({
+      statusOutput: " M src/main.js\n?? plugins/new.js\n",
+      currentManifest,
+    });
+    const result = await runDeliverablesProbe({
+      deliverables: ["plugins"],
+      headingPresent: true,
+      callTool: fakeTool,
+      container: "fake-cid",
+      baseline,
+    });
+    assert.equal(result.probe, "P3: deliverables");
+    assert.equal(result.passed, true);
+    assert.match(result.detail, /touches declared deliverables/);
+  });
+
+  it("newlyChangedPaths contains only what changed since baseline, not all dirty paths", async () => {
+    const baseline = {
+      treeHash: "abc",
+      files: { "src/old.js": "hash-old", "docs/guide.md": "hash-guide" },
+    };
+    const currentManifest = {
+      treeHash: "def",
+      files: {
+        "src/old.js": "hash-old",
+        "docs/guide.md": "hash-guide",
+        "src/new.js": "hash-new",
+      },
+    };
+    const fakeTool = fakeCallToolForP3WithBaseline({
+      statusOutput: " M src/old.js\n M docs/guide.md\n?? src/new.js\n",
+      currentManifest,
+    });
+    const result = await runDeliverablesProbe({
+      deliverables: ["src/old.js"],
+      headingPresent: true,
+      callTool: fakeTool,
+      container: "fake-cid",
+      baseline,
+    });
+    // src/old.js is in both manifests with same hash → not newly changed
+    // src/new.js is new → changed, but it's not a deliverable
+    assert.equal(result.passed, false);
+    assert.deepEqual(result.newlyChangedPaths, ["src/new.js"]);
+    assert.deepEqual(result.changedPaths, ["src/old.js", "docs/guide.md", "src/new.js"]);
+  });
 });
 
 // buildImplementText  —  pure, extracted from cmdChain (chain-phases.mjs)
@@ -598,6 +734,56 @@ describe("shouldSkipReview", () => {
     });
     assert.equal(result, false);
   });
+
+  // The cases above omit chainNewlyChanged, so they only exercise the
+  // fallback.  In production runProbePhase always passes it — these cover
+  // that path.
+
+  it("skips review when the round changed nothing since the baseline, even though the tree is dirty", () => {
+    // This is the case the baseline exists for: the tree carries a previous
+    // chain's work, so chainChangedPaths is non-empty, but this round added
+    // nothing of its own.
+    const result = shouldSkipReview({
+      chainStatusObserved: true,
+      chainChangedPaths: ["src/foo.js", "src/bar.js"],
+      chainNewlyChanged: [],
+      chainDeliverables: ["src/foo.js"],
+    });
+    assert.equal(result, true);
+  });
+
+  it("does not skip review when the round changed a file, even if it was already dirty", () => {
+    const result = shouldSkipReview({
+      chainStatusObserved: true,
+      chainChangedPaths: ["src/foo.js"],
+      chainNewlyChanged: ["src/foo.js"],
+      chainDeliverables: ["src/foo.js"],
+    });
+    assert.equal(result, false);
+  });
+
+  it("an unmeasurable round (null) is not treated as an empty one", () => {
+    // null means the comparison could not be made.  Falling through to
+    // chainChangedPaths keeps a real change set visible; collapsing null to []
+    // here would discard a round because the measurement broke.
+    const result = shouldSkipReview({
+      chainStatusObserved: true,
+      chainChangedPaths: ["src/foo.js"],
+      chainNewlyChanged: null,
+      chainDeliverables: ["src/foo.js"],
+    });
+    assert.equal(result, false);
+  });
+
+  it("an unmeasurable round on a genuinely empty tree still skips", () => {
+    const result = shouldSkipReview({
+      chainStatusObserved: true,
+      chainChangedPaths: [],
+      chainNewlyChanged: null,
+      chainDeliverables: ["src/foo.js"],
+    });
+    assert.equal(result, true);
+  });
 });
 
 // computeChainTotals  —  pure, extracted from cmdChain (chain-phases.mjs)
@@ -788,8 +974,8 @@ describe("renderEscalateOutcome", () => {
     ];
     const disposition = { disposition: "escalate", reason: "repeated areas" };
     const result = renderEscalateOutcome({ chainId, round: 2, disposition, orchestrator: null, roundRecord, records });
-    assert.ok(result.includes("Round 1: model=test/gpt-4, verdict=needs-attention, probesGreen=false, resume=continue_session"));
-    assert.ok(result.includes("Round 2: model=test/gpt-4o, verdict=needs-attention, probesGreen=true, resume=fresh_session: new session"));
+    assert.ok(result.includes("Round 1: model=test/gpt-4, verdict=needs-attention, probesGreen=false, changed=unknown, resume=continue_session"));
+    assert.ok(result.includes("Round 2: model=test/gpt-4o, verdict=needs-attention, probesGreen=true, changed=unknown, resume=fresh_session: new session"));
   });
 
   it("renders 'unknown' when reason is missing", () => {
@@ -818,8 +1004,8 @@ describe("renderMaxRoundsOutcome", () => {
     assert.ok(result.includes("orchestrator=gpt-5"));
     assert.ok(result.includes("Remaining findings:"));
     assert.ok(result.includes("still has bugs"));
-    assert.ok(result.includes("Round 1: model=test/gpt-4, verdict=needs-attention, probesGreen=false, resume=continue_session"));
-    assert.ok(result.includes("Round 2: model=test/gpt-4o, verdict=needs-attention, probesGreen=true, resume=fresh_session"));
+    assert.ok(result.includes("Round 1: model=test/gpt-4, verdict=needs-attention, probesGreen=false, changed=unknown, resume=continue_session"));
+    assert.ok(result.includes("Round 2: model=test/gpt-4o, verdict=needs-attention, probesGreen=true, changed=unknown, resume=fresh_session"));
     assert.ok(result.includes("Hand over to orchestrator for final judgement."));
   });
 
@@ -910,8 +1096,8 @@ describe("renderProviderExhaustedOutcome", () => {
     });
 
     assert.ok(result.includes("Prior rounds:"));
-    assert.ok(result.includes("Round 1: model=provider/model-a, verdict=needs-attention, probesGreen=true, resume=continue_session"));
-    assert.ok(result.includes("Round 2: model=provider/model-b, verdict=n/a, probesGreen=false, resume=fresh_session"));
+    assert.ok(result.includes("Round 1: model=provider/model-a, verdict=needs-attention, probesGreen=true, changed=unknown, resume=continue_session"));
+    assert.ok(result.includes("Round 2: model=provider/model-b, verdict=n/a, probesGreen=false, changed=unknown, resume=fresh_session"));
   });
 
   it("handles null jobError gracefully", () => {
