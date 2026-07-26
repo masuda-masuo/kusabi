@@ -18,7 +18,7 @@ import process from "node:process";
 import { execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
-import { stateRoot, stateDirFor, readJson } from "./state-paths.mjs";
+import { stateRoot, stateDirFor, readJson, writeJson } from "./state-paths.mjs";
 import { collectChainRecords, computeStats, renderChainStats, renderComparison } from "./chain-stats.mjs";
 import { jobDir, saveJob, loadJob, listJobs, latestJob } from "./job-store.mjs";
 import { opencodeBin, serverHealthy, ensureServer, reapIdleServes, api } from "./serve-lifecycle.mjs";
@@ -43,7 +43,7 @@ import {
   renderAcceptWithFollowupOutcome,
   renderEscalateOutcome,
   renderMaxRoundsOutcome,
-  renderProviderExhaustedOutcome,
+  handleProviderExhaustion,
 } from "./chain-phases.mjs";
 
 // Import the probe functions locally so cmdTask can call them directly.
@@ -884,19 +884,16 @@ async function cmdChain(cwd, { flags, text }) {
 
       // ---- stop on implement provider exhaustion ----
       if (implementJobStatus === "provider-error") {
-        roundRecord.tierAfter = currentTierIndex;
-        records.push(roundRecord);
-        const chainTotals = computeChainTotals(records);
-        persistChainState({
-          chainDir, round, roundRecord, chainId, container, model, modelChain,
-          maxRounds, brief, orchestrator, records, baseSha, chainTotals,
+        const { chainState, outcome } = handleProviderExhaustion({
+          records, roundRecord,
+          currentTierIndex, phase: "implement", jobError: implementJobError,
+          chainId, round, container, model, modelChain,
+          maxRounds, brief, orchestrator, baseSha,
           strategized, chainFollowupDraft: null,
         });
-        return renderProviderExhaustedOutcome({
-          chainId, round, phase: "implement",
-          jobError: implementJobError,
-          records,
-        });
+        writeJson(path.join(chainDir, "round-" + round + ".json"), roundRecord);
+        writeJson(path.join(chainDir, "chain.json"), chainState);
+        return outcome;
       }
 
       // ---- phase 4: deterministic probes (P1–P4) ----
@@ -920,19 +917,16 @@ async function cmdChain(cwd, { flags, text }) {
 
       // ---- stop on review provider exhaustion ----
       if (reviewJobStatus === "provider-error") {
-        roundRecord.tierAfter = currentTierIndex;
-        records.push(roundRecord);
-        const chainTotals = computeChainTotals(records);
-        persistChainState({
-          chainDir, round, roundRecord, chainId, container, model, modelChain,
-          maxRounds, brief, orchestrator, records, baseSha, chainTotals,
+        const { chainState, outcome } = handleProviderExhaustion({
+          records, roundRecord,
+          currentTierIndex, phase: "review", jobError: reviewJobError,
+          chainId, round, container, model, modelChain,
+          maxRounds, brief, orchestrator, baseSha,
           strategized, chainFollowupDraft: null,
         });
-        return renderProviderExhaustedOutcome({
-          chainId, round, phase: "review",
-          jobError: reviewJobError,
-          records,
-        });
+        writeJson(path.join(chainDir, "round-" + round + ".json"), roundRecord);
+        writeJson(path.join(chainDir, "chain.json"), chainState);
+        return outcome;
       }
 
       // ---- phase 6: derive disposition ----
@@ -1020,21 +1014,18 @@ async function cmdChain(cwd, { flags, text }) {
 
         // ---- stop on strategize provider exhaustion ----
         if (strategistJobStatus === "provider-error") {
-          // roundRecord was already pushed onto records during phase 7,
-          // so we must NOT push it again -- implement and review
-          // provider-error handlers push before phase 7 runs, but
-          // strategize runs after phase 7 (which already pushed).
-          const chainTotals = computeChainTotals(records);
-          persistChainState({
-            chainDir, round, roundRecord, chainId, container, model, modelChain,
-            maxRounds, brief, orchestrator, records, baseSha, chainTotals,
+          // roundRecord was already pushed onto records during phase 7;
+          // handleProviderExhaustion detects that and does not push again.
+          const { chainState, outcome } = handleProviderExhaustion({
+            records, roundRecord,
+            currentTierIndex, phase: "strategize", jobError: strategistJobError,
+            chainId, round, container, model, modelChain,
+            maxRounds, brief, orchestrator, baseSha,
             strategized, chainFollowupDraft,
           });
-          return renderProviderExhaustedOutcome({
-            chainId, round, phase: "strategize",
-            jobError: strategistJobError,
-            records,
-          });
+          writeJson(path.join(chainDir, "round-" + round + ".json"), roundRecord);
+          writeJson(path.join(chainDir, "chain.json"), chainState);
+          return outcome;
         }
 
         strategized = true;

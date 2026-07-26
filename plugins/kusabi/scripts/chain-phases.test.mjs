@@ -10,6 +10,7 @@ import {
   renderEscalateOutcome,
   renderMaxRoundsOutcome,
   renderProviderExhaustedOutcome,
+  handleProviderExhaustion,
   runSmokeProbe,
   runHeadCleanProbe,
   runVerifyProbe,
@@ -978,8 +979,243 @@ describe("renderProviderExhaustedOutcome", () => {
   });
 });
 
-// parseReviewResult — pure function for decision-path review parsing (AC3, AC4)
+// handleProviderExhaustion — pure, testable
 // =========================================================================
+
+describe("handleProviderExhaustion", () => {
+  const chainId = "chain-test-provider-error-1";
+  const baseState = {
+    chainId,
+    round: 3,
+    container: "test-container",
+    model: "test-model",
+    modelChain: ["test-model"],
+    maxRounds: 5,
+    brief: "Test brief",
+    orchestrator: "test-orchestrator",
+    baseSha: "abc1234",
+    strategized: false,
+  };
+
+  function makeRecords(rounds) {
+    return rounds.map((r) => ({
+      round: r,
+      modelEntry: "provider/model-" + r,
+      verdict: "needs-attention",
+      probesGreen: true,
+      resumeMethod: { type: "continue_session" },
+    }));
+  }
+
+  // ---- implement ----
+
+  it("implement provider-error: the round appears exactly once in records", () => {
+    const records = makeRecords([1, 2]);
+    const roundRecord = { round: 3, modelEntry: "provider/model-3", verdict: null };
+
+    const result = handleProviderExhaustion({
+      records,
+      roundRecord,
+      currentTierIndex: 0,
+      phase: "implement",
+      jobError: "All routes exhausted",
+      chainFollowupDraft: null,
+      ...baseState,
+    });
+
+    assert.equal(result.records.length, 3, "records should have 3 entries");
+    const round3Entries = result.records.filter((r) => r.round === 3);
+    assert.equal(round3Entries.length, 1, "round 3 must appear exactly once");
+    assert.equal(round3Entries[0].tierAfter, 0, "tierAfter must be set");
+    assert.ok(result.outcome.includes("implement provider exhausted"),
+      "outcome names the implement phase");
+  });
+
+  // ---- review ----
+
+  it("review provider-error: the round appears exactly once in records", () => {
+    const records = makeRecords([1, 2]);
+    const roundRecord = { round: 3, modelEntry: "provider/model-3", verdict: null };
+
+    const result = handleProviderExhaustion({
+      records,
+      roundRecord,
+      currentTierIndex: 1,
+      phase: "review",
+      jobError: "All routes exhausted",
+      chainFollowupDraft: null,
+      ...baseState,
+    });
+
+    assert.equal(result.records.length, 3, "records should have 3 entries");
+    const round3Entries = result.records.filter((r) => r.round === 3);
+    assert.equal(round3Entries.length, 1, "round 3 must appear exactly once");
+    assert.equal(round3Entries[0].tierAfter, 1, "tierAfter must be set");
+    assert.ok(result.outcome.includes("review provider exhausted"),
+      "outcome names the review phase");
+  });
+
+  // ---- strategize (the bug PR #119 fixed) ----
+
+  it("strategize provider-error: the round appears exactly once in records (no duplicate)", () => {
+    // round 3 has already been pushed by phase 7 — simulate that state
+    const records = makeRecords([1, 2]);
+    const roundRecord = { round: 3, modelEntry: "provider/model-3", verdict: null };
+    records.push(roundRecord);
+
+    const result = handleProviderExhaustion({
+      records,
+      roundRecord,
+      currentTierIndex: 0,
+      phase: "strategize",
+      jobError: "All routes exhausted",
+      chainFollowupDraft: null,
+      ...baseState,
+    });
+
+    // Must NOT push the round a second time
+    assert.equal(result.records.length, 3, "records should still have 3 entries (no duplicate)");
+    const round3Entries = result.records.filter((r) => r.round === 3);
+    assert.equal(round3Entries.length, 1, "round 3 must appear exactly once");
+    assert.equal(round3Entries[0].tierAfter, 0, "tierAfter must be set on the existing record");
+    assert.ok(result.outcome.includes("strategize provider exhausted"),
+      "outcome names the strategize phase");
+  });
+
+  // ---- persisted state ----
+
+  it("persisted chainState for implement contains the round exactly once", () => {
+    const records = makeRecords([1]);
+    const roundRecord = { round: 2, modelEntry: "provider/model-2" };
+
+    const result = handleProviderExhaustion({
+      records, roundRecord,
+      currentTierIndex: 0,
+      phase: "implement",
+      jobError: "error detail",
+      chainFollowupDraft: null,
+      ...baseState, round: 2,
+    });
+
+    const round2InState = result.chainState.records.filter((r) => r.round === 2);
+    assert.equal(round2InState.length, 1, "chainState records must contain round 2 exactly once");
+    assert.equal(round2InState[0].tierAfter, 0, "tierAfter must be reflected in chainState");
+  });
+
+  it("persisted chainState for review contains the round exactly once", () => {
+    const records = makeRecords([1]);
+    const roundRecord = { round: 2, modelEntry: "provider/model-2" };
+
+    const result = handleProviderExhaustion({
+      records, roundRecord,
+      currentTierIndex: 1,
+      phase: "review",
+      jobError: "error detail",
+      chainFollowupDraft: null,
+      ...baseState, round: 2,
+    });
+
+    const round2InState = result.chainState.records.filter((r) => r.round === 2);
+    assert.equal(round2InState.length, 1, "chainState records must contain round 2 exactly once");
+  });
+
+  it("persisted chainState for strategize contains the round exactly once", () => {
+    const records = makeRecords([1]);
+    const roundRecord = { round: 2, modelEntry: "provider/model-2" };
+    records.push(roundRecord); // already recorded by phase 7
+
+    const result = handleProviderExhaustion({
+      records, roundRecord,
+      currentTierIndex: 0,
+      phase: "strategize",
+      jobError: "error detail",
+      chainFollowupDraft: null,
+      ...baseState, round: 2,
+    });
+
+    // chainState records must contain round 2 exactly once
+    const round2InState = result.chainState.records.filter((r) => r.round === 2);
+    assert.equal(round2InState.length, 1, "chainState records must contain round 2 exactly once");
+  });
+
+  // ---- the push decision is derived, not supplied ----
+
+  it("never duplicates a round that is already in records, whatever the phase", () => {
+    // The caller used to pass a roundAlreadyRecorded flag.  A call site that got
+    // it wrong would silently duplicate the round (the PR #119 defect) and no
+    // test of this function could have caught it, because the function would
+    // have been doing exactly what it was told.  The decision is now derived
+    // from records, so there is no flag left to get wrong.
+    for (const phase of ["implement", "review", "strategize"]) {
+      const records = makeRecords([1]);
+      const roundRecord = { round: 2, modelEntry: "provider/model-2" };
+      records.push(roundRecord);
+
+      const result = handleProviderExhaustion({
+        records, roundRecord,
+        currentTierIndex: 0,
+        phase,
+        jobError: "error detail",
+        chainFollowupDraft: null,
+        ...baseState, round: 2,
+      });
+
+      const occurrences = result.chainState.records.filter((r) => r === roundRecord);
+      assert.equal(occurrences.length, 1, `round duplicated for phase ${phase}`);
+    }
+  });
+
+  it("pushes a round that is not yet in records, whatever the phase", () => {
+    for (const phase of ["implement", "review", "strategize"]) {
+      const records = makeRecords([1]);
+      const roundRecord = { round: 2, modelEntry: "provider/model-2" };
+
+      const result = handleProviderExhaustion({
+        records, roundRecord,
+        currentTierIndex: 0,
+        phase,
+        jobError: "error detail",
+        chainFollowupDraft: null,
+        ...baseState, round: 2,
+      });
+
+      const occurrences = result.chainState.records.filter((r) => r === roundRecord);
+      assert.equal(occurrences.length, 1, `round missing or duplicated for phase ${phase}`);
+    }
+  });
+
+  // ---- outcome names the phase ----
+
+  it("rendered outcome names each failing phase", () => {
+    const phases = [
+      { phase: "implement",  alreadyRecorded: false },
+      { phase: "review",     alreadyRecorded: false },
+      { phase: "strategize", alreadyRecorded: true },
+    ];
+
+    for (const { phase, alreadyRecorded } of phases) {
+      const records = makeRecords([1]);
+      const roundRecord = { round: 2, modelEntry: "provider/model-2" };
+      if (alreadyRecorded) records.push(roundRecord);
+
+      const result = handleProviderExhaustion({
+        records, roundRecord,
+        currentTierIndex: 0,
+        phase,
+        jobError: "error detail",
+        chainFollowupDraft: null,
+        ...baseState, round: 2,
+      });
+
+      assert.ok(
+        result.outcome.includes(phase + " provider exhausted"),
+        "outcome must name the phase: " + phase,
+      );
+    }
+  });
+});
+
+// parseReviewResult — pure function for decision-path review parsing (AC3, AC4)// =========================================================================
 
 describe("parseReviewResult", () => {
   // AC3: VERDICT token inside JSON fence with findings recovery

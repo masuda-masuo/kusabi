@@ -868,3 +868,104 @@ export async function runDeliverablesProbe({ deliverables, headingPresent, callT
   probeResult.statusOutput = statusOutput;
   return probeResult;
 }
+
+// =========================================================================
+// Provider-exhaustion handler — extracted for testability
+// =========================================================================
+
+/**
+ * Handle provider exhaustion for a chain phase.
+ *
+ * Pure function that decides what goes into `records`, what gets persisted,
+ * and what outcome is rendered when a phase job returns
+ * `status === "provider-error"`.
+ *
+ * Whether the round still needs pushing depends on where the failing phase
+ * sits relative to phase 7's unconditional push: implement and review return
+ * before it, strategize (phase 9) runs after it.  **That is detected here, not
+ * passed in.**  A caller that got such a flag wrong would silently duplicate or
+ * drop the round — the exact defect PR #119 fixed — and no test of this
+ * function could catch a mistake made at the call site.
+ *
+ * @param {Object} opts
+ * @param {Array}  opts.records             - Chain records so far (mutated in place).
+ * @param {Object} opts.roundRecord          - Current round record (mutated: tierAfter set).
+ * @param {number} opts.currentTierIndex     - Tier index to record as `tierAfter`.
+ * @param {string} opts.phase               - Phase name ("implement", "review", "strategize").
+ * @param {string|null} [opts.jobError=null] - Provider error detail.
+ * @param {string} opts.chainId
+ * @param {number} opts.round
+ * @param {string} opts.container
+ * @param {string} opts.model
+ * @param {Array}  opts.modelChain
+ * @param {number} opts.maxRounds
+ * @param {string} opts.brief
+ * @param {string} opts.orchestrator
+ * @param {string} opts.baseSha
+ * @param {boolean} opts.strategized
+ * @param {string|null} [opts.chainFollowupDraft=null]
+ * @returns {{ records: Array, chainState: Object, outcome: string }}
+ *   - `records`   — the (mutated) records array with roundRecord present exactly once.
+ *   - `chainState` — the object that should be written to chain.json.
+ *   - `outcome`    — the rendered outcome string for the operator.
+ */
+export function handleProviderExhaustion({
+  records,
+  roundRecord,
+  currentTierIndex,
+  phase,
+  jobError = null,
+  chainId,
+  round,
+  container,
+  model,
+  modelChain,
+  maxRounds,
+  brief,
+  orchestrator,
+  baseSha,
+  strategized,
+  chainFollowupDraft = null,
+}) {
+  // Record the tier after this round
+  roundRecord.tierAfter = currentTierIndex;
+
+  // Whether the round was already pushed depends on where the failing phase sits
+  // relative to phase 7's unconditional push: implement and review return before
+  // it, strategize runs after it.  That is derived here rather than passed in by
+  // the caller — a caller that got the flag wrong would silently duplicate or
+  // drop the round, which is the exact bug PR #119 fixed.
+  if (!records.includes(roundRecord)) {
+    records.push(roundRecord);
+  }
+
+  // Compute totals across all rounds
+  const chainTotals = computeChainTotals(records);
+
+  // Build the chain state object (what would be persisted to chain.json)
+  const chainState = {
+    chainId,
+    container,
+    model,
+    modelChain,
+    maxRounds,
+    brief,
+    orchestrator,
+    records,
+    baseSha,
+    chainTotals,
+    strategized,
+    followupIssueDraft: chainFollowupDraft,
+  };
+
+  // Render outcome
+  const outcome = renderProviderExhaustedOutcome({
+    chainId,
+    round,
+    phase,
+    jobError,
+    records,
+  });
+
+  return { records, chainState, outcome };
+}
