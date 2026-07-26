@@ -26,6 +26,7 @@ import {
   fakeCallToolForP2,
   fakeCallToolForP3,
 } from "./fixtures.mjs";
+import { renderPriorFindings } from "./render.mjs";
 
 describe("runSmokeProbe", () => {
   it("observes exit 0 for a command whose output far exceeds page size", async () => {
@@ -425,6 +426,125 @@ describe("buildImplementText", () => {
     const prev = { findingsText: "some findings" };
     const result = buildImplementText({ round: 2, brief, previousRecord: prev });
     assert.ok(!result.includes("Strategist recommendation"));
+  });
+
+  it("includes body and recommendation of a prior finding when structured findings exist", () => {
+    const prev = {
+      findings: [
+        {
+          severity: "high",
+          title: "Missing null check",
+          file: "src/foo.js",
+          line_start: 42,
+          line_end: 45,
+          confidence: 0.9,
+          body: "The function bar() does not validate its input.",
+          recommendation: "Add a null guard at the top of bar().",
+        },
+      ],
+    };
+    const result = buildImplementText({ round: 2, brief, previousRecord: prev });
+    assert.ok(result.includes("Missing null check"));
+    assert.ok(result.includes("src/foo.js:42"));
+    assert.ok(result.includes("The function bar() does not validate its input."));
+    assert.ok(result.includes("Add a null guard at the top of bar()."));
+  });
+
+  it("includes the instruction that findings must be resolved or reported", () => {
+    const prev = {
+      findingsText: "some findings",
+      findings: [
+        { severity: "low", title: "Naming", file: "a.js", line_start: 1, line_end: 1, confidence: 0.5, body: "x", recommendation: "rename" },
+      ],
+    };
+    const result = buildImplementText({ round: 2, brief, previousRecord: prev });
+    assert.ok(result.includes("## Instruction"));
+    assert.ok(result.includes("Resolve each prior finding"));
+    assert.ok(result.includes("cannot be fully resolved"));
+    assert.ok(result.includes("explain why"));
+  });
+
+  it("marks truncation when the prior findings block exceeds the budget", () => {
+    // Build a finding with a long body to exceed the 8000-char PRIOR_FINDINGS_BUDGET
+    const longBody = "A".repeat(8100);
+    const prev = {
+      findings: [
+        {
+          severity: "medium",
+          title: "Long finding",
+          file: "big.js",
+          line_start: 1,
+          line_end: 10,
+          confidence: 0.8,
+          body: longBody,
+          recommendation: "short fix",
+        },
+      ],
+    };
+    const result = buildImplementText({ round: 2, brief, previousRecord: prev });
+    assert.ok(result.includes("Prior findings truncated to"));
+    assert.ok(result.includes("8000"));
+  });
+
+  it("does not mark truncation when the prior findings block is under the budget", () => {
+    const prev = {
+      findings: [
+        {
+          severity: "low",
+          title: "Tiny issue",
+          file: "small.js",
+          line_start: 1,
+          line_end: 2,
+          confidence: 0.9,
+          body: "Short body.",
+          recommendation: "Fix it.",
+        },
+      ],
+    };
+    const result = buildImplementText({ round: 2, brief, previousRecord: prev });
+    assert.ok(!result.includes("Prior findings truncated to"));
+    assert.ok(!result.includes("truncated"));
+  });
+
+  it("produces a usable prompt without throwing when previous record has no structured findings", () => {
+    const prev = { findingsText: "[high] Old issue (old.js:5)" };
+    const result = buildImplementText({ round: 2, brief, previousRecord: prev });
+    assert.ok(result.includes("## Prior findings"));
+    assert.ok(result.includes("[high] Old issue (old.js:5)"));
+    assert.ok(result.includes("## Acceptance criteria"));
+  });
+
+  it("produces a usable prompt without throwing when previous record is empty", () => {
+    const prev = {};
+    const result = buildImplementText({ round: 2, brief, previousRecord: prev });
+    assert.ok(result.includes("## Prior findings"));
+    assert.ok(result.includes("(none)"));
+    assert.ok(result.includes("## Acceptance criteria"));
+  });
+});
+
+// renderPriorFindings — pure function exported from render.mjs
+// =========================================================================
+
+describe("renderPriorFindings", () => {
+
+  it("returns '(none)' when previousRecord is null", () => {
+    assert.equal(renderPriorFindings(null), "(none)");
+  });
+
+  it("returns '(none)' when previousRecord is undefined", () => {
+    assert.equal(renderPriorFindings(undefined), "(none)");
+  });
+
+  it("falls back to findingsText when no structured findings array", () => {
+    const prev = { findingsText: "[high] thing (f:1)" };
+    const result = renderPriorFindings(prev);
+    assert.equal(result, "[high] thing (f:1)");
+  });
+
+  it("falls back to '(none)' when no findingsText and no findings array", () => {
+    const prev = {};
+    assert.equal(renderPriorFindings(prev), "(none)");
   });
 });
 
