@@ -7,7 +7,7 @@
 // session never sees intermediate narration, tool logs, or raw events.
 
 
-import { parseArgs, parseModel, resolveModel, reviewDenyTools, explainDenyTools, WRITE_TOOL_NAMES, validateChainEntries } from "./cli.mjs";
+import { parseArgs, parseModel, resolveModel, reviewDenyTools, WRITE_TOOL_NAMES, validateChainEntries } from "./cli.mjs";
 import { renderReview, renderChainShow, renderJobLine, renderHeader, extractJson, renderFollowupDraft } from "./render.mjs";
 import { hasSectionHeading, parseDeliverables, parseSmoke, parseOrchestratorSignature } from "./brief-parsing.mjs";
 import { deriveDisposition, deriveReworkStrategy } from "./disposition.mjs";
@@ -237,207 +237,6 @@ export function readBriefFile(flags, text) {
   return text;
 }
 
-
-// ---------------------------------------------------------------------------
-// explain helpers — pure functions, exported for testing
-// ---------------------------------------------------------------------------
-
-/**
- * Convert an absolute path to the Claude Code directory slug format.
- * Replaces `/` and `.` with `-`.
- * @param {string} cwd - Absolute working directory path
- * @returns {string} Slug, e.g. "/home/u/dev/x" -> "-home-u-dev-x"
- */
-export function cwdSlug(cwd) {
-  return cwd.replace(/[/.]/g, "-");
-}
-
-/**
- * Find the newest `*.jsonl` file under `<baseDir>/<cwdSlug>/`.
- * @param {{ baseDir: string, cwdSlug: string }} opts
- * @returns {string|null} Absolute path to the newest JSONL file, or null if none found.
- */
-export function findTranscriptFile({ baseDir, cwdSlug: slug }) {
-  const dir = path.join(baseDir, slug);
-  if (!fs.existsSync(dir)) return null;
-  const files = fs.readdirSync(dir)
-    .filter(function (f) { return f.endsWith(".jsonl"); })
-    .map(function (f) {
-      const fullPath = path.join(dir, f);
-      try {
-        return { name: f, mtime: fs.statSync(fullPath).mtimeMs };
-      } catch {
-        return null;
-      }
-    })
-    .filter(Boolean)
-    .sort(function (a, b) {
-      const mtimeDiff = b.mtime - a.mtime;
-      if (mtimeDiff !== 0) return mtimeDiff;
-      // Tiebreak: lexicographic by name for deterministic selection
-      return a.name.localeCompare(b.name);
-    });
-  return files.length > 0 ? path.join(dir, files[0].name) : null;
-}
-
-/**
- * Parse JSONL records from a transcript file.
- * @param {string} filePath
- * @returns {Array<object>}
- */
-function parseTranscript(filePath) {
-  const content = fs.readFileSync(filePath, "utf8");
-  return content
-    .split("\n")
-    .filter(function (line) { return line.trim() !== ""; })
-    .map(function (line) { return JSON.parse(line); });
-}
-
-/**
- * Extract text passages from the last N assistant (and optionally user)
- * messages in transcript records, excluding tool_use / tool_result / thinking
- * blocks by default.
- *
- * @param {Array<object>} records  - Parsed JSONL records from a transcript.
- * @param {object}        [opts]
- * @param {number}        [opts.lastN=1]         - How many assistant messages to include.
- * @param {boolean}       [opts.includeTools=false] - Also include tool_result blocks.
- * @returns {string} Concatenated text, trimmed.
- */
-export function extractAssistantText(records, { lastN = 1, includeTools = false } = {}) {
-  // Walk backwards to find indices of the last N assistant records that
-  // actually carry a text block.  In real transcripts each content block is
-  // its own record, so the trailing assistant records of an in-progress turn
-  // are tool_use-only and must be skipped, not treated as "no text found".
-  const assistantIndices = [];
-  for (let i = records.length - 1; i >= 0 && assistantIndices.length < lastN; i--) {
-    if (records[i].type !== "assistant") continue;
-    const content = records[i].message?.content;
-    if (!Array.isArray(content)) continue;
-    if (content.some(function (b) { return b.type === "text" && b.text; })) {
-      assistantIndices.unshift(i);
-    }
-  }
-
-  if (assistantIndices.length === 0) return "";
-
-  // Bound the slice at BOTH ends by the selected assistant records — not
-  // just the start. The backwards scan makes assistantIndices[last] the
-  // FINAL text-carrying assistant record in the file, so every record after
-  // it is either a tool-use-only assistant record or user-side content —
-  // and at explain time the trailing user content is the in-flight
-  // `/kusabi:explain` command expansion itself (the literal "Run: ```bash
-  // node .../kusabi-companion.mjs explain ..." block that self-replicated
-  // in the kusabi #136 incident). A tail-inclusive slice quoted that block
-  // straight into the worker prompt, and the worker obeyed it.
-  //
-  // Interleaved user messages BETWEEN selected assistant messages (the
-  // documented reason for collecting more than just the assistant records
-  // themselves, e.g. with `--last N > 1`) still fall inside this bounded
-  // slice, so that behaviour is preserved — only the open-ended tail is cut.
-  //
-  // Consequence for `--tools` (includeTools): tool_result blocks are only
-  // ever included when they lie within this bounded slice, so trailing
-  // tool_result records after the last assistant text are now excluded too.
-  // This narrowing is intentional, not incidental.
-  const relevantRecords = records.slice(
-    assistantIndices[0],
-    assistantIndices[assistantIndices.length - 1] + 1,
-  );
-
-  const parts = [];
-  for (let ri = 0; ri < relevantRecords.length; ri++) {
-    const record = relevantRecords[ri];
-    const content = record.message?.content;
-    if (!Array.isArray(content)) continue;
-    for (let bi = 0; bi < content.length; bi++) {
-      const block = content[bi];
-      if (block.type === "text" && block.text) {
-        parts.push(block.text);
-      } else if (includeTools && block.type === "tool_result") {
-        // Real transcripts carry the payload in block.content as a string or
-        // an array of {type:"text", text} items; block.text is a fallback.
-        const payload = block.content;
-        if (typeof payload === "string") {
-          parts.push(payload);
-        } else if (Array.isArray(payload)) {
-          for (const item of payload) {
-            if (item && item.type === "text" && item.text) parts.push(item.text);
-          }
-        } else if (block.text != null) {
-          parts.push(block.text);
-        }
-      }
-    }
-  }
-
-  return parts.join("\n").trim();
-}
-
-/**
- * Resolve the passage to explain: either an explicit `--quote`, or the
- * last assistant text block extracted from the Claude Code session
- * transcript under `<baseDir>/<cwdSlug>/`.
- *
- * Throws a clear error when the transcript is missing, unreadable, empty,
- * or contains no assistant text.  The CLI entry point translates these to
- * non-zero exit.
- *
- * @param {object} opts
- * @param {string}        opts.baseDir - Base directory (e.g. ~/.claude/projects)
- * @param {string}        opts.cwd     - Current working directory
- * @param {string|undefined} opts.quote  - Explicit passage (--quote flag)
- * @param {number}        opts.last    - Positive integer (--last N, default 1)
- * @param {boolean}       opts.tools   - Include tool results (--tools flag)
- * @returns {{ passage: string, source: "quote" | "transcript" }}
- */
-export function resolveExplainPassage({ baseDir, cwd, quote, last = 1, tools = false }) {
-  // Validate --last: must be a positive integer
-  if (!Number.isFinite(last) || last < 1 || !Number.isInteger(last)) {
-    throw new Error(`--last must be a positive integer, got: ${String(last)}`);
-  }
-
-  if (quote !== undefined) {
-    if (quote.trim() === "") {
-      throw new Error("--quote must not be empty");
-    }
-    return { passage: quote, source: "quote" };
-  }
-
-  const slug = cwdSlug(cwd);
-  const transcriptFile = findTranscriptFile({ baseDir, cwdSlug: slug });
-
-  if (!transcriptFile) {
-    throw new Error(
-      `No Claude Code transcript found for this directory. ` +
-      `Expected a *.jsonl file under ${path.join(baseDir, slug)}. ` +
-      `Claude Code may not have created a session transcript yet.`
-    );
-  }
-
-  let records;
-  try {
-    records = parseTranscript(transcriptFile);
-  } catch (err) {
-    throw new Error(`Failed to read transcript ${transcriptFile}: ${err.message}`);
-  }
-
-  if (records.length === 0) {
-    throw new Error(`Transcript ${transcriptFile} is empty.`);
-  }
-
-  const passage = extractAssistantText(records, { lastN: last, includeTools: tools });
-
-  if (!passage) {
-    throw new Error(
-      `No assistant text found in transcript ${transcriptFile}. ` +
-      `The session may not contain any assistant responses yet.`
-    );
-  }
-
-  return { passage, source: "transcript" };
-}
-
 // ---------------------------------------------------------------------------
 // subcommands
 // ---------------------------------------------------------------------------
@@ -595,64 +394,6 @@ async function cmdTask(cwd, { flags, text }) {
   }
 
   return taskOutput;
-}
-
-async function cmdExplain(cwd, { flags, text }) {
-  if (!text) {
-    throw new Error("explain requires a question. Usage: explain <question>");
-  }
-
-  // Resolve the passage: explicit --quote or transcript extraction.
-  const baseDir = path.join(os.homedir(), ".claude", "projects");
-  const last = flags.last === undefined ? 1 : Number(flags.last);
-  const { passage } = resolveExplainPassage({
-    baseDir,
-    cwd,
-    quote: flags.quote,
-    last,
-    tools: !!flags.tools,
-  });
-
-  // Build the worker prompt: the extracted passage + the user's question.
-  const promptText = [
-    "## Context from Claude Code transcript",
-    "",
-    passage,
-    "",
-    "## Question",
-    "",
-    text,
-  ].join("\n");
-
-  // Launch a cheap worker via the existing runPrompt path.
-  const config = loadConfig(stateRoot());
-  // No phase — use the first entry from the global chain (= cheap model).
-  const resolved = resolveModel({ flag: flags.model, phase: undefined, config });
-  const model = resolved.model;
-
-  const { job, resultText } = await runPrompt({
-    cwd,
-    kind: "explain",
-    title: "explain: " + text.slice(0, 80),
-    promptText,
-    agent: undefined,
-    model,
-    session: undefined,
-    // explain's whole job is "read the prompt, answer" — deny the entire
-    // tool surface (kusabi #136 fix 2). Compare cmdReview below, which
-    // passes reviewDenyTools(); the previous `tools: undefined` here left
-    // the explain worker with unrestricted bash, which is how the #136
-    // fork-bomb incident got a shell to re-invoke the companion from.
-    tools: explainDenyTools(),
-    timeoutS: Number(flags.timeout ?? 120),
-    watchdogS: 0,
-  });
-
-  if (job.status !== "completed") {
-    throw new Error("explain failed: " + (job.error || job.status));
-  }
-
-  return resultText || "(empty explanation)";
 }
 
 async function cmdReview(cwd, { flags, text }) {
@@ -1565,7 +1306,6 @@ function usage() {
     "  serve-stop Stop the background opencode server and remove its state file",
     "  install-agents  Copy phase agent definitions to OPENCODE_AGENT_DIR",
     "  salvage    Salvage a dead job (inspect progress and produce structured report)",
-    "  explain    Answer a question about the last assistant passage using a cheap worker model",
     "  help       Show this help message",
     "",
     "Flags:",
@@ -1578,9 +1318,6 @@ function usage() {
     "  --force (serve-stop: force kill the serve even when jobs are running)",
     "  --prior <text> (review: prior findings for anti-ratchet)",
     "  --max-rounds <N> (chain: max rounds, default 4)",
-    "  --last <N> (explain: include last N assistant/user exchanges, default 1)",
-    "  --tools (explain: also include tool results in context)",
-    "  --quote <text> (explain: use explicit passage instead of transcript extraction)",
     "  --since <ISO> (chain-stats: start of time range, inclusive)",
     "  --until <ISO> (chain-stats: end of time range, exclusive)",
     "  --compare <ISO> (chain-stats: show before/after comparison at cutoff)",
@@ -1614,8 +1351,7 @@ function usage() {
 //   review   -> runPrompt            (cmdReview)
 //   salvage  -> runPrompt            (cmdSalvage)
 //   chain    -> dispatchWithFallback via runImplementPhase, per round (cmdChain)
-//   explain  -> runPrompt            (cmdExplain)
-const JOB_CREATING_SUBCOMMANDS = new Set(["task", "review", "salvage", "chain", "explain"]);
+const JOB_CREATING_SUBCOMMANDS = new Set(["task", "review", "salvage", "chain"]);
 
 async function main() {
   const [subcommand, ...argv] = process.argv.slice(2);
@@ -1698,10 +1434,8 @@ async function main() {
     case "metrics-report":
     case "metricsReport":
       return cmdMetricsReport(cwd, parsed);
-    case "explain":
-      return cmdExplain(cwd, parsed);
     default:
-      throw new Error(`unknown subcommand: ${subcommand ?? "(none)"}. Use setup|task|review|chain|chain-show|chain-stats|metrics-ingest|metrics-report|chain-cancel|status|result|cancel|serve-stop|install-agents|salvage|explain`);
+      throw new Error(`unknown subcommand: ${subcommand ?? "(none)"}. Use setup|task|review|chain|chain-show|chain-stats|metrics-ingest|metrics-report|chain-cancel|status|result|cancel|serve-stop|install-agents|salvage`);
   }
 }
 

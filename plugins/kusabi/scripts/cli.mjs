@@ -15,24 +15,6 @@ export function reviewDenyTools() {
   );
 }
 
-// explain's entire job is "read the prompt, answer" — it has no legitimate
-// tool use at all. Deny strictly more than reviewDenyTools(): everything that
-// denies, plus the read/navigation surface (a compromised or confused
-// explain worker cannot even read the repo, let alone act on it). This is
-// the explicit-list route (kusabi #136 fix 2): no wildcard `"*": false` entry
-// is used because this repo has no vendored opencode types/docs confirming
-// the `tools` session parameter honours wildcard keys — shipping an
-// unverified wildcard as the *only* guard would be worse than no guard, so
-// the explicit deny list stands alone.
-export function explainDenyTools() {
-  return {
-    ...reviewDenyTools(),
-    ...Object.fromEntries(
-      ["read", "grep", "glob", "list", "webfetch", "todowrite", "todoread"].map((t) => [t, false]),
-    ),
-  };
-}
-
 export function parseArgs(argv) {
   const flags = {};
   const rest = [];
@@ -46,13 +28,13 @@ export function parseArgs(argv) {
     } else if (
       arg === "--auto" || arg === "--read-only" || arg === "--resume-last" ||
       arg === "--wait" || arg === "--background" || arg === "--keep-serve" || arg === "--help" || arg === "-h" ||
-      arg === "--tools" || arg === "--force" || arg === "--dry-run" || arg === "--json"
+      arg === "--force" || arg === "--dry-run" || arg === "--json"
     ) {
       const key = arg.startsWith("--")
         ? arg.slice(2).replace(/-([a-z])/g, (_, c) => c.toUpperCase())
         : arg.slice(1);
       flags[key] = true;
-    } else if (arg === "--base" || arg === "--model" || arg === "--agent" || arg === "--session" || arg === "--timeout" || arg === "--deny" || arg === "--watchdog" || arg === "--phase" || arg === "--container" || arg === "--prior" || arg === "--max-rounds" || arg === "--brief-file" || arg === "--last" || arg === "--quote" || arg === "--since" || arg === "--until" || arg === "--compare" || arg === "--transcript-dir" || arg === "--state-root" || arg === "--db") {
+    } else if (arg === "--base" || arg === "--model" || arg === "--agent" || arg === "--session" || arg === "--timeout" || arg === "--deny" || arg === "--watchdog" || arg === "--phase" || arg === "--container" || arg === "--prior" || arg === "--max-rounds" || arg === "--brief-file" || arg === "--since" || arg === "--until" || arg === "--compare" || arg === "--transcript-dir" || arg === "--state-root" || arg === "--db") {
       const flagName = arg.slice(2);
       const val = argv[++i];
       if (val === undefined || (typeof val === "string" && val.startsWith("--"))) {
