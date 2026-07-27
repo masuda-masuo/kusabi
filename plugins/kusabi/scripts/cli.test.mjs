@@ -6,6 +6,7 @@ import {
   resolveModel,
   implementDenyTools,
   reviewDenyTools,
+  explainDenyTools,
 } from "./cli.mjs";
 
 // parseArgs
@@ -452,6 +453,48 @@ describe("reviewDenyTools", () => {
   it("returns a fresh object on each call", () => {
     const a = reviewDenyTools();
     const b = reviewDenyTools();
+    assert.notEqual(a, b);
+    assert.deepEqual(a, b);
+  });
+});
+
+// explainDenyTools — deny map for explain-phase sessions (kusabi #136 fix 2)
+// ---------------------------------------------------------------------------
+
+describe("explainDenyTools", () => {
+  it("denies a strict superset of reviewDenyTools()", () => {
+    const explain = explainDenyTools();
+    const review = reviewDenyTools();
+    for (const key of Object.keys(review)) {
+      assert.equal(explain[key], false, `explainDenyTools should deny '${key}' (from reviewDenyTools)`);
+    }
+    // strict superset: explain denies at least one key review does not
+    const extraKeys = Object.keys(explain).filter((k) => !(k in review));
+    assert.ok(extraKeys.length > 0, "explainDenyTools should deny more than reviewDenyTools");
+  });
+
+  it("denies bash and read (explain has no legitimate tool use)", () => {
+    const result = explainDenyTools();
+    assert.equal(result.bash, false);
+    assert.equal(result.read, false);
+  });
+
+  it("denies the read/navigation surface: grep, glob, list, webfetch, todowrite, todoread", () => {
+    const result = explainDenyTools();
+    for (const key of ["grep", "glob", "list", "webfetch", "todowrite", "todoread"]) {
+      assert.equal(result[key], false, `explainDenyTools should deny '${key}'`);
+    }
+  });
+
+  it("all values are false", () => {
+    const result = explainDenyTools();
+    const allFalse = Object.values(result).every((v) => v === false);
+    assert.equal(allFalse, true);
+  });
+
+  it("returns a fresh object on each call", () => {
+    const a = explainDenyTools();
+    const b = explainDenyTools();
     assert.notEqual(a, b);
     assert.deepEqual(a, b);
   });

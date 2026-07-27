@@ -4,7 +4,38 @@ import { spawn } from "node:child_process";
 import process from "node:process";
 import {
   shouldReapServer,
+  buildServeEnv,
 } from "./serve-lifecycle.mjs";
+
+// buildServeEnv — env-building seam for ensureServer's spawn (kusabi #136 fix 3)
+// ---------------------------------------------------------------------------
+// Unit-tested at this seam rather than through ensureServer itself, per the
+// brief: asserting the marker without spawning a real opencode serve.
+
+describe("buildServeEnv", () => {
+  it("stamps KUSABI_WORKER_CONTEXT=1 into the returned env", () => {
+    const env = buildServeEnv({ PATH: "/usr/bin" }, "secret-pw");
+    assert.equal(env.KUSABI_WORKER_CONTEXT, "1");
+  });
+
+  it("also sets OPENCODE_SERVER_PASSWORD from the given password", () => {
+    const env = buildServeEnv({}, "secret-pw");
+    assert.equal(env.OPENCODE_SERVER_PASSWORD, "secret-pw");
+  });
+
+  it("preserves the rest of the base env untouched", () => {
+    const env = buildServeEnv({ PATH: "/usr/bin", HOME: "/home/x" }, "pw");
+    assert.equal(env.PATH, "/usr/bin");
+    assert.equal(env.HOME, "/home/x");
+  });
+
+  it("does not mutate the base env object passed in", () => {
+    const base = { PATH: "/usr/bin" };
+    buildServeEnv(base, "pw");
+    assert.equal(base.KUSABI_WORKER_CONTEXT, undefined);
+    assert.equal(base.OPENCODE_SERVER_PASSWORD, undefined);
+  });
+});
 
 // shouldReapServer — pure function: reap decision logic
 // ---------------------------------------------------------------------------

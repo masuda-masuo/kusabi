@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import os from "node:os";
 import path from "node:path";
 import fs from "node:fs";
+import { spawnSync } from "node:child_process";
 import {
   newestChainDir,
   PHASE_AGENTS,
@@ -469,16 +470,23 @@ describe("extractAssistantText", () => {
     assert.equal(extractAssistantText(records), "the actual last message");
   });
 
-  it("reads tool_result payloads in the real transcript shape (content array / string)", () => {
+  it("reads tool_result payloads in the real transcript shape (content array / string), when interleaved within the bounded slice", () => {
+    // Fix 1 (kusabi #136) bounds the slice at BOTH ends, so a tool_result
+    // record must sit BETWEEN two selected assistant records to be reachable
+    // — a trailing tool_result after the last assistant text is now out of
+    // range (see the dedicated bounded-slice test below). This test still
+    // exercises both real payload shapes (array-of-text-blocks and plain
+    // string), just placed where the new bound actually includes them.
     const records = [
-      makeRecord("assistant", [textBlock("checking output")]),
+      makeRecord("assistant", [textBlock("first")]),
       makeRecord("user", [
         { type: "tool_result", content: [{ type: "text", text: "array shaped" }] },
         { type: "tool_result", content: "string shaped" },
       ]),
+      makeRecord("assistant", [textBlock("checking output")]),
     ];
     assert.equal(extractAssistantText(records), "checking output");
-    const widened = extractAssistantText(records, { includeTools: true });
+    const widened = extractAssistantText(records, { lastN: 2, includeTools: true });
     assert.ok(widened.includes("array shaped"));
     assert.ok(widened.includes("string shaped"));
   });
@@ -554,6 +562,56 @@ describe("extractAssistantText", () => {
     assert.ok(last2.includes("hi there"));
     assert.ok(last2.includes("explain this code"));
     assert.ok(last2.includes("The code does X."));
+  });
+
+  // kusabi #136 incident regression: a trailing user record whose text is
+  // the in-flight `/kusabi:explain` command expansion (containing a literal
+  // "Run: ```bash node .../kusabi-companion.mjs explain ..." block) must
+  // never appear in the extracted passage. The old tail-inclusive slice
+  // (records.slice(startIdx)) quoted that block into the worker prompt,
+  // which is how one explain call self-replicated into 202 jobs.
+  it("kusabi #136 regression: trailing in-flight explain command text is excluded (lastN=1)", () => {
+    const records = [
+      makeRecord("assistant", [textBlock("here is the analysis you asked for")]),
+      makeRecord("user", [textBlock(
+        'Run: ```bash node /home/x/.claude/plugins/kusabi/scripts/kusabi-companion.mjs explain "q"```'
+      )]),
+    ];
+    const result = extractAssistantText(records, { lastN: 1 });
+    assert.equal(result, "here is the analysis you asked for");
+    assert.ok(!result.includes("kusabi-companion.mjs"));
+  });
+
+  it("lastN=2 still includes interleaved user text between two selected assistant messages", () => {
+    const records = [
+      makeRecord("assistant", [textBlock("a1")]),
+      makeRecord("user", [textBlock("interleaved question")]),
+      makeRecord("assistant", [textBlock("a2")]),
+    ];
+    const result = extractAssistantText(records, { lastN: 2 });
+    assert.ok(result.includes("a1"));
+    assert.ok(result.includes("interleaved question"));
+    assert.ok(result.includes("a2"));
+  });
+
+  it("trailing tool-use-only assistant records after the last text record are still skipped", () => {
+    const records = [
+      makeRecord("assistant", [textBlock("final text")]),
+      makeRecord("assistant", [toolUseBlock("bash", { cmd: "ls" })]),
+      makeRecord("assistant", [toolUseBlock("read", { file: "x" })]),
+    ];
+    const result = extractAssistantText(records, { lastN: 1 });
+    assert.equal(result, "final text");
+  });
+
+  it("bounded slice narrows --tools: trailing tool_result after the last assistant text is excluded", () => {
+    const records = [
+      makeRecord("assistant", [textBlock("final text")]),
+      makeRecord("user", [{ type: "tool_result", content: "trailing tool output" }]),
+    ];
+    const withTools = extractAssistantText(records, { lastN: 1, includeTools: true });
+    assert.equal(withTools, "final text");
+    assert.ok(!withTools.includes("trailing tool output"));
   });
 });
 
@@ -824,6 +882,78 @@ describe("PHASE_AGENTS", () => {
       const filePath = path.join(agentsDir, `${agentName}.md`);
       assert.ok(fs.existsSync(filePath), `agent file missing: ${filePath}`);
     }
+  });
+});
+
+// worker-context guard (kusabi #136 fix 3) — job-creating subcommands must
+// be refused when KUSABI_WORKER_CONTEXT is set, before any server contact.
+// These tests spawn the CLI as a real subprocess (execFile-style, via
+// spawnSync) since the guard lives in main()'s dispatch, not in an exported
+// function — it fires on process.env before parseArgs/dispatch even run, so
+// no live opencode serve is needed.
+// ---------------------------------------------------------------------------
+
+describe("worker-context guard (KUSABI_WORKER_CONTEXT)", () => {
+  const COMPANION_SCRIPT = path.join(import.meta.dirname, "kusabi-companion.mjs");
+
+  function runCompanion(args, { workerContext = false } = {}) {
+    const env = { ...process.env };
+    if (workerContext) env.KUSABI_WORKER_CONTEXT = "1";
+    else delete env.KUSABI_WORKER_CONTEXT;
+    return spawnSync(process.execPath, [COMPANION_SCRIPT, ...args], {
+      encoding: "utf8",
+      env,
+      timeout: 10_000,
+    });
+  }
+
+  it("refuses explain under the marker with a non-zero exit", () => {
+    const result = runCompanion(["explain", "q"], { workerContext: true });
+    assert.notEqual(result.status, 0);
+    assert.match(result.stdout, /worker context/i);
+  });
+
+  it("refuses explain with a message stating both the reason and the alternative", () => {
+    const result = runCompanion(["explain", "q"], { workerContext: true });
+    assert.match(result.stdout, /KUSABI_WORKER_CONTEXT/);
+    assert.match(result.stdout, /final answer|orchestrator decide/i);
+  });
+
+  it("refuses task under the marker with a non-zero exit", () => {
+    const result = runCompanion(["task", "q"], { workerContext: true });
+    assert.notEqual(result.status, 0);
+    assert.match(result.stdout, /worker context/i);
+  });
+
+  it("refuses review under the marker with a non-zero exit", () => {
+    const result = runCompanion(["review", "q"], { workerContext: true });
+    assert.notEqual(result.status, 0);
+    assert.match(result.stdout, /worker context/i);
+  });
+
+  it("refuses salvage under the marker with a non-zero exit", () => {
+    const result = runCompanion(["salvage", "job-does-not-exist"], { workerContext: true });
+    assert.notEqual(result.status, 0);
+    assert.match(result.stdout, /worker context/i);
+  });
+
+  it("refuses chain under the marker with a non-zero exit", () => {
+    const result = runCompanion(["chain", "q"], { workerContext: true });
+    assert.notEqual(result.status, 0);
+    assert.match(result.stdout, /worker context/i);
+  });
+
+  it("does not refuse explain when the marker is absent (behaviour unchanged)", () => {
+    // Without a real transcript this still fails, but NOT with the worker-context
+    // message — it must fail for the ordinary "no transcript found" reason.
+    const result = runCompanion(["explain", "q"], { workerContext: false });
+    assert.doesNotMatch(result.stdout, /worker context/i);
+  });
+
+  it("status still exits 0 under the marker (read-only subcommands stay allowed)", () => {
+    const result = runCompanion(["status"], { workerContext: true });
+    assert.equal(result.status, 0);
+    assert.doesNotMatch(result.stdout, /worker context/i);
   });
 });
 

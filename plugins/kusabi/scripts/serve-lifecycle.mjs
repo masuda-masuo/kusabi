@@ -29,6 +29,17 @@ export function authHeader(server) {
   return { authorization: `Basic ${Buffer.from(`${user}:${server.password}`).toString("base64")}` };
 }
 
+// Build the env for the spawned opencode serve process. Pulled out as its
+// own pure function (kusabi #136 fix 3) so it is unit-testable without
+// spawning a real serve: KUSABI_WORKER_CONTEXT="1" is the marker every tool
+// process a worker session runs (bash included) inherits as a descendant of
+// this serve. The companion's CLI entry refuses job-creating subcommands
+// when it sees the marker, closing the path the #136 fork bomb used to
+// re-invoke itself from inside a worker's own bash.
+export function buildServeEnv(baseEnv, password) {
+  return { ...baseEnv, OPENCODE_SERVER_PASSWORD: password, KUSABI_WORKER_CONTEXT: "1" };
+}
+
 export async function serverHealthy(server) {
   if (!server?.port || !server?.password) return false;
   try {
@@ -56,7 +67,7 @@ export async function ensureServer(cwd) {
     cwd,
     detached: true,
     stdio: ["ignore", logFd, logFd],
-    env: { ...process.env, OPENCODE_SERVER_PASSWORD: password },
+    env: buildServeEnv(process.env, password),
   });
   child.unref();
   child.on("exit", (code, signal) => {

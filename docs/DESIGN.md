@@ -397,6 +397,83 @@ publish / issue_write / sandbox_initialize etc. are **structurally uncallable** 
 
 `sandbox_exec`'s `commands` **must be passed as an array** (a string causes a validation error).
 
+### 3.7 explain subcommand — three structural guards (kusabi #136)
+
+`kusabi-companion.mjs explain <question>` extracts a passage from the Claude
+Code transcript and hands it, plus the question, to a cheap worker via
+`runPrompt`. On 2026-07-27 one `/kusabi:explain` invocation self-replicated
+into 202 explain jobs in 106 seconds and took the host down. Root cause was
+three independent gaps stacking: the extracted passage included the
+in-flight `/kusabi:explain` command's own text, the explain worker had no
+tool deny at all, and nothing anywhere refused a worker re-invoking the
+companion. Any one of the three would have stopped the incident on its own;
+all three were fixed because each guards a different layer and all three are
+cheap.
+
+**Guard 1 — bounded passage extraction.** `extractAssistantText` selects the
+last N text-carrying assistant records by scanning backwards, then used to
+collect `records.slice(startIdx)` — open-ended to the end of the file. At
+explain time the trailing record is always the in-flight `/kusabi:explain`
+command expansion (a user-side record whose text contains a literal
+``Run: ```bash node …/kusabi-companion.mjs explain "…"``` `` block), so that
+block was quoted straight into the worker prompt. The slice is now bounded
+at **both** ends: `records.slice(assistantIndices[0], assistantIndices[last] + 1)`.
+Interleaved user text between selected assistant messages (the reason the
+slice was ever more than the assistant records themselves, e.g. `--last N >
+1`) still falls inside the bound. **Narrowing consequence**: `--tools`
+(`includeTools`) no longer picks up `tool_result` blocks that trail the last
+assistant text — only those that lie within the bounded slice. This is
+intentional, not incidental: a trailing tool result at explain time is, like
+the trailing user text, part of the in-flight command rather than the
+answer being explained.
+
+**Guard 2 — explain gets a deny-all tool surface.** `cmdExplain` passed
+`tools: undefined` to `runPrompt` — no deny at all, unlike `cmdReview`
+(`reviewDenyTools()`). The worker that self-replicated had bash. Fix:
+`cli.mjs` exports `explainDenyTools()`, a strict superset of
+`reviewDenyTools()` — every tool review denies, plus the read/navigation
+surface (`read`, `grep`, `glob`, `list`, `webfetch`, `todowrite`,
+`todoread`). explain's entire job is "read the extracted passage, answer the
+question" — it has no legitimate tool use, not even read-only ones.
+`cmdExplain` now passes `tools: explainDenyTools()`.
+**Route taken: explicit deny list, not a wildcard.** A wildcard entry like
+`"*": false` was considered (it would future-proof against new tools this
+list doesn't yet name), but nothing in this repo — no vendored opencode
+types, no doc, no tested CLI behaviour — confirms the `tools` session
+parameter honours wildcard keys (§7 above documents only the per-name
+`{name: false}` deny contract, confirmed via live A/B testing on 1.18.3).
+Shipping an unverified wildcard as the *only* guard would read as safe while
+possibly doing nothing. The explicit list stands alone until wildcard
+support is verified.
+
+**Guard 3 — refuse dispatch from inside a worker context.** Even with
+guards 1 and 2, nothing stopped a worker that regained tool access some
+other way (a quoted command, a deny-list gap, a future tool) from
+re-invoking the companion and starting the same chain reaction. `ensureServer`
+(`serve-lifecycle.mjs`) now stamps `KUSABI_WORKER_CONTEXT: "1"` into the
+spawned serve's env (built by the `buildServeEnv` seam, alongside
+`OPENCODE_SERVER_PASSWORD`); every tool process a worker session runs —
+bash included — is a descendant of that serve and inherits the marker. The
+companion's CLI entry (`main()` in `kusabi-companion.mjs`) checks the marker
+before dispatch: if set and the subcommand is **job-creating** — reaches
+`runPrompt`/`dispatchWithFallback`, or starts a chain, which dispatches
+rounds through the same path — it exits non-zero instead of running. The
+job-creating set, enumerated from the dispatch table rather than guessed:
+`task`, `review`, `salvage`, `chain`, `explain`. Everything else (`status`,
+`result`, `cancel`, `serve-stop`, `chain-cancel`, `chain-show`,
+`chain-stats`, `metrics-ingest`, `metrics-report`, `install-agents`,
+`setup`, `help`) stays allowed — the guard is against *spawning* a job, not
+against reading or stopping one. The refusal message states both the reason
+and the alternative (a denial without an alternative pushes a confused
+worker toward a worse path):
+> refusing to dispatch from inside a kusabi worker context
+> (KUSABI_WORKER_CONTEXT is set). Workers must not spawn jobs — put your
+> findings in your final answer and let the orchestrator decide.
+
+The orchestrator's own (host) invocations are unaffected — nothing sets the
+marker outside a serve's own descendants, so the marker travels only
+serve → worker tool processes, never back to the host shell.
+
 ## 4. Model operations
 
 - **Default is Flash**: zen's deepseek-v4-flash-free (daily free tier) → go's deepseek v4 Flash.
