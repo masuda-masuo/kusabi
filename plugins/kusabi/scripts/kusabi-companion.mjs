@@ -35,9 +35,10 @@ import {
 import { jobDir, saveJob, loadJob, listJobs, latestJob } from "./job-store.mjs";
 import { opencodeBin, serverHealthy, ensureServer, reapIdleServes, api } from "./serve-lifecycle.mjs";
 import { runPrompt, dispatchWithFallback, resetFailedRoutes } from "./prompt-execution.mjs";
-import { openMetricsDb } from "./metrics-db.mjs";
+import { openMetricsDb, openMetricsDbReadOnly } from "./metrics-db.mjs";
 import { ingestTranscriptDirectory } from "./transcript-ingest.mjs";
 import { ingestChainDirectory } from "./chain-ingest.mjs";
+import { computeReport, renderReportText, renderReportJson, missingStoreReport, renderMissingText } from "./metrics-report.mjs";
 
 // Chain round-phases module — imported here for cmdChain.
 // Probe functions are imported separately below with local bindings so
@@ -1475,6 +1476,48 @@ function cmdMetricsIngest(cwd, { flags }) {
 }
 
 // ---------------------------------------------------------------------------
+// metrics-report
+// ---------------------------------------------------------------------------
+
+/**
+ * Pure-reader query/report surface over the SQLite metrics store built by
+ * `metrics-ingest` (issues #83 / #81). Never ingests, never opens the
+ * writable handle (`openMetricsDb`) -- only `openMetricsDbReadOnly`. See
+ * DESIGN.md 3.5.9.
+ */
+function cmdMetricsReport(cwd, { flags }) {
+  if (flags.compare) {
+    // Silently ignoring an accepted flag would answer a different question
+    // than the one asked -- chain-stats supports --compare, this surface
+    // does not, and pretending otherwise produces a plausible-looking but
+    // wrong report.
+    throw new Error("--compare is not supported by metrics-report; run it twice with --since/--until instead");
+  }
+
+  const metricsStateRoot = flags["state-root"] || stateRoot();
+  const dbPath = flags.db || path.join(metricsStateRoot, "metrics.db");
+  const since = flags.since || undefined;
+  const until = flags.until || undefined;
+  const wantJson = !!flags.json;
+
+  if (!fs.existsSync(dbPath)) {
+    // Never open a read-only handle against a missing path (it throws) and
+    // never create the file here -- an absent store is a state, not an
+    // error: this returns normally (exit 0).
+    const report = missingStoreReport(dbPath);
+    return wantJson ? renderReportJson(report) : renderMissingText(dbPath);
+  }
+
+  const db = openMetricsDbReadOnly(dbPath);
+  try {
+    const report = computeReport(db, { since, until, dbPath });
+    return wantJson ? renderReportJson(report) : renderReportText(report);
+  } finally {
+    db.close();
+  }
+}
+
+// ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
 
@@ -1490,6 +1533,7 @@ function usage() {
     "  chain-show Print a compact plain-text digest of a chain (read-only, no LLM)",
     "  chain-stats Aggregate every chain record and print a summary (read-only, no LLM)",
     "  metrics-ingest  Ingest transcripts + chain records into a durable SQLite store (read-only source, no LLM)",
+    "  metrics-report  Query/report over the SQLite metrics store (read-only, no LLM, never ingests)",
     "  chain-cancel  Request a running chain to stop (file-based, works across processes)",
     "  status     List recent jobs or show one by ID",
     "  result     Show completed job result (latest, or by ID)",
@@ -1520,6 +1564,11 @@ function usage() {
     "  --state-root <path> (metrics-ingest: default the kusabi state root, ~/.kusabi)",
     "  --db <path> (metrics-ingest: default <state-root>/metrics.db)",
     "  --dry-run (metrics-ingest: parse and report counts, write nothing)",
+    "  --db <path> (metrics-report: default <state-root>/metrics.db)",
+    "  --state-root <path> (metrics-report: default the kusabi state root)",
+    "  --since <ISO> (metrics-report: window start, inclusive)",
+    "  --until <ISO> (metrics-report: window end, exclusive)",
+    "  --json (metrics-report: emit the report as one JSON document instead of text)",
     "  -h, --help",
     "",
     "Unknown flags cause an error. Use -- to treat subsequent tokens as literal text.",
@@ -1594,10 +1643,13 @@ async function main() {
     case "metrics-ingest":
     case "metricsIngest":
       return cmdMetricsIngest(cwd, parsed);
+    case "metrics-report":
+    case "metricsReport":
+      return cmdMetricsReport(cwd, parsed);
     case "explain":
       return cmdExplain(cwd, parsed);
     default:
-      throw new Error(`unknown subcommand: ${subcommand ?? "(none)"}. Use setup|task|review|chain|chain-show|chain-stats|metrics-ingest|chain-cancel|status|result|cancel|serve-stop|install-agents|salvage|explain`);
+      throw new Error(`unknown subcommand: ${subcommand ?? "(none)"}. Use setup|task|review|chain|chain-show|chain-stats|metrics-ingest|metrics-report|chain-cancel|status|result|cancel|serve-stop|install-agents|salvage|explain`);
   }
 }
 

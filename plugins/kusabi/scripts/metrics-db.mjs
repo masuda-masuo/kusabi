@@ -169,6 +169,26 @@ export function openMetricsDb(dbPath) {
   return db;
 }
 
+/**
+ * Open the metrics database at `dbPath` READ-ONLY, for the `metrics-report`
+ * query surface only. Never creates the file, never runs `PRAGMA
+ * journal_mode`, never applies the schema or the `finding.source` migration,
+ * and never writes. Deliberately NOT `openMetricsDb`: that function's
+ * `CREATE TABLE` / `ALTER TABLE` calls are writes, and this module remains
+ * the only place that constructs a `DatabaseSync` — the report's SELECTs
+ * live in metrics-report.mjs, which receives this already-open handle.
+ *
+ * A read-only open of a path that does not exist throws — callers must
+ * check `fs.existsSync(dbPath)` first (see `metrics-report` in
+ * kusabi-companion.mjs) rather than relying on this to report "not found".
+ *
+ * @param {string} dbPath
+ * @returns {import("node:sqlite").DatabaseSync}
+ */
+export function openMetricsDbReadOnly(dbPath) {
+  return new DatabaseSync(dbPath, { readOnly: true });
+}
+
 // ---------------------------------------------------------------------------
 // source_file — skip-unchanged bookkeeping (speed only, never correctness)
 // ---------------------------------------------------------------------------
