@@ -7,7 +7,7 @@
 // session never sees intermediate narration, tool logs, or raw events.
 
 
-import { parseArgs, parseModel, resolveModel, reviewDenyTools, WRITE_TOOL_NAMES, validateChainEntries } from "./cli.mjs";
+import { parseArgs, parseModel, resolveModel, reviewDenyTools, explainDenyTools, WRITE_TOOL_NAMES, validateChainEntries } from "./cli.mjs";
 import { renderReview, renderChainShow, renderJobLine, renderHeader, extractJson, renderFollowupDraft } from "./render.mjs";
 import { hasSectionHeading, parseDeliverables, parseSmoke, parseOrchestratorSignature } from "./brief-parsing.mjs";
 import { deriveDisposition, deriveReworkStrategy } from "./disposition.mjs";
@@ -321,10 +321,29 @@ export function extractAssistantText(records, { lastN = 1, includeTools = false 
 
   if (assistantIndices.length === 0) return "";
 
-  // Collect records from the first selected assistant message onward so that
-  // interleaved user messages are also included.
-  const startIdx = assistantIndices[0];
-  const relevantRecords = records.slice(startIdx);
+  // Bound the slice at BOTH ends by the selected assistant records — not
+  // just the start. The backwards scan makes assistantIndices[last] the
+  // FINAL text-carrying assistant record in the file, so every record after
+  // it is either a tool-use-only assistant record or user-side content —
+  // and at explain time the trailing user content is the in-flight
+  // `/kusabi:explain` command expansion itself (the literal "Run: ```bash
+  // node .../kusabi-companion.mjs explain ..." block that self-replicated
+  // in the kusabi #136 incident). A tail-inclusive slice quoted that block
+  // straight into the worker prompt, and the worker obeyed it.
+  //
+  // Interleaved user messages BETWEEN selected assistant messages (the
+  // documented reason for collecting more than just the assistant records
+  // themselves, e.g. with `--last N > 1`) still fall inside this bounded
+  // slice, so that behaviour is preserved — only the open-ended tail is cut.
+  //
+  // Consequence for `--tools` (includeTools): tool_result blocks are only
+  // ever included when they lie within this bounded slice, so trailing
+  // tool_result records after the last assistant text are now excluded too.
+  // This narrowing is intentional, not incidental.
+  const relevantRecords = records.slice(
+    assistantIndices[0],
+    assistantIndices[assistantIndices.length - 1] + 1,
+  );
 
   const parts = [];
   for (let ri = 0; ri < relevantRecords.length; ri++) {
@@ -619,7 +638,12 @@ async function cmdExplain(cwd, { flags, text }) {
     agent: undefined,
     model,
     session: undefined,
-    tools: undefined,
+    // explain's whole job is "read the prompt, answer" — deny the entire
+    // tool surface (kusabi #136 fix 2). Compare cmdReview below, which
+    // passes reviewDenyTools(); the previous `tools: undefined` here left
+    // the explain worker with unrestricted bash, which is how the #136
+    // fork-bomb incident got a shell to re-invoke the companion from.
+    tools: explainDenyTools(),
     timeoutS: Number(flags.timeout ?? 120),
     watchdogS: 0,
   });
@@ -1582,9 +1606,37 @@ function usage() {
   ].join("\n");
 }
 
+// Subcommands that create a job — they reach runPrompt() or dispatchWithFallback()
+// (which itself calls runPrompt()) directly, or start a chain (which dispatches
+// rounds through the same path). Enumerated from the switch in main() below;
+// every other subcommand only reads or stops existing state.
+//   task     -> dispatchWithFallback (cmdTask)
+//   review   -> runPrompt            (cmdReview)
+//   salvage  -> runPrompt            (cmdSalvage)
+//   chain    -> dispatchWithFallback via runImplementPhase, per round (cmdChain)
+//   explain  -> runPrompt            (cmdExplain)
+const JOB_CREATING_SUBCOMMANDS = new Set(["task", "review", "salvage", "chain", "explain"]);
+
 async function main() {
   const [subcommand, ...argv] = process.argv.slice(2);
   const cwd = process.cwd();
+
+  // Fix 3 (kusabi #136): refuse to spawn a job when running inside a kusabi
+  // worker's own tool process. ensureServer() stamps KUSABI_WORKER_CONTEXT=1
+  // into the opencode serve's env; every tool process a worker session runs
+  // (bash included) is a descendant of that serve and inherits the marker.
+  // Without this, a worker that regains dispatch access (a quoted command,
+  // a bug in a deny list, a future tool) can re-invoke the companion and
+  // start a chain reaction — this is exactly how the #136 fork bomb spread.
+  // Read-only / stop subcommands stay allowed: the guard is against
+  // *spawning*, not against reading or stopping. The orchestrator's own
+  // (host) invocations are unaffected because nothing sets the marker there.
+  if (process.env.KUSABI_WORKER_CONTEXT && JOB_CREATING_SUBCOMMANDS.has(subcommand)) {
+    throw new Error(
+      "refusing to dispatch from inside a kusabi worker context (KUSABI_WORKER_CONTEXT is set). " +
+      "Workers must not spawn jobs — put your findings in your final answer and let the orchestrator decide."
+    );
+  }
 
   // Startup reaper: reap idle serves whose last activity is older than TTL.
   // Best-effort; a failure here must never crash the invoking command.
