@@ -397,7 +397,7 @@ publish / issue_write / sandbox_initialize etc. are **structurally uncallable** 
 
 `sandbox_exec`'s `commands` **must be passed as an array** (a string causes a validation error).
 
-### 3.7 explain subcommand — three structural guards (kusabi #136)
+### 3.7 explain subcommand (retired 2026-07-27, #139) — the #136 incident and its guards
 
 `kusabi-companion.mjs explain <question>` extracts a passage from the Claude
 Code transcript and hands it, plus the question, to a cheap worker via
@@ -459,7 +459,7 @@ before dispatch: if set and the subcommand is **job-creating** — reaches
 `runPrompt`/`dispatchWithFallback`, or starts a chain, which dispatches
 rounds through the same path — it exits non-zero instead of running. The
 job-creating set, enumerated from the dispatch table rather than guessed:
-`task`, `review`, `salvage`, `chain`, `explain`. Everything else (`status`,
+`task`, `review`, `salvage`, `chain`. Everything else (`status`,
 `result`, `cancel`, `serve-stop`, `chain-cancel`, `chain-show`,
 `chain-stats`, `metrics-ingest`, `metrics-report`, `install-agents`,
 `setup`, `help`) stays allowed — the guard is against *spawning* a job, not
@@ -473,6 +473,17 @@ worker toward a worse path):
 The orchestrator's own (host) invocations are unaffected — nothing sets the
 marker outside a serve's own descendants, so the marker travels only
 serve → worker tool processes, never back to the host shell.
+
+**Retirement (#139).** The explain subcommand itself is gone: its motive is
+better served by the built-in `/btw` (zero lasting context cost), it had
+zero successful real uses (its first real invocation was this incident), and
+its transcript-parsing surface tracked an undocumented external format.
+Guards 1 and 2 above (bounded passage extraction, deny-all tool surface)
+were explain-specific and left with the code. Guard 3 (worker-context
+dispatch refusal) survives unchanged because it protects every job-creating
+subcommand, not just explain. The durable lesson is not about explain in
+particular: anything quoted into a worker prompt will eventually be
+executed if the worker has tools.
 
 ## 4. Model operations
 
