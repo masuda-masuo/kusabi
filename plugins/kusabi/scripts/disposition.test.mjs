@@ -133,6 +133,39 @@ describe("deriveDisposition", () => {
     const result = deriveDisposition({ verdict: "discard", probesGreen: true, round: 2, maxRounds: 3, repeatedAreas: true, strategizeEligible: true });
     assert.deepEqual(result, { disposition: "escalate", reason: "reviewer discarded the work" });
   });
+
+  // ---- kusabi#117: approve + probes red must also see repeatedAreas ----
+
+  it("strategize: approve + probes red + repeatedAreas + strategizeEligible + round < maxRounds", () => {
+    const result = deriveDisposition({ verdict: "approve", probesGreen: false, round: 1, maxRounds: 3, repeatedAreas: true, strategizeEligible: true });
+    assert.deepEqual(result, { disposition: "strategize", reason: "deterministic probes failed and same file area flagged twice; structural re-diagnosis before next rework" });
+  });
+
+  it("escalate: approve + probes red + repeatedAreas + strategizeEligible false", () => {
+    const result = deriveDisposition({ verdict: "approve", probesGreen: false, round: 1, maxRounds: 3, repeatedAreas: true, strategizeEligible: false });
+    assert.deepEqual(result, { disposition: "escalate", reason: "deterministic probes failed; same file area flagged for two consecutive rounds" });
+  });
+
+  it("escalate (not strategize): approve + probes red + repeatedAreas + strategizeEligible true but round === maxRounds", () => {
+    const result = deriveDisposition({ verdict: "approve", probesGreen: false, round: 3, maxRounds: 3, repeatedAreas: true, strategizeEligible: true });
+    assert.deepEqual(result, { disposition: "escalate", reason: "deterministic probes failed; same file area flagged for two consecutive rounds; max rounds (3) reached" });
+  });
+
+  it("accept unaffected: approve + probesGreen + repeatedAreas", () => {
+    const result = deriveDisposition({ verdict: "approve", probesGreen: true, round: 1, maxRounds: 3, repeatedAreas: true });
+    assert.deepEqual(result, { disposition: "accept" });
+  });
+
+  // ---- kusabi#117: max-rounds escalate reason surfaces the stagnation signal ----
+
+  it("escalate: needs-attention + repeatedAreas + a high finding + round === maxRounds → reason mentions same file area", () => {
+    const result = deriveDisposition({ verdict: "needs-attention", probesGreen: true, round: 3, maxRounds: 3, repeatedAreas: true, findingSeverities: ["high", "low"] });
+    assert.equal(result.disposition, "escalate");
+    assert.match(result.reason, /same file area flagged/);
+  });
+
+  // Regression guard: repeats + eligible + round < maxRounds still strategizes
+  // (already covered above by "strategize: repeatedAreas + strategizeEligible true", round 2 of 3).
 });
 
 // deriveReworkStrategy — default ladder and strategize rule
