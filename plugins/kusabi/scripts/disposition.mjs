@@ -63,19 +63,34 @@ export function deriveReworkStrategy({ reworkCount, strategized }) {
  * @param {number}  opts.maxRounds
  * @param {boolean} opts.repeatedAreas — same file area flagged 2+ rounds
  * @param {string[]} [opts.findingSeverities] — severity strings from the round's review findings
- * @param {boolean} [opts.strategizeEligible] — true on first stagnation to get strategize instead of escalate
+ * @param {boolean} [opts.strategizeEligible] — true on first stagnation to get strategize instead of
+ *   escalate; combined internally with `round < maxRounds` (see strategizeAllowed) because a
+ *   strategist job produced on the final round has no next round left to consume its output, so
+ *   the final round never strategizes even when strategizeEligible is true.
  * @returns {{ disposition: "accept"|"accept-with-followup"|"strategize"|"rework"|"escalate", reason?: string }}
  */
 export function deriveDisposition({ verdict, probesGreen, round, maxRounds, repeatedAreas, findingSeverities, strategizeEligible }) {
+  // strategize only pays off if there is a next round to spend its output on —
+  // on the final round the strategist job would be produced and then discarded
+  // (the chain loop's post-strategize `continue` just exits the loop). Gate
+  // eligibility on a round remaining so the final round never buys it.
+  const strategizeAllowed = strategizeEligible === true && round < maxRounds;
+
   // Decision 5: accept-with-followup (economic cutoff)
   // Checked BEFORE max-rounds escalate so it takes precedence for the needs-attention case.
+  // repeatedAreas does NOT preempt this branch: probes green + all findings low/medium is a
+  // ship decision regardless of stagnation (policy decision, #117, 2026-07-29). strategize only
+  // has value for rounds that cannot ship as-is.
   if (probesGreen && verdict === "needs-attention" && Array.isArray(findingSeverities) && findingSeverities.length > 0 && findingSeverities.every(function (s) { return s === "low" || s === "medium"; })) {
     return { disposition: "accept-with-followup", reason: "probes green; remaining findings all minor" };
   }
 
   // Hard limit: max rounds reached without acceptance → escalate
   if (round >= maxRounds && verdict !== "approve") {
-    return { disposition: "escalate", reason: `max rounds (${maxRounds}) reached without acceptance` };
+    const reason = repeatedAreas
+      ? `max rounds (${maxRounds}) reached without acceptance; same file area flagged for two consecutive rounds`
+      : `max rounds (${maxRounds}) reached without acceptance`;
+    return { disposition: "escalate", reason };
   }
 
   if (verdict === "approve" && probesGreen) {
@@ -87,10 +102,31 @@ export function deriveDisposition({ verdict, probesGreen, round, maxRounds, repe
   let reason;
 
   switch (verdict) {
-    case "approve":
-      disposition = "rework";
-      reason = "deterministic probes failed";
+    case "approve": {
+      // Reachable only when probesGreen is false (the probesGreen && approve
+      // case returns "accept" above). Mirrors the needs-attention branch:
+      // repeats + a next round available => strategize; repeats without a
+      // next round => escalate with the stagnation reason surfaced.
+      if (repeatedAreas) {
+        if (strategizeAllowed) {
+          disposition = "strategize";
+          reason = "deterministic probes failed and same file area flagged twice; structural re-diagnosis before next rework";
+        } else {
+          disposition = "escalate";
+          reason = "deterministic probes failed; same file area flagged for two consecutive rounds";
+          // Surface budget exhaustion too: approve is exempt from the max-rounds
+          // early return above, so this branch is where an operator would
+          // otherwise miss that the round budget also ran out.
+          if (round >= maxRounds) {
+            reason += `; max rounds (${maxRounds}) reached`;
+          }
+        }
+      } else {
+        disposition = "rework";
+        reason = "deterministic probes failed";
+      }
       break;
+    }
 
     case "approve-partial":
       disposition = "escalate";
@@ -99,7 +135,7 @@ export function deriveDisposition({ verdict, probesGreen, round, maxRounds, repe
 
     case "needs-attention": {
       if (repeatedAreas) {
-        if (strategizeEligible === true) {
+        if (strategizeAllowed) {
           disposition = "strategize";
           reason = "same file area flagged twice; structural re-diagnosis before next rework";
         } else {

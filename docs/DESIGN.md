@@ -187,19 +187,25 @@ Verdict: 4-value + optional `unverified`:
 
 #### 3.5.4 Derive disposition (deriveDisposition)
 
-Pure function `deriveDisposition({verdict, probesGreen, round, maxRounds, repeatedAreas, findingSeverities})` in `plugins/kusabi/scripts/kusabi-companion.mjs`:
+Pure function `deriveDisposition({verdict, probesGreen, round, maxRounds, repeatedAreas, findingSeverities, strategizeEligible})` in `plugins/kusabi/scripts/disposition.mjs`:
 
 | verdict | probesGreen | Condition | disposition | Meaning |
 |---|---|---|---|---|---|
 | approve | true | — | **accept** | Conclude, hand to orchestrator |
-| approve | false | — | rework | Probe failure |
+| approve | false | repeatedAreas=false | rework | Probe failure |
+| approve | false | repeatedAreas=true + strategizeAllowed | **strategize** | Stalled despite approve: structural re-diagnosis before next rework (§9.1) |
+| approve | false | repeatedAreas=true otherwise | **escalate** | Stalled with no strategize available; reason also notes max-rounds exhaustion when it applies |
 | approve-partial | — | — | **escalate** | Unverified items remain, orchestrator decides |
 | needs-attention | true | all findings low/medium (no critical/high) | **accept-with-followup** | Economic cutoff: see Decision 5 (§9.2) |
 | needs-attention | — | repeatedAreas=false | rework | Fix and re-review |
-| needs-attention | — | repeatedAreas=true + strategizeEligible=true | **strategize** | First stall: structural re-diagnosis before next rework (§9.1) |
-| needs-attention | — | repeatedAreas=true + strategizeEligible≠true | **escalate** | Same file area flagged 2 rounds in a row = stalled |
+| needs-attention | — | repeatedAreas=true + strategizeAllowed | **strategize** | First stall: structural re-diagnosis before next rework (§9.1) |
+| needs-attention | — | repeatedAreas=true otherwise | **escalate** | Same file area flagged 2 rounds in a row = stalled |
 | discard | — | — | **escalate** | Reviewer deemed it discardable |
-| — | — | round ≥ maxRounds and not accepted | **escalate** | Max rounds reached |
+| — | — | round ≥ maxRounds and not accepted | **escalate** | Max rounds reached; reason appends the stagnation note when repeatedAreas is true |
+
+`strategizeAllowed` = `strategizeEligible === true && round < maxRounds`. A strategist job produced on the final round has no next round left to consume its output, so the final round never strategizes even when eligible (#117).
+
+Policy (#117, decided 2026-07-29): `repeatedAreas` does **not** preempt accept-with-followup — probes green + all findings low/medium ships with a follow-up issue even when the same file area was flagged two rounds running. strategize only has value for rounds that cannot ship as-is.
 
 accept-with-followup misuse guards:
 - Severity comes from the reviewer's separate session (not the implementer)
@@ -581,7 +587,7 @@ The following content is derived from the design agreed in the "design confirmat
 
 Implemented in `plugins/kusabi/scripts/kusabi-companion.mjs`:
 
-- `deriveDisposition` accepts an optional `strategizeEligible` boolean. When `needs-attention` + `repeatedAreas` + `strategizeEligible === true`, returns `{ disposition: "strategize", reason: "same file area flagged twice; structural re-diagnosis before next rework" }`. On the second stagnation (strategized=true), escalates as before.
+- `deriveDisposition` accepts an optional `strategizeEligible` boolean, combined internally with `round < maxRounds` into `strategizeAllowed` (a strategist job on the final round has no next round to consume its output — #117). When `repeatedAreas` holds on a non-shippable round and `strategizeAllowed` is true — `needs-attention`, or `approve` with probes red — returns `{ disposition: "strategize", ... }` (needs-attention reason: "same file area flagged twice; structural re-diagnosis before next rework"). On the second stagnation (strategized=true), escalates as before.
 - `renderStrategistPrompt` is an exported pure function that builds the prompt for the strategist: acceptance criteria + findings from the last two rounds + one-structural-change instruction.
 - On `strategize` disposition, the chain dispatches ONE extra job (kind: "strategist") with agent `kusabi-investigate` and `tools: reviewDenyTools()`. Records `strategistJobId`, `strategistUsage`, and `strategistRecommendation` on the round record.
 - Sets chain-level `strategized: true` persisted in `chain.json`. The next rework round includes the recommendation under `## Strategist recommendation (structural change for this rework)` and starts a FRESH session on the existing worktree (anchoring break per §3.4 — the conversation is discarded, the work is not).
