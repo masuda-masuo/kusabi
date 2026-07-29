@@ -1,6 +1,14 @@
 name: pull-request-ci
 on:
   pull_request:
+
+# Least privilege for GITHUB_TOKEN. The repository default is already
+# read-only; declaring it here keeps this workflow minimal even if that
+# default changes (CodeQL actions/missing-workflow-permissions). This
+# workflow only checks out and runs npm test.
+permissions:
+  contents: read
+
 jobs:
   test:
     runs-on: ubuntu-latest
