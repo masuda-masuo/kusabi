@@ -300,6 +300,72 @@ describe("parseChainRecord — malformed / missing input", () => {
   });
 });
 
+describe("parseChainRecord — retried review rounds (reviewFirstUsage)", () => {
+  it("folds the first attempt's usage into reviewIn/reviewOut/reviewCost when both attempts are available", () => {
+    const parsed = parseChainRecord({
+      chainId: "chain-retried",
+      records: [
+        {
+          round: 1,
+          reviewUsage: { available: true, input: 200, output: 100, cost: 0.02 },
+          reviewFirstUsage: { available: true, input: 150, output: 75, cost: 0.015 },
+        },
+      ],
+    });
+    assert.equal(parsed.roundRows.length, 1);
+    assert.equal(parsed.roundRows[0].reviewIn, 350);
+    assert.equal(parsed.roundRows[0].reviewOut, 175);
+    assert.equal(parsed.roundRows[0].reviewCost, 0.035);
+  });
+
+  it("keeps today's single-attempt values when reviewFirstUsage is absent", () => {
+    const parsed = parseChainRecord({
+      chainId: "chain-single",
+      records: [
+        {
+          round: 1,
+          reviewUsage: { available: true, input: 200, output: 100, cost: 0.02 },
+        },
+      ],
+    });
+    assert.equal(parsed.roundRows[0].reviewIn, 200);
+    assert.equal(parsed.roundRows[0].reviewOut, 100);
+    assert.equal(parsed.roundRows[0].reviewCost, 0.02);
+  });
+
+  it("a reviewFirstUsage with available: false contributes nothing", () => {
+    const parsed = parseChainRecord({
+      chainId: "chain-first-unavailable",
+      records: [
+        {
+          round: 1,
+          reviewUsage: { available: true, input: 200, output: 100, cost: 0.02 },
+          reviewFirstUsage: { available: false, input: 150, output: 75, cost: 0.015 },
+        },
+      ],
+    });
+    assert.equal(parsed.roundRows[0].reviewIn, 200);
+    assert.equal(parsed.roundRows[0].reviewOut, 100);
+    assert.equal(parsed.roundRows[0].reviewCost, 0.02);
+  });
+
+  it("keeps null when neither attempt yields a usable numeric field", () => {
+    const parsed = parseChainRecord({
+      chainId: "chain-no-usable-review",
+      records: [
+        {
+          round: 1,
+          reviewUsage: { available: true },
+          reviewFirstUsage: { available: true },
+        },
+      ],
+    });
+    assert.equal(parsed.roundRows[0].reviewIn, null);
+    assert.equal(parsed.roundRows[0].reviewOut, null);
+    assert.equal(parsed.roundRows[0].reviewCost, null);
+  });
+});
+
 // ---------------------------------------------------------------------------
 // ingestChainDirectory — filesystem + database integration
 // ---------------------------------------------------------------------------

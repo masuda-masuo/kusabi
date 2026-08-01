@@ -465,7 +465,7 @@ export function computeStats(chains, opts = {}) {
   // Also sum per-round usage for the time-filtered subset
   const filteredTotals = { input: 0, output: 0, reasoning: 0, cacheRead: 0, cacheWrite: 0, cost: 0 };
   for (const { round } of allRounds) {
-    for (const usage of [round.implementUsage, round.reviewUsage, round.strategistUsage]) {
+    for (const usage of [round.implementUsage, round.reviewUsage, round.strategistUsage, round.reviewFirstUsage]) {
       if (usage && usage.available) {
         filteredTotals.input += usage.input || 0;
         filteredTotals.output += usage.output || 0;
