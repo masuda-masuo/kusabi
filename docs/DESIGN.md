@@ -129,7 +129,17 @@ at chain start and measures each round against it.
 pointing at a scratch file) and runs `git write-tree` to produce a tree hash
 that covers the entire worktree — tracked files, modified tracked files, and
 untracked files alike.  The real index is never touched.  The manifest
-(`treeHash` + per-file content SHA map) is the baseline.
+(`treeHash` + per-file content SHA map) is the baseline.  Retrieval is
+**verified-complete or null**: the listing is fetched with `verbose: "full"`
+and an explicit large page window on the `sandbox_exec` call, the shell
+command prints a `COUNT=<n>` marker on the same pipeline data as the entries,
+and the capture is accepted only when the parsed entry count equals `COUNT`
+and the response carries no truncation sign (`truncated`/`has_more`).
+`verbose: "full"` is required, not optional: sunaba's sandbox_exec applies
+summary truncation (head-50/tail-50 at `max_lines=100`) *before* pagination,
+so a large page window alone cannot recover the omitted middle of any listing
+over ~100 lines.  Any truncation or mismatch yields `null` — a partial
+manifest is never recorded as a baseline.
 
 **Per-round comparison.**  At each round’s probe phase, `runDeliverablesProbe`
 captures the worktree state again and calls `computeNewlyChanged` to produce

@@ -30,8 +30,26 @@
  * @returns {Promise<Object|null>} Manifest with:
  *   - treeHash {string} — combined tree hash representing the entire worktree
  *   - files   {Object<string,string>} — relative-path → content-SHA mapping
- *   Returns null when the capture fails.
+ *   Returns null when the capture fails or when the retrieved listing cannot
+ *   be verified as complete (any pagination/truncation sign, or a COUNT
+ *   marker mismatch) — a partial manifest is never returned.
  */
+// sunaba's sandbox_exec has TWO independent layers that can cut the listing
+// short, and both must be defeated for the capture to succeed on large repos:
+//   1. summary truncation — the default (verbose="summary", max_lines=100)
+//      keeps head-50 / "... (N lines omitted)" / tail-50 and sets
+//      truncated=true, and it runs BEFORE pagination, so no page window can
+//      recover the omitted middle.  verbose="full" disables it and returns
+//      the entire output with truncated=false.
+//   2. pagination — the default window is limit=50 lines; the explicit large
+//      window below returns the whole display in a single response
+//      (has_more=false).
+// The manifest is one line per entry, so this combination comfortably covers
+// every repo the baseline is meant for (several hundred to a few thousand
+// tracked files).  Completeness is still verified below, never assumed: a
+// listing that exceeds the window yields null, not a partial manifest.
+const CAPTURE_PAGE_LIMIT = 1000000;
+
 export async function captureWorktreeState(callTool, container) {
   // Single shell command: copy the real index to a temp file, use it for
   // git add -A + git write-tree, list all entries with content hashes,
@@ -40,6 +58,10 @@ export async function captureWorktreeState(callTool, container) {
   // The temp index is removed by an EXIT trap rather than by a trailing
   // command: an &&-chained cleanup is skipped exactly when an earlier step
   // fails, which is when a stale copy of the index would be left behind.
+  //
+  // The listing pipeline appends a COUNT=<n> marker derived from the same
+  // pipeline data (awk's own record counter), so the parser can verify that
+  // every entry line made it through retrieval intact.
   const commands = [
     "cd /workspace && " +
     'TMPIDX=$(mktemp /tmp/kb-XXXXXX.idx 2>/dev/null) && ' +
@@ -49,7 +71,7 @@ export async function captureWorktreeState(callTool, container) {
     'TREE=$(GIT_INDEX_FILE="$TMPIDX" git write-tree 2>/dev/null) && ' +
     'echo "TREE_HASH=$TREE" && ' +
     "GIT_INDEX_FILE=\"$TMPIDX\" git ls-files --stage 2>/dev/null | " +
-    "awk -F'\\t' '{n=split($1,a,\" \"); print a[2] \"|\" $2}'",
+    "awk -F'\\t' '{n=split($1,a,\" \"); print a[2] \"|\" $2; c++} END {print \"COUNT=\" (c+0)}'",
   ];
 
   let result;
@@ -57,8 +79,26 @@ export async function captureWorktreeState(callTool, container) {
     result = await callTool("sandbox_exec", {
       container_id: container,
       commands,
+      // verbose="full" disables sunaba's summary truncation (head-50 /
+      // tail-50 at max_lines=100, truncated=true), which runs BEFORE
+      // pagination and would otherwise destroy any listing over ~100 lines
+      // — a large limit alone cannot recover the omitted middle.  The
+      // explicit large `limit` then pages the full display in one response
+      // (without it sunaba defaults to 50 lines and the listing of any repo
+      // with more than ~49 tracked files is cut — the P3 baseline truncation
+      // bug, kusabi #143).
+      verbose: "full",
+      limit: CAPTURE_PAGE_LIMIT,
     });
   } catch {
+    return null;
+  }
+
+  // Any pagination/truncation sign means the listing is partial.  A partial
+  // manifest must never be returned: it would silently hide every path
+  // outside the retrieved window from computeNewlyChanged, making rounds
+  // that touch only those paths look like "changed nothing".
+  if (!result || result.truncated === true || result.has_more === true) {
     return null;
   }
 
@@ -68,12 +108,17 @@ export async function captureWorktreeState(callTool, container) {
   const lines = output.split("\n").filter(Boolean);
   const files = {};
   let treeHash = null;
+  let countMarker = null;
 
   for (const line of lines) {
     const trimmed = line.trim();
     if (trimmed.startsWith("TREE_HASH=")) {
       treeHash = trimmed.slice("TREE_HASH=".length).trim();
+    } else if (trimmed.startsWith("COUNT=")) {
+      countMarker = trimmed.slice("COUNT=".length).trim();
     } else if (trimmed.includes("|")) {
+      // The first pipe separates hash from path; a path may itself contain
+      // pipes, so only the first occurrence is the separator.
       const pipeIdx = trimmed.indexOf("|");
       const hash = trimmed.slice(0, pipeIdx).trim();
       const filePath = trimmed.slice(pipeIdx + 1).trim();
@@ -84,6 +129,16 @@ export async function captureWorktreeState(callTool, container) {
   }
 
   if (!treeHash) return null;
+
+  // Verified-complete or null: the shell printed COUNT=<n> on the same
+  // pipeline data as the entries, and the parsed entry count must match
+  // exactly.  A missing or non-numeric marker, a silently dropped line, or
+  // a duplicated path all make the capture unverifiable, so yield null
+  // rather than a partial manifest.
+  const countMarkerValid =
+    countMarker !== null && /^[0-9]+$/.test(countMarker);
+  const parsedCount = Object.keys(files).length;
+  if (!countMarkerValid || parsedCount !== Number(countMarker)) return null;
 
   return { treeHash, files };
 }
