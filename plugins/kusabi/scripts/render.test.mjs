@@ -255,6 +255,50 @@ describe("renderReview discard token", () => {
   });
 });
 
+// renderReview — malformed-review guards (kusabi #153)
+// ---------------------------------------------------------------------------
+// A model responding to a broken review input (e.g. git failure text in the
+// prompt) can emit `findings` as a string or object instead of an array.
+// renderReview must normalise and annotate — never throw an internal
+// "findings.forEach is not a function" TypeError.
+
+describe("renderReview malformed fields", () => {
+  it("normalises a string findings field instead of crashing", () => {
+    const parsed = { verdict: "needs-attention", summary: "s", findings: "not an array" };
+    const result = renderReview(parsed, "");
+    assert.match(result, /malformed review: "findings" was not an array/);
+    assert.match(result, /No material findings\./);
+    assert.doesNotMatch(result, /forEach/);
+  });
+
+  it("normalises an object findings field instead of crashing", () => {
+    const parsed = { verdict: "approve", summary: "s", findings: { file: "x.js" } };
+    const result = renderReview(parsed, "");
+    assert.match(result, /malformed review: "findings" was not an array \(object\)/);
+  });
+
+  it("treats a string next_steps as absent instead of crashing", () => {
+    const parsed = { verdict: "approve", summary: "s", findings: [], next_steps: "just text" };
+    const result = renderReview(parsed, "");
+    assert.doesNotMatch(result, /Next steps:/);
+    assert.doesNotMatch(result, /forEach/);
+  });
+
+  it("treats a string unverified as absent instead of crashing", () => {
+    const parsed = { verdict: "approve", summary: "s", findings: [], unverified: "just text" };
+    const result = renderReview(parsed, "");
+    assert.doesNotMatch(result, /Unverified:/);
+    assert.doesNotMatch(result, /forEach/);
+  });
+
+  it("does not annotate malformed-review when findings is a proper array", () => {
+    const parsed = { verdict: "approve", summary: "s", findings: [] };
+    const result = renderReview(parsed, "");
+    assert.doesNotMatch(result, /malformed review/);
+    assert.match(result, /No material findings\./);
+  });
+});
+
 // renderChainShow — chain-show pure rendering helper
 // ---------------------------------------------------------------------------
 
@@ -576,6 +620,81 @@ describe("renderChainShow", () => {
     ];
     const result = renderChainShow(chain, rounds);
     assert.doesNotMatch(result, /\(unparseable\)/);
+  });
+
+  // kusabi #153: a clamped escalation must display the clamp reason instead
+  // of an out-of-range "0 → 1" that the orchestrator misreads as a
+  // stronger-model re-run.
+  it("renders a single-tier clamped escalation with the clamp note", () => {
+    const chain = { chainId: "chain-clamped" };
+    const rounds = [
+      {
+        round: 1,
+        verdict: "needs-attention",
+        disposition: { disposition: "rework" },
+        resumeMethod: { type: "continue_session" },
+        tierBefore: 0,
+        tierAfter: 0,
+        tierClamped: true,
+        tierClampReason: "single-tier chain",
+      },
+    ];
+    const result = renderChainShow(chain, rounds);
+    assert.ok(result.includes("tier: 0 (escalation clamped: single-tier chain)"));
+  });
+
+  it("renders a top-tier clamp note on a multi-tier chain", () => {
+    const chain = { chainId: "chain-clamped2" };
+    const rounds = [
+      {
+        round: 1,
+        verdict: "needs-attention",
+        disposition: { disposition: "rework" },
+        resumeMethod: { type: "continue_session" },
+        tierBefore: 1,
+        tierAfter: 1,
+        tierClamped: true,
+        tierClampReason: "escalation beyond top tier (modelChain has 2 tiers)",
+      },
+    ];
+    const result = renderChainShow(chain, rounds);
+    assert.ok(result.includes("tier: 1 (escalation clamped: escalation beyond top tier (modelChain has 2 tiers))"));
+  });
+
+  it("renders a normal tier line without any clamp note", () => {
+    const chain = { chainId: "chain-noclamp" };
+    const rounds = [
+      {
+        round: 1,
+        verdict: "needs-attention",
+        disposition: { disposition: "rework" },
+        resumeMethod: { type: "continue_session" },
+        tierBefore: 0,
+        tierAfter: 0,
+        tierClamped: false,
+        tierClampReason: null,
+      },
+    ];
+    const result = renderChainShow(chain, rounds);
+    assert.ok(result.includes("tier: 0"));
+    assert.doesNotMatch(result, /escalation clamped/);
+  });
+
+  it("still renders tierBefore → tierAfter arrow when escalation is within range", () => {
+    const chain = { chainId: "chain-inrange" };
+    const rounds = [
+      {
+        round: 1,
+        verdict: "needs-attention",
+        disposition: { disposition: "rework" },
+        resumeMethod: { type: "continue_session" },
+        tierBefore: 0,
+        tierAfter: 1,
+      },
+    ];
+    const result = renderChainShow(chain, rounds);
+    assert.ok(result.includes("tier: 0 → 1"));
+    assert.doesNotMatch(result, /escalation clamped/);
   });
 });
 

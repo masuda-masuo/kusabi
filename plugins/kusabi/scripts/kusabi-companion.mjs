@@ -9,8 +9,8 @@
 
 import { parseArgs, parseModel, resolveModel, reviewDenyTools, WRITE_TOOL_NAMES, validateChainEntries } from "./cli.mjs";
 import { renderReview, renderChainShow, renderJobLine, renderHeader, extractJson, renderFollowupDraft } from "./render.mjs";
-import { hasSectionHeading, parseDeliverables, parseSmoke, parseOrchestratorSignature } from "./brief-parsing.mjs";
-import { deriveDisposition, deriveReworkStrategy } from "./disposition.mjs";
+import { hasSectionHeading, parseDeliverables, parseSmoke, parseOrchestratorSignature, briefRequestsPublish } from "./brief-parsing.mjs";
+import { deriveDisposition } from "./disposition.mjs";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -60,6 +60,7 @@ import {
   renderEscalateOutcome,
   renderMaxRoundsOutcome,
   handleProviderExhaustion,
+  recordReworkEscalation,
 } from "./chain-phases.mjs";
 
 // Import the probe functions locally so cmdTask can call them directly.
@@ -102,6 +103,20 @@ export function __testProbeBindings() {
   };
 }
 
+// The one-line orchestrator warning emitted at chain start when the brief
+// appears to demand publish (kusabi #153).  Exported so the exact chain
+// output text is fixed by tests; cmdChain prints it verbatim (plus a
+// newline) before any job is dispatched.  publish is orchestrator-exclusive:
+// the worker's toolset has no publish, so a brief demanding it must be
+// surfaced to the orchestrator, never silently dropped.
+export function publishWarningForBrief(brief) {
+  if (!briefRequestsPublish(brief)) return null;
+  return (
+    "brief が publish を要求しているが、ワーカーは publish できない(オーケストレーター専権)。" +
+    "受理後にオーケストレーターが publish を行う。"
+  );
+}
+
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const PLUGIN_ROOT = path.resolve(HERE, "..");
 const DEFAULT_TASK_TIMEOUT_S = 3600;
@@ -133,10 +148,19 @@ export const PHASE_AGENTS = {
 function git(cwd, args) {
   try {
     return execFileSync("git", args, { cwd, encoding: "utf8", maxBuffer: 16 * 1024 * 1024 });
-  } catch (err) {
-    return `(git ${args.join(" ")} failed: ${String(err.message).slice(0, 200)})\n`;
+  } catch {
+    return null;
   }
 }
+
+// Standalone `review` reads the HOST worktree via git.  A git failure used to
+// be swallowed into an error string that then went into the review prompt —
+// the model answered garbage, and the crash the user actually saw was
+// "findings.forEach is not a function" downstream (kusabi #153).  Fail loud
+// and early instead: a review of a diff that could not be produced is not a
+// review, and the error must name the real cause, not an internal TypeError.
+const HOST_REVIEW_GIT_HINT =
+  "review reads the host worktree; for a container review use: task --phase review --container <cid> --brief-file <path>";
 
 function buildReviewInput(cwd, base) {
   let label;
@@ -144,11 +168,22 @@ function buildReviewInput(cwd, base) {
   if (base) {
     label = `branch diff against ${base}`;
     diff = git(cwd, ["diff", `${base}...HEAD`]);
+    if (diff === null) {
+      throw new Error(`git diff ${base}...HEAD failed: ${base} is not a valid revision in this worktree (${HOST_REVIEW_GIT_HINT})`);
+    }
   } else {
     label = "uncommitted working tree changes";
-    diff = git(cwd, ["diff", "HEAD"]) + git(cwd, ["diff", "--cached"]);
+    const headDiff = git(cwd, ["diff", "HEAD"]);
+    const cachedDiff = git(cwd, ["diff", "--cached"]);
+    if (headDiff === null || cachedDiff === null) {
+      throw new Error(`git diff failed in this worktree (${headDiff === null ? "git diff HEAD" : "git diff --cached"}) (${HOST_REVIEW_GIT_HINT})`);
+    }
+    diff = headDiff + cachedDiff;
   }
   const status = git(cwd, ["status", "--short", "--untracked-files=all"]);
+  if (status === null) {
+    throw new Error(`git status failed in this worktree (${HOST_REVIEW_GIT_HINT})`);
+  }
   let truncated = "";
   if (diff.length > REVIEW_DIFF_LIMIT) {
     diff = diff.slice(0, REVIEW_DIFF_LIMIT);
@@ -397,6 +432,18 @@ async function cmdTask(cwd, { flags, text }) {
 }
 
 async function cmdReview(cwd, { flags, text }) {
+  // kusabi #153: `review --container <cid>` was silently ignored — the review
+  // read the HOST worktree's git state, failed on the container-only --base,
+  // and then crashed with "findings.forEach is not a function".  The
+  // standalone review has no container path; the sanctioned container review
+  // route is `task --phase review --container <cid>`.  Reject early and
+  // loudly instead of pretending the flag works (silent ignore is forbidden).
+  if (flags.container) {
+    throw new Error(
+      "review does not support --container (it inspects the host worktree via git). " +
+      "For a container review use: task --phase review --container " + flags.container + " --brief-file <path>"
+    );
+  }
   const promptTemplate = fs.readFileSync(path.join(PLUGIN_ROOT, "prompts", "adversarial-review.md"), "utf8");
   const schema = JSON.parse(fs.readFileSync(path.join(PLUGIN_ROOT, "schemas", "review-output.schema.json"), "utf8"));
   const { label, input } = buildReviewInput(cwd, flags.base);
@@ -706,6 +753,17 @@ async function cmdChain(cwd, { flags, text }) {
   if (!text) throw new Error("chain requires a brief description (inline or via --brief-file)");
   const orchestrator = parseOrchestratorSignature(text);
 
+  // ---- runtime publish guard (kusabi #153) ----
+  // publish is structurally absent from the worker toolset (orchestrator-
+  // exclusive network exit).  A brief that demands PUBLISH cannot be
+  // executed by the worker — warn the orchestrator in the chain output
+  // instead of letting it read "the worker skipped publish" after the fact.
+  // One line only; behaviour is unchanged.  Over-detection is acceptable.
+  const publishWarning = publishWarningForBrief(text);
+  if (publishWarning) {
+    process.stdout.write(publishWarning + "\n");
+  }
+
   // ---- setup ----
   const stateDir = stateDirFor(cwd);
   const config = loadConfig(stateRoot());
@@ -876,7 +934,8 @@ async function cmdChain(cwd, { flags, text }) {
       }
 
       // ---- phase 6: derive disposition ----
-      const findingSeverities = chainParsedReview?.findings
+      // Malformed-review guard (kusabi #153): `findings` may be a non-array.
+      const findingSeverities = Array.isArray(chainParsedReview?.findings)
         ? chainParsedReview.findings.map(function (f) { return f.severity; })
         : undefined;
 
@@ -917,14 +976,23 @@ async function cmdChain(cwd, { flags, text }) {
       // ---- Compute rework strategy for the NEXT round (if rework needed) ----
       let pendingReworkStrategy = null;
       if (disposition.disposition === "rework") {
-        pendingReworkStrategy = deriveReworkStrategy({
+        // Tier escalation is clamped to the modelChain range (kusabi #153):
+        // selectRoutes already keeps dispatch at the top tier, so the
+        // recorded tier must match the model actually used — never "0 → 1"
+        // on a single-tier chain.  The clamp fields (tierClamped /
+        // tierClampReason) land on the round record here.
+        const escalation = recordReworkEscalation({
+          roundRecord,
+          currentTierIndex,
           reworkCount,
           strategized,
+          tierCount: modelChain ? modelChain.length : 0,
         });
 
         // Update cross-round state for the next iteration
+        pendingReworkStrategy = escalation.strategy;
         reworkCount += 1;
-        currentTierIndex += pendingReworkStrategy.tierDelta;
+        currentTierIndex = escalation.currentTierIndex;
       } else if (disposition.disposition === "strategize") {
         // Strategize doesn't consume a rework count, but it sets strategized=true
         // which affects the next rework strategy.
@@ -1308,7 +1376,7 @@ function usage() {
     "Subcommands:",
     "  setup      Start or verify the opencode server for this directory",
     "  task       Run an opencode task",
-    "  review     Run an adversarial review of working-tree changes",
+    "  review     Run an adversarial review of working-tree changes (host worktree only; --container is rejected \u2014 use task --phase review for container reviews)",
     "  chain      Run implement→review→rework chain until acceptance or escalate",
     "  chain-show Print a compact plain-text digest of a chain (read-only, no LLM)",
     "  chain-stats Aggregate every chain record and print a summary (read-only, no LLM)",
@@ -1328,7 +1396,7 @@ function usage() {
     "  --base <ref>, --model <provider/model>, --agent <id>, --phase <name> (draft|investigate|implement|review|respond|salvage|gofer)",
     "  --session <id>, --timeout <s>, --watchdog <s>, --deny <tools>",
     "  --brief-file <path> (task / chain: read the brief from a file; exclusive with inline text)",
-    "  --container <cid> (chain/task: container to run deterministic probes in)",
+    "  --container <cid> (chain/task: container to run deterministic probes in; NOT supported by review)",
     "  --keep-serve (chain: keep the serve alive after chain finishes)",
     "  --force (serve-stop: force kill the serve even when jobs are running)",
     "  --prior <text> (review: prior findings for anti-ratchet)",

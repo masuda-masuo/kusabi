@@ -6,6 +6,7 @@ import {
   parseSmoke,
   hasSectionHeading,
   parseChangedPaths,
+  briefRequestsPublish,
 } from "./brief-parsing.mjs";
 
 // parseOrchestratorSignature
@@ -471,6 +472,52 @@ describe("hasSectionHeading", () => {
   it("returns true even when section body is unparseable prose", () => {
     assert.equal(hasSectionHeading("## Deliverables\njust prose\nno bullets\n", "Deliverables"), true);
     assert.equal(hasSectionHeading("## Smoke\njust prose\n", "Smoke"), true);
+  });
+});
+
+// briefRequestsPublish — publish-demand detection (kusabi #153)
+// ---------------------------------------------------------------------------
+// Heuristic contract: a brief that looks like it demands the worker publish
+// must be flagged so the chain can warn the orchestrator (publish is
+// orchestrator-exclusive; the worker cannot execute it).  Over-detection is
+// acceptable — the warning is one line and changes no behaviour.
+
+describe("briefRequestsPublish", () => {
+  it("flags a markdown heading that mentions publish", () => {
+    assert.equal(briefRequestsPublish("## PUBLISH (mandatory)\n\nDo the work."), true);
+    assert.equal(briefRequestsPublish("## Acceptance criteria\n## Publish steps\nfoo"), true);
+  });
+
+  it("flags publish near a demand keyword on the same line", () => {
+    assert.equal(briefRequestsPublish("PUBLISH (mandatory) after the gate."), true);
+    assert.equal(briefRequestsPublish("publish must happen after acceptance."), true);
+    assert.equal(briefRequestsPublish("Must publish the changes."), true);
+    assert.equal(briefRequestsPublish("publish is required."), true);
+    assert.equal(briefRequestsPublish("publish 必須"), true);
+    assert.equal(briefRequestsPublish("publish が必要な場合"), true);
+    assert.equal(briefRequestsPublish("Do it.\n\nPUBLISH required, then report."), true);
+  });
+
+  it("is case-insensitive for both publish and keywords", () => {
+    assert.equal(briefRequestsPublish("PUBLISH MANDATORY"), true);
+    assert.equal(briefRequestsPublish("Publish Must be done"), true);
+  });
+
+  it("does not flag explanatory mentions of publish", () => {
+    assert.equal(briefRequestsPublish("publish is orchestrator-exclusive; the worker cannot call it."), false);
+    assert.equal(briefRequestsPublish("Do not publish anything."), false);
+    assert.equal(briefRequestsPublish("The orchestrator publishes after acceptance."), false);
+  });
+
+  it("returns false for briefs without publish", () => {
+    assert.equal(briefRequestsPublish("Implement the feature and verify."), false);
+    assert.equal(briefRequestsPublish(""), false);
+  });
+
+  it("never throws on non-string input", () => {
+    assert.equal(briefRequestsPublish(null), false);
+    assert.equal(briefRequestsPublish(undefined), false);
+    assert.equal(briefRequestsPublish(42), false);
   });
 });
 

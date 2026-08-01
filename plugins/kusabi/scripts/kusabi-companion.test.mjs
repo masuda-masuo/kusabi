@@ -10,6 +10,7 @@ import {
   loadConfig,
   readBriefFile,
   __testProbeBindings,
+  publishWarningForBrief,
 } from "./kusabi-companion.mjs";
 import {
   parseOrchestratorSignature,
@@ -576,5 +577,202 @@ describe("metrics-ingest / metrics-report — delegated jobs (#154)", () => {
     assert.match(result.stdout, /Jobs \(delegated single-shot task\/review jobs\):/);
     assert.match(result.stdout, /jobs scanned:\s+0/);
     assert.match(result.stdout, /jobs ingested:\s+0/);
+  });
+});
+
+// publishWarningForBrief — chain-start publish guard (kusabi #153)
+// ---------------------------------------------------------------------------
+// publish is orchestrator-exclusive; a brief that demands it cannot be
+// executed by the worker.  The chain prints this warning verbatim at start.
+// The exact text is fixed here so the runtime output cannot drift.
+
+describe("publishWarningForBrief", () => {
+  it("returns the warning for a brief that demands publish", () => {
+    const warning = publishWarningForBrief("## PUBLISH (mandatory)\n\nDo the work.");
+    assert.ok(warning, "warning must be non-null");
+    assert.match(warning, /publish を要求している/);
+    assert.match(warning, /ワーカーは publish できない/);
+    assert.match(warning, /オーケストレーター専権/);
+  });
+
+  it("returns the warning for inline 'PUBLISH must ...' style demands", () => {
+    const warning = publishWarningForBrief("Fix the bug. PUBLISH must happen after the gate.");
+    assert.ok(warning);
+    assert.match(warning, /オーケストレーター専権/);
+  });
+
+  it("returns null when the brief does not demand publish", () => {
+    assert.equal(publishWarningForBrief("Implement the feature and verify."), null);
+    assert.equal(publishWarningForBrief("publish is orchestrator-exclusive; workers cannot call it."), null);
+    assert.equal(publishWarningForBrief(""), null);
+  });
+
+  it("is exactly one line (no embedded newlines)", () => {
+    const warning = publishWarningForBrief("## PUBLISH (mandatory)");
+    assert.equal(warning.split("\n").length, 1);
+  });
+});
+
+// standalone review — --container rejection (kusabi #153 #2)
+// ---------------------------------------------------------------------------
+// `review --container <cid>` used to silently ignore the flag, read the HOST
+// worktree's git state, fail on the container-only --base, and crash with
+// "findings.forEach is not a function".  The flag must now be rejected early
+// with guidance to the sanctioned container-review route.  Spawned as a real
+// subprocess: the rejection fires before any server contact, so no opencode
+// serve or sunaba endpoint is needed.
+
+describe("review --container rejection", () => {
+  const COMPANION_SCRIPT = path.join(import.meta.dirname, "kusabi-companion.mjs");
+
+  function runCompanion(args, cwd) {
+    const env = { ...process.env };
+    delete env.KUSABI_WORKER_CONTEXT;
+    return spawnSync(process.execPath, [COMPANION_SCRIPT, ...args], {
+      encoding: "utf8",
+      cwd,
+      env,
+      timeout: 15_000,
+    });
+  }
+
+  it("rejects --container early with guidance and no forEach crash", () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-review-cid-"));
+    try {
+      const result = runCompanion(
+        ["review", "--container", "deadbeef123456", "--base", "e1ed885", "review focus text"],
+        tmpDir,
+      );
+      assert.notEqual(result.status, 0, `expected failure, got: ${result.stdout}`);
+      assert.match(result.stdout, /review does not support --container/);
+      assert.match(result.stdout, /task --phase review --container deadbeef123456/);
+      assert.match(result.stdout, /--brief-file/);
+      assert.doesNotMatch(result.stdout, /forEach is not a function/);
+      assert.doesNotMatch(result.stdout, /worker context/i);
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects --container before touching git (no repo needed)", () => {
+    // The failure mode being fixed was git failing FIRST (silent flag ignore).
+    // The rejection must fire before any git call, so a non-git cwd proves it.
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-review-cid2-"));
+    try {
+      const result = runCompanion(["review", "--container", "abc", "text"], tmpDir);
+      assert.notEqual(result.status, 0);
+      assert.match(result.stdout, /review does not support --container/);
+      assert.doesNotMatch(result.stdout, /git diff/);
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+});
+
+// standalone review — git failure produces a clear error, not a forEach crash
+// (kusabi #153 #2)
+// ---------------------------------------------------------------------------
+// A host-worktree git failure used to be swallowed into an error string that
+// went into the review prompt; the model answered garbage and the user saw
+// "findings.forEach is not a function".  Now the failure aborts the review
+// with the real cause before any dispatch.
+
+describe("review git failure", () => {
+  const COMPANION_SCRIPT = path.join(import.meta.dirname, "kusabi-companion.mjs");
+
+  function makeEmptyRepo() {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-review-git-"));
+    const repoDir = path.join(tmpDir, "repo");
+    fs.mkdirSync(repoDir);
+    const init = spawnSync("git", ["init", "-q"], { cwd: repoDir, encoding: "utf8" });
+    assert.equal(init.status, 0, `git init failed: ${init.stderr}`);
+    return tmpDir;
+  }
+
+  function runCompanion(args, cwd) {
+    const env = { ...process.env };
+    delete env.KUSABI_WORKER_CONTEXT;
+    return spawnSync(process.execPath, [COMPANION_SCRIPT, ...args], {
+      encoding: "utf8",
+      cwd,
+      env,
+      timeout: 15_000,
+    });
+  }
+
+  it("fails with a clear git error when --base is not a revision in the host worktree", () => {
+    const tmpDir = makeEmptyRepo();
+    try {
+      const result = runCompanion(["review", "--base", "e1ed885", "focus"], path.join(tmpDir, "repo"));
+      assert.notEqual(result.status, 0, `expected failure, got: ${result.stdout}`);
+      assert.match(result.stdout, /git diff .* failed/);
+      assert.match(result.stdout, /host worktree/);
+      assert.doesNotMatch(result.stdout, /forEach is not a function/);
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it("fails with a clear git error in an empty repo (git diff HEAD fails)", () => {
+    const tmpDir = makeEmptyRepo();
+    try {
+      const result = runCompanion(["review", "focus"], path.join(tmpDir, "repo"));
+      assert.notEqual(result.status, 0, `expected failure, got: ${result.stdout}`);
+      assert.match(result.stdout, /git diff failed/);
+      assert.doesNotMatch(result.stdout, /forEach is not a function/);
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+});
+
+// chain — publish-demand warning at start (kusabi #153 #3)
+// ---------------------------------------------------------------------------
+// The chain prints the one-line orchestrator warning before any dispatch
+// when the brief looks publish-demanding.  OPENCODE_BIN points at a
+// nonexistent binary so the chain dies fast after printing the warning; the
+// assertion is only on the warning line being the first thing in stdout.
+
+describe("chain publish-demand warning", () => {
+  const COMPANION_SCRIPT = path.join(import.meta.dirname, "kusabi-companion.mjs");
+
+  it("prints the orchestrator warning line for a publish-demanding brief", () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-chain-warn-"));
+    try {
+      const env = { ...process.env };
+      delete env.KUSABI_WORKER_CONTEXT;
+      env.KUSABI_STATE_DIR = path.join(tmpDir, "state");
+      env.OPENCODE_BIN = path.join(tmpDir, "no-such-opencode-bin");
+      const result = spawnSync(
+        process.execPath,
+        [COMPANION_SCRIPT, "chain", "--container", "fake-cid", "## PUBLISH (mandatory)\n\nImplement it."],
+        { encoding: "utf8", cwd: tmpDir, env, timeout: 20_000 },
+      );
+      assert.match(result.stdout, /brief が publish を要求しているが、ワーカーは publish できない/);
+      assert.match(result.stdout, /オーケストレーター専権/);
+      // The warning is the FIRST line of the chain output, before anything else.
+      assert.ok(result.stdout.startsWith("brief が publish を要求している"), `warning not first: ${result.stdout.slice(0, 120)}`);
+      assert.doesNotMatch(result.stdout, /worker context/i);
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it("prints no warning for a brief that does not demand publish", () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-chain-warn2-"));
+    try {
+      const env = { ...process.env };
+      delete env.KUSABI_WORKER_CONTEXT;
+      env.KUSABI_STATE_DIR = path.join(tmpDir, "state");
+      env.OPENCODE_BIN = path.join(tmpDir, "no-such-opencode-bin");
+      const result = spawnSync(
+        process.execPath,
+        [COMPANION_SCRIPT, "chain", "--container", "fake-cid", "Implement it and verify."],
+        { encoding: "utf8", cwd: tmpDir, env, timeout: 20_000 },
+      );
+      assert.doesNotMatch(result.stdout, /publish を要求/);
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
   });
 });

@@ -161,6 +161,12 @@ is visible in `status` and `result` output for each round.
 
 ## Notes
 
+- **Publish is outside the chain.** Writing "PUBLISH (mandatory)" into a brief
+  does not execute anything: the worker's toolset has no publish (the network
+  exit is orchestrator-exclusive by design). The orchestrator performs publish
+  after acceptance, from the worker's reported change set. A chain whose brief
+  demands publish prints a one-line warning to that effect at chain start —
+  it is a reminder to the orchestrator, not an action the worker can take.
 - Jobs, event logs, and results are stored per directory under `~/.kusabi/`.
 - `opencode serve` keeps running between jobs; stop it with `node plugins/kusabi/scripts/kusabi-companion.mjs serve-stop` if needed. While jobs are running, `serve-stop` declines unless `--force` is passed — stopping the serve does not stop a chain, which spawns a new serve on its next dispatch.
 - A chain holds the container it was given for its whole run. `status` names the chains that are running and the containers they hold; `chain-cancel <chainId>` is the way to stop one.
