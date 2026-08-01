@@ -485,9 +485,22 @@ export async function runReviewPhase({
     // round with identical options and treat the second attempt as final;
     // two consecutive unparseable results escalate exactly as before.  The
     // retry lives entirely inside this phase and never consumes a round.
-    if (!_parseable && _verdict === "unparseable") {
+    //
+    // The retry is gated on the first job having COMPLETED: a job that
+    // failed outright (serve-dead / stalled / timeout / error) returns
+    // empty or garbage resultText, and re-dispatching would double
+    // worst-case latency (2 × watchdog 900s / timeout 1800s) in exactly the
+    // degraded environments where it is known-futile.  Only a completed job
+    // whose output was garbage gets a second attempt; a hard failure
+    // escalates after a single attempt, exactly as before the retry existed.
+    if (!_parseable && _verdict === "unparseable" && reviewJob.status === "completed") {
       roundRecord.reviewUnparseableRetried = true;
       roundRecord.reviewFirstJobId = reviewJob.id;
+      // First-attempt spend and fallback trail, so retried rounds report
+      // their true cost in chain totals (same shapes as the final-attempt
+      // reviewUsage / reviewFallbacks fields recorded below).
+      roundRecord.reviewFirstUsage = reviewJob.usage || null;
+      roundRecord.reviewFirstFallbacks = reviewJob.fallbacks || null;
       ({ job: reviewJob, resultText: reviewResultText } = await _dispatch(reviewDispatchOptions));
       ({ chainParsedReview: _parsed, chainVerdict: _verdict,
          chainFindingsText: _findings, reviewParseable: _parseable } = parseReviewResult(reviewResultText));
@@ -537,7 +550,7 @@ export async function runReviewPhase({
 export function computeChainTotals(records) {
   const chainTotals = { input: 0, output: 0, reasoning: 0, cacheRead: 0, cacheWrite: 0, cost: 0 };
   for (const rec of records) {
-    for (const usage of [rec.implementUsage, rec.reviewUsage]) {
+    for (const usage of [rec.implementUsage, rec.reviewUsage, rec.reviewFirstUsage]) {
       if (usage && usage.available) {
         chainTotals.input += usage.input || 0;
         chainTotals.output += usage.output || 0;

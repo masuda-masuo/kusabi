@@ -838,6 +838,21 @@ describe("computeChainTotals", () => {
     assert.equal(result.output, 20);
   });
 
+  it("includes reviewFirstUsage from retried rounds", () => {
+    const records = [{
+      implementUsage: { available: true, input: 50, output: 60, reasoning: 0, cacheRead: 0, cacheWrite: 0, cost: 0.001 },
+      reviewUsage: { available: true, input: 30, output: 40, reasoning: 10, cacheRead: 20, cacheWrite: 0, cost: 0.002 },
+      reviewFirstUsage: { available: true, input: 5, output: 6, reasoning: 1, cacheRead: 2, cacheWrite: 0, cost: 0.0005 },
+    }];
+    const result = computeChainTotals(records);
+    assert.equal(result.input, 85);    // 50+30+5
+    assert.equal(result.output, 106);  // 60+40+6
+    assert.equal(result.reasoning, 11); // 0+10+1
+    assert.equal(result.cacheRead, 22); // 0+20+2
+    assert.equal(result.cacheWrite, 0);
+    assert.equal(result.cost, 0.0035); // 0.001+0.002+0.0005
+  });
+
   it("handles missing usage fields as zeros", () => {
     const records = [
       { implementUsage: { available: true, input: 10, output: 20, reasoning: 0, cacheRead: 0, cacheWrite: 0, cost: 0.001 } },
@@ -2003,6 +2018,8 @@ describe("runReviewPhase — unparseable-output retry (issue #145)", () => {
     assert.equal(calls.length, 1);
     assert.equal(roundRecord.reviewUnparseableRetried, undefined);
     assert.equal(roundRecord.reviewFirstJobId, undefined);
+    assert.equal(roundRecord.reviewFirstUsage, undefined);
+    assert.equal(roundRecord.reviewFirstFallbacks, undefined);
     assert.equal(roundRecord.reviewJobId, "job-ok");
     assert.equal(result.chainVerdict, "needs-attention");
     assert.ok(result.chainFindingsText.includes("Off-by-one"));
@@ -2011,17 +2028,26 @@ describe("runReviewPhase — unparseable-output retry (issue #145)", () => {
 
   it("garbage then valid: 2 dispatch calls, final-attempt fields win, retry recorded", async () => {
     const { result, roundRecord, calls } = await runWith([
-      fakeJob("job-broken-1", GARBAGE),
+      fakeJob("job-broken-1", GARBAGE, { usage: { available: true, input: 5, output: 2, reasoning: 0, cacheRead: 0, cacheWrite: 0, cost: 0.001 }, fallbacks: ["test-org/test-flash"] }),
       fakeJob("job-fixed-2", VALID, { usage: { available: true, input: 9, output: 4 }, modelEntry: "test-org/test-fixed-model" }),
     ]);
 
     assert.equal(calls.length, 2);
     assert.equal(roundRecord.reviewUnparseableRetried, true);
     assert.equal(roundRecord.reviewFirstJobId, "job-broken-1");
+    // The first attempt's spend and fallback trail are kept on retried rounds
+    // so chain totals reflect the true cost.
+    assert.deepEqual(roundRecord.reviewFirstUsage, { available: true, input: 5, output: 2, reasoning: 0, cacheRead: 0, cacheWrite: 0, cost: 0.001 });
+    assert.deepEqual(roundRecord.reviewFirstFallbacks, ["test-org/test-flash"]);
     // All review* fields reflect the FINAL attempt.
     assert.equal(roundRecord.reviewJobId, "job-fixed-2");
     assert.equal(roundRecord.reviewModelEntry, "test-org/test-fixed-model");
     assert.deepEqual(roundRecord.reviewUsage, { available: true, input: 9, output: 4 });
+    // Chain totals count BOTH attempts.
+    const totals = computeChainTotals([roundRecord]);
+    assert.equal(totals.input, 14);   // 5 + 9
+    assert.equal(totals.output, 6);   // 2 + 4
+    assert.equal(totals.cost, 0.001); // first attempt only (final attempt has no cost)
     assert.equal(result.chainVerdict, "needs-attention");
     assert.ok(result.chainFindingsText.includes("Off-by-one"));
     assert.equal(result.reviewParseable, true);
@@ -2048,7 +2074,35 @@ describe("runReviewPhase — unparseable-output retry (issue #145)", () => {
     assert.equal(roundRecord.verdict, "unparseable");
     assert.equal(roundRecord.reviewParseable, false);
     assert.equal(roundRecord.findingsText, "(review output could not be parsed)");
+    // First-attempt fields are recorded (null usage here) when a retry happens.
+    assert.equal(roundRecord.reviewFirstUsage, null);
+    assert.equal(roundRecord.reviewFirstFallbacks, null);
   });
+
+  // A first job that FAILED outright (serve-dead / stalled / timeout / error)
+  // returns empty or garbage resultText — re-dispatching would double
+  // worst-case latency in exactly the degraded environments where it is
+  // known-futile.  The retry is gated on job.status === "completed": these
+  // never get a second dispatch and escalate after a single attempt.
+  const HARD_FAILURES = ["serve-dead", "stalled", "timeout", "error"];
+  for (const status of HARD_FAILURES) {
+    it("first job " + status + " with empty resultText: exactly 1 dispatch call, no retry, unparseable escalates", async () => {
+      const { result, roundRecord, calls } = await runWith([
+        fakeJob("job-" + status, "", { status, usage: { available: true, input: 7, output: 3, reasoning: 0, cacheRead: 0, cacheWrite: 0, cost: 0.001 }, fallbacks: ["test-org/test-flash"] }),
+      ]);
+
+      assert.equal(calls.length, 1);
+      assert.equal(roundRecord.reviewUnparseableRetried, undefined);
+      assert.equal(roundRecord.reviewFirstJobId, undefined);
+      assert.equal(roundRecord.reviewFirstUsage, undefined);
+      assert.equal(roundRecord.reviewFirstFallbacks, undefined);
+      assert.equal(roundRecord.reviewJobId, "job-" + status);
+      assert.equal(result.chainVerdict, "unparseable");
+      assert.equal(result.reviewParseable, false);
+      assert.equal(result.chainFindingsText, "(review output could not be parsed)");
+      assert.equal(roundRecord.verdict, "unparseable");
+    });
+  }
 
   it("unparseable JSON with recoverable VERDICT token: exactly 1 dispatch call, no retry", async () => {
     const { result, roundRecord, calls } = await runWith([
@@ -2058,6 +2112,8 @@ describe("runReviewPhase — unparseable-output retry (issue #145)", () => {
     assert.equal(calls.length, 1);
     assert.equal(roundRecord.reviewUnparseableRetried, undefined);
     assert.equal(roundRecord.reviewFirstJobId, undefined);
+    assert.equal(roundRecord.reviewFirstUsage, undefined);
+    assert.equal(roundRecord.reviewFirstFallbacks, undefined);
     assert.equal(roundRecord.reviewJobId, "job-token");
     assert.equal(result.chainVerdict, "needs-attention");
     assert.equal(result.reviewParseable, false);
@@ -2078,5 +2134,7 @@ describe("runReviewPhase — unparseable-output retry (issue #145)", () => {
     assert.equal(roundRecord.verdict, "discard");
     assert.equal(roundRecord.verdictSource, "probe");
     assert.equal(roundRecord.reviewUnparseableRetried, undefined);
+    assert.equal(roundRecord.reviewFirstUsage, undefined);
+    assert.equal(roundRecord.reviewFirstFallbacks, undefined);
   });
 });
