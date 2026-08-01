@@ -451,7 +451,9 @@ export async function runReviewPhase({
     // passed so selectRoutes offers tier 1 onwards, and `explicitModel` keeps
     // `--model` in force for reviews of every round.
     // dispatchWithFallback handles capacity fallback transparently.
-    const { job: reviewJob, resultText: reviewResultText } = await _dispatch({
+    // These options are reused verbatim for the unparseable-output retry
+    // below — same prompt, tiers, agent, tools, and timeouts.
+    const reviewDispatchOptions = {
       cwd,
       kind: "review",
       title: "chain: " + chainId + " round " + roundRecord.round + " review",
@@ -463,7 +465,34 @@ export async function runReviewPhase({
       tiers: modelChain,
       round: 1,
       explicitModel: flagsModel || null,
-    });
+    };
+
+    let reviewJob;
+    let reviewResultText;
+    ({ job: reviewJob, resultText: reviewResultText } = await _dispatch(reviewDispatchOptions));
+
+    // ---- parse review result ----
+    let {
+      chainParsedReview: _parsed, chainVerdict: _verdict,
+      chainFindingsText: _findings, reviewParseable: _parseable,
+    } = parseReviewResult(reviewResultText);
+
+    // ---- retry once on unparseable output ----
+    // A job that completes with garbage — no JSON and no recoverable
+    // VERDICT token — is usually a transient provider hiccup rather than a
+    // genuine verdict (real incident: a 132-token broken review response
+    // that re-dispatched cleanly).  Re-dispatch exactly once within this
+    // round with identical options and treat the second attempt as final;
+    // two consecutive unparseable results escalate exactly as before.  The
+    // retry lives entirely inside this phase and never consumes a round.
+    if (!_parseable && _verdict === "unparseable") {
+      roundRecord.reviewUnparseableRetried = true;
+      roundRecord.reviewFirstJobId = reviewJob.id;
+      ({ job: reviewJob, resultText: reviewResultText } = await _dispatch(reviewDispatchOptions));
+      ({ chainParsedReview: _parsed, chainVerdict: _verdict,
+         chainFindingsText: _findings, reviewParseable: _parseable } = parseReviewResult(reviewResultText));
+    }
+
     roundRecord.reviewJobId = reviewJob.id;
     roundRecord.reviewUsage = reviewJob.usage || null;
     roundRecord.reviewModelEntry = reviewJob.modelEntry || null;
@@ -472,11 +501,6 @@ export async function runReviewPhase({
     reviewJobStatus = reviewJob.status;
     reviewJobError = reviewJob.error || null;
 
-    // ---- parse review result ----
-    const {
-      chainParsedReview: _parsed, chainVerdict: _verdict,
-      chainFindingsText: _findings, reviewParseable: _parseable,
-    } = parseReviewResult(reviewResultText);
     chainParsedReview = _parsed;
     chainVerdict = _verdict;
     chainFindingsText = _findings;

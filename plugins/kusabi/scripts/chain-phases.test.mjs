@@ -1923,3 +1923,160 @@ describe("runReviewPhase fallback trail fidelity", () => {
     assert.equal(roundRecord.reviewFallbacks, null);
   });
 });
+
+// ---------------------------------------------------------------------------
+// runReviewPhase — one retry on unparseable review output (issue #145)
+//
+// A review job that completes with garbage (no JSON, no recoverable VERDICT
+// token) is re-dispatched exactly once within the same call, with identical
+// options.  Two consecutive unparseable results still escalate.  A verdict
+// recovered from a VERDICT token never triggers the retry.
+// ---------------------------------------------------------------------------
+
+describe("runReviewPhase — unparseable-output retry (issue #145)", () => {
+  function makeDispatch(results) {
+    const calls = [];
+    function stubbedDispatch(options) {
+      calls.push(options);
+      return results.shift();
+    }
+    return { stubbedDispatch, calls };
+  }
+
+  function fakeJob(id, resultText, extra = {}) {
+    return {
+      job: {
+        id,
+        status: "completed",
+        modelEntry: "test-org/test-review-model",
+        modelVariant: null,
+        fallbacks: null,
+        usage: null,
+        error: null,
+        ...extra,
+      },
+      resultText,
+    };
+  }
+
+  const GARBAGE = "definitely not JSON and no VERDICT token here at all";
+  const GARBAGE_WITH_TOKEN = "not JSON either\nVERDICT: needs-attention";
+  const VALID = JSON.stringify({
+    verdict: "needs-attention",
+    summary: "One real finding.",
+    findings: [
+      { severity: "medium", title: "Off-by-one", file: "src/calc.js", line_start: 7 },
+    ],
+  });
+
+  async function runWith(results, extra = {}) {
+    const { stubbedDispatch, calls } = makeDispatch(results);
+    const roundRecord = { round: 1 };
+    const result = await runReviewPhase({
+      container: "test",
+      brief: "test brief",
+      modelChain: ["test-org/test-flash", "test-org/test-pro"],
+      chainId: "test-chain",
+      cwd: process.cwd(),
+      previousRecord: null,
+      baseSha: "abc123",
+      chainStatusOutput: "",
+      chainBaseLog: "",
+      chainDiff: "",
+      chainUntracked: "",
+      roundRecord,
+      chainChangedPaths: [],
+      chainStatusObserved: false,
+      chainDeliverables: [],
+      flagsModel: null,
+      _dispatchWithFallback: stubbedDispatch,
+      ...extra,
+    });
+    return { result, roundRecord, calls };
+  }
+
+  it("parseable first result: exactly 1 dispatch call, no retry flag", async () => {
+    const { result, roundRecord, calls } = await runWith([
+      fakeJob("job-ok", VALID),
+    ]);
+
+    assert.equal(calls.length, 1);
+    assert.equal(roundRecord.reviewUnparseableRetried, undefined);
+    assert.equal(roundRecord.reviewFirstJobId, undefined);
+    assert.equal(roundRecord.reviewJobId, "job-ok");
+    assert.equal(result.chainVerdict, "needs-attention");
+    assert.ok(result.chainFindingsText.includes("Off-by-one"));
+    assert.equal(result.reviewParseable, true);
+  });
+
+  it("garbage then valid: 2 dispatch calls, final-attempt fields win, retry recorded", async () => {
+    const { result, roundRecord, calls } = await runWith([
+      fakeJob("job-broken-1", GARBAGE),
+      fakeJob("job-fixed-2", VALID, { usage: { available: true, input: 9, output: 4 }, modelEntry: "test-org/test-fixed-model" }),
+    ]);
+
+    assert.equal(calls.length, 2);
+    assert.equal(roundRecord.reviewUnparseableRetried, true);
+    assert.equal(roundRecord.reviewFirstJobId, "job-broken-1");
+    // All review* fields reflect the FINAL attempt.
+    assert.equal(roundRecord.reviewJobId, "job-fixed-2");
+    assert.equal(roundRecord.reviewModelEntry, "test-org/test-fixed-model");
+    assert.deepEqual(roundRecord.reviewUsage, { available: true, input: 9, output: 4 });
+    assert.equal(result.chainVerdict, "needs-attention");
+    assert.ok(result.chainFindingsText.includes("Off-by-one"));
+    assert.equal(result.reviewParseable, true);
+    // Both dispatches carried identical options.
+    assert.deepEqual(calls[0], calls[1]);
+    assert.ok(calls[0].promptText.includes("test brief"));
+    assert.equal(calls[0].agent, "kusabi-review");
+    assert.equal(calls[0].round, 1);
+  });
+
+  it("both dispatches garbage: 2 dispatch calls, verdict stays unparseable", async () => {
+    const { result, roundRecord, calls } = await runWith([
+      fakeJob("job-g1", GARBAGE),
+      fakeJob("job-g2", GARBAGE),
+    ]);
+
+    assert.equal(calls.length, 2);
+    assert.equal(roundRecord.reviewUnparseableRetried, true);
+    assert.equal(roundRecord.reviewFirstJobId, "job-g1");
+    assert.equal(roundRecord.reviewJobId, "job-g2");
+    assert.equal(result.chainVerdict, "unparseable");
+    assert.equal(result.reviewParseable, false);
+    assert.equal(result.chainFindingsText, "(review output could not be parsed)");
+    assert.equal(roundRecord.verdict, "unparseable");
+    assert.equal(roundRecord.reviewParseable, false);
+    assert.equal(roundRecord.findingsText, "(review output could not be parsed)");
+  });
+
+  it("unparseable JSON with recoverable VERDICT token: exactly 1 dispatch call, no retry", async () => {
+    const { result, roundRecord, calls } = await runWith([
+      fakeJob("job-token", GARBAGE_WITH_TOKEN),
+    ]);
+
+    assert.equal(calls.length, 1);
+    assert.equal(roundRecord.reviewUnparseableRetried, undefined);
+    assert.equal(roundRecord.reviewFirstJobId, undefined);
+    assert.equal(roundRecord.reviewJobId, "job-token");
+    assert.equal(result.chainVerdict, "needs-attention");
+    assert.equal(result.reviewParseable, false);
+    assert.equal(roundRecord.verdictSource, "recovered-from-token");
+    assert.equal(result.chainFindingsText, "(review output could not be parsed)");
+  });
+
+  it("probe-driven skipReview: 0 dispatch calls, unchanged", async () => {
+    const { result, roundRecord, calls } = await runWith([], {
+      chainChangedPaths: [],
+      chainNewlyChanged: [],
+      chainStatusObserved: true,
+      chainDeliverables: ["src/foo.js"],
+    });
+
+    assert.equal(calls.length, 0);
+    assert.equal(result.skipReview, true);
+    assert.equal(roundRecord.verdict, "discard");
+    assert.equal(roundRecord.verdictSource, "probe");
+    assert.equal(roundRecord.reviewUnparseableRetried, undefined);
+  });
+});

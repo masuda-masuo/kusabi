@@ -180,6 +180,8 @@ that, so a failed measurement would throw away work that was actually done.
 
 Uses `plugins/kusabi/prompts/adversarial-review.md` + `plugins/kusabi/schemas/review-output.schema.json`. The JSON schema is **embedded in the prompt** rather than passed via opencode's `format: json_schema` (workaround for opencode 1.17.x bug, issue #8). The companion extracts JSON from the model's response (`extractJson`+`strip`) and formats it (`renderReview`).
 
+**Unparseable-output retry**: when the review response contains neither parseable JSON nor a recoverable `VERDICT:` token, `runReviewPhase` re-dispatches the review job exactly once within the same round, with identical options (same prompt, tiers, agent, tools, timeouts). The retry does not consume a round, and the round record keeps both jobs traceable (`reviewFirstJobId` for the first attempt, all other `review*` fields from the final attempt, `reviewUnparseableRetried: true`). A verdict recovered from a `VERDICT:` token never triggers the retry; two consecutive unparseable results escalate exactly as before.
+
 Reviewer (kusabi-review) permissions:
 - **allow**: `sunaba_verify_in_container`, `sunaba_lint_in_container`, `sunaba_type_check_in_container` — independently re-runs the implementer's "gate green" claim to verify it (PR#37/#40)
 - **deny**: all mutation tools (sandbox_exec, write_file, edit_file, checkout, publish, etc.) — because if the reviewer starts fixing, independence is lost
