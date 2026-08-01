@@ -37,7 +37,7 @@ import { opencodeBin, serverHealthy, ensureServer, reapIdleServes, api } from ".
 import { runPrompt, dispatchWithFallback, resetFailedRoutes } from "./prompt-execution.mjs";
 import { openMetricsDb, openMetricsDbReadOnly } from "./metrics-db.mjs";
 import { ingestTranscriptDirectory } from "./transcript-ingest.mjs";
-import { ingestChainDirectory } from "./chain-ingest.mjs";
+import { ingestChainDirectory, ingestJobDirectory } from "./chain-ingest.mjs";
 import { computeReport, renderReportText, renderReportJson, missingStoreReport, renderMissingText } from "./metrics-report.mjs";
 
 // Chain round-phases module — imported here for cmdChain.
@@ -1169,8 +1169,8 @@ function cmdChainStats(cwd, { flags }) {
 // ---------------------------------------------------------------------------
 
 /**
- * Ingest Claude Code transcripts and kusabi chain records into a durable
- * SQLite metrics store.  This is the ingest + store step only (issues #83 /
+ * Ingest Claude Code transcripts, kusabi chain records, and delegated-job
+ * records (#154) into a durable SQLite metrics store.  This is the ingest + store step only (issues #83 /
  * #81) -- no reporting/rendering here; that is a follow-up PR.
  *
  * `--dry-run` parses everything but writes to a throwaway in-memory
@@ -1188,10 +1188,12 @@ function cmdMetricsIngest(cwd, { flags }) {
 
   let transcriptSummary;
   let chainSummary;
+  let jobSummary;
   db.exec("BEGIN");
   try {
     transcriptSummary = ingestTranscriptDirectory(db, transcriptDir);
     chainSummary = ingestChainDirectory(db, metricsStateRoot);
+    jobSummary = ingestJobDirectory(db, metricsStateRoot);
     db.exec("COMMIT");
   } catch (err) {
     db.exec("ROLLBACK");
@@ -1236,6 +1238,19 @@ function cmdMetricsIngest(cwd, { flags }) {
   // not something to divide into a percentage here -- the follow-up
   // query/report PR decides how (or whether) to qualify a rate over it.
   lines.push(`  chains with structured findings (non-empty findings/findingFiles): ${chainSummary.chainsWithStructuredFindings} of ${chainSummary.chainsIngested}`);
+  lines.push("");
+  // Delegated jobs (#154). Counters are per JOB, not per file — a job is up
+  // to two files (job.json + usage.json) sharing one composite skip key
+  // (see ingestJobDirectory). Reported even when every number is 0, so
+  // "no jobs on disk" is visible rather than a silent absence.
+  lines.push("Jobs (delegated single-shot task/review jobs):");
+  lines.push(`  state root:                ${metricsStateRoot}`);
+  lines.push(`  jobs scanned:              ${jobSummary.jobsScanned}`);
+  lines.push(`  jobs skipped (unchanged):  ${jobSummary.jobsSkippedUnchanged}`);
+  lines.push(`  I/O failures (job.json/usage.json unreadable): ${jobSummary.ioFailures}`);
+  lines.push(`  parse failures (malformed JSON / no job id):   ${jobSummary.parseFailures}`);
+  lines.push(`  jobs ingested:             ${jobSummary.jobsIngested}`);
+  lines.push(`  jobs without usage.json (ended before usage was written): ${jobSummary.jobsMissingUsage}`);
 
   return lines.join("\n");
 }
@@ -1297,7 +1312,7 @@ function usage() {
     "  chain      Run implement→review→rework chain until acceptance or escalate",
     "  chain-show Print a compact plain-text digest of a chain (read-only, no LLM)",
     "  chain-stats Aggregate every chain record and print a summary (read-only, no LLM)",
-    "  metrics-ingest  Ingest transcripts + chain records into a durable SQLite store (read-only source, no LLM)",
+    "  metrics-ingest  Ingest transcripts + chain records + delegated-job records into a durable SQLite store (read-only source, no LLM)",
     "  metrics-report  Query/report over the SQLite metrics store (read-only, no LLM, never ingests)",
     "  chain-cancel  Request a running chain to stop (file-based, works across processes)",
     "  status     List recent jobs or show one by ID",

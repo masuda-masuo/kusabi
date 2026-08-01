@@ -44,8 +44,10 @@ import {
   upsertChain,
   upsertRound,
   upsertFinding,
+  upsertJob,
   upsertSourceFile,
   isSourceFileUnchanged,
+  getSourceFile,
 } from "./metrics-db.mjs";
 
 function toBoolInt(v) {
@@ -370,6 +372,284 @@ export function ingestChainDirectory(db, stateRoot) {
         mtimeMs: stat.mtimeMs,
         ingestedAt: new Date().toISOString(),
       });
+    }
+  }
+
+  return summary;
+}
+
+// ---------------------------------------------------------------------------
+// Delegated single-shot jobs (#154) — `task` / `review` delegations write
+// `<stateRoot>/<slug>/jobs/job-<id>/{job.json,usage.json}` and create no
+// chain record, so until this existed they never entered the store at all.
+//
+// A job is TWO files written at different times: `job.json` exists from the
+// moment the job starts (and is re-saved as events arrive); `usage.json`
+// appears only when the job ends.  The skip-if-unchanged source key is
+// therefore the PAIR:
+//   - `job.json`'s size+mtime (a `source_file` row), AND
+//   - `usage.json`'s size+mtime when it exists, or its recorded ABSENCE
+//     (no `source_file` row for its path) when it does not.
+// Keying on `job.json` alone would mean a job ingested while running is
+// never re-read once its usage lands (nothing forces job.json to change at
+// that exact moment); keying on `usage.json` alone would mean a job that
+// died before writing usage is never ingested at all.  With the pair, a
+// running job ingests immediately (usage columns NULL, distinguishable from
+// measured zero), the later appearance of `usage.json` makes the pair
+// "changed" and forces a re-read, and a fully-ingested job with both files
+// unchanged is skipped like any unchanged chain file.
+// ---------------------------------------------------------------------------
+
+/**
+ * Parse one job's already-`JSON.parse`d `job.json` (+ optional `usage.json`)
+ * into a `job` row shape.
+ *
+ * Pure — no I/O.  Returns `null` when the record has no usable `id` (the
+ * caller counts that as a parse failure).  Everything else degrades
+ * field-by-field to `null`, with two deliberate exceptions:
+ *
+ * - `usageAvailable` is three-valued: `null` when `usageJson` is null (no
+ *   usage.json on disk — the job died before writing it), `0` when the file
+ *   exists but says `available: false`, `1` when it carries measured
+ *   numbers.  Absent usage and measured-zero usage must never collapse.
+ * - `usageCost` 0 is a real measurement (free tier) and is preserved as 0.
+ *
+ * `status` is copied verbatim — no enum. `durationSeconds` prefers the
+ * value usage.json recorded; when that is absent it is derived from
+ * startedAt/finishedAt when both parse, else `null`.
+ *
+ * @param {*} jobJson
+ * @param {*} usageJson  Parsed usage.json, or null when the file does not exist.
+ * @param {{ workspaceSlug?: string }} [ctx]
+ * @returns {{ jobRow: object } | null}
+ */
+export function parseJobRecord(jobJson, usageJson, ctx = {}) {
+  if (!jobJson || typeof jobJson !== "object") return null;
+  const jobId = jobJson.id;
+  if (typeof jobId !== "string" || !jobId) return null;
+
+  const parseMs = (iso) => {
+    if (typeof iso !== "string") return null;
+    const ms = Date.parse(iso);
+    return Number.isFinite(ms) ? ms : null;
+  };
+
+  const startedAt = typeof jobJson.startedAt === "string" ? jobJson.startedAt : null;
+  const finishedAt = typeof jobJson.finishedAt === "string" ? jobJson.finishedAt : null;
+  const startedMs = parseMs(startedAt);
+  const finishedMs = parseMs(finishedAt);
+
+  const stats = (jobJson.stats && typeof jobJson.stats === "object") ? jobJson.stats : {};
+
+  let usageAvailable = null;
+  let usageModel = null;
+  let usageInput = null;
+  let usageOutput = null;
+  let usageReasoning = null;
+  let usageCacheRead = null;
+  let usageCacheWrite = null;
+  let usageCost = null;
+  let durationSeconds = null;
+
+  if (usageJson && typeof usageJson === "object") {
+    usageAvailable = usageJson.available === true ? 1 : 0;
+    // durationSeconds is written alongside `available`, not gated by it
+    // (see runPrompt in prompt-execution.mjs), so it is read either way.
+    if (typeof usageJson.durationSeconds === "number") durationSeconds = usageJson.durationSeconds;
+    if (usageJson.available === true) {
+      // usage.json carries `available: true|false`; the numeric fields are
+      // NOT guaranteed present even when available — every one is guarded.
+      usageModel = typeof usageJson.model === "string" ? usageJson.model : null;
+      usageInput = typeof usageJson.input === "number" ? usageJson.input : null;
+      usageOutput = typeof usageJson.output === "number" ? usageJson.output : null;
+      usageReasoning = typeof usageJson.reasoning === "number" ? usageJson.reasoning : null;
+      usageCacheRead = typeof usageJson.cacheRead === "number" ? usageJson.cacheRead : null;
+      usageCacheWrite = typeof usageJson.cacheWrite === "number" ? usageJson.cacheWrite : null;
+      usageCost = typeof usageJson.cost === "number" ? usageJson.cost : null; // 0 is real
+    }
+  }
+
+  if (durationSeconds === null && startedMs !== null && finishedMs !== null) {
+    durationSeconds = (finishedMs - startedMs) / 1000;
+  }
+
+  return {
+    jobRow: {
+      jobId,
+      workspaceSlug: ctx.workspaceSlug ?? null,
+      kind: typeof jobJson.kind === "string" ? jobJson.kind : null,
+      title: typeof jobJson.title === "string" ? jobJson.title : null,
+      status: typeof jobJson.status === "string" ? jobJson.status : null,
+      phase: typeof jobJson.phase === "string" ? jobJson.phase : null,
+      modelEntry: typeof jobJson.modelEntry === "string" ? jobJson.modelEntry : null,
+      startedAt,
+      startedMs,
+      finishedAt,
+      finishedMs,
+      durationSeconds,
+      steps: typeof stats.steps === "number" ? stats.steps : null,
+      error: typeof jobJson.error === "string" ? jobJson.error : null,
+      usageAvailable,
+      usageModel,
+      usageInput,
+      usageOutput,
+      usageReasoning,
+      usageCacheRead,
+      usageCacheWrite,
+      usageCost,
+    },
+  };
+}
+
+/**
+ * Walk `stateRoot` for delegated-job records at
+ * `<stateRoot>/<workspace-hash>/jobs/job-<id>/{job.json,usage.json}` and
+ * upsert `job` rows into `db`.  Same shape as `ingestChainDirectory`, one
+ * level over (`jobs/` instead of `chains/`).
+ *
+ * Counters are per JOB (a job is up to two files), hence `jobsScanned` /
+ * `jobsSkippedUnchanged` rather than the chain walker's file-based names.
+ * `ioFailures` / `parseFailures` keep the same split as the other walkers:
+ * whole-file-unreadable vs read-but-malformed (or no usable `id`).  A
+ * failure on EITHER of a job's two files skips the whole job without
+ * recording anything — ingesting job.json while silently dropping an
+ * existing-but-broken usage.json would record a false "died before writing
+ * usage"; nothing is written to `source_file` either, so the job is retried
+ * on the next run.
+ *
+ * A job directory with no `job.json` (nothing usable was ever persisted) is
+ * silently skipped, mirroring the chain walker's no-chain.json case.
+ * `jobsMissingUsage` counts jobs ingested WITHOUT a usage.json — the
+ * job-side analogue of "chains that died without writing chain.json": a job
+ * that failed early is exactly the one worth seeing.
+ *
+ * @param {import("node:sqlite").DatabaseSync} db
+ * @param {string} stateRoot
+ * @returns {{
+ *   workspacesScanned: number,
+ *   jobsScanned: number, jobsSkippedUnchanged: number,
+ *   ioFailures: number, parseFailures: number,
+ *   jobsIngested: number, jobsMissingUsage: number,
+ * }}
+ */
+export function ingestJobDirectory(db, stateRoot) {
+  const summary = {
+    workspacesScanned: 0,
+    jobsScanned: 0,
+    jobsSkippedUnchanged: 0,
+    ioFailures: 0,
+    parseFailures: 0,
+    jobsIngested: 0,
+    jobsMissingUsage: 0,
+  };
+
+  if (!fs.existsSync(stateRoot)) return summary;
+
+  let workspaceDirs;
+  try {
+    workspaceDirs = fs.readdirSync(stateRoot, { withFileTypes: true }).filter((e) => e.isDirectory());
+  } catch {
+    return summary;
+  }
+
+  for (const wdirent of workspaceDirs) {
+    const workspaceSlug = wdirent.name;
+    const jobsDir = path.join(stateRoot, workspaceSlug, "jobs");
+    if (!fs.existsSync(jobsDir)) continue;
+    summary.workspacesScanned += 1;
+
+    let jobDirs;
+    try {
+      jobDirs = fs.readdirSync(jobsDir, { withFileTypes: true }).filter((e) => e.isDirectory());
+    } catch {
+      continue;
+    }
+
+    for (const jdirent of jobDirs) {
+      if (!jdirent.name.startsWith("job-")) continue;
+      const jobJsonPath = path.join(jobsDir, jdirent.name, "job.json");
+      const usageJsonPath = path.join(jobsDir, jdirent.name, "usage.json");
+      if (!fs.existsSync(jobJsonPath)) continue; // nothing usable persisted — not a failure
+
+      summary.jobsScanned += 1;
+
+      let jobStat;
+      try {
+        jobStat = fs.statSync(jobJsonPath);
+      } catch {
+        summary.ioFailures += 1;
+        continue;
+      }
+
+      let usageStat = null;
+      if (fs.existsSync(usageJsonPath)) {
+        try {
+          usageStat = fs.statSync(usageJsonPath);
+        } catch {
+          summary.ioFailures += 1;
+          continue;
+        }
+      }
+
+      // Composite skip key (see the header comment): job.json unchanged AND
+      // usage.json unchanged-or-consistently-absent.  When usage.json does
+      // not exist, "unchanged" means no source_file row for it either — a
+      // usage.json that appears (or vanishes) since the last run always
+      // forces a re-read.
+      const jobUnchanged = isSourceFileUnchanged(db, jobJsonPath, jobStat.size, jobStat.mtimeMs);
+      const usageUnchanged = usageStat
+        ? isSourceFileUnchanged(db, usageJsonPath, usageStat.size, usageStat.mtimeMs)
+        : getSourceFile(db, usageJsonPath) === undefined;
+      if (jobUnchanged && usageUnchanged) {
+        summary.jobsSkippedUnchanged += 1;
+        continue;
+      }
+
+      let jobJson;
+      try {
+        jobJson = JSON.parse(fs.readFileSync(jobJsonPath, "utf8"));
+      } catch (err) {
+        if (err instanceof SyntaxError) summary.parseFailures += 1;
+        else summary.ioFailures += 1;
+        continue;
+      }
+
+      let usageJson = null;
+      if (usageStat) {
+        try {
+          usageJson = JSON.parse(fs.readFileSync(usageJsonPath, "utf8"));
+        } catch (err) {
+          if (err instanceof SyntaxError) summary.parseFailures += 1;
+          else summary.ioFailures += 1;
+          continue;
+        }
+      }
+
+      const parsed = parseJobRecord(jobJson, usageJson, { workspaceSlug });
+      if (!parsed) {
+        summary.parseFailures += 1;
+        continue;
+      }
+
+      summary.jobsIngested += 1;
+      if (usageJson === null) summary.jobsMissingUsage += 1;
+
+      upsertJob(db, parsed.jobRow);
+      const ingestedAt = new Date().toISOString();
+      upsertSourceFile(db, {
+        path: jobJsonPath,
+        size: jobStat.size,
+        mtimeMs: jobStat.mtimeMs,
+        ingestedAt,
+      });
+      if (usageStat) {
+        upsertSourceFile(db, {
+          path: usageJsonPath,
+          size: usageStat.size,
+          mtimeMs: usageStat.mtimeMs,
+          ingestedAt,
+        });
+      }
     }
   }
 

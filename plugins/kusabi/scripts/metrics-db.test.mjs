@@ -22,13 +22,14 @@ import {
   upsertChain,
   upsertRound,
   upsertFinding,
+  upsertJob,
   countRows,
 } from "./metrics-db.mjs";
 
 describe("openMetricsDb", () => {
   it("creates all tables on an in-memory database", () => {
     const db = openMetricsDb(":memory:");
-    for (const table of ["source_file", "session", "turn", "chain", "round", "finding"]) {
+    for (const table of ["source_file", "session", "turn", "chain", "round", "finding", "job"]) {
       assert.equal(countRows(db, table), 0, `expected empty ${table}`);
     }
   });
@@ -284,5 +285,47 @@ describe("transactions", () => {
     });
     db.exec("COMMIT");
     assert.equal(countRows(db, "chain"), 1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// job (#154)
+// ---------------------------------------------------------------------------
+
+describe("upsertJob", () => {
+  it("is idempotent on job_id (INSERT OR REPLACE, one row after two upserts)", () => {
+    const db = openMetricsDb(":memory:");
+    const row = { jobId: "job-a", status: "completed", usageAvailable: 1, usageCost: 0 };
+    upsertJob(db, row);
+    upsertJob(db, row);
+    assert.equal(countRows(db, "job"), 1);
+  });
+
+  it("stores cost 0 as 0 (a free-tier measurement), never coerced to NULL", () => {
+    const db = openMetricsDb(":memory:");
+    upsertJob(db, { jobId: "job-free", status: "completed", usageAvailable: 1, usageCost: 0 });
+    const got = db.prepare("SELECT usage_cost FROM job WHERE job_id = 'job-free'").get();
+    assert.equal(got.usage_cost, 0);
+  });
+
+  it("stores absent fields as NULL, and keeps usage_available three-valued (NULL vs 0 vs 1)", () => {
+    const db = openMetricsDb(":memory:");
+    upsertJob(db, { jobId: "job-nousage", status: "error" }); // no usage.json at all
+    upsertJob(db, { jobId: "job-unavail", status: "completed", usageAvailable: 0 });
+    upsertJob(db, { jobId: "job-measured", status: "completed", usageAvailable: 1, usageOutput: 79 });
+    const rows = db.prepare("SELECT job_id, usage_available, usage_output, usage_cost FROM job ORDER BY job_id").all();
+    const byId = Object.fromEntries(rows.map((r) => [r.job_id, r]));
+    assert.equal(byId["job-nousage"].usage_available, null);
+    assert.equal(byId["job-nousage"].usage_cost, null);
+    assert.equal(byId["job-unavail"].usage_available, 0);
+    assert.equal(byId["job-measured"].usage_available, 1);
+    assert.equal(byId["job-measured"].usage_output, 79);
+  });
+
+  it("stores an unknown status string verbatim", () => {
+    const db = openMetricsDb(":memory:");
+    upsertJob(db, { jobId: "job-x", status: "totally-new-status" });
+    const got = db.prepare("SELECT status FROM job WHERE job_id = 'job-x'").get();
+    assert.equal(got.status, "totally-new-status");
   });
 });

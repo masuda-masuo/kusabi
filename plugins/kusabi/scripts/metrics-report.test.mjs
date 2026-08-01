@@ -16,6 +16,7 @@ import {
   upsertTurn,
   upsertChain,
   upsertRound,
+  upsertJob,
 } from "./metrics-db.mjs";
 
 import {
@@ -85,7 +86,7 @@ describe("empty store", () => {
     assert.equal(report.freshness.sourceFilesRecorded, 0);
     const text = renderReportText(report);
     assert.match(text, /\(none\)/);
-    assert.match(text, /Store is empty \(0 sessions, 0 turns, 0 chains\)\./);
+    assert.match(text, /Store is empty \(0 sessions, 0 turns, 0 chains, 0 jobs\)\./);
   });
 
   it("does not throw and produces output for --json on an empty store", () => {
@@ -490,5 +491,191 @@ describe("chain join warning banner", () => {
     }));
     assert.match(bounded, /IN-WINDOW portion of the orchestrator session/);
     assert.doesNotMatch(bounded, /WHOLE orchestrator session/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Delegated jobs (#154)
+// ---------------------------------------------------------------------------
+
+/** Add a spread of delegated jobs to an existing fixture db. */
+function addJobsFixture(db) {
+  // Free-tier completed job — cost 0 is a REAL measurement.
+  upsertJob(db, {
+    jobId: "job-measured",
+    workspaceSlug: "ws1",
+    kind: "task",
+    status: "completed",
+    startedAt: "2026-07-26T12:00:00.000Z",
+    startedMs: Date.parse("2026-07-26T12:00:00.000Z"),
+    finishedAt: "2026-07-26T12:26:15.000Z",
+    finishedMs: Date.parse("2026-07-26T12:26:15.000Z"),
+    durationSeconds: 1575,
+    steps: 152,
+    usageAvailable: 1,
+    usageInput: 5000,
+    usageOutput: 82419,
+    usageReasoning: 102005,
+    usageCost: 0,
+  });
+  // Job that died before writing usage.json (usageAvailable null).
+  upsertJob(db, {
+    jobId: "job-nousage",
+    workspaceSlug: "ws1",
+    kind: "task",
+    status: "error",
+    startedAt: "2026-07-26T13:00:00.000Z",
+    startedMs: Date.parse("2026-07-26T13:00:00.000Z"),
+    steps: 3,
+    usageAvailable: null,
+  });
+  // usage.json present but available: false.
+  upsertJob(db, {
+    jobId: "job-unavailable",
+    workspaceSlug: "ws2",
+    kind: "review",
+    status: "provider-error",
+    startedAt: "2026-07-24T02:00:00.000Z",
+    startedMs: Date.parse("2026-07-24T02:00:00.000Z"),
+    durationSeconds: 564,
+    steps: 21,
+    usageAvailable: 0,
+  });
+  // A status this code has never heard of — must survive verbatim.
+  upsertJob(db, {
+    jobId: "job-unknown-status",
+    workspaceSlug: "ws2",
+    kind: "task",
+    status: "some-future-status",
+    startedAt: "2026-07-24T03:00:00.000Z",
+    startedMs: Date.parse("2026-07-24T03:00:00.000Z"),
+    usageAvailable: 1,
+    usageOutput: 79,
+    usageReasoning: 0,
+    usageCost: 0,
+  });
+  // A job with no timestamps at all — excluded (and counted) when a bound
+  // is active.
+  upsertJob(db, {
+    jobId: "job-undated",
+    workspaceSlug: "ws1",
+    kind: "task",
+    status: "cancelled",
+    usageAvailable: null,
+  });
+  return db;
+}
+
+describe("delegated jobs section (#154)", () => {
+  it("counts statuses verbatim, including values not in any known vocabulary", () => {
+    const db = addJobsFixture(buildFixture());
+    const report = computeReport(db, { dbPath: ":memory:" });
+    assert.equal(report.delegatedJobs.jobCount, 5);
+    assert.equal(report.delegatedJobs.statusCounts.completed, 1);
+    assert.equal(report.delegatedJobs.statusCounts.error, 1);
+    assert.equal(report.delegatedJobs.statusCounts["provider-error"], 1);
+    assert.equal(report.delegatedJobs.statusCounts.cancelled, 1);
+    assert.equal(report.delegatedJobs.statusCounts["some-future-status"], 1);
+    const text = renderReportText(report);
+    assert.match(text, /some-future-status/);
+  });
+
+  it("keeps absent usage, unavailable usage, and measured usage as three distinct states", () => {
+    const db = addJobsFixture(buildFixture());
+    const report = computeReport(db, { dbPath: ":memory:" });
+    assert.equal(report.delegatedJobs.jobsWithoutUsage, 2); // job-nousage + job-undated
+    assert.equal(report.delegatedJobs.jobsUsageUnavailable, 1); // job-unavailable
+    const rows = report.delegatedJobs.jobs;
+    assert.equal(rows.find((j) => j.jobId === "job-nousage").usageState, "never_written");
+    assert.equal(rows.find((j) => j.jobId === "job-unavailable").usageState, "unavailable");
+    assert.equal(rows.find((j) => j.jobId === "job-measured").usageState, "measured");
+    const text = renderReportText(report);
+    assert.match(text, /usage\.json never written/);
+    assert.match(text, /usage recorded but unavailable/);
+  });
+
+  it("renders cost 0 (free tier) as 0.00, never n/a — a measured zero is not a missing value", () => {
+    const db = addJobsFixture(buildFixture());
+    const report = computeReport(db, { dbPath: ":memory:" });
+    // Both measured jobs have cost 0 -> total is 0, not null.
+    assert.equal(report.delegatedJobs.totals.cost, 0);
+    assert.equal(report.delegatedJobs.totals.output, 82419 + 79);
+    const text = renderReportText(report);
+    assert.match(text, /cost 0\.00/);
+    const measuredRow = renderReportText(report)
+      .split("\n")
+      .find((l) => l.includes("job-measured"));
+    assert.doesNotMatch(measuredRow, /cost n\/a/);
+  });
+
+  it("honours --since/--until by job start instant and counts undated jobs as excluded", () => {
+    const db = addJobsFixture(buildFixture());
+    const report = computeReport(db, {
+      since: "2026-07-26T00:00:00.000Z",
+      until: "2026-07-27T00:00:00.000Z",
+      dbPath: ":memory:",
+    });
+    // Only job-measured and job-nousage started on 2026-07-26.
+    assert.equal(report.window.jobsInWindow, 2);
+    assert.equal(report.window.jobsExcludedNoTimestamp, 1); // job-undated
+    const ids = report.delegatedJobs.jobs.map((j) => j.jobId).sort();
+    assert.deepEqual(ids, ["job-measured", "job-nousage"]);
+  });
+
+  it("does not appear in, or change, any chain section (a job is not a chain)", () => {
+    const before = computeReport(buildFixture(), { dbPath: ":memory:" });
+    const after = computeReport(addJobsFixture(buildFixture()), { dbPath: ":memory:" });
+    // Chain sections byte-identical with and without the jobs present.
+    assert.deepEqual(after.chainJoin, before.chainJoin);
+    assert.deepEqual(after.briefOutcome, before.briefOutcome);
+    assert.deepEqual(after.sessionCostByModel, before.sessionCostByModel);
+    assert.equal(after.window.chainsInWindow, before.window.chainsInWindow);
+    // And no job id ever leaks into the chain join rows.
+    for (const row of after.chainJoin) {
+      assert.doesNotMatch(String(row.chainId), /^job-/);
+    }
+  });
+
+  it("a store written before the job table existed reports zero jobs instead of crashing", () => {
+    const db = buildFixture();
+    db.exec("DROP TABLE job"); // simulate a pre-#154 metrics.db opened read-only
+    const report = computeReport(db, { dbPath: ":memory:" });
+    assert.equal(report.delegatedJobs.jobCount, 0);
+    assert.equal(report.freshness.newestJobStart, null);
+    const text = renderReportText(report);
+    assert.match(text, /Delegated jobs/);
+    assert.match(text, /no data in window/);
+  });
+
+  it("an all-jobs store is not 'empty', and a job-only window is not 'empty_window'", () => {
+    const db = openMetricsDb(":memory:");
+    upsertJob(db, {
+      jobId: "job-only",
+      status: "completed",
+      startedAt: "2026-07-26T12:00:00.000Z",
+      startedMs: Date.parse("2026-07-26T12:00:00.000Z"),
+      usageAvailable: 1,
+      usageOutput: 10,
+      usageCost: 0,
+    });
+    const report = computeReport(db, { dbPath: ":memory:" });
+    assert.equal(report.status, "ok");
+    assert.equal(report.delegatedJobs.jobCount, 1);
+  });
+
+  it("freshness reports the newest job start independently of the window", () => {
+    const db = addJobsFixture(buildFixture());
+    const report = computeReport(db, { since: "2099-01-01T00:00:00.000Z", dbPath: ":memory:" });
+    assert.equal(report.freshness.newestJobStart, "2026-07-26T13:00:00.000Z");
+  });
+
+  it("--json carries the delegatedJobs section with nulls preserved", () => {
+    const db = addJobsFixture(buildFixture());
+    const parsed = JSON.parse(renderReportJson(computeReport(db, { dbPath: ":memory:" })));
+    const row = parsed.delegatedJobs.jobs.find((j) => j.jobId === "job-nousage");
+    assert.equal(row.output, null);
+    assert.equal(row.cost, null);
+    const measured = parsed.delegatedJobs.jobs.find((j) => j.jobId === "job-measured");
+    assert.equal(measured.cost, 0);
   });
 });
