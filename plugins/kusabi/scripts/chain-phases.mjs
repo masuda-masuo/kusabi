@@ -36,6 +36,7 @@ import {
 import {
   checkSmokeProbe,
 } from "./probe-decisions.mjs";
+import { deriveReworkStrategy } from "./disposition.mjs";
 // resolveRoundResume is defined below and is the only resume-resolution
 // mechanism.  checkpoint_restore was removed in issue #114 — the chain
 // never rolls the worktree back.
@@ -377,8 +378,11 @@ export function parseReviewResult(reviewResultText) {
 
   if (reviewParseable) {
     const chainVerdict = parsed.verdict || "needs-attention";
-    const chainFindingsText = parsed.findings && parsed.findings.length > 0
-      ? parsed.findings.map(function (f) { return "[" + f.severity + "] " + f.title + " (" + f.file + ":" + f.line_start + ")"; }).join("\n")
+    // Malformed-review guard (kusabi #153): `findings` may arrive as a
+    // string/object instead of an array; never call .map on a non-array.
+    const findingsArray = Array.isArray(parsed.findings) ? parsed.findings : [];
+    const chainFindingsText = findingsArray.length > 0
+      ? findingsArray.map(function (f) { return "[" + f.severity + "] " + f.title + " (" + f.file + ":" + f.line_start + ")"; }).join("\n")
       : "(no structured findings)";
     return { chainParsedReview: parsed, chainVerdict, chainFindingsText, reviewParseable };
   }
@@ -541,10 +545,11 @@ export async function runReviewPhase({
     // Stores the raw finding file paths from the parsed review.
     // Comparison uses path-segment suffix matching in hasRepeatedAreas,
     // so absolute vs relative path differences are handled transparently.
-    roundRecord.findingFiles = chainParsedReview?.findings
-      ? chainParsedReview.findings.map(function (f) { return normalizeFilePath(f.file); })
-      : [];
-    roundRecord.findings = chainParsedReview?.findings || [];
+    // Malformed-review guard (kusabi #153): normalise a non-array `findings`
+    // to [] so nothing downstream calls .map / .forEach on a string.
+    const reviewFindingsArray = Array.isArray(chainParsedReview?.findings) ? chainParsedReview.findings : [];
+    roundRecord.findingFiles = reviewFindingsArray.map(function (f) { return normalizeFilePath(f.file); });
+    roundRecord.findings = reviewFindingsArray;
 
     // ---- determine repeated areas using hasRepeatedAreas ----
     // Uses the stored findingFiles array instead of re-parsing the
@@ -974,6 +979,84 @@ export async function runDeliverablesProbe({ deliverables, headingPresent, callT
   probeResult.statusOutput = statusOutput;
   probeResult.worktreeChanged = worktreeChanged;
   return probeResult;
+}
+
+// =========================================================================
+// Tier escalation clamping
+// =========================================================================
+
+/**
+ * Clamp a rework tier escalation to the modelChain's tier range.
+ *
+ * Pure function.  The model ladder is 0..tierCount-1; `selectRoutes` already
+ * clamps dispatch, so an escalation past the top tier never changes the
+ * model actually used — but the *recorded* tier must match it too (kusabi
+ * #153: a 1-tier chain recorded "0 → 1" while the job stayed on flash, and
+ * the orchestrator misread it as a stronger-model re-run).
+ *
+ * @param {object} opts
+ * @param {number} opts.currentTierIndex  - Tier index before this escalation.
+ * @param {number} opts.tierDelta         - Escalation step (normally +1).
+ * @param {number} opts.tierCount         - Number of tiers in modelChain.
+ * @returns {{ tierIndex: number, clamped: boolean, reason: string|null }}
+ *   - `tierIndex` — min(current + delta, tierCount - 1).
+ *   - `clamped`   — true when the raw escalation exceeded the top tier.
+ *   - `reason`    — human-readable why (null when not clamped).
+ */
+export function applyTierEscalation({ currentTierIndex, tierDelta, tierCount }) {
+  const nextTier = currentTierIndex + tierDelta;
+  if (!Number.isFinite(tierCount) || tierCount <= 0) {
+    // No usable ladder: nothing to clamp against.
+    return { tierIndex: nextTier, clamped: false, reason: null };
+  }
+  const maxTier = tierCount - 1;
+  if (nextTier <= maxTier) {
+    return { tierIndex: nextTier, clamped: false, reason: null };
+  }
+  const reason = tierCount === 1
+    ? "single-tier chain"
+    : "escalation beyond top tier (modelChain has " + tierCount + " tiers)";
+  return { tierIndex: maxTier, clamped: true, reason };
+}
+
+/**
+ * Apply the rework levers for the NEXT round and record them on the current
+ * round record, with the tier escalation clamped to the modelChain range.
+ *
+ * This is the driver's rework branch, extracted so the round-record contract
+ * (tierAfter / tierClamped / tierClampReason) is testable without running a
+ * chain.  Mutates roundRecord with the clamp fields only; the caller still
+ * records `tierAfter` and `pendingReworkStrategy` on the round record and
+ * persists cross-round state as before.
+ *
+ * @param {object} opts
+ * @param {object} opts.roundRecord       - Current round record (mutated: tierClamped/tierClampReason).
+ * @param {number} opts.currentTierIndex  - Tier index before this escalation.
+ * @param {number} opts.reworkCount       - Reworks done so far (pre-increment).
+ * @param {boolean} opts.strategized      - Whether a strategize already ran.
+ * @param {number} opts.tierCount         - Number of tiers in modelChain.
+ * @returns {{ currentTierIndex: number, strategy: { tierDelta: number, newSession: boolean, reason: string } }}
+ */
+export function recordReworkEscalation({ roundRecord, currentTierIndex, reworkCount, strategized, tierCount }) {
+  const strategy = deriveReworkStrategy({ reworkCount, strategized });
+  const { tierIndex, clamped, reason } = applyTierEscalation({
+    currentTierIndex,
+    tierDelta: strategy.tierDelta,
+    tierCount,
+  });
+  roundRecord.tierClamped = clamped;
+  roundRecord.tierClampReason = clamped ? reason : null;
+  if (clamped && strategy.tierDelta > 0) {
+    // The stored/rendered strategy reason must never claim an escalation
+    // that dispatch did not perform (#153④): chain-show prints this string
+    // right next to the clamped tier line, and "escalate tier" there reads
+    // as a stronger-model re-run.
+    strategy.reason = strategy.reason.replace(
+      /escalate tier/g,
+      `tier unchanged (escalation clamped: ${reason})`,
+    );
+  }
+  return { currentTierIndex: tierIndex, strategy };
 }
 
 // =========================================================================

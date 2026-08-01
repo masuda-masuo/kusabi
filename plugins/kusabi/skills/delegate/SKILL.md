@@ -121,3 +121,9 @@ Publish is the orchestrator's exclusive network exit and is never granted to a w
 credentials stay host-side and never enter the container. Declare an explicit file
 manifest taken from the worker's reported change set — anything undeclared must not be
 staged, and a bulk "add everything" is how a worker's scratch files reach the remote.
+
+**Writing "PUBLISH" into a brief does not make it happen.** The worker's toolset has no
+publish, so a chain brief that demands it is executed as far as the worker can take it and
+then stops — publish happens here, after acceptance, never inside the chain. The chain
+prints a one-line warning when the brief looks publish-demanding; treat that warning as a
+to-do for yourself, not as a worker failure.

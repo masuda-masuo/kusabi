@@ -21,6 +21,8 @@ import {
   parseReviewResult,
   normalizeFilePath,
   hasRepeatedAreas,
+  applyTierEscalation,
+  recordReworkEscalation,
 } from "./chain-phases.mjs";
 import {
   createFakeCallTool,
@@ -1562,6 +1564,162 @@ describe("parseReviewResult", () => {
 
     // The two produce different reviewParseable and different findingsText
     // despite having the same verdict string.
+  });
+
+  // kusabi #153: a parseable review whose `findings` is a non-array (string /
+  // object — e.g. a model responding to a broken review input) must not crash
+  // with ".map is not a function"; it degrades to "(no structured findings)".
+  it("tolerates a string findings field without crashing", () => {
+    const payload = "```json\n{\n  \"verdict\": \"needs-attention\",\n  \"summary\": \"s\",\n  \"findings\": \"not an array\"\n}\n```";
+    const result = parseReviewResult(payload);
+
+    assert.equal(result.reviewParseable, true);
+    assert.equal(result.chainVerdict, "needs-attention");
+    assert.equal(result.chainFindingsText, "(no structured findings)");
+    assert.deepEqual(result.chainParsedReview.findings, "not an array");
+  });
+
+  it("tolerates an object findings field without crashing", () => {
+    const payload = "```json\n{\n  \"verdict\": \"approve\",\n  \"summary\": \"s\",\n  \"findings\": { \"file\": \"x.js\" }\n}\n```";
+    const result = parseReviewResult(payload);
+
+    assert.equal(result.reviewParseable, true);
+    assert.equal(result.chainVerdict, "approve");
+    assert.equal(result.chainFindingsText, "(no structured findings)");
+  });
+});
+
+// applyTierEscalation — tier clamping (kusabi #153)
+// =========================================================================
+
+describe("applyTierEscalation", () => {
+  it("clamps an escalation past the top of a single-tier chain", () => {
+    const result = applyTierEscalation({ currentTierIndex: 0, tierDelta: 1, tierCount: 1 });
+    assert.deepEqual(result, { tierIndex: 0, clamped: true, reason: "single-tier chain" });
+  });
+
+  it("clamps repeated escalations on a single-tier chain", () => {
+    const result = applyTierEscalation({ currentTierIndex: 0, tierDelta: 2, tierCount: 1 });
+    assert.equal(result.tierIndex, 0);
+    assert.equal(result.clamped, true);
+  });
+
+  it("does not clamp an in-range escalation on a multi-tier chain", () => {
+    const result = applyTierEscalation({ currentTierIndex: 0, tierDelta: 1, tierCount: 2 });
+    assert.deepEqual(result, { tierIndex: 1, clamped: false, reason: null });
+  });
+
+  it("clamps an escalation past the top of a multi-tier chain", () => {
+    const result = applyTierEscalation({ currentTierIndex: 1, tierDelta: 1, tierCount: 2 });
+    assert.equal(result.tierIndex, 1);
+    assert.equal(result.clamped, true);
+    assert.equal(result.reason, "escalation beyond top tier (modelChain has 2 tiers)");
+  });
+
+  it("never clamps when there is no usable ladder", () => {
+    const result = applyTierEscalation({ currentTierIndex: 0, tierDelta: 1, tierCount: 0 });
+    assert.deepEqual(result, { tierIndex: 1, clamped: false, reason: null });
+  });
+});
+
+// recordReworkEscalation — driver rework branch (round-record contract)
+// =========================================================================
+
+describe("recordReworkEscalation", () => {
+  it("records the clamp on the round record for a single-tier chain", () => {
+    const roundRecord = { tierBefore: 0 };
+    const result = recordReworkEscalation({
+      roundRecord,
+      currentTierIndex: 0,
+      reworkCount: 1, // 2nd rework: tierDelta +1
+      strategized: false,
+      tierCount: 1,
+    });
+
+    assert.equal(result.currentTierIndex, 0); // clamped: stays on tier 0
+    assert.equal(result.strategy.tierDelta, 1);
+    assert.equal(roundRecord.tierClamped, true);
+    assert.equal(roundRecord.tierClampReason, "single-tier chain");
+  });
+
+  it("amends the strategy reason on a clamped escalation so it never claims 'escalate tier'", () => {
+    // #153④: chain-show renders the strategy reason verbatim next to the
+    // clamped tier line — "escalate tier" there reads as a stronger-model
+    // re-run that dispatch never performed.
+    const roundRecord = { tierBefore: 0 };
+    const result = recordReworkEscalation({
+      roundRecord,
+      currentTierIndex: 0,
+      reworkCount: 1, // 2nd rework: tierDelta +1, clamped on a 1-tier chain
+      strategized: false,
+      tierCount: 1,
+    });
+
+    assert.ok(!result.strategy.reason.includes("escalate tier"), result.strategy.reason);
+    assert.ok(
+      result.strategy.reason.includes("tier unchanged (escalation clamped: single-tier chain)"),
+      result.strategy.reason,
+    );
+  });
+
+  it("keeps the plain 'escalate tier' wording for an in-range escalation", () => {
+    const roundRecord = { tierBefore: 0 };
+    const result = recordReworkEscalation({
+      roundRecord,
+      currentTierIndex: 0,
+      reworkCount: 1, // 2nd rework: tierDelta +1 -> tier 1 of 2, no clamp
+      strategized: false,
+      tierCount: 2,
+    });
+
+    assert.ok(result.strategy.reason.includes("escalate tier"), result.strategy.reason);
+  });
+
+  it("records no clamp when escalation stays within range", () => {
+    const roundRecord = { tierBefore: 0 };
+    const result = recordReworkEscalation({
+      roundRecord,
+      currentTierIndex: 0,
+      reworkCount: 0, // 1st rework: tierDelta 0
+      strategized: false,
+      tierCount: 2,
+    });
+
+    assert.equal(result.currentTierIndex, 0);
+    assert.equal(roundRecord.tierClamped, false);
+    assert.equal(roundRecord.tierClampReason, null);
+  });
+
+  it("records no clamp for an in-range escalation on a multi-tier chain", () => {
+    const roundRecord = { tierBefore: 0 };
+    const result = recordReworkEscalation({
+      roundRecord,
+      currentTierIndex: 0,
+      reworkCount: 1, // 2nd rework: tierDelta +1 -> tier 1 of 2
+      strategized: false,
+      tierCount: 2,
+    });
+
+    assert.equal(result.currentTierIndex, 1);
+    assert.equal(roundRecord.tierClamped, false);
+    assert.equal(roundRecord.tierClampReason, null);
+  });
+
+  it("keeps the recorded tierAfter consistent with the model actually used", () => {
+    // Driver contract: after recordReworkEscalation the driver stores
+    // roundRecord.tierAfter = result.currentTierIndex.  For a single-tier
+    // chain that must stay 0 (never "0 → 1").
+    const roundRecord = { tierBefore: 0 };
+    const escalation = recordReworkEscalation({
+      roundRecord,
+      currentTierIndex: 0,
+      reworkCount: 1,
+      strategized: false,
+      tierCount: 1,
+    });
+    roundRecord.tierAfter = escalation.currentTierIndex;
+    assert.equal(roundRecord.tierAfter, 0);
+    assert.equal(roundRecord.tierClamped, true);
   });
 });
 

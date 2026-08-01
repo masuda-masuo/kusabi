@@ -113,7 +113,15 @@ export function renderReview(parsed, rawText) {
     return `(review output was not valid JSON; raw output below)\n\n${rawText}`;
   }
   const lines = [`**Verdict: ${parsed.verdict}**`, "", parsed.summary, ""];
-  const findings = parsed.findings ?? [];
+  // Malformed-review guard (kusabi #153): a model that responds to a broken
+  // review input can emit `findings` as a string or object instead of an
+  // array.  Normalise to an array and say so — never surface an internal
+  // "findings.forEach is not a function" TypeError to the user.
+  const findings = Array.isArray(parsed.findings) ? parsed.findings : [];
+  if (parsed.findings !== undefined && parsed.findings !== null && !Array.isArray(parsed.findings)) {
+    lines.push(`> malformed review: "findings" was not an array (${typeof parsed.findings}); treated as none.`);
+    lines.push("");
+  }
   if (findings.length === 0) {
     lines.push("No material findings.");
   }
@@ -128,12 +136,12 @@ export function renderReview(parsed, rawText) {
       "",
     );
   });
-  const next = parsed.next_steps ?? [];
+  const next = Array.isArray(parsed.next_steps) ? parsed.next_steps : [];
   if (next.length) {
     lines.push("**Next steps:**");
     next.forEach((s) => lines.push(`- ${s}`));
   }
-  const unverified = parsed.unverified ?? [];
+  const unverified = Array.isArray(parsed.unverified) ? parsed.unverified : [];
   if (unverified.length) {
     lines.push("", "**Unverified:**");
     unverified.forEach((s) => lines.push(`- ${s}`));
@@ -445,7 +453,15 @@ export function renderChainShow(chain, rounds, unreadable = [], control = null) 
     if (round.tierBefore !== undefined) {
       const tierAfter = round.tierAfter !== undefined ? round.tierAfter : round.tierBefore;
       const tierArrow = round.tierBefore !== tierAfter ? ` ${round.tierBefore} \u2192 ${tierAfter}` : ` ${round.tierBefore}`;
-      lines.push(`  tier:${tierArrow}`);
+      let tierLine = `  tier:${tierArrow}`;
+      // Escalation beyond the modelChain's top tier is clamped at the driver
+      // (kusabi #153): the recorded tier must match the model actually used.
+      // When clamping happened, say why instead of letting "0 → 1" mislead
+      // the orchestrator into thinking a stronger model was dispatched.
+      if (round.tierClamped) {
+        tierLine += ` (escalation clamped: ${round.tierClampReason || "modelChain top tier"})`;
+      }
+      lines.push(tierLine);
     }
 
     // Rework strategy reason (B8: why these levers were pulled)

@@ -232,6 +232,42 @@ export function parseSmoke(briefText) {
 }
 
 // ---------------------------------------------------------------------------
+// briefRequestsPublish — detect a brief that asks the worker to publish
+// ---------------------------------------------------------------------------
+
+// Requirement keywords that make a "publish" mention read as a demand rather
+// than as background explanation.  Deliberately simple and over-eager: the
+// cost of a false positive is one warning line; the cost of a false negative
+// is the orchestrator misreading "the worker skipped publish" (kusabi #153).
+const PUBLISH_DEMAND_KEYWORDS = /\b(must|mandatory|required|essential)\b|(?:必須|必要)/i;
+
+/**
+ * Heuristic: does this brief appear to demand that the worker publish?
+ *
+ * True when (per line):
+ *  - a markdown heading (## ...) mentions "publish", or
+ *  - "publish" and a demand keyword (must / mandatory / required / 必須…)
+ *    appear on the same line.
+ *
+ * Over-detection is acceptable — the caller only emits a single warning line
+ * and never changes behaviour.  "publish is orchestrator-exclusive" style
+ * explanatory sentences do NOT match (no demand keyword on the line).
+ *
+ * @param {string|null|undefined} briefText
+ * @returns {boolean}
+ */
+export function briefRequestsPublish(briefText) {
+  if (!briefText || typeof briefText !== "string") return false;
+  for (const line of briefText.split("\n")) {
+    const trimmed = line.trim();
+    if (!/\bpublish\b/i.test(trimmed)) continue;
+    if (/^#{1,6}\s+/.test(trimmed)) return true;
+    if (PUBLISH_DEMAND_KEYWORDS.test(trimmed)) return true;
+  }
+  return false;
+}
+
+// ---------------------------------------------------------------------------
 // parseOrchestratorSignature
 // ---------------------------------------------------------------------------
 
