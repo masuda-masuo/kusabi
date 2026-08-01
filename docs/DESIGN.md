@@ -97,7 +97,7 @@ Launched with `chain --container <cid> --model <m> [--max-rounds N] "<brief>"`. 
 
 Each round r (1..maxRounds, default 3) flows as follows:
 
-1. **implement**: implement with the `kusabi-implement` agent. r=1 gets the full brief; r≥2 gets only the previous round's findings + the brief's acceptance criteria. The previous session's trial-and-error log is not carried over.
+1. **implement**: implement with the `kusabi-implement` agent. r=1 gets the full brief; r≥2 gets only the previous round's findings + the brief's acceptance criteria. The previous session's trial-and-error log is not carried over. The companion injects the `--container` ID into every implement prompt (mirroring the review-side injection), so briefs no longer need to carry it.
    - Every dispatch in the chain (implement, review, strategist) goes through `dispatchWithFallback`. When a dispatch ends as `provider-error`, the companion re-dispatches on the next unused route of the same tier — same round, same container, same brief. Routes that fail with a capacity reason are remembered for the rest of the process. Fallbacks do not consume rounds.
 2. **Deterministic probes** (§3.5.2): non-LLM checks inside the container via sunaba-rpc.
 3. **review**: adversarial review with the `kusabi-review` agent. Carries over previous round findings via `--prior`. The reviewer does not climb the round ladder: it stays on `--model` when given, otherwise on tier 0, for every round — the same route the pre-fallback implementation used. When those routes are dead it falls through to later tiers via the same `dispatchWithFallback` mechanism. Note that tier 0 is the *cheapest* tier, not the strongest; raising the reviewer's model is done with `--model`.

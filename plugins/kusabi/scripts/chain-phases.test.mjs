@@ -529,6 +529,34 @@ describe("buildImplementText", () => {
     assert.equal(result, brief);
   });
 
+  it("round 1 without container is the brief verbatim (no header)", () => {
+    const result = buildImplementText({ round: 1, brief, previousRecord: null });
+    assert.equal(result, brief);
+    assert.ok(!result.includes("The workspace lives inside container"));
+  });
+
+  it("round 1 with container starts with the exact-ID header, then the brief verbatim", () => {
+    const result = buildImplementText({ round: 1, brief, previousRecord: null, container: "abc123def456" });
+    assert.ok(result.startsWith(
+      "The workspace lives inside container `abc123def456`. Pass this exact ID as `container_id` to every sunaba tool call. Do not guess container names or call sandbox_attach.\n\n"
+    ));
+    assert.ok(result.endsWith(brief));
+  });
+
+  it("round 2+ with container keeps the header first, then the prior-findings structure intact", () => {
+    const prev = { findingsText: "file: src/foo.js:42 \u2014 missing null check" };
+    const result = buildImplementText({ round: 2, brief, previousRecord: prev, container: "abc123def456" });
+    assert.ok(result.startsWith(
+      "The workspace lives inside container `abc123def456`. Pass this exact ID as `container_id` to every sunaba tool call. Do not guess container names or call sandbox_attach.\n\n"
+    ));
+    assert.ok(result.includes("## Prior findings"));
+    assert.ok(result.includes("file: src/foo.js:42"));
+    assert.ok(result.includes("## Acceptance criteria"));
+    assert.ok(result.includes(brief));
+    // The header must appear only once, before any other content.
+    assert.equal(result.indexOf("The workspace lives inside container"), 0);
+  });
+
   it("round 2+ includes prior findings and acceptance criteria", () => {
     const prev = { findingsText: "file: src/foo.js:42 — missing null check" };
     const result = buildImplementText({ round: 2, brief, previousRecord: prev });

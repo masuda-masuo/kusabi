@@ -796,7 +796,7 @@ async function cmdChain(cwd, { flags, text }) {
       // runReviewPhase which passes round=1 to dispatchWithFallback.
 
       // ---- phase 3: implement text + dispatch ----
-      const implementText = buildImplementText({ round, brief, previousRecord });
+      const implementText = buildImplementText({ round, brief, previousRecord, container });
       const {
         roundRecord,
         session: resolvedSession,
