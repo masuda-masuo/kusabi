@@ -230,12 +230,14 @@ export function buildCaptureOutput(manifest) {
   if (!manifest) return "";
   const lines = [];
   lines.push("TREE_HASH=" + manifest.treeHash);
-  if (manifest.files) {
-    const entries = Object.entries(manifest.files);
-    entries.sort(function (a, b) { return a[0].localeCompare(b[0]); });
-    for (const [filePath, hash] of entries) {
-      lines.push(hash + "|" + filePath);
-    }
+  const files = manifest.files ?? {};
+  const entries = Object.entries(files);
+  entries.sort(function (a, b) { return a[0].localeCompare(b[0]); });
+  for (const [filePath, hash] of entries) {
+    lines.push(hash + "|" + filePath);
   }
+  // captureWorktreeState requires the COUNT marker (same pipeline data) to
+  // verify the listing arrived complete; the fake must emit it too.
+  lines.push("COUNT=" + entries.length);
   return lines.join("\n");
 }

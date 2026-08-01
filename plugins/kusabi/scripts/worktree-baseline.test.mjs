@@ -516,3 +516,362 @@ describe("captureWorktreeState (throwaway git repo)", () => {
     assert.equal(resolveWorktreeChanged(dirtyBaseline, afterRound), true);
   });
 });
+
+// =========================================================================
+// captureWorktreeState — truncation contract (kusabi #143)
+// =========================================================================
+//
+// captureWorktreeState must never return a partial manifest: retrieval is
+// verified-complete (the parsed entry count equals the shell's COUNT marker
+// and the sandbox_exec response carries no truncation sign) or the capture
+// is null.  The fix has three parts: verbose="full" (disables sunaba's
+// pre-pagination summary truncation at max_lines=100), an explicit large
+// `limit` (defeats the default 50-line page), and the COUNT/truncation
+// verification.  These tests drive the function with injected fake
+// callTools: canned responses pin the parser contracts, and a faithful fake
+// reproducing sunaba's real output pipeline (truncate_output then
+// paginate_output — see sunaba src/sunaba/tools/exec.py) proves that large
+// listings succeed end-to-end.
+
+describe("captureWorktreeState truncation contract", () => {
+  /**
+   * Fake callTool returning a canned sandbox_exec response; records every
+   * call's params so tests can assert on the request shape.
+   */
+  function makeFakeTool(response, calls) {
+    return async (toolName, params) => {
+      calls.push(params);
+      if (toolName !== "sandbox_exec") return { output: "" };
+      return response;
+    };
+  }
+
+  /**
+   * Fake callTool that reproduces sunaba's real sandbox_exec output pipeline
+   * (src/sunaba/tools/exec.py): sanitize -> truncate_output(verbose,
+   * max_lines=100) -> paginate_output(offset, limit), returning the same
+   * response fields (shown/total_lines/truncated/next_offset/has_more).
+   * A listing can only arrive complete when the request disables summary
+   * truncation with verbose="full" AND pages with a large enough limit —
+   * exactly the fix under test.  Without verbose="full", any listing over
+   * max_lines is reduced to head-50 / "... (N lines omitted)" / tail-50
+   * with truncated=true BEFORE pagination can see it.
+   */
+  function faithfulSunabaFake(fullOutput, calls) {
+    return async (toolName, params) => {
+      calls.push(params);
+      if (toolName !== "sandbox_exec") return { output: "" };
+      if (!fullOutput || !fullOutput.trim()) {
+        return {
+          status: "ok",
+          output: "",
+          shown: 0,
+          total_lines: 0,
+          truncated: false,
+          next_offset: null,
+          has_more: false,
+        };
+      }
+      const maxLines = 100;
+      const lines = fullOutput.split("\n");
+      const totalLines = lines.length;
+      let display = fullOutput;
+      let truncated = false;
+      let shown = totalLines;
+      if (params.verbose !== "full" && totalLines > maxLines) {
+        const headCount = Math.floor(maxLines / 2);
+        const tailCount = maxLines - headCount;
+        const head = lines.slice(0, headCount);
+        const tail = lines.slice(-tailCount);
+        display = head
+          .concat(["... (" + (totalLines - maxLines) + " lines omitted)"], tail)
+          .join("\n");
+        truncated = true;
+        shown = head.length + 1 + tail.length;
+      }
+      const displayLines = display.split("\n");
+      const offset = params.offset ?? 0;
+      const limit = params.limit ?? 50;
+      const page = displayLines.slice(offset, offset + limit);
+      const hasMore = offset + limit < displayLines.length;
+      return {
+        status: "ok",
+        output: page.join("\n"),
+        shown,
+        total_lines: totalLines,
+        truncated,
+        next_offset: hasMore ? offset + limit : null,
+        has_more: hasMore,
+      };
+    };
+  }
+
+  /** Build a complete listing: TREE_HASH + n sorted hash|path entries + COUNT. */
+  function buildListing(n) {
+    const lines = ["TREE_HASH=tree-" + n];
+    const expected = {};
+    for (let i = 0; i < n; i++) {
+      const filePath = "file-" + String(i).padStart(3, "0");
+      const hash = "hash-" + String(i).padStart(3, "0");
+      lines.push(hash + "|" + filePath);
+      expected[filePath] = hash;
+    }
+    lines.push("COUNT=" + n);
+    return { text: lines.join("\n"), expected };
+  }
+
+  it("complete small listing → manifest with correct treeHash and files map", async () => {
+    const output = [
+      "TREE_HASH=abc123",
+      "hash-foo|src/foo.mjs",
+      "hash-bar|docs/guide.md",
+      "COUNT=2",
+    ].join("\n");
+    const calls = [];
+    // Mimic the real sunaba_exec response shape from the incident:
+    // truncated/has_more present and false.
+    const tool = makeFakeTool(
+      { output, truncated: false, has_more: false, next_offset: null },
+      calls,
+    );
+    const manifest = await captureWorktreeState(tool, "fake-cid");
+    assert.ok(manifest, "complete listing must yield a manifest");
+    assert.equal(manifest.treeHash, "abc123");
+    assert.deepEqual(manifest.files, {
+      "src/foo.mjs": "hash-foo",
+      "docs/guide.md": "hash-bar",
+    });
+  });
+
+  it("requests verbose=full and an explicit large page limit from sandbox_exec", async () => {
+    const calls = [];
+    const tool = makeFakeTool({ output: "TREE_HASH=abc\nCOUNT=0" }, calls);
+    await captureWorktreeState(tool, "fake-cid");
+    assert.equal(calls.length, 1);
+    const params = calls[0];
+    assert.equal(params.container_id, "fake-cid");
+    // verbose="full" disables sunaba's pre-pagination summary truncation
+    // (head-50/tail-50 at max_lines=100): a large limit alone cannot
+    // recover the omitted middle, so this flag is part of the fix.
+    assert.equal(
+      params.verbose,
+      "full",
+      "capture must disable summary truncation via verbose=full",
+    );
+    // The pre-fix call omitted `limit`, so sunaba's 50-line default page
+    // silently truncated any repo with more than ~49 tracked files.
+    assert.ok(
+      Number.isInteger(params.limit) && params.limit >= 10000,
+      "capture must pass an explicit large limit (got " + params.limit + ")",
+    );
+  });
+
+  it("truncated: true in the response → null", async () => {
+    const output = [
+      "TREE_HASH=abc123",
+      "hash-a|a.js",
+      "hash-b|b.js",
+      "COUNT=2",
+    ].join("\n");
+    const tool = makeFakeTool({ output, truncated: true }, []);
+    const manifest = await captureWorktreeState(tool, "fake-cid");
+    assert.equal(manifest, null);
+  });
+
+  it("has_more: true in the response → null", async () => {
+    const output = [
+      "TREE_HASH=abc123",
+      "hash-a|a.js",
+      "hash-b|b.js",
+      "COUNT=2",
+    ].join("\n");
+    const tool = makeFakeTool({ output, has_more: true }, []);
+    const manifest = await captureWorktreeState(tool, "fake-cid");
+    assert.equal(manifest, null);
+  });
+
+  it("COUNT marker mismatch (fewer parsed entries than COUNT) → null", async () => {
+    // Three entries delivered but the pipeline counted five: retrieval or
+    // parsing lost lines — the capture is unverifiable.
+    const output = [
+      "TREE_HASH=abc123",
+      "hash-a|a.js",
+      "hash-b|b.js",
+      "hash-c|c.js",
+      "COUNT=5",
+    ].join("\n");
+    const tool = makeFakeTool({ output }, []);
+    const manifest = await captureWorktreeState(tool, "fake-cid");
+    assert.equal(manifest, null);
+  });
+
+  it("unparseable line silently dropped → COUNT mismatch → null", async () => {
+    // A line with no pipe is not an entry; it would be silently ignored, so
+    // the parsed count falls below COUNT and the capture is rejected.
+    const output = [
+      "TREE_HASH=abc123",
+      "hash-a|a.js",
+      "some garbage line without a pipe",
+      "hash-b|b.js",
+      "COUNT=3",
+    ].join("\n");
+    const tool = makeFakeTool({ output }, []);
+    const manifest = await captureWorktreeState(tool, "fake-cid");
+    assert.equal(manifest, null);
+  });
+
+  it("missing COUNT marker → null", async () => {
+    const output = [
+      "TREE_HASH=abc123",
+      "hash-a|a.js",
+      "hash-b|b.js",
+    ].join("\n");
+    const tool = makeFakeTool({ output }, []);
+    const manifest = await captureWorktreeState(tool, "fake-cid");
+    assert.equal(manifest, null);
+  });
+
+  it("regression: 300-entry listing succeeds against a faithful sunaba model (verbose=full + large limit)", async () => {
+    // The pre-fix defect had two layers: sunaba's summary truncation
+    // (max_lines=100) kept only head-50/tail-50 with truncated=true, and its
+    // default 50-line page cut the rest — a repo with more than ~49 tracked
+    // files produced a manifest containing only the alphabetically-first
+    // paths (or, with the flag check, null).  The faithful fake reproduces
+    // sunaba's real pipeline (truncate_output then paginate_output), so this
+    // test proves the fixed request — verbose="full" + large limit — yields
+    // the complete 302-line listing through the same pipeline a real server
+    // runs.
+    const { text, expected } = buildListing(300);
+    const calls = [];
+    const tool = faithfulSunabaFake(text, calls);
+    const manifest = await captureWorktreeState(tool, "fake-cid");
+    assert.ok(manifest, "300-entry listing must yield a manifest");
+    assert.equal(manifest.treeHash, "tree-300");
+    assert.equal(Object.keys(manifest.files).length, 300);
+    assert.deepEqual(manifest.files, expected);
+    // the request that made it possible: summary truncation disabled, and a
+    // page window covering the whole display in one response
+    assert.equal(calls[0].verbose, "full");
+    assert.ok(calls[0].limit >= 300, "limit must cover the whole listing");
+  });
+
+  it("regression: 99 tracked files (101 lines) succeeds against the faithful sunaba model", async () => {
+    // 99 entries + TREE_HASH + COUNT = 101 lines, just past sunaba's
+    // summary max_lines=100: with default verbose this listing is destroyed
+    // before pagination; with verbose="full" it arrives complete.
+    const { text, expected } = buildListing(99);
+    const calls = [];
+    const tool = faithfulSunabaFake(text, calls);
+    const manifest = await captureWorktreeState(tool, "fake-cid");
+    assert.ok(manifest, "99-entry listing must yield a manifest");
+    assert.equal(Object.keys(manifest.files).length, 99);
+    assert.deepEqual(manifest.files, expected);
+    assert.equal(calls[0].verbose, "full");
+  });
+
+  it("faithful model sanity: pre-fix request shapes are summary-truncated (the failure the fix defeats)", async () => {
+    // Direct checks of the faithful fake, proving it models the real server:
+    // requests without verbose="full" get head-50/tail-50 with
+    // truncated=true — responses captureWorktreeState must (and does)
+    // reject as incomplete.
+    const { text } = buildListing(300);
+    const calls = [];
+    const tool = faithfulSunabaFake(text, calls);
+
+    // Pre-fix shape: no verbose, default limit=50 -> page 0 of the truncated
+    // display is TREE_HASH + the first 49 entries, truncated=true.
+    const page0 = await tool("sandbox_exec", {
+      container_id: "fake-cid",
+      commands: ["x"],
+      limit: 50,
+    });
+    assert.equal(page0.truncated, true);
+    assert.equal(page0.output.split("\n").length, 50);
+    assert.ok(!page0.output.includes("COUNT=300"));
+    // feeding that response shape into the capture yields null, never a
+    // 49-entry manifest
+    const manifest = await captureWorktreeState(
+      makeFakeTool({ output: page0.output, truncated: true }, []),
+      "fake-cid",
+    );
+    assert.equal(manifest, null);
+
+    // Same request without verbose but a page window big enough to see the
+    // middle: the display is head-50 / "... (202 lines omitted)" / tail-50.
+    // The omitted middle is unrecoverable by any page window — which is why
+    // verbose="full" is part of the fix.
+    const fullPage = await tool("sandbox_exec", {
+      container_id: "fake-cid",
+      commands: ["x"],
+      limit: 500,
+    });
+    assert.equal(fullPage.truncated, true);
+    assert.match(fullPage.output, /lines omitted/);
+    assert.equal(fullPage.output.split("\n").length, 101);
+    const nullManifest = await captureWorktreeState(
+      makeFakeTool({ output: fullPage.output, truncated: true }, []),
+      "fake-cid",
+    );
+    assert.equal(nullManifest, null);
+  });
+
+  it("regression: pre-fix failure shape (first 49 lines only, truncation flagged) → null, never a 49-entry manifest", async () => {
+    // Exactly what the incident produced: the response was cut at sunaba's
+    // 50-line default page (TREE_HASH + 49 entries) with truncated=true.
+    const { text } = buildListing(300);
+    const truncatedOutput = text.split("\n").slice(0, 50).join("\n");
+    assert.ok(!truncatedOutput.includes("COUNT=300"));
+    const tool = makeFakeTool({ output: truncatedOutput, truncated: true }, []);
+    const manifest = await captureWorktreeState(tool, "fake-cid");
+    assert.equal(
+      manifest,
+      null,
+      "truncated listing must never yield a partial manifest",
+    );
+  });
+
+  it("regression: 49-entry window without truncation flag but COUNT missing → null", async () => {
+    // The same cut delivered WITHOUT the truncation flag: the COUNT marker
+    // is absent, so the capture is still rejected — never a 49-entry
+    // manifest even if sunaba failed to flag the truncation.
+    const { text } = buildListing(300);
+    const cutOutput = text.split("\n").slice(0, 50).join("\n");
+    const tool = makeFakeTool({ output: cutOutput }, []);
+    const manifest = await captureWorktreeState(tool, "fake-cid");
+    assert.equal(manifest, null);
+  });
+
+  it("preserves pipe-containing paths (first pipe is the separator)", async () => {
+    const output = [
+      "TREE_HASH=abc123",
+      "hash-1|src/odd|name.js",
+      "hash-2|plain.js",
+      "COUNT=2",
+    ].join("\n");
+    const tool = makeFakeTool({ output }, []);
+    const manifest = await captureWorktreeState(tool, "fake-cid");
+    assert.ok(manifest);
+    assert.equal(manifest.files["src/odd|name.js"], "hash-1");
+    assert.equal(manifest.files["plain.js"], "hash-2");
+  });
+
+  it("empty listing with COUNT=0 → manifest with empty files", async () => {
+    const tool = makeFakeTool({ output: "TREE_HASH=empty\nCOUNT=0" }, []);
+    const manifest = await captureWorktreeState(tool, "fake-cid");
+    assert.ok(manifest);
+    assert.equal(manifest.treeHash, "empty");
+    assert.deepEqual(manifest.files, {});
+  });
+
+  it("ERROR_NO_INDEX → null", async () => {
+    const tool = makeFakeTool({ output: "ERROR_NO_INDEX\n" }, []);
+    const manifest = await captureWorktreeState(tool, "fake-cid");
+    assert.equal(manifest, null);
+  });
+
+  it("empty output → null", async () => {
+    const tool = makeFakeTool({ output: "" }, []);
+    const manifest = await captureWorktreeState(tool, "fake-cid");
+    assert.equal(manifest, null);
+  });
+});
