@@ -155,10 +155,23 @@ function countTable(db, table) {
   return db.prepare(`SELECT COUNT(*) AS c FROM ${table}`).get().c;
 }
 
+/**
+ * Whether `table` exists in this database file.  The `job` table (#154) was
+ * added after real on-disk stores already existed, and this surface opens
+ * READ-ONLY — it can never run the schema/migration the writable open does.
+ * A store written before the table existed must render as "no jobs
+ * recorded", not crash on `no such table`.
+ */
+function tableExists(db, table) {
+  return db.prepare(
+    "SELECT name FROM sqlite_master WHERE type = 'table' AND name = $name",
+  ).get({ name: table }) !== undefined;
+}
+
 function isStoreEmpty(db) {
-  return ["source_file", "session", "turn", "chain", "round", "finding"].every(
-    (t) => countTable(db, t) === 0,
-  );
+  const tables = ["source_file", "session", "turn", "chain", "round", "finding"];
+  if (tableExists(db, "job")) tables.push("job");
+  return tables.every((t) => countTable(db, t) === 0);
 }
 
 function computeFreshness(db, dbPath) {
@@ -166,6 +179,9 @@ function computeFreshness(db, dbPath) {
   const newestTranscriptTurn = db.prepare("SELECT MAX(ts) AS m FROM turn").get().m ?? null;
   const newestChainRound = db.prepare("SELECT MAX(started_at) AS m FROM round").get().m ?? null;
   const newestChainDate = db.prepare("SELECT MAX(orch_date) AS m FROM chain").get().m ?? null;
+  const newestJobStart = tableExists(db, "job")
+    ? (db.prepare("SELECT MAX(started_at) AS m FROM job").get().m ?? null)
+    : null;
   const sourceFilesRecorded = countTable(db, "source_file");
   return {
     dbPath: dbPath ?? null,
@@ -173,6 +189,7 @@ function computeFreshness(db, dbPath) {
     newestTranscriptTurn,
     newestChainRound,
     newestChainDate,
+    newestJobStart,
     sourceFilesRecorded,
   };
 }
@@ -200,6 +217,34 @@ function fetchChains(db) {
 
 function fetchRounds(db) {
   return db.prepare(`SELECT chain_id, round, started_at, started_ms, disposition FROM round`).all();
+}
+
+/** Callers must check `tableExists(db, "job")` first (pre-#154 store files
+ * have no `job` table and this surface cannot migrate them). */
+function fetchJobs(db) {
+  return db.prepare(`
+    SELECT job_id, workspace_slug, kind, status, phase, model_entry,
+           started_at, started_ms, finished_at, finished_ms,
+           duration_seconds, steps,
+           usage_available, usage_input, usage_output, usage_reasoning, usage_cost
+    FROM job
+  `).all();
+}
+
+/** A job's window key: started_ms, else finished_ms, else null (undated). */
+function jobWindowKeyMs(job) {
+  if (job.started_ms !== null && job.started_ms !== undefined) return job.started_ms;
+  if (job.finished_ms !== null && job.finished_ms !== undefined) return job.finished_ms;
+  return null;
+}
+
+function jobInWindow(job, sinceMs, untilMs, hasBound) {
+  if (!hasBound) return true;
+  const keyMs = jobWindowKeyMs(job);
+  if (keyMs === null) return false;
+  if (sinceMs !== undefined && keyMs < sinceMs) return false;
+  if (untilMs !== undefined && keyMs >= untilMs) return false;
+  return true;
 }
 
 function groupBy(rows, keyFn) {
@@ -473,6 +518,91 @@ function computeBriefOutcome(inWindowChains, roundsByChain) {
 }
 
 // ---------------------------------------------------------------------------
+// section 8 — delegated jobs (#154)
+//
+// Deliberately a SEPARATE section, not rows grafted onto `Orchestrator vs
+// worker, per chain`: that view is per-chain by construction (rounds,
+// dispositions, the prefix join), and a job has none of those — folding
+// chain-less records in would distort both halves.  Nothing here touches
+// the chain sections' inputs.
+// ---------------------------------------------------------------------------
+
+function emptyDelegatedJobs() {
+  return {
+    jobCount: 0,
+    statusCounts: {},
+    jobsWithoutUsage: 0,
+    jobsUsageUnavailable: 0,
+    totals: { output: null, reasoning: null, cost: null, durationSeconds: null },
+    jobs: [],
+  };
+}
+
+/** Sum `field` over rows where it is an actual number; null when none is —
+ * a sum of measured zeros is 0, a sum over nothing is null. */
+function sumNumericField(rows, field) {
+  const vals = rows.map((r) => r[field]).filter((v) => typeof v === "number");
+  if (vals.length === 0) return null;
+  return vals.reduce((a, b) => a + b, 0);
+}
+
+function computeDelegatedJobs(inWindowJobs) {
+  // Status counts are verbatim — the vocabulary observed on disk is
+  // completed / provider-error / error / cancelled, but an unknown value
+  // must survive to the report, never be dropped by an enum.
+  const statusCounts = {};
+  for (const j of inWindowJobs) {
+    const s = j.status ?? "(no status)";
+    statusCounts[s] = (statusCounts[s] || 0) + 1;
+  }
+
+  // usage_available: null = usage.json never written (died early — the
+  // job-side analogue of "chains that died without writing chain.json");
+  // 0 = written but available:false; 1 = measured.
+  const jobsWithoutUsage = inWindowJobs
+    .filter((j) => j.usage_available === null || j.usage_available === undefined).length;
+  const jobsUsageUnavailable = inWindowJobs.filter((j) => j.usage_available === 0).length;
+  const withMeasuredUsage = inWindowJobs.filter((j) => j.usage_available === 1);
+
+  const totals = {
+    output: sumNumericField(withMeasuredUsage, "usage_output"),
+    reasoning: sumNumericField(withMeasuredUsage, "usage_reasoning"),
+    // cost 0 (free tier) is a real measurement: it participates in the sum,
+    // and an all-zero sum renders 0.00, never "n/a".
+    cost: sumNumericField(withMeasuredUsage, "usage_cost"),
+    durationSeconds: sumNumericField(inWindowJobs, "duration_seconds"),
+  };
+
+  const jobs = inWindowJobs.map((j) => ({
+    jobId: j.job_id,
+    workspaceSlug: j.workspace_slug,
+    kind: j.kind,
+    status: j.status,
+    startedAt: j.started_at,
+    startedMs: j.started_ms,
+    steps: j.steps,
+    durationSeconds: j.duration_seconds,
+    modelEntry: j.model_entry,
+    usageState: (j.usage_available === null || j.usage_available === undefined)
+      ? "never_written"
+      : (j.usage_available === 1 ? "measured" : "unavailable"),
+    output: j.usage_output,
+    reasoning: j.usage_reasoning,
+    cost: j.usage_cost,
+  }));
+  jobs.sort((a, b) => (b.startedMs ?? -Infinity) - (a.startedMs ?? -Infinity));
+
+  return {
+    jobCount: inWindowJobs.length,
+    statusCounts,
+    jobsWithoutUsage,
+    jobsUsageUnavailable,
+    totals,
+    jobs,
+  };
+}
+
+// ---------------------------------------------------------------------------
 // top-level report
 // ---------------------------------------------------------------------------
 
@@ -493,6 +623,7 @@ export function missingStoreReport(dbPath) {
       newestTranscriptTurn: null,
       newestChainRound: null,
       newestChainDate: null,
+      newestJobStart: null,
       sourceFilesRecorded: 0,
     },
     window: null,
@@ -500,6 +631,7 @@ export function missingStoreReport(dbPath) {
     sessionsInWindow: [],
     chainJoin: [],
     briefOutcome: [],
+    delegatedJobs: emptyDelegatedJobs(),
   };
 }
 
@@ -533,6 +665,7 @@ export function computeReport(db, opts = {}) {
       sessionsInWindow: [],
       chainJoin: [],
       briefOutcome: [],
+      delegatedJobs: emptyDelegatedJobs(),
     };
   }
 
@@ -540,6 +673,9 @@ export function computeReport(db, opts = {}) {
   const allSessions = fetchSessions(db);
   const allChains = fetchChains(db);
   const allRounds = fetchRounds(db);
+  // A store file written before #154 has no `job` table and cannot be
+  // migrated by a read-only open — treated as zero jobs, not an error.
+  const allJobs = tableExists(db, "job") ? fetchJobs(db) : [];
   const roundsByChain = groupBy(allRounds, (r) => r.chain_id);
 
   const inWindowTurns = allTurns.filter((t) => turnInWindow(t, sinceMs, untilMs, hasBound));
@@ -553,6 +689,11 @@ export function computeReport(db, opts = {}) {
     ? allChains.filter((c) => chainKeyMs.get(c.chain_id) === null).length
     : 0;
 
+  const inWindowJobs = allJobs.filter((j) => jobInWindow(j, sinceMs, untilMs, hasBound));
+  const jobsExcludedNoTimestamp = hasBound
+    ? allJobs.filter((j) => jobWindowKeyMs(j) === null).length
+    : 0;
+
   const sessionAggMap = computeSessionAggregates(allSessions, inWindowTurns);
   const sessionsInWindowCount = [...sessionAggMap.values()].filter((a) => a.turnCount > 0).length;
 
@@ -560,8 +701,11 @@ export function computeReport(db, opts = {}) {
   const sessionsInWindow = computeSessionsList(sessionAggMap);
   const chainJoin = computeChainJoin(inWindowChains, sessionAggMap, allSessions);
   const briefOutcome = computeBriefOutcome(inWindowChains, roundsByChain);
+  const delegatedJobs = computeDelegatedJobs(inWindowJobs);
 
-  const status = (inWindowTurns.length === 0 && inWindowChains.length === 0) ? "empty_window" : "ok";
+  const status = (inWindowTurns.length === 0 && inWindowChains.length === 0 && inWindowJobs.length === 0)
+    ? "empty_window"
+    : "ok";
 
   return {
     status,
@@ -573,13 +717,16 @@ export function computeReport(db, opts = {}) {
       turnsInWindow: inWindowTurns.length,
       sessionsInWindow: sessionsInWindowCount,
       chainsInWindow: inWindowChains.length,
+      jobsInWindow: inWindowJobs.length,
       turnsExcludedNoTimestamp,
       chainsExcludedNoTimestamp,
+      jobsExcludedNoTimestamp,
     },
     sessionCostByModel,
     sessionsInWindow,
     chainJoin,
     briefOutcome,
+    delegatedJobs,
   };
 }
 
@@ -594,6 +741,7 @@ function renderFreshness(f) {
     `  newest transcript turn: ${fmtTs(f.newestTranscriptTurn)}`,
     `  newest chain round:     ${fmtTs(f.newestChainRound)}`,
     `  newest chain date:      ${fmtTs(f.newestChainDate)}`,
+    `  newest job start:       ${fmtTs(f.newestJobStart)}`,
     `  source files recorded:  ${fmtCount(f.sourceFilesRecorded)}`,
     "  This command only reads the store; it never ingests. Stale timestamps above mean the ingest timer has not run.",
   ];
@@ -604,9 +752,9 @@ function renderWindowLine(w) {
     ? `since ${w.since ?? "(none)"} until ${w.until ?? "(none)"}`
     : "all time";
   const lines = [`Window: ${rangeLabel}`];
-  lines.push(`  turns: ${fmtCount(w.turnsInWindow)}  sessions: ${fmtCount(w.sessionsInWindow)}  chains: ${fmtCount(w.chainsInWindow)}`);
+  lines.push(`  turns: ${fmtCount(w.turnsInWindow)}  sessions: ${fmtCount(w.sessionsInWindow)}  chains: ${fmtCount(w.chainsInWindow)}  jobs: ${fmtCount(w.jobsInWindow)}`);
   if (w.hasBound) {
-    lines.push(`  excluded (no timestamp): turns ${fmtCount(w.turnsExcludedNoTimestamp)}, chains ${fmtCount(w.chainsExcludedNoTimestamp)}`);
+    lines.push(`  excluded (no timestamp): turns ${fmtCount(w.turnsExcludedNoTimestamp)}, chains ${fmtCount(w.chainsExcludedNoTimestamp)}, jobs ${fmtCount(w.jobsExcludedNoTimestamp)}`);
   }
   return lines;
 }
@@ -726,6 +874,55 @@ function renderBriefOutcome(blocks) {
   return lines;
 }
 
+function renderDelegatedJobRow(j) {
+  let usageStr;
+  if (j.usageState === "measured") {
+    // cost is the provider-reported figure — 0.00 (free tier) is a real
+    // measurement and renders as 0.00; only a truly absent field is n/a.
+    usageStr = `out ${fmtInt(j.output)}  reasoning ${fmtInt(j.reasoning)}  cost ${fmtCost(j.cost)}`;
+  } else if (j.usageState === "unavailable") {
+    usageStr = "usage recorded but unavailable";
+  } else {
+    usageStr = "usage.json never written";
+  }
+  const durationStr = (j.durationSeconds === null || j.durationSeconds === undefined)
+    ? "duration n/a"
+    : `${fmtNum(j.durationSeconds)}s`;
+  return `  ${fmtTs(j.startedAt)}  ${j.jobId}  ${j.status ?? "(no status)"}  `
+    + `steps ${fmtInt(j.steps)}  ${usageStr}  ${durationStr}  `
+    + `${j.modelEntry ?? "(no model)"}  ws ${j.workspaceSlug ?? "(none)"}`;
+}
+
+function renderDelegatedJobs(section) {
+  const lines = [
+    "Delegated jobs (single-shot task/review jobs — not chains: no rounds, no disposition):",
+  ];
+  if (section.jobCount === 0) {
+    lines.push("  (no data in window)");
+    return lines;
+  }
+  const statusStr = Object.keys(section.statusCounts)
+    .sort()
+    .map((s) => `${s} ${fmtCount(section.statusCounts[s])}`)
+    .join(" | ");
+  lines.push(`  status counts: ${statusStr}`);
+  lines.push(
+    `  usage.json never written (job ended before usage persisted): ${fmtCount(section.jobsWithoutUsage)}`
+    + `  |  usage recorded but unavailable: ${fmtCount(section.jobsUsageUnavailable)}`,
+  );
+  lines.push(
+    `  totals over jobs with measured usage: output ${fmtInt(section.totals.output)}  `
+    + `reasoning ${fmtInt(section.totals.reasoning)}  cost ${fmtCost(section.totals.cost)}  `
+    + `|  recorded duration (all jobs): ${fmtNum(section.totals.durationSeconds)}s`,
+  );
+  lines.push("  Cost is the provider-reported figure, NOT the relative units above — 0.00 on a free-tier route is a real measurement, not missing data.");
+  lines.push("  A 'completed' status can still be a failure (quota deaths appear as completed with tiny output) — judge by the measured output/steps/duration, not the status string.");
+  for (const j of section.jobs) {
+    lines.push(renderDelegatedJobRow(j));
+  }
+  return lines;
+}
+
 /**
  * Render a computed report (from `computeReport` or `missingStoreReport`) as
  * plain aligned text.
@@ -739,7 +936,7 @@ export function renderReportText(report) {
 
   if (report.status === "empty") {
     lines.push("");
-    lines.push("Store is empty (0 sessions, 0 turns, 0 chains).");
+    lines.push("Store is empty (0 sessions, 0 turns, 0 chains, 0 jobs).");
     return lines.join("\n");
   }
 
@@ -753,6 +950,8 @@ export function renderReportText(report) {
   lines.push(...renderChainJoin(report.chainJoin, report.window.hasBound));
   lines.push("");
   lines.push(...renderBriefOutcome(report.briefOutcome));
+  lines.push("");
+  lines.push(...renderDelegatedJobs(report.delegatedJobs));
   return lines.join("\n");
 }
 

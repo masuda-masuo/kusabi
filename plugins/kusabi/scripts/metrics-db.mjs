@@ -129,6 +129,46 @@ CREATE TABLE IF NOT EXISTS finding (
   source TEXT,
   PRIMARY KEY (chain_id, round, idx)
 );
+
+-- Delegated single-shot jobs (#154).  A job is NOT a chain: no rounds, no
+-- findings, no disposition.  It gets its own table rather than a degenerate
+-- chain row so chain statistics are never diluted by chain-less records.
+--
+-- usage_available is deliberately three-valued:
+--   NULL = no usage.json existed on disk (the job died/was cancelled before
+--          usage was persisted) -- "absent" is a fact worth seeing;
+--   0    = usage.json exists but says available: false;
+--   1    = usage.json exists with measured numbers.
+-- usage_cost 0 is a REAL measurement (every free-tier job costs 0) and is
+-- stored as 0, never coerced to NULL; conversely an absent cost stays NULL.
+-- status is stored verbatim (completed / provider-error / error / cancelled /
+-- anything future) -- never validated against an enum, so an unknown status
+-- survives to the report instead of being silently dropped.
+CREATE TABLE IF NOT EXISTS job (
+  job_id TEXT PRIMARY KEY,
+  workspace_slug TEXT,
+  kind TEXT,
+  title TEXT,
+  status TEXT,
+  phase TEXT,
+  model_entry TEXT,
+  started_at TEXT,
+  started_ms INTEGER,
+  finished_at TEXT,
+  finished_ms INTEGER,
+  duration_seconds REAL,
+  steps INTEGER,
+  error TEXT,
+  usage_available INTEGER,
+  usage_model TEXT,
+  usage_input INTEGER,
+  usage_output INTEGER,
+  usage_reasoning INTEGER,
+  usage_cache_read INTEGER,
+  usage_cache_write INTEGER,
+  usage_cost REAL
+);
+CREATE INDEX IF NOT EXISTS idx_job_started_ms ON job(started_ms);
 `;
 
 /**
@@ -427,6 +467,59 @@ export function upsertFinding(db, row) {
     // severity/title (NULL), same as an incomplete real `findings` entry
     // would; `source` is the only column that tells the two apart.
     source: row.source ?? null,
+  });
+}
+
+// ---------------------------------------------------------------------------
+// job — delegated single-shot jobs (#154)
+// ---------------------------------------------------------------------------
+
+/**
+ * Upsert one delegated-job row.  `usageCost` uses an explicit
+ * `=== undefined ? null :` guard rather than `?? null` purely for symmetry
+ * with the schema comment above — `?? null` would also preserve 0, but the
+ * point that 0 must survive is worth being unmissable here.
+ *
+ * @param {import("node:sqlite").DatabaseSync} db
+ * @param {object} row
+ */
+export function upsertJob(db, row) {
+  db.prepare(`
+    INSERT OR REPLACE INTO job
+      (job_id, workspace_slug, kind, title, status, phase, model_entry,
+       started_at, started_ms, finished_at, finished_ms, duration_seconds,
+       steps, error, usage_available, usage_model,
+       usage_input, usage_output, usage_reasoning,
+       usage_cache_read, usage_cache_write, usage_cost)
+    VALUES
+      ($jobId, $workspaceSlug, $kind, $title, $status, $phase, $modelEntry,
+       $startedAt, $startedMs, $finishedAt, $finishedMs, $durationSeconds,
+       $steps, $error, $usageAvailable, $usageModel,
+       $usageInput, $usageOutput, $usageReasoning,
+       $usageCacheRead, $usageCacheWrite, $usageCost)
+  `).run({
+    jobId: row.jobId,
+    workspaceSlug: row.workspaceSlug ?? null,
+    kind: row.kind ?? null,
+    title: row.title ?? null,
+    status: row.status ?? null,
+    phase: row.phase ?? null,
+    modelEntry: row.modelEntry ?? null,
+    startedAt: row.startedAt ?? null,
+    startedMs: row.startedMs ?? null,
+    finishedAt: row.finishedAt ?? null,
+    finishedMs: row.finishedMs ?? null,
+    durationSeconds: row.durationSeconds ?? null,
+    steps: row.steps ?? null,
+    error: row.error ?? null,
+    usageAvailable: row.usageAvailable ?? null,
+    usageModel: row.usageModel ?? null,
+    usageInput: row.usageInput ?? null,
+    usageOutput: row.usageOutput ?? null,
+    usageReasoning: row.usageReasoning ?? null,
+    usageCacheRead: row.usageCacheRead ?? null,
+    usageCacheWrite: row.usageCacheWrite ?? null,
+    usageCost: row.usageCost === undefined ? null : row.usageCost,
   });
 }
 

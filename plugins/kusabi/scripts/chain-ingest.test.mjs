@@ -27,7 +27,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-import { parseChainRecord, ingestChainDirectory } from "./chain-ingest.mjs";
+import { parseChainRecord, ingestChainDirectory, parseJobRecord, ingestJobDirectory } from "./chain-ingest.mjs";
 import { openMetricsDb, upsertChain, countRows } from "./metrics-db.mjs";
 
 const MODERN_BRIEF = [
@@ -473,5 +473,264 @@ describe("idempotency is a PRIMARY KEY property, not a skip-cache property", () 
     upsertChain(db, parsed.chainRow);
     upsertChain(db, parsed.chainRow);
     assert.equal(countRows(db, "chain"), 1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Delegated jobs (#154) — parseJobRecord / ingestJobDirectory
+//
+// Fixture shapes reconstructed from the actual writers: runPrompt in
+// prompt-execution.mjs creates job.json ({id, kind, title, status, phase,
+// modelEntry, startedAt, finishedAt, stats:{steps,...}, error, ...}) and
+// writes usage.json ({...accumulateUsage(events), phase, durationSeconds})
+// when the job ends.  Statuses observed on disk: completed / provider-error
+// / error, plus cancelled (cmdCancel).
+// ---------------------------------------------------------------------------
+
+function completedJobFixture() {
+  return {
+    id: "job-msa5ztfv553b",
+    kind: "task",
+    title: "fix the thing",
+    status: "completed",
+    sessionID: "ses_x",
+    cwd: "/w",
+    phase: "implement",
+    modelEntry: "opencode/deepseek-v4-flash-free:max",
+    startedAt: "2026-08-01T10:00:00.000Z",
+    finishedAt: "2026-08-01T10:26:15.000Z",
+    stats: { events: 900, steps: 152, lastTool: "bash", permissionsAllowed: 3, permissionsRejected: 0, lastActivity: null, models: ["opencode/deepseek-v4-flash"] },
+    error: null,
+  };
+}
+
+function completedUsageFixture() {
+  return {
+    available: true,
+    input: 5000,
+    output: 82419,
+    reasoning: 102005,
+    cacheRead: 1000,
+    cacheWrite: 200,
+    cost: 0, // free tier — a real measurement, not a missing one
+    model: "opencode/deepseek-v4-flash",
+    phase: "implement",
+    durationSeconds: 1575,
+  };
+}
+
+describe("parseJobRecord", () => {
+  it("parses a completed job with usage, preserving cost 0 as 0 (not null)", () => {
+    const parsed = parseJobRecord(completedJobFixture(), completedUsageFixture(), { workspaceSlug: "ws1" });
+    assert.ok(parsed);
+    const row = parsed.jobRow;
+    assert.equal(row.jobId, "job-msa5ztfv553b");
+    assert.equal(row.workspaceSlug, "ws1");
+    assert.equal(row.kind, "task");
+    assert.equal(row.status, "completed");
+    assert.equal(row.steps, 152);
+    assert.equal(row.usageAvailable, 1);
+    assert.equal(row.usageOutput, 82419);
+    assert.equal(row.usageReasoning, 102005);
+    assert.equal(row.usageCost, 0);
+    assert.equal(row.durationSeconds, 1575);
+    assert.equal(row.startedMs, Date.parse("2026-08-01T10:00:00.000Z"));
+  });
+
+  it("a job with NO usage.json gets usageAvailable null — absent, not measured-zero", () => {
+    const parsed = parseJobRecord(completedJobFixture(), null);
+    assert.equal(parsed.jobRow.usageAvailable, null);
+    assert.equal(parsed.jobRow.usageOutput, null);
+    assert.equal(parsed.jobRow.usageCost, null);
+  });
+
+  it("usage.json with available: false yields usageAvailable 0 with null numerics, but keeps durationSeconds", () => {
+    const parsed = parseJobRecord(completedJobFixture(), { available: false, phase: "implement", durationSeconds: 42 });
+    assert.equal(parsed.jobRow.usageAvailable, 0);
+    assert.equal(parsed.jobRow.usageOutput, null);
+    assert.equal(parsed.jobRow.usageCost, null);
+    assert.equal(parsed.jobRow.durationSeconds, 42);
+  });
+
+  it("usage available: true with missing numeric fields stays null field-by-field", () => {
+    const parsed = parseJobRecord(completedJobFixture(), { available: true, output: 10 });
+    assert.equal(parsed.jobRow.usageAvailable, 1);
+    assert.equal(parsed.jobRow.usageOutput, 10);
+    assert.equal(parsed.jobRow.usageInput, null);
+    assert.equal(parsed.jobRow.usageCost, null);
+    // durationSeconds falls back to finishedAt - startedAt.
+    assert.equal(parsed.jobRow.durationSeconds, 1575);
+  });
+
+  it("keeps an unknown status verbatim instead of dropping it", () => {
+    const job = completedJobFixture();
+    job.status = "some-status-from-the-future";
+    const parsed = parseJobRecord(job, null);
+    assert.equal(parsed.jobRow.status, "some-status-from-the-future");
+  });
+
+  it("returns null for a record with no usable id, and for non-object input", () => {
+    assert.equal(parseJobRecord({ status: "completed" }, null), null);
+    assert.equal(parseJobRecord(null, null), null);
+    assert.equal(parseJobRecord("nope", null), null);
+  });
+
+  it("a still-running job (no finishedAt, no usage) parses with null duration", () => {
+    const job = completedJobFixture();
+    job.status = "running";
+    job.finishedAt = null;
+    const parsed = parseJobRecord(job, null);
+    assert.equal(parsed.jobRow.finishedAt, null);
+    assert.equal(parsed.jobRow.durationSeconds, null);
+    assert.equal(parsed.jobRow.usageAvailable, null);
+  });
+});
+
+function writeJobDir(stateRoot, workspaceSlug, jobId, jobJson, usageJson = undefined) {
+  const dir = path.join(stateRoot, workspaceSlug, "jobs", jobId);
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, "job.json"), JSON.stringify(jobJson), "utf8");
+  if (usageJson !== undefined) {
+    fs.writeFileSync(path.join(dir, "usage.json"), JSON.stringify(usageJson), "utf8");
+  }
+  return dir;
+}
+
+describe("ingestJobDirectory", () => {
+  it("re-reads a job whose usage.json lands AFTER first ingest, even when job.json is untouched (the two-file source key)", () => {
+    const stateRoot = makeTempStateRoot();
+    // A running job: job.json only, no usage.json yet.
+    const job = completedJobFixture();
+    job.status = "running";
+    job.finishedAt = null;
+    const dir = writeJobDir(stateRoot, "ws1", job.id, job);
+
+    const db = openMetricsDb(":memory:");
+    const first = ingestJobDirectory(db, stateRoot);
+    assert.equal(first.jobsIngested, 1);
+    assert.equal(first.jobsMissingUsage, 1);
+    let row = db.prepare("SELECT status, usage_available, usage_output FROM job").get();
+    assert.equal(row.status, "running");
+    assert.equal(row.usage_available, null); // absent, not zero
+
+    // The job finishes: ONLY usage.json appears; job.json is deliberately
+    // left byte-for-byte identical (same size, same mtime) to prove the
+    // skip key is the pair, not job.json alone.
+    fs.writeFileSync(path.join(dir, "usage.json"), JSON.stringify(completedUsageFixture()), "utf8");
+
+    const second = ingestJobDirectory(db, stateRoot);
+    assert.equal(second.jobsSkippedUnchanged, 0, "usage.json landing must force a re-read");
+    assert.equal(second.jobsIngested, 1);
+    assert.equal(second.jobsMissingUsage, 0);
+    assert.equal(countRows(db, "job"), 1); // re-ingest replaced, not duplicated
+    row = db.prepare("SELECT usage_available, usage_output, usage_cost FROM job").get();
+    assert.equal(row.usage_available, 1);
+    assert.equal(row.usage_output, 82419);
+    assert.equal(row.usage_cost, 0);
+
+    // Third run: both files unchanged — skipped.
+    const third = ingestJobDirectory(db, stateRoot);
+    assert.equal(third.jobsSkippedUnchanged, 1);
+    assert.equal(third.jobsIngested, 0);
+    assert.equal(countRows(db, "job"), 1);
+
+    fs.rmSync(stateRoot, { recursive: true, force: true });
+  });
+
+  it("ingests a complete job (both files) once and skips it unchanged on re-run", () => {
+    const stateRoot = makeTempStateRoot();
+    writeJobDir(stateRoot, "ws1", "job-msa5ztfv553b", completedJobFixture(), completedUsageFixture());
+    writeJobDir(stateRoot, "ws1", "job-died-early", { ...completedJobFixture(), id: "job-died-early", status: "error", error: "boom" });
+
+    const db = openMetricsDb(":memory:");
+    const first = ingestJobDirectory(db, stateRoot);
+    assert.equal(first.workspacesScanned, 1);
+    assert.equal(first.jobsScanned, 2);
+    assert.equal(first.jobsIngested, 2);
+    assert.equal(first.jobsMissingUsage, 1);
+    assert.equal(countRows(db, "job"), 2);
+
+    const second = ingestJobDirectory(db, stateRoot);
+    assert.equal(second.jobsSkippedUnchanged, 2);
+    assert.equal(second.jobsIngested, 0);
+    assert.equal(countRows(db, "job"), 2);
+
+    fs.rmSync(stateRoot, { recursive: true, force: true });
+  });
+
+  it("skips a job directory with no job.json silently, mirrors the chain walker", () => {
+    const stateRoot = makeTempStateRoot();
+    fs.mkdirSync(path.join(stateRoot, "ws1", "jobs", "job-neverwrote"), { recursive: true });
+
+    const db = openMetricsDb(":memory:");
+    const result = ingestJobDirectory(db, stateRoot);
+    assert.equal(result.jobsScanned, 0);
+    assert.equal(result.jobsIngested, 0);
+    assert.equal(result.parseFailures, 0);
+
+    fs.rmSync(stateRoot, { recursive: true, force: true });
+  });
+
+  it("counts a malformed job.json under parseFailures without throwing", () => {
+    const stateRoot = makeTempStateRoot();
+    const dir = path.join(stateRoot, "ws1", "jobs", "job-broken");
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, "job.json"), "{not valid json", "utf8");
+
+    const db = openMetricsDb(":memory:");
+    const result = ingestJobDirectory(db, stateRoot);
+    assert.equal(result.parseFailures, 1);
+    assert.equal(result.ioFailures, 0);
+    assert.equal(result.jobsIngested, 0);
+    assert.equal(countRows(db, "job"), 0);
+
+    fs.rmSync(stateRoot, { recursive: true, force: true });
+  });
+
+  it("a malformed usage.json skips the whole job (never recorded as 'died before usage') and retries next run", () => {
+    const stateRoot = makeTempStateRoot();
+    const dir = writeJobDir(stateRoot, "ws1", "job-msa5ztfv553b", completedJobFixture());
+    fs.writeFileSync(path.join(dir, "usage.json"), "{broken", "utf8");
+
+    const db = openMetricsDb(":memory:");
+    const first = ingestJobDirectory(db, stateRoot);
+    assert.equal(first.parseFailures, 1);
+    assert.equal(first.jobsIngested, 0);
+    assert.equal(countRows(db, "job"), 0);
+
+    // Fix the file: the job must be picked up on the next run (nothing was
+    // written to source_file for the failed attempt).
+    fs.writeFileSync(path.join(dir, "usage.json"), JSON.stringify(completedUsageFixture()), "utf8");
+    const second = ingestJobDirectory(db, stateRoot);
+    assert.equal(second.jobsIngested, 1);
+    assert.equal(countRows(db, "job"), 1);
+
+    fs.rmSync(stateRoot, { recursive: true, force: true });
+  });
+
+  it("returns a zeroed summary for a state root that does not exist", () => {
+    const db = openMetricsDb(":memory:");
+    const result = ingestJobDirectory(db, path.join(os.tmpdir(), "does-not-exist-" + Date.now()));
+    assert.equal(result.workspacesScanned, 0);
+    assert.equal(result.jobsIngested, 0);
+  });
+
+  it("coexists with chain ingest in one store without touching chain rows", () => {
+    const stateRoot = makeTempStateRoot();
+    writeChainDir(stateRoot, "ws1", "chain-ms1g7lesd89b", chainModernFixture());
+    writeJobDir(stateRoot, "ws1", "job-msa5ztfv553b", completedJobFixture(), completedUsageFixture());
+
+    const db = openMetricsDb(":memory:");
+    const chainSummary = ingestChainDirectory(db, stateRoot);
+    const jobSummary = ingestJobDirectory(db, stateRoot);
+    assert.equal(chainSummary.chainsIngested, 1);
+    assert.equal(jobSummary.jobsIngested, 1);
+    assert.equal(countRows(db, "chain"), 1);
+    assert.equal(countRows(db, "job"), 1);
+    // A job never creates chain/round/finding rows.
+    assert.equal(countRows(db, "round"), 2);
+    assert.equal(countRows(db, "finding"), 1);
+
+    fs.rmSync(stateRoot, { recursive: true, force: true });
   });
 });

@@ -459,3 +459,122 @@ describe("worker-context guard (KUSABI_WORKER_CONTEXT)", () => {
   });
 });
 
+// metrics-ingest / metrics-report — delegated jobs end to end (#154).
+// Spawns the CLI as a real subprocess against fixture directories: a state
+// root containing one workspace with two jobs (one complete with usage.json,
+// one that died before writing usage), and an empty transcript dir.  Proves
+// the wiring in cmdMetricsIngest / cmdMetricsReport, not just the modules.
+// ---------------------------------------------------------------------------
+
+describe("metrics-ingest / metrics-report — delegated jobs (#154)", () => {
+  const COMPANION_SCRIPT = path.join(import.meta.dirname, "kusabi-companion.mjs");
+  let tmpDir;
+  let stateRoot;
+  let transcriptDir;
+  let dbPath;
+
+  beforeEach(() => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-test-metrics-jobs-"));
+    stateRoot = path.join(tmpDir, "state");
+    transcriptDir = path.join(tmpDir, "transcripts");
+    dbPath = path.join(tmpDir, "metrics.db");
+    fs.mkdirSync(transcriptDir, { recursive: true });
+
+    const jobsDir = path.join(stateRoot, "ws-hash-1", "jobs");
+    const completeDir = path.join(jobsDir, "job-complete01");
+    fs.mkdirSync(completeDir, { recursive: true });
+    fs.writeFileSync(path.join(completeDir, "job.json"), JSON.stringify({
+      id: "job-complete01",
+      kind: "task",
+      status: "completed",
+      startedAt: "2026-08-01T10:00:00.000Z",
+      finishedAt: "2026-08-01T10:26:15.000Z",
+      stats: { steps: 152 },
+    }), "utf8");
+    fs.writeFileSync(path.join(completeDir, "usage.json"), JSON.stringify({
+      available: true,
+      input: 5000,
+      output: 82419,
+      reasoning: 102005,
+      cost: 0,
+      durationSeconds: 1575,
+    }), "utf8");
+
+    const deadDir = path.join(jobsDir, "job-diedearly02");
+    fs.mkdirSync(deadDir, { recursive: true });
+    fs.writeFileSync(path.join(deadDir, "job.json"), JSON.stringify({
+      id: "job-diedearly02",
+      kind: "task",
+      status: "error",
+      startedAt: "2026-08-01T11:00:00.000Z",
+      error: "boom",
+      stats: { steps: 3 },
+    }), "utf8");
+  });
+
+  afterEach(() => {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  function runCompanion(args) {
+    return spawnSync(process.execPath, [COMPANION_SCRIPT, ...args], {
+      encoding: "utf8",
+      timeout: 30_000,
+    });
+  }
+
+  it("metrics-ingest reports the job counters and metrics-report shows the delegated jobs section", () => {
+    const ingest = runCompanion([
+      "metrics-ingest",
+      "--state-root", stateRoot,
+      "--transcript-dir", transcriptDir,
+      "--db", dbPath,
+    ]);
+    assert.equal(ingest.status, 0, `ingest failed: ${ingest.stdout} ${ingest.stderr}`);
+    assert.match(ingest.stdout, /Jobs \(delegated single-shot task\/review jobs\):/);
+    assert.match(ingest.stdout, /jobs scanned:\s+2/);
+    assert.match(ingest.stdout, /jobs ingested:\s+2/);
+    assert.match(ingest.stdout, /jobs without usage\.json \(ended before usage was written\): 1/);
+
+    const report = runCompanion(["metrics-report", "--db", dbPath]);
+    assert.equal(report.status, 0, `report failed: ${report.stdout} ${report.stderr}`);
+    assert.match(report.stdout, /Delegated jobs/);
+    assert.match(report.stdout, /job-complete01/);
+    assert.match(report.stdout, /job-diedearly02/);
+    assert.match(report.stdout, /cost 0\.00/); // free-tier zero is a measurement
+    assert.match(report.stdout, /usage\.json never written/);
+    assert.match(report.stdout, /jobs: 2/);
+
+    // Windowed out: --since past every fixture start leaves the section
+    // present but explicitly empty.
+    const windowed = runCompanion(["metrics-report", "--db", dbPath, "--since", "2099-01-01T00:00:00Z"]);
+    assert.equal(windowed.status, 0);
+    assert.match(windowed.stdout, /Delegated jobs/);
+    assert.match(windowed.stdout, /\(no data in window\)/);
+  });
+
+  it("re-running metrics-ingest skips both jobs as unchanged (idempotent and cheap)", () => {
+    const first = runCompanion([
+      "metrics-ingest", "--state-root", stateRoot, "--transcript-dir", transcriptDir, "--db", dbPath,
+    ]);
+    assert.equal(first.status, 0);
+    const second = runCompanion([
+      "metrics-ingest", "--state-root", stateRoot, "--transcript-dir", transcriptDir, "--db", dbPath,
+    ]);
+    assert.equal(second.status, 0);
+    assert.match(second.stdout, /jobs skipped \(unchanged\):\s+2/);
+    assert.match(second.stdout, /jobs ingested:\s+0/);
+  });
+
+  it("a state root with no jobs at all still prints the Jobs block with zeros (visible, not silent)", () => {
+    const emptyRoot = path.join(tmpDir, "empty-state");
+    fs.mkdirSync(emptyRoot, { recursive: true });
+    const result = runCompanion([
+      "metrics-ingest", "--state-root", emptyRoot, "--transcript-dir", transcriptDir, "--dry-run",
+    ]);
+    assert.equal(result.status, 0, `dry-run failed: ${result.stdout} ${result.stderr}`);
+    assert.match(result.stdout, /Jobs \(delegated single-shot task\/review jobs\):/);
+    assert.match(result.stdout, /jobs scanned:\s+0/);
+    assert.match(result.stdout, /jobs ingested:\s+0/);
+  });
+});
