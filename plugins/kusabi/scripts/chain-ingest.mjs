@@ -55,6 +55,21 @@ function toBoolInt(v) {
 }
 
 /**
+ * Sum one usage field across the final and first review attempts.  Each side
+ * contributes only when its usage object is usable (available === true,
+ * checked by the caller) and the field is a number \u2014 the same guard style as
+ * the pre-retry columns.  When neither side contributes the result is null
+ * (the old single-attempt value), so a round without a retry is
+ * byte-for-byte identical to before.
+ */
+function usageFieldSum(usage, firstUsage, field) {
+  const value = usage && typeof usage[field] === "number" ? usage[field] : null;
+  const firstValue = firstUsage && typeof firstUsage[field] === "number" ? firstUsage[field] : null;
+  if (value === null && firstValue === null) return null;
+  return (value === null ? 0 : value) + (firstValue === null ? 0 : firstValue);
+}
+
+/**
  * Render a chain.json `model` object ({providerID, modelID, variant?}) as
  * the same "provider/model[:variant]" route-string convention used
  * elsewhere in this codebase (cli.mjs `parseModel` / `selectRoutes`).
@@ -159,6 +174,11 @@ export function parseChainRecord(chainJson, ctx = {}) {
 
     const implementUsage = (rec.implementUsage && rec.implementUsage.available === true) ? rec.implementUsage : null;
     const reviewUsage = (rec.reviewUsage && rec.reviewUsage.available === true) ? rec.reviewUsage : null;
+    // First review attempt, recorded when the unparseable-output retry fired
+    // (runReviewPhase in chain-phases.mjs).  Its spend folds into the same
+    // columns as the final attempt's, so the round row reports the round's
+    // total review spend without any schema change.
+    const reviewFirstUsage = (rec.reviewFirstUsage && rec.reviewFirstUsage.available === true) ? rec.reviewFirstUsage : null;
 
     let startedMs = null;
     if (typeof rec.startedAt === "string") {
@@ -184,9 +204,9 @@ export function parseChainRecord(chainJson, ctx = {}) {
       implementIn: implementUsage && typeof implementUsage.input === "number" ? implementUsage.input : null,
       implementOut: implementUsage && typeof implementUsage.output === "number" ? implementUsage.output : null,
       implementCost: implementUsage && typeof implementUsage.cost === "number" ? implementUsage.cost : null,
-      reviewIn: reviewUsage && typeof reviewUsage.input === "number" ? reviewUsage.input : null,
-      reviewOut: reviewUsage && typeof reviewUsage.output === "number" ? reviewUsage.output : null,
-      reviewCost: reviewUsage && typeof reviewUsage.cost === "number" ? reviewUsage.cost : null,
+      reviewIn: usageFieldSum(reviewUsage, reviewFirstUsage, "input"),
+      reviewOut: usageFieldSum(reviewUsage, reviewFirstUsage, "output"),
+      reviewCost: usageFieldSum(reviewUsage, reviewFirstUsage, "cost"),
     });
 
     // Generational gap (hazard 3): prefer full `findings` objects

@@ -2084,7 +2084,7 @@ describe("runReviewPhase — unparseable-output retry (issue #145)", () => {
   // worst-case latency in exactly the degraded environments where it is
   // known-futile.  The retry is gated on job.status === "completed": these
   // never get a second dispatch and escalate after a single attempt.
-  const HARD_FAILURES = ["serve-dead", "stalled", "timeout", "error"];
+  const HARD_FAILURES = ["serve-dead", "provider-error", "stalled", "timeout", "error"];
   for (const status of HARD_FAILURES) {
     it("first job " + status + " with empty resultText: exactly 1 dispatch call, no retry, unparseable escalates", async () => {
       const { result, roundRecord, calls } = await runWith([

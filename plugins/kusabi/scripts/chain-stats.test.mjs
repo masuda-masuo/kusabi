@@ -47,6 +47,7 @@ function round({
   startedAt = new Date("2026-01-01").toISOString(),
   implementUsage = null,
   reviewUsage = null,
+  reviewFirstUsage = null,
   strategistUsage = null,
 } = {}) {
   const safeFindings = Array.isArray(findings) ? findings : (findings === null ? null : undefined);
@@ -73,6 +74,7 @@ function round({
 
   if (implementUsage) r.implementUsage = implementUsage;
   if (reviewUsage) r.reviewUsage = reviewUsage;
+  if (reviewFirstUsage) r.reviewFirstUsage = reviewFirstUsage;
   if (strategistUsage) r.strategistUsage = strategistUsage;
   return r;
 }
@@ -489,6 +491,54 @@ describe("computeStats", () => {
     assert.equal(stats.overallTotals.cost, 0.035);
     // filteredTotals from per-round usage
     assert.equal(stats.filteredTotals.input, 350);
+  });
+
+  it("filteredTotals sums reviewFirstUsage when a retried round has both attempts' usage", () => {
+    const chains = [
+      chain({
+        chainId: "c1",
+        rounds: [
+          round({
+            round: 1,
+            verdict: "approve",
+            disposition: "accept",
+            implementUsage: { available: true, input: 100, output: 50, cost: 0.01 },
+            reviewUsage: { available: true, input: 20, output: 10, cost: 0.002 },
+            reviewFirstUsage: { available: true, input: 20, output: 10, cost: 0.002 },
+          }),
+        ],
+        chainTotals: { input: 140, output: 70, cost: 0.014 },
+      }),
+    ];
+
+    const stats = computeStats(chains);
+    // 100 implement + 20 final review + 20 first-attempt review
+    assert.equal(stats.filteredTotals.input, 140);
+    assert.equal(stats.filteredTotals.output, 70);
+    assert.equal(stats.filteredTotals.cost, 0.014);
+  });
+
+  it("filteredTotals is unchanged for rounds without reviewFirstUsage", () => {
+    const chains = [
+      chain({
+        chainId: "c1",
+        rounds: [
+          round({
+            round: 1,
+            verdict: "approve",
+            disposition: "accept",
+            implementUsage: { available: true, input: 100, output: 50, cost: 0.01 },
+            reviewUsage: { available: true, input: 20, output: 10, cost: 0.002 },
+          }),
+        ],
+        chainTotals: { input: 120, output: 60, cost: 0.012 },
+      }),
+    ];
+
+    const stats = computeStats(chains);
+    assert.equal(stats.filteredTotals.input, 120);
+    assert.equal(stats.filteredTotals.output, 60);
+    assert.equal(stats.filteredTotals.cost, 0.012);
   });
 });
 
