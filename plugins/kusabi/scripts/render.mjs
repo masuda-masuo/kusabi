@@ -411,6 +411,17 @@ export function renderChainShow(chain, rounds, unreadable = [], control = null) 
   for (const round of safeRounds) {
     lines.push(`Round ${round.round}`);
 
+    // Partial round persisted at stop time (kusabi #153①) and rounds resumed
+    // by chain-resume — visible traces of the interruption/recovery so the
+    // digest never reads as a plain completed round.
+    if (round.interrupted) {
+      const after = round.interruptedAfter ? ` (after ${round.interruptedAfter})` : "";
+      lines.push(`  interrupted: yes${after}`);
+    }
+    if (round.resumed) {
+      lines.push(`  resumed: yes`);
+    }
+
     // Model entry(+variant)
     if (round.modelEntry) {
       lines.push(`  model: ${round.modelEntry}`);

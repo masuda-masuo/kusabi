@@ -41,6 +41,11 @@ import { deriveReworkStrategy } from "./disposition.mjs";
 // mechanism.  checkpoint_restore was removed in issue #114 — the chain
 // never rolls the worktree back.
 import { writeJson } from "./state-paths.mjs";
+// effectiveStatus powers resolveChainResume (kusabi #153①): a chain whose
+// pid is gone is an abnormal stop that may be resumed; a live process or a
+// finished status is not.  chain-control has no imports from this module, so
+// there is no cycle.
+import { effectiveStatus } from "./chain-control.mjs";
 import { dispatchWithFallback } from "./prompt-execution.mjs";
 import {
   captureWorktreeState,
@@ -213,6 +218,7 @@ export function buildImplementText({ round, brief, previousRecord, container }) 
 export async function runImplementPhase({
   cwd, chainId, round, isFirstRound, implementText, modelChain, tierIndex,
   useNewSession, session, previousRecord, resumeMethod, flagsModel,
+  _dispatchWithFallback: _dispatch = dispatchWithFallback,
 }) {
   let resolvedSession = session;
   if (!resolvedSession && !isFirstRound && previousRecord?.sessionID) {
@@ -221,7 +227,7 @@ export async function runImplementPhase({
     }
   }
 
-  const { job, resultText } = await dispatchWithFallback({
+  const { job, resultText } = await _dispatch({
     cwd,
     kind: "task",
     title: "chain: " + chainId + " round " + round + " implement",
@@ -276,7 +282,6 @@ export async function runProbePhase({ baseSha, container, brief, callTool, workt
   let worktreeChanged = null;
   let chainStatusObserved = false;
   let chainStatusOutput = "";
-  let chainBaseLog = "";
 
   try {
     const p1Result = await runHeadCleanProbe({ baseSha, callTool, container, sourceLabel: "chain" });
@@ -321,7 +326,31 @@ export async function runProbePhase({ baseSha, container, brief, callTool, workt
     probesGreen = false;
   }
 
+  // Base log + diff + untracked for review context (read-only; failures yield
+  // empty strings, never errors).
+  const diffCtx = await collectContainerDiffContext(callTool, container);
+
+  return {
+    probesGreen, probeResults, chainChangedPaths, chainNewlyChanged,
+    chainStatusObserved, chainStatusOutput,
+    chainBaseLog: diffCtx.chainBaseLog, chainDeliverables,
+    chainDiff: diffCtx.chainDiff, chainUntracked: diffCtx.chainUntracked,
+    worktreeChanged,
+  };
+}
+
+/**
+ * Collect the container-side context the review prompt renders: the base log,
+ * the working diff, and untracked files.  Read-only sandbox_exec calls; every
+ * failure yields an empty string rather than an error.
+ *
+ * @param {Function} callTool   The RPC callTool function (injectable).
+ * @param {string}   container  Container ID.
+ * @returns {Promise<{ chainBaseLog: string, chainDiff: string, chainUntracked: string }>}
+ */
+export async function collectContainerDiffContext(callTool, container) {
   // Base log for review context (own try/catch so failure does not affect probesGreen)
+  let chainBaseLog = "";
   try {
     const baseLogResult = await callTool("sandbox_exec", {
       container_id: container,
@@ -347,7 +376,74 @@ export async function runProbePhase({ baseSha, container, brief, callTool, workt
     chainUntracked = untrackedResult?.output ?? "";
   } catch { /* chainDiff and chainUntracked stay "" */ }
 
-  return { probesGreen, probeResults, chainChangedPaths, chainNewlyChanged, chainStatusObserved, chainStatusOutput, chainBaseLog, chainDeliverables, chainDiff, chainUntracked, worktreeChanged };
+  return { chainBaseLog, chainDiff, chainUntracked };
+}
+
+/**
+ * Collect the review-phase context for a round WITHOUT running the probes.
+ *
+ * Used by chain-resume (kusabi #153①) when a cancelled chain resumes at the
+ * review phase of an interrupted round: the probes already ran and their
+ * results are on the persisted round record; only the context the review
+ * prompt renders (status, base log, diff, untracked) is re-collected from
+ * the container.
+ *
+ * `worktreeBaseline` should be null here: the interrupted round's changes ARE
+ * the review target, and comparing them against a baseline captured at resume
+ * time would read as "nothing changed since baseline" and skip the review
+ * entirely (shouldSkipReview discards an empty change set).
+ *
+ * @param {object}  opts
+ * @param {string}  opts.container
+ * @param {string}  opts.brief
+ * @param {Function} opts.callTool
+ * @param {object|null} [opts.worktreeBaseline=null]
+ * @returns {Promise<object>} The same context fields runProbePhase returns
+ *   minus the probe results (probesGreen / probeResults).
+ */
+export async function collectReviewContext({ container, brief, callTool, worktreeBaseline = null }) {
+  const chainDeliverables = parseDeliverables(brief);
+  // Degraded-container guard (#153① review): this runs on the RECOVERY path,
+  // so a transient container/RPC failure here must degrade, not throw the
+  // resumed chain into the terminal "failed" state.  Mirror runProbePhase:
+  // on failure the status was NOT observed (chainStatusObserved=false), which
+  // shouldSkipReview never reads as "nothing changed" — the review still runs.
+  let chainChangedPaths = [];
+  let chainNewlyChanged = [];
+  let worktreeChanged = false;
+  let chainStatusOutput = "";
+  let chainStatusObserved = false;
+  try {
+    const p3Result = await runDeliverablesProbe({
+      deliverables: chainDeliverables,
+      headingPresent: hasSectionHeading(brief, "Deliverables"),
+      callTool,
+      container,
+      baseline: worktreeBaseline,
+    });
+    chainChangedPaths = p3Result.changedPaths;
+    // `newlyChangedPaths` is null when the comparison could not be made — fall
+    // back to the full changed set (same rule as runProbePhase).
+    chainNewlyChanged = p3Result.newlyChangedPaths ?? chainChangedPaths;
+    worktreeChanged = p3Result.worktreeChanged;
+    chainStatusOutput = p3Result.statusOutput;
+    chainStatusObserved = true;
+  } catch {
+    // Degraded: fields keep their "unknown" defaults.
+  }
+  const diffCtx = await collectContainerDiffContext(callTool, container);
+
+  return {
+    chainChangedPaths,
+    chainNewlyChanged,
+    chainStatusObserved,
+    chainStatusOutput,
+    chainBaseLog: diffCtx.chainBaseLog,
+    chainDeliverables,
+    chainDiff: diffCtx.chainDiff,
+    chainUntracked: diffCtx.chainUntracked,
+    worktreeChanged,
+  };
 }
 
 
@@ -585,12 +681,36 @@ export function computeChainTotals(records) {
  * Persist a round record and update chain.json.
  *
  * Writes both `round-N.json` and `chain.json` to the chain directory.
+ *
+ * `interrupted` (kusabi #153①): the chain stopped at a phase boundary inside
+ * this round (implement + probes done, review not run).  The record is marked
+ * `interrupted` so chain-show renders it as a partial round and chain-resume
+ * can pick up at the next phase.  control.json is finalised by the caller.
+ *
+ * The round is pushed into `records` idempotently: a chain-resumed round was
+ * already pushed when its partial state was persisted at stop time.
  */
 export function persistChainState({
   chainDir, round, roundRecord, chainId, container, model, modelChain,
   maxRounds, brief, orchestrator, records, baseSha, chainTotals,
-  strategized, chainFollowupDraft,
+  strategized, chainFollowupDraft, interrupted = false,
 }) {
+  if (interrupted) {
+    roundRecord.interrupted = true;
+    roundRecord.interruptedAfter = "probes";
+  } else if (roundRecord.interrupted) {
+    // The round completed after a resume: `interrupted` means "still
+    // partial", so a completed round must not keep claiming it (#153①
+    // review — chain-show would render a finished, dispositioned round as
+    // "interrupted" forever).  The history moves to a separate trace field;
+    // `resumed: true` stays for the recovery narrative.
+    delete roundRecord.interrupted;
+    delete roundRecord.interruptedAfter;
+    roundRecord.wasInterrupted = true;
+  }
+  if (!records.includes(roundRecord)) {
+    records.push(roundRecord);
+  }
   writeJson(path.join(chainDir, "round-" + round + ".json"), roundRecord);
   writeJson(path.join(chainDir, "chain.json"), {
     chainId,
@@ -1158,4 +1278,151 @@ export function handleProviderExhaustion({
   });
 
   return { records, chainState, outcome };
+}
+
+// =========================================================================
+// Chain resume (kusabi #153①) — resume-position resolution
+// =========================================================================
+
+/**
+ * Decide where a stopped chain resumes, from its persisted state alone.
+ *
+ * Pure function: reads nothing, writes nothing.  The caller still validates
+ * container reachability before re-running (a resumed chain's work lives in
+ * the recorded container; the state root is machine-local).
+ *
+ * Preconditions (explicit errors for everything else):
+ *   - The chain must be stopped: status "cancelled", or "running" with a dead
+ *     pid (stale — abnormal stop).  A live process (running / stopping) and
+ *     any finished status (completed / failed) are errors.
+ *
+ * Resume position, from the LAST round record in chain.json:
+ *   - Last record has implement done but no review/disposition (an
+ *     interrupted round persisted at stop time) → resume at that round's
+ *     REVIEW phase, continuing the persisted partial record.
+ *   - Last record is complete with disposition rework/strategize → resume at
+ *     the NEXT round's IMPLEMENT phase (rework: with the escalated
+ *     tier/reworkCount; strategize: with the fresh-session lever from the
+ *     record's pendingReworkStrategy).
+ *   - Terminal dispositions (accept / accept-with-followup / escalate) mean
+ *     the chain already finished — error.
+ *
+ * Cross-round state (reworkCount, currentTierIndex, strategized, session,
+ * baseSha) is derived from the record fields so the resumed run continues the
+ * ladder exactly where the original left off.
+ *
+ * @param {object}  opts
+ * @param {object|null} opts.control    — control.json record.
+ * @param {object|null} opts.chainJson  — chain.json record.
+ * @returns {{ ok: true, position: object } | { ok: false, error: string }}
+ *   `position`:
+ *   - `phase`        — "review" | "implement"
+ *   - `round`        — round to continue at
+ *   - `roundRecord`  — the persisted partial record (review-resume only)
+ *   - `records`      — chain.json records array (continued in place)
+ *   - `reworkCount`, `currentTierIndex`, `strategized`, `session`, `baseSha`
+ */
+export function resolveChainResume({ control, chainJson }) {
+  if (!control) {
+    return { ok: false, error: "no control record (control.json missing)" };
+  }
+  if (!chainJson) {
+    return { ok: false, error: "no chain.json (nothing was persisted)" };
+  }
+
+  const { status, stale } = effectiveStatus(control);
+  if (status === "running" || status === "stopping") {
+    return {
+      ok: false,
+      error: `chain is still running (pid ${control.pid}) — stop it first (chain-cancel)`,
+    };
+  }
+  if (status !== "cancelled" && !stale) {
+    return {
+      ok: false,
+      error: `chain already finished (status: ${status})`,
+    };
+  }
+
+  if (!Array.isArray(chainJson.modelChain) || chainJson.modelChain.length === 0) {
+    return { ok: false, error: "chain.json has no modelChain to dispatch with" };
+  }
+  if (typeof chainJson.brief !== "string" || !chainJson.brief.trim()) {
+    return { ok: false, error: "chain.json has no brief to continue with" };
+  }
+
+  const maxRounds = Number.isInteger(chainJson.maxRounds) && chainJson.maxRounds > 0
+    ? chainJson.maxRounds
+    : 4;
+  const records = Array.isArray(chainJson.records) ? chainJson.records : [];
+  const last = records.length > 0 ? records[records.length - 1] : null;
+  const strategized = !!chainJson.strategized;
+  const baseSha = chainJson.baseSha ?? null;
+
+  if (!last) {
+    return {
+      ok: false,
+      error: "no round records to resume from (the chain stopped before completing a round)",
+    };
+  }
+
+  const lastDisposition = last.disposition?.disposition;
+  if (lastDisposition) {
+    if (lastDisposition === "accept" || lastDisposition === "accept-with-followup" || lastDisposition === "escalate") {
+      return {
+        ok: false,
+        error: `chain already finished (last round ${last.round} disposition: ${lastDisposition})`,
+      };
+    }
+    const nextRound = (last.round ?? records.length) + 1;
+    if (nextRound > maxRounds) {
+      return {
+        ok: false,
+        error: `max rounds (${maxRounds}) already reached at round ${last.round}`,
+      };
+    }
+    return {
+      ok: true,
+      position: {
+        phase: "implement",
+        round: nextRound,
+        roundRecord: null,
+        records,
+        // A rework consumed one rework; a strategize did not.
+        reworkCount: (last.reworkCount ?? 0) + (lastDisposition === "rework" ? 1 : 0),
+        currentTierIndex: last.tierAfter ?? last.tierBefore ?? 0,
+        strategized,
+        session: last.sessionID ?? undefined,
+        baseSha,
+      },
+    };
+  }
+
+  // No disposition → partial (interrupted) round.
+  if (!last.implementJobId) {
+    return {
+      ok: false,
+      error: `round ${last.round ?? "?"} record has no implement job — no phase boundary to resume at`,
+    };
+  }
+  if (last.reviewJobId || last.verdict) {
+    return {
+      ok: false,
+      error: `round ${last.round} record is inconsistent (review present but no disposition) — manual inspection required`,
+    };
+  }
+  return {
+    ok: true,
+    position: {
+      phase: "review",
+      round: last.round,
+      roundRecord: last,
+      records,
+      reworkCount: last.reworkCount ?? 0,
+      currentTierIndex: last.tierBefore ?? 0,
+      strategized,
+      session: last.sessionID ?? undefined,
+      baseSha,
+    },
+  };
 }

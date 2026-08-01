@@ -14,6 +14,7 @@ import {
   shouldStopNow,
   updateChainControlRound,
   finalizeChainControl,
+  rearmChainControl,
   chainIdForJob,
   listChainDirs,
   collectChainStatuses,
@@ -312,6 +313,62 @@ describe("finalizeChainControl", () => {
   it("does nothing when no control file exists", () => {
     finalizeChainControl({ chainDir: tmpDir, status: "completed", round: 1 });
     assert.equal(readChainControl(tmpDir), null);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// rearmChainControl — chain-resume re-arm (kusabi #153①)
+// ---------------------------------------------------------------------------
+
+describe("rearmChainControl", () => {
+  let tmpDir;
+
+  beforeEach(() => {
+    tmpDir = makeTmpDir();
+  });
+
+  afterEach(() => {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it("sets status back to running with the new pid and clears the stop-request fields", () => {
+    writeChainControl(tmpDir, {
+      chainId: "chain-1",
+      container: "cid-1",
+      pid: 0,
+      status: "cancelled",
+      round: 3,
+      stopRequestedAt: "2026-08-01T00:00:00.000Z",
+      stopRequestedBy: "cli",
+      finishedAt: "2026-08-01T00:00:00.000Z",
+      startedAt: "2026-08-01T00:00:00.000Z",
+    });
+    const next = rearmChainControl({ chainDir: tmpDir, round: 3 });
+
+    assert.equal(next.status, "running");
+    assert.equal(next.pid, process.pid);
+    assert.equal(next.round, 3);
+    assert.ok(next.resumedAt);
+    // Stop fields cleared so shouldStopNow() no longer fires
+    assert.equal(next.stopRequestedAt, undefined);
+    assert.equal(next.stopRequestedBy, undefined);
+    assert.equal(next.finishedAt, undefined);
+    // Identity fields preserved
+    assert.equal(next.chainId, "chain-1");
+    assert.equal(next.container, "cid-1");
+    assert.equal(next.startedAt, "2026-08-01T00:00:00.000Z");
+
+    const persisted = readChainControl(tmpDir);
+    assert.equal(persisted.status, "running");
+    assert.equal(persisted.stopRequestedAt, undefined);
+    assert.equal(persisted.resumedAt, next.resumedAt);
+  });
+
+  it("throws when no control record exists", () => {
+    assert.throws(
+      () => rearmChainControl({ chainDir: tmpDir, round: 1 }),
+      /no control record found/,
+    );
   });
 });
 

@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import os from "node:os";
 import path from "node:path";
 import fs from "node:fs";
+import crypto from "node:crypto";
 import { spawnSync } from "node:child_process";
 import {
   newestChainDir,
@@ -11,10 +12,21 @@ import {
   readBriefFile,
   __testProbeBindings,
   publishWarningForBrief,
+  runChainDriver,
 } from "./kusabi-companion.mjs";
 import {
   parseOrchestratorSignature,
 } from "./brief-parsing.mjs";
+import {
+  readChainControl,
+  writeChainControl,
+  rearmChainControl,
+} from "./chain-control.mjs";
+import {
+  resolveChainResume,
+  computeChainTotals,
+} from "./chain-phases.mjs";
+import { readJson, writeJson } from "./state-paths.mjs";
 
 // newestChainDir — chain directory selection by mtime
 // ---------------------------------------------------------------------------
@@ -773,6 +785,565 @@ describe("chain publish-demand warning", () => {
       assert.doesNotMatch(result.stdout, /publish を要求/);
     } finally {
       fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+});
+
+// =========================================================================
+// runChainDriver — resume paths (kusabi #153①)
+// -------------------------------------------------------------------------
+// Drives the shared chain loop with fake callTool / dispatch, exactly as
+// cmdChainResume wires it: resolveChainResume → rearmChainControl →
+// runChainDriver(resume: position).
+// =========================================================================
+
+describe("runChainDriver resume", () => {
+  const BRIEF = "Implement X.\n\n## Deliverables\n- src/foo.js\n";
+
+  function fakeResumeCallTool({ statusOutput = " M src/foo.js\n" } = {}) {
+    return async (toolName, params) => {
+      if (toolName === "verify_in_container") {
+        return { gate_passed: true };
+      }
+      if (toolName !== "sandbox_exec") return { output: "" };
+      const cmd = params.commands[0];
+      // captureWorktreeState: capture failure → baseline null (graceful)
+      if (cmd.startsWith("cd /workspace &&") && cmd.includes("TMPIDX=")) {
+        return { output: "ERROR_NO_INDEX\n" };
+      }
+      if (cmd === "git rev-parse HEAD") return { output: "abc123\n" };
+      if (cmd === "git status --porcelain") return { output: statusOutput };
+      if (cmd === "git log --oneline -5") return { output: "abc123 latest change\n" };
+      if (cmd === "git diff") return { output: "diff --git a/src/foo.js b/src/foo.js\n" };
+      if (cmd === "git ls-files --others --exclude-standard") return { output: "untracked.txt\n" };
+      return { output: "" };
+    };
+  }
+
+  function makeFakeDispatch({
+    reviewResult = JSON.stringify({ verdict: "approve", findings: [], summary: "ok" }),
+    implementStatus = "completed",
+  } = {}) {
+    const dispatch = async (opts) => {
+      if (opts.kind === "review") {
+        return {
+          job: {
+            id: "job-rev-1", status: "completed", modelEntry: "fake/review", modelVariant: null,
+            fallbacks: null, sessionID: "sess-rev",
+            usage: { available: true, input: 2, output: 2, reasoning: 0, cacheRead: 0, cacheWrite: 0, cost: 0.01 },
+            error: null,
+          },
+          resultText: reviewResult,
+        };
+      }
+      if (opts.kind === "task") {
+        return {
+          job: {
+            id: "job-imp-" + (opts.round ?? 1), status: implementStatus,
+            modelEntry: "fake/model", modelVariant: null, fallbacks: null,
+            sessionID: "sess-imp-" + (opts.round ?? 1),
+            usage: { available: true, input: 1, output: 1, reasoning: 0, cacheRead: 0, cacheWrite: 0, cost: 0.01 },
+            error: implementStatus === "provider-error" ? "All routes exhausted: fake/model — retry at attempt 3" : null,
+          },
+          resultText: "implemented",
+        };
+      }
+      if (opts.kind === "strategist") {
+        return {
+          job: {
+            id: "job-strat-1", status: "completed", modelEntry: "fake/strat", modelVariant: null,
+            fallbacks: null, sessionID: "sess-strat",
+            usage: { available: true, input: 1, output: 1, reasoning: 0, cacheRead: 0, cacheWrite: 0, cost: 0.01 },
+            error: null,
+          },
+          resultText: "restructure the module",
+        };
+      }
+      throw new Error("unexpected dispatch kind: " + opts.kind);
+    };
+    dispatch.calls = [];
+    const wrapped = async (opts) => {
+      dispatch.calls.push(opts);
+      return dispatch(opts);
+    };
+    wrapped.calls = dispatch.calls;
+    return wrapped;
+  }
+
+  function makeChainState({ records, controlOverrides = {}, chainId = "chain-test" } = {}) {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-resume-"));
+    const chainDir = path.join(tmp, "chains", chainId);
+    fs.mkdirSync(chainDir, { recursive: true });
+    writeJson(path.join(chainDir, "chain.json"), {
+      chainId, container: "cid-1", model: "fake/model",
+      modelChain: [["fake/model"], ["fake/pro"]], maxRounds: 4,
+      brief: BRIEF, orchestrator: null, records,
+      baseSha: "abc123",
+      chainTotals: computeChainTotals(records),
+      strategized: false, followupIssueDraft: null,
+    });
+    writeChainControl(chainDir, {
+      chainId, container: "cid-1", pid: 0,
+      status: "cancelled", round: 3,
+      stopRequestedAt: "2026-08-01T00:00:00.000Z", stopRequestedBy: "cli",
+      finishedAt: "2026-08-01T00:00:00.000Z",
+      ...controlOverrides,
+    });
+    return { tmp, chainDir };
+  }
+
+  // Mirrors cmdChainResume: resolve the position, re-arm the control, run.
+  async function resumeChain({ chainDir, dispatch, statusOutput, callTool }) {
+    const resolution = resolveChainResume({
+      control: readChainControl(chainDir),
+      chainJson: readJson(path.join(chainDir, "chain.json")),
+    });
+    assert.equal(resolution.ok, true);
+    rearmChainControl({
+      chainDir,
+      round: resolution.position.phase === "review" ? resolution.position.round : resolution.position.round - 1,
+    });
+    const tmp = path.dirname(path.dirname(chainDir));
+    return runChainDriver({
+      cwd: tmp, stateDir: path.dirname(path.dirname(chainDir)), chainDir,
+      chainId: "chain-test", container: "cid-1",
+      model: "fake/model", modelChain: [["fake/model"], ["fake/pro"]], maxRounds: 4,
+      brief: BRIEF, orchestrator: null, baseSha: "abc123", worktreeBaseline: null,
+      callTool: callTool ?? fakeResumeCallTool({ statusOutput }),
+      dispatchWithFallback: dispatch,
+      keepServe: true,
+      signalReceived: () => false,
+      resume: resolution.position,
+    });
+  }
+
+  it("resumes an interrupted round at review and completes it (implement done, review not run)", async () => {
+    const partial = {
+      round: 3,
+      resumeMethod: { type: "continue_session" },
+      startedAt: "2026-08-01T00:00:00.000Z",
+      verdict: null,
+      probesGreen: true,
+      modelEntry: "fake/model",
+      modelVariant: null,
+      fallbacks: null,
+      implementJobId: "job-imp-3",
+      sessionID: "sess-3",
+      implementUsage: { available: true, input: 1, output: 1, reasoning: 0, cacheRead: 0, cacheWrite: 0, cost: 0.01 },
+      tierBefore: 0,
+      reworkStrategyReason: null,
+      reworkCount: 2,
+      probeResults: [{ probe: "P1: HEAD clean", passed: true, detail: "ok" }],
+      worktreeChanged: true,
+      interrupted: true,
+      interruptedAfter: "probes",
+    };
+    const { chainDir } = makeChainState({ records: [partial] });
+    const dispatch = makeFakeDispatch(); // review approves
+
+    const text = await resumeChain({ chainDir, dispatch });
+
+    assert.match(text, /accepted at round 3/);
+    // The resumed review actually dispatched (kind review, round 3)
+    assert.ok(dispatch.calls.some((c) => c.kind === "review"), "review must be dispatched");
+
+    const control = readChainControl(chainDir);
+    assert.equal(control.status, "completed");
+    assert.equal(control.round, 3);
+
+    const round3 = readJson(path.join(chainDir, "round-3.json"));
+    assert.equal(round3.reviewJobId, "job-rev-1");
+    assert.equal(round3.verdict, "approve");
+    assert.equal(round3.disposition.disposition, "accept");
+    assert.equal(round3.resumed, true);
+    // A completed round is no longer "interrupted" — that flag means "still
+    // partial" (#153① review).  The history moves to wasInterrupted.
+    assert.equal(round3.interrupted, undefined);
+    assert.equal(round3.interruptedAfter, undefined);
+    assert.equal(round3.wasInterrupted, true);
+
+    const chainJson = readJson(path.join(chainDir, "chain.json"));
+    assert.equal(chainJson.records.length, 1); // no duplicate push
+  });
+
+  it("carries tier/reworkCount into the next round after a resumed review that reworks", async () => {
+    const partial = {
+      round: 3,
+      resumeMethod: { type: "continue_session" },
+      startedAt: "2026-08-01T00:00:00.000Z",
+      verdict: null,
+      probesGreen: true,
+      modelEntry: "fake/model",
+      modelVariant: null,
+      fallbacks: null,
+      implementJobId: "job-imp-3",
+      sessionID: "sess-3",
+      implementUsage: null,
+      tierBefore: 0,
+      reworkStrategyReason: null,
+      reworkCount: 1,
+      probeResults: [],
+      worktreeChanged: true,
+      interrupted: true,
+      interruptedAfter: "probes",
+    };
+    const { chainDir } = makeChainState({ records: [partial] });
+    // Review finds problems → rework; the next round's implement hits provider
+    // exhaustion so the test can observe the carried tier/reworkCount.
+    const dispatch = makeFakeDispatch({
+      reviewResult: JSON.stringify({ verdict: "needs-attention", findings: [] }),
+      implementStatus: "provider-error",
+    });
+
+    const text = await resumeChain({ chainDir, dispatch });
+
+    assert.match(text, /implement provider exhausted/);
+
+    // Cross-round context derived at resume (position) — the ladder continues
+    const round3 = readJson(path.join(chainDir, "round-3.json"));
+    assert.equal(round3.disposition.disposition, "rework");
+    assert.equal(round3.tierAfter, 1); // 0 + 1 (2nd rework escalates), 2-tier chain, not clamped
+
+    const round4 = readJson(path.join(chainDir, "round-4.json"));
+    assert.equal(round4.tierBefore, 1);   // carried currentTierIndex
+    assert.equal(round4.reworkCount, 2);  // 1 + the consumed rework
+    // round 4 is a NEW round after the resumed one — only the resumed round
+    // itself carries the resumed trace
+    assert.equal(round4.resumed, undefined);
+
+    const control = readChainControl(chainDir);
+    assert.equal(control.status, "failed");
+    assert.equal(control.round, 4);
+  });
+
+  it("resumes a rework chain at the next round's implement, keeping prior-findings context", async () => {
+    const complete = {
+      round: 2,
+      resumeMethod: { type: "fresh_session" },
+      startedAt: "2026-08-01T00:00:00.000Z",
+      verdict: "needs-attention",
+      probesGreen: false,
+      modelEntry: "fake/model",
+      modelVariant: null,
+      fallbacks: null,
+      implementJobId: "job-imp-2",
+      reviewJobId: "job-rev-2",
+      sessionID: "sess-2",
+      implementUsage: null,
+      reviewUsage: null,
+      tierBefore: 0,
+      tierAfter: 1,
+      reworkCount: 1,
+      pendingReworkStrategy: { tierDelta: 1, newSession: true, reason: "2nd rework: escalate tier, new session, keep artifacts" },
+      disposition: { disposition: "rework", reason: "needs-attention" },
+      findingsText: "fix the parser",
+    };
+    const { chainDir } = makeChainState({ records: [complete], controlOverrides: { round: 2 } });
+    const dispatch = makeFakeDispatch({ implementStatus: "provider-error" });
+
+    const text = await resumeChain({ chainDir, dispatch });
+
+    assert.match(text, /implement provider exhausted/);
+
+    // The resumed round's implement ran with the previous round's findings
+    const impCall = dispatch.calls.find((c) => c.kind === "task");
+    assert.ok(impCall, "implement must be dispatched");
+    assert.equal(impCall.round, 3);
+    assert.match(impCall.promptText, /Prior findings/);
+    assert.match(impCall.promptText, /fix the parser/);
+
+    const round3 = readJson(path.join(chainDir, "round-3.json"));
+    assert.equal(round3.tierBefore, 1);   // carried from round 2 tierAfter
+    assert.equal(round3.reworkCount, 2);  // 1 + the consumed rework
+    assert.equal(round3.resumed, true);
+
+    const control = readChainControl(chainDir);
+    assert.equal(control.status, "failed");
+    assert.equal(control.round, 3);
+  });
+
+  it("persists the interrupted round when stopped after probes (stop-accept path)", async () => {
+    // Fresh chain (resume: null).  The implement dispatch writes a stop
+    // request into control.json as a side effect; the driver's after-probes
+    // stop check must persist the partial round and finalise round N.
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-resume-stop-"));
+    const chainDir = path.join(tmp, "chains", "chain-test");
+    fs.mkdirSync(chainDir, { recursive: true });
+    writeChainControl(chainDir, {
+      chainId: "chain-test", container: "cid-1", pid: process.pid,
+      status: "running", round: 0, startedAt: new Date().toISOString(),
+    });
+
+    const dispatch = makeFakeDispatch();
+    const dispatchWithStop = async (opts) => {
+      const result = await dispatch(opts);
+      if (opts.kind === "task") {
+        // The stop arrives while the round is in flight — exactly what
+        // chain-cancel does via requestChainStop.
+        writeChainControl(chainDir, {
+          ...readChainControl(chainDir),
+          stopRequestedAt: new Date().toISOString(),
+          stopRequestedBy: "test",
+        });
+      }
+      return result;
+    };
+
+    const text = await runChainDriver({
+      cwd: tmp, stateDir: tmp, chainDir, chainId: "chain-test", container: "cid-1",
+      model: "fake/model", modelChain: [["fake/model"], ["fake/pro"]], maxRounds: 4,
+      brief: BRIEF, orchestrator: null, baseSha: "abc123", worktreeBaseline: null,
+      callTool: fakeResumeCallTool(),
+      dispatchWithFallback: dispatchWithStop,
+      keepServe: true,
+      signalReceived: () => false,
+      resume: null,
+    });
+
+    assert.match(text, /cancelled during round 1/);
+    assert.match(text, /Progress preserved/);
+    assert.match(text, /chain-resume chain-test/);
+
+    const control = readChainControl(chainDir);
+    assert.equal(control.status, "cancelled");
+    assert.equal(control.round, 1); // control round matches actual progress
+
+    const round1 = readJson(path.join(chainDir, "round-1.json"));
+    assert.equal(round1.implementJobId, "job-imp-1");
+    assert.equal(round1.interrupted, true);
+    assert.equal(round1.interruptedAfter, "probes");
+    assert.ok(round1.probeResults.length > 0);
+    assert.equal(round1.reviewJobId, undefined); // no review was bought
+
+    const chainJson = readJson(path.join(chainDir, "chain.json"));
+    assert.equal(chainJson.records.length, 1);
+    assert.equal(chainJson.records[0].interrupted, true);
+
+    // The persisted partial record is resumable
+    const resolution = resolveChainResume({
+      control: readChainControl(chainDir),
+      chainJson: readJson(path.join(chainDir, "chain.json")),
+    });
+    assert.equal(resolution.ok, true);
+    assert.equal(resolution.position.phase, "review");
+    assert.equal(resolution.position.round, 1);
+  });
+});
+
+// =========================================================================
+// chain-resume CLI — subprocess error paths (kusabi #153①)
+// =========================================================================
+
+describe("chain-resume CLI", () => {
+  const COMPANION_SCRIPT = path.join(import.meta.dirname, "kusabi-companion.mjs");
+
+  // The subprocess resolves its workspace state dir via stateDirFor(cwd),
+  // which hashes the cwd under the state root — replicate that here so the
+  // fixture chain lands where the subprocess looks for it.
+  function hashedWorkspaceDir(stateRootDir, cwd) {
+    const hash = crypto.createHash("sha256").update(cwd).digest("hex").slice(0, 12);
+    return path.join(stateRootDir, hash);
+  }
+
+  function runResume(args, { stateDir, cwd } = {}) {
+    const env = { ...process.env };
+    delete env.KUSABI_WORKER_CONTEXT;
+    env.KUSABI_STATE_DIR = stateDir;
+    return spawnSync(process.execPath, [COMPANION_SCRIPT, "chain-resume", ...args], {
+      encoding: "utf8",
+      cwd,
+      env,
+      timeout: 15_000,
+    });
+  }
+
+  function makeChain(stateDir, chainId, { control, chainJson } = {}) {
+    const chainDir = path.join(stateDir, "chains", chainId);
+    fs.mkdirSync(chainDir, { recursive: true });
+    if (chainJson) writeJson(path.join(chainDir, "chain.json"), chainJson);
+    if (control) writeChainControl(chainDir, control);
+    return chainDir;
+  }
+
+  function validChainJson() {
+    return {
+      chainId: "chain-x",
+      container: "cid-1",
+      model: "fake/model",
+      modelChain: [["fake/model"]],
+      maxRounds: 4,
+      brief: "Implement X.",
+      orchestrator: null,
+      records: [{
+        round: 1,
+        implementJobId: "job-1",
+        verdict: null,
+        probesGreen: true,
+        tierBefore: 0,
+        reworkCount: 0,
+        interrupted: true,
+        interruptedAfter: "probes",
+      }],
+      baseSha: "abc123",
+      chainTotals: { input: 0, output: 0, reasoning: 0, cacheRead: 0, cacheWrite: 0, cost: 0 },
+      strategized: false,
+      followupIssueDraft: null,
+    };
+  }
+
+  it("requires a chain id", () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-resume-cli-"));
+    try {
+      const result = runResume([], { stateDir: path.join(tmp, "state"), cwd: tmp });
+      assert.notEqual(result.status, 0);
+      assert.match(result.stdout, /chain-resume requires a chain id/);
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("errors for an unknown chain id", () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-resume-cli-"));
+    try {
+      const result = runResume(["chain-nope"], { stateDir: path.join(tmp, "state"), cwd: tmp });
+      assert.notEqual(result.status, 0);
+      assert.match(result.stdout, /chain not found: chain-nope/);
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects unsupported flags explicitly instead of silently ignoring them", () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-resume-cli-"));
+    try {
+      const result = runResume(["--model", "x/y", "chain-x"], { stateDir: path.join(tmp, "state"), cwd: tmp });
+      assert.notEqual(result.status, 0);
+      assert.match(result.stdout, /does not support --model/);
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses a running chain (live pid) before any container contact", () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-resume-cli-"));
+    try {
+      const stateDir = hashedWorkspaceDir(path.join(tmp, "state"), tmp);
+      makeChain(stateDir, "chain-running", {
+        control: {
+          chainId: "chain-running", container: "cid-1", pid: process.pid, // alive
+          status: "running", round: 2, startedAt: new Date().toISOString(),
+        },
+        chainJson: validChainJson(),
+      });
+      const result = runResume(["chain-running"], { stateDir: path.join(tmp, "state"), cwd: tmp });
+      assert.notEqual(result.status, 0);
+      assert.match(result.stdout, /still running/);
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses a completed chain", () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-resume-cli-"));
+    try {
+      const stateDir = hashedWorkspaceDir(path.join(tmp, "state"), tmp);
+      makeChain(stateDir, "chain-done", {
+        control: {
+          chainId: "chain-done", container: "cid-1", pid: 0,
+          status: "completed", round: 2, finishedAt: new Date().toISOString(),
+        },
+        chainJson: validChainJson(),
+      });
+      const result = runResume(["chain-done"], { stateDir: path.join(tmp, "state"), cwd: tmp });
+      assert.notEqual(result.status, 0);
+      assert.match(result.stdout, /already finished/);
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses to resume while a job of this chain is still recorded as running (#153①)", () => {
+    // A dead driver (stale pid) can leave a phase job mid-flight with no
+    // phase boundary in the records; resuming would re-dispatch that phase
+    // as a duplicate job against the same container worktree.
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-resume-cli-"));
+    try {
+      const stateDir = hashedWorkspaceDir(path.join(tmp, "state"), tmp);
+      makeChain(stateDir, "chain-x", {
+        control: {
+          chainId: "chain-x", container: "cid-1", pid: 0, // dead pid — abnormal stop
+          status: "running", round: 1, startedAt: new Date().toISOString(),
+        },
+        chainJson: validChainJson(),
+      });
+      const jobDir = path.join(stateDir, "jobs", "job-mid");
+      fs.mkdirSync(jobDir, { recursive: true });
+      writeJson(path.join(jobDir, "job.json"), {
+        id: "job-mid",
+        status: "running",
+        title: "chain: chain-x round 1 review",
+        startedAt: new Date().toISOString(),
+      });
+      const result = runResume(["chain-x"], { stateDir: path.join(tmp, "state"), cwd: tmp });
+      assert.notEqual(result.status, 0);
+      assert.match(result.stdout, /still recorded as running/);
+      assert.match(result.stdout, /cancel job-mid/);
+      // The guard fires before any container contact / control re-arm.
+      const control = readChainControl(path.join(stateDir, "chains", "chain-x"));
+      assert.equal(control.resumedAt, undefined);
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("ignores running jobs of OTHER chains when resuming", () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-resume-cli-"));
+    try {
+      const stateDir = hashedWorkspaceDir(path.join(tmp, "state"), tmp);
+      makeChain(stateDir, "chain-x", {
+        control: {
+          chainId: "chain-x", container: "fake-cid", pid: 0,
+          status: "running", round: 1, startedAt: new Date().toISOString(),
+        },
+        chainJson: validChainJson(),
+      });
+      const jobDir = path.join(stateDir, "jobs", "job-other");
+      fs.mkdirSync(jobDir, { recursive: true });
+      writeJson(path.join(jobDir, "job.json"), {
+        id: "job-other",
+        status: "running",
+        title: "chain: chain-unrelated round 2 implement",
+        startedAt: new Date().toISOString(),
+      });
+      const result = runResume(["chain-x"], { stateDir: path.join(tmp, "state"), cwd: tmp });
+      // Falls through the guard to the container-reachability check.
+      assert.notEqual(result.status, 0);
+      assert.match(result.stdout, /not reachable/);
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("reports an unreachable container for a resumable stale chain (no sunaba endpoint in tests)", () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-resume-cli-"));
+    try {
+      const stateDir = hashedWorkspaceDir(path.join(tmp, "state"), tmp);
+      makeChain(stateDir, "chain-stale", {
+        control: {
+          chainId: "chain-stale", container: "fake-cid", pid: 0, // dead pid → abnormal stop
+          status: "running", round: 1, startedAt: new Date().toISOString(),
+        },
+        chainJson: validChainJson(),
+      });
+      const result = runResume(["chain-stale"], { stateDir: path.join(tmp, "state"), cwd: tmp });
+      assert.notEqual(result.status, 0);
+      assert.match(result.stdout, /not reachable/);
+      // The control record must NOT have been re-armed past the failure
+      const control = readChainControl(path.join(stateDir, "chains", "chain-stale"));
+      assert.equal(control.status, "running");
+      assert.equal(control.resumedAt, undefined);
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
     }
   });
 });

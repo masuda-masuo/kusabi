@@ -1,5 +1,8 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import {
   buildImplementText,
   shouldSkipReview,
@@ -23,6 +26,10 @@ import {
   hasRepeatedAreas,
   applyTierEscalation,
   recordReworkEscalation,
+  persistChainState,
+  collectContainerDiffContext,
+  collectReviewContext,
+  resolveChainResume,
 } from "./chain-phases.mjs";
 import {
   createFakeCallTool,
@@ -32,6 +39,7 @@ import {
   fakeCallToolForP3WithBaseline,
 } from "./fixtures.mjs";
 import { renderPriorFindings } from "./render.mjs";
+import { readJson } from "./state-paths.mjs";
 
 describe("runSmokeProbe", () => {
   it("observes exit 0 for a command whose output far exceeds page size", async () => {
@@ -2322,5 +2330,448 @@ describe("runReviewPhase — unparseable-output retry (issue #145)", () => {
     assert.equal(roundRecord.reviewUnparseableRetried, undefined);
     assert.equal(roundRecord.reviewFirstUsage, undefined);
     assert.equal(roundRecord.reviewFirstFallbacks, undefined);
+  });
+});
+
+// =========================================================================
+// persistChainState — interrupted-round persistence (kusabi #153①)
+// =========================================================================
+
+describe("persistChainState interrupted round", () => {
+  function makeChainDir() {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-persist-"));
+    return path.join(tmp, "chain-test");
+  }
+
+  const chainCtx = {
+    chainId: "chain-test",
+    container: "cid-1",
+    model: "fake/model",
+    modelChain: [["fake/model"]],
+    maxRounds: 4,
+    brief: "Implement X.",
+    orchestrator: null,
+    baseSha: "abc123",
+    strategized: false,
+    chainFollowupDraft: null,
+  };
+
+  it("marks the record interrupted and writes it into chain.json records (stop-after-probes path)", () => {
+    const chainDir = makeChainDir();
+    fs.mkdirSync(chainDir, { recursive: true });
+    const roundRecord = {
+      round: 3, implementJobId: "job-3", verdict: null,
+      probesGreen: true, tierBefore: 0, reworkCount: 2,
+    };
+    const records = [];
+    persistChainState({
+      chainDir, round: 3, roundRecord, records,
+      chainTotals: computeChainTotals([roundRecord]),
+      ...chainCtx,
+      interrupted: true,
+    });
+
+    assert.equal(roundRecord.interrupted, true);
+    assert.equal(roundRecord.interruptedAfter, "probes");
+
+    const written = readJson(path.join(chainDir, "round-3.json"));
+    assert.equal(written.interrupted, true);
+    assert.equal(written.interruptedAfter, "probes");
+
+    const chainJson = readJson(path.join(chainDir, "chain.json"));
+    assert.equal(chainJson.records.length, 1);
+    assert.equal(chainJson.records[0].round, 3);
+    assert.equal(chainJson.records[0].implementJobId, "job-3");
+    assert.equal(chainJson.records[0].interrupted, true);
+  });
+
+  it("does not mark the record when interrupted is not requested", () => {
+    const chainDir = makeChainDir();
+    fs.mkdirSync(chainDir, { recursive: true });
+    const roundRecord = { round: 1, implementJobId: "job-1" };
+    persistChainState({
+      chainDir, round: 1, roundRecord, records: [roundRecord],
+      chainTotals: computeChainTotals([roundRecord]),
+      ...chainCtx,
+    });
+    assert.equal(roundRecord.interrupted, undefined);
+    const chainJson = readJson(path.join(chainDir, "chain.json"));
+    assert.equal(chainJson.records.length, 1);
+  });
+
+  it("does not duplicate a record that is already in records (review-resume path)", () => {
+    const chainDir = makeChainDir();
+    fs.mkdirSync(chainDir, { recursive: true });
+    const roundRecord = { round: 3, implementJobId: "job-3" };
+    const records = [roundRecord]; // already pushed at stop time
+    persistChainState({
+      chainDir, round: 3, roundRecord, records,
+      chainTotals: computeChainTotals(records),
+      ...chainCtx,
+    });
+    const chainJson = readJson(path.join(chainDir, "chain.json"));
+    assert.equal(chainJson.records.length, 1);
+  });
+});
+
+// =========================================================================
+// resolveChainResume — resume-position decision (kusabi #153①)
+// =========================================================================
+
+describe("resolveChainResume", () => {
+  function baseChainJson(overrides = {}) {
+    return {
+      chainId: "chain-test",
+      container: "cid-1",
+      model: "fake/model",
+      modelChain: [["fake/model"], ["fake/pro"]],
+      maxRounds: 4,
+      brief: "Implement X.",
+      orchestrator: null,
+      records: [],
+      baseSha: "abc123",
+      chainTotals: { input: 0, output: 0, reasoning: 0, cacheRead: 0, cacheWrite: 0, cost: 0 },
+      strategized: false,
+      followupIssueDraft: null,
+      ...overrides,
+    };
+  }
+
+  function partialRound(overrides = {}) {
+    return {
+      round: 3,
+      resumeMethod: { type: "continue_session" },
+      startedAt: "2026-08-01T00:00:00.000Z",
+      verdict: null,
+      probesGreen: true,
+      modelEntry: "fake/model",
+      implementJobId: "job-imp-3",
+      sessionID: "sess-3",
+      implementUsage: null,
+      tierBefore: 1,
+      reworkStrategyReason: null,
+      reworkCount: 2,
+      probeResults: [],
+      worktreeChanged: true,
+      interrupted: true,
+      interruptedAfter: "probes",
+      ...overrides,
+    };
+  }
+
+  it("errors when the control record is missing", () => {
+    const result = resolveChainResume({ control: null, chainJson: baseChainJson() });
+    assert.equal(result.ok, false);
+    assert.match(result.error, /no control record/);
+  });
+
+  it("errors when chain.json is missing", () => {
+    const result = resolveChainResume({ control: { status: "cancelled" }, chainJson: null });
+    assert.equal(result.ok, false);
+    assert.match(result.error, /no chain\.json/);
+  });
+
+  it("errors for a running chain (live pid)", () => {
+    const control = {
+      chainId: "chain-test", container: "cid-1", pid: process.pid,
+      status: "running", round: 2, startedAt: new Date().toISOString(),
+    };
+    const result = resolveChainResume({ control, chainJson: baseChainJson() });
+    assert.equal(result.ok, false);
+    assert.match(result.error, /still running/);
+  });
+
+  it("errors for a stopping chain (stop requested, live pid)", () => {
+    const control = {
+      chainId: "chain-test", container: "cid-1", pid: process.pid,
+      status: "running", round: 2, startedAt: new Date().toISOString(),
+      stopRequestedAt: new Date().toISOString(), stopRequestedBy: "cli",
+    };
+    const result = resolveChainResume({ control, chainJson: baseChainJson() });
+    assert.equal(result.ok, false);
+    assert.match(result.error, /still running/);
+  });
+
+  it("errors for a completed chain", () => {
+    const control = {
+      chainId: "chain-test", container: "cid-1", pid: 0,
+      status: "completed", round: 2, finishedAt: new Date().toISOString(),
+    };
+    const result = resolveChainResume({ control, chainJson: baseChainJson() });
+    assert.equal(result.ok, false);
+    assert.match(result.error, /already finished/);
+  });
+
+  it("errors for a failed chain", () => {
+    const control = {
+      chainId: "chain-test", container: "cid-1", pid: 0,
+      status: "failed", round: 2, finishedAt: new Date().toISOString(),
+    };
+    const result = resolveChainResume({ control, chainJson: baseChainJson() });
+    assert.equal(result.ok, false);
+    assert.match(result.error, /already finished/);
+  });
+
+  it("treats a running record with a dead pid as resumable (abnormal stop)", () => {
+    const control = {
+      chainId: "chain-test", container: "cid-1", pid: 0, // dead
+      status: "running", round: 2,
+    };
+    const chainJson = baseChainJson({ records: [partialRound()] });
+    const result = resolveChainResume({ control, chainJson });
+    assert.equal(result.ok, true);
+    assert.equal(result.position.phase, "review");
+  });
+
+  it("resumes at the review phase of the interrupted round, carrying its context", () => {
+    const control = {
+      chainId: "chain-test", container: "cid-1", pid: 0,
+      status: "cancelled", round: 3, finishedAt: new Date().toISOString(),
+    };
+    const partial = partialRound();
+    const chainJson = baseChainJson({ records: [partial], strategized: true });
+    const result = resolveChainResume({ control, chainJson });
+
+    assert.equal(result.ok, true);
+    const p = result.position;
+    assert.equal(p.phase, "review");
+    assert.equal(p.round, 3);
+    assert.equal(p.roundRecord, partial);
+    assert.equal(p.reworkCount, 2);           // carried, not incremented
+    assert.equal(p.currentTierIndex, 1);      // from tierBefore
+    assert.equal(p.strategized, true);
+    assert.equal(p.session, "sess-3");
+    assert.equal(p.baseSha, "abc123");
+  });
+
+  it("resumes at the next round's implement after a rework disposition, with escalated tier and rework count", () => {
+    const control = {
+      chainId: "chain-test", container: "cid-1", pid: 0,
+      status: "cancelled", round: 2, finishedAt: new Date().toISOString(),
+    };
+    const complete = {
+      round: 2,
+      implementJobId: "job-imp-2",
+      reviewJobId: "job-rev-2",
+      verdict: "needs-attention",
+      findingsText: "fix it",
+      sessionID: "sess-2",
+      tierBefore: 0,
+      tierAfter: 1,
+      reworkCount: 1,
+      pendingReworkStrategy: { tierDelta: 1, newSession: true, reason: "2nd rework: escalate tier" },
+      disposition: { disposition: "rework", reason: "needs-attention" },
+    };
+    const chainJson = baseChainJson({ records: [complete] });
+    const result = resolveChainResume({ control, chainJson });
+
+    assert.equal(result.ok, true);
+    const p = result.position;
+    assert.equal(p.phase, "implement");
+    assert.equal(p.round, 3);
+    assert.equal(p.roundRecord, null);
+    assert.equal(p.reworkCount, 2);        // 1 + the consumed rework
+    assert.equal(p.currentTierIndex, 1);   // tierAfter carried
+    assert.equal(p.session, "sess-2");
+  });
+
+  it("does not consume a rework after a strategize disposition", () => {
+    const control = {
+      chainId: "chain-test", container: "cid-1", pid: 0,
+      status: "cancelled", round: 2, finishedAt: new Date().toISOString(),
+    };
+    const complete = {
+      round: 2,
+      implementJobId: "job-imp-2",
+      reviewJobId: "job-rev-2",
+      verdict: "needs-attention",
+      sessionID: "sess-2",
+      tierBefore: 1,
+      tierAfter: 1,
+      reworkCount: 1,
+      pendingReworkStrategy: { tierDelta: 0, newSession: true, reason: "strategized: new session" },
+      disposition: { disposition: "strategize", reason: "same file area flagged twice" },
+    };
+    const chainJson = baseChainJson({ records: [complete], strategized: true });
+    const result = resolveChainResume({ control, chainJson });
+
+    assert.equal(result.ok, true);
+    assert.equal(result.position.phase, "implement");
+    assert.equal(result.position.round, 3);
+    assert.equal(result.position.reworkCount, 1); // strategize consumed none
+    assert.equal(result.position.currentTierIndex, 1);
+  });
+
+  it("errors for a cancelled chain whose last round was accepted", () => {
+    const control = { chainId: "chain-test", container: "cid-1", pid: 0, status: "cancelled", round: 2 };
+    const complete = {
+      round: 2,
+      implementJobId: "job-imp-2",
+      reviewJobId: "job-rev-2",
+      verdict: "approve",
+      disposition: { disposition: "accept" },
+    };
+    const result = resolveChainResume({ control, chainJson: baseChainJson({ records: [complete] }) });
+    assert.equal(result.ok, false);
+    assert.match(result.error, /already finished/);
+  });
+
+  it("errors for a cancelled chain whose last round escalated", () => {
+    const control = { chainId: "chain-test", container: "cid-1", pid: 0, status: "cancelled", round: 2 };
+    const complete = {
+      round: 2,
+      implementJobId: "job-imp-2",
+      reviewJobId: "job-rev-2",
+      verdict: "discard",
+      disposition: { disposition: "escalate" },
+    };
+    const result = resolveChainResume({ control, chainJson: baseChainJson({ records: [complete] }) });
+    assert.equal(result.ok, false);
+    assert.match(result.error, /already finished/);
+  });
+
+  it("errors when there are no round records at all", () => {
+    const control = { chainId: "chain-test", container: "cid-1", pid: 0, status: "cancelled", round: 0 };
+    const result = resolveChainResume({ control, chainJson: baseChainJson() });
+    assert.equal(result.ok, false);
+    assert.match(result.error, /no round records to resume from/);
+  });
+
+  it("errors for a record with no implement job (no phase boundary)", () => {
+    const control = { chainId: "chain-test", container: "cid-1", pid: 0, status: "cancelled", round: 3 };
+    const broken = { round: 3, verdict: null, interrupted: true };
+    const result = resolveChainResume({ control, chainJson: baseChainJson({ records: [broken] }) });
+    assert.equal(result.ok, false);
+    assert.match(result.error, /no implement job/);
+  });
+
+  it("errors for an inconsistent record (review present, no disposition)", () => {
+    const control = { chainId: "chain-test", container: "cid-1", pid: 0, status: "cancelled", round: 3 };
+    const broken = { round: 3, implementJobId: "job-3", reviewJobId: "job-rev-3", verdict: "approve" };
+    const result = resolveChainResume({ control, chainJson: baseChainJson({ records: [broken] }) });
+    assert.equal(result.ok, false);
+    assert.match(result.error, /inconsistent/);
+  });
+
+  it("errors when rework would exceed maxRounds", () => {
+    const control = { chainId: "chain-test", container: "cid-1", pid: 0, status: "cancelled", round: 4 };
+    const complete = {
+      round: 4,
+      implementJobId: "job-imp-4",
+      reviewJobId: "job-rev-4",
+      verdict: "needs-attention",
+      tierBefore: 1,
+      tierAfter: 1,
+      reworkCount: 2,
+      disposition: { disposition: "rework", reason: "needs-attention" },
+    };
+    const result = resolveChainResume({ control, chainJson: baseChainJson({ records: [complete], maxRounds: 4 }) });
+    assert.equal(result.ok, false);
+    assert.match(result.error, /max rounds \(4\) already reached/);
+  });
+
+  it("errors when chain.json has no modelChain", () => {
+    const control = { chainId: "chain-test", container: "cid-1", pid: 0, status: "cancelled", round: 3 };
+    const chainJson = baseChainJson({ modelChain: undefined, records: [partialRound()] });
+    const result = resolveChainResume({ control, chainJson });
+    assert.equal(result.ok, false);
+    assert.match(result.error, /no modelChain/);
+  });
+
+  it("errors when chain.json has no brief", () => {
+    const control = { chainId: "chain-test", container: "cid-1", pid: 0, status: "cancelled", round: 3 };
+    const chainJson = baseChainJson({ brief: "", records: [partialRound()] });
+    const result = resolveChainResume({ control, chainJson });
+    assert.equal(result.ok, false);
+    assert.match(result.error, /no brief/);
+  });
+});
+
+// =========================================================================
+// collectReviewContext — review context without re-running probes (resume)
+// =========================================================================
+
+describe("collectReviewContext", () => {
+  function fakeReviewContextCallTool({ statusOutput = "" } = {}) {
+    return async (toolName, params) => {
+      if (toolName !== "sandbox_exec") return { output: "" };
+      const cmd = params.commands[0];
+      if (cmd === "git status --porcelain") return { output: statusOutput };
+      if (cmd === "git log --oneline -5") return { output: "abc123 latest change\n" };
+      if (cmd === "git diff") return { output: "diff --git a/src/foo.js b/src/foo.js\n" };
+      if (cmd === "git ls-files --others --exclude-standard") return { output: "untracked.txt\n" };
+      return { output: "" };
+    };
+  }
+
+  it("collects status/changed paths, base log, diff and untracked without running probes", async () => {
+    const callTool = fakeReviewContextCallTool({ statusOutput: " M src/foo.js\n" });
+    const ctx = await collectReviewContext({
+      container: "fake-cid",
+      brief: "Implement X.\n\n## Deliverables\n- src/foo.js\n",
+      callTool,
+      worktreeBaseline: null,
+    });
+
+    assert.deepEqual(ctx.chainChangedPaths, ["src/foo.js"]);
+    assert.deepEqual(ctx.chainNewlyChanged, ["src/foo.js"]); // baseline null → full changed set
+    assert.equal(ctx.chainStatusObserved, true);
+    assert.equal(ctx.chainStatusOutput, " M src/foo.js\n");
+    assert.equal(ctx.chainBaseLog, "abc123 latest change\n");
+    assert.equal(ctx.chainDiff, "diff --git a/src/foo.js b/src/foo.js\n");
+    assert.equal(ctx.chainUntracked, "untracked.txt\n");
+    assert.deepEqual(ctx.chainDeliverables, ["src/foo.js"]);
+  });
+
+  it("yields empty strings for unreadable context calls instead of throwing", async () => {
+    const callTool = async (toolName, params) => {
+      if (toolName !== "sandbox_exec") return { output: "" };
+      const cmd = params.commands[0];
+      if (cmd === "git status --porcelain") return { output: "" };
+      throw new Error("sandbox unreachable");
+    };
+    const ctx = await collectReviewContext({
+      container: "fake-cid",
+      brief: "Implement X.",
+      callTool,
+      worktreeBaseline: null,
+    });
+    assert.equal(ctx.chainBaseLog, "");
+    assert.equal(ctx.chainDiff, "");
+    assert.equal(ctx.chainUntracked, "");
+    assert.deepEqual(ctx.chainChangedPaths, []);
+  });
+
+  it("degrades to unobserved status when the probe RPC fails instead of throwing (#153①)", async () => {
+    // This context is collected on the RECOVERY path — a transient
+    // container/RPC failure must not turn the resumed chain terminal.
+    const callTool = async () => { throw new Error("container unreachable"); };
+    const ctx = await collectReviewContext({
+      container: "fake-cid",
+      brief: "Implement X.\n\n## Deliverables\n- src/foo.js\n",
+      callTool,
+      worktreeBaseline: null,
+    });
+    assert.equal(ctx.chainStatusObserved, false); // unknown — never "nothing changed"
+    assert.deepEqual(ctx.chainChangedPaths, []);
+    assert.equal(ctx.chainBaseLog, "");
+    // An unobserved status must not skip the review as an empty change set.
+    assert.equal(
+      shouldSkipReview({
+        chainStatusObserved: ctx.chainStatusObserved,
+        chainChangedPaths: ctx.chainChangedPaths,
+        chainNewlyChanged: ctx.chainNewlyChanged,
+        chainDeliverables: ctx.chainDeliverables,
+      }),
+      false,
+    );
+  });
+
+  it("collectContainerDiffContext alone returns the three context strings", async () => {
+    const callTool = fakeReviewContextCallTool({});
+    const diffCtx = await collectContainerDiffContext(callTool, "fake-cid");
+    assert.equal(diffCtx.chainBaseLog, "abc123 latest change\n");
+    assert.equal(diffCtx.chainDiff, "diff --git a/src/foo.js b/src/foo.js\n");
+    assert.equal(diffCtx.chainUntracked, "untracked.txt\n");
   });
 });

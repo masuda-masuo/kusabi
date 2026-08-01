@@ -379,10 +379,33 @@ describe("renderChainShow", () => {
     assert.match(result, /P2: verify gate — PASS.*gate_passed=true.*changed=3.*untracked=1/);
   });
 
-  it("findingsText appears verbatim in the output", () => {
-    const result = renderChainShow(sampleChain, sampleRounds);
-    assert.ok(result.includes("[low] Minor style issue (src/foo.js:10)"));
-    assert.ok(result.includes("[high] Missing error handling (src/bar.js:42)"));
+  it("marks interrupted and resumed rounds (kusabi #153\u2460)", () => {
+    const chain = { chainId: "chain-int", brief: "Interrupted chain" };
+    const rounds = [
+      {
+        round: 2,
+        modelEntry: "opencode-go/deepseek-v4-flash",
+        verdict: "approve",
+        disposition: { disposition: "accept" },
+        resumeMethod: { type: "continue_session" },
+        interrupted: true,
+        interruptedAfter: "probes",
+        resumed: true,
+      },
+      {
+        round: 3,
+        modelEntry: "opencode-go/deepseek-v4-flash",
+        interrupted: true,
+        interruptedAfter: "probes",
+      },
+    ];
+    const result = renderChainShow(chain, rounds);
+    assert.match(result, /Round 2/);
+    assert.match(result, /interrupted: yes \(after probes\)/);
+    assert.match(result, /resumed: yes/);
+    // A partial round without verdict/disposition still shows its trace
+    assert.match(result, /Round 3/);
+    assert.match(result, /interrupted: yes \(after probes\)/);
   });
 
   it("renders totals line", () => {
