@@ -191,6 +191,41 @@ export function updateChainControlRound({ chainDir, round }) {
 }
 
 /**
+ * Re-arm a control record for a resumed run (kusabi #153①).
+ *
+ * Called by chain-resume before re-running the chain driver: sets status back
+ * to "running" with the new process pid, advances the round counter to match
+ * the resume position, clears the stop-request fields — shouldStopNow() keys
+ * off stopRequestedAt, so a fresh stop must be requested for the resumed
+ * run — and records resumedAt as the recovery trace.
+ *
+ * @param {object} opts
+ * @param {string} opts.chainDir
+ * @param {number} opts.round  — the round the resumed run continues at (the
+ *        interrupted round for a review-resume, the last completed round
+ *        otherwise).
+ * @returns {object} The new control record.
+ */
+export function rearmChainControl({ chainDir, round }) {
+  const existing = readChainControl(chainDir);
+  if (!existing) {
+    throw new Error(`no control record found for chain in ${chainDir}`);
+  }
+  const next = {
+    ...existing,
+    status: "running",
+    pid: process.pid,
+    round,
+    stopRequestedAt: undefined,
+    stopRequestedBy: undefined,
+    finishedAt: undefined,
+    resumedAt: new Date().toISOString(),
+  };
+  writeChainControl(chainDir, next);
+  return next;
+}
+
+/**
  * Finalise the chain control record on exit. Only the chain process should
  * call this. The stop request fields (if any) are preserved.
  *

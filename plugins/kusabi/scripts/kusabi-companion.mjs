@@ -29,6 +29,7 @@ import {
   shouldStopNow,
   updateChainControlRound,
   finalizeChainControl,
+  rearmChainControl,
   chainIdForJob,
   collectChainStatuses,
 } from "./chain-control.mjs";
@@ -61,6 +62,8 @@ import {
   renderMaxRoundsOutcome,
   handleProviderExhaustion,
   recordReworkEscalation,
+  resolveChainResume,
+  collectReviewContext,
 } from "./chain-phases.mjs";
 
 // Import the probe functions locally so cmdTask can call them directly.
@@ -812,24 +815,308 @@ async function cmdChain(cwd, { flags, text }) {
     );
   }
 
+  try {
+    return await runChainDriver({
+      cwd, stateDir, chainDir, chainId, container, model, modelChain, maxRounds,
+      brief, orchestrator, baseSha, worktreeBaseline, callTool,
+      initialSession: flags.session,
+      flagsModel: flags.model,
+      signalReceived: () => signalReceived,
+      keepServe: !!flags.keepServe,
+      resume: null,
+    });
+  } finally {
+    process.removeListener("SIGTERM", onSignal);
+    process.removeListener("SIGINT", onSignal);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// chain driver — shared by `chain` and `chain-resume` (kusabi #153①)
+// ---------------------------------------------------------------------------
+
+/**
+ * Run the chain round loop.  Shared by cmdChain (fresh chain) and
+ * cmdChainResume (resumed chain); `resume` carries the position resolved by
+ * resolveChainResume, or null for a fresh chain.
+ *
+ * Exported so tests can drive the loop with fake callTool / dispatch; the
+ * CLI wrappers install signal handlers and (for resume) validate the
+ * container before calling this.
+ *
+ * @param {object} opts
+ * @param {string} opts.cwd
+ * @param {string} opts.stateDir
+ * @param {string} opts.chainDir
+ * @param {string} opts.chainId
+ * @param {string} opts.container
+ * @param {string|null} opts.model
+ * @param {Array} opts.modelChain
+ * @param {number} opts.maxRounds
+ * @param {string} opts.brief
+ * @param {object|null} opts.orchestrator
+ * @param {string|null} opts.baseSha        — null → captured from the container.
+ * @param {object|null} opts.worktreeBaseline — null → captured from the container.
+ * @param {Function} opts.callTool
+ * @param {Function} [opts.dispatchWithFallback] — injection seam (defaults to
+ *        the real dispatchWithFallback; phase functions receive it as their
+ *        own _dispatchWithFallback seam).
+ * @param {string} [opts.initialSession]
+ * @param {string|null} [opts.flagsModel]
+ * @param {Function} [opts.signalReceived]  — getter: has SIGTERM/SIGINT fired?
+ * @param {boolean} [opts.keepServe]
+ * @param {object|null} [opts.resume]       — resolveChainResume position or null.
+ * @returns {Promise<string>} Outcome text for the operator.
+ */
+export async function runChainDriver({
+  cwd, stateDir, chainDir, chainId, container, model, modelChain, maxRounds,
+  brief, orchestrator, baseSha, worktreeBaseline, callTool,
+  dispatchWithFallback: injectedDispatch = dispatchWithFallback,
+  initialSession, flagsModel = null, signalReceived = () => false,
+  keepServe = false, resume = null,
+}) {
+  // baseSha: a resume keeps the ORIGINAL chain base — the resumed round's diff
+  // is measured against it (P1 auto-resets HEAD to it); a fresh chain captures
+  // it from the container.
+  const effectiveBaseSha = baseSha ?? await captureBaseSha(callTool, container);
+  // worktreeBaseline: captured once per run.  A resumed chain re-captures at
+  // resume time — the pre-cancel baseline is not persisted, and the resumed
+  // run measures what IT changes from here on.  The interrupted round's
+  // review-resume path deliberately bypasses it (see collectReviewContext).
+  const effectiveBaseline = worktreeBaseline ?? await captureWorktreeState(callTool, container);
+
   // ---- round loop state (cross-round) ----
-  const records = [];
-  let strategized = false;
-  let session = flags.session;
-  let reworkCount = 0; // how many reworks have been done (B2: tier/session/artifacts)
-  let currentTierIndex = 0; // cumulative tier index (starts at 0)
+  const records = resume ? resume.records : [];
+  let strategized = resume ? resume.strategized : false;
+  let session = resume ? resume.session : initialSession;
+  let reworkCount = resume ? resume.reworkCount : 0;
+  let currentTierIndex = resume ? resume.currentTierIndex : 0;
+  const startRound = resume ? resume.round : 1;
+
+  // Phases 5–13 (review → disposition → persistence → strategize), shared by
+  // fresh rounds and review-resumes.  Mutates the cross-round state above in
+  // place; returns { done: true, text } when the chain ended.
+  async function finishRound({ round, roundRecord, previousRecord, probeCtx }) {
+    const {
+      probesGreen, chainChangedPaths, chainNewlyChanged, chainStatusObserved,
+      chainStatusOutput, chainBaseLog, chainDeliverables, chainDiff, chainUntracked,
+    } = probeCtx;
+
+    // ---- phase 5: review (or skip when change set empty) ----
+    const {
+      chainVerdict, chainFindingsText, chainParsedReview, chainRepeatedAreas, skipReview,
+      reviewJobStatus, reviewJobError,
+    } = await runReviewPhase({
+      container, brief, modelChain, chainId, cwd, previousRecord, baseSha: effectiveBaseSha,
+      chainStatusOutput, chainBaseLog, chainDiff, chainUntracked, roundRecord,
+      chainChangedPaths, chainNewlyChanged, chainStatusObserved, chainDeliverables,
+      flagsModel, _dispatchWithFallback: injectedDispatch,
+    });
+
+    // ---- stop on review provider exhaustion ----
+    if (reviewJobStatus === "provider-error") {
+      const { chainState, outcome } = handleProviderExhaustion({
+        records, roundRecord,
+        currentTierIndex, phase: "review", jobError: reviewJobError,
+        chainId, round, container, model, modelChain,
+        maxRounds, brief, orchestrator, baseSha: effectiveBaseSha,
+        strategized, chainFollowupDraft: null,
+      });
+      writeJson(path.join(chainDir, "round-" + round + ".json"), roundRecord);
+      writeJson(path.join(chainDir, "chain.json"), chainState);
+      finalizeChainControl({ chainDir, status: "failed", round });
+      return { done: true, text: outcome };
+    }
+
+    // ---- phase 6: derive disposition ----
+    // Malformed-review guard (kusabi #153): `findings` may be a non-array.
+    const findingSeverities = Array.isArray(chainParsedReview?.findings)
+      ? chainParsedReview.findings.map(function (f) { return f.severity; })
+      : undefined;
+
+    const disposition = deriveDisposition({
+      verdict: chainVerdict || "needs-attention",
+      probesGreen,
+      round,
+      maxRounds,
+      repeatedAreas: chainRepeatedAreas,
+      findingSeverities,
+      strategizeEligible: !strategized,
+    });
+    roundRecord.disposition = disposition;
+
+    // ---- phase 7: record keeping + persistence ----
+    // Idempotent push: a review-resumed round is already in `records` (its
+    // partial state was persisted at stop time).
+    if (!records.includes(roundRecord)) records.push(roundRecord);
+
+    // Compute totals across all rounds so far
+    const chainTotals = computeChainTotals(records);
+
+    // When review was skipped, ensure findingsText is set
+    if (skipReview && !roundRecord.findingsText) {
+      roundRecord.findingsText = "(no review — change set was empty)";
+    }
+
+    // Followup draft for accept-with-followup
+    let chainFollowupDraft = null;
+    if (disposition.disposition === "accept-with-followup" && chainParsedReview?.findings) {
+      const briefTitle = brief ? brief.split("\n")[0].trim() : "";
+      chainFollowupDraft = renderFollowupDraft({
+        chainId,
+        briefTitle,
+        findings: chainParsedReview.findings,
+      });
+      roundRecord.followupIssueDraft = chainFollowupDraft;
+    }
+
+    // ---- Compute rework strategy for the NEXT round (if rework needed) ----
+    let pendingReworkStrategy = null;
+    if (disposition.disposition === "rework") {
+      // Tier escalation is clamped to the modelChain range (kusabi #153):
+      // selectRoutes already keeps dispatch at the top tier, so the
+      // recorded tier must match the model actually used — never "0 → 1"
+      // on a single-tier chain.  The clamp fields (tierClamped /
+      // tierClampReason) land on the round record here.
+      const escalation = recordReworkEscalation({
+        roundRecord,
+        currentTierIndex,
+        reworkCount,
+        strategized,
+        tierCount: modelChain ? modelChain.length : 0,
+      });
+
+      // Update cross-round state for the next iteration
+      pendingReworkStrategy = escalation.strategy;
+      reworkCount += 1;
+      currentTierIndex = escalation.currentTierIndex;
+    } else if (disposition.disposition === "strategize") {
+      // Strategize doesn't consume a rework count, but it sets strategized=true
+      // which affects the next rework strategy.
+    }
+
+    // Record the pending rework strategy on the round record so the next
+    // round can read it, and so chain-show can display what levers were pulled.
+    roundRecord.pendingReworkStrategy = pendingReworkStrategy;
+    roundRecord.tierAfter = currentTierIndex;
+
+    persistChainState({
+      chainDir, round, roundRecord, chainId, container, model, modelChain,
+      maxRounds, brief, orchestrator, records, baseSha: effectiveBaseSha,
+      chainTotals, strategized, chainFollowupDraft,
+    });
+
+    // Update the chain control round counter
+    updateChainControlRound({ chainDir, round });
+
+    // ---- phase 8: disposition handling ----
+    if (disposition.disposition === "accept") {
+      finalizeChainControl({ chainDir, status: "completed", round });
+      return { done: true, text: renderAcceptOutcome({ chainId, round, chainParsedReview, chainFindingsText }) };
+    }
+
+    if (disposition.disposition === "accept-with-followup") {
+      finalizeChainControl({ chainDir, status: "completed", round });
+      return { done: true, text: renderAcceptWithFollowupOutcome({ chainId, round, chainParsedReview, chainFindingsText, chainFollowupDraft, brief }) };
+    }
+
+    if (disposition.disposition === "escalate") {
+      finalizeChainControl({ chainDir, status: "completed", round });
+      return { done: true, text: renderEscalateOutcome({ chainId, round, disposition, orchestrator, roundRecord, records }) };
+    }
+
+    // ---- phase 9: strategize (structural re-diagnosis before next rework) ----
+    if (disposition.disposition === "strategize") {
+      const { strategistJobStatus, strategistJobError } = await runStrategizePhase({
+        cwd, chainId, round, brief, previousRecord, roundRecord, modelChain,
+        _dispatchWithFallback: injectedDispatch,
+      });
+
+      // ---- stop on strategize provider exhaustion ----
+      if (strategistJobStatus === "provider-error") {
+        // roundRecord was already pushed onto records during phase 7;
+        // handleProviderExhaustion detects that and does not push again.
+        const { chainState, outcome } = handleProviderExhaustion({
+          records, roundRecord,
+          currentTierIndex, phase: "strategize", jobError: strategistJobError,
+          chainId, round, container, model, modelChain,
+          maxRounds, brief, orchestrator, baseSha: effectiveBaseSha,
+          strategized, chainFollowupDraft,
+        });
+        writeJson(path.join(chainDir, "round-" + round + ".json"), roundRecord);
+        writeJson(path.join(chainDir, "chain.json"), chainState);
+        finalizeChainControl({ chainDir, status: "failed", round });
+        return { done: true, text: outcome };
+      }
+
+      strategized = true;
+
+      // The next round must use a fresh session to break anchoring (§3.4).
+      // Set a pendingReworkStrategy so the loop picks it up at phase 1.
+      roundRecord.pendingReworkStrategy = {
+        tierDelta: 0,
+        newSession: true,
+        reason: "strategized: new session (anchoring break per §3.4)",
+      };
+
+      // Re-persist after strategize updates roundRecord and strategized flag
+      const updatedTotals = computeChainTotals(records);
+      persistChainState({
+        chainDir, round, roundRecord, chainId, container, model, modelChain,
+        maxRounds, brief, orchestrator, records, baseSha: effectiveBaseSha,
+        chainTotals: updatedTotals, strategized: true, chainFollowupDraft,
+      });
+    }
+    return { done: false };
+  }
 
   try {
-    for (let round = 1; round <= maxRounds; round++) {
+    for (let round = startRound; round <= maxRounds; round++) {
       // ---- stop check: honour file-based stop request or signal ----
-      if (shouldStopNow({ chainDir, signalReceived })) {
+      if (shouldStopNow({ chainDir, signalReceived: signalReceived() })) {
         finalizeChainControl({ chainDir, status: "cancelled", round: round - 1 });
         return `Chain ${chainId} cancelled at round ${round} (stop requested).`;
       }
 
-      const isFirstRound = round === 1;
+      const isFirstRound = !resume && round === 1;
       const hasPreviousRound = round > 1 && records.length > 0;
       const previousRecord = hasPreviousRound ? records[records.length - 1] : null;
+
+      // ---- review-resume: continue the interrupted round from its review ----
+      if (resume && resume.phase === "review" && round === resume.round) {
+        const roundRecord = resume.roundRecord;
+        roundRecord.resumed = true;
+        const reviewCtx = await collectReviewContext({
+          container, brief, callTool,
+          // The interrupted round's changes ARE the review target.  A baseline
+          // captured now would read as "nothing changed since baseline" and
+          // skip the review (shouldSkipReview discards an empty change set);
+          // use the full changed set instead.
+          worktreeBaseline: null,
+        });
+        const probeCtx = {
+          probesGreen: roundRecord.probesGreen ?? false,
+          chainChangedPaths: reviewCtx.chainChangedPaths,
+          chainNewlyChanged: reviewCtx.chainNewlyChanged,
+          chainStatusObserved: reviewCtx.chainStatusObserved,
+          chainStatusOutput: reviewCtx.chainStatusOutput,
+          chainBaseLog: reviewCtx.chainBaseLog,
+          chainDeliverables: reviewCtx.chainDeliverables,
+          chainDiff: reviewCtx.chainDiff,
+          chainUntracked: reviewCtx.chainUntracked,
+          worktreeChanged: reviewCtx.worktreeChanged,
+        };
+        const result = await finishRound({
+          round,
+          roundRecord,
+          // The interrupted round is the last record in `records`; the
+          // previous COMPLETE round is the one before it.
+          previousRecord: records.length >= 2 ? records[records.length - 2] : null,
+          probeCtx,
+        });
+        if (result.done) return result.text;
+        continue;
+      }
 
       // ---- phase 1: resume strategy (B2: derive rework levers when rework) ----
       let useNewSession = false;
@@ -850,7 +1137,7 @@ async function cmdChain(cwd, { flags, text }) {
 
       // ---- phase 2: round model selection ----
       // Use currentTierIndex (never round) so tier is decoupled from the round counter.
-      // For review, the reviewer stays on tier 0 (round 1) \u2014 that's handled in
+      // For review, the reviewer stays on tier 0 (round 1) — that's handled in
       // runReviewPhase which passes round=1 to dispatchWithFallback.
 
       // ---- phase 3: implement text + dispatch ----
@@ -863,7 +1150,8 @@ async function cmdChain(cwd, { flags, text }) {
       } = await runImplementPhase({
         cwd, chainId, round, isFirstRound, implementText, modelChain,
         tierIndex: currentTierIndex,
-        useNewSession, session, previousRecord, resumeMethod, flagsModel: flags.model,
+        useNewSession, session, previousRecord, resumeMethod, flagsModel,
+        _dispatchWithFallback: injectedDispatch,
       });
       session = resolvedSession;
 
@@ -872,13 +1160,18 @@ async function cmdChain(cwd, { flags, text }) {
       roundRecord.reworkStrategyReason = reworkStrategyReason;
       roundRecord.reworkCount = reworkCount;
 
+      // Resume trace: this round was (re)started by chain-resume.
+      if (resume && resume.phase === "implement" && round === resume.round) {
+        roundRecord.resumed = true;
+      }
+
       // ---- stop on implement provider exhaustion ----
       if (implementJobStatus === "provider-error") {
         const { chainState, outcome } = handleProviderExhaustion({
           records, roundRecord,
           currentTierIndex, phase: "implement", jobError: implementJobError,
           chainId, round, container, model, modelChain,
-          maxRounds, brief, orchestrator, baseSha,
+          maxRounds, brief, orchestrator, baseSha: effectiveBaseSha,
           strategized, chainFollowupDraft: null,
         });
         writeJson(path.join(chainDir, "round-" + round + ".json"), roundRecord);
@@ -888,186 +1181,39 @@ async function cmdChain(cwd, { flags, text }) {
       }
 
       // ---- phase 4: deterministic probes (P1–P4) ----
-      const {
-        probesGreen, probeResults, chainChangedPaths, chainNewlyChanged,
-        chainStatusObserved, chainStatusOutput, chainBaseLog,
-        chainDeliverables, chainDiff, chainUntracked, worktreeChanged,
-      } = await runProbePhase({ baseSha, container, brief, callTool, worktreeBaseline });
-      roundRecord.probesGreen = probesGreen;
-      roundRecord.probeResults = probeResults;
-      roundRecord.worktreeChanged = worktreeChanged;
+      const probeResult = await runProbePhase({
+        baseSha: effectiveBaseSha, container, brief, callTool, worktreeBaseline: effectiveBaseline,
+      });
+      roundRecord.probesGreen = probeResult.probesGreen;
+      roundRecord.probeResults = probeResult.probeResults;
+      roundRecord.worktreeChanged = probeResult.worktreeChanged;
 
       // ---- stop check: a stop requested during implement must not buy a
       // review job, and must not leave the container busy while the
       // orchestrator inspects it.  Placed after the probes rather than
       // before them so the worktree is left in the canonical post-P1 state
       // (HEAD == base, changes unstaged) that the orchestrator publishes from.
-      if (shouldStopNow({ chainDir, signalReceived })) {
-        finalizeChainControl({ chainDir, status: "cancelled", round: round - 1 });
-        return `Chain ${chainId} cancelled during round ${round} (stop requested after probes, before review).`;
-      }
-
-      // ---- phase 5: review (or skip when change set empty) ----
-      const {
-        chainVerdict, chainFindingsText, chainParsedReview, chainRepeatedAreas, skipReview,
-        reviewJobStatus, reviewJobError,
-      } = await runReviewPhase({
-        container, brief, modelChain, chainId, cwd, previousRecord, baseSha,
-        chainStatusOutput, chainBaseLog, chainDiff, chainUntracked, roundRecord,
-        chainChangedPaths, chainNewlyChanged, chainStatusObserved, chainDeliverables,
-        flagsModel: flags.model,
-      });
-
-      // ---- stop on review provider exhaustion ----
-      if (reviewJobStatus === "provider-error") {
-        const { chainState, outcome } = handleProviderExhaustion({
-          records, roundRecord,
-          currentTierIndex, phase: "review", jobError: reviewJobError,
-          chainId, round, container, model, modelChain,
-          maxRounds, brief, orchestrator, baseSha,
-          strategized, chainFollowupDraft: null,
-        });
-        writeJson(path.join(chainDir, "round-" + round + ".json"), roundRecord);
-        writeJson(path.join(chainDir, "chain.json"), chainState);
-        finalizeChainControl({ chainDir, status: "failed", round });
-        return outcome;
-      }
-
-      // ---- phase 6: derive disposition ----
-      // Malformed-review guard (kusabi #153): `findings` may be a non-array.
-      const findingSeverities = Array.isArray(chainParsedReview?.findings)
-        ? chainParsedReview.findings.map(function (f) { return f.severity; })
-        : undefined;
-
-      const disposition = deriveDisposition({
-        verdict: chainVerdict || "needs-attention",
-        probesGreen,
-        round,
-        maxRounds,
-        repeatedAreas: chainRepeatedAreas,
-        findingSeverities,
-        strategizeEligible: !strategized,
-      });
-      roundRecord.disposition = disposition;
-
-      // ---- phase 7: record keeping + persistence ----
-      records.push(roundRecord);
-
-      // Compute totals across all rounds so far
-      const chainTotals = computeChainTotals(records);
-
-      // When review was skipped, ensure findingsText is set
-      if (skipReview && !roundRecord.findingsText) {
-        roundRecord.findingsText = "(no review \u2014 change set was empty)";
-      }
-
-      // Followup draft for accept-with-followup
-      let chainFollowupDraft = null;
-      if (disposition.disposition === "accept-with-followup" && chainParsedReview?.findings) {
-        const briefTitle = brief ? brief.split("\n")[0].trim() : "";
-        chainFollowupDraft = renderFollowupDraft({
-          chainId,
-          briefTitle,
-          findings: chainParsedReview.findings,
-        });
-        roundRecord.followupIssueDraft = chainFollowupDraft;
-      }
-
-      // ---- Compute rework strategy for the NEXT round (if rework needed) ----
-      let pendingReworkStrategy = null;
-      if (disposition.disposition === "rework") {
-        // Tier escalation is clamped to the modelChain range (kusabi #153):
-        // selectRoutes already keeps dispatch at the top tier, so the
-        // recorded tier must match the model actually used — never "0 → 1"
-        // on a single-tier chain.  The clamp fields (tierClamped /
-        // tierClampReason) land on the round record here.
-        const escalation = recordReworkEscalation({
-          roundRecord,
-          currentTierIndex,
-          reworkCount,
-          strategized,
-          tierCount: modelChain ? modelChain.length : 0,
-        });
-
-        // Update cross-round state for the next iteration
-        pendingReworkStrategy = escalation.strategy;
-        reworkCount += 1;
-        currentTierIndex = escalation.currentTierIndex;
-      } else if (disposition.disposition === "strategize") {
-        // Strategize doesn't consume a rework count, but it sets strategized=true
-        // which affects the next rework strategy.
-      }
-
-      // Record the pending rework strategy on the round record so the next
-      // round can read it, and so chain-show can display what levers were pulled.
-      roundRecord.pendingReworkStrategy = pendingReworkStrategy;
-      roundRecord.tierAfter = currentTierIndex;
-
-      persistChainState({
-        chainDir, round, roundRecord, chainId, container, model, modelChain,
-        maxRounds, brief, orchestrator, records, baseSha, chainTotals,
-        strategized, chainFollowupDraft,
-      });
-
-      // Update the chain control round counter
-      updateChainControlRound({ chainDir, round });
-
-      // ---- phase 8: disposition handling ----
-      if (disposition.disposition === "accept") {
-        finalizeChainControl({ chainDir, status: "completed", round });
-        return renderAcceptOutcome({ chainId, round, chainParsedReview, chainFindingsText });
-      }
-
-      if (disposition.disposition === "accept-with-followup") {
-        finalizeChainControl({ chainDir, status: "completed", round });
-        return renderAcceptWithFollowupOutcome({ chainId, round, chainParsedReview, chainFindingsText, chainFollowupDraft, brief });
-      }
-
-      if (disposition.disposition === "escalate") {
-        finalizeChainControl({ chainDir, status: "completed", round });
-        return renderEscalateOutcome({ chainId, round, disposition, orchestrator, roundRecord, records });
-      }
-
-      // ---- phase 9: strategize (structural re-diagnosis before next rework) ----
-      if (disposition.disposition === "strategize") {
-        const { strategistJobStatus, strategistJobError } = await runStrategizePhase({ cwd, chainId, round, brief, previousRecord, roundRecord, modelChain });
-
-        // ---- stop on strategize provider exhaustion ----
-        if (strategistJobStatus === "provider-error") {
-          // roundRecord was already pushed onto records during phase 7;
-          // handleProviderExhaustion detects that and does not push again.
-          const { chainState, outcome } = handleProviderExhaustion({
-            records, roundRecord,
-            currentTierIndex, phase: "strategize", jobError: strategistJobError,
-            chainId, round, container, model, modelChain,
-            maxRounds, brief, orchestrator, baseSha,
-            strategized, chainFollowupDraft,
-          });
-          writeJson(path.join(chainDir, "round-" + round + ".json"), roundRecord);
-          writeJson(path.join(chainDir, "chain.json"), chainState);
-          finalizeChainControl({ chainDir, status: "failed", round });
-          return outcome;
-        }
-
-        strategized = true;
-
-        // The next round must use a fresh session to break anchoring (§3.4).
-        // Set a pendingReworkStrategy so the loop picks it up at phase 1.
-        roundRecord.pendingReworkStrategy = {
-          tierDelta: 0,
-          newSession: true,
-          reason: "strategized: new session (anchoring break per §3.4)",
-        };
-
-        // Re-persist after strategize updates roundRecord and strategized flag
-        const updatedTotals = computeChainTotals(records);
+      // The partial round (implement + probes done) is PERSISTED so the chain
+      // is resumable (kusabi #153①) and control round matches actual progress.
+      if (shouldStopNow({ chainDir, signalReceived: signalReceived() })) {
+        const partialTotals = computeChainTotals([...records, roundRecord]);
         persistChainState({
           chainDir, round, roundRecord, chainId, container, model, modelChain,
-          maxRounds, brief, orchestrator, records, baseSha,
-          chainTotals: updatedTotals, strategized: true, chainFollowupDraft,
+          maxRounds, brief, orchestrator, records, baseSha: effectiveBaseSha,
+          chainTotals: partialTotals, strategized, chainFollowupDraft: null,
+          interrupted: true,
         });
-        continue;
+        finalizeChainControl({ chainDir, status: "cancelled", round });
+        return `Chain ${chainId} cancelled during round ${round} (stop requested after probes, before review). Progress preserved — resume with chain-resume ${chainId}.`;
       }
+
+      const result = await finishRound({
+        round,
+        roundRecord,
+        previousRecord,
+        probeCtx: probeResult,
+      });
+      if (result.done) return result.text;
     }
 
     // ---- max rounds reached without acceptance ----
@@ -1078,20 +1224,129 @@ async function cmdChain(cwd, { flags, text }) {
     finalizeChainControl({ chainDir, status: "failed", round: records.length });
     throw err;
   } finally {
-    // Remove signal handlers
-    process.removeListener("SIGTERM", onSignal);
-    process.removeListener("SIGINT", onSignal);
-
     // Stop the serve for this cwd unless --keep-serve or another job is running
-    if (!flags.keepServe) {
+    if (!keepServe) {
       try {
-        const jobs = listJobs(stateDirFor(cwd));
+        const jobs = listJobs(stateDir);
         const hasRunning = jobs.some(function (j) { return j.status === "running"; });
         if (!hasRunning) {
           cmdServeStop(cwd);
         }
       } catch { /* best-effort */ }
     }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// chain-resume (kusabi #153①)
+// ---------------------------------------------------------------------------
+
+async function cmdChainResume(cwd, { flags, text }) {
+  // Resumption context comes entirely from the saved chain state (chain.json
+  // brief, records, ladder; control.json container).  Accepting another flag
+  // and ignoring it would answer a different question than the one asked.
+  const unsupported = Object.keys(flags).filter(function (k) { return k !== "keepServe"; });
+  if (unsupported.length > 0) {
+    throw new Error(
+      `chain-resume does not support --${unsupported[0]}: resumption context comes from the saved chain state (chain.json / control.json)`
+    );
+  }
+
+  const stateDir = stateDirFor(cwd);
+  const chainId = text.split(/\s+/).filter(Boolean)[0];
+  if (!chainId) throw new Error("chain-resume requires a chain id. Usage: chain-resume <chainId>");
+
+  const chainDir = path.join(stateDir, "chains", chainId);
+  if (!fs.existsSync(chainDir)) {
+    throw new Error(`chain not found: ${chainId}`);
+  }
+
+  const control = readChainControl(chainDir);
+  const chainJson = readJson(path.join(chainDir, "chain.json"));
+  if (!chainJson) {
+    throw new Error(`chain.json not found for ${chainId} — the chain never persisted state to resume from`);
+  }
+
+  // ---- resume-position decision, from the records alone ----
+  const resolution = resolveChainResume({ control, chainJson });
+  if (!resolution.ok) {
+    throw new Error(`cannot resume chain ${chainId}: ${resolution.error}`);
+  }
+  const position = resolution.position;
+
+  // ---- mid-flight job guard (#153① review) ----
+  // A dead driver (stale pid) may have left a phase job dispatched but not
+  // finished; the record then has no phase boundary for it, and resuming
+  // would re-dispatch the phase — a duplicate job working the same
+  // container worktree.  Any job of this chain still recorded as running
+  // blocks the resume: wait for it to finish, or cancel it first.
+  const inflight = listJobs(stateDir).filter(function (j) {
+    return j.status === "running" && chainIdForJob(j) === chainId;
+  });
+  if (inflight.length > 0) {
+    throw new Error(
+      `cannot resume chain ${chainId}: job ${inflight[0].id} is still recorded as running ` +
+      `("${inflight[0].title}") — it may be mid-flight from the previous driver. ` +
+      `Wait for it to finish (kusabi-companion status ${inflight[0].id}), or cancel it ` +
+      `(kusabi-companion cancel ${inflight[0].id}), then retry chain-resume`
+    );
+  }
+
+  const container = control?.container || chainJson.container;
+  if (!container) {
+    throw new Error(`cannot resume chain ${chainId}: no container recorded in control.json / chain.json`);
+  }
+
+  // ---- container must exist: the chain's work lives in it ----
+  const { callTool } = await import("./sunaba-rpc.mjs");
+  try {
+    await callTool("sandbox_exec", {
+      container_id: container,
+      commands: ["echo kusabi-chain-resume-check"],
+    });
+  } catch {
+    throw new Error(
+      `cannot resume chain ${chainId}: container ${container} is not reachable — ` +
+      `the chain's work lives in that container and it must exist before resuming`
+    );
+  }
+
+  // ---- re-arm the control record: running again, resume trace kept ----
+  // The stop-request fields are cleared: shouldStopNow() keys off
+  // stopRequestedAt, and a fresh stop must be requested for the resumed run.
+  // `round` reflects actual progress: the interrupted round for a
+  // review-resume, the last completed round otherwise.
+  rearmChainControl({
+    chainDir,
+    round: position.phase === "review" ? position.round : position.round - 1,
+  });
+
+  // ---- SIGTERM/SIGINT handler feeds the same predicate as the file-based stop ----
+  let signalReceived = false;
+  const onSignal = () => { signalReceived = true; };
+  process.on("SIGTERM", onSignal);
+  process.on("SIGINT", onSignal);
+
+  try {
+    return await runChainDriver({
+      cwd, stateDir, chainDir, chainId, container,
+      model: chainJson.model ?? null,
+      modelChain: chainJson.modelChain,
+      maxRounds: chainJson.maxRounds ?? 4,
+      brief: chainJson.brief ?? "",
+      orchestrator: chainJson.orchestrator ?? null,
+      baseSha: chainJson.baseSha ?? null,
+      worktreeBaseline: null,
+      callTool,
+      initialSession: position.session,
+      flagsModel: null,
+      signalReceived: () => signalReceived,
+      keepServe: !!flags.keepServe,
+      resume: position,
+    });
+  } finally {
+    process.removeListener("SIGTERM", onSignal);
+    process.removeListener("SIGINT", onSignal);
   }
 }
 // ---------------------------------------------------------------------------
@@ -1378,6 +1633,7 @@ function usage() {
     "  task       Run an opencode task",
     "  review     Run an adversarial review of working-tree changes (host worktree only; --container is rejected \u2014 use task --phase review for container reviews)",
     "  chain      Run implement→review→rework chain until acceptance or escalate",
+    "  chain-resume  Resume a cancelled chain from its last recorded phase boundary (reads chain.json / control.json; same chain lifecycle as chain)",
     "  chain-show Print a compact plain-text digest of a chain (read-only, no LLM)",
     "  chain-stats Aggregate every chain record and print a summary (read-only, no LLM)",
     "  metrics-ingest  Ingest transcripts + chain records + delegated-job records into a durable SQLite store (read-only source, no LLM)",
@@ -1397,7 +1653,7 @@ function usage() {
     "  --session <id>, --timeout <s>, --watchdog <s>, --deny <tools>",
     "  --brief-file <path> (task / chain: read the brief from a file; exclusive with inline text)",
     "  --container <cid> (chain/task: container to run deterministic probes in; NOT supported by review)",
-    "  --keep-serve (chain: keep the serve alive after chain finishes)",
+    "  --keep-serve (chain / chain-resume: keep the serve alive after the chain finishes)",
     "  --force (serve-stop: force kill the serve even when jobs are running)",
     "  --prior <text> (review: prior findings for anti-ratchet)",
     "  --max-rounds <N> (chain: max rounds, default 4)",
@@ -1430,11 +1686,12 @@ function usage() {
 // (which itself calls runPrompt()) directly, or start a chain (which dispatches
 // rounds through the same path). Enumerated from the switch in main() below;
 // every other subcommand only reads or stops existing state.
-//   task     -> dispatchWithFallback (cmdTask)
-//   review   -> runPrompt            (cmdReview)
-//   salvage  -> runPrompt            (cmdSalvage)
-//   chain    -> dispatchWithFallback via runImplementPhase, per round (cmdChain)
-const JOB_CREATING_SUBCOMMANDS = new Set(["task", "review", "salvage", "chain"]);
+//   task         -> dispatchWithFallback (cmdTask)
+//   review       -> runPrompt            (cmdReview)
+//   salvage      -> runPrompt            (cmdSalvage)
+//   chain        -> dispatchWithFallback via runImplementPhase, per round (cmdChain)
+//   chain-resume -> same as chain, from a saved position (cmdChainResume)
+const JOB_CREATING_SUBCOMMANDS = new Set(["task", "review", "salvage", "chain", "chain-resume"]);
 
 async function main() {
   const [subcommand, ...argv] = process.argv.slice(2);
@@ -1505,6 +1762,9 @@ async function main() {
       return cmdSalvage(cwd, parsed);
     case "chain":
       return cmdChain(cwd, parsed);
+    case "chain-resume":
+    case "chainResume":
+      return cmdChainResume(cwd, parsed);
     case "chain-show":
     case "chainShow":
       return cmdChainShow(cwd, parsed);
@@ -1518,7 +1778,7 @@ async function main() {
     case "metricsReport":
       return cmdMetricsReport(cwd, parsed);
     default:
-      throw new Error(`unknown subcommand: ${subcommand ?? "(none)"}. Use setup|task|review|chain|chain-show|chain-stats|metrics-ingest|metrics-report|chain-cancel|status|result|cancel|serve-stop|install-agents|salvage`);
+      throw new Error(`unknown subcommand: ${subcommand ?? "(none)"}. Use setup|task|review|chain|chain-resume|chain-show|chain-stats|metrics-ingest|metrics-report|chain-cancel|status|result|cancel|serve-stop|install-agents|salvage`);
   }
 }
 
