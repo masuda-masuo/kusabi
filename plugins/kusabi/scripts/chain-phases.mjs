@@ -176,18 +176,30 @@ export function resolveRoundResume({ useNewSession }) {
 
 /**
  * Build the implement prompt text for a chain round.
+ *
+ * When `container` is given, a header naming the exact container ID is
+ * prepended to the returned text for every round (mirroring the review-prompt
+ * injection). Without `container` the output is byte-for-byte what this
+ * function produced before.
  */
-export function buildImplementText({ round, brief, previousRecord }) {
-  if (round === 1) return brief;
-  if (previousRecord) {
+export function buildImplementText({ round, brief, previousRecord, container }) {
+  let text;
+  if (round === 1) {
+    text = brief;
+  } else if (previousRecord) {
     let strategistSection = "";
     if (previousRecord.strategistRecommendation) {
       strategistSection = "\n\n## Strategist recommendation (structural change for this rework)\n" + previousRecord.strategistRecommendation + "\n";
     }
     const priorFindingsText = renderPriorFindings(previousRecord);
-    return "## Prior findings\n" + priorFindingsText + "\n\n## Instruction\nResolve each prior finding in this round. If a finding cannot be fully resolved, you must explain why and report what remains." + strategistSection + "\n\n## Acceptance criteria\n" + brief;
+    text = "## Prior findings\n" + priorFindingsText + "\n\n## Instruction\nResolve each prior finding in this round. If a finding cannot be fully resolved, you must explain why and report what remains." + strategistSection + "\n\n## Acceptance criteria\n" + brief;
+  } else {
+    text = brief;
   }
-  return brief;
+  if (container) {
+    return "The workspace lives inside container `" + container + "`. Pass this exact ID as `container_id` to every sunaba tool call. Do not guess container names or call sandbox_attach.\n\n" + text;
+  }
+  return text;
 }
 
 /**

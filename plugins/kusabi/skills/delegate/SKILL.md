@@ -35,7 +35,8 @@ What does *not* change with the CLI:
 - **Pass the brief as a file**, not inline — inline quoting is an accident generator.
 - **Container preparation is the orchestrator's job.** Implement-phase workers are denied
   `sandbox_initialize` / `publish` / issue writes by design, so hand them a container id
-  in the brief.
+  in the brief. (The chain companion injects the ID into implement and review prompts
+  automatically; briefs may still repeat it — harmless.)
 - **Re-run `install-agents` after merging any PR that touches an agent definition.**
   The installed copies are stale until you do; the worker will run the old rules.
 - **The `investigate` phase writes its brief to the target issue by design** — that holds
