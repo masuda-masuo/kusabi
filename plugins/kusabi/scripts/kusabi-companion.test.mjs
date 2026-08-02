@@ -1479,3 +1479,110 @@ describe("chain-resume CLI", () => {
     }
   });
 });
+
+// serve-stop — fossil `running` records must not block stopping (kusabi #162
+// follow-up).  The companion runs as a real subprocess against a temp state
+// root; the recorded serve is a fake long-lived process the test spawns and
+// kills itself.  The startup reaper hook runs inside the subprocess too: the
+// fixture's fresh file mtimes keep reapIdleServes from reaping, and the fake
+// carries no kusabi marker env, so the orphan sweep cannot touch it.
+// ---------------------------------------------------------------------------
+
+describe("serve-stop fossil running records", () => {
+  const COMPANION_SCRIPT = path.join(import.meta.dirname, "kusabi-companion.mjs");
+
+  function serveStopFixture({ lastActivityAgeMs }) {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-servestop-"));
+    const stateRootDir = path.join(tmp, "state");
+    const cwd = path.join(tmp, "ws");
+    fs.mkdirSync(cwd, { recursive: true });
+    const hash = crypto.createHash("sha256").update(cwd).digest("hex").slice(0, 12);
+    const stateDir = path.join(stateRootDir, hash);
+    const jobsDir = path.join(stateDir, "jobs", "job-fossil");
+    fs.mkdirSync(jobsDir, { recursive: true });
+    const sleeper = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
+    const job = {
+      id: "job-fossil",
+      status: "running",
+      startedAt: new Date(Date.now() - lastActivityAgeMs).toISOString(),
+      stats: { lastActivity: new Date(Date.now() - lastActivityAgeMs).toISOString() },
+    };
+    fs.writeFileSync(path.join(jobsDir, "job.json"), JSON.stringify(job), "utf8");
+    const serverFile = path.join(stateDir, "server.json");
+    fs.writeFileSync(serverFile, JSON.stringify({ pid: sleeper.pid, port: 0, password: "x", cwd }), "utf8");
+    return {
+      tmp,
+      stateRootDir,
+      cwd,
+      serverFile,
+      sleeper,
+      run(args = []) {
+        const env = { ...process.env, KUSABI_STATE_DIR: stateRootDir };
+        return spawnSync(process.execPath, [COMPANION_SCRIPT, "serve-stop", ...args], {
+          cwd,
+          encoding: "utf8",
+          env,
+          timeout: 15_000,
+        });
+      },
+      cleanup() {
+        try { process.kill(sleeper.pid, "SIGKILL"); } catch { /* already gone */ }
+        fs.rmSync(tmp, { recursive: true, force: true });
+      },
+    };
+  }
+
+  function pidAlive(pid) {
+    try { process.kill(pid, 0); return true; } catch { return false; }
+  }
+
+  async function waitPidDead(pid, timeoutMs = 5000) {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      if (!pidAlive(pid)) return;
+      await new Promise((r) => setTimeout(r, 50));
+    }
+    throw new Error(`pid ${pid} still alive after ${timeoutMs}ms`);
+  }
+
+  it("stops the serve without --force when the only running records are fossils", async () => {
+    const fx = serveStopFixture({ lastActivityAgeMs: 7 * 24 * 3600 * 1000 });
+    try {
+      const result = fx.run();
+      assert.equal(result.status, 0, `serve-stop failed: ${result.stdout} ${result.stderr}`);
+      assert.match(result.stdout, /stopped opencode server \(pid \d+\)/);
+      await waitPidDead(fx.sleeper.pid);
+      assert.ok(!fs.existsSync(fx.serverFile), "server.json must be removed by serve-stop");
+    } finally {
+      fx.cleanup();
+    }
+  });
+
+  it("declines with the existing message when a running record is recent (1 hour ago)", async () => {
+    const fx = serveStopFixture({ lastActivityAgeMs: 3600 * 1000 });
+    try {
+      const result = fx.run();
+      assert.equal(result.status, 0, `serve-stop errored: ${result.stdout} ${result.stderr}`);
+      assert.match(result.stdout, /job\(s\) still running/);
+      assert.match(result.stdout, /job-fossil/);
+      assert.match(result.stdout, /serve-stop does not stop a running chain/);
+      assert.doesNotMatch(result.stdout, /stopped opencode server/);
+      assert.ok(pidAlive(fx.sleeper.pid), "the serve must survive a declined serve-stop");
+      assert.ok(fs.existsSync(fx.serverFile), "server.json must survive a declined serve-stop");
+    } finally {
+      fx.cleanup();
+    }
+  });
+
+  it("--force still stops the serve when a recent running record exists", async () => {
+    const fx = serveStopFixture({ lastActivityAgeMs: 3600 * 1000 });
+    try {
+      const result = fx.run(["--force"]);
+      assert.equal(result.status, 0, `serve-stop --force failed: ${result.stdout} ${result.stderr}`);
+      assert.match(result.stdout, /stopped opencode server \(pid \d+\)/);
+      await waitPidDead(fx.sleeper.pid);
+    } finally {
+      fx.cleanup();
+    }
+  });
+});

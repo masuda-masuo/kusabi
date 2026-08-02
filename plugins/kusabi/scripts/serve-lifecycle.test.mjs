@@ -10,6 +10,9 @@ import {
   buildServeEnv,
   ensureServer,
   serverReadyTimeoutMs,
+  runningRecordIsStale,
+  RUNNING_STALE_MS,
+  reapOrphanedServes,
 } from "./serve-lifecycle.mjs";
 import { readJson, stateDirFor } from "./state-paths.mjs";
 
@@ -40,6 +43,72 @@ describe("buildServeEnv", () => {
     buildServeEnv(base, "pw");
     assert.equal(base.KUSABI_WORKER_CONTEXT, undefined);
     assert.equal(base.OPENCODE_SERVER_PASSWORD, undefined);
+  });
+
+  it("stamps KUSABI_SERVE_STATE_DIR when a state dir is given", () => {
+    const env = buildServeEnv({}, "pw", "/tmp/state/abc");
+    assert.equal(env.KUSABI_SERVE_STATE_DIR, "/tmp/state/abc");
+  });
+
+  it("leaves KUSABI_SERVE_STATE_DIR unstamped when no state dir is given", () => {
+    const env = buildServeEnv({}, "pw");
+    assert.equal(env.KUSABI_SERVE_STATE_DIR, undefined);
+  });
+});
+
+// runningRecordIsStale — fossil judgement for `running` job records
+// ---------------------------------------------------------------------------
+// A `running` record whose last activity is older than RUNNING_STALE_MS is a
+// fossil: the driver died without rewriting it, so it must not count as proof
+// that work is in flight (kusabi #162 follow-up).  Activity is
+// stats.lastActivity, falling back to startedAt; records with no usable
+// timestamp cannot be proven stale and still count as running.
+
+describe("runningRecordIsStale", () => {
+  const HOUR = 3600 * 1000;
+
+  it("false for a non-running record", () => {
+    const job = { status: "completed", startedAt: new Date(Date.now() - 30 * 24 * HOUR).toISOString() };
+    assert.equal(runningRecordIsStale(job), false);
+  });
+
+  it("false for a running record with recent lastActivity (1 hour ago)", () => {
+    const job = { status: "running", stats: { lastActivity: new Date(Date.now() - HOUR).toISOString() } };
+    assert.equal(runningRecordIsStale(job), false);
+  });
+
+  it("true for a running record whose lastActivity is a fossil (7 days ago)", () => {
+    const job = { status: "running", stats: { lastActivity: new Date(Date.now() - 7 * 24 * HOUR).toISOString() } };
+    assert.equal(runningRecordIsStale(job), true);
+  });
+
+  it("falls back to startedAt when stats.lastActivity is absent", () => {
+    const job = { status: "running", startedAt: new Date(Date.now() - 7 * 24 * HOUR).toISOString() };
+    assert.equal(runningRecordIsStale(job), true);
+  });
+
+  it("boundary: just under 6 hours is still running, just over is stale", () => {
+    const now = Date.now();
+    const justUnder = { status: "running", startedAt: new Date(now - RUNNING_STALE_MS + 1000).toISOString() };
+    const justOver = { status: "running", startedAt: new Date(now - RUNNING_STALE_MS - 1000).toISOString() };
+    assert.equal(runningRecordIsStale(justUnder, now), false);
+    assert.equal(runningRecordIsStale(justOver, now), true);
+  });
+
+  it("false when the record has no usable activity timestamp", () => {
+    assert.equal(runningRecordIsStale({ status: "running" }), false);
+    assert.equal(runningRecordIsStale({ status: "running", stats: {} }), false);
+  });
+
+  it("false when lastActivity is present but unparseable (precedence, no fallback)", () => {
+    // lastActivity is the timestamp to judge by; garbage there cannot prove
+    // staleness, and startedAt is not consulted (conservative: keep running).
+    const job = {
+      status: "running",
+      stats: { lastActivity: "not-a-date" },
+      startedAt: new Date(Date.now() - 7 * 24 * HOUR).toISOString(),
+    };
+    assert.equal(runningRecordIsStale(job), false);
   });
 });
 
@@ -177,6 +246,48 @@ describe("shouldReapServer", () => {
     ];
     const result = shouldReapServer({ serverMtime, jobRecords, now, ttlMs: TTL });
     assert.equal(result.reap, true);
+  });
+
+  // kusabi #162 follow-up: a `running` record whose last activity is older
+  // than 6 hours is a fossil and must not pin the serve.
+  it("reap: a fossil running record (activity 7 days ago) no longer pins the serve", () => {
+    const now = Date.now();
+    const serverMtime = now - TTL - 5000;
+    const jobRecords = [
+      {
+        status: "running",
+        mtime: now - TTL - 4000,
+        stats: { lastActivity: new Date(now - 7 * 24 * 3600 * 1000).toISOString() },
+      },
+    ];
+    const result = shouldReapServer({ serverMtime, jobRecords, now, ttlMs: TTL });
+    assert.equal(result.reap, true);
+  });
+
+  it("keep: a recent running record still pins the serve even when server mtime is past TTL", () => {
+    const now = Date.now();
+    const serverMtime = now - TTL - 5000;
+    const jobRecords = [
+      {
+        status: "running",
+        mtime: now - TTL - 4000,
+        stats: { lastActivity: new Date(now - 3600 * 1000).toISOString() },
+      },
+    ];
+    const result = shouldReapServer({ serverMtime, jobRecords, now, ttlMs: TTL });
+    assert.equal(result.reap, false);
+    assert.equal(result.reason, "a running job exists");
+  });
+
+  it("keep: a running record without any activity timestamp still pins the serve", () => {
+    const now = Date.now();
+    const serverMtime = now - TTL - 5000;
+    const jobRecords = [
+      { status: "running", mtime: now - TTL - 4000, stats: {}, startedAt: undefined },
+    ];
+    const result = shouldReapServer({ serverMtime, jobRecords, now, ttlMs: TTL });
+    assert.equal(result.reap, false);
+    assert.equal(result.reason, "a running job exists");
   });
 });
 
@@ -449,6 +560,232 @@ describe("ensureServer (fake serve, spawn-based)", () => {
       ctx.killAll();
       ctx.restore();
       ctx.rm();
+    }
+  });
+
+  it("stamps KUSABI_SERVE_STATE_DIR into the spawned serve's own env", async () => {
+    // The orphan sweep (kusabi #162 follow-up) attributes a live process back
+    // to the state dir that should name it via this marker — it must be the
+    // real spawned process's env, not just the buildServeEnv() return value.
+    const ctx = fakeServeContext("ready");
+    process.env.KUSABI_SERVE_READY_TIMEOUT_MS = "5000";
+    try {
+      const server = await ensureServer(ctx.cwd);
+      const deadline = Date.now() + 5000;
+      let envText = "";
+      while (Date.now() < deadline) {
+        try {
+          envText = fs.readFileSync(`/proc/${server.pid}/environ`, "utf8");
+          if (envText.includes("KUSABI_SERVE_STATE_DIR=")) break;
+        } catch { /* not readable yet */ }
+        await new Promise((r) => setTimeout(r, 25));
+      }
+      const map = {};
+      for (const entry of envText.split("\0").filter(Boolean)) {
+        const eq = entry.indexOf("=");
+        if (eq > 0) map[entry.slice(0, eq)] = entry.slice(eq + 1);
+      }
+      assert.equal(map.KUSABI_SERVE_STATE_DIR, ctx.stateDir);
+    } finally {
+      ctx.killAll();
+      ctx.restore();
+      ctx.rm();
+    }
+  });
+});
+
+// reapOrphanedServes — orphan-serve sweep (kusabi #162 follow-up)
+// ---------------------------------------------------------------------------
+// Fixtures are fake long-lived processes the test spawns itself; the only
+// processes carrying kusabi's marker env are these fixtures, and their state
+// dirs live under a temp state root — so the sweep can never touch anything
+// outside the fixtures.  Liveness is asserted by pid, never by a log line.
+
+const ORPHAN_SLEEPER_SOURCE = "setInterval(() => {}, 1000);\n";
+
+function orphanFixture() {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-orphan-test-"));
+  const sleeper = path.join(tmp, "sleeper.mjs");
+  fs.writeFileSync(sleeper, ORPHAN_SLEEPER_SOURCE, "utf8");
+  const root = path.join(tmp, "state");
+  const stateDir = path.join(root, "abcd1234ef01");
+  fs.mkdirSync(stateDir, { recursive: true });
+  return { tmp, sleeper, root, stateDir, serverFile: path.join(stateDir, "server.json") };
+}
+
+// Spawn a fake long-lived serve-like process.  With marker=true it carries
+// the same env buildServeEnv() stamps into a real serve; serveArgv controls
+// whether the argv looks like a serve (a bare "serve" token).
+function spawnOrphanSleeper(sleeper, stateDir, { marker = true, stateDirOverride = null, serveArgv = true } = {}) {
+  const env = { ...process.env };
+  if (marker) {
+    env.KUSABI_WORKER_CONTEXT = "1";
+    env.KUSABI_SERVE_STATE_DIR = stateDirOverride ?? stateDir;
+  } else {
+    delete env.KUSABI_WORKER_CONTEXT;
+    delete env.KUSABI_SERVE_STATE_DIR;
+  }
+  const args = serveArgv ? [sleeper, "serve", "--port", "0"] : [sleeper];
+  return spawn(process.execPath, args, { env, stdio: "ignore" });
+}
+
+// Between spawn() and exec the child's /proc/<pid>/environ still shows the
+// parent's env; wait until the fixture actually carries the marker so the
+// sweep is exercised, not skipped by timing.
+async function waitForMarkerEnv(pid, timeoutMs = 5000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    try {
+      if (fs.readFileSync(`/proc/${pid}/environ`, "utf8").includes("KUSABI_WORKER_CONTEXT=1")) return;
+    } catch { /* not readable yet */ }
+    await new Promise((r) => setTimeout(r, 25));
+  }
+  throw new Error(`pid ${pid} never showed the marker env`);
+}
+
+function killPid(pid) {
+  try { process.kill(pid, "SIGKILL"); } catch { /* already gone */ }
+}
+
+describe("reapOrphanedServes (spawn-based, temp state root)", () => {
+  it("kills a marked serve whose state dir's server.json names a different pid", async () => {
+    const fx = orphanFixture();
+    const child = spawnOrphanSleeper(fx.sleeper, fx.stateDir);
+    fs.writeFileSync(fx.serverFile, JSON.stringify({ pid: 424242, port: 1 }), "utf8");
+    try {
+      await waitForMarkerEnv(child.pid);
+      assert.ok(isAlive(child.pid), "fixture must be alive before the sweep");
+      reapOrphanedServes(fx.root);
+      await waitForDeath(child.pid);
+    } finally {
+      killPid(child.pid);
+      fs.rmSync(fx.tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("spares a marked serve whose server.json names the same pid", async () => {
+    const fx = orphanFixture();
+    const child = spawnOrphanSleeper(fx.sleeper, fx.stateDir);
+    fs.writeFileSync(fx.serverFile, JSON.stringify({ pid: child.pid, port: 1 }), "utf8");
+    try {
+      await waitForMarkerEnv(child.pid);
+      reapOrphanedServes(fx.root);
+      assert.ok(isAlive(child.pid), "a recorded serve must survive the sweep");
+    } finally {
+      killPid(child.pid);
+      fs.rmSync(fx.tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("spares a marked process whose argv is not a serve (descendant simulation)", async () => {
+    const fx = orphanFixture();
+    const child = spawnOrphanSleeper(fx.sleeper, fx.stateDir, { serveArgv: false });
+    try {
+      await waitForMarkerEnv(child.pid);
+      reapOrphanedServes(fx.root);
+      assert.ok(isAlive(child.pid), "a marker-carrying non-serve must survive");
+    } finally {
+      killPid(child.pid);
+      fs.rmSync(fx.tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("spares a live process without kusabi's marker", async () => {
+    const fx = orphanFixture();
+    const child = spawnOrphanSleeper(fx.sleeper, fx.stateDir, { marker: false });
+    try {
+      reapOrphanedServes(fx.root);
+      assert.ok(isAlive(child.pid), "an unmarked process must survive");
+    } finally {
+      killPid(child.pid);
+      fs.rmSync(fx.tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("spares a marked serve whose marker names a state dir outside the swept root", async () => {
+    const fx = orphanFixture();
+    const outside = path.join(fx.tmp, "other-state", "h1");
+    fs.mkdirSync(outside, { recursive: true });
+    const child = spawnOrphanSleeper(fx.sleeper, outside, { stateDirOverride: outside });
+    try {
+      await waitForMarkerEnv(child.pid);
+      reapOrphanedServes(fx.root);
+      assert.ok(isAlive(child.pid), "a serve outside the swept root must survive");
+    } finally {
+      killPid(child.pid);
+      fs.rmSync(fx.tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("spares a marked serve whose state dir holds a fresh serve.lock and no server.json", async () => {
+    const fx = orphanFixture();
+    fs.mkdirSync(path.join(fx.stateDir, "serve.lock"));
+    const child = spawnOrphanSleeper(fx.sleeper, fx.stateDir);
+    try {
+      await waitForMarkerEnv(child.pid);
+      reapOrphanedServes(fx.root);
+      assert.ok(isAlive(child.pid), "a serve mid-start-up must survive");
+    } finally {
+      killPid(child.pid);
+      fs.rmSync(fx.tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("kills a marked serve whose state dir has a stale serve.lock and no server.json", async () => {
+    const fx = orphanFixture();
+    const lockDir = path.join(fx.stateDir, "serve.lock");
+    fs.mkdirSync(lockDir);
+    const old = new Date(Date.now() - 3600_000); // 1h old — far past the ready timeout
+    fs.utimesSync(lockDir, old, old);
+    const child = spawnOrphanSleeper(fx.sleeper, fx.stateDir);
+    try {
+      await waitForMarkerEnv(child.pid);
+      reapOrphanedServes(fx.root);
+      await waitForDeath(child.pid);
+    } finally {
+      killPid(child.pid);
+      fs.rmSync(fx.tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("is a no-op when /proc cannot be listed (macOS-style degradation)", () => {
+    const fx = orphanFixture();
+    const realReaddirSync = fs.readdirSync;
+    fs.readdirSync = (p, ...rest) => {
+      if (p === "/proc") throw new Error("no /proc here");
+      return realReaddirSync(p, ...rest);
+    };
+    try {
+      reapOrphanedServes(fx.root); // must not throw
+    } finally {
+      fs.readdirSync = realReaddirSync;
+      fs.rmSync(fx.tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("skips an unreadable pid's environ without failing the rest of the sweep", async () => {
+    const fx = orphanFixture();
+    const victim = spawnOrphanSleeper(fx.sleeper, fx.stateDir);
+    const survivor = spawnOrphanSleeper(fx.sleeper, fx.stateDir);
+    try {
+      await waitForMarkerEnv(victim.pid);
+      await waitForMarkerEnv(survivor.pid);
+      const realReadFileSync = fs.readFileSync;
+      fs.readFileSync = (p, ...rest) => {
+        if (p === `/proc/${victim.pid}/environ`) throw new Error("operation not permitted");
+        return realReadFileSync(p, ...rest);
+      };
+      try {
+        reapOrphanedServes(fx.root);
+      } finally {
+        fs.readFileSync = realReadFileSync;
+      }
+      assert.ok(isAlive(victim.pid), "an unreadable pid must be skipped, not killed");
+      await waitForDeath(survivor.pid);
+    } finally {
+      killPid(victim.pid);
+      killPid(survivor.pid);
+      fs.rmSync(fx.tmp, { recursive: true, force: true });
     }
   });
 });

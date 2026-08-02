@@ -46,8 +46,42 @@ export function authHeader(server) {
 // this serve. The companion's CLI entry refuses job-creating subcommands
 // when it sees the marker, closing the path the #136 fork bomb used to
 // re-invoke itself from inside a worker's own bash.
-export function buildServeEnv(baseEnv, password) {
-  return { ...baseEnv, OPENCODE_SERVER_PASSWORD: password, KUSABI_WORKER_CONTEXT: "1" };
+export function buildServeEnv(baseEnv, password, stateDir) {
+  const env = { ...baseEnv, OPENCODE_SERVER_PASSWORD: password, KUSABI_WORKER_CONTEXT: "1" };
+  // The serve's own state dir is stamped as well, so a live process can be
+  // attributed back to the state dir that should name it in server.json —
+  // reapOrphanedServes() reads this marker to find serves no record names.
+  if (stateDir) env.KUSABI_SERVE_STATE_DIR = stateDir;
+  return env;
+}
+
+// A `running` job record is written when its driver starts and only
+// rewritten when the driver finishes.  A driver that dies without a chance
+// to rewrite (crash, killed terminal, machine sleep) leaves the record
+// `running` forever.  The record carries no pid, so the only liveness
+// signal is its activity timestamp — stats.lastActivity, falling back to
+// startedAt.  A `running` record whose last activity is older than
+// RUNNING_STALE_MS is a fossil: it must not count as proof that work is in
+// flight (kusabi #162 follow-up).  This is a read-side judgement only — the
+// record on disk is never rewritten.
+export const RUNNING_STALE_MS = 6 * 60 * 60 * 1000; // 6 hours
+
+/**
+ * @param {{status?: string, stats?: object, startedAt?: string}} job
+ * @param {number} now — epoch ms at decision time
+ * @returns {boolean} true when *job* is a `running` record whose last
+ *   activity (stats.lastActivity, falling back to startedAt) is older than
+ *   RUNNING_STALE_MS.  False for every other status and for records with no
+ *   usable activity timestamp (staleness cannot be proven, so the record
+ *   still counts as running).
+ */
+export function runningRecordIsStale(job, now = Date.now()) {
+  if (job?.status !== "running") return false;
+  const raw = job?.stats?.lastActivity ?? job?.startedAt;
+  if (typeof raw !== "string" || raw === "") return false;
+  const activity = Date.parse(raw);
+  if (!Number.isFinite(activity)) return false;
+  return now - activity > RUNNING_STALE_MS;
 }
 
 export async function serverHealthy(server) {
@@ -153,7 +187,7 @@ async function startServer({ stateDir, serverFile, cwd, timeoutMs }) {
       cwd,
       detached: true,
       stdio: ["ignore", logFd, logFd],
-      env: buildServeEnv(process.env, password),
+      env: buildServeEnv(process.env, password, stateDir),
     });
   } catch (err) {
     try { fs.closeSync(logFd); } catch { /* best-effort */ }
@@ -226,7 +260,9 @@ export async function api(server, method, apiPath, body) {
 /**
  * Scan all hash directories under the state root and reap idle serves whose
  * last activity is older than *ttlMs*.  A serve is never touched when any of
- * its jobs still has `status === "running"`.
+ * its jobs still has a *fresh* `running` record — a `running` record whose
+ * last activity is older than RUNNING_STALE_MS is a fossil and does not pin
+ * the serve (kusabi #162 follow-up).
  *
  * Best-effort: per-directory errors are caught and the function never throws.
  */
@@ -258,7 +294,12 @@ export function reapIdleServes(root, ttlMs) {
           const job = readJson(jobFile);
           if (!job) continue;
           try {
-            jobRecords.push({ status: job.status, mtime: fs.statSync(jobFile).mtimeMs });
+            jobRecords.push({
+              status: job.status,
+              mtime: fs.statSync(jobFile).mtimeMs,
+              stats: job.stats,
+              startedAt: job.startedAt,
+            });
           } catch { /* skip unreadable job */ }
         }
       }
@@ -302,16 +343,99 @@ export function judgeServeDeath(pid) {
   }
 }
 
+// Reap orphaned `opencode serve` processes: live processes carrying kusabi's
+// serve marker (KUSABI_WORKER_CONTEXT=1 plus KUSABI_SERVE_STATE_DIR pointing
+// under *root*) whose pid is not named by that state dir's server.json.
+// Such serves are invisible to serve-stop and to reapIdleServes (both start
+// from server.json) and would hold memory forever; PR #163 stopped creating
+// them, this recovers ones that already exist (kusabi #162 follow-up).
+//
+// Identification is /proc-based: /proc/<pid>/environ carries the marker env
+// that buildServeEnv() stamps into every spawned serve, and
+// /proc/<pid>/cmdline is sanity-checked for a bare "serve" argv token so
+// descendant tool/bash processes that merely inherited the marker env are
+// never touched.  A start-up in progress (fresh serve.lock) is never killed,
+// and a recorded serve is never killed.  Best-effort throughout: unreadable
+// or vanished pids are skipped, and the sweep degrades to a no-op where
+// /proc is unavailable (macOS) — it never throws.
+export function reapOrphanedServes(root) {
+  let pids;
+  try {
+    pids = fs.readdirSync("/proc").filter((e) => /^\d+$/.test(e));
+  } catch {
+    return; // /proc unavailable → no-op, never an error
+  }
+  for (const pidEntry of pids) {
+    try {
+      const pid = Number(pidEntry);
+      const env = readProcEnv(pid);
+      if (!env || env.KUSABI_WORKER_CONTEXT !== "1") continue;
+      const stateDir = env.KUSABI_SERVE_STATE_DIR;
+      if (!stateDir || !pathIsUnder(root, stateDir)) continue;
+      // cmdline sanity check: the serve process itself carries a bare
+      // "serve" argv token; its descendants inherit the marker env but not
+      // that argv, so they are never matched here.
+      const cmdline = readProcCmdline(pid);
+      if (!cmdline.includes("serve")) continue;
+      // A start-up in progress holds a fresh serve.lock — that window is
+      // legitimate, never kill.
+      if (startupInProgress(stateDir)) continue;
+      const server = readJson(path.join(stateDir, "server.json"));
+      if (server?.pid === pid) continue; // recorded — leave alone
+      process.kill(pid);
+    } catch { /* best-effort per pid: vanished, unreadable, unkillable */ }
+  }
+}
+
+function readProcEnv(pid) {
+  const text = fs.readFileSync(`/proc/${pid}/environ`, "utf8");
+  const env = {};
+  for (const entry of text.split("\0")) {
+    const eq = entry.indexOf("=");
+    if (eq <= 0) continue;
+    env[entry.slice(0, eq)] = entry.slice(eq + 1);
+  }
+  return env;
+}
+
+function readProcCmdline(pid) {
+  return fs.readFileSync(`/proc/${pid}/cmdline`, "utf8").split("\0");
+}
+
+function pathIsUnder(root, dir) {
+  let r = root;
+  let d = dir;
+  try { r = fs.realpathSync(root); } catch { r = path.resolve(root); }
+  try { d = fs.realpathSync(dir); } catch { d = path.resolve(dir); }
+  return d === r || d.startsWith(r + path.sep);
+}
+
+function startupInProgress(stateDir) {
+  const lockDir = path.join(stateDir, "serve.lock");
+  let lockMtime;
+  try { lockMtime = fs.statSync(lockDir).mtimeMs; } catch { return false; }
+  try {
+    return Date.now() - lockMtime <= serverReadyTimeoutMs();
+  } catch {
+    return false;
+  }
+}
+
 /**
  * @param {object} opts
  * @param {number} opts.serverMtime  — mtimeMs of server.json
- * @param {Array<{status: string, mtime: number}>} opts.jobRecords
+ * @param {Array<{status: string, mtime: number, stats?: object, startedAt?: string}>} opts.jobRecords
  * @param {number} opts.now          — Date.now() at decision time
  * @param {number} opts.ttlMs        — idle TTL in milliseconds
  * @returns {{ reap: boolean, reason: string }}
  */
 export function shouldReapServer({ serverMtime, jobRecords, now, ttlMs }) {
-  const hasRunning = jobRecords.some(function (j) { return j.status === "running"; });
+  const hasRunning = jobRecords.some(function (j) {
+    // A `running` record whose last activity is older than RUNNING_STALE_MS
+    // is a fossil (the driver died without rewriting it) — it does not pin
+    // the serve.
+    return j.status === "running" && !runningRecordIsStale(j, now);
+  });
   if (hasRunning) return { reap: false, reason: "a running job exists" };
 
   let maxJobMtime = 0;
