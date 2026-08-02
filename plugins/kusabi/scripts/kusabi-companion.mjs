@@ -34,7 +34,7 @@ import {
   collectChainStatuses,
 } from "./chain-control.mjs";
 import { jobDir, saveJob, loadJob, listJobs, latestJob } from "./job-store.mjs";
-import { opencodeBin, serverHealthy, ensureServer, reapIdleServes, api } from "./serve-lifecycle.mjs";
+import { opencodeBin, serverHealthy, ensureServer, reapIdleServes, reapOrphanedServes, runningRecordIsStale, api } from "./serve-lifecycle.mjs";
 import { runPrompt, dispatchWithFallback, resetFailedRoutes } from "./prompt-execution.mjs";
 import { openMetricsDb, openMetricsDbReadOnly } from "./metrics-db.mjs";
 import { ingestTranscriptDirectory } from "./transcript-ingest.mjs";
@@ -590,8 +590,11 @@ function cmdServeStop(cwd, { flags } = {}) {
   const stateDir = stateDirFor(cwd);
 
   // Check for running jobs. If any exist, decline unless --force is passed.
+  // A `running` record whose last activity is older than 6 hours is a fossil
+  // (the driver died without rewriting it) and does not count — it must not
+  // block stopping the serve (kusabi #162 follow-up).
   const jobs = listJobs(stateDir);
-  const runningJobs = jobs.filter(function (j) { return j.status === "running"; });
+  const runningJobs = jobs.filter(function (j) { return j.status === "running" && !runningRecordIsStale(j); });
   if (runningJobs.length > 0) {
     if (!flags?.force) {
       const jobList = runningJobs.map(function (j) { return j.id; }).join(", ");
@@ -1722,13 +1725,17 @@ async function main() {
     );
   }
 
-  // Startup reaper: reap idle serves whose last activity is older than TTL.
-  // Best-effort; a failure here must never crash the invoking command.
+  // Startup reaper: reap idle serves whose last activity is older than TTL,
+  // and reap orphaned serve processes that no server.json names (the marker
+  // env buildServeEnv() stamps makes them recognisable). Best-effort; a
+  // failure here must never crash the invoking command.
   try {
     const raw = process.env.KUSABI_SERVE_TTL_MS;
     const ttlMs = parseFloat(raw);
     const ttl = Number.isFinite(ttlMs) && ttlMs > 0 ? ttlMs : 30 * 60 * 1000;
-    reapIdleServes(stateRoot(), ttl);
+    const root = stateRoot();
+    reapIdleServes(root, ttl);
+    reapOrphanedServes(root);
   } catch { /* best-effort */ }
 
   // Claude Code passes "$ARGUMENTS" as a single string; re-split it.
