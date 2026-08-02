@@ -1298,15 +1298,23 @@ async function cmdChainResume(cwd, { flags, text }) {
   }
 
   // ---- container must exist: the chain's work lives in it ----
+  // `callTool` throws when sunaba itself is unreachable, but it RESOLVES with
+  // an error-shaped result ({ status: "error", error: "Container … not
+  // found" }) when the container is missing — treat both as unreachable so
+  // the driver never starts against a container that does not exist.
   const { callTool } = await import("./sunaba-rpc.mjs");
+  let probe;
   try {
-    await callTool("sandbox_exec", {
+    probe = await callTool("sandbox_exec", {
       container_id: container,
       commands: ["echo kusabi-chain-resume-check"],
     });
-  } catch {
+  } catch (err) {
+    probe = { status: "error", error: err?.message ?? String(err) };
+  }
+  if (probe?.status === "error") {
     throw new Error(
-      `cannot resume chain ${chainId}: container ${container} is not reachable — ` +
+      `cannot resume chain ${chainId}: container ${container} is not reachable (${probe.error}) — ` +
       `the chain's work lives in that container and it must exist before resuming`
     );
   }

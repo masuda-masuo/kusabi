@@ -4,7 +4,8 @@ import os from "node:os";
 import path from "node:path";
 import fs from "node:fs";
 import crypto from "node:crypto";
-import { spawnSync } from "node:child_process";
+import http from "node:http";
+import { spawn, spawnSync } from "node:child_process";
 import {
   newestChainDir,
   PHASE_AGENTS,
@@ -1145,15 +1146,95 @@ describe("chain-resume CLI", () => {
     return path.join(stateRootDir, hash);
   }
 
-  function runResume(args, { stateDir, cwd } = {}) {
+  // The container-reachability guard must not depend on whatever happens to
+  // be listening on the default endpoint in the ambient environment: every
+  // subprocess gets an explicit endpoint here (a dead port by default;
+  // tests that need a live answer pass their own KUSABI_SUNABA_URL).
+  function resumeEnv(stateDir, extraEnv) {
     const env = { ...process.env };
     delete env.KUSABI_WORKER_CONTEXT;
     env.KUSABI_STATE_DIR = stateDir;
+    env.KUSABI_SUNABA_URL = extraEnv?.KUSABI_SUNABA_URL ?? "http://127.0.0.1:9/mcp";
+    return env;
+  }
+
+  function runResume(args, { stateDir, cwd, env: extraEnv } = {}) {
     return spawnSync(process.execPath, [COMPANION_SCRIPT, "chain-resume", ...args], {
       encoding: "utf8",
       cwd,
-      env,
+      env: resumeEnv(stateDir, extraEnv),
       timeout: 15_000,
+    });
+  }
+
+  // Async variant for tests that serve a stub endpoint: spawnSync would block
+  // this process's event loop, so the stub could never answer the child.
+  function runResumeAsync(args, { stateDir, cwd, env: extraEnv } = {}) {
+    return new Promise((resolve) => {
+      const child = spawn(process.execPath, [COMPANION_SCRIPT, "chain-resume", ...args], {
+        cwd,
+        env: resumeEnv(stateDir, extraEnv),
+      });
+      let stdout = "";
+      let stderr = "";
+      child.stdout.on("data", (chunk) => { stdout += chunk; });
+      child.stderr.on("data", (chunk) => { stderr += chunk; });
+      const timer = setTimeout(() => child.kill("SIGTERM"), 15_000);
+      child.on("close", (code) => {
+        clearTimeout(timer);
+        resolve({ status: code, stdout, stderr });
+      });
+    });
+  }
+
+  // A minimal sunaba MCP endpoint for the reachability tests. callTool does
+  // three POSTs to the same URL: initialize (must answer with the
+  // mcp-session-id response header), notifications/initialized, then
+  // tools/call (parsed as SSE, unwrapped from result.content[0].text as JSON).
+  // We answer every request with the session-id header, a 200, and one SSE
+  // data: line; tools/call carries the given tool result. Bound to port 0 so
+  // parallel runs do not collide.
+  function startSunabaStub({ toolResultText }) {
+    const server = http.createServer((req, res) => {
+      res.on("error", () => {});
+      let body = "";
+      req.on("data", (chunk) => { body += chunk; });
+      req.on("end", () => {
+        let payload = null;
+        try {
+          payload = JSON.parse(body);
+        } catch {
+          // not JSON — still answer the handshake
+        }
+        res.setHeader("mcp-session-id", "stub-session");
+        res.writeHead(200, { "content-type": "text/event-stream" });
+        let envelope;
+        if (payload?.method === "tools/call") {
+          envelope = {
+            jsonrpc: "2.0",
+            id: payload.id ?? 1,
+            result: { content: [{ type: "text", text: JSON.stringify(toolResultText) }] },
+          };
+        } else {
+          envelope = {
+            jsonrpc: "2.0",
+            id: payload?.id ?? 1,
+            result: {
+              protocolVersion: "2024-11-05",
+              capabilities: {},
+              serverInfo: { name: "kusabi-stub", version: "0.0.0" },
+            },
+          };
+        }
+        res.end(`data: ${JSON.stringify(envelope)}\n\n`);
+      });
+    });
+    return new Promise((resolve, reject) => {
+      server.once("error", reject);
+      server.listen(0, "127.0.0.1", () => {
+        const { port } = server.address();
+        resolve({ server, url: `http://127.0.0.1:${port}/mcp` });
+      });
     });
   }
 
@@ -1315,7 +1396,13 @@ describe("chain-resume CLI", () => {
         title: "chain: chain-unrelated round 2 implement",
         startedAt: new Date().toISOString(),
       });
-      const result = runResume(["chain-x"], { stateDir: path.join(tmp, "state"), cwd: tmp });
+      const result = runResume(["chain-x"], {
+        stateDir: path.join(tmp, "state"),
+        cwd: tmp,
+        // Falls past the in-flight guard to the container-reachability check:
+        // nothing is listening on this explicit endpoint (connection refused).
+        env: { KUSABI_SUNABA_URL: "http://127.0.0.1:9/mcp" },
+      });
       // Falls through the guard to the container-reachability check.
       assert.notEqual(result.status, 0);
       assert.match(result.stdout, /not reachable/);
@@ -1324,7 +1411,7 @@ describe("chain-resume CLI", () => {
     }
   });
 
-  it("reports an unreachable container for a resumable stale chain (no sunaba endpoint in tests)", () => {
+  it("reports an unreachable container for a resumable stale chain (nothing listening on the endpoint)", () => {
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-resume-cli-"));
     try {
       const stateDir = hashedWorkspaceDir(path.join(tmp, "state"), tmp);
@@ -1335,7 +1422,12 @@ describe("chain-resume CLI", () => {
         },
         chainJson: validChainJson(),
       });
-      const result = runResume(["chain-stale"], { stateDir: path.join(tmp, "state"), cwd: tmp });
+      const result = runResume(["chain-stale"], {
+        stateDir: path.join(tmp, "state"),
+        cwd: tmp,
+        // Nothing is listening on this explicit endpoint (connection refused).
+        env: { KUSABI_SUNABA_URL: "http://127.0.0.1:9/mcp" },
+      });
       assert.notEqual(result.status, 0);
       assert.match(result.stdout, /not reachable/);
       // The control record must NOT have been re-armed past the failure
@@ -1343,6 +1435,46 @@ describe("chain-resume CLI", () => {
       assert.equal(control.status, "running");
       assert.equal(control.resumedAt, undefined);
     } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses to resume when the sunaba server answers that the container is missing (error-shaped result)", async () => {
+    // callTool resolves (does not throw) with { status: "error", error:
+    // "Container … not found" } when the container is gone — the guard must
+    // treat that as unreachable, not let the resume sail through.
+    const { server, url } = await startSunabaStub({
+      toolResultText: {
+        status: "error",
+        error: "Container fake-cid not found",
+        recommended_next_action: "sandbox_list_containers to find running containers, or sandbox_initialize to start one",
+      },
+    });
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-resume-cli-"));
+    try {
+      const stateDir = hashedWorkspaceDir(path.join(tmp, "state"), tmp);
+      makeChain(stateDir, "chain-stale", {
+        control: {
+          chainId: "chain-stale", container: "fake-cid", pid: 0, // dead pid → abnormal stop
+          status: "running", round: 1, startedAt: new Date().toISOString(),
+        },
+        chainJson: validChainJson(),
+      });
+      const result = await runResumeAsync(["chain-stale"], {
+        stateDir: path.join(tmp, "state"),
+        cwd: tmp,
+        env: { KUSABI_SUNABA_URL: url },
+      });
+      assert.notEqual(result.status, 0);
+      assert.match(result.stdout, /not reachable/);
+      assert.match(result.stdout, /Container fake-cid not found/);
+      // The control record must NOT have been re-armed past the failure
+      const control = readChainControl(path.join(stateDir, "chains", "chain-stale"));
+      assert.equal(control.status, "running");
+      assert.equal(control.resumedAt, undefined);
+    } finally {
+      server.close();
+      server.closeAllConnections?.();
       fs.rmSync(tmp, { recursive: true, force: true });
     }
   });
