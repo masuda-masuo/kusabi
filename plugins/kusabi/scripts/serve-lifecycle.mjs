@@ -9,6 +9,16 @@ import { stateDirFor, readJson, writeJson } from "./state-paths.mjs";
 
 const SERVER_READY_TIMEOUT_MS = 20_000;
 
+// How long the spawned serve is given to answer a health probe.  Overridable
+// via KUSABI_SERVE_READY_TIMEOUT_MS so tests can drive the timeout path
+// without waiting 20 s (kusabi #162); the module constant stays the default.
+export function serverReadyTimeoutMs() {
+  const raw = process.env.KUSABI_SERVE_READY_TIMEOUT_MS;
+  if (raw === undefined || raw === "") return SERVER_READY_TIMEOUT_MS;
+  const parsed = Number(raw);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : SERVER_READY_TIMEOUT_MS;
+}
+
 export function opencodeBin() {
   return process.env.OPENCODE_BIN || "opencode";
 }
@@ -53,22 +63,103 @@ export async function serverHealthy(server) {
   }
 }
 
+/**
+ * Make sure a healthy `opencode serve` exists for *cwd* and return its
+ * record.  Reuses the recorded serve from server.json when it answers a
+ * health probe; otherwise starts one.
+ *
+ * Start-up is serialised per state directory with an atomic mkdir lock
+ * (`serve.lock`) so concurrent callers for the same cwd end up with exactly
+ * one live serve (kusabi #162): a caller that loses the lock race waits for
+ * the winner's server.json instead of spawning a second process.  Every
+ * failure path kills the process it spawned before throwing, so no live
+ * serve ever outlives a call that did not record it in server.json.
+ */
 export async function ensureServer(cwd) {
   const stateDir = stateDirFor(cwd);
   const serverFile = path.join(stateDir, "server.json");
+  const timeoutMs = serverReadyTimeoutMs();
+
   const existing = readJson(serverFile);
   if (await serverHealthy(existing)) return { ...existing, stateDir };
 
+  const lockDir = path.join(stateDir, "serve.lock");
+  for (;;) {
+    let acquired = false;
+    try {
+      fs.mkdirSync(lockDir);
+      acquired = true;
+    } catch (err) {
+      if (err?.code !== "EEXIST") throw err;
+      // Another caller is starting a serve.  Wait (bounded) for its
+      // server.json to appear and become healthy, then reuse it.
+      const published = await waitForPublishedHealthy(serverFile, lockDir, timeoutMs);
+      if (published) return { ...published, stateDir };
+      if (lockIsStale(lockDir, timeoutMs)) {
+        // The holder gave up (or died) without publishing: a lock older than
+        // the ready timeout is stale.  Take it over and start ourselves.
+        try { fs.rmdirSync(lockDir); } catch { /* raced: another caller took it */ }
+        continue;
+      }
+      // The lock is still fresh — its holder is legitimately starting and
+      // has not had its own full window yet.  Fail rather than stack a
+      // second spawn; the holder will publish or clean up.
+      throw new Error(`opencode serve did not become ready within ${timeoutMs}ms (concurrent start-up in ${stateDir})`);
+    }
+    if (acquired) {
+      try {
+        return await startServer({ stateDir, serverFile, cwd, timeoutMs });
+      } finally {
+        try { fs.rmdirSync(lockDir); } catch { /* best-effort */ }
+      }
+    }
+  }
+}
+
+// Wait for the lock holder to publish a healthy server.json.  Returns the
+// published record when it appears, or null when the holder releases the
+// lock without publishing (failed start-up) or the wait bound expires.
+async function waitForPublishedHealthy(serverFile, lockDir, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const published = readJson(serverFile);
+    if (published && (await serverHealthy(published))) return published;
+    if (!fs.existsSync(lockDir)) return null;
+    await new Promise((r) => setTimeout(r, 200));
+  }
+  return null;
+}
+
+function lockIsStale(lockDir, timeoutMs) {
+  try {
+    return Date.now() - fs.statSync(lockDir).mtimeMs > timeoutMs;
+  } catch {
+    return true; // lock vanished — caller should retry acquisition
+  }
+}
+
+// Spawn the serve and poll health while holding the lock.  On success the
+// record is written to server.json (the lock holder's finally releases the
+// lock afterwards); on any failure the spawned child is killed before the
+// error propagates, so a live serve is never left unrecorded.
+async function startServer({ stateDir, serverFile, cwd, timeoutMs }) {
   const port = await freePort();
   const password = crypto.randomBytes(16).toString("hex");
   const logFile = path.join(stateDir, "server.log");
   const logFd = fs.openSync(logFile, "a");
-  const child = spawn(opencodeBin(), ["serve", "--port", String(port)], {
-    cwd,
-    detached: true,
-    stdio: ["ignore", logFd, logFd],
-    env: buildServeEnv(process.env, password),
-  });
+  let child;
+  try {
+    child = spawn(opencodeBin(), ["serve", "--port", String(port)], {
+      cwd,
+      detached: true,
+      stdio: ["ignore", logFd, logFd],
+      env: buildServeEnv(process.env, password),
+    });
+  } catch (err) {
+    try { fs.closeSync(logFd); } catch { /* best-effort */ }
+    throw err;
+  }
+  fs.closeSync(logFd);
   child.unref();
   child.on("exit", (code, signal) => {
     try {
@@ -76,18 +167,41 @@ export async function ensureServer(cwd) {
       fs.appendFileSync(logFile, line, "utf8");
     } catch { /* best-effort */ }
   });
-  fs.closeSync(logFd);
 
   const server = { port, password, pid: child.pid, cwd, startedAt: new Date().toISOString() };
-  const deadline = Date.now() + SERVER_READY_TIMEOUT_MS;
-  while (Date.now() < deadline) {
-    if (await serverHealthy(server)) {
-      writeJson(serverFile, server);
-      return { ...server, stateDir };
+  const deadline = Date.now() + timeoutMs;
+  try {
+    while (Date.now() < deadline) {
+      if (await serverHealthy(server)) {
+        writeJson(serverFile, server);
+        return { ...server, stateDir };
+      }
+      await new Promise((r) => setTimeout(r, 250));
     }
-    await new Promise((r) => setTimeout(r, 250));
+    throw new Error(`opencode serve did not become ready within ${timeoutMs}ms (log: ${logFile})`);
+  } catch (err) {
+    await killChildGracefully(child);
+    throw err;
   }
-  throw new Error(`opencode serve did not become ready within ${SERVER_READY_TIMEOUT_MS}ms (log: ${logFile})`);
+}
+
+// SIGTERM the child and wait for it to exit; SIGKILL after a short grace if
+// it ignores SIGTERM.  `child.unref()` keeps it from holding the parent's
+// event loop open but does not stop us from killing it.
+async function killChildGracefully(child) {
+  if (!child || child.pid == null) return;
+  if (child.exitCode !== null || child.signalCode !== null) return; // already gone
+  const exited = new Promise((resolve) => child.once("exit", resolve));
+  try {
+    process.kill(child.pid, "SIGTERM");
+  } catch {
+    return; // already gone
+  }
+  await Promise.race([exited, new Promise((r) => setTimeout(r, 1_500))]);
+  if (child.exitCode === null && child.signalCode === null) {
+    try { process.kill(child.pid, "SIGKILL"); } catch { /* gone */ }
+    await Promise.race([exited, new Promise((r) => setTimeout(r, 1_500))]);
+  }
 }
 
 export async function api(server, method, apiPath, body) {

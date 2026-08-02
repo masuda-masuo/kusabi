@@ -2,10 +2,16 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import process from "node:process";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import {
   shouldReapServer,
   buildServeEnv,
+  ensureServer,
+  serverReadyTimeoutMs,
 } from "./serve-lifecycle.mjs";
+import { readJson, stateDirFor } from "./state-paths.mjs";
 
 // buildServeEnv — env-building seam for ensureServer's spawn (kusabi #136 fix 3)
 // ---------------------------------------------------------------------------
@@ -249,6 +255,200 @@ describe("judgeServeDeath", () => {
       assert.equal(result.reason, null);
     } finally {
       process.kill = realKill;
+    }
+  });
+});
+
+// ensureServer — spawn-based tests against a fake `opencode serve` (kusabi #162)
+// ---------------------------------------------------------------------------
+// ensureServer resolves the binary through OPENCODE_BIN, so these tests point
+// it at a fake serve script written into a temp dir: the "ready" fake starts
+// an HTTP server on the --port it is given and answers any request with 200;
+// the "never" fake stays alive without listening (drives the timeout path).
+// KUSABI_STATE_DIR points at a temp dir so nothing touches the real state
+// root.  Every process these tests spawn is killed by the test itself, and
+// liveness is asserted by pid (process.kill(pid, 0)), never by reading a
+// log line.
+
+const FAKE_SERVE_SOURCE = `#!/usr/bin/env node
+import http from "node:http";
+import fs from "node:fs";
+
+const argv = process.argv.slice(2);
+const portIdx = argv.indexOf("--port");
+const port = Number(argv[portIdx + 1]);
+if (!port || Number.isNaN(port)) {
+  process.stderr.write("fake serve: no --port argument\\n");
+  process.exit(2);
+}
+fs.appendFileSync(process.env.FAKE_SPAWN_PIDS, process.pid + "\\n");
+if (process.env.FAKE_MODE !== "never") {
+  const server = http.createServer((req, res) => {
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end("{}");
+  });
+  server.listen(port, "127.0.0.1");
+}
+setInterval(() => {}, 1000);
+`;
+
+function isAlive(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function waitForDeath(pid, timeoutMs = 5000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (!isAlive(pid)) return;
+    await new Promise((r) => setTimeout(r, 50));
+  }
+  throw new Error(`pid ${pid} still alive after ${timeoutMs}ms`);
+}
+
+function spawnedPids(spawnLog) {
+  const text = fs.readFileSync(spawnLog, "utf8");
+  return text.trim() ? text.trim().split("\n").map(Number) : [];
+}
+
+function fakeServeContext(mode) {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-serve-test-"));
+  const binPath = path.join(tmp, "fake-serve.mjs");
+  const spawnLog = path.join(tmp, "spawned.pids");
+  fs.writeFileSync(binPath, FAKE_SERVE_SOURCE, "utf8");
+  fs.chmodSync(binPath, 0o755);
+  fs.writeFileSync(spawnLog, "", "utf8");
+  const stateRoot = path.join(tmp, "state");
+  const cwd = path.join(tmp, "cwd");
+  fs.mkdirSync(cwd, { recursive: true });
+  const saved = {
+    OPENCODE_BIN: process.env.OPENCODE_BIN,
+    KUSABI_STATE_DIR: process.env.KUSABI_STATE_DIR,
+    KUSABI_SERVE_READY_TIMEOUT_MS: process.env.KUSABI_SERVE_READY_TIMEOUT_MS,
+    FAKE_MODE: process.env.FAKE_MODE,
+    FAKE_SPAWN_PIDS: process.env.FAKE_SPAWN_PIDS,
+  };
+  // Set the env first: stateDirFor hashes cwd under KUSABI_STATE_DIR, so it
+  // must see the temp root or the returned paths point at the real state dir.
+  process.env.OPENCODE_BIN = binPath;
+  process.env.KUSABI_STATE_DIR = stateRoot;
+  process.env.FAKE_MODE = mode;
+  process.env.FAKE_SPAWN_PIDS = spawnLog;
+  const stateDir = stateDirFor(cwd); // hashes cwd under KUSABI_STATE_DIR
+  return {
+    tmp,
+    cwd,
+    stateDir,
+    serverFile: path.join(stateDir, "server.json"),
+    lockFile: path.join(stateDir, "serve.lock"),
+    spawnLog,
+    restore() {
+      for (const [key, value] of Object.entries(saved)) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+    },
+    killAll() {
+      for (const pid of spawnedPids(spawnLog)) {
+        try { process.kill(pid, "SIGKILL"); } catch { /* already gone */ }
+      }
+    },
+    rm() {
+      try { fs.rmSync(tmp, { recursive: true, force: true }); } catch { /* best-effort */ }
+    },
+  };
+}
+
+describe("ensureServer (fake serve, spawn-based)", () => {
+  it("honours KUSABI_SERVE_READY_TIMEOUT_MS with the 20s constant as default", () => {
+    const prev = process.env.KUSABI_SERVE_READY_TIMEOUT_MS;
+    try {
+      delete process.env.KUSABI_SERVE_READY_TIMEOUT_MS;
+      assert.equal(serverReadyTimeoutMs(), 20_000);
+      process.env.KUSABI_SERVE_READY_TIMEOUT_MS = "800";
+      assert.equal(serverReadyTimeoutMs(), 800);
+    } finally {
+      if (prev === undefined) delete process.env.KUSABI_SERVE_READY_TIMEOUT_MS;
+      else process.env.KUSABI_SERVE_READY_TIMEOUT_MS = prev;
+    }
+  });
+
+  it("concurrent ensureServer calls leave exactly one live serve, the one recorded in server.json", async () => {
+    const ctx = fakeServeContext("ready");
+    process.env.KUSABI_SERVE_READY_TIMEOUT_MS = "5000";
+    try {
+      const results = await Promise.allSettled([
+        ensureServer(ctx.cwd),
+        ensureServer(ctx.cwd),
+        ensureServer(ctx.cwd),
+      ]);
+      for (const r of results) {
+        assert.equal(r.status, "fulfilled", r.reason ? String(r.reason) : "call rejected");
+      }
+      const servers = results.map((r) => r.value);
+      assert.equal(new Set(servers.map((s) => s.port)).size, 1, "all callers must share one port");
+      assert.equal(new Set(servers.map((s) => s.pid)).size, 1, "all callers must share one pid");
+      assert.equal(new Set(servers.map((s) => s.stateDir)).size, 1);
+
+      const recorded = readJson(ctx.serverFile);
+      assert.ok(recorded, "server.json must be written by the winner");
+      assert.equal(recorded.pid, servers[0].pid, "server.json must record the shared pid");
+      assert.equal(recorded.port, servers[0].port, "server.json must record the shared port");
+
+      const spawned = spawnedPids(ctx.spawnLog);
+      assert.equal(spawned.length, 1, "exactly one serve process may be spawned");
+      const alive = spawned.filter(isAlive);
+      assert.deepEqual(alive, [recorded.pid], "the only live serve must be the recorded one");
+    } finally {
+      ctx.killAll();
+      ctx.restore();
+      ctx.rm();
+    }
+  });
+
+  it("rejects when the serve never becomes ready and kills the spawned process", async () => {
+    const ctx = fakeServeContext("never");
+    process.env.KUSABI_SERVE_READY_TIMEOUT_MS = "800";
+    try {
+      await assert.rejects(ensureServer(ctx.cwd), /did not become ready/);
+      const spawned = spawnedPids(ctx.spawnLog);
+      assert.equal(spawned.length, 1, "exactly one serve process may be spawned");
+      await waitForDeath(spawned[0]);
+      assert.ok(!isAlive(spawned[0]), "the spawned serve must be dead after the rejection");
+      assert.equal(readJson(ctx.serverFile), null, "no record may be written for an unready serve");
+      assert.ok(!fs.existsSync(ctx.lockFile), "the start-up lock must be released after failure");
+    } finally {
+      ctx.killAll();
+      ctx.restore();
+      ctx.rm();
+    }
+  });
+
+  it("reuses a healthy recorded serve without spawning anything new", async () => {
+    const ctx = fakeServeContext("ready");
+    process.env.KUSABI_SERVE_READY_TIMEOUT_MS = "5000";
+    try {
+      const first = await ensureServer(ctx.cwd);
+      const second = await ensureServer(ctx.cwd);
+      assert.equal(second.pid, first.pid);
+      assert.equal(second.port, first.port);
+      assert.equal(second.stateDir, first.stateDir);
+
+      const recorded = readJson(ctx.serverFile);
+      assert.equal(recorded.pid, first.pid, "server.json must still name the same serve");
+      assert.equal(recorded.port, first.port);
+
+      const spawned = spawnedPids(ctx.spawnLog);
+      assert.equal(spawned.length, 1, "a healthy recorded serve must not trigger a new spawn");
+      assert.ok(isAlive(first.pid), "the recorded serve must still be alive");
+    } finally {
+      ctx.killAll();
+      ctx.restore();
+      ctx.rm();
     }
   });
 });
