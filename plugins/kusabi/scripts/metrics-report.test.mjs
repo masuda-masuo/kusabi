@@ -438,6 +438,216 @@ describe("final disposition", () => {
   });
 });
 
+// ---------------------------------------------------------------------------
+// escalate substantive/no-work split (kusabi #165)
+// ---------------------------------------------------------------------------
+
+/** Build a store with escalated chains in each class, plus a non-escalated
+ * chain that must not touch the split. */
+function buildEscalateSplitFixture() {
+  const db = openMetricsDb(":memory:");
+
+  upsertChain(db, {
+    chainId: "esc-substantive",
+    orchModel: "claude-opus-5",
+    orchSession: null,
+    orchDate: "2026-07-26",
+    briefHasSmoke: 1,
+    briefChars: 300,
+    briefHasDeliverables: 1,
+  });
+  // Changed the worktree, then escalated anyway.
+  upsertRound(db, {
+    chainId: "esc-substantive",
+    round: 1,
+    startedAt: "2026-07-26T09:00:00.000Z",
+    startedMs: Date.parse("2026-07-26T09:00:00.000Z"),
+    disposition: "escalate",
+    worktreeChanged: 1,
+  });
+
+  upsertChain(db, {
+    chainId: "esc-nowork",
+    orchModel: "claude-opus-5",
+    orchSession: null,
+    orchDate: "2026-07-26",
+    briefHasSmoke: 1,
+    briefChars: 200,
+    briefHasDeliverables: 1,
+  });
+  // The 722-token zero-change shape: implement produced tokens, measured no
+  // change — still no-work.
+  upsertRound(db, {
+    chainId: "esc-nowork",
+    round: 1,
+    startedAt: "2026-07-26T09:30:00.000Z",
+    startedMs: Date.parse("2026-07-26T09:30:00.000Z"),
+    disposition: "escalate",
+    worktreeChanged: 0,
+    implementOut: 722,
+  });
+
+  upsertChain(db, {
+    chainId: "esc-unknown",
+    orchModel: "claude-opus-5",
+    orchSession: null,
+    orchDate: "2026-07-26",
+    briefHasSmoke: 1,
+    briefChars: 150,
+    briefHasDeliverables: 1,
+  });
+  // Old record — worktree_changed was never written (NULL).
+  upsertRound(db, {
+    chainId: "esc-unknown",
+    round: 1,
+    startedAt: "2026-07-26T10:00:00.000Z",
+    startedMs: Date.parse("2026-07-26T10:00:00.000Z"),
+    disposition: "escalate",
+  });
+
+  // Non-escalated chains: accepted and discarded — must never enter the split.
+  upsertChain(db, {
+    chainId: "chain-accept",
+    orchModel: "claude-opus-5",
+    orchSession: null,
+    orchDate: "2026-07-26",
+    briefHasSmoke: 1,
+    briefChars: 100,
+    briefHasDeliverables: 1,
+  });
+  upsertRound(db, {
+    chainId: "chain-accept",
+    round: 1,
+    startedAt: "2026-07-26T11:00:00.000Z",
+    startedMs: Date.parse("2026-07-26T11:00:00.000Z"),
+    disposition: "accept",
+    worktreeChanged: 1,
+  });
+
+  return db;
+}
+
+describe("escalate split (kusabi #165)", () => {
+  it("splits escalated chains into substantive / no-work / unknown, preserving the escalate total", () => {
+    const db = buildEscalateSplitFixture();
+    const report = computeReport(db, { dbPath: ":memory:" });
+    const block = report.briefOutcome.find((b) => b.orchModel === "claude-opus-5");
+    assert.ok(block, "expected a claude-opus-5 block");
+    assert.deepEqual(block.escalateSplit, {
+      escalated: 3,
+      substantive: 1,
+      noWork: 1,
+      unknown: 1,
+    });
+    // The escalate cell in the disposition table is unchanged by the split.
+    assert.equal(block.table["Smoke present"].escalate["rounds=1"], 3);
+    // A non-escalated chain never enters the split.
+    assert.equal(block.escalateSplit.substantive + block.escalateSplit.noWork
+      + block.escalateSplit.unknown, block.escalateSplit.escalated);
+  });
+
+  it("renders the split line in the text report", () => {
+    const db = buildEscalateSplitFixture();
+    const text = renderReportText(computeReport(db, { dbPath: ":memory:" }));
+    assert.match(text, /escalated chains: 3 \(substantive 1, no-work 1, unknown 1\)/);
+  });
+
+  it("escalated chains whose rounds predate the field render as uncomputable, never no-work 0", () => {
+    // buildFixture's chain-3 escalated with no worktree_changed written —
+    // the store has the column but the round predates it (NULL).
+    const db = buildFixture();
+    const report = computeReport(db, { dbPath: ":memory:" });
+    const block = report.briefOutcome.find((b) => b.orchModel === "claude-sonnet-5");
+    assert.deepEqual(block.escalateSplit, {
+      escalated: 1,
+      substantive: 0,
+      noWork: 0,
+      unknown: 1,
+    });
+    const text = renderReportText(report);
+    assert.match(text, /escalated chains: 1 \(no-work: \?\)/);
+  });
+
+  it("a block with no escalated chains carries an all-zero split and no text line", () => {
+    const db = openMetricsDb(":memory:");
+    upsertChain(db, {
+      chainId: "chain-accept-only",
+      orchModel: "claude-opus-5",
+      orchSession: null,
+      orchDate: "2026-07-26",
+      briefHasSmoke: 1,
+      briefChars: 100,
+      briefHasDeliverables: 1,
+    });
+    upsertRound(db, {
+      chainId: "chain-accept-only",
+      round: 1,
+      startedAt: "2026-07-26T11:00:00.000Z",
+      startedMs: Date.parse("2026-07-26T11:00:00.000Z"),
+      disposition: "accept",
+      worktreeChanged: 1,
+    });
+    const report = computeReport(db, { dbPath: ":memory:" });
+    const block = report.briefOutcome.find((b) => b.orchModel === "claude-opus-5");
+    assert.deepEqual(block.escalateSplit, {
+      escalated: 0,
+      substantive: 0,
+      noWork: 0,
+      unknown: 0,
+    });
+    const text = renderReportText(report);
+    assert.doesNotMatch(text, /escalated chains:/);
+  });
+
+  it("--json carries the split in the briefOutcome blocks", () => {
+    const db = buildEscalateSplitFixture();
+    const parsed = JSON.parse(renderReportJson(computeReport(db, { dbPath: ":memory:" })));
+    const block = parsed.briefOutcome.find((b) => b.orchModel === "claude-opus-5");
+    assert.deepEqual(block.escalateSplit, {
+      escalated: 3,
+      substantive: 1,
+      noWork: 1,
+      unknown: 1,
+    });
+  });
+});
+
+describe("escalate split — legacy store degradation (kusabi #165)", () => {
+  it("a store written before round.worktree_changed existed renders escalates as unknown, never no-work", () => {
+    const db = openMetricsDb(":memory:");
+    // Simulate a pre-#165 store file: the writable schema already added the
+    // column, so drop it the way the read-only surface will encounter it.
+    db.exec("ALTER TABLE round DROP COLUMN worktree_changed");
+
+    // Old stores were written by pre-#165 code, so insert with raw SQL that
+    // predates the column (upsertRound would reference the dropped column).
+    db.prepare(`
+      INSERT INTO chain (chain_id, orch_model, orch_session, orch_date,
+        totals_input, totals_output, totals_cost, brief_has_smoke, brief_chars,
+        brief_has_deliverables)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run("chain-legacy-esc", "claude-opus-5", null, "2026-07-22",
+      10, 20, 0.5, 1, 300, 1);
+    db.prepare(`
+      INSERT INTO round (chain_id, round, started_at, started_ms, disposition)
+      VALUES (?, ?, ?, ?, ?)
+    `).run("chain-legacy-esc", 1, "2026-07-22T09:00:00.000Z",
+      Date.parse("2026-07-22T09:00:00.000Z"), "escalate");
+
+    const report = computeReport(db, { dbPath: ":memory:" });
+    const block = report.briefOutcome.find((b) => b.orchModel === "claude-opus-5");
+    assert.deepEqual(block.escalateSplit, {
+      escalated: 1,
+      substantive: 0,
+      noWork: 0,
+      unknown: 1,
+    });
+    // The text surface shows the absence explicitly — never a silent 0.
+    const text = renderReportText(report);
+    assert.match(text, /escalated chains: 1 \(no-work: \?\)/);
+  });
+});
+
 describe("--json output", () => {
   it("parses as valid JSON and preserves null for absent sums", () => {
     const db = openMetricsDb(":memory:");

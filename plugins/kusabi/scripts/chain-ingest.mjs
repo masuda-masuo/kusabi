@@ -198,6 +198,12 @@ export function parseChainRecord(chainJson, ctx = {}) {
       tierAfter: typeof rec.tierAfter === "number" ? rec.tierAfter : null,
       verdict: typeof rec.verdict === "string" ? rec.verdict : null,
       probesGreen: toBoolInt(rec.probesGreen),
+      // Three-valued (kusabi #165): 1 = worker changed the worktree,
+      // 0 = measured no change, NULL = never measured (old record or a
+      // round that died before probes).  The escalate substantive/no-work
+      // split needs the absent case kept distinct — NULL is "unknown",
+      // never "no-work".
+      worktreeChanged: toBoolInt(rec.worktreeChanged),
       disposition: (rec.disposition && typeof rec.disposition.disposition === "string")
         ? rec.disposition.disposition
         : null,

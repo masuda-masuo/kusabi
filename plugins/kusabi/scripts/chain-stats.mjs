@@ -10,6 +10,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { readJson } from "./state-paths.mjs";
 import { hasRepeatedAreas } from "./chain-phases.mjs";
+import { classifyEscalate } from "./chain-substance.mjs";
 
 // =========================================================================
 // I/O — collecting records from the state directory
@@ -280,6 +281,11 @@ export function computeStats(chains, opts = {}) {
   const rpcValues = Object.values(roundsPerChain);
 
   // ---- final dispositions (disposition of the last round of each chain) ----
+  // Escalated chains are additionally split by whether the worker ever
+  // produced a change set (kusabi #165): an infra death (no round changed
+  // anything) is not the same failure as substantive work that was rejected.
+  // `escalateSplit` always sums to dispositionCounts.escalate, so the totals
+  // below stay comparable with earlier reports.
   const dispositionCounts = {
     accept: 0,
     "accept-with-followup": 0,
@@ -289,6 +295,7 @@ export function computeStats(chains, opts = {}) {
     discard: 0,
     other: 0,
   };
+  const escalateSplit = { substantive: 0, noWork: 0, unknown: 0 };
 
   for (let ci = 0; ci < chains.length; ci++) {
     // Find the last round of this chain that passes time filters
@@ -300,6 +307,14 @@ export function computeStats(chains, opts = {}) {
     const disp = lastRound.disposition?.disposition;
     if (disp && disp in dispositionCounts) {
       dispositionCounts[disp] += 1;
+      if (disp === "escalate") {
+        // Classify over the SAME in-range rounds that produced the
+        // disposition, so the split never disagrees with the count.
+        const label = classifyEscalate(chainRounds);
+        if (label === "substantive") escalateSplit.substantive += 1;
+        else if (label === "no-work") escalateSplit.noWork += 1;
+        else escalateSplit.unknown += 1;
+      }
     } else {
       dispositionCounts.other += 1;
     }
@@ -584,6 +599,11 @@ export function computeStats(chains, opts = {}) {
 
     // Dispositions (final per chain)
     dispositionCounts,
+    // Escalate split (kusabi #165): sums to dispositionCounts.escalate.
+    // `unknown` = escalated chains whose rounds never recorded whether the
+    // worktree changed (old records / pre-probe death) — never counted as
+    // no-work.
+    escalateSplit,
 
     // Verdicts
     verdictCounts,
@@ -707,7 +727,22 @@ export function renderChainStats(stats, opts = {}) {
   const dispOrder = ["accept", "accept-with-followup", "escalate", "rework", "strategize", "discard"];
   for (const key of dispOrder) {
     if (dc[key] > 0 || totalDisps > 0) {
-      lines.push(line(key, dc[key], totalDisps));
+      // Escalates carry the substantive/no-work split (kusabi #165): an
+      // escalated chain whose worker never produced a change set is a
+      // different failure from substantive work that was rejected.  The
+      // count and percentage stay exactly as before — the split only
+      // annotates the label.  `n/a` = rounds never recorded whether the
+      // worktree changed (old records) — never folded into no-work.
+      let label = key;
+      if (key === "escalate" && dc.escalate > 0 && stats.escalateSplit) {
+        const es = stats.escalateSplit;
+        const parts = [];
+        if (es.substantive > 0) parts.push(`substantive ${es.substantive}`);
+        if (es.noWork > 0) parts.push(`no-work ${es.noWork}`);
+        if (es.unknown > 0) parts.push(`n/a ${es.unknown}`);
+        if (parts.length > 0) label = `${key} (${parts.join(", ")})`;
+      }
+      lines.push(line(label, dc[key], totalDisps));
     }
   }
   if (dc.other > 0) {
@@ -958,6 +993,20 @@ export function renderComparison(statsBefore, statsAfter, cutoff) {
     if (cb > 0 || ca > 0) {
       lines.push(col(`  ${key}`, `${cb}/${totalB}`, `${ca}/${totalA}`));
     }
+  }
+  // Escalate split (kusabi #165): substantive / no-work / n/a per side,
+  // shown only when at least one side has escalates.  The disposition
+  // totals above are untouched.
+  if ((statsBefore.dispositionCounts.escalate || 0) > 0 || (statsAfter.dispositionCounts.escalate || 0) > 0) {
+    const splitStr = (s) => {
+      const es = s.escalateSplit || { substantive: 0, noWork: 0, unknown: 0 };
+      const parts = [];
+      if (es.substantive > 0) parts.push(`subst ${es.substantive}`);
+      if (es.noWork > 0) parts.push(`no-work ${es.noWork}`);
+      if (es.unknown > 0) parts.push(`n/a ${es.unknown}`);
+      return parts.length > 0 ? parts.join(", ") : "—";
+    };
+    lines.push(col("  escalate split", splitStr(statsBefore), splitStr(statsAfter)));
   }
 
   // Review verdicts
