@@ -256,6 +256,70 @@ describe("finding.source migration on a pre-existing database file", () => {
   });
 });
 
+describe("round.worktree_changed migration (kusabi #165)", () => {
+  it("adds the column to a database created before it existed, preserving old rows as NULL", () => {
+    const dbPath = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-migrate-test-")), "metrics.db");
+
+    // Simulate a database written before round.worktree_changed existed —
+    // the full pre-#165 column set, with no worktree_changed.
+    const legacyDb = new DatabaseSync(dbPath);
+    legacyDb.exec(`
+      CREATE TABLE round (
+        chain_id TEXT,
+        round INTEGER,
+        started_at TEXT,
+        started_ms INTEGER,
+        model_entry TEXT,
+        tier_before INTEGER,
+        tier_after INTEGER,
+        verdict TEXT,
+        probes_green INTEGER,
+        disposition TEXT,
+        rework_count INTEGER,
+        findings_text TEXT,
+        implement_in INTEGER,
+        implement_out INTEGER,
+        implement_cost REAL,
+        review_in INTEGER,
+        review_out INTEGER,
+        review_cost REAL,
+        PRIMARY KEY (chain_id, round)
+      )
+    `);
+    legacyDb.prepare("INSERT INTO round (chain_id, round, started_at, started_ms, disposition) VALUES (?, ?, ?, ?, ?)")
+      .run("chain-legacy", 1, "2026-07-22T09:00:00.000Z", Date.parse("2026-07-22T09:00:00.000Z"), "escalate");
+    if (typeof legacyDb.close === "function") legacyDb.close();
+
+    // Re-opening through openMetricsDb must migrate in place and must NOT
+    // rewrite the old row's NULL worktree_changed — NULL is "unknown",
+    // never "no-work".
+    const db = openMetricsDb(dbPath);
+    const legacyRow = db.prepare("SELECT * FROM round WHERE chain_id = ?").get("chain-legacy");
+    assert.equal(legacyRow.disposition, "escalate");
+    assert.equal(legacyRow.worktree_changed, null);
+
+    // New rows written after migration store the three-valued flag.
+    upsertRound(db, {
+      chainId: "chain-new", round: 1, startedAt: null, startedMs: null, modelEntry: null,
+      tierBefore: null, tierAfter: null, verdict: null, probesGreen: null, disposition: "escalate",
+      reworkCount: null, findingsText: null, worktreeChanged: 0,
+      implementIn: null, implementOut: null, implementCost: null,
+      reviewIn: null, reviewOut: null, reviewCost: null,
+    });
+    const newRow = db.prepare("SELECT worktree_changed FROM round WHERE chain_id = ?").get("chain-new");
+    assert.equal(newRow.worktree_changed, 0);
+
+    fs.rmSync(path.dirname(dbPath), { recursive: true, force: true });
+  });
+
+  it("openMetricsDb is idempotent on a database that already has the column", () => {
+    const dbPath = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-migrate-test-")), "metrics.db");
+    openMetricsDb(dbPath);
+    assert.doesNotThrow(() => openMetricsDb(dbPath));
+    fs.rmSync(path.dirname(dbPath), { recursive: true, force: true });
+  });
+});
+
 describe("transactions", () => {
   it("a rolled-back transaction leaves no partial rows (crash-mid-ingest safety)", () => {
     const db = openMetricsDb(":memory:");

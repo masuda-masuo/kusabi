@@ -107,6 +107,7 @@ CREATE TABLE IF NOT EXISTS round (
   tier_after INTEGER,
   verdict TEXT,
   probes_green INTEGER,
+  worktree_changed INTEGER,
   disposition TEXT,
   rework_count INTEGER,
   findings_text TEXT,
@@ -206,6 +207,10 @@ export function openMetricsDb(dbPath) {
   db.exec(SCHEMA);
   // Migration for databases created before `finding.source` existed.
   ensureColumn(db, "finding", "source", "TEXT");
+  // Migration for databases created before `round.worktree_changed` existed
+  // (kusabi #165 — the escalate substantive/no-work split).  Old rows keep
+  // NULL, which the report surfaces render as "unknown", never as no-work.
+  ensureColumn(db, "round", "worktree_changed", "INTEGER");
   return db;
 }
 
@@ -415,11 +420,11 @@ export function upsertRound(db, row) {
   db.prepare(`
     INSERT OR REPLACE INTO round
       (chain_id, round, started_at, started_ms, model_entry, tier_before, tier_after,
-       verdict, probes_green, disposition, rework_count, findings_text,
+       verdict, probes_green, worktree_changed, disposition, rework_count, findings_text,
        implement_in, implement_out, implement_cost, review_in, review_out, review_cost)
     VALUES
       ($chainId, $round, $startedAt, $startedMs, $modelEntry, $tierBefore, $tierAfter,
-       $verdict, $probesGreen, $disposition, $reworkCount, $findingsText,
+       $verdict, $probesGreen, $worktreeChanged, $disposition, $reworkCount, $findingsText,
        $implementIn, $implementOut, $implementCost, $reviewIn, $reviewOut, $reviewCost)
   `).run({
     chainId: row.chainId,
@@ -431,6 +436,11 @@ export function upsertRound(db, row) {
     tierAfter: row.tierAfter ?? null,
     verdict: row.verdict ?? null,
     probesGreen: row.probesGreen ?? null,
+    // Three-valued (kusabi #165): 1 = changed, 0 = measured no change,
+    // NULL = never measured (old record / pre-probe death).  Absent is a
+    // fact worth preserving — the report renders NULL as "unknown", never
+    // as no-work.
+    worktreeChanged: row.worktreeChanged ?? null,
     disposition: row.disposition ?? null,
     reworkCount: row.reworkCount ?? null,
     findingsText: row.findingsText ?? null,

@@ -49,6 +49,7 @@ function round({
   reviewUsage = null,
   reviewFirstUsage = null,
   strategistUsage = null,
+  worktreeChanged = null,
 } = {}) {
   const safeFindings = Array.isArray(findings) ? findings : (findings === null ? null : undefined);
   const safeFindingFiles = Array.isArray(findingFiles) ? findingFiles : (findingFiles === null ? null : undefined);
@@ -76,6 +77,10 @@ function round({
   if (reviewUsage) r.reviewUsage = reviewUsage;
   if (reviewFirstUsage) r.reviewFirstUsage = reviewFirstUsage;
   if (strategistUsage) r.strategistUsage = strategistUsage;
+  // worktreeChanged (kusabi #165): null (default) means the field stays
+  // ABSENT, exercising the old-record "unknown" path; pass true/false to
+  // record a measured change/no-change.
+  if (worktreeChanged !== null) r.worktreeChanged = worktreeChanged;
   return r;
 }
 
@@ -543,6 +548,126 @@ describe("computeStats", () => {
 });
 
 // ---------------------------------------------------------------------------
+// computeStats — escalate substantive/no-work split (kusabi #165)
+// ---------------------------------------------------------------------------
+
+describe("computeStats — escalate split", () => {
+  it("splits escalated chains into substantive / no-work / unknown, preserving the total", () => {
+    const chains = [
+      // Substantive: round 1 changed the worktree, chain still escalated.
+      chain({
+        chainId: "esc-substantive",
+        rounds: [
+          round({ round: 1, verdict: "needs-attention", disposition: "escalate", worktreeChanged: true }),
+        ],
+      }),
+      // No-work: round measured no change (the 722-token zero-change shape).
+      chain({
+        chainId: "esc-nowork",
+        rounds: [
+          round({
+            round: 1,
+            verdict: "needs-attention",
+            disposition: "escalate",
+            worktreeChanged: false,
+            implementUsage: { available: true, input: 4000, output: 722, cost: 0.0004 },
+          }),
+        ],
+      }),
+      // Unknown: old record — no worktreeChanged field at all.
+      chain({
+        chainId: "esc-unknown",
+        rounds: [
+          round({ round: 1, verdict: "needs-attention", disposition: "escalate" }),
+        ],
+      }),
+      // Non-escalated chains must not touch the split at all.
+      chain({
+        chainId: "acc",
+        rounds: [
+          round({ round: 1, verdict: "approve", disposition: "accept", worktreeChanged: true }),
+        ],
+      }),
+      chain({
+        chainId: "disc",
+        rounds: [
+          round({ round: 1, verdict: "discard", disposition: "discard", worktreeChanged: false }),
+        ],
+      }),
+    ];
+
+    const stats = computeStats(chains);
+    // Total per disposition stays exactly as before the split existed.
+    assert.equal(stats.dispositionCounts.escalate, 3);
+    assert.equal(stats.dispositionCounts.accept, 1);
+    assert.equal(stats.dispositionCounts.discard, 1);
+    assert.deepEqual(stats.escalateSplit, { substantive: 1, noWork: 1, unknown: 1 });
+    // The split sums to the escalate total — invariant for longitudinal
+    // comparisons.
+    const { substantive, noWork, unknown } = stats.escalateSplit;
+    assert.equal(substantive + noWork + unknown, stats.dispositionCounts.escalate);
+  });
+
+  it("a multi-round escalate is substantive when ANY round changed the worktree", () => {
+    const chains = [
+      chain({
+        chainId: "esc-multi",
+        rounds: [
+          round({ round: 1, verdict: "needs-attention", disposition: "rework", worktreeChanged: true }),
+          round({ round: 2, verdict: "needs-attention", disposition: "escalate", worktreeChanged: false }),
+        ],
+      }),
+    ];
+    const stats = computeStats(chains);
+    assert.equal(stats.dispositionCounts.escalate, 1);
+    assert.deepEqual(stats.escalateSplit, { substantive: 1, noWork: 0, unknown: 0 });
+  });
+
+  it("an escalated chain with no measured rounds at all is unknown, never no-work", () => {
+    const chains = [
+      chain({
+        chainId: "esc-old",
+        rounds: [
+          round({ round: 1, verdict: "needs-attention", disposition: "escalate" }),
+        ],
+      }),
+    ];
+    const stats = computeStats(chains);
+    assert.deepEqual(stats.escalateSplit, { substantive: 0, noWork: 0, unknown: 1 });
+  });
+
+  it("no escalated chains → the split is all zeros", () => {
+    const chains = [
+      chain({
+        chainId: "c1",
+        rounds: [round({ round: 1, verdict: "approve", disposition: "accept" })],
+      }),
+    ];
+    const stats = computeStats(chains);
+    assert.equal(stats.dispositionCounts.escalate, 0);
+    assert.deepEqual(stats.escalateSplit, { substantive: 0, noWork: 0, unknown: 0 });
+  });
+
+  it("time-filtered stats classify over the same in-range rounds that set the disposition", () => {
+    // Round 1 (changed) is outside the range; the in-range round 2 is the
+    // escalate round with measured no-change → the split must agree with
+    // the in-range disposition (no-work), not with the full chain history.
+    const chains = [
+      chain({
+        chainId: "esc-window",
+        rounds: [
+          round({ round: 1, startedAt: "2026-01-01T00:00:00.000Z", verdict: "needs-attention", disposition: "rework", worktreeChanged: true }),
+          round({ round: 2, startedAt: "2026-07-01T00:00:00.000Z", verdict: "needs-attention", disposition: "escalate", worktreeChanged: false }),
+        ],
+      }),
+    ];
+    const stats = computeStats(chains, { since: "2026-06-01T00:00:00.000Z" });
+    assert.equal(stats.dispositionCounts.escalate, 1);
+    assert.deepEqual(stats.escalateSplit, { substantive: 0, noWork: 1, unknown: 0 });
+  });
+});
+
+// ---------------------------------------------------------------------------
 // renderChainStats
 // ---------------------------------------------------------------------------
 
@@ -578,6 +703,56 @@ describe("renderChainStats", () => {
     // The heuristic label must appear near the prior-unresolved number
     assert.ok(output.includes("heuristic"));
     assert.ok(output.includes("Flagged as unresolved"));
+  });
+
+  it("annotates the escalate disposition line with the substantive/no-work split", () => {
+    const chains = [
+      chain({
+        chainId: "esc-sub",
+        rounds: [round({ round: 1, verdict: "needs-attention", disposition: "escalate", worktreeChanged: true })],
+      }),
+      chain({
+        chainId: "esc-nw",
+        rounds: [round({ round: 1, verdict: "needs-attention", disposition: "escalate", worktreeChanged: false })],
+      }),
+      chain({
+        chainId: "esc-unk",
+        rounds: [round({ round: 1, verdict: "needs-attention", disposition: "escalate" })],
+      }),
+    ];
+    const output = renderChainStats(computeStats(chains));
+    const escLine = output.split("\n").find((l) => l.includes("escalate"));
+    assert.ok(escLine, "escalate disposition line must exist");
+    assert.match(escLine, /escalate \(substantive 1, no-work 1, n\/a 1\)/);
+    // The total and its percentage are unchanged by the annotation.
+    assert.match(escLine, /3 \(100\.0%\)/);
+  });
+
+  it("keeps the plain escalate line when no escalate has a classifiable split", () => {
+    // Unknown-only split still annotates — absent data must be visible, not
+    // silently rendered as no-work 0.
+    const chains = [
+      chain({
+        chainId: "esc-unk",
+        rounds: [round({ round: 1, verdict: "needs-attention", disposition: "escalate" })],
+      }),
+    ];
+    const output = renderChainStats(computeStats(chains));
+    const escLine = output.split("\n").find((l) => l.includes("escalate"));
+    assert.match(escLine, /escalate \(n\/a 1\)/);
+  });
+
+  it("renders a plain 'escalate' line when there are no escalates at all", () => {
+    const chains = [
+      chain({
+        chainId: "c1",
+        rounds: [round({ round: 1, verdict: "approve", disposition: "accept" })],
+      }),
+    ];
+    const output = renderChainStats(computeStats(chains));
+    const escLine = output.split("\n").find((l) => l.includes("escalate"));
+    assert.ok(escLine);
+    assert.doesNotMatch(escLine, /\(substantive|no-work|n\/a/);
   });
 });
 
@@ -1349,6 +1524,53 @@ describe("renderComparison tier labelling", () => {
     assert.match(out, /peak tier per chain/);
     // Must not claim a single shared tier count when there isn't one.
     assert.doesNotMatch(out, /tier \d+ of \d+/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// renderComparison — escalate substantive/no-work split (kusabi #165)
+// ---------------------------------------------------------------------------
+
+describe("renderComparison escalate split", () => {
+  it("shows the split for both sides when either side has escalates", () => {
+    const chainsBefore = [
+      chain({
+        chainId: "esc-before",
+        rounds: [
+          round({ round: 1, startedAt: "2026-01-01T00:00:00.000Z", verdict: "needs-attention", disposition: "escalate", worktreeChanged: true }),
+        ],
+      }),
+    ];
+    const chainsAfter = [
+      chain({
+        chainId: "esc-after",
+        rounds: [
+          round({ round: 1, startedAt: "2026-07-01T00:00:00.000Z", verdict: "needs-attention", disposition: "escalate", worktreeChanged: false }),
+        ],
+      }),
+    ];
+
+    const before = computeStats(chainsBefore, { until: "2026-06-01T00:00:00.000Z" });
+    const after = computeStats(chainsAfter, { since: "2026-06-01T00:00:00.000Z" });
+    const output = renderComparison(before, after, "2026-06-01T00:00:00.000Z");
+    assert.match(output, /escalate split/);
+    assert.match(output, /subst 1/);       // before side
+    assert.match(output, /no-work 1/);     // after side
+    // The disposition totals themselves are untouched by the split line.
+    assert.match(output, /escalate\s+1\/1/);
+  });
+
+  it("omits the split line when neither side has escalates", () => {
+    const chains = [
+      chain({
+        chainId: "c1",
+        rounds: [round({ round: 1, startedAt: "2026-01-01T00:00:00.000Z", verdict: "approve", disposition: "accept" })],
+      }),
+    ];
+    const before = computeStats(chains, { until: "2026-06-01T00:00:00.000Z" });
+    const after = computeStats(chains, { since: "2026-06-01T00:00:00.000Z" });
+    const output = renderComparison(before, after, "2026-06-01T00:00:00.000Z");
+    assert.doesNotMatch(output, /escalate split/);
   });
 });
 

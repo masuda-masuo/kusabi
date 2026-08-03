@@ -22,6 +22,8 @@
 // no per-model price table to rot, but it must never be presented as
 // currency.
 
+import { classifyEscalate } from "./chain-substance.mjs";
+
 const WEIGHT_INPUT = 1;
 const WEIGHT_OUTPUT = 5;
 const WEIGHT_CACHE_WRITE = 1.25;
@@ -168,6 +170,17 @@ function tableExists(db, table) {
   ).get({ name: table }) !== undefined;
 }
 
+/**
+ * Whether `column` exists on `table` — the column-level analogue of
+ * tableExists.  `round.worktree_changed` (#165) was added after real
+ * on-disk stores already existed; a store written before it must render its
+ * escalated chains as "unknown", not crash on `no such column`.
+ */
+function tableHasColumn(db, table, column) {
+  return db.prepare(`PRAGMA table_info(${table})`).all()
+    .some((c) => c.name === column);
+}
+
 function isStoreEmpty(db) {
   const tables = ["source_file", "session", "turn", "chain", "round", "finding"];
   if (tableExists(db, "job")) tables.push("job");
@@ -216,7 +229,14 @@ function fetchChains(db) {
 }
 
 function fetchRounds(db) {
-  return db.prepare(`SELECT chain_id, round, started_at, started_ms, disposition FROM round`).all();
+  // `worktree_changed` (#165) may be absent from stores written before the
+  // column existed — this surface opens READ-ONLY and can never migrate, so
+  // the select degrades to omitting the column and rows read as "unknown".
+  const hasWorktreeChanged = tableHasColumn(db, "round", "worktree_changed");
+  const sql = hasWorktreeChanged
+    ? `SELECT chain_id, round, started_at, started_ms, disposition, worktree_changed FROM round`
+    : `SELECT chain_id, round, started_at, started_ms, disposition FROM round`;
+  return db.prepare(sql).all();
 }
 
 /** Callers must check `tableExists(db, "job")` first (pre-#154 store files
@@ -480,6 +500,12 @@ function computeBriefOutcome(inWindowChains, roundsByChain) {
     let chainsWithNoRounds = 0;
     /** @type {Record<string, Record<string, Record<string, number>>>} */
     const table = {};
+    // Escalate split (kusabi #165), same definition as chain-stats.mjs:
+    // of the chains whose FINAL disposition is escalate, how many had a
+    // worker that produced a change set (substantive) vs never produced one
+    // (no-work) vs never recorded whether it did (unknown — old records /
+    // pre-probe death).  substantive + noWork + unknown === escalated.
+    const escalateSplit = { escalated: 0, substantive: 0, noWork: 0, unknown: 0 };
     for (const c of chains) {
       const rounds = roundsByChain.get(c.chain_id) || [];
       if (rounds.length === 0) {
@@ -488,6 +514,13 @@ function computeBriefOutcome(inWindowChains, roundsByChain) {
       }
       const smokeLabel = c.brief_has_smoke ? "Smoke present" : "Smoke absent";
       const disp = finalDisposition(c.chain_id, roundsByChain) ?? "(no disposition)";
+      if (disp === "escalate") {
+        escalateSplit.escalated += 1;
+        const label = classifyEscalate(rounds);
+        if (label === "substantive") escalateSplit.substantive += 1;
+        else if (label === "no-work") escalateSplit.noWork += 1;
+        else escalateSplit.unknown += 1;
+      }
       const bucket = roundBucket(rounds.length);
       if (!table[smokeLabel]) table[smokeLabel] = {};
       if (!table[smokeLabel][disp]) table[smokeLabel][disp] = emptyBucketRow();
@@ -503,6 +536,7 @@ function computeBriefOutcome(inWindowChains, roundsByChain) {
       orchModel: model,
       chainCount: chains.length,
       chainsWithNoRounds,
+      escalateSplit,
       table,
       briefChars: {
         min: briefChars.length ? Math.min(...briefChars) : null,
@@ -865,6 +899,22 @@ function renderBriefOutcome(blocks) {
     lines.push(`  orch_model: ${b.orchModel} (${fmtCount(b.chainCount)} chains)`);
     lines.push(`    chains with no rounds: ${fmtCount(b.chainsWithNoRounds)}`);
     lines.push(...renderBriefOutcomeTable(b.table));
+    if (b.escalateSplit && b.escalateSplit.escalated > 0) {
+      const es = b.escalateSplit;
+      const classifiable = es.substantive + es.noWork;
+      if (classifiable === 0) {
+        // Every escalated chain predates the worktree_changed field (or died
+        // before probes) — the split cannot be computed at all.  Show the
+        // absence explicitly, never a silent "no-work 0".
+        lines.push(`    escalated chains: ${fmtCount(es.escalated)} (no-work: ?)`);
+      } else {
+        const parts = [];
+        if (es.substantive > 0) parts.push(`substantive ${fmtCount(es.substantive)}`);
+        if (es.noWork > 0) parts.push(`no-work ${fmtCount(es.noWork)}`);
+        if (es.unknown > 0) parts.push(`unknown ${fmtCount(es.unknown)}`);
+        lines.push(`    escalated chains: ${fmtCount(es.escalated)} (${parts.join(", ")})`);
+      }
+    }
     lines.push(`    brief_chars: min ${fmtNum(b.briefChars.min)}  median ${fmtNum(b.briefChars.median)}  max ${fmtNum(b.briefChars.max)}`);
     lines.push(
       `    with ## Deliverables: ${fmtCount(b.withDeliverables)}/${fmtCount(b.totalChains)} `

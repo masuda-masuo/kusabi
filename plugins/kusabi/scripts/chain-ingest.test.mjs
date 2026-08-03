@@ -75,6 +75,7 @@ function chainModernFixture() {
         tierAfter: 0,
         verdict: "needs-attention",
         probesGreen: true,
+        worktreeChanged: true,
         disposition: { disposition: "rework" },
         reworkCount: 0,
         findingsText: "1. [medium] something off in src/a.mjs",
@@ -102,6 +103,7 @@ function chainModernFixture() {
         tierAfter: 0,
         verdict: "approve-partial",
         probesGreen: true,
+        worktreeChanged: false,
         disposition: { disposition: "accept-with-followup" },
         reworkCount: 1,
         findingsText: "(none)",
@@ -201,6 +203,9 @@ describe("parseChainRecord — chain-modern shape (has findings + findingFiles)"
     // Round 2's reviewUsage.available is false -> null fields, not 0.
     assert.equal(parsed.roundRows[1].reviewIn, null);
     assert.equal(parsed.roundRows[1].reviewOut, null);
+    // worktreeChanged (kusabi #165) is ingested three-valued.
+    assert.equal(parsed.roundRows[0].worktreeChanged, 1);
+    assert.equal(parsed.roundRows[1].worktreeChanged, 0);
 
     assert.equal(parsed.findingRows.length, 1);
     assert.equal(parsed.findingRows[0].severity, "medium");
@@ -247,6 +252,9 @@ describe("parseChainRecord — chain-old shape (neither findings nor findingFile
     assert.equal(parsed.roundRows[2].reviewIn, null);
     assert.equal(parsed.roundRows[2].reviewOut, null);
     assert.equal(parsed.roundRows[2].reviewCost, null);
+    // Pre-#165 records carry no worktreeChanged -> NULL (unknown), never 0.
+    assert.equal(parsed.roundRows[0].worktreeChanged, null);
+    assert.equal(parsed.roundRows[2].worktreeChanged, null);
   });
 
   it("survives orch_model / orch_session / orch_date verbatim", () => {
@@ -297,6 +305,28 @@ describe("parseChainRecord — malformed / missing input", () => {
     });
     assert.equal(parsed.findingRows.length, 0);
     assert.equal(parsed.hasStructuredFindings, false);
+  });
+
+  it("ingests worktreeChanged as NULL when absent or unmeasurable (kusabi #165 — absent is not no-change)", () => {
+    // A round that died before probes (provider death) has no worktreeChanged.
+    const parsed = parseChainRecord({
+      chainId: "chain-infra-death",
+      records: [
+        {
+          round: 1,
+          startedAt: "2026-07-26T10:00:00.000Z",
+          implementUsage: { available: false },
+        },
+      ],
+    });
+    assert.equal(parsed.roundRows.length, 1);
+    assert.equal(parsed.roundRows[0].worktreeChanged, null);
+    // An explicit null on the record is preserved as null, not coerced to 0.
+    const parsedNull = parseChainRecord({
+      chainId: "chain-explicit-null",
+      records: [{ round: 1, worktreeChanged: null }],
+    });
+    assert.equal(parsedNull.roundRows[0].worktreeChanged, null);
   });
 });
 
