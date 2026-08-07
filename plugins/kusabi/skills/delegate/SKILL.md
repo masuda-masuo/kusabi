@@ -68,13 +68,16 @@ end up re-running a doomed cheap round three times.
   markdown copy of the issue body and claimed done). Accepted item syntaxes: unordered
   bullets (`-`, `*`, `+`), ordered items (`1.`, `1)`), indented bullets, and lines inside
   a fenced code block; the first backtick-quoted token (or first whitespace-delimited
-  token) is taken as the path.
+  token) is taken as the path. The heading may carry a trailing annotation — e.g.
+  `## Deliverables (files that must change; notes are NOT deliverables)` — and is
+  still recognised (word-boundary prefix match, case-sensitive).
 - **Declare `## Smoke` when runtime behaviour is the point.** The smoke probe runs those
   commands in the container and compares exit codes. A gate that only lints proves the
   code parses, not that it runs. Accepted item syntaxes: unordered bullets, ordered
   items, indented bullets, or a fenced code block (one command per line, exit 0);
   bullet entries require a backtick-quoted command with an optional `exit <N>`
-  annotation.
+  annotation. The heading may carry a trailing annotation — e.g. `## Smoke (run in
+  container)` — and is still recognised.
 - **Inline the whole spec. Never open with "read issue #N first."** The brief is the
   contract; a pointer is not.
 - **Freeze outcomes, not architecture.** Acceptance criteria must describe observable

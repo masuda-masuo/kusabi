@@ -225,6 +225,27 @@ describe("parseDeliverables", () => {
     assert.deepEqual(parseDeliverables(text), []);
   });
 
+  it("parses paths under an annotated heading (kusabi #167)", () => {
+    const text = "## Deliverables (files that must change; notes are NOT deliverables)\n- `plugins/kusabi/scripts/foo.mjs`\n- `docs/DESIGN.md`\n";
+    assert.deepEqual(parseDeliverables(text), ["plugins/kusabi/scripts/foo.mjs", "docs/DESIGN.md"]);
+  });
+
+  it("parses paths under colon and dash annotated headings (kusabi #167)", () => {
+    const text = "## Deliverables:\n- `file1.js`\n## Deliverables — required\n- `file2.py`\n";
+    assert.deepEqual(parseDeliverables(text), ["file1.js", "file2.py"]);
+  });
+
+  it("does not treat word-extension headings as Deliverables (kusabi #167)", () => {
+    assert.deepEqual(parseDeliverables("## Deliverables2\n- `file1.js`\n"), []);
+    assert.deepEqual(parseDeliverables("## Deliverable\n- `file1.js`\n"), []);
+    assert.deepEqual(parseDeliverables("## DeliverablesExtra\n- `file1.js`\n"), []);
+  });
+
+  it("annotated heading with nothing parseable yields empty array (kusabi #167)", () => {
+    const text = "## Deliverables (notes only)\njust prose, no bullet syntax\n";
+    assert.deepEqual(parseDeliverables(text), []);
+  });
+
   it("never throws on any input", () => {
     assert.doesNotThrow(() => parseDeliverables(null));
     assert.doesNotThrow(() => parseDeliverables(undefined));
@@ -440,6 +461,25 @@ describe("parseSmoke", () => {
     assert.deepEqual(parseSmoke(text), []);
   });
 
+  it("parses commands under an annotated heading (kusabi #167)", () => {
+    const text = "## Smoke (run in container)\n- `node scripts/x.mjs --help`\n- `npm test` exit 1\n";
+    const result = parseSmoke(text);
+    assert.deepEqual(result, [
+      { command: "node scripts/x.mjs --help", expectedExit: 0 },
+      { command: "npm test", expectedExit: 1 },
+    ]);
+  });
+
+  it("does not treat word-extension headings as Smoke (kusabi #167)", () => {
+    assert.deepEqual(parseSmoke("## Smoketest\n- `npm test`\n"), []);
+    assert.deepEqual(parseSmoke("## Smoke2\n- `npm test`\n"), []);
+  });
+
+  it("annotated heading with nothing parseable yields empty array (kusabi #167)", () => {
+    const text = "## Smoke (optional)\njust prose, no bullet or code block\n";
+    assert.deepEqual(parseSmoke(text), []);
+  });
+
   it("never throws on any input", () => {
     assert.doesNotThrow(() => parseSmoke(null));
     assert.doesNotThrow(() => parseSmoke(undefined));
@@ -472,6 +512,24 @@ describe("hasSectionHeading", () => {
   it("returns true even when section body is unparseable prose", () => {
     assert.equal(hasSectionHeading("## Deliverables\njust prose\nno bullets\n", "Deliverables"), true);
     assert.equal(hasSectionHeading("## Smoke\njust prose\n", "Smoke"), true);
+  });
+
+  it("returns true for annotated headings (kusabi #167)", () => {
+    assert.equal(hasSectionHeading("## Deliverables (files that must change)\n- `file.js`\n", "Deliverables"), true);
+    assert.equal(hasSectionHeading("## Deliverables:\n- `file.js`\n", "Deliverables"), true);
+    assert.equal(hasSectionHeading("## Smoke (run in container)\n- `npm test`\n", "Smoke"), true);
+  });
+
+  it("returns true for annotated heading even with no parseable items (kusabi #167)", () => {
+    assert.equal(hasSectionHeading("## Deliverables (notes only)\njust prose\n", "Deliverables"), true);
+    assert.equal(hasSectionHeading("## Smoke (optional)\njust prose\n", "Smoke"), true);
+  });
+
+  it("returns false for word-extension headings (kusabi #167)", () => {
+    assert.equal(hasSectionHeading("## Deliverables2\n- `file.js`\n", "Deliverables"), false);
+    assert.equal(hasSectionHeading("## Deliverable\n- `file.js`\n", "Deliverables"), false);
+    assert.equal(hasSectionHeading("## Smoketest\n- `npm test`\n", "Smoke"), false);
+    assert.equal(hasSectionHeading("## Smoke2\n- `npm test`\n", "Smoke"), false);
   });
 });
 
