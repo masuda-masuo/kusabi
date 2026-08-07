@@ -24,6 +24,7 @@ import {
   renderStrategistPrompt,
   renderReview,
   renderFollowupDraft,
+  renderReviewRecord,
   extractJson,
   recoverVerdictFromText,
 } from "./render.mjs";
@@ -726,6 +727,66 @@ export function persistChainState({
     strategized,
     followupIssueDraft: chainFollowupDraft,
   });
+}
+
+/**
+ * Write the chain's postable review record (kusabi #52).
+ *
+ * Rendered by the pure `renderReviewRecord` (render.mjs) and written to the
+ * chain's state directory as `review-record.md`.  Called only when the chain
+ * reaches a terminal disposition (accept / accept-with-followup / escalate /
+ * max-rounds); cancelled and failed chains never get one.  Regeneration
+ * overwrites the previous record.  The companion only writes the local file
+ * and returns its path — posting it to the archive repository is
+ * orchestrator-exclusive.
+ *
+ * @param {object} opts
+ * @param {string} opts.chainDir
+ * @param {string} opts.chainId
+ * @param {string} opts.container
+ * @param {Array}  [opts.modelChain]
+ * @param {number} [opts.maxRounds]
+ * @param {string} [opts.brief]
+ * @param {object|null} [opts.orchestrator]
+ * @param {Array}  [opts.records]       — round records (used as-is).
+ * @param {object} [opts.chainTotals]   — existing chainTotals; recomputed
+ *                                       from records only when not given.
+ * @param {{disposition: string, round: number, reason?: string|null}} opts.disposition
+ *                                       — the FINAL disposition.
+ * @param {string} [opts.label]         — repo/cwd label for the header.
+ * @param {string} [opts.finishedAt]    — ISO timestamp; defaults to now.
+ * @returns {string} The absolute path of the written record file.
+ */
+export function writeReviewRecord({
+  chainDir, chainId, container, modelChain, maxRounds, brief, orchestrator,
+  records, chainTotals, disposition, round, label, finishedAt,
+}) {
+  const safeRecords = Array.isArray(records) ? records : [];
+  const markdown = renderReviewRecord({
+    chainId,
+    container,
+    label,
+    brief,
+    orchestrator,
+    modelChain,
+    maxRounds,
+    records: safeRecords,
+    chainTotals: chainTotals ?? computeChainTotals(safeRecords),
+    disposition: {
+      disposition: disposition?.disposition ?? "unknown",
+      round,
+      reason: disposition?.reason ?? null,
+    },
+    finishedAt,
+  });
+  const recordPath = path.join(chainDir, "review-record.md");
+  fs.mkdirSync(chainDir, { recursive: true });
+  // Atomic write: readers must never observe a truncated record — the file is
+  // posted as authoritative by the orchestrator.
+  const tmpPath = recordPath + ".tmp";
+  fs.writeFileSync(tmpPath, markdown, "utf8");
+  fs.renameSync(tmpPath, recordPath);
+  return recordPath;
 }
 
 /**

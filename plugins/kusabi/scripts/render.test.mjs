@@ -9,6 +9,7 @@ import {
   renderBaseFacts,
   renderFollowupDraft,
   renderStrategistPrompt,
+  renderReviewRecord,
   recoverVerdictFromText,
 } from "./render.mjs";
 import { sampleParsed } from "./fixtures.mjs";
@@ -1272,5 +1273,181 @@ describe("renderChainShow with control record", () => {
     ];
     const result = renderChainShow(minimalChain, rounds, [], null);
     assert.match(result, /status: accepted at round 1/);
+  });
+});
+
+// renderReviewRecord — postable review record (kusabi #52)
+// ---------------------------------------------------------------------------
+
+describe("renderReviewRecord", () => {
+  it("renders a minimal record without throwing and contains the chain id", () => {
+    const text = renderReviewRecord({ chainId: "chain-x" });
+    assert.equal(typeof text, "string");
+    assert.match(text, /chain-x/);
+    assert.match(text, /# \[review-record\]/);
+    // Both fill-at-inspection sections are always present.
+    assert.match(text, /## Findings adjudication \(fill at inspection\)/);
+    assert.match(text, /## 判例として \(fill at inspection\)/);
+  });
+
+  it("does not throw on null / undefined / empty records", () => {
+    for (const record of [null, undefined, {}]) {
+      const text = renderReviewRecord(record);
+      assert.equal(typeof text, "string");
+      assert.match(text, /\(unknown\)/);
+    }
+  });
+
+  it("skips null / non-object elements inside a round's findings array", () => {
+    const text = renderReviewRecord({
+      chainId: "chain-x",
+      records: [{
+        round: 1,
+        findings: [null, "stray string", { severity: "low", title: "Real one", file: "src/a.js" }],
+      }],
+    });
+    assert.equal(typeof text, "string");
+    assert.match(text, /- \[low\] Real one \(src\/a\.js\)/);
+    assert.match(text, /\| 1 \| low \| Real one \(src\/a\.js\) \| _fill_ \| _fill_ \|/);
+    // Only the one real finding survives — no row for the malformed elements.
+    assert.doesNotMatch(text, /\| 2 \|/);
+  });
+
+  it("renders a representative two-round chain record end to end", () => {
+    const record = {
+      chainId: "chain-abc",
+      label: "kusabi",
+      brief: "Implement X.\nOrchestrator: claude-fable-5 | session abc123 | 2026-08-08\n## Deliverables\n- src/x.js",
+      orchestrator: { model: "claude-fable-5" },
+      container: "cid-123",
+      modelChain: [["flash/quick"], ["pro/deep"]],
+      maxRounds: 4,
+      finishedAt: "2026-08-08T12:00:00.000Z",
+      records: [
+        {
+          round: 1,
+          modelEntry: "flash/quick",
+          verdict: "approve",
+          disposition: { disposition: "accept" },
+          worktreeChanged: true,
+          probeResults: [
+            { probe: "P1: HEAD clean", passed: true, detail: "HEAD matches base abc123" },
+            { probe: "P2: verify gate", passed: true, detail: JSON.stringify({ gate_passed: true, diff_summary: { changed_files: 1, untracked: 0 } }) },
+            { probe: "P3: deliverables", passed: true, detail: "touches declared deliverables" },
+            { probe: "P4: smoke", passed: true, detail: "no Smoke declared; check skipped" },
+          ],
+          findings: [{ severity: "high", title: "Null pointer", file: "src/x.js", line_start: 42 }],
+          findingsText: "[high] Null pointer (src/x.js:42)",
+        },
+        {
+          round: 2,
+          modelEntry: "flash/quick",
+          verdict: "approve-partial",
+          verdictSource: "recovered-from-token",
+          disposition: { disposition: "escalate", reason: "unverified items remain" },
+          worktreeChanged: false,
+          probeResults: [],
+          findings: [],
+          findingsText: "(no structured findings)",
+        },
+      ],
+      chainTotals: { input: 10, output: 8, reasoning: 2, cacheRead: 100, cacheWrite: 5, cost: 0.42 },
+      disposition: { disposition: "escalated", round: 2, reason: "unverified items remain" },
+    };
+    const text = renderReviewRecord(record);
+
+    // Header: label, chain id, truncated brief first line.
+    assert.match(text, /# \[review-record\] kusabi chain-abc — Implement X\./);
+    assert.match(text, /Orchestrator: claude-fable-5 \| session abc123 \| 2026-08-08 \| finished: 2026-08-08T12:00:00\.000Z/);
+    assert.match(text, /Model chain: flash\/quick → pro\/deep \| container: cid-123/);
+    assert.match(text, /Final disposition: escalated at round 2 of 4/);
+
+    // Per-round verdict/disposition lines.
+    assert.match(text, /Round 1 — model: flash\/quick, verdict: approve \(parsed\), disposition: accept, changed: yes/);
+    assert.match(text, /Round 2 — model: flash\/quick, verdict: approve-partial \(recovered-from-token\), disposition: escalate, changed: no/);
+
+    // Probe one-liners.
+    assert.match(text, /P1: HEAD clean — PASS \(HEAD matches base abc123\)/);
+    assert.match(text, /P2: verify gate — PASS \(gate_passed=true, changed=1, untracked=0\)/);
+    assert.match(text, /P3: deliverables — PASS \(touches declared deliverables\)/);
+    assert.match(text, /P4: smoke — PASS \(no Smoke declared; check skipped\)/);
+
+    // Per-round findings bullets.
+    assert.match(text, /- \[high\] Null pointer \(src\/x\.js:42\)/);
+
+    // Findings adjudication table: one row per finding, 採否/理由 unfilled.
+    assert.match(text, /## Findings adjudication \(fill at inspection\)/);
+    assert.match(text, /\| # \| severity \| finding \| 採否 \| 理由 \|/);
+    assert.match(text, /\| 1 \| high \| Null pointer \(src\/x\.js:42\) \| _fill_ \| _fill_ \|/);
+
+    // Precedent section.
+    assert.match(text, /## 判例として \(fill at inspection\)/);
+    assert.match(text, /_fill: reusable precedent, if any_/);
+
+    // Usage totals from chainTotals.
+    assert.match(text, /input=10 output=8 reasoning=2 cacheRead=100 cacheWrite=5 cost=\$0\.42/);
+  });
+
+  it("zero-findings chains get both fill-at-inspection sections with an explicit no-findings statement", () => {
+    const text = renderReviewRecord({
+      chainId: "chain-zero",
+      brief: "Do the thing.",
+      container: "cid-0",
+      maxRounds: 1,
+      records: [
+        {
+          round: 1,
+          modelEntry: "flash/quick",
+          verdict: "approve",
+          disposition: { disposition: "accept" },
+          worktreeChanged: false,
+          probeResults: [],
+          findings: [],
+          findingsText: "(no structured findings)",
+        },
+      ],
+      chainTotals: { input: 1, output: 1, reasoning: 0, cacheRead: 0, cacheWrite: 0, cost: 0 },
+      disposition: { disposition: "accepted", round: 1 },
+    });
+    assert.match(text, /## Findings adjudication \(fill at inspection\)/);
+    assert.match(text, /_No findings were produced by this chain — nothing to adjudicate\._/);
+    // No table rows when there are no findings.
+    assert.doesNotMatch(text, /\| 1 \|/);
+    assert.match(text, /## 判例として \(fill at inspection\)/);
+    assert.match(text, /_fill: reusable precedent, if any_/);
+    assert.match(text, /input=1 output=1 reasoning=0 cacheRead=0 cacheWrite=0 cost=\$0/);
+  });
+
+  it("falls back to findingsText bullets when structured findings are absent", () => {
+    const text = renderReviewRecord({
+      chainId: "chain-old",
+      records: [
+        {
+          round: 1,
+          modelEntry: "flash/quick",
+          verdict: "needs-attention",
+          disposition: { disposition: "escalate" },
+          worktreeChanged: null,
+          findingsText: "[medium] Slow path (src/a.js:3)\n[low] Style nit (src/b.js:9)",
+        },
+      ],
+      chainTotals: {},
+      disposition: { disposition: "escalated", round: 1 },
+    });
+    assert.match(text, /- \[medium\] Slow path \(src\/a\.js:3\)/);
+    assert.match(text, /\| 1 \| medium \| Slow path \(src\/a\.js:3\) \| _fill_ \| _fill_ \|/);
+    assert.match(text, /\| 2 \| low \| Style nit \(src\/b\.js:9\) \| _fill_ \| _fill_ \|/);
+    // changed: unknown when worktreeChanged is null
+    assert.match(text, /changed: unknown/);
+  });
+
+  it("renders rounds without probe or findings data gracefully", () => {
+    const text = renderReviewRecord({
+      chainId: "chain-bare",
+      records: [{ round: 3 }],
+      disposition: { disposition: "accepted", round: 3 },
+    });
+    assert.match(text, /Round 3 — model: \?, verdict: \? \(parsed\), disposition: \?, changed: unknown/);
+    assert.match(text, /_No findings were produced by this chain — nothing to adjudicate\._/);
   });
 });
