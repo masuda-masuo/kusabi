@@ -43,6 +43,79 @@ describe("extractJson", () => {
     const input = "```json\n{invalid}\n```";
     assert.equal(extractJson(input), null);
   });
+
+  it("recovers bare JSON after prose with a trailing VERDICT line (no fence)", () => {
+    // kusabi #170 round-1 shape: prose, then one line of bare JSON, then a
+    // trailing VERDICT: line.  Whole-text parse fails on the prose and there
+    // is no fence, so recovery must find the JSON substring.
+    const obj = { verdict: "needs-attention", summary: "probe fix looks wrong" };
+    const input = "prose sentence.\n\n" + JSON.stringify(obj) + "\nVERDICT: needs-attention";
+    const result = extractJson(input);
+    assert.deepEqual(result, obj);
+  });
+
+  it("recovers JSON from an unclosed ```json fence with a trailing VERDICT line", () => {
+    // kusabi #170 round-2 shape: prose, then a ```json fence that is never
+    // closed, containing the JSON, then a trailing VERDICT: line.  The lazy
+    // closed-fence regex requires a closing ``` so it never matches here.
+    const obj = { verdict: "needs-attention", summary: "probe fix looks wrong" };
+    const input = "prose.\n```json\n" + JSON.stringify(obj) + "\nVERDICT: needs-attention";
+    const result = extractJson(input);
+    assert.deepEqual(result, obj);
+  });
+
+  it("recovers a review-shaped object with nested braces and escaped quotes", () => {
+    // kusabi #170 criterion 3: nested braces { } and escaped quotes inside
+    // string values must not break recovery in either shape.
+    const obj = {
+      verdict: "needs-attention",
+      summary: "probe output reviewed",
+      findings: [
+        { severity: "low", title: "cosmetic", body: "contains braces { } and \"quotes\"" },
+      ],
+    };
+    const round1 = "prose sentence.\n\n" + JSON.stringify(obj) + "\nVERDICT: needs-attention";
+    const round2 = "prose.\n```json\n" + JSON.stringify(obj) + "\nVERDICT: needs-attention";
+    assert.deepEqual(extractJson(round1), obj);
+    assert.deepEqual(extractJson(round2), obj);
+  });
+
+  it("parses a closed fence with prose around it", () => {
+    const input = "Some prose before.\n```json\n{\"verdict\":\"approve\"}\n```\nSome prose after.";
+    const result = extractJson(input);
+    assert.deepEqual(result, { verdict: "approve" });
+  });
+
+  it("returns null for prose with a stray brace but no parseable JSON", () => {
+    assert.equal(extractJson("prose with a {stray brace and nothing else"), null);
+    assert.equal(extractJson("{a} still no json here"), null);
+  });
+
+  it("does not recover a parseable non-review object quoted in prose", () => {
+    // A probe result quoted in prose is parseable JSON but not a review.
+    // Recovering it would override a correctly recovered VERDICT token and
+    // suppress the #147 unparseable retry — it must be rejected.
+    const input = 'The probe output {"status":"ok","n":3} and the fix is fine.\nVERDICT: approve';
+    assert.equal(extractJson(input), null);
+  });
+
+  it("does not recover a non-review object from token-less garbage output", () => {
+    // With no VERDICT token either, the result must stay null so the
+    // deliberate #147 unparseable retry still fires.
+    assert.equal(extractJson('garbage output with {"status":"ok"} embedded'), null);
+  });
+
+  it("does not recover a non-review object inside an unclosed fence", () => {
+    const input = 'prose.\n```json\n{"status":"ok","n":3}\nVERDICT: approve';
+    assert.equal(extractJson(input), null);
+  });
+
+  it("still parses a non-review object via the whole-text and closed-fence paths", () => {
+    // The review-shape guard applies only to the recovery paths — paths 1
+    // and 2 keep their existing behaviour.
+    assert.deepEqual(extractJson('{"status":"ok"}'), { status: "ok" });
+    assert.deepEqual(extractJson('```json\n{"status":"ok"}\n```'), { status: "ok" });
+  });
 });
 
 // recoverVerdictFromText — verdict recovery (A1/A3)
