@@ -18,6 +18,13 @@
  *
  * A `## ` heading ends the section.  Blank and prose lines are skipped.
  *
+ * Heading match is a word-boundary prefix match (kusabi #167): a `## `
+ * heading opens the named section when its text equals headingName, or
+ * starts with headingName and the character right after is not alphanumeric
+ * or underscore.  Annotations such as `## Deliverables (…)` are therefore
+ * recognised, while `## Deliverables2` / `## Smoketest` are not.  Matching
+ * is case-sensitive.
+ *
  * @param {string|null|undefined} briefText  The full brief text.
  * @param {string}                headingName  e.g. "Deliverables" or "Smoke".
  * @returns {{ items: Array<{content: string, source: "bullet"|"code-block"}>,
@@ -47,7 +54,15 @@ function parseSectionItems(briefText, headingName) {
     // Section boundary: ## heading
     if (!inCodeBlock && trimmed.startsWith("## ")) {
       const heading = trimmed.slice(3).trim();
-      if (heading === headingName) {
+      // Word-boundary prefix match (kusabi #167): the heading matches when it
+      // equals headingName, or starts with it and the character immediately
+      // after is not alphanumeric or underscore — so trailing annotations
+      // like "## Deliverables (…)" are recognised while look-alike headings
+      // like "## Deliverables2" or "## Smoketest" are not.  Case-sensitive.
+      const isHeading =
+        heading === headingName ||
+        (heading.startsWith(headingName) && !/[A-Za-z0-9_]/.test(heading[headingName.length]));
+      if (isHeading) {
         inSection = true;
         headingFound = true;
         continue;
