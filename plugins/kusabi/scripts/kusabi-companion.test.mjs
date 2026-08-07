@@ -948,6 +948,18 @@ describe("runChainDriver resume", () => {
     // The resumed review actually dispatched (kind review, round 3)
     assert.ok(dispatch.calls.some((c) => c.kind === "review"), "review must be dispatched");
 
+    // Terminal disposition => the postable review record exists and its path
+    // is printed in the terminal output (kusabi #52).  The resumed path goes
+    // through the same finalisation point as a fresh chain.
+    const recordPath = path.join(chainDir, "review-record.md");
+    assert.ok(fs.existsSync(recordPath), "review-record.md must exist after a terminal disposition");
+    assert.match(text, /review record: .*review-record\.md/);
+    const recordText = fs.readFileSync(recordPath, "utf8");
+    assert.match(recordText, /# \[review-record\] .* chain-test — Implement X\./);
+    assert.match(recordText, /Final disposition: accepted at round 3 of 4/);
+    assert.match(recordText, /## Findings adjudication \(fill at inspection\)/);
+    assert.match(recordText, /## 判例として \(fill at inspection\)/);
+
     const control = readChainControl(chainDir);
     assert.equal(control.status, "completed");
     assert.equal(control.round, 3);
@@ -1119,6 +1131,11 @@ describe("runChainDriver resume", () => {
     const chainJson = readJson(path.join(chainDir, "chain.json"));
     assert.equal(chainJson.records.length, 1);
     assert.equal(chainJson.records[0].interrupted, true);
+
+    // A cancelled chain produces no review record (kusabi #52) — the record
+    // exists only when a terminal disposition is reached.
+    assert.equal(fs.existsSync(path.join(chainDir, "review-record.md")), false);
+    assert.doesNotMatch(text, /review record:/);
 
     // The persisted partial record is resumable
     const resolution = resolveChainResume({

@@ -55,6 +55,7 @@ import {
   runReviewPhase,
   computeChainTotals,
   persistChainState,
+  writeReviewRecord,
   runStrategizePhase,
   renderAcceptOutcome,
   renderAcceptWithFollowupOutcome,
@@ -896,6 +897,33 @@ export async function runChainDriver({
   let currentTierIndex = resume ? resume.currentTierIndex : 0;
   const startRound = resume ? resume.round : 1;
 
+  // ---- terminal finalisation: write the postable review record and append
+  // its path to the outcome text.  Every terminal disposition funnels
+  // through here (accept / accept-with-followup / escalate / max-rounds), so
+  // `chain` and `chain-resume` cannot diverge.  Cancelled and failed chains
+  // never reach it (kusabi #52).  The record is a convenience artifact: a
+  // write failure must not take the already-decided chain outcome down with
+  // it, so it degrades to a visible note instead of throwing.
+  function finaliseChain(text, disposition, round) {
+    let recordPath = null;
+    let writeError = null;
+    try {
+      recordPath = writeReviewRecord({
+        chainDir, chainId, container, modelChain, maxRounds, brief, orchestrator,
+        records, chainTotals: computeChainTotals(records),
+        disposition, round,
+        label: path.basename(cwd) || null,
+      });
+    } catch (err) {
+      // Best-effort — the outcome text stays intact, but the failure must be
+      // observable or renderer defects hide behind a silently absent record.
+      writeError = err;
+    }
+    return recordPath
+      ? text + "\n\n" + "review record: " + recordPath
+      : text + "\n\n" + "review record: (write failed: " + (writeError?.message || "unknown error") + " — chain state dir " + chainDir + ")";
+  }
+
   // Phases 5–13 (review → disposition → persistence → strategize), shared by
   // fresh rounds and review-resumes.  Mutates the cross-round state above in
   // place; returns { done: true, text } when the chain ended.
@@ -1015,17 +1043,29 @@ export async function runChainDriver({
     // ---- phase 8: disposition handling ----
     if (disposition.disposition === "accept") {
       finalizeChainControl({ chainDir, status: "completed", round });
-      return { done: true, text: renderAcceptOutcome({ chainId, round, chainParsedReview, chainFindingsText }) };
+      return { done: true, text: finaliseChain(
+        renderAcceptOutcome({ chainId, round, chainParsedReview, chainFindingsText }),
+        { disposition: "accepted", round },
+        round,
+      ) };
     }
 
     if (disposition.disposition === "accept-with-followup") {
       finalizeChainControl({ chainDir, status: "completed", round });
-      return { done: true, text: renderAcceptWithFollowupOutcome({ chainId, round, chainParsedReview, chainFindingsText, chainFollowupDraft, brief }) };
+      return { done: true, text: finaliseChain(
+        renderAcceptWithFollowupOutcome({ chainId, round, chainParsedReview, chainFindingsText, chainFollowupDraft, brief }),
+        { disposition: "accepted-with-followup", round },
+        round,
+      ) };
     }
 
     if (disposition.disposition === "escalate") {
       finalizeChainControl({ chainDir, status: "completed", round });
-      return { done: true, text: renderEscalateOutcome({ chainId, round, disposition, orchestrator, roundRecord, records }) };
+      return { done: true, text: finaliseChain(
+        renderEscalateOutcome({ chainId, round, disposition, orchestrator, roundRecord, records }),
+        { disposition: "escalated", round, reason: disposition.reason || null },
+        round,
+      ) };
     }
 
     // ---- phase 9: strategize (structural re-diagnosis before next rework) ----
@@ -1221,7 +1261,11 @@ export async function runChainDriver({
 
     // ---- max rounds reached without acceptance ----
     finalizeChainControl({ chainDir, status: "completed", round: maxRounds });
-    return renderMaxRoundsOutcome({ chainId, maxRounds, records, orchestrator });
+    return finaliseChain(
+      renderMaxRoundsOutcome({ chainId, maxRounds, records, orchestrator }),
+      { disposition: "max-rounds", round: maxRounds },
+      maxRounds,
+    );
   } catch (err) {
     // Exception thrown mid-round — record failure and rethrow
     finalizeChainControl({ chainDir, status: "failed", round: records.length });

@@ -27,6 +27,7 @@ import {
   applyTierEscalation,
   recordReworkEscalation,
   persistChainState,
+  writeReviewRecord,
   collectContainerDiffContext,
   collectReviewContext,
   resolveChainResume,
@@ -2411,6 +2412,109 @@ describe("persistChainState interrupted round", () => {
     });
     const chainJson = readJson(path.join(chainDir, "chain.json"));
     assert.equal(chainJson.records.length, 1);
+  });
+});
+
+// =========================================================================
+// writeReviewRecord — postable review record at a terminal disposition
+// (kusabi #52)
+// =========================================================================
+
+describe("writeReviewRecord", () => {
+  function makeChainDir() {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-review-record-"));
+    const chainDir = path.join(tmp, "chains", "chain-1");
+    fs.mkdirSync(chainDir, { recursive: true });
+    return chainDir;
+  }
+
+  const records = [
+    {
+      round: 1,
+      modelEntry: "flash/quick",
+      verdict: "approve",
+      disposition: { disposition: "accept" },
+      worktreeChanged: true,
+      probeResults: [{ probe: "P1: HEAD clean", passed: true, detail: "HEAD matches base abc123" }],
+      findings: [{ severity: "high", title: "Null pointer", file: "src/x.js", line_start: 42 }],
+    },
+  ];
+
+  it("writes review-record.md with the rendered markdown and returns its path", () => {
+    const chainDir = makeChainDir();
+    const recordPath = writeReviewRecord({
+      chainDir,
+      chainId: "chain-1",
+      container: "cid-1",
+      label: "repo",
+      modelChain: [["flash/quick"]],
+      maxRounds: 4,
+      brief: "Implement X.",
+      orchestrator: null,
+      records,
+      disposition: { disposition: "accepted", round: 1 },
+      round: 1,
+      finishedAt: "2026-08-08T00:00:00.000Z",
+    });
+
+    assert.equal(recordPath, path.join(chainDir, "review-record.md"));
+    assert.ok(fs.existsSync(recordPath));
+
+    const text = fs.readFileSync(recordPath, "utf8");
+    assert.match(text, /# \[review-record\] repo chain-1 — Implement X\./);
+    assert.match(text, /Final disposition: accepted at round 1 of 4/);
+    assert.match(text, /Round 1 — model: flash\/quick, verdict: approve \(parsed\), disposition: accept, changed: yes/);
+    assert.match(text, /- \[high\] Null pointer \(src\/x\.js:42\)/);
+    assert.match(text, /\| 1 \| high \| Null pointer \(src\/x\.js:42\) \| _fill_ \| _fill_ \|/);
+    assert.match(text, /## 判例として \(fill at inspection\)/);
+    // Usage comes from the chain's existing chainTotals (zero here — nothing
+    // recomputed from records).
+    assert.match(text, /input=0 output=0 reasoning=0 cacheRead=0 cacheWrite=0 cost=\$0/);
+  });
+
+  it("uses the given chainTotals verbatim instead of recomputing from rounds", () => {
+    const chainDir = makeChainDir();
+    writeReviewRecord({
+      chainDir,
+      chainId: "chain-1",
+      container: "cid-1",
+      records,
+      disposition: { disposition: "escalated", round: 1 },
+      round: 1,
+      chainTotals: { input: 7, output: 5, reasoning: 1, cacheRead: 20, cacheWrite: 2, cost: 0.11 },
+      finishedAt: "2026-08-08T00:00:00.000Z",
+    });
+    const text = fs.readFileSync(path.join(chainDir, "review-record.md"), "utf8");
+    assert.match(text, /input=7 output=5 reasoning=1 cacheRead=20 cacheWrite=2 cost=\$0\.11/);
+    // The escalate reason flows into the record when given.
+    assert.match(text, /Final disposition: escalated at round 1 of \?/);
+  });
+
+  it("regeneration overwrites the previous record", () => {
+    const chainDir = makeChainDir();
+    writeReviewRecord({
+      chainDir,
+      chainId: "chain-1",
+      container: "cid-1",
+      records,
+      disposition: { disposition: "accepted", round: 1 },
+      round: 1,
+      finishedAt: "2026-08-08T00:00:00.000Z",
+    });
+    writeReviewRecord({
+      chainDir,
+      chainId: "chain-1",
+      container: "cid-1",
+      records,
+      disposition: { disposition: "accepted", round: 2 },
+      round: 2,
+      brief: "Second brief.",
+      finishedAt: "2026-08-08T01:00:00.000Z",
+    });
+    const text = fs.readFileSync(path.join(chainDir, "review-record.md"), "utf8");
+    assert.match(text, /Final disposition: accepted at round 2 of \?/);
+    assert.match(text, /Second brief\./);
+    assert.doesNotMatch(text, /Final disposition: accepted at round 1/);
   });
 });
 
