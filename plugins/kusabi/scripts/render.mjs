@@ -61,19 +61,96 @@ export function renderHeader(job) {
 }
 
 export function extractJson(text) {
+  // Path 1: the whole text is the JSON.
   try {
     return JSON.parse(text);
   } catch {
+    // Path 2: content of a properly closed fenced code block
+    // (``` or ```json), with or without surrounding prose.
     const fenced = text.match(/```(?:json)?\s*([\s\S]*?)```/);
     if (fenced) {
       try {
         return JSON.parse(fenced[1]);
       } catch {
-        return null;
+        // fall through to the recovery paths below
       }
     }
-    return null;
   }
+
+  // Path 3a: unclosed fence — the model opened a ```json fence and never
+  // closed it (kusabi #170 round-2 shape).  Parse the text after the last
+  // unclosed opener, tolerating trailing non-JSON lines (e.g. a VERDICT:).
+  const afterOpener = textAfterUnclosedFence(text);
+  if (afterOpener !== null) {
+    const parsed = jsonParseToleratingTrailingLines(afterOpener);
+    if (isReviewShaped(parsed)) return parsed;
+  }
+
+  // Path 3b: bare JSON embedded in prose with no fence at all (kusabi #170
+  // round-1 shape) — the substring from the first { to the last }.
+  const start = text.indexOf("{");
+  const end = text.lastIndexOf("}");
+  if (start !== -1 && end > start) {
+    try {
+      const parsed = JSON.parse(text.slice(start, end + 1));
+      return isReviewShaped(parsed) ? parsed : null;
+    } catch {
+      return null;
+    }
+  }
+  return null;
+}
+
+const REVIEW_VERDICTS = ["approve", "approve-partial", "needs-attention", "discard"];
+
+/**
+ * Guard for the recovery paths (3a/3b): unlike paths 1 and 2, recovery scans
+ * arbitrary prose, so any quoted JSON — a probe result, an example object —
+ * would otherwise be returned as "the review" and override a correctly
+ * recovered VERDICT token (and suppress the #147 unparseable retry).  Only an
+ * object carrying a schema-valid verdict is accepted as a recovered review.
+ */
+function isReviewShaped(parsed) {
+  return parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)
+    && REVIEW_VERDICTS.includes(parsed.verdict);
+}
+
+/**
+ * Locate the text after the last fence opener (``` or ```json) that is not
+ * closed by a later ```.  Returns null when the text has no unclosed opener
+ * (a properly closed fence is handled by path 2 above).
+ */
+function textAfterUnclosedFence(text) {
+  const openers = [];
+  const openerRe = /```(?:json)?/g;
+  let m;
+  while ((m = openerRe.exec(text)) !== null) openers.push(m);
+  for (let i = openers.length - 1; i >= 0; i--) {
+    const rest = text.slice(openers[i].index + openers[i][0].length);
+    if (!rest.includes("```")) return rest;
+  }
+  return null;
+}
+
+/**
+ * JSON.parse a candidate while tolerating trailing non-JSON lines — e.g. a
+ * "VERDICT: …" token on its own line after the JSON (kusabi #107: the token
+ * can survive the caller's stripping, so recovery must not depend on the
+ * strip having worked).  Trailing lines are dropped one at a time until the
+ * remainder parses.
+ */
+function jsonParseToleratingTrailingLines(candidate) {
+  const lines = candidate.trim().split("\n");
+  for (let i = lines.length; i > 0; i--) {
+    const attempt = lines.slice(0, i).join("\n").trim();
+    if (attempt === "") return null;
+    try {
+      return JSON.parse(attempt);
+    } catch {
+      // drop the next trailing line and retry
+    }
+  }
+  return null;
 }
 
 /**
