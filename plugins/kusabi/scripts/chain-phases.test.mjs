@@ -723,6 +723,74 @@ describe("renderPriorFindings", () => {
     const prev = {};
     assert.equal(renderPriorFindings(prev), "(none)");
   });
+
+  // ---- kusabi #60 step 1: grouped rework brief ----
+  // Design findings come FIRST, explicitly flagged as requiring deliberate
+  // individual treatment; mechanical findings follow as a checklist.  When
+  // every finding is one kind, a single section is emitted.
+
+  it("groups mixed-kind findings: design section first, mechanical checklist after", () => {
+    const prev = {
+      findings: [
+        { severity: "low", title: "Rename", file: "a.js", line_start: 1, kind: "mechanical", body: "b1", recommendation: "rename it" },
+        { severity: "high", title: "Policy call", file: "b.js", line_start: 2, kind: "design", body: "b2", recommendation: "decide" },
+        { severity: "medium", title: "Dead code", file: "c.js", line_start: 3, kind: "mechanical", body: "b3", recommendation: "remove" },
+      ],
+    };
+    const result = renderPriorFindings(prev);
+    const designIdx = result.indexOf("Design findings (require deliberate individual treatment)");
+    const mechIdx = result.indexOf("Mechanical findings (checklist)");
+    assert.ok(designIdx >= 0, result);
+    assert.ok(mechIdx >= 0, result);
+    // Design FIRST, mechanical AFTER.
+    assert.ok(designIdx < mechIdx, result);
+    // The design finding (and its full body/recommendation) precedes the
+    // mechanical checklist entries.
+    assert.ok(result.indexOf("Policy call") < result.indexOf("Rename"));
+    assert.ok(result.indexOf("decide") < result.indexOf("rename it"));
+    // Every finding keeps its full block rendering.
+    assert.ok(result.includes("### [high] Policy call (b.js:2)"));
+    assert.ok(result.includes("### [low] Rename (a.js:1)"));
+    assert.ok(result.includes("### [medium] Dead code (c.js:3)"));
+  });
+
+  it("emits a single design section when every finding lacks a kind tag", () => {
+    const prev = {
+      findings: [
+        { severity: "low", title: "No kind", file: "a.js", line_start: 1 },
+        { severity: "medium", title: "Also no kind", file: "b.js", line_start: 2 },
+      ],
+    };
+    const result = renderPriorFindings(prev);
+    assert.ok(result.includes("Design findings (require deliberate individual treatment)"), result);
+    assert.ok(!result.includes("Mechanical findings (checklist)"), result);
+    assert.ok(result.includes("### [low] No kind (a.js:1)"));
+    assert.ok(result.includes("### [medium] Also no kind (b.js:2)"));
+  });
+
+  it("emits a single mechanical section when every finding is mechanical", () => {
+    const prev = {
+      findings: [
+        { severity: "low", title: "Rename", file: "a.js", line_start: 1, kind: "mechanical" },
+        { severity: "low", title: "Remove", file: "b.js", line_start: 2, kind: "mechanical" },
+      ],
+    };
+    const result = renderPriorFindings(prev);
+    assert.ok(result.includes("Mechanical findings (checklist)"), result);
+    assert.ok(!result.includes("Design findings (require deliberate individual treatment)"), result);
+  });
+
+  it("treats an invalid kind as design in the grouped prior findings", () => {
+    const prev = {
+      findings: [
+        { severity: "high", title: "Odd kind", file: "a.js", line_start: 1, kind: "whatever" },
+      ],
+    };
+    const result = renderPriorFindings(prev);
+    assert.ok(result.includes("Design findings (require deliberate individual treatment)"), result);
+    assert.ok(!result.includes("Mechanical findings (checklist)"), result);
+    assert.ok(result.includes("### [high] Odd kind (a.js:1)"));
+  });
 });
 
 // shouldSkipReview  —  pure, extracted from cmdChain (chain-phases.mjs)
@@ -1596,6 +1664,80 @@ describe("parseReviewResult", () => {
     assert.equal(result.chainVerdict, "approve");
     assert.equal(result.chainFindingsText, "(no structured findings)");
   });
+
+  // ---- kusabi #60 step 1: `kind` tagging ----
+  // The `kind` tag flows through to the stored findings untouched; the
+  // one-line findingsText is grouped (design first, mechanical after) with a
+  // missing/invalid kind defaulting to design at the consumption point.
+
+  it("carries kind through to the parsed findings and groups the findingsText", () => {
+    const payload = "```json\n{\n  \"verdict\": \"needs-attention\",\n  \"summary\": \"s\",\n  \"findings\": [\n    { \"severity\": \"high\", \"title\": \"Design call\", \"file\": \"src/a.js\", \"line_start\": 1, \"kind\": \"design\" },\n    { \"severity\": \"low\", \"title\": \"Rename var\", \"file\": \"src/b.js\", \"line_start\": 2, \"kind\": \"mechanical\" }\n  ]\n}\n```";
+    const result = parseReviewResult(payload);
+
+    assert.equal(result.reviewParseable, true);
+    // Raw kind tags survive on the parsed findings (stored untouched).
+    assert.equal(result.chainParsedReview.findings[0].kind, "design");
+    assert.equal(result.chainParsedReview.findings[1].kind, "mechanical");
+    // Grouped one-line text: design section first, mechanical after.
+    const text = result.chainFindingsText;
+    const designIdx = text.indexOf("Design findings (require deliberate individual treatment)");
+    const mechIdx = text.indexOf("Mechanical findings (checklist)");
+    assert.ok(designIdx >= 0, text);
+    assert.ok(mechIdx >= 0, text);
+    assert.ok(designIdx < mechIdx, "design section must precede mechanical");
+    assert.ok(text.indexOf("Design call") < text.indexOf("Rename var"));
+    assert.ok(text.includes("[high] Design call (src/a.js:1)"));
+    assert.ok(text.includes("[low] Rename var (src/b.js:2)"));
+  });
+
+  it("treats a missing kind as design (safe side) in the grouped findingsText", () => {
+    const payload = "```json\n{\n  \"verdict\": \"needs-attention\",\n  \"summary\": \"s\",\n  \"findings\": [\n    { \"severity\": \"medium\", \"title\": \"No kind tag\", \"file\": \"src/c.js\", \"line_start\": 3 }\n  ]\n}\n```";
+    const result = parseReviewResult(payload);
+
+    assert.equal(result.reviewParseable, true);
+    // Missing kind → design section, single section (no mechanical heading).
+    const text = result.chainFindingsText;
+    assert.ok(text.includes("Design findings (require deliberate individual treatment)"), text);
+    assert.ok(!text.includes("Mechanical findings (checklist)"), text);
+    assert.ok(text.includes("[medium] No kind tag (src/c.js:3)"));
+  });
+
+  it("treats an invalid kind as design (safe side) in the grouped findingsText", () => {
+    const payload = "```json\n{\n  \"verdict\": \"needs-attention\",\n  \"summary\": \"s\",\n  \"findings\": [\n    { \"severity\": \"low\", \"title\": \"Weird kind\", \"file\": \"src/d.js\", \"line_start\": 4, \"kind\": \"cosmetic\" }\n  ]\n}\n```";
+    const result = parseReviewResult(payload);
+
+    assert.equal(result.reviewParseable, true);
+    const text = result.chainFindingsText;
+    assert.ok(text.includes("Design findings (require deliberate individual treatment)"), text);
+    assert.ok(!text.includes("Mechanical findings (checklist)"), text);
+    // The raw invalid value is not rewritten on the stored finding.
+    assert.equal(result.chainParsedReview.findings[0].kind, "cosmetic");
+  });
+
+  it("keeps kind through the VERDICT-token recovery (extractJson) path", () => {
+    // Real-world shape from the extractJson recovery path (#170): the token
+    // sits inside the JSON fence and must be stripped before parsing.
+    const payload = [
+      "```json",
+      "{",
+      "  \"verdict\": \"needs-attention\",",
+      "  \"summary\": \"s\",",
+      "  \"findings\": [",
+      "    { \"severity\": \"high\", \"title\": \"Recovered\", \"file\": \"src/e.js\", \"line_start\": 5, \"kind\": \"mechanical\" }",
+      "  ]",
+      "}",
+      "```",
+      "",
+      "VERDICT: needs-attention",
+    ].join("\n");
+    const result = parseReviewResult(payload);
+
+    assert.equal(result.reviewParseable, true);
+    assert.equal(result.chainVerdict, "needs-attention");
+    assert.equal(result.chainParsedReview.findings[0].kind, "mechanical");
+    assert.ok(result.chainFindingsText.includes("Mechanical findings (checklist)"));
+    assert.ok(result.chainFindingsText.includes("[high] Recovered (src/e.js:5)"));
+  });
 });
 
 // applyTierEscalation — tier clamping (kusabi #153)
@@ -1729,6 +1871,62 @@ describe("recordReworkEscalation", () => {
     roundRecord.tierAfter = escalation.currentTierIndex;
     assert.equal(roundRecord.tierAfter, 0);
     assert.equal(roundRecord.tierClamped, true);
+  });
+
+  it("wires the anchoring-override evidence through to deriveReworkStrategy on the 1st rework", () => {
+    // Kusabi #62: a round that ended `approve` + probes red must schedule its
+    // 1st rework with a NEW session, tier unchanged, and a reason naming the
+    // anchoring trigger — the same lever the driver will read back as
+    // reworkStrategyReason.
+    const roundRecord = { tierBefore: 0 };
+    const result = recordReworkEscalation({
+      roundRecord,
+      currentTierIndex: 0,
+      reworkCount: 0,
+      strategized: false,
+      tierCount: 2,
+      chainVerdict: "approve",
+      chainRepeatedAreas: false,
+      probesGreen: false,
+    });
+    assert.equal(result.strategy.newSession, true);
+    assert.equal(result.strategy.tierDelta, 0);
+    assert.match(result.strategy.reason, /worker claimed done, probes red: anchoring break/);
+    assert.equal(result.currentTierIndex, 0);
+    assert.equal(roundRecord.tierClamped, false);
+    assert.equal(roundRecord.tierClampReason, null);
+  });
+
+  it("wires the repeatedAreas anchoring-override evidence through on the 1st rework", () => {
+    const roundRecord = { tierBefore: 0 };
+    const result = recordReworkEscalation({
+      roundRecord,
+      currentTierIndex: 0,
+      reworkCount: 0,
+      strategized: false,
+      tierCount: 2,
+      chainVerdict: "needs-attention",
+      chainRepeatedAreas: true,
+      probesGreen: false,
+    });
+    assert.equal(result.strategy.newSession, true);
+    assert.equal(result.strategy.tierDelta, 0);
+    assert.match(result.strategy.reason, /same file area flagged across rounds: anchoring break/);
+  });
+
+  it("does not trigger the override from the default ladder inputs alone", () => {
+    // Existing callers that pass no evidence keep the plain 1st-rework row:
+    // continue session, same tier.
+    const roundRecord = { tierBefore: 0 };
+    const result = recordReworkEscalation({
+      roundRecord,
+      currentTierIndex: 0,
+      reworkCount: 0,
+      strategized: false,
+      tierCount: 2,
+    });
+    assert.equal(result.strategy.newSession, false);
+    assert.equal(result.strategy.tierDelta, 0);
   });
 });
 
@@ -2135,6 +2333,111 @@ describe("runReviewPhase fallback trail fidelity", () => {
 });
 
 // ---------------------------------------------------------------------------
+// runReviewPhase \u2014 single result conduit (kusabi #100)
+//
+// runReviewPhase writes every value that belongs on the persisted round
+// record onto `roundRecord` and returns ONLY what is genuinely not record
+// state.  This pins the chosen direction (b): the record fields are the
+// contract, and the return key set must stay exactly the non-record set \u2014
+// so a future refactor cannot silently reintroduce the double write.
+// ---------------------------------------------------------------------------
+
+describe("runReviewPhase \u2014 single result conduit (kusabi #100)", () => {
+  function stubbedDispatch() {
+    return {
+      job: {
+        id: "job-1",
+        status: "completed",
+        modelEntry: "test-org/test-review-model:variant",
+        modelVariant: "variant",
+        fallbacks: null,
+        usage: { available: true, input: 3, output: 2, reasoning: 0, cacheRead: 0, cacheWrite: 0, cost: 0.001 },
+        error: null,
+      },
+      resultText: JSON.stringify({
+        verdict: "needs-attention",
+        summary: "s",
+        findings: [
+          { severity: "high", title: "Design call", file: "src/a.js", line_start: 1, kind: "design" },
+          { severity: "low", title: "Rename", file: "src/b.js", line_start: 2, kind: "mechanical" },
+        ],
+      }),
+    };
+  }
+
+  async function runPhase(roundRecord, extra = {}) {
+    return runReviewPhase({
+      container: "test",
+      brief: "test brief",
+      modelChain: ["test-org/test-flash", "test-org/test-pro"],
+      chainId: "test-chain",
+      cwd: process.cwd(),
+      previousRecord: null,
+      baseSha: "abc123",
+      chainStatusOutput: "",
+      chainBaseLog: "",
+      chainDiff: "",
+      chainUntracked: "",
+      roundRecord,
+      chainChangedPaths: [],
+      chainStatusObserved: false,
+      chainDeliverables: [],
+      flagsModel: null,
+      _dispatchWithFallback: stubbedDispatch,
+      ...extra,
+    });
+  }
+
+  it("persists every record field onto roundRecord after a simulated review phase", async () => {
+    const roundRecord = { round: 1 };
+    await runPhase(roundRecord);
+
+    // --- record fields (the persisted contract) ---
+    assert.equal(roundRecord.verdict, "needs-attention");
+    assert.equal(roundRecord.reviewParseable, true);
+    assert.equal(roundRecord.reviewJobId, "job-1");
+    assert.equal(roundRecord.reviewModelEntry, "test-org/test-review-model:variant");
+    assert.equal(roundRecord.reviewModelVariant, "variant");
+    assert.equal(roundRecord.reviewFallbacks, null);
+    assert.equal(roundRecord.reviewUsage.available, true);
+    // Raw findings (with kind tags) land on the record untouched.
+    assert.equal(roundRecord.findings.length, 2);
+    assert.equal(roundRecord.findings[0].kind, "design");
+    assert.equal(roundRecord.findings[1].kind, "mechanical");
+    assert.deepEqual(roundRecord.findingFiles, ["src/a.js", "src/b.js"]);
+    // Grouped findingsText (design section first).
+    assert.ok(roundRecord.findingsText.includes("Design findings (require deliberate individual treatment)"));
+    assert.ok(roundRecord.findingsText.includes("Mechanical findings (checklist)"));
+  });
+
+  it("returns exactly the non-record keys (single conduit)", async () => {
+    const roundRecord = { round: 1 };
+    const result = await runPhase(roundRecord);
+    assert.deepEqual(
+      Object.keys(result).sort(),
+      ["chainParsedReview", "chainRepeatedAreas", "reviewJobError", "reviewJobStatus", "skipReview"],
+    );
+    assert.equal(result.chainParsedReview.findings[0].kind, "design");
+    assert.equal(result.chainRepeatedAreas, false);
+    assert.equal(result.skipReview, false);
+    assert.equal(result.reviewJobStatus, "completed");
+  });
+
+  it("record-derived values reach the disposition inputs from roundRecord, not the return", async () => {
+    const roundRecord = { round: 1 };
+    const result = await runPhase(roundRecord);
+    // The disposition phase reads verdict / findingsText from the record
+    // (caller does `const chainVerdict = roundRecord.verdict`), and the
+    // return must not shadow them with a second conduit.
+    assert.equal(Object.hasOwn(result, "chainVerdict"), false);
+    assert.equal(Object.hasOwn(result, "chainFindingsText"), false);
+    assert.equal(Object.hasOwn(result, "reviewParseable"), false);
+    assert.equal(roundRecord.verdict, "needs-attention");
+    assert.ok(roundRecord.findingsText.includes("[high] Design call (src/a.js:1)"));
+  });
+});
+
+// ---------------------------------------------------------------------------
 // runReviewPhase — one retry on unparseable review output (issue #145)
 //
 // A review job that completes with garbage (no JSON, no recoverable VERDICT
@@ -2206,7 +2509,7 @@ describe("runReviewPhase — unparseable-output retry (issue #145)", () => {
   }
 
   it("parseable first result: exactly 1 dispatch call, no retry flag", async () => {
-    const { result, roundRecord, calls } = await runWith([
+    const { roundRecord, calls } = await runWith([
       fakeJob("job-ok", VALID),
     ]);
 
@@ -2216,13 +2519,13 @@ describe("runReviewPhase — unparseable-output retry (issue #145)", () => {
     assert.equal(roundRecord.reviewFirstUsage, undefined);
     assert.equal(roundRecord.reviewFirstFallbacks, undefined);
     assert.equal(roundRecord.reviewJobId, "job-ok");
-    assert.equal(result.chainVerdict, "needs-attention");
-    assert.ok(result.chainFindingsText.includes("Off-by-one"));
-    assert.equal(result.reviewParseable, true);
+    assert.equal(roundRecord.verdict, "needs-attention");
+    assert.ok(roundRecord.findingsText.includes("Off-by-one"));
+    assert.equal(roundRecord.reviewParseable, true);
   });
 
   it("garbage then valid: 2 dispatch calls, final-attempt fields win, retry recorded", async () => {
-    const { result, roundRecord, calls } = await runWith([
+    const { roundRecord, calls } = await runWith([
       fakeJob("job-broken-1", GARBAGE, { usage: { available: true, input: 5, output: 2, reasoning: 0, cacheRead: 0, cacheWrite: 0, cost: 0.001 }, fallbacks: ["test-org/test-flash"] }),
       fakeJob("job-fixed-2", VALID, { usage: { available: true, input: 9, output: 4 }, modelEntry: "test-org/test-fixed-model" }),
     ]);
@@ -2243,9 +2546,9 @@ describe("runReviewPhase — unparseable-output retry (issue #145)", () => {
     assert.equal(totals.input, 14);   // 5 + 9
     assert.equal(totals.output, 6);   // 2 + 4
     assert.equal(totals.cost, 0.001); // first attempt only (final attempt has no cost)
-    assert.equal(result.chainVerdict, "needs-attention");
-    assert.ok(result.chainFindingsText.includes("Off-by-one"));
-    assert.equal(result.reviewParseable, true);
+    assert.equal(roundRecord.verdict, "needs-attention");
+    assert.ok(roundRecord.findingsText.includes("Off-by-one"));
+    assert.equal(roundRecord.reviewParseable, true);
     // Both dispatches carried identical options.
     assert.deepEqual(calls[0], calls[1]);
     assert.ok(calls[0].promptText.includes("test brief"));
@@ -2254,7 +2557,7 @@ describe("runReviewPhase — unparseable-output retry (issue #145)", () => {
   });
 
   it("both dispatches garbage: 2 dispatch calls, verdict stays unparseable", async () => {
-    const { result, roundRecord, calls } = await runWith([
+    const { roundRecord, calls } = await runWith([
       fakeJob("job-g1", GARBAGE),
       fakeJob("job-g2", GARBAGE),
     ]);
@@ -2263,9 +2566,6 @@ describe("runReviewPhase — unparseable-output retry (issue #145)", () => {
     assert.equal(roundRecord.reviewUnparseableRetried, true);
     assert.equal(roundRecord.reviewFirstJobId, "job-g1");
     assert.equal(roundRecord.reviewJobId, "job-g2");
-    assert.equal(result.chainVerdict, "unparseable");
-    assert.equal(result.reviewParseable, false);
-    assert.equal(result.chainFindingsText, "(review output could not be parsed)");
     assert.equal(roundRecord.verdict, "unparseable");
     assert.equal(roundRecord.reviewParseable, false);
     assert.equal(roundRecord.findingsText, "(review output could not be parsed)");
@@ -2282,7 +2582,7 @@ describe("runReviewPhase — unparseable-output retry (issue #145)", () => {
   const HARD_FAILURES = ["serve-dead", "provider-error", "stalled", "timeout", "error"];
   for (const status of HARD_FAILURES) {
     it("first job " + status + " with empty resultText: exactly 1 dispatch call, no retry, unparseable escalates", async () => {
-      const { result, roundRecord, calls } = await runWith([
+      const { roundRecord, calls } = await runWith([
         fakeJob("job-" + status, "", { status, usage: { available: true, input: 7, output: 3, reasoning: 0, cacheRead: 0, cacheWrite: 0, cost: 0.001 }, fallbacks: ["test-org/test-flash"] }),
       ]);
 
@@ -2292,15 +2592,14 @@ describe("runReviewPhase — unparseable-output retry (issue #145)", () => {
       assert.equal(roundRecord.reviewFirstUsage, undefined);
       assert.equal(roundRecord.reviewFirstFallbacks, undefined);
       assert.equal(roundRecord.reviewJobId, "job-" + status);
-      assert.equal(result.chainVerdict, "unparseable");
-      assert.equal(result.reviewParseable, false);
-      assert.equal(result.chainFindingsText, "(review output could not be parsed)");
       assert.equal(roundRecord.verdict, "unparseable");
+      assert.equal(roundRecord.reviewParseable, false);
+      assert.equal(roundRecord.findingsText, "(review output could not be parsed)");
     });
   }
 
   it("unparseable JSON with recoverable VERDICT token: exactly 1 dispatch call, no retry", async () => {
-    const { result, roundRecord, calls } = await runWith([
+    const { roundRecord, calls } = await runWith([
       fakeJob("job-token", GARBAGE_WITH_TOKEN),
     ]);
 
@@ -2310,10 +2609,10 @@ describe("runReviewPhase — unparseable-output retry (issue #145)", () => {
     assert.equal(roundRecord.reviewFirstUsage, undefined);
     assert.equal(roundRecord.reviewFirstFallbacks, undefined);
     assert.equal(roundRecord.reviewJobId, "job-token");
-    assert.equal(result.chainVerdict, "needs-attention");
-    assert.equal(result.reviewParseable, false);
+    assert.equal(roundRecord.verdict, "needs-attention");
+    assert.equal(roundRecord.reviewParseable, false);
     assert.equal(roundRecord.verdictSource, "recovered-from-token");
-    assert.equal(result.chainFindingsText, "(review output could not be parsed)");
+    assert.equal(roundRecord.findingsText, "(review output could not be parsed)");
   });
 
   it("probe-driven skipReview: 0 dispatch calls, unchanged", async () => {

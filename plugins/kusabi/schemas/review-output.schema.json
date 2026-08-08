@@ -47,6 +47,14 @@
               "low"
             ]
           },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "mechanical",
+              "design"
+            ],
+            "description": "mechanical = the fix is prescribed by the finding itself (rename, registration, message fix, dead code removal); design = fixing it requires a decision the finding does not itself make. When unsure, use design. Optional: old records and lenient recovery parses without it stay valid, and a missing/invalid kind is treated as design at the consumption point."
+          },
           "title": {
             "type": "string",
             "minLength": 1

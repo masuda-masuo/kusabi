@@ -25,6 +25,7 @@ import {
   renderReview,
   renderFollowupDraft,
   renderReviewRecord,
+  renderGroupedFindingsText,
   extractJson,
   recoverVerdictFromText,
 } from "./render.mjs";
@@ -478,9 +479,11 @@ export function parseReviewResult(reviewResultText) {
     // Malformed-review guard (kusabi #153): `findings` may arrive as a
     // string/object instead of an array; never call .map on a non-array.
     const findingsArray = Array.isArray(parsed.findings) ? parsed.findings : [];
-    const chainFindingsText = findingsArray.length > 0
-      ? findingsArray.map(function (f) { return "[" + f.severity + "] " + f.title + " (" + f.file + ":" + f.line_start + ")"; }).join("\n")
-      : "(no structured findings)";
+    // Grouped one-line rendering (kusabi #60 step 1): design findings first,
+    // mechanical after, single section when all findings share one kind.
+    // The raw findings (including any `kind` tags) still flow through to
+    // roundRecord.findings untouched — this is consumption-point rendering.
+    const chainFindingsText = renderGroupedFindingsText(findingsArray);
     return { chainParsedReview: parsed, chainVerdict, chainFindingsText, reviewParseable };
   }
 
@@ -505,8 +508,15 @@ export function shouldSkipReview({ chainStatusObserved, chainChangedPaths, chain
 /**
  * Run the review phase (or mark skip when the change set is empty).
  *
- * Mutates roundRecord in place with review-job fields, verdict, and findings.
- * Returns review results needed by the disposition phase.
+ * Single result conduit (kusabi #100): everything that belongs on the
+ * persisted round record — review-job fields (reviewJobId / reviewUsage /
+ * reviewModelEntry / reviewModelVariant / reviewFallbacks), verdict,
+ * verdictSource, reviewParseable, findingsText, findings, findingFiles and
+ * the unparseable-retry trace fields — is written onto `roundRecord` and is
+ * NOT returned.  The return value carries only what is genuinely not record
+ * state: the parsed review object, the cross-round repeated-areas signal,
+ * whether review was skipped, and the job status/error needed by the
+ * caller's provider-exhaustion branch.
  */
 export async function runReviewPhase({
   container, brief, modelChain, chainId, cwd, previousRecord, baseSha,
@@ -655,7 +665,9 @@ export async function runReviewPhase({
     chainRepeatedAreas = hasRepeatedAreas(previousRecord?.findingFiles, chainParsedReview?.findings);
   }
 
-  return { chainVerdict, chainFindingsText, chainParsedReview, chainRepeatedAreas, skipReview, reviewJobStatus, reviewJobError, reviewParseable };
+  // Single conduit: record state stays on roundRecord; the return carries
+  // only what is not record state (see the docstring above).
+  return { chainParsedReview, chainRepeatedAreas, skipReview, reviewJobStatus, reviewJobError };
 }
 
 /**
@@ -1216,10 +1228,16 @@ export function applyTierEscalation({ currentTierIndex, tierDelta, tierCount }) 
  * @param {number} opts.reworkCount       - Reworks done so far (pre-increment).
  * @param {boolean} opts.strategized      - Whether a strategize already ran.
  * @param {number} opts.tierCount         - Number of tiers in modelChain.
+ * @param {string} [opts.chainVerdict]    - Finished round's review verdict (anchoring-override evidence, #62).
+ * @param {boolean} [opts.chainRepeatedAreas] - Same file area flagged across rounds.
+ * @param {boolean} [opts.probesGreen]    - Finished round's deterministic probes passed.
  * @returns {{ currentTierIndex: number, strategy: { tierDelta: number, newSession: boolean, reason: string } }}
  */
-export function recordReworkEscalation({ roundRecord, currentTierIndex, reworkCount, strategized, tierCount }) {
-  const strategy = deriveReworkStrategy({ reworkCount, strategized });
+export function recordReworkEscalation({ roundRecord, currentTierIndex, reworkCount, strategized, tierCount, chainVerdict, chainRepeatedAreas, probesGreen }) {
+  const strategy = deriveReworkStrategy({
+    reworkCount, strategized,
+    verdict: chainVerdict, probesGreen, repeatedAreas: chainRepeatedAreas,
+  });
   const { tierIndex, clamped, reason } = applyTierEscalation({
     currentTierIndex,
     tierDelta: strategy.tierDelta,

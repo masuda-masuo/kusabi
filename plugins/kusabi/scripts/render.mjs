@@ -289,13 +289,78 @@ export function renderBaseFacts({ baseSha, baseLog, statusOutput, diffContent, u
   return parts.join("\n");
 }
 
+const FINDING_DESIGN_HEADING = "## Design findings (require deliberate individual treatment)";
+const FINDING_MECHANICAL_HEADING = "## Mechanical findings (checklist)";
+
+/**
+ * Split findings into design / mechanical groups by their `kind` tag
+ * (kusabi #60 step 1).
+ *
+ * A missing or invalid `kind` is treated as `"design"` — the safe side: a
+ * lone design-judgment item must never be silently filed under mechanical.
+ * This is a consumption-point default; stored records are never rewritten.
+ *
+ * @param {Array|undefined|null} findings
+ * @returns {{ design: Array, mechanical: Array }}
+ */
+export function groupFindingsByKind(findings) {
+  const design = [];
+  const mechanical = [];
+  if (Array.isArray(findings)) {
+    for (const f of findings) {
+      if (!f || typeof f !== "object") continue;
+      if (f.kind === "mechanical") {
+        mechanical.push(f);
+      } else {
+        // missing / invalid kind → design (safe side)
+        design.push(f);
+      }
+    }
+  }
+  return { design, mechanical };
+}
+
+/**
+ * Render findings as grouped one-line rows ("[severity] title (file:line)")
+ * for the `findingsText` field: design findings first under a labelled
+ * section, mechanical findings after as a checklist.  When every finding is
+ * one kind, a single section is emitted (no empty headings).
+ *
+ * @param {Array|undefined|null} findings
+ * @returns {string} "(no structured findings)" when there is nothing to render.
+ */
+export function renderGroupedFindingsText(findings) {
+  if (!Array.isArray(findings) || findings.length === 0) {
+    return "(no structured findings)";
+  }
+  const { design, mechanical } = groupFindingsByKind(findings);
+  const sections = [];
+  if (design.length > 0) {
+    sections.push(FINDING_DESIGN_HEADING);
+    sections.push(design.map(oneLineFinding).join("\n"));
+  }
+  if (mechanical.length > 0) {
+    sections.push(FINDING_MECHANICAL_HEADING);
+    sections.push(mechanical.map(oneLineFinding).join("\n"));
+  }
+  return sections.join("\n\n");
+}
+
+function oneLineFinding(f) {
+  return "[" + f.severity + "] " + f.title + " (" + f.file + ":" + f.line_start + ")";
+}
+
 /**
  * Render the prior-findings block for a rework round's implement prompt.
  *
  * When the previous round record carries a structured `findings` array
  * (severity, title, body, recommendation etc.), each finding is rendered
- * in full.  The block is bounded by `PRIOR_FINDINGS_BUDGET` characters;
- * when exceeded, a truncation note is appended.
+ * in full, grouped under two labelled sections by `kind` (kusabi #60 step 1):
+ * design findings FIRST, explicitly flagged as requiring deliberate
+ * individual treatment, mechanical findings after, as a checklist.  When
+ * every finding is one kind, a single section is emitted.  The block is
+ * bounded by `PRIOR_FINDINGS_BUDGET` characters; when exceeded, a
+ * truncation note is appended.
  *
  * Old records without the `findings` array degrade gracefully to the
  * current one-line `findingsText` format.
@@ -313,26 +378,37 @@ export function renderPriorFindings(previousRecord) {
     return previousRecord.findingsText || "(none)";
   }
 
-  const parts = [];
-  for (const f of findings) {
-    const severity = f.severity || "unknown";
-    const title = f.title || "(untitled)";
-    const file = f.file || "?";
-    const lineStart = f.line_start !== undefined ? f.line_start : "?";
+  const { design, mechanical } = groupFindingsByKind(findings);
+  const sections = [];
+  for (const group of [
+    { heading: FINDING_DESIGN_HEADING, items: design },
+    { heading: FINDING_MECHANICAL_HEADING, items: mechanical },
+  ]) {
+    if (group.items.length === 0) continue;
+    const block = [];
+    block.push(group.heading);
+    block.push("");
+    for (const f of group.items) {
+      const severity = f.severity || "unknown";
+      const title = f.title || "(untitled)";
+      const file = f.file || "?";
+      const lineStart = f.line_start !== undefined ? f.line_start : "?";
 
-    parts.push(`### [${severity}] ${title} (${file}:${lineStart})`);
-    parts.push("");
-    if (f.body) {
-      parts.push(f.body);
-      parts.push("");
+      block.push(`### [${severity}] ${title} (${file}:${lineStart})`);
+      block.push("");
+      if (f.body) {
+        block.push(f.body);
+        block.push("");
+      }
+      if (f.recommendation) {
+        block.push(`**Recommendation:** ${f.recommendation}`);
+        block.push("");
+      }
     }
-    if (f.recommendation) {
-      parts.push(`**Recommendation:** ${f.recommendation}`);
-      parts.push("");
-    }
+    sections.push(block.join("\n").replace(/\n+$/, ""));
   }
 
-  let text = parts.join("\n");
+  let text = sections.join("\n\n");
 
   if (text.length > PRIOR_FINDINGS_BUDGET) {
     text = text.slice(0, PRIOR_FINDINGS_BUDGET);
