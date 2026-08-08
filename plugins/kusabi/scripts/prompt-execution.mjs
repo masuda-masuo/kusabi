@@ -4,9 +4,9 @@
 import path from "node:path";
 import fs from "node:fs";
 import process from "node:process";
-import { ensureServer, api, authHeader, judgeServeDeath } from "./serve-lifecycle.mjs";
+import { ensureServer, api, authHeader, judgeServeDeath, isOurServe } from "./serve-lifecycle.mjs";
 import { newJobId, saveJob, jobDir, appendEvent } from "./job-store.mjs";
-import { writeJson } from "./state-paths.mjs";
+import { writeJson, stateRoot } from "./state-paths.mjs";
 import { durationS } from "./render.mjs";
 import { parseModel, selectRoutes } from "./cli.mjs";
 
@@ -321,6 +321,54 @@ async function fetchFinalMessage(server, sessionID) {
 }
 
 /**
+ * Watchdog kill step: decide whether the stalled job's recorded serve may be
+ * SIGKILLed, and carry out the kill or the decline.
+ *
+ * The recorded pid is only ever killed after isOurServe() confirms it is one
+ * of our own serves (kusabi #181).  The watchdog is the most dangerous kill
+ * site: it fires when the *recorded* port does not answer — which is more
+ * likely precisely when the record is stale — and SIGKILL leaves the victim
+ * no chance to log anything.  The record can outlive the serve by days, so
+ * the pid may by then belong to a stranger (a recycled pid, or a TID of an
+ * unrelated process).  When identity is refuted the kill is declined, an
+ * event with the reason is recorded, and the stale record is removed; when
+ * identity is merely unverifiable (hidepid, older marker set, /proc-less
+ * platform) the kill is also declined but the record is kept — the pid may
+ * well be our serve and the record is the only handle to it.  Either way the
+ * stall handling is not silently lost: the session is still aborted by the
+ * caller, only the kill is skipped.
+ *
+ * @returns {boolean} true when a process was actually killed
+ */
+export function watchdogKillOrDecline({ server, stateDir, job, abortOk, healthOk, serveDead }) {
+  if (serveDead || (abortOk && healthOk)) return false;
+  const identity = isOurServe(server.pid, { root: stateRoot(), stateDir });
+  if (!identity.ours) {
+    appendEvent(stateDir, job.id, {
+      type: "companion.watchdog.declined-kill",
+      pid: server.pid,
+      class: identity.class,
+      reason: identity.reason,
+    });
+    if (identity.class === "refuted") {
+      // The record positively names a process that is not our serve: the
+      // record is what is invalid — remove it, kill nothing.
+      try { fs.unlinkSync(path.join(stateDir, "server.json")); } catch { /* best-effort */ }
+    }
+    // 'unverifiable': the pid may well be our serve but we cannot prove it
+    // (hidepid, older marker set, /proc-less platform).  Keep the record —
+    // deleting it would strand the process and the next dispatch's health
+    // probe could no longer reuse it.  The stall handling above (abort +
+    // event) proceeds either way.
+    return false;
+  }
+  try { process.kill(server.pid, "SIGKILL"); } catch { /* best-effort */ }
+  try { fs.unlinkSync(path.join(stateDir, "server.json")); } catch { /* best-effort */ }
+  appendEvent(stateDir, job.id, { type: "companion.watchdog.kill" });
+  return true;
+}
+
+/**
  * Core prompt-execution primitive.
  *
  * Creates an opencode session, dispatches a prompt via SSE, handles
@@ -449,10 +497,9 @@ export async function runPrompt({ cwd, kind, title, promptText, agent, model, se
           // Re-checked here as well as at the top of the tick: the liveness
           // poll can land while these two probes are in flight.
           if (!serveDead && (!abortOk || !healthOk)) {
-            try { process.kill(server.pid, "SIGKILL"); } catch { /* best-effort */ }
-            watchdogKilled = true;
-            try { fs.unlinkSync(path.join(stateDir, "server.json")); } catch { /* best-effort */ }
-            appendEvent(stateDir, job.id, { type: "companion.watchdog.kill" });
+            if (watchdogKillOrDecline({ server, stateDir, job, abortOk, healthOk, serveDead })) {
+              watchdogKilled = true;
+            }
           }
           abort.abort();
         })();

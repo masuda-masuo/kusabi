@@ -264,12 +264,33 @@ export async function api(server, method, apiPath, body) {
  * last activity is older than RUNNING_STALE_MS is a fossil and does not pin
  * the serve (kusabi #162 follow-up).
  *
+ * Every recorded pid is checked against isOurServe() before anything can be
+ * signalled (kusabi #181): a record can outlive the serve by days and the
+ * pid may by then belong to a stranger (recycled pid, or a TID of an
+ * unrelated process — the liveness check passes for a live TID).  A *refuted*
+ * record is deleted without killing, so the next call does not look at that
+ * pid again.  An *unverifiable* record (hidepid, older marker set) is left
+ * alone: deleting it would strand a genuine serve that is merely
+ * unprovable.  With `keepIdentityFailed` (serve-stop invocations) even
+ * refuted records are left for the invoking command to adjudicate, so its
+ * reason-bearing refusal reaches the user.  Every identity refusal is
+ * appended to the state dir's server.log — the sweep never acts silently.
+ *
  * Best-effort: per-directory errors are caught and the function never throws.
+ *
+ * @param {string} root
+ * @param {number} ttlMs
+ * @param {{ keepIdentityFailed?: boolean }} [opts]
  */
-export function reapIdleServes(root, ttlMs) {
+export function reapIdleServes(root, ttlMs, opts = {}) {
   if (!fs.existsSync(root)) return;
   let entries;
   try { entries = fs.readdirSync(root); } catch { return; }
+  // Identity confirmation is /proc-based.  Where /proc is unavailable the
+  // sweep cannot tell our serves from strangers and degrades to a no-op
+  // (kusabi #181), matching reapOrphanedServes — a leaked serve costs
+  // memory, shooting a stranger costs someone else's process.
+  try { fs.readdirSync("/proc"); } catch { return; }
   for (const entry of entries) {
     try {
       const hashDir = path.join(root, entry);
@@ -282,6 +303,37 @@ export function reapIdleServes(root, ttlMs) {
 
       // Pid alive?
       try { process.kill(server.pid, 0); } catch { continue; }
+
+      // Is this pid really one of our serves?  A record can outlive the
+      // serve by days; the pid may by then belong to something else
+      // entirely (a recycled pid, or a TID of an unrelated process — the
+      // liveness check above passes for a live TID).  Never signal a pid we
+      // cannot attribute to our own serve (kusabi #181).
+      const identity = isOurServe(server.pid, { root, stateDir: hashDir });
+      if (!identity.ours) {
+        const logLine = `[${new Date().toISOString()}] reap-idle: pid ${server.pid} refused (${identity.class}: ${identity.reason}) — no signal sent`;
+        if (identity.class === "refuted" && !opts.keepIdentityFailed) {
+          // The record positively names a process that is not our serve (or
+          // is gone): the record is what is invalid.  Delete it without
+          // killing, and say so in server.log — a silent disappearance is
+          // exactly the confusion the identity gate exists to prevent.
+          try { fs.unlinkSync(serverFile); } catch { /* best-effort */ }
+          try { fs.appendFileSync(path.join(hashDir, "server.log"), `${logLine}; server.json removed\n`, "utf8"); } catch { /* best-effort */ }
+        } else if (identity.class === "unverifiable") {
+          // The pid may well be our serve — we just cannot prove it.  The
+          // record is the only handle to that process: deleting it would
+          // strand it (unreachable by serve-stop, invisible to the orphan
+          // sweep) and spawn a duplicate on the next dispatch.  Fail closed
+          // and keep the handle; the next ensureServer() health probe can
+          // still reuse a healthy serve.
+          try { fs.appendFileSync(path.join(hashDir, "server.log"), `${logLine}; server.json kept (identity unprovable)\n`, "utf8"); } catch { /* best-effort */ }
+        } else {
+          // refuted + keepIdentityFailed: left for the invoking command
+          // (serve-stop) to adjudicate and report.
+          try { fs.appendFileSync(path.join(hashDir, "server.log"), `${logLine}; server.json kept (left for the invoking command)\n`, "utf8"); } catch { /* best-effort */ }
+        }
+        continue;
+      }
 
       // Collect job statuses + mtimes.
       const jobRecords = [];
@@ -350,14 +402,15 @@ export function judgeServeDeath(pid) {
 // from server.json) and would hold memory forever; PR #163 stopped creating
 // them, this recovers ones that already exist (kusabi #162 follow-up).
 //
-// Identification is /proc-based: /proc/<pid>/environ carries the marker env
-// that buildServeEnv() stamps into every spawned serve, and
-// /proc/<pid>/cmdline is sanity-checked for a bare "serve" argv token so
-// descendant tool/bash processes that merely inherited the marker env are
-// never touched.  A start-up in progress (fresh serve.lock) is never killed,
-// and a recorded serve is never killed.  Best-effort throughout: unreadable
-// or vanished pids are skipped, and the sweep degrades to a no-op where
-// /proc is unavailable (macOS) — it never throws.
+// Identification is isOurServe() — the same identity gate every kill site
+// uses (kusabi #181): /proc/<pid>/environ carries the marker env that
+// buildServeEnv() stamps into every spawned serve, and /proc/<pid>/cmdline
+// is sanity-checked for a bare "serve" argv token so descendant tool/bash
+// processes that merely inherited the marker env are never touched.  A
+// start-up in progress (fresh serve.lock) is never killed, and a recorded
+// serve is never killed.  Best-effort throughout: unreadable or vanished
+// pids are skipped, and the sweep degrades to a no-op where /proc is
+// unavailable (macOS) — it never throws.
 export function reapOrphanedServes(root) {
   let pids;
   try {
@@ -368,23 +421,164 @@ export function reapOrphanedServes(root) {
   for (const pidEntry of pids) {
     try {
       const pid = Number(pidEntry);
-      const env = readProcEnv(pid);
-      if (!env || env.KUSABI_WORKER_CONTEXT !== "1") continue;
-      const stateDir = env.KUSABI_SERVE_STATE_DIR;
-      if (!stateDir || !pathIsUnder(root, stateDir)) continue;
-      // cmdline sanity check: the serve process itself carries a bare
-      // "serve" argv token; its descendants inherit the marker env but not
-      // that argv, so they are never matched here.
-      const cmdline = readProcCmdline(pid);
-      if (!cmdline.includes("serve")) continue;
+      const identity = isOurServe(pid, { root });
+      if (!identity.ours) continue;
       // A start-up in progress holds a fresh serve.lock — that window is
       // legitimate, never kill.
-      if (startupInProgress(stateDir)) continue;
-      const server = readJson(path.join(stateDir, "server.json"));
+      if (startupInProgress(identity.markerStateDir)) continue;
+      const server = readJson(path.join(identity.markerStateDir, "server.json"));
       if (server?.pid === pid) continue; // recorded — leave alone
       process.kill(pid);
     } catch { /* best-effort per pid: vanished, unreadable, unkillable */ }
   }
+}
+
+/**
+ * The single place that answers "may I signal this pid": is it one of our
+ * `opencode serve` processes?
+ *
+ * Every serve we spawn carries the marker env buildServeEnv() stamps
+ * (KUSABI_WORKER_CONTEXT=1 plus KUSABI_SERVE_STATE_DIR) and an argv with a
+ * bare "serve" token.  A server.json record can outlive the serve by days,
+ * so the pid it holds may by then belong to something else entirely — a
+ * recycled pid, or even a thread id (TID) of an unrelated process.  /proc
+ * never lies here: /proc/<pid>/environ and /proc/<pid>/cmdline return the
+ * owning process's own environ and cmdline (verified by measurement for the
+ * TID case too), so a marker-env check or a cmdline check catches the TID
+ * case and the pid-reuse case alike (kusabi #181).
+ *
+ * Every kill site (reapIdleServes, cmdServeStop, the watchdog,
+ * reapOrphanedServes) goes through this gate so a fourth site cannot grow a
+ * fourth standard.  The helper never kills — callers own the consequence.
+ * Fails closed: when /proc is unavailable or the pid's contents cannot be
+ * read, the answer is "not ours".  A leaked serve costs memory; shooting a
+ * stranger costs someone else's process.
+ *
+ * Refusals carry a `class` so callers can tell the two very different kinds
+ * of "no" apart (kusabi #181 follow-up):
+ *
+ *   - "refuted" — a positive conflict: the pid's contents prove it is not
+ *     the serve this record names (marker naming a different state dir,
+ *     argv without a bare "serve" token, or the process is gone).  The
+ *     record is invalid and safe to delete.
+ *   - "unverifiable" — the pid may well BE our serve, we just cannot prove
+ *     it: /proc unavailable (macOS), environ/cmdline unreadable (hidepid
+ *     mounts), or a marker set older than this code (KUSABI_SERVE_STATE_DIR
+ *     is only stamped since 2026-08-03, KUSABI_WORKER_CONTEXT=1 only since
+ *     2026-07-27).  Deleting the record here would strand a live serve:
+ *     serve-stop could never stop it again, the orphan sweep cannot identify
+ *     it (it needs the marker), and the next dispatch would spawn a
+ *     duplicate.  Record-driven sites must decline WITHOUT deleting so the
+ *     record survives and the next ensureServer() health probe can still
+ *     reuse the genuine serve.
+ *
+ * @param {number} pid
+ * @param {{ root?: string, stateDir?: string }} [opts]
+ *   root     — the marker's KUSABI_SERVE_STATE_DIR must live under this
+ *              state root (like reapOrphanedServes' sweep root)
+ *   stateDir — when given, the marker's KUSABI_SERVE_STATE_DIR must equal it
+ *              (the caller's own state dir)
+ * @returns {{ ours: boolean, class: "ours"|"refuted"|"unverifiable", reason: string|null, markerStateDir: string|null }}
+ *   `ours` is true only when all three checks pass.  `class` distinguishes
+ *   the two refusal kinds above.  `reason` explains a refusal for logging;
+ *   `markerStateDir` is the state dir the marker names (null when the marker
+ *   is absent/unreadable).
+ */
+export function isOurServe(pid, { root = null, stateDir = null } = {}) {
+  let env;
+  try {
+    env = readProcEnv(pid);
+  } catch (err) {
+    // ENOENT with /proc present means the process is gone — nothing alive
+    // to strand, so the record is refuted.  EACCES (hidepid) / EPERM / a
+    // missing /proc (macOS) mean a possibly-live process we cannot inspect:
+    // unverifiable.
+    const gone = !procUnavailable() && err?.code === "ENOENT";
+    return {
+      ours: false,
+      class: gone ? "refuted" : "unverifiable",
+      reason: `cannot read /proc/${pid}/environ (${err?.code ?? err?.message ?? err})`,
+      markerStateDir: null,
+    };
+  }
+  if (env.KUSABI_WORKER_CONTEXT !== "1") {
+    // No marker at all: the process may predate KUSABI_WORKER_CONTEXT=1
+    // (stamped only since 2026-07-27) and still BE our serve — a genuine
+    // pre-marker serve is stranded if its record is deleted (unreachable by
+    // serve-stop, invisible to the orphan sweep).  Its argv still carries a
+    // bare "serve" token, so the cmdline decides: token present → may well
+    // be our serve, unverifiable (record kept); token absent → positively
+    // not our serve, refuted (record deletable).  Either way nothing is
+    // ever signalled — the kill sites still require the full marker set.
+    let cmdline;
+    try {
+      cmdline = readProcCmdline(pid);
+    } catch (err) {
+      // Same gone-vs-unreadable rule as the environ read above: ENOENT with
+      // /proc present means the process is gone — nothing alive to strand,
+      // so refuted.  EACCES (hidepid) / EPERM / a missing /proc (macOS) mean
+      // a possibly-live process we cannot inspect: unverifiable.
+      const gone = !procUnavailable() && err?.code === "ENOENT";
+      return {
+        ours: false,
+        class: gone ? "refuted" : "unverifiable",
+        reason: `cannot read /proc/${pid}/cmdline (${err?.code ?? err?.message ?? err})`,
+        markerStateDir: null,
+      };
+    }
+    if (cmdline.includes("serve")) {
+      return { ours: false, class: "unverifiable", reason: `pid ${pid} carries no KUSABI_WORKER_CONTEXT=1 marker but argv (${cmdline.filter(Boolean).join(" ")}) has a bare "serve" token (serve predates 2026-07-27?)`, markerStateDir: null };
+    }
+    return { ours: false, class: "refuted", reason: `pid ${pid} does not carry the KUSABI_WORKER_CONTEXT=1 marker`, markerStateDir: null };
+  }
+  const markerStateDir = env.KUSABI_SERVE_STATE_DIR;
+  if (!markerStateDir) {
+    // The marker is present but predates KUSABI_SERVE_STATE_DIR (stamped
+    // only since 2026-08-03): very likely one of our older serves, just not
+    // attributable to a state dir — unverifiable, never refuted.
+    return { ours: false, class: "unverifiable", reason: `pid ${pid} carries KUSABI_WORKER_CONTEXT=1 but no KUSABI_SERVE_STATE_DIR (older marker set)`, markerStateDir: null };
+  }
+  if (root && !pathIsUnder(root, markerStateDir)) {
+    return { ours: false, class: "refuted", reason: `pid ${pid} names state dir ${markerStateDir}, which is not under ${root}`, markerStateDir };
+  }
+  if (stateDir && !samePath(stateDir, markerStateDir)) {
+    return { ours: false, class: "refuted", reason: `pid ${pid} names state dir ${markerStateDir}, not ${stateDir}`, markerStateDir };
+  }
+  // cmdline sanity check: the serve process itself carries a bare "serve"
+  // argv token; its descendants inherit the marker env but not that argv,
+  // so they are never matched here.
+  let cmdline;
+  try {
+    cmdline = readProcCmdline(pid);
+  } catch (err) {
+    const gone = !procUnavailable() && err?.code === "ENOENT";
+    return {
+      ours: false,
+      class: gone ? "refuted" : "unverifiable",
+      reason: `cannot read /proc/${pid}/cmdline (${err?.code ?? err?.message ?? err})`,
+      markerStateDir,
+    };
+  }
+  if (!cmdline.includes("serve")) {
+    return { ours: false, class: "refuted", reason: `pid ${pid} argv (${cmdline.filter(Boolean).join(" ")}) carries no bare "serve" token`, markerStateDir };
+  }
+  return { ours: true, class: "ours", reason: null, markerStateDir };
+}
+
+// True when /proc cannot be listed at all (macOS-style degradation).
+function procUnavailable() {
+  try {
+    fs.readdirSync("/proc");
+    return false;
+  } catch {
+    return true;
+  }
+}
+
+// True when both paths resolve to the same directory (realpath when
+// possible, resolve otherwise): containment in both directions is equality.
+function samePath(a, b) {
+  return pathIsUnder(a, b) && pathIsUnder(b, a);
 }
 
 function readProcEnv(pid) {
