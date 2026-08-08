@@ -1,7 +1,7 @@
 # kusabi Design Document
 
-Last updated: 2026-07-26
-Status: Design finalized + field-verified up to the phase chain, auto-chain (chain subcommand + sunaba-rpc) **implemented / reflected in main**. Decision 5 (accept-with-followup, §9.2) **implemented**. Decision 4 (strategist, §9.1) **implemented**. Fail-fast retry detection, tiered chain entries, and capacity fallback (issue #50) **implemented**. chain-stats (issue #124) **implemented**. Stages C/D are planned (see #36).
+Last updated: 2026-08-08
+Status: Design finalized + field-verified up to the phase chain, auto-chain (chain subcommand + sunaba-rpc) **implemented / reflected in main**. Decision 5 (accept-with-followup, §9.2) **implemented**. Decision 4 (strategist, §9.1) **implemented**. Fail-fast retry detection, tiered chain entries, and capacity fallback (issue #50) **implemented**. chain-stats (issue #124) **implemented**. The metrics store — ingest (§3.5.8) and query/report (§3.5.9) — **implemented**. chain-resume (§3.5.10) **implemented**. The review record (§3.5.7) and the P2 verify-gate baseline (§3.5.2) **implemented**. Stages C/D remain future work (§9.3).
 
 ## 1. Purpose and positioning
 
@@ -95,7 +95,7 @@ Launched with `chain --container <cid> --model <m> [--max-rounds N] "<brief>"`. 
 
 #### 3.5.1 Round structure
 
-Each round r (1..maxRounds, default 3) flows as follows:
+Each round r (1..maxRounds, default 4) flows as follows:
 
 1. **implement**: implement with the `kusabi-implement` agent. r=1 gets the full brief; r≥2 gets only the previous round's findings + the brief's acceptance criteria. The previous session's trial-and-error log is not carried over. The companion injects the `--container` ID into every implement prompt (mirroring the review-side injection), so briefs no longer need to carry it.
    - Every dispatch in the chain (implement, review, strategist) goes through `dispatchWithFallback`. When a dispatch ends as `provider-error`, the companion re-dispatches on the next unused route of the same tier — same round, same container, same brief. Routes that fail with a capacity reason are remembered for the rest of the process. Fallbacks do not consume rounds.
@@ -188,7 +188,7 @@ Reviewer (kusabi-review) permissions:
 - **allow**: `sunaba_verify_in_container`, `sunaba_lint_in_container`, `sunaba_type_check_in_container` — independently re-runs the implementer's "gate green" claim to verify it (PR#37/#40)
 - **deny**: all mutation tools (sandbox_exec, write_file, edit_file, checkout, publish, etc.) — because if the reviewer starts fixing, independence is lost
 - **deny**: `sunaba_sandbox_issue_write` and `sunaba_sandbox_pr_review_write` — outward writes are the orchestrator's exclusive exit; the reviewer's deliverable is the structured final report, not issue comments or PR reviews
-- The chain review prompt is augmented with machine-collected base facts (`baseSha`, recent base history, actual change set from `git status --porcelain`) so the reviewer receives "what is this task's change set" as data rather than guessing. See `renderBaseFacts` in `kusabi-companion.mjs`.
+- The chain review prompt is augmented with machine-collected base facts (`baseSha`, recent base history, actual change set from `git status --porcelain`) so the reviewer receives "what is this task's change set" as data rather than guessing. See `renderBaseFacts` in `render.mjs`.
 
 Verdict: 4-value + optional `unverified`:
 
@@ -363,11 +363,13 @@ It is consulted at two points per round: at the round boundary, and after the de
 
 **serve-stop protection.** `serve-stop` checks for running jobs before killing the serve. When jobs are running, it declines and points at `chain-cancel` as the correct way to stop a chain, because the chain spawns a new serve on its next dispatch. An explicit `--force` flag overrides this protection.
 
+**Serve lifecycle.** The serve for a state dir is owned by `serve-lifecycle.mjs` (`ensureServer`): a recorded serve whose `server.json` answers a health probe is reused; otherwise one is started on demand, serialised per state dir by an atomic `serve.lock` so concurrent callers end up with exactly one live serve. Nothing runs 24/7. The chain stops its serve itself: `runChainDriver`'s finally block runs `serve-stop` for the cwd when the chain finishes, unless `--keep-serve` was passed or another job is still running (`liveRunningJobs` — the same fossil rule as `serve-stop`). Idle reaping happens on every companion invocation: a startup sweep (`main()`) calls `reapIdleServes(root, ttl)` — a serve with no fresh `running` job whose last activity (max of `server.json` mtime and its jobs' mtimes) is older than `KUSABI_SERVE_TTL_MS` (30 min by default) is killed — and `reapOrphanedServes`, which kills live serve processes carrying the `KUSABI_WORKER_CONTEXT`/`KUSABI_SERVE_STATE_DIR` markers that no `server.json` names. Both are best-effort: per-directory errors are caught and never crash the invoking command.
+
 **Review record (`review-record.md`)** (kusabi #52). When a chain reaches a terminal disposition — accepted (incl. accept-with-followup), or terminated by escalate / max-rounds — the shared finalisation point inside `runChainDriver` (the same code path for `chain` and `chain-resume`) renders the chain's outcome through `renderReviewRecord` (`plugins/kusabi/scripts/render.mjs`, a pure renderer that never throws on partial records) and writes it to the chain's state directory as `chains/<chainId>/review-record.md`; the chain's terminal output prints the record's path. Cancelled and failed (provider-exhausted) chains get no record — nothing was decided. The record is regenerated (overwritten) whenever a resumed chain later completes. The two "fill at inspection" sections — the findings adjudication table (採否/理由 columns) and the 判例として precedent slot — are deliberately generated blank (`_fill_`) for the orchestrator to complete by hand. Posting the record to the archive repository (kairanban) is orchestrator-exclusive by the same exit principle as publish: the companion only writes the local file and prints its path, and never posts anywhere.
 
 ### 3.5.8 metrics store (ingest) — implemented
 
-`metrics-db.mjs`, `transcript-ingest.mjs`, `chain-ingest.mjs`. A durable SQLite digest of two perishable/durable data sources, feeding the token-efficiency work (#83) and brief/outcome correlation work (#81). **Ingest + store only** — there is no query or report surface here; that is a follow-up PR.
+`metrics-db.mjs`, `transcript-ingest.mjs`, `chain-ingest.mjs`. A durable SQLite digest of two perishable/durable data sources, feeding the token-efficiency work (#83) and brief/outcome correlation work (#81). **Ingest + store only** — the write side lives here; the query/report surface it was built to feed is delivered and documented in §3.5.9.
 
 **Why a database and not another `chain-stats`-style live reader.** Claude Code transcripts (`~/.claude/projects/<slug>/*.jsonl`) are on a rolling delete: `cleanupPeriodDays` is unset, so they are pruned by file mtime. kusabi chain records (`~/.kusabi/<hash>/chains/chain-*/chain.json`) are durable. Ingest reduces the perishable source to a durable digest that stays correct after the raw transcripts are gone.
 
@@ -436,6 +438,20 @@ It is consulted at two points per round: at the round boundary, and after the de
 - **Windowing** uses the job's start instant (`started_ms`, falling back to `finished_ms`), honouring `--since`/`--until` exactly like the other sections; undated jobs are excluded under a bound and counted in the `excluded (no timestamp)` line.
 - **A pre-#154 store file has no `job` table**, and this surface opens read-only and can never migrate it — the report checks `sqlite_master` and renders zero jobs instead of crashing; the next `metrics-ingest` (writable open) creates the table via the ordinary `CREATE TABLE IF NOT EXISTS` path.
 - **Not built, on purpose:** no cross-machine aggregation (jobs also exist on a second machine; `--state-root` already points the ingest elsewhere, and merging stores is a separate decision), no machine identifier column, no change to what `task` writes (`job.json`/`usage.json` are read as-is), and `--compare` remains unsupported on this surface.
+
+#### 3.5.10 chain-resume — implemented
+
+`chain-resume <chainId>` continues a stopped chain from its persisted state. The resumption context comes entirely from the saved records — `chain.json` (brief, round records, ladder, `verifyBaseline`) and `control.json` (container) — so the only accepted flag is `--keep-serve`; any other flag is rejected rather than ignored. The CLI wrapper (`cmdChainResume` in `kusabi-companion.mjs`) validates that the recorded container still exists and is reachable (the chain's work lives in it), and refuses to start while any job of the chain is still recorded as running — a dead driver may have left a phase job dispatched but unfinished, and resuming over it would duplicate the phase. It then re-arms the control record (status `running` again, stop-request fields cleared) and hands the position to `runChainDriver` — the same driver `chain` uses.
+
+**Resume position.** The decision is the pure `resolveChainResume` in `chain-phases.mjs`, from the LAST round record alone:
+
+- Last record has implement done but no review/disposition (an interrupted round persisted at stop time) → resume at that round's **review** phase, continuing the persisted partial record.
+- Last record is complete with disposition `rework`/`strategize` → resume at the **next round's implement** phase — a rework carries the escalated tier/reworkCount, a strategize carries the fresh-session lever from the record's `pendingReworkStrategy`.
+- Terminal dispositions (`accept` / `accept-with-followup` / `escalate`) → the chain already finished; resume is refused. A still-running chain (live pid) is refused too: stop it with `chain-cancel` first.
+
+Cross-round state (`reworkCount`, `currentTierIndex`, `strategized`, `session`, `baseSha`) is derived from the record fields, so the resumed run continues the tier ladder exactly where the original left off. `baseSha` keeps the ORIGINAL chain base — the resumed round's diff is measured against it (P1 auto-resets HEAD to it); the worktree baseline, by contrast, is re-captured at resume time (the pre-cancel baseline is not persisted).
+
+**Shared lifecycle.** `chain-resume` goes through `runChainDriver` — the same round loop, stop predicate, serve stopping (unless `--keep-serve`), and terminal finalisation (including the review record, §3.5.7) as `chain`. The verify baseline is the one recorded at chain start, reused and never re-captured on the now-modified worktree (§3.5.2).
 
 ### 3.6 sunaba-rpc (raw JSON-RPC client) — implemented
 
@@ -639,7 +655,7 @@ The following content is derived from the design agreed in the "design confirmat
 
 ### 9.1 Decision 4: strategist stage (stall countermeasure) — **implemented**
 
-Implemented in `plugins/kusabi/scripts/kusabi-companion.mjs`:
+Implemented across `plugins/kusabi/scripts/`: `deriveDisposition` in `disposition.mjs`, `renderStrategistPrompt` in `render.mjs`, the strategist dispatch (`runStrategizePhase`) in `chain-phases.mjs`, orchestrated by `runChainDriver` in `kusabi-companion.mjs`.
 
 - `deriveDisposition` accepts an optional `strategizeEligible` boolean, combined internally with `round < maxRounds` into `strategizeAllowed` (a strategist job on the final round has no next round to consume its output — #117). When `repeatedAreas` holds on a non-shippable round and `strategizeAllowed` is true — `needs-attention`, or `approve` with probes red — returns `{ disposition: "strategize", ... }` (needs-attention reason: "same file area flagged twice; structural re-diagnosis before next rework"). On the second stagnation (strategized=true), escalates as before.
 - `renderStrategistPrompt` is an exported pure function that builds the prompt for the strategist: acceptance criteria + findings from the last two rounds + one-structural-change instruction.
@@ -650,7 +666,7 @@ Implemented in `plugins/kusabi/scripts/kusabi-companion.mjs`:
 
 ### 9.2 Decision 5: accept-with-followup (economic cutoff) — **implemented**
 
-Implemented in `plugins/kusabi/scripts/kusabi-companion.mjs`:
+Implemented across `plugins/kusabi/scripts/`: `deriveDisposition` in `disposition.mjs`, `renderFollowupDraft` in `render.mjs`, the draft storage and terminal handling in `runChainDriver` (`kusabi-companion.mjs`), rendered by `chain-show` via `renderChainShow` (`render.mjs`).
 
 - `deriveDisposition` accepts an optional `findingSeverities` array. When `probesGreen=true`, `verdict="needs-attention"`, and every element of `findingSeverities` is `"low"` or `"medium"`, returns `{ disposition: "accept-with-followup", reason: "probes green; remaining findings all minor" }`.
 - `renderFollowupDraft` is an exported pure function that builds a markdown draft from chainId, briefTitle, and findings.
@@ -685,8 +701,6 @@ Reference: issue #36 comment "Design confirmation before starting → Decision 3
 ### 9.4 Remaining tasks (current state)
 
 Managed via issues:
-- #7-2 (remaining model visualization items)
 - #8 (upstream tracking: report and fix opencode format:json_schema bug)
 - #33 (best-of-n tournament)
-- #35 (threat model: qualifies as a design invariant for deterministic probes)
-- #36 (this issue) implementation items from Stage B onward
+- #60 (split chain rework rounds by the nature of findings, not their count — the follow-up to the `kind` tag described in §3.5.3)

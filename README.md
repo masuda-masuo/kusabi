@@ -54,16 +54,32 @@ Run `/kusabi:setup` or `kusabi-companion.mjs install-agents` to copy them to `OP
 
 ## Commands
 
+Slash commands (`plugins/kusabi/commands/`):
+
 | Command | What it does |
 | --- | --- |
 | `/kusabi:task [--brief-file <path>]` | Delegate a task. Provide the brief inline or via `--brief-file <path>` (mutually exclusive). Flags: `--model provider/model`, `--agent name`, `--phase <name>`, `--read-only`, `--resume-last`, `--session <id>`, `--wait`, `--background`, `--deny <tools>`, `--timeout <s>`, `--watchdog <s>` |
-| `/kusabi:review` | Adversarial, read-only review of the working tree; `--base <ref>` for branch review; `--prior <text>` for anti-ratchet carry-over; extra text = review focus |
-| `/kusabi:chain [--brief-file <path>]` | **Auto chain** — run implement → review → rework until acceptance or escalate. Requires `--container <cid>`. Optional: `--model <provider/model>`, `--brief-file <path>`, `--max-rounds <N>` (default 3), `--session`. When `--model` is omitted the model is resolved from the config file or built-in default chain. |
+| `/kusabi:review` | Adversarial, read-only review of the working tree; `--base <ref>` for branch review; `--prior <text>` for anti-ratchet carry-over; extra text = review focus. Host worktree only — `--container` is rejected; use `task --phase review` for container reviews |
 | `/kusabi:status [job-id]` | Compact job list, or progress detail for one job |
 | `/kusabi:result [job-id]` | Stored final output of a finished job |
 | `/kusabi:cancel [job-id]` | Abort a running job |
-| `/kusabi:salvage <job-id>` | Recover a dead/stalled job: reads its prompt + events, launches a salvage agent to produce a structured report |
 | `/kusabi:setup` | Check CLI, start/reuse the server, install phase agents |
+
+Everything else is a companion subcommand, invoked directly as
+`node plugins/kusabi/scripts/kusabi-companion.mjs <subcommand>`:
+
+| Subcommand | What it does |
+| --- | --- |
+| `chain [--brief-file <path>]` | **Auto chain** — run implement → review → rework until acceptance or escalate. Requires `--container <cid>`. Optional: `--model <provider/model>`, `--brief-file <path>`, `--max-rounds <N>` (default 4), `--session`, `--keep-serve`. When `--model` is omitted the model is resolved from the config file or built-in default chain. |
+| `chain-resume <chainId>` | Resume a cancelled chain from its last recorded phase boundary (reads `chain.json` / `control.json`; same chain lifecycle as `chain`; only flag: `--keep-serve`) |
+| `chain-show` | Compact plain-text digest of a chain (read-only, no LLM) |
+| `chain-stats` | Aggregate every chain record and print a summary (read-only, no LLM) |
+| `chain-cancel <chainId>` | Request a running chain to stop (file-based, works across processes) |
+| `metrics-ingest` | Ingest transcripts + chain records + delegated-job records into a durable SQLite store (read-only source, no LLM) |
+| `metrics-report` | Query/report over the SQLite metrics store (read-only, no LLM, never ingests) |
+| `serve-stop` | Stop the background opencode server and remove its state file; declines with running jobs unless `--force` |
+| `install-agents` | Copy phase agent definitions to `OPENCODE_AGENT_DIR` |
+| `salvage <job-id>` | Recover a dead/stalled job: reads its prompt + events, launches a salvage agent to produce a structured report |
 
 The `kusabi:opencode-worker` subagent forwards delegation requests to `task` so the main Claude thread never carries the work.
 
@@ -73,6 +89,8 @@ The `kusabi:opencode-worker` subagent forwards delegation requests to `task` so 
 | --- | --- |
 | `delegate` | The orchestrator-side discipline: what belongs in a brief, how to inspect what comes back, what never leaves the orchestrator. Load it before starting an implementation task. |
 | `kusabi-result-handling` | Internal rule for relaying worker output faithfully (not user-invocable). |
+| `metrics` | Refresh the kusabi metrics store and report from it (ingest, then report); use for "show me the metrics" / "how is token efficiency" / an explicit `/metrics` request, passing window arguments through. |
+| `update` | Reflect a merged kusabi change into the running local installation (pull, stop serve, redistribute agents, relink the plugin cache); load after merging any kusabi PR. |
 
 The `delegate` skill intentionally points at `--help` and `docs/DESIGN.md` for the CLI
 surface and the chain semantics instead of restating them, so that improving kusabi does
@@ -82,9 +100,18 @@ Every result includes the opencode session ID; continue the same session in the 
 
 ## Model configuration
 
-By default, kusabi resolves the model to use through an ordered chain:
-`opencode/deepseek-v4-flash-free` → `opencode-go/deepseek-v4-flash` → `opencode-go/deepseek-v4-pro`.
-The first entry in the chain is used unless overridden.
+By default, kusabi resolves the model to use through the built-in **tiered**
+chain (`BUILTIN_DEFAULT_CHAIN` in `plugins/kusabi/scripts/cli.mjs`): two
+tiers, with the `:max` reasoning variant pinned on every route:
+
+    tier 0: opencode/deepseek-v4-flash-free:max  ↔  opencode-go/deepseek-v4-flash:max
+    tier 1: opencode-go/deepseek-v4-pro:max
+
+Tier 0's two routes are interchangeable — the same quality, tried in order
+when one is unavailable. That is capacity fallback, not a quality step: with
+the default ladder, rounds 1 and 2 both run on tier 0 and the second tier is
+first reached at round 3 (see "Chain round escalation"). The first route of
+the current tier is used unless overridden.
 
 You can customise this with a config file at `<state root>/config.json`
 (typically `~/.kusabi/config.json`, or the directory pointed to by
@@ -93,11 +120,17 @@ You can customise this with a config file at `<state root>/config.json`
 ```json
 {
   "models": {
-    "chain": ["opencode/deepseek-v4-flash-free", "opencode-go/deepseek-v4-flash:max", "opencode-go/deepseek-v4-pro"],
+    "chain": [
+      ["opencode/deepseek-v4-flash-free:max", "opencode-go/deepseek-v4-flash:max"],
+      ["opencode-go/deepseek-v4-pro:max"]
+    ],
     "phases": { "implement": ["opencode-go/deepseek-v4-flash"] }
   }
 }
 ```
+
+Flat all-string chains are still accepted (each string is a single-route
+tier) — but the built-in default is the tiered shape above.
 
 ### Variant syntax
 
@@ -121,7 +154,7 @@ A trailing colon (`p/a:`) or missing `/` are fatal parse errors.
 1. **Explicit `--model` flag** — wins for the phases it applies to: a single `task` dispatch, a chain's round-1 implement, and every chain review. A chain's rework rounds follow the tier ladder instead (see "Chain round escalation" below).
 2. **Per-phase chain** — `models.phases.<phase>` first entry (e.g. a config with `"implement": ["m1"]` resolves to `m1` for implement-phase tasks).
 3. **Global chain** — `models.chain` first entry, or the built-in default chain when no config file exists.
-4. **Built-in default** — `opencode/deepseek-v4-flash-free` when no config file and no flag is set.
+4. **Built-in default** — the first route of `BUILTIN_DEFAULT_CHAIN`, `opencode/deepseek-v4-flash-free:max`, when no config file and no flag is set.
 
 Missing config file = silently uses the built-in defaults. A malformed config file (unparseable JSON or wrong shape) produces a fatal error naming the file path — kusabi does not silently fall back in that case.
 
@@ -168,6 +201,6 @@ is visible in `status` and `result` output for each round.
   demands publish prints a one-line warning to that effect at chain start —
   it is a reminder to the orchestrator, not an action the worker can take.
 - Jobs, event logs, and results are stored per directory under `~/.kusabi/`.
-- `opencode serve` keeps running between jobs; stop it with `node plugins/kusabi/scripts/kusabi-companion.mjs serve-stop` if needed. While jobs are running, `serve-stop` declines unless `--force` is passed — stopping the serve does not stop a chain, which spawns a new serve on its next dispatch.
+- `opencode serve` is started on demand and healthy servers are reused; a chain stops its serve on completion unless `--keep-serve` is passed. Idle serves with no running jobs are reaped on the next companion invocation after `KUSABI_SERVE_TTL_MS` (default 30 min). `serve-stop` (`node plugins/kusabi/scripts/kusabi-companion.mjs serve-stop`) kills the serve and removes its state file; while jobs are running it declines and points at `chain-cancel` unless `--force` is passed — stopping the serve does not stop a chain, which spawns a new serve on its next dispatch.
 - A chain holds the container it was given for its whole run. `status` names the chains that are running and the containers they hold; `chain-cancel <chainId>` is the way to stop one.
 - The opencode HTTP API is mid-migration (v1 → v2); the companion targets the v1 surface present in opencode ≥ 1.17.
