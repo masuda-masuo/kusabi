@@ -1610,12 +1610,31 @@ describe("chain-resume CLI", () => {
   });
 });
 
+// Spawn a fake long-lived serve: the marker env buildServeEnv() stamps into
+// every real serve (KUSABI_WORKER_CONTEXT=1 plus KUSABI_SERVE_STATE_DIR) and
+// a bare "serve" argv token, so the recorded pid passes the isOurServe()
+// identity gate every kill site now uses (kusabi #181).  A marker-less pid
+// recorded in server.json is refused everywhere now (record deleted, nothing
+// killed); the refusal paths are covered in serve-lifecycle.test.mjs.
+function spawnServeShapedSleeper(stateDir) {
+  const env = {
+    ...process.env,
+    KUSABI_WORKER_CONTEXT: "1",
+    KUSABI_SERVE_STATE_DIR: stateDir,
+  };
+  return spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)", "serve"], { env, stdio: "ignore" });
+}
+
 // serve-stop — fossil `running` records must not block stopping (kusabi #162
 // follow-up).  The companion runs as a real subprocess against a temp state
 // root; the recorded serve is a fake long-lived process the test spawns and
 // kills itself.  The startup reaper hook runs inside the subprocess too: the
-// fixture's fresh file mtimes keep reapIdleServes from reaping, and the fake
-// carries no kusabi marker env, so the orphan sweep cannot touch it.
+// fixture's fresh file mtimes keep reapIdleServes from reaping, and the
+// fixture carries the marker env with the recorded pid named in server.json,
+// so the orphan sweep spares it.  The fake is serve-shaped (marker env +
+// bare "serve" argv) because every kill site now refuses a recorded pid that
+// fails the isOurServe() identity gate (kusabi #181) — the decline itself is
+// covered by the identity-gate tests in serve-lifecycle.test.mjs.
 // ---------------------------------------------------------------------------
 
 describe("serve-stop fossil running records", () => {
@@ -1630,7 +1649,7 @@ describe("serve-stop fossil running records", () => {
     const stateDir = path.join(stateRootDir, hash);
     const jobsDir = path.join(stateDir, "jobs", "job-fossil");
     fs.mkdirSync(jobsDir, { recursive: true });
-    const sleeper = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
+    const sleeper = spawnServeShapedSleeper(stateDir);
     const job = {
       id: "job-fossil",
       status: "running",
@@ -1717,6 +1736,130 @@ describe("serve-stop fossil running records", () => {
   });
 });
 
+// serve-stop identity gate — the real CLI flow (kusabi #181 follow-up)
+// ---------------------------------------------------------------------------
+// The startup reaper runs before the subcommand switch; on a serve-stop
+// invocation it must leave identity-failed records in place so cmdServeStop
+// itself adjudicates them and the reason-bearing decline message reaches the
+// user in the actual invocation path — not just via a direct function call.
+// The recorded pid is a marker-less live process (the incident shape); the
+// sweep's reapOrphanedServes cannot touch it (no marker), reapIdleServes
+// leaves it (keepIdentityFailed), and cmdServeStop declines with the reason.
+
+describe("serve-stop identity gate (CLI subprocess)", () => {
+  const COMPANION_SCRIPT = path.join(import.meta.dirname, "kusabi-companion.mjs");
+
+  function identityDeclineFixture() {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-servestop-idcli-"));
+    const stateRootDir = path.join(tmp, "state");
+    const cwd = path.join(tmp, "ws");
+    fs.mkdirSync(cwd, { recursive: true });
+    const hash = crypto.createHash("sha256").update(cwd).digest("hex").slice(0, 12);
+    const stateDir = path.join(stateRootDir, hash);
+    fs.mkdirSync(path.join(stateDir, "jobs"), { recursive: true });
+    // A marker-less live process — the incident shape: the record holds a
+    // pid that is not one of our serves.
+    const stranger = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
+    const serverFile = path.join(stateDir, "server.json");
+    fs.writeFileSync(serverFile, JSON.stringify({ pid: stranger.pid, port: 0, password: "x", cwd }), "utf8");
+    return {
+      tmp,
+      stateRootDir,
+      cwd,
+      serverFile,
+      stranger,
+      run(args = []) {
+        const env = { ...process.env, KUSABI_STATE_DIR: stateRootDir };
+        return spawnSync(process.execPath, [COMPANION_SCRIPT, "serve-stop", ...args], {
+          cwd,
+          encoding: "utf8",
+          env,
+          timeout: 15_000,
+        });
+      },
+      cleanup() {
+        try { process.kill(stranger.pid, "SIGKILL"); } catch { /* already gone */ }
+        fs.rmSync(tmp, { recursive: true, force: true });
+      },
+    };
+  }
+
+  function pidAlive(pid) {
+    try { process.kill(pid, 0); return true; } catch { return false; }
+  }
+
+  it("declines with the reason in the real CLI flow for a marker-less live recorded pid", async () => {
+    const fx = identityDeclineFixture();
+    try {
+      const result = fx.run();
+      assert.equal(result.status, 0, `serve-stop failed: ${result.stdout} ${result.stderr}`);
+      assert.match(result.stdout, /declined to stop pid \d+/);
+      assert.match(result.stdout, /KUSABI_WORKER_CONTEXT/);
+      assert.ok(pidAlive(fx.stranger.pid), "a marker-less recorded pid must never be signalled");
+      assert.ok(!fs.existsSync(fx.serverFile), "the invalid record must be removed by cmdServeStop");
+    } finally {
+      fx.cleanup();
+    }
+  });
+
+  it("declines with the reason for a recorded stranger's thread TID (the incident shape)", async () => {
+    const fx = identityDeclineFixture();
+    // Re-point the record at a non-main thread of the stranger: the whole
+    // process must survive the CLI invocation.
+    const tidSleeper = path.join(fx.tmp, "tid-sleeper.mjs");
+    fs.writeFileSync(tidSleeper, `import { Worker } from "node:worker_threads";
+import fs from "node:fs";
+const tidFile = process.env.KUSABI_TEST_TID_FILE;
+const mainTid = Number(process.pid);
+const worker = new Worker(
+  "const { parentPort } = require('node:worker_threads'); setInterval(() => {}, 1000);",
+  { eval: true }
+);
+worker.on("online", () => {
+  const deadline = Date.now() + 5000;
+  const poll = () => {
+    let tids = [];
+    try { tids = fs.readdirSync("/proc/self/task").map(Number); } catch { /* not ready yet */ }
+    const workerTids = tids.filter((t) => t !== mainTid);
+    if (workerTids.length > 0) {
+      fs.writeFileSync(tidFile, JSON.stringify({ mainPid: process.pid, mainTid, workerTids }));
+      return;
+    }
+    if (Date.now() < deadline) setTimeout(poll, 25);
+    else fs.writeFileSync(tidFile, JSON.stringify({ mainPid: process.pid, mainTid, workerTids: [] }));
+  };
+  poll();
+});
+setInterval(() => {}, 1000);
+`, "utf8");
+    const tidFile = path.join(fx.tmp, "tids.json");
+    const env = { ...process.env, KUSABI_TEST_TID_FILE: tidFile };
+    delete env.KUSABI_WORKER_CONTEXT;
+    const threaded = spawn(process.execPath, [tidSleeper], { env, stdio: "ignore" });
+    try {
+      const deadline = Date.now() + 5000;
+      let workerTid = null;
+      while (Date.now() < deadline && workerTid === null) {
+        try {
+          const data = JSON.parse(fs.readFileSync(tidFile, "utf8"));
+          workerTid = data.workerTids[0] ?? null;
+        } catch { /* not written yet */ }
+        if (workerTid === null) await new Promise((r) => setTimeout(r, 25));
+      }
+      assert.ok(workerTid !== null, "threaded stranger never reported a worker TID");
+      fs.writeFileSync(fx.serverFile, JSON.stringify({ pid: workerTid, port: 0, password: "x", cwd: fx.cwd }), "utf8");
+      const result = fx.run();
+      assert.equal(result.status, 0, `serve-stop failed: ${result.stdout} ${result.stderr}`);
+      assert.match(result.stdout, /declined to stop pid \d+/);
+      assert.ok(pidAlive(threaded.pid), "the whole process must survive the CLI invocation");
+      assert.ok(!fs.existsSync(fx.serverFile), "the invalid record must be removed by cmdServeStop");
+    } finally {
+      try { process.kill(threaded.pid, "SIGKILL"); } catch { /* already gone */ }
+      fx.cleanup();
+    }
+  });
+});
+
 // chain finally — fossil `running` records must not block the chain's serve
 // stop (kusabi #175).  The chain driver's finally block stops the serve for
 // the cwd unless another GENUINELY running job exists, using the same
@@ -1784,7 +1927,7 @@ describe("chain finally serve-stop fossil guard", () => {
     process.env.KUSABI_STATE_DIR = path.join(tmp, "state");
     const stateDir = stateDirFor(cwd);
     const serverFile = path.join(stateDir, "server.json");
-    const sleeper = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
+    const sleeper = spawnServeShapedSleeper(stateDir);
     fs.writeFileSync(serverFile, JSON.stringify({ pid: sleeper.pid, port: 0, password: "x", cwd }), "utf8");
 
     // A non-chain job record: fossil (jobAgeMs old) or genuinely running.

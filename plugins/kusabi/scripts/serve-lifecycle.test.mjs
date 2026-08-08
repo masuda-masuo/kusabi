@@ -13,8 +13,17 @@ import {
   runningRecordIsStale,
   RUNNING_STALE_MS,
   reapOrphanedServes,
+  reapIdleServes,
+  isOurServe,
 } from "./serve-lifecycle.mjs";
 import { readJson, stateDirFor } from "./state-paths.mjs";
+// The identity gate is shared by every kill site (kusabi #181); these two
+// call sites are tested here, against real spawned processes, together with
+// reapIdleServes.  (kusabi-companion.mjs and prompt-execution.mjs guard
+// their CLI/interval entry points behind argv checks, so importing them is
+// side-effect free.)
+import { cmdServeStop } from "./kusabi-companion.mjs";
+import { watchdogKillOrDecline } from "./prompt-execution.mjs";
 
 // buildServeEnv — env-building seam for ensureServer's spawn (kusabi #136 fix 3)
 // ---------------------------------------------------------------------------
@@ -615,12 +624,14 @@ function orphanFixture() {
 
 // Spawn a fake long-lived serve-like process.  With marker=true it carries
 // the same env buildServeEnv() stamps into a real serve; serveArgv controls
-// whether the argv looks like a serve (a bare "serve" token).
-function spawnOrphanSleeper(sleeper, stateDir, { marker = true, stateDirOverride = null, serveArgv = true } = {}) {
+// whether the argv looks like a serve (a bare "serve" token).  omitStateDir
+// leaves KUSABI_SERVE_STATE_DIR unstamped (the marker set buildServeEnv used
+// before 2026-08-03) so the identity gate reports 'unverifiable'.
+function spawnOrphanSleeper(sleeper, stateDir, { marker = true, stateDirOverride = null, serveArgv = true, omitStateDir = false } = {}) {
   const env = { ...process.env };
   if (marker) {
     env.KUSABI_WORKER_CONTEXT = "1";
-    env.KUSABI_SERVE_STATE_DIR = stateDirOverride ?? stateDir;
+    if (!omitStateDir) env.KUSABI_SERVE_STATE_DIR = stateDirOverride ?? stateDir;
   } else {
     delete env.KUSABI_WORKER_CONTEXT;
     delete env.KUSABI_SERVE_STATE_DIR;
@@ -643,8 +654,92 @@ async function waitForMarkerEnv(pid, timeoutMs = 5000) {
   throw new Error(`pid ${pid} never showed the marker env`);
 }
 
+// Same race for the markerless fixtures: before exec the child's cmdline is
+// still the parent's (no "serve" token), so waiting for the bare token
+// synchronises on the fixture's own argv being in place.
+async function waitForServeArgv(pid, timeoutMs = 5000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    try {
+      if (fs.readFileSync(`/proc/${pid}/cmdline`, "utf8").split("\0").includes("serve")) return;
+    } catch { /* not readable yet */ }
+    await new Promise((r) => setTimeout(r, 25));
+  }
+  throw new Error(`pid ${pid} never showed a bare serve argv token`);
+}
+
 function killPid(pid) {
   try { process.kill(pid, "SIGKILL"); } catch { /* already gone */ }
+}
+
+// A long-lived process with a real extra OS thread (worker_threads), for the
+// TID case (kusabi #181): the incident record held a non-main thread's TID of
+// an unrelated process.  /proc/<tid>/environ and /proc/<tid>/cmdline return
+// the owning process's own, so the marker/cmdline gate catches a stranger's
+// TID; kill(2) aimed at a TID would have SIGTERMed the whole thread group.
+// The fixture writes { mainPid, mainTid, workerTids } to KUSABI_TEST_TID_FILE
+// once the worker's task entry is visible, so the test can record a
+// non-main TID in server.json exactly like the incident.
+const TID_SLEEPER_SOURCE = `import { Worker } from "node:worker_threads";
+import fs from "node:fs";
+
+const tidFile = process.env.KUSABI_TEST_TID_FILE;
+const mainTid = Number(process.pid);
+
+const worker = new Worker(
+  "const { parentPort } = require('node:worker_threads'); setInterval(() => {}, 1000);",
+  { eval: true }
+);
+
+worker.on("online", () => {
+  const deadline = Date.now() + 5000;
+  const poll = () => {
+    let tids = [];
+    try { tids = fs.readdirSync("/proc/self/task").map(Number); } catch { /* not ready yet */ }
+    const workerTids = tids.filter((t) => t !== mainTid);
+    if (workerTids.length > 0) {
+      fs.writeFileSync(tidFile, JSON.stringify({ mainPid: process.pid, mainTid, workerTids }));
+      return;
+    }
+    if (Date.now() < deadline) setTimeout(poll, 25);
+    else fs.writeFileSync(tidFile, JSON.stringify({ mainPid: process.pid, mainTid, workerTids: [] }));
+  };
+  poll();
+});
+
+setInterval(() => {}, 1000);
+`;
+
+// Spawn the threaded fixture.  marker=true gives it the kusabi serve env
+// (serve-shaped), marker=false leaves it a stranger; serveArgv adds a bare
+// "serve" argv token (node runs the script regardless).  Resolves once the
+// fixture has written its TID file.
+async function spawnThreadedSleeper(tmp, { marker = false, stateDir = null, serveArgv = false } = {}) {
+  const tidFile = path.join(tmp, "tids.json");
+  const script = path.join(tmp, "tid-sleeper.mjs");
+  fs.writeFileSync(script, TID_SLEEPER_SOURCE, "utf8");
+  const env = { ...process.env, KUSABI_TEST_TID_FILE: tidFile };
+  if (marker) {
+    env.KUSABI_WORKER_CONTEXT = "1";
+    env.KUSABI_SERVE_STATE_DIR = stateDir;
+  } else {
+    delete env.KUSABI_WORKER_CONTEXT;
+    delete env.KUSABI_SERVE_STATE_DIR;
+  }
+  const args = serveArgv ? [script, "serve"] : [script];
+  const proc = spawn(process.execPath, args, { env, stdio: "ignore" });
+  const deadline = Date.now() + 5000;
+  while (Date.now() < deadline) {
+    try {
+      const data = JSON.parse(fs.readFileSync(tidFile, "utf8"));
+      if (data.workerTids.length > 0) {
+        return { proc, mainPid: data.mainPid, workerTid: data.workerTids[0] };
+      }
+    } catch { /* not written yet */ }
+    await new Promise((r) => setTimeout(r, 25));
+  }
+  try { proc.kill("SIGKILL"); } catch { /* already gone */ }
+  throw new Error("threaded sleeper never reported a worker TID");
 }
 
 describe("reapOrphanedServes (spawn-based, temp state root)", () => {
@@ -785,6 +880,813 @@ describe("reapOrphanedServes (spawn-based, temp state root)", () => {
     } finally {
       killPid(victim.pid);
       killPid(survivor.pid);
+      fs.rmSync(fx.tmp, { recursive: true, force: true });
+    }
+  });
+});
+
+// isOurServe — the identity gate every kill site uses (kusabi #181)
+// ---------------------------------------------------------------------------
+// Real spawned processes only.  Mocks cannot reproduce this defect: the
+// broken code never inspected the pid's contents, so a mocked kill would
+// only ever report "it was called".  The fixture processes carry exactly the
+// env/argv shapes buildServeEnv() produces (or deliberately do not).
+
+describe("isOurServe (spawn-based)", () => {
+  it("true for a serve-shaped process (marker env + bare serve argv)", async () => {
+    const fx = orphanFixture();
+    const child = spawnOrphanSleeper(fx.sleeper, fx.stateDir); // marker + serve argv by default
+    try {
+      await waitForMarkerEnv(child.pid);
+      const result = isOurServe(child.pid, { root: fx.root, stateDir: fx.stateDir });
+      assert.equal(result.ours, true);
+      assert.equal(result.class, "ours");
+      assert.equal(result.reason, null);
+      assert.equal(result.markerStateDir, fx.stateDir);
+    } finally {
+      killPid(child.pid);
+      fs.rmSync(fx.tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("false for a live process without the marker env", async () => {
+    const fx = orphanFixture();
+    const child = spawnOrphanSleeper(fx.sleeper, fx.stateDir, { marker: false, serveArgv: false });
+    try {
+      assert.ok(isAlive(child.pid), "fixture must be alive");
+      const result = isOurServe(child.pid, { root: fx.root, stateDir: fx.stateDir });
+      assert.equal(result.ours, false);
+      assert.equal(result.class, "refuted");
+      assert.match(result.reason, /KUSABI_WORKER_CONTEXT/);
+    } finally {
+      killPid(child.pid);
+      fs.rmSync(fx.tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("unverifiable (not refuted) for a markerless pid whose argv carries a bare serve token", async () => {
+    // A serve spawned before KUSABI_WORKER_CONTEXT=1 was stamped
+    // (2026-07-27) carries no marker at all — only its argv says "serve".
+    // It may well BE our serve, so it must be unverifiable, never refuted:
+    // a refuted record is deleted by record-driven callers, stranding the
+    // genuine serve (unreachable by serve-stop, invisible to the orphan
+    // sweep).  Nothing here may ever be signalled either way.
+    const fx = orphanFixture();
+    const child = spawnOrphanSleeper(fx.sleeper, fx.stateDir, { marker: false }); // serveArgv defaults true
+    try {
+      await waitForServeArgv(child.pid);
+      assert.ok(isAlive(child.pid), "fixture must be alive");
+      const result = isOurServe(child.pid, { root: fx.root, stateDir: fx.stateDir });
+      assert.equal(result.ours, false);
+      assert.equal(result.class, "unverifiable");
+      assert.match(result.reason, /KUSABI_WORKER_CONTEXT/);
+      assert.match(result.reason, /"serve"/);
+      assert.equal(result.markerStateDir, null);
+    } finally {
+      killPid(child.pid);
+      fs.rmSync(fx.tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("unverifiable (not refuted) when a markerless pid's cmdline is unreadable (hidepid-style EACCES)", async () => {
+    // The markerless judgement leans on the argv: when that cannot be read
+    // either, the same gone-vs-unreadable rule as the environ read applies
+    // — ENOENT with /proc present is refuted, anything else unverifiable.
+    const fx = orphanFixture();
+    const child = spawnOrphanSleeper(fx.sleeper, fx.stateDir, { marker: false });
+    try {
+      assert.ok(isAlive(child.pid), "fixture must be alive");
+      const realReadFileSync = fs.readFileSync;
+      fs.readFileSync = (p, ...rest) => {
+        if (p === `/proc/${child.pid}/cmdline`) {
+          const err = new Error("operation not permitted");
+          err.code = "EACCES";
+          throw err;
+        }
+        return realReadFileSync(p, ...rest);
+      };
+      let result;
+      try {
+        result = isOurServe(child.pid, { root: fx.root, stateDir: fx.stateDir });
+      } finally {
+        fs.readFileSync = realReadFileSync;
+      }
+      assert.equal(result.ours, false);
+      assert.equal(result.class, "unverifiable");
+      assert.match(result.reason, /cannot read/);
+      assert.match(result.reason, /cmdline/);
+    } finally {
+      killPid(child.pid);
+      fs.rmSync(fx.tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("refuted (not unverifiable) when a markerless pid's cmdline is gone (ENOENT with /proc present)", async () => {
+    // The environ read succeeds (no marker) but the cmdline read hits
+    // ENOENT — the process vanished between the two reads, so nothing alive
+    // is stranded: refuted, exactly like the environ ENOENT rule.
+    const fx = orphanFixture();
+    const child = spawnOrphanSleeper(fx.sleeper, fx.stateDir, { marker: false });
+    try {
+      assert.ok(isAlive(child.pid), "fixture must be alive");
+      const realReadFileSync = fs.readFileSync;
+      fs.readFileSync = (p, ...rest) => {
+        if (p === `/proc/${child.pid}/cmdline`) {
+          const err = new Error("no such file or directory");
+          err.code = "ENOENT";
+          throw err;
+        }
+        return realReadFileSync(p, ...rest);
+      };
+      let result;
+      try {
+        result = isOurServe(child.pid, { root: fx.root, stateDir: fx.stateDir });
+      } finally {
+        fs.readFileSync = realReadFileSync;
+      }
+      assert.equal(result.ours, false);
+      assert.equal(result.class, "refuted");
+      assert.match(result.reason, /cannot read/);
+      assert.match(result.reason, /cmdline/);
+    } finally {
+      killPid(child.pid);
+      fs.rmSync(fx.tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("false when the marker names a different state dir than the caller's", async () => {
+    const fx = orphanFixture();
+    const other = path.join(fx.root, "ffffffffffff");
+    const child = spawnOrphanSleeper(fx.sleeper, fx.stateDir, { stateDirOverride: other });
+    try {
+      await waitForMarkerEnv(child.pid);
+      const result = isOurServe(child.pid, { root: fx.root, stateDir: fx.stateDir });
+      assert.equal(result.ours, false);
+      assert.equal(result.class, "refuted");
+      assert.match(result.reason, /names state dir/);
+    } finally {
+      killPid(child.pid);
+      fs.rmSync(fx.tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("false when the marker names a state dir outside the swept root", async () => {
+    const fx = orphanFixture();
+    const outside = path.join(fx.tmp, "other-state", "h1");
+    fs.mkdirSync(outside, { recursive: true });
+    const child = spawnOrphanSleeper(fx.sleeper, fx.stateDir, { stateDirOverride: outside });
+    try {
+      await waitForMarkerEnv(child.pid);
+      const result = isOurServe(child.pid, { root: fx.root });
+      assert.equal(result.ours, false);
+      assert.equal(result.class, "refuted");
+      assert.match(result.reason, /not under/);
+    } finally {
+      killPid(child.pid);
+      fs.rmSync(fx.tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("false when the argv carries no serve token (descendant simulation)", async () => {
+    const fx = orphanFixture();
+    const child = spawnOrphanSleeper(fx.sleeper, fx.stateDir, { serveArgv: false });
+    try {
+      await waitForMarkerEnv(child.pid);
+      const result = isOurServe(child.pid, { root: fx.root, stateDir: fx.stateDir });
+      assert.equal(result.ours, false);
+      assert.equal(result.class, "refuted");
+      assert.match(result.reason, /argv/);
+    } finally {
+      killPid(child.pid);
+      fs.rmSync(fx.tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("refuted for a dead pid (ENOENT with /proc present — the process is gone, nothing to strand)", async () => {
+    const fx = orphanFixture();
+    const child = spawnOrphanSleeper(fx.sleeper, fx.stateDir);
+    try {
+      await waitForMarkerEnv(child.pid);
+      killPid(child.pid);
+      await waitForDeath(child.pid);
+      const result = isOurServe(child.pid, { root: fx.root, stateDir: fx.stateDir });
+      assert.equal(result.ours, false);
+      assert.equal(result.class, "refuted");
+      assert.match(result.reason, /cannot read/);
+    } finally {
+      killPid(child.pid);
+      fs.rmSync(fx.tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("false for a stranger's thread id (TID) — the incident shape", async () => {
+    // 2026-08-09: server.json held 59244, a TID of an unrelated process
+    // (sunaba's main pid was 46988).  /proc/<tid>/environ and cmdline return
+    // the owning process's own, so a marker check catches the TID case.
+    const fx = orphanFixture();
+    const stranger = await spawnThreadedSleeper(fx.tmp, { marker: false });
+    try {
+      assert.ok(isAlive(stranger.mainPid), "stranger must be alive");
+      const result = isOurServe(stranger.workerTid, { root: fx.root, stateDir: fx.stateDir });
+      assert.equal(result.ours, false);
+      assert.equal(result.class, "refuted");
+      assert.match(result.reason, /KUSABI_WORKER_CONTEXT/);
+      assert.ok(isAlive(stranger.mainPid), "the whole process must survive — nothing was signalled");
+    } finally {
+      killPid(stranger.mainPid);
+      fs.rmSync(fx.tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("true for a TID of our own serve-shaped process (/proc returns the owning process's contents)", async () => {
+    const fx = orphanFixture();
+    const serve = await spawnThreadedSleeper(fx.tmp, { marker: true, stateDir: fx.stateDir, serveArgv: true });
+    try {
+      const result = isOurServe(serve.workerTid, { root: fx.root, stateDir: fx.stateDir });
+      assert.equal(result.ours, true, "a TID of our own serve passes identity — killing it kills our own serve");
+      assert.equal(result.class, "ours");
+      assert.equal(result.reason, null);
+    } finally {
+      killPid(serve.mainPid);
+      fs.rmSync(fx.tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("unverifiable (not refuted) for the older marker set — KUSABI_WORKER_CONTEXT without KUSABI_SERVE_STATE_DIR", async () => {
+    // KUSABI_SERVE_STATE_DIR is only stamped since 2026-08-03; a serve
+    // carrying the older marker set is genuine but unattributable.  It must
+    // not be treated as refuted: deleting its record would strand it.
+    const fx = orphanFixture();
+    const child = spawnOrphanSleeper(fx.sleeper, fx.stateDir, { omitStateDir: true });
+    try {
+      await waitForMarkerEnv(child.pid);
+      const result = isOurServe(child.pid, { root: fx.root, stateDir: fx.stateDir });
+      assert.equal(result.ours, false);
+      assert.equal(result.class, "unverifiable");
+      assert.match(result.reason, /KUSABI_SERVE_STATE_DIR/);
+    } finally {
+      killPid(child.pid);
+      fs.rmSync(fx.tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("unverifiable (not refuted) when environ is unreadable (hidepid-style EACCES)", async () => {
+    // A live process we cannot inspect may well be our serve; refuting it
+    // (and letting callers delete the record) would strand it.  The stub
+    // only simulates the platform condition (hidepid) — the identity
+    // judgement itself runs against a real spawned process.
+    const fx = orphanFixture();
+    const child = spawnOrphanSleeper(fx.sleeper, fx.stateDir);
+    try {
+      await waitForMarkerEnv(child.pid);
+      const realReadFileSync = fs.readFileSync;
+      fs.readFileSync = (p, ...rest) => {
+        if (p === `/proc/${child.pid}/environ`) {
+          const err = new Error("operation not permitted");
+          err.code = "EACCES";
+          throw err;
+        }
+        return realReadFileSync(p, ...rest);
+      };
+      let result;
+      try {
+        result = isOurServe(child.pid, { root: fx.root, stateDir: fx.stateDir });
+      } finally {
+        fs.readFileSync = realReadFileSync;
+      }
+      assert.equal(result.ours, false);
+      assert.equal(result.class, "unverifiable");
+      assert.match(result.reason, /cannot read/);
+    } finally {
+      killPid(child.pid);
+      fs.rmSync(fx.tmp, { recursive: true, force: true });
+    }
+  });
+});
+
+// reapIdleServes — the identity gate (kusabi #181)
+// ---------------------------------------------------------------------------
+// The record-driven sweep: a recorded pid that is not one of our serves must
+// never be signalled.  A *refuted* record (a positive conflict — no serve
+// token in the argv, wrong marker, gone process) is deleted instead so the
+// next call does not look at that pid again; an *unverifiable* record (older
+// marker set — including a wholly markerless pid whose argv still says
+// "serve" — hidepid, /proc-less platform) is kept — the pid may well be a
+// genuine serve and the record is the only handle to it; deleting it would
+// strand the process and spawn a duplicate on the next dispatch.  Records
+// are aged past the TTL in every test so the only thing sparing the fixture
+// is the identity gate, not the reap decision.  Liveness is asserted by
+// pid, never by a log line.
+
+function writeStaleServerRecord(serverFile, pid, extra = {}) {
+  fs.writeFileSync(serverFile, JSON.stringify({ pid, port: 1, password: "x", cwd: "/tmp", ...extra }), "utf8");
+  const old = new Date(Date.now() - 3600_000); // 1h old — far past a 30min TTL
+  fs.utimesSync(serverFile, old, old);
+}
+
+describe("reapIdleServes (spawn-based, temp state root)", () => {
+  const TTL = 30 * 60 * 1000;
+
+  it("deletes the record and spares a live process without the marker env", async () => {
+    const fx = orphanFixture();
+    const child = spawnOrphanSleeper(fx.sleeper, fx.stateDir, { marker: false, serveArgv: false });
+    writeStaleServerRecord(fx.serverFile, child.pid);
+    try {
+      assert.ok(isAlive(child.pid), "fixture must be alive before the sweep");
+      reapIdleServes(fx.root, TTL);
+      assert.ok(isAlive(child.pid), "a marker-less recorded pid must never be signalled");
+      assert.ok(!fs.existsSync(fx.serverFile), "the invalid record must be deleted");
+    } finally {
+      killPid(child.pid);
+      fs.rmSync(fx.tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps the record and spares a markerless process whose argv carries a bare serve token (pre-marker serve)", async () => {
+    // A serve spawned before KUSABI_WORKER_CONTEXT=1 was stamped
+    // (2026-07-27) is wholly markerless — only its argv says "serve".
+    // Refuting it would delete the record, stranding the genuine serve:
+    // serve-stop could never stop it again, the orphan sweep cannot
+    // identify it (it needs the marker), and the next dispatch would spawn
+    // a duplicate.  The sweep must keep both the process and the record
+    // (unverifiable) and say so in server.log.
+    const fx = orphanFixture();
+    const child = spawnOrphanSleeper(fx.sleeper, fx.stateDir, { marker: false }); // serveArgv defaults true
+    writeStaleServerRecord(fx.serverFile, child.pid);
+    try {
+      await waitForServeArgv(child.pid);
+      assert.ok(isAlive(child.pid), "fixture must be alive before the sweep");
+      reapIdleServes(fx.root, TTL);
+      assert.ok(isAlive(child.pid), "a markerless serve-shaped pid must never be signalled");
+      assert.ok(fs.existsSync(fx.serverFile), "an unverifiable serve's record must be kept, not deleted");
+      const log = fs.readFileSync(path.join(fx.stateDir, "server.log"), "utf8");
+      assert.match(log, /reap-idle: pid \d+ refused \(unverifiable/);
+      assert.match(log, /server\.json kept/);
+    } finally {
+      killPid(child.pid);
+      fs.rmSync(fx.tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("deletes the record and spares the whole process when the record holds a stranger's thread TID", async () => {
+    // The incident shape: the record held a TID, not a pid.  kill(2) aimed
+    // at a TID delivers a group signal, so a liveness-only guard passes and
+    // the whole unrelated process dies.  The identity gate must decline.
+    const fx = orphanFixture();
+    const stranger = await spawnThreadedSleeper(fx.tmp, { marker: false });
+    writeStaleServerRecord(fx.serverFile, stranger.workerTid);
+    try {
+      assert.ok(isAlive(stranger.workerTid), "the TID must read as alive (kill(pid, 0) passes for TIDs)");
+      reapIdleServes(fx.root, TTL);
+      assert.ok(isAlive(stranger.mainPid), "the whole process must survive the sweep");
+      assert.ok(!fs.existsSync(fx.serverFile), "the invalid record must be deleted");
+    } finally {
+      killPid(stranger.mainPid);
+      fs.rmSync(fx.tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("still reaps a serve-shaped process carrying the marker env", async () => {
+    const fx = orphanFixture();
+    const child = spawnOrphanSleeper(fx.sleeper, fx.stateDir); // marker + serve argv
+    writeStaleServerRecord(fx.serverFile, child.pid);
+    try {
+      await waitForMarkerEnv(child.pid);
+      reapIdleServes(fx.root, TTL);
+      await waitForDeath(child.pid);
+      assert.ok(!fs.existsSync(fx.serverFile), "the reaped serve's record must be deleted");
+    } finally {
+      killPid(child.pid);
+      fs.rmSync(fx.tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("is a no-op when /proc cannot be listed (macOS-style degradation)", () => {
+    const fx = orphanFixture();
+    const child = spawnOrphanSleeper(fx.sleeper, fx.stateDir, { marker: false });
+    writeStaleServerRecord(fx.serverFile, child.pid);
+    const realReaddirSync = fs.readdirSync;
+    fs.readdirSync = (p, ...rest) => {
+      if (p === "/proc") throw new Error("no /proc here");
+      return realReaddirSync(p, ...rest);
+    };
+    try {
+      reapIdleServes(fx.root, TTL); // must not throw
+      assert.ok(isAlive(child.pid), "nothing may be signalled without /proc");
+      assert.ok(fs.existsSync(fx.serverFile), "the sweep is a no-op — records are left alone");
+    } finally {
+      fs.readdirSync = realReaddirSync;
+      killPid(child.pid);
+      fs.rmSync(fx.tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps the record and spares a genuine serve with the older marker set (unverifiable, not refuted)", async () => {
+    // A pre-2026-08-03 serve carries KUSABI_WORKER_CONTEXT=1 without
+    // KUSABI_SERVE_STATE_DIR: genuine but unattributable.  Deleting its
+    // record would strand it (unreachable by serve-stop, invisible to the
+    // orphan sweep) and spawn a duplicate on the next dispatch.
+    const fx = orphanFixture();
+    const child = spawnOrphanSleeper(fx.sleeper, fx.stateDir, { omitStateDir: true });
+    writeStaleServerRecord(fx.serverFile, child.pid);
+    try {
+      await waitForMarkerEnv(child.pid);
+      reapIdleServes(fx.root, TTL);
+      assert.ok(isAlive(child.pid), "an unverifiable serve must never be signalled");
+      assert.ok(fs.existsSync(fx.serverFile), "an unverifiable serve's record must be kept");
+      const log = fs.readFileSync(path.join(fx.stateDir, "server.log"), "utf8");
+      assert.match(log, /reap-idle: pid \d+ refused \(unverifiable/);
+      assert.match(log, /server\.json kept/);
+    } finally {
+      killPid(child.pid);
+      fs.rmSync(fx.tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps the record and spares a live process whose environ is unreadable (hidepid-style EACCES)", async () => {
+    const fx = orphanFixture();
+    const child = spawnOrphanSleeper(fx.sleeper, fx.stateDir);
+    writeStaleServerRecord(fx.serverFile, child.pid);
+    try {
+      await waitForMarkerEnv(child.pid);
+      const realReadFileSync = fs.readFileSync;
+      fs.readFileSync = (p, ...rest) => {
+        if (p === `/proc/${child.pid}/environ`) {
+          const err = new Error("operation not permitted");
+          err.code = "EACCES";
+          throw err;
+        }
+        return realReadFileSync(p, ...rest);
+      };
+      try {
+        reapIdleServes(fx.root, TTL); // must not throw
+      } finally {
+        fs.readFileSync = realReadFileSync;
+      }
+      assert.ok(isAlive(child.pid), "an uninspectable pid must never be signalled");
+      assert.ok(fs.existsSync(fx.serverFile), "an unverifiable record must be kept, not deleted");
+    } finally {
+      killPid(child.pid);
+      fs.rmSync(fx.tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps refuted records when keepIdentityFailed is set (serve-stop invocations)", async () => {
+    // main() passes keepIdentityFailed for serve-stop so cmdServeStop can
+    // adjudicate the record itself and say why it declined — the sweep must
+    // not delete the record (and the reason) first (kusabi #181 follow-up).
+    const fx = orphanFixture();
+    const child = spawnOrphanSleeper(fx.sleeper, fx.stateDir, { marker: false, serveArgv: false });
+    writeStaleServerRecord(fx.serverFile, child.pid);
+    try {
+      reapIdleServes(fx.root, TTL, { keepIdentityFailed: true });
+      assert.ok(isAlive(child.pid), "a marker-less recorded pid must never be signalled");
+      assert.ok(fs.existsSync(fx.serverFile), "the record must be left for the invoking command");
+      const log = fs.readFileSync(path.join(fx.stateDir, "server.log"), "utf8");
+      assert.match(log, /left for the invoking command/);
+    } finally {
+      killPid(child.pid);
+      fs.rmSync(fx.tmp, { recursive: true, force: true });
+    }
+  });
+});
+
+// cmdServeStop — the identity gate (kusabi #181)
+// ---------------------------------------------------------------------------
+// Called directly (the module guards its CLI entry behind an argv check).
+// On serve-stop invocations the startup reaper now leaves identity-failed
+// records in place (keepIdentityFailed) so cmdServeStop adjudicates them
+// itself — the decline path below is therefore the one the real CLI flow
+// takes; a subprocess-level test in kusabi-companion.test.mjs covers the
+// end-to-end path.  'refuted' records are removed with the decline;
+// 'unverifiable' records are kept so a genuine serve is never stranded.
+
+function serveStopFixture() {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-servestop-id-"));
+  const root = path.join(tmp, "state");
+  const cwd = path.join(tmp, "ws");
+  fs.mkdirSync(cwd, { recursive: true });
+  const sleeper = path.join(tmp, "sleeper.mjs");
+  fs.writeFileSync(sleeper, ORPHAN_SLEEPER_SOURCE, "utf8");
+  const saved = process.env.KUSABI_STATE_DIR;
+  process.env.KUSABI_STATE_DIR = root;
+  const stateDir = stateDirFor(cwd);
+  return {
+    tmp,
+    root,
+    cwd,
+    sleeper,
+    stateDir,
+    serverFile: path.join(stateDir, "server.json"),
+    restore() {
+      if (saved === undefined) delete process.env.KUSABI_STATE_DIR;
+      else process.env.KUSABI_STATE_DIR = saved;
+    },
+  };
+}
+
+describe("cmdServeStop identity gate (spawn-based)", () => {
+  it("declines with a reason and deletes the record for a live process without the marker env", async () => {
+    const fx = serveStopFixture();
+    const child = spawnOrphanSleeper(fx.sleeper, fx.stateDir, { marker: false, serveArgv: false });
+    fs.writeFileSync(fx.serverFile, JSON.stringify({ pid: child.pid, port: 1, password: "x", cwd: fx.cwd }), "utf8");
+    try {
+      const message = cmdServeStop(fx.cwd);
+      assert.match(message, /declined to stop pid/);
+      assert.match(message, /KUSABI_WORKER_CONTEXT/);
+      assert.ok(isAlive(child.pid), "a marker-less recorded pid must never be signalled");
+      assert.ok(!fs.existsSync(fx.serverFile), "the invalid record must be deleted");
+    } finally {
+      killPid(child.pid);
+      fx.restore();
+      fs.rmSync(fx.tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("declines but keeps the record for a markerless process whose argv carries a bare serve token (pre-marker serve)", async () => {
+    // The pid may well be our serve (spawned before KUSABI_WORKER_CONTEXT=1
+    // was stamped): deleting the record would strand it — it could never be
+    // stopped again and the next dispatch would spawn a duplicate.  The
+    // decline must say the record was kept.
+    const fx = serveStopFixture();
+    const child = spawnOrphanSleeper(fx.sleeper, fx.stateDir, { marker: false }); // serveArgv defaults true
+    fs.writeFileSync(fx.serverFile, JSON.stringify({ pid: child.pid, port: 1, password: "x", cwd: fx.cwd }), "utf8");
+    try {
+      await waitForServeArgv(child.pid);
+      const message = cmdServeStop(fx.cwd);
+      assert.match(message, /declined to stop pid/);
+      assert.match(message, /KUSABI_WORKER_CONTEXT/);
+      assert.match(message, /server\.json kept/);
+      assert.ok(isAlive(child.pid), "a markerless serve-shaped pid must never be signalled");
+      assert.ok(fs.existsSync(fx.serverFile), "the record must be kept — it is the only handle to the serve");
+    } finally {
+      killPid(child.pid);
+      fx.restore();
+      fs.rmSync(fx.tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("declines and spares the whole process when the record holds a stranger's thread TID", async () => {
+    const fx = serveStopFixture();
+    const stranger = await spawnThreadedSleeper(fx.tmp, { marker: false });
+    fs.writeFileSync(fx.serverFile, JSON.stringify({ pid: stranger.workerTid, port: 1, password: "x", cwd: fx.cwd }), "utf8");
+    try {
+      const message = cmdServeStop(fx.cwd);
+      assert.match(message, /declined to stop pid/);
+      assert.ok(isAlive(stranger.mainPid), "the whole process must survive serve-stop");
+      assert.ok(!fs.existsSync(fx.serverFile), "the invalid record must be deleted");
+    } finally {
+      killPid(stranger.mainPid);
+      fx.restore();
+      fs.rmSync(fx.tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("still stops a serve-shaped process carrying the marker env", async () => {
+    const fx = serveStopFixture();
+    const child = spawnOrphanSleeper(fx.sleeper, fx.stateDir); // marker + serve argv
+    fs.writeFileSync(fx.serverFile, JSON.stringify({ pid: child.pid, port: 1, password: "x", cwd: fx.cwd }), "utf8");
+    try {
+      await waitForMarkerEnv(child.pid);
+      const message = cmdServeStop(fx.cwd);
+      assert.match(message, /stopped opencode server \(pid \d+\)/);
+      await waitForDeath(child.pid);
+      assert.ok(!fs.existsSync(fx.serverFile), "server.json must be removed by serve-stop");
+    } finally {
+      killPid(child.pid);
+      fx.restore();
+      fs.rmSync(fx.tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("declines but keeps the record when identity is unverifiable (hidepid-style EACCES)", async () => {
+    // A live process we cannot inspect may well be our serve: deleting the
+    // record would strand it (never stoppable again) and spawn a duplicate
+    // on the next dispatch.  The decline must say the record was kept.
+    const fx = serveStopFixture();
+    const child = spawnOrphanSleeper(fx.sleeper, fx.stateDir);
+    fs.writeFileSync(fx.serverFile, JSON.stringify({ pid: child.pid, port: 1, password: "x", cwd: fx.cwd }), "utf8");
+    try {
+      await waitForMarkerEnv(child.pid);
+      const realReadFileSync = fs.readFileSync;
+      fs.readFileSync = (p, ...rest) => {
+        if (p === `/proc/${child.pid}/environ`) {
+          const err = new Error("operation not permitted");
+          err.code = "EACCES";
+          throw err;
+        }
+        return realReadFileSync(p, ...rest);
+      };
+      let message;
+      try {
+        message = cmdServeStop(fx.cwd);
+      } finally {
+        fs.readFileSync = realReadFileSync;
+      }
+      assert.match(message, /declined to stop pid/);
+      assert.match(message, /server\.json kept/);
+      assert.ok(isAlive(child.pid), "an uninspectable pid must never be signalled");
+      assert.ok(fs.existsSync(fx.serverFile), "an unverifiable serve's record must be kept");
+    } finally {
+      killPid(child.pid);
+      fx.restore();
+      fs.rmSync(fx.tmp, { recursive: true, force: true });
+    }
+  });
+});
+
+// watchdog kill decision — the identity gate (kusabi #181)
+// ---------------------------------------------------------------------------
+// watchdogKillOrDecline() is the exact code the watchdog interval runs when
+// the recorded port stops answering (the SIGKILL site — the most dangerous
+// one: its trigger is more likely precisely when the record is stale, and
+// SIGKILL leaves the victim no chance to log anything).  Driven directly
+// with real spawned processes; the interval's abort.abort() is outside this
+// function and stays unconditional, so the stall handling is never lost.
+
+function watchdogFixture() {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-watchdog-id-"));
+  const root = path.join(tmp, "state");
+  const cwd = path.join(tmp, "ws");
+  fs.mkdirSync(cwd, { recursive: true });
+  const sleeper = path.join(tmp, "sleeper.mjs");
+  fs.writeFileSync(sleeper, ORPHAN_SLEEPER_SOURCE, "utf8");
+  const saved = process.env.KUSABI_STATE_DIR;
+  process.env.KUSABI_STATE_DIR = root;
+  const stateDir = stateDirFor(cwd);
+  const jobId = "job-wd";
+  fs.mkdirSync(path.join(stateDir, "jobs", jobId), { recursive: true });
+  return {
+    tmp,
+    root,
+    cwd,
+    sleeper,
+    stateDir,
+    jobId,
+    serverFile: path.join(stateDir, "server.json"),
+    eventsFile: path.join(stateDir, "jobs", jobId, "events.ndjson"),
+    restore() {
+      if (saved === undefined) delete process.env.KUSABI_STATE_DIR;
+      else process.env.KUSABI_STATE_DIR = saved;
+    },
+  };
+}
+
+function readEvents(eventsFile) {
+  try {
+    return fs.readFileSync(eventsFile, "utf8").trim().split("\n").filter(Boolean).map((l) => JSON.parse(l));
+  } catch {
+    return [];
+  }
+}
+
+describe("watchdog kill decision (identity gate, spawn-based)", () => {
+  function callWatchdog(fx, pid, { abortOk = false, healthOk = false, serveDead = null } = {}) {
+    return watchdogKillOrDecline({
+      server: { pid, port: 1, password: "x" },
+      stateDir: fx.stateDir,
+      job: { id: fx.jobId },
+      abortOk,
+      healthOk,
+      serveDead,
+    });
+  }
+
+  it("SIGKILLs the serve and records watchdog.kill when the recorded pid is one of our serves", async () => {
+    const fx = watchdogFixture();
+    const child = spawnOrphanSleeper(fx.sleeper, fx.stateDir); // marker + serve argv
+    fs.writeFileSync(fx.serverFile, JSON.stringify({ pid: child.pid, port: 1, password: "x", cwd: fx.cwd }), "utf8");
+    try {
+      await waitForMarkerEnv(child.pid);
+      const killed = callWatchdog(fx, child.pid);
+      assert.equal(killed, true);
+      await waitForDeath(child.pid);
+      assert.ok(!fs.existsSync(fx.serverFile), "server.json must be removed after the kill");
+      const types = readEvents(fx.eventsFile).map((e) => e.type);
+      assert.ok(types.includes("companion.watchdog.kill"));
+    } finally {
+      killPid(child.pid);
+      fx.restore();
+      fs.rmSync(fx.tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("declines to kill, records an event with the reason, and removes the record for a marker-less pid", async () => {
+    const fx = watchdogFixture();
+    const child = spawnOrphanSleeper(fx.sleeper, fx.stateDir, { marker: false, serveArgv: false });
+    fs.writeFileSync(fx.serverFile, JSON.stringify({ pid: child.pid, port: 1, password: "x", cwd: fx.cwd }), "utf8");
+    try {
+      const killed = callWatchdog(fx, child.pid);
+      assert.equal(killed, false);
+      assert.ok(isAlive(child.pid), "a marker-less recorded pid must never be SIGKILLed");
+      assert.ok(!fs.existsSync(fx.serverFile), "the invalid record must be removed");
+      const declined = readEvents(fx.eventsFile).filter((e) => e.type === "companion.watchdog.declined-kill");
+      assert.equal(declined.length, 1, "the decline must be recorded, not silent");
+      assert.equal(declined[0].pid, child.pid);
+      assert.match(declined[0].reason, /KUSABI_WORKER_CONTEXT/);
+    } finally {
+      killPid(child.pid);
+      fx.restore();
+      fs.rmSync(fx.tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("declines with class unverifiable and keeps the record for a markerless pid whose argv carries a bare serve token", async () => {
+    // A pre-marker serve is wholly markerless; only its argv says "serve".
+    // The kill must be declined (never SIGKILL a pid we cannot attribute to
+    // our own serve) but the record kept — it is the only handle to the
+    // serve, and deleting it would strand the process and force a duplicate
+    // spawn on the next dispatch.  The decline event must carry the class
+    // so the audit trail distinguishes this from 'refuted'.
+    const fx = watchdogFixture();
+    const child = spawnOrphanSleeper(fx.sleeper, fx.stateDir, { marker: false }); // serveArgv defaults true
+    fs.writeFileSync(fx.serverFile, JSON.stringify({ pid: child.pid, port: 1, password: "x", cwd: fx.cwd }), "utf8");
+    try {
+      await waitForServeArgv(child.pid);
+      const killed = callWatchdog(fx, child.pid);
+      assert.equal(killed, false);
+      assert.ok(isAlive(child.pid), "a markerless serve-shaped pid must never be SIGKILLed");
+      assert.ok(fs.existsSync(fx.serverFile), "an unverifiable serve's record must be kept");
+      const declined = readEvents(fx.eventsFile).filter((e) => e.type === "companion.watchdog.declined-kill");
+      assert.equal(declined.length, 1, "the decline must be recorded, not silent");
+      assert.equal(declined[0].class, "unverifiable");
+      assert.match(declined[0].reason, /KUSABI_WORKER_CONTEXT/);
+    } finally {
+      killPid(child.pid);
+      fx.restore();
+      fs.rmSync(fx.tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("declines and spares the whole process when the record holds a stranger's thread TID", async () => {
+    const fx = watchdogFixture();
+    const stranger = await spawnThreadedSleeper(fx.tmp, { marker: false });
+    fs.writeFileSync(fx.serverFile, JSON.stringify({ pid: stranger.workerTid, port: 1, password: "x", cwd: fx.cwd }), "utf8");
+    try {
+      const killed = callWatchdog(fx, stranger.workerTid);
+      assert.equal(killed, false);
+      assert.ok(isAlive(stranger.mainPid), "the whole process must survive the watchdog");
+      assert.ok(!fs.existsSync(fx.serverFile), "the invalid record must be removed");
+      const declined = readEvents(fx.eventsFile).filter((e) => e.type === "companion.watchdog.declined-kill");
+      assert.equal(declined.length, 1, "the decline must be recorded, not silent");
+    } finally {
+      killPid(stranger.mainPid);
+      fx.restore();
+      fs.rmSync(fx.tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("leaves everything alone when both probes succeed (no stall, no kill, no event)", async () => {
+    const fx = watchdogFixture();
+    const child = spawnOrphanSleeper(fx.sleeper, fx.stateDir);
+    fs.writeFileSync(fx.serverFile, JSON.stringify({ pid: child.pid, port: 1, password: "x", cwd: fx.cwd }), "utf8");
+    try {
+      const killed = callWatchdog(fx, child.pid, { abortOk: true, healthOk: true });
+      assert.equal(killed, false);
+      assert.ok(isAlive(child.pid));
+      assert.ok(fs.existsSync(fx.serverFile), "a healthy serve's record must be left alone");
+      assert.deepEqual(readEvents(fx.eventsFile), [], "no event may be recorded when nothing was done");
+    } finally {
+      killPid(child.pid);
+      fx.restore();
+      fs.rmSync(fx.tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("declines but keeps the record when identity is unverifiable (hidepid-style EACCES)", async () => {
+    // The pid may well be our serve — deleting the record would strand it
+    // and force a duplicate spawn.  The decline event must carry the class
+    // so the audit trail distinguishes 'refuted' from 'unverifiable'.
+    const fx = watchdogFixture();
+    const child = spawnOrphanSleeper(fx.sleeper, fx.stateDir);
+    fs.writeFileSync(fx.serverFile, JSON.stringify({ pid: child.pid, port: 1, password: "x", cwd: fx.cwd }), "utf8");
+    try {
+      await waitForMarkerEnv(child.pid);
+      const realReadFileSync = fs.readFileSync;
+      fs.readFileSync = (p, ...rest) => {
+        if (p === `/proc/${child.pid}/environ`) {
+          const err = new Error("operation not permitted");
+          err.code = "EACCES";
+          throw err;
+        }
+        return realReadFileSync(p, ...rest);
+      };
+      let killed;
+      try {
+        killed = callWatchdog(fx, child.pid);
+      } finally {
+        fs.readFileSync = realReadFileSync;
+      }
+      assert.equal(killed, false);
+      assert.ok(isAlive(child.pid), "an uninspectable pid must never be SIGKILLed");
+      assert.ok(fs.existsSync(fx.serverFile), "an unverifiable serve's record must be kept");
+      const declined = readEvents(fx.eventsFile).filter((e) => e.type === "companion.watchdog.declined-kill");
+      assert.equal(declined.length, 1, "the decline must be recorded, not silent");
+      assert.equal(declined[0].class, "unverifiable");
+      assert.match(declined[0].reason, /cannot read/);
+    } finally {
+      killPid(child.pid);
+      fx.restore();
       fs.rmSync(fx.tmp, { recursive: true, force: true });
     }
   });
