@@ -561,6 +561,90 @@ subcommand, not just explain. The durable lesson is not about explain in
 particular: anything quoted into a worker prompt will eventually be
 executed if the worker has tools.
 
+### 3.8 Skills (opencode Agent Skills)
+
+**What they are for.** Agent Skills (`SKILL.md` + YAML frontmatter, loaded on
+demand through opencode's built-in `skill` tool) carry occasional, long-form
+worker knowledge — deep procedure that is only relevant to a narrow class of
+task. Keeping that text in the agent definition would load it into every
+session of that phase; a skill keeps it one `skill` call away without paying
+context for it in the common case. kusabi ships them under
+`plugins/kusabi/opencode-skills/<name>/SKILL.md`.
+
+**Distribution path.** `install-agents` copies agents and skills in one pass:
+agents to `OPENCODE_AGENT_DIR` and every directory under `opencode-skills/` —
+whole directory, keeping its own name — to `OPENCODE_SKILL_DIR`, creating the
+destination when missing. Both defaults are derived from opencode's own config
+dir (`$XDG_CONFIG_HOME/opencode`, else `~/.config/opencode`) rather than a
+hardcoded `~/.config`, so the default destination stays a discovery path on
+hosts that relocated their config. Known gap: if opencode also honours
+`OPENCODE_CONFIG_DIR` for relocation, `install-agents` does not follow that
+one — set `OPENCODE_SKILL_DIR` explicitly on such a host. A skill is only *reachable*, never implicitly
+loaded; discovery is opencode's job. Whether a phase can actually pull it is
+decided by the agent's permission map: every kusabi agent opens with
+`"*": deny` (last matching rule wins), so a skill is unreachable until the
+`skill` tool is granted explicitly. Currently only the implement phase
+grants it, and only for `kusabi-*` names.
+
+**Two invariants.**
+1. **Skills grant nothing.** A skill is a document; it carries no
+   `permission:` key and cannot grant or deny tools. The agent allowlist is
+   the only thing that decides what tools exist.
+2. **The destination is never pruned, and a collision never fails the
+   install.** `install-agents` copies and overwrites skills only — it never
+   deletes anything under `OPENCODE_SKILL_DIR`, because that directory is
+   shared with skills the user installed themselves and there is no
+   kusabi-owned name registry that would make deletion safe. (Contrast the
+   agent path, which deletes a fixed, explicit list of legacy `oc-*` names.)
+   A name collision with a non-directory (a user file squatting on a skill's
+   directory name) skips that skill with a warning and leaves the file
+   untouched; a destination root that is not a directory fails with a clear
+   error *before* any mutation.
+
+**Runtime verification status (opencode 1.18.15, source-verified against the
+release commit `d7b115f`).** The mechanism is confirmed from opencode's own
+source, not just from docs:
+
+- **Discovery.** `~/.config/opencode/skills/<name>/SKILL.md` is a real scan
+  path: the config layer returns `Global.Path.config` (`$XDG_CONFIG_HOME` /
+  `~/.config` + `opencode`, relocatable via `OPENCODE_CONFIG_DIR`) as a
+  config directory, and the skill loader scans `{skill,skills}/**/SKILL.md`
+  under each (`packages/opencode/src/config/paths.ts`,
+  `packages/opencode/src/skill/index.ts`). The same scan covers the project's
+  `.opencode/skills` and the Claude/Agent-compatible `~/.claude/skills` /
+  `~/.agents/skills`, plus config-file `skills.paths` / `skills.urls`.
+- **`OPENCODE_SKILL_DIR` is a placement override, not a discovery path.**
+  opencode 1.18.15 does not read that env var anywhere (zero occurrences in
+  the release source), and the same holds for the pre-existing
+  `OPENCODE_AGENT_DIR`: both knobs only tell `install-agents` where to copy.
+  Setting `OPENCODE_SKILL_DIR` lands the skill outside opencode's scan, so it
+  must never be reported as discovered; the runtime-verified discovery path
+  is the default `~/.config/opencode/skills` (or the relocated config dir via
+  `XDG_CONFIG_HOME` / `OPENCODE_CONFIG_DIR`).
+- **Permission.** `permission.skill` accepts an action or a
+  pattern→action object; object entries become per-pattern rules in map
+  order, and `evaluate` picks the **last matching rule** (`findLast`), so
+  `"*": deny` first + `skill: {"kusabi-*": allow}` allows exactly
+  `kusabi-*` skill names and denies everything else
+  (`packages/opencode/src/permission/index.ts`). The implement agent is the
+  only kusabi agent with a `skill` rule; for agents without one the skill
+  tool is hidden entirely (`visibleTools`). Permitted skills are listed for
+  the agent (`Skill.available` filters to non-deny), and the tool call
+  itself is re-gated through the same rules (`ctx.ask("skill", <name>)`).
+- **Still unverified: the skill being actually pulled in a real job.** The
+  chain above is mechanism; "a worker really loaded it" is behavior and
+  needs a live session on the host (issue #179 acceptance criterion 4).
+  Pending that probe, criterion 2 of the experiment brief is met as config
+  + mechanism, not as observed runtime behavior. Host probe procedure:
+  1. `node plugins/kusabi/scripts/kusabi-companion.mjs install-agents`
+     (no env overrides — default destination).
+  2. Confirm the skill is listed in the implement session's system prompt
+     (it is rendered by the `skill` tool as "Available Skills") or invoke
+     `skill` with name `kusabi-rust-cross-target-checks` in a session whose
+     task touches `#[cfg]`-gated Rust.
+  3. Confirm a non-`kusabi-*` skill name is refused for the implement agent.
+  4. Record the outcome on issue #179 before closing the experiment.
+
 ## 4. Model operations
 
 - **Default is Flash**: zen's deepseek-v4-flash-free (daily free tier) → go's deepseek v4 Flash.

@@ -1872,3 +1872,253 @@ describe("chain finally serve-stop fossil guard", () => {
     }
   });
 });
+
+// install-agents: skills distribution
+// ---------------------------------------------------------------------------
+// kusabi ships opencode Agent Skills under opencode-skills/; install-agents
+// copies them (whole directory, own name) to OPENCODE_SKILL_DIR — copy and
+// overwrite only, never delete (the destination is shared with user-installed
+// skills and there is no kusabi-owned name registry to make deletion safe).
+
+/** Parse the YAML frontmatter of a SKILL.md into { name, description }. */
+function parseSkillFrontmatter(content) {
+  const m = content.match(/^---\n([\s\S]*?)\n---\n/);
+  assert.ok(m, "SKILL.md must start with a YAML frontmatter block");
+  const yaml = m[1];
+  const name = yaml.match(/^name:\s*(.+?)\s*$/m)?.[1]?.replace(/^["']|["']$/g, "");
+  const description = yaml.match(/^description:\s*(.+?)\s*$/m)?.[1]?.replace(/^["']|["']$/g, "");
+  return { name, description };
+}
+
+/**
+ * Parse the permission: block of an agent definition into a nested map
+ * (2-space tool entries, 4-space pattern -> action entries under a tool).
+ * Returns e.g. { "*": "deny", "skill": { "kusabi-*": "allow" } }.
+ */
+function parsePermissionBlock(content) {
+  const m = content.match(/^---\n([\s\S]*?)\n---\n/);
+  assert.ok(m, "agent definition must start with a YAML frontmatter block");
+  const permission = {};
+  let inPermission = false;
+  let nestedKey = null;
+  for (const line of m[1].split("\n")) {
+    const indent = line.match(/^\s*/)[0].length;
+    const text = line.trim();
+    if (!text) continue;
+    if (!inPermission) {
+      inPermission = text === "permission:";
+      continue;
+    }
+    if (indent === 0) break; // left the permission block
+    const entry = text.match(/^(.+?):\s*(.*)$/);
+    if (!entry) continue;
+    const key = entry[1].replace(/^["']|["']$/g, "").trim();
+    const value = entry[2].trim().replace(/^["']|["']$/g, "");
+    if (indent === 2) {
+      nestedKey = value === "" ? key : null;
+      permission[key] = value === "" ? {} : value;
+    } else if (indent === 4 && nestedKey) {
+      permission[nestedKey][key] = value;
+    }
+  }
+  return permission;
+}
+
+describe("install-agents skills distribution", () => {
+  const COMPANION_SCRIPT = path.join(import.meta.dirname, "kusabi-companion.mjs");
+  const SKILLS_SRC = path.resolve(import.meta.dirname, "..", "opencode-skills");
+
+  function runInstallAgents(env) {
+    return spawnSync(process.execPath, [COMPANION_SCRIPT, "install-agents"], {
+      encoding: "utf8",
+      env: { ...process.env, ...env },
+      timeout: 10_000,
+    });
+  }
+
+  function expectedSkillCount() {
+    return fs.readdirSync(SKILLS_SRC, { withFileTypes: true }).filter((e) => e.isDirectory()).length;
+  }
+
+  it("installs both agents and skills, honouring OPENCODE_SKILL_DIR", () => {
+    const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-install-agent-"));
+    const skillDir = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-install-skill-"));
+    try {
+      const result = runInstallAgents({ OPENCODE_AGENT_DIR: agentDir, OPENCODE_SKILL_DIR: skillDir });
+      assert.equal(result.status, 0, result.stdout + result.stderr);
+
+      // Agents still land in OPENCODE_AGENT_DIR ...
+      const agentFile = path.join(agentDir, "kusabi-implement.md");
+      assert.ok(fs.existsSync(agentFile), `agent not installed: ${agentFile}`);
+
+      // ... and the skill lands whole (own directory name) in OPENCODE_SKILL_DIR.
+      const installed = path.join(skillDir, "kusabi-rust-cross-target-checks", "SKILL.md");
+      assert.ok(fs.existsSync(installed), `skill not installed: ${installed}`);
+      assert.match(fs.readFileSync(installed, "utf8"), /^name: kusabi-rust-cross-target-checks$/m);
+
+      // Success message reports skill count and destination alongside agent counts.
+      const expected = expectedSkillCount();
+      assert.match(result.stdout, /installed \d+ phase agents to .*\(removed \d+ stale legacy names\)/);
+      assert.ok(result.stdout.includes(`installed ${expected} skills to ${skillDir}`), result.stdout);
+    } finally {
+      fs.rmSync(agentDir, { recursive: true, force: true });
+      fs.rmSync(skillDir, { recursive: true, force: true });
+    }
+  });
+
+  it("leaves pre-existing unrelated content at the destination untouched", () => {
+    const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-install-agent-"));
+    const skillDir = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-install-skill-"));
+    try {
+      // Content a user installed themselves — a custom skill dir and a loose file.
+      const userSkillDir = path.join(skillDir, "user-custom-skill");
+      fs.mkdirSync(userSkillDir, { recursive: true });
+      fs.writeFileSync(path.join(userSkillDir, "SKILL.md"), "# user's own skill\n");
+      const looseFile = path.join(skillDir, "notes.txt");
+      fs.writeFileSync(looseFile, "keep me\n");
+
+      const result = runInstallAgents({ OPENCODE_AGENT_DIR: agentDir, OPENCODE_SKILL_DIR: skillDir });
+      assert.equal(result.status, 0, result.stdout + result.stderr);
+
+      assert.equal(fs.readFileSync(path.join(userSkillDir, "SKILL.md"), "utf8"), "# user's own skill\n");
+      assert.equal(fs.readFileSync(looseFile, "utf8"), "keep me\n");
+      // The kusabi skill was still installed alongside them.
+      assert.ok(fs.existsSync(path.join(skillDir, "kusabi-rust-cross-target-checks", "SKILL.md")));
+    } finally {
+      fs.rmSync(agentDir, { recursive: true, force: true });
+      fs.rmSync(skillDir, { recursive: true, force: true });
+    }
+  });
+
+  it("skips a skill whose destination name is blocked by a file, leaving it untouched", () => {
+    const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-install-agent-"));
+    const skillDir = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-install-skill-"));
+    try {
+      // A user file squatting on the skill's directory name (no-delete rule:
+      // the destination is user-controlled, so the install must not crash on
+      // it — skip with a warning and leave it alone).
+      const blocker = path.join(skillDir, "kusabi-rust-cross-target-checks");
+      fs.writeFileSync(blocker, "user file in the way\n");
+
+      const result = runInstallAgents({ OPENCODE_AGENT_DIR: agentDir, OPENCODE_SKILL_DIR: skillDir });
+      assert.equal(result.status, 0, result.stdout + result.stderr);
+
+      // Collision left untouched; agents and the rest of the install still done.
+      assert.equal(fs.readFileSync(blocker, "utf8"), "user file in the way\n");
+      assert.ok(fs.existsSync(path.join(agentDir, "kusabi-implement.md")), "agents must still be installed");
+      // The warning names the skipped skill and the reason.
+      assert.match(result.stdout, /skipped 1 skill\(s\): kusabi-rust-cross-target-checks/);
+      assert.match(result.stdout, /not a directory/);
+      // The reported count is the successfully installed number.
+      assert.ok(result.stdout.includes(`installed ${expectedSkillCount() - 1} skills to`), result.stdout);
+    } finally {
+      fs.rmSync(agentDir, { recursive: true, force: true });
+      fs.rmSync(skillDir, { recursive: true, force: true });
+    }
+  });
+
+  it("fails before any mutation when the skills destination root is a file", () => {
+    const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-install-agent-"));
+    const parentDir = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-install-skillparent-"));
+    const skillDirFile = path.join(parentDir, "skill-dest");
+    fs.writeFileSync(skillDirFile, "not a directory\n");
+    try {
+      const result = runInstallAgents({ OPENCODE_AGENT_DIR: agentDir, OPENCODE_SKILL_DIR: skillDirFile });
+      assert.notEqual(result.status, 0);
+      assert.match(result.stdout, /is not a usable directory \(not-a-directory\)/);
+      // Preflight runs before the agent copy: nothing was written anywhere.
+      assert.deepEqual(fs.readdirSync(agentDir), [], "no mutation before the failure");
+    } finally {
+      fs.rmSync(agentDir, { recursive: true, force: true });
+      fs.rmSync(parentDir, { recursive: true, force: true });
+    }
+  });
+
+  // A dangling symlink is the case a plain statSync gets wrong: stat throws, so
+  // the path reads as "absent" and the failure moves to the mkdirSync further
+  // down -- after the agents were already copied. The preflight must classify
+  // it from lstat and refuse before touching anything.
+  it("fails before any mutation when the skills destination is a broken symlink", () => {
+    const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-install-agent-"));
+    const parentDir = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-install-skillparent-"));
+    const skillDirLink = path.join(parentDir, "skill-dest");
+    fs.symlinkSync(path.join(parentDir, "no-such-target"), skillDirLink);
+    try {
+      const result = runInstallAgents({ OPENCODE_AGENT_DIR: agentDir, OPENCODE_SKILL_DIR: skillDirLink });
+      assert.notEqual(result.status, 0);
+      assert.match(result.stdout, /is not a usable directory \(broken-symlink\)/);
+      assert.deepEqual(fs.readdirSync(agentDir), [], "no mutation before the failure");
+    } finally {
+      fs.rmSync(agentDir, { recursive: true, force: true });
+      fs.rmSync(parentDir, { recursive: true, force: true });
+    }
+  });
+
+  // The defaults must land inside opencode's own config dir, which is
+  // relocatable via XDG_CONFIG_HOME. Hardcoding ~/.config would put the files
+  // outside opencode's scan on a relocated host -- installed but never found.
+  it("defaults to opencode's config dir and follows XDG_CONFIG_HOME", () => {
+    const xdgDir = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-install-xdg-"));
+    try {
+      const result = runInstallAgents({
+        XDG_CONFIG_HOME: xdgDir,
+        OPENCODE_AGENT_DIR: "",
+        OPENCODE_SKILL_DIR: "",
+      });
+      assert.equal(result.status, 0, result.stderr);
+      assert.ok(
+        fs.existsSync(path.join(xdgDir, "opencode", "agent", "kusabi-implement.md")),
+        "agents land under $XDG_CONFIG_HOME/opencode/agent",
+      );
+      for (const d of fs.readdirSync(SKILLS_SRC, { withFileTypes: true }).filter((e) => e.isDirectory())) {
+        assert.ok(
+          fs.existsSync(path.join(xdgDir, "opencode", "skills", d.name, "SKILL.md")),
+          `skill ${d.name} lands under $XDG_CONFIG_HOME/opencode/skills`,
+        );
+      }
+    } finally {
+      fs.rmSync(xdgDir, { recursive: true, force: true });
+    }
+  });
+
+  it("every skill directory has a SKILL.md whose name matches its directory and a non-empty description", () => {
+    const dirs = fs.readdirSync(SKILLS_SRC, { withFileTypes: true }).filter((e) => e.isDirectory());
+    assert.ok(dirs.length > 0, `no skill directories found under ${SKILLS_SRC}`);
+    for (const d of dirs) {
+      const skillFile = path.join(SKILLS_SRC, d.name, "SKILL.md");
+      assert.ok(fs.existsSync(skillFile), `missing SKILL.md in ${path.join(SKILLS_SRC, d.name)}`);
+      const fm = parseSkillFrontmatter(fs.readFileSync(skillFile, "utf8"));
+      assert.equal(fm.name, d.name, `frontmatter name in ${skillFile} must equal its directory name`);
+      assert.ok(fm.description && fm.description.length > 0, `non-empty description required in ${skillFile}`);
+    }
+  });
+
+  it("skills never grant tools — no permission: key under opencode-skills", () => {
+    const files = [];
+    const walk = (dir) => {
+      for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
+        const p = path.join(dir, e.name);
+        if (e.isDirectory()) walk(p);
+        else files.push(p);
+      }
+    };
+    walk(SKILLS_SRC);
+    assert.ok(files.length > 0, `no files under ${SKILLS_SRC}`);
+    for (const f of files) {
+      const content = fs.readFileSync(f, "utf8");
+      assert.ok(
+        !/^\s*permission\s*:/m.test(content),
+        `a skill is a document, not a tool grant — permission: key must not appear (${f})`,
+      );
+    }
+  });
+
+  it("kusabi-implement still denies all first and grants only kusabi-* skills", () => {
+    const file = path.resolve(import.meta.dirname, "..", "opencode-agents", "kusabi-implement.md");
+    const permission = parsePermissionBlock(fs.readFileSync(file, "utf8"));
+    const entries = Object.entries(permission);
+    assert.equal(entries[0][0], "*");
+    assert.equal(entries[0][1], "deny");
+    assert.deepEqual(permission.skill, { "kusabi-*": "allow" });
+  });
+});
