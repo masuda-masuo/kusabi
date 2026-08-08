@@ -27,7 +27,7 @@ import {
   resolveChainResume,
   computeChainTotals,
 } from "./chain-phases.mjs";
-import { readJson, writeJson } from "./state-paths.mjs";
+import { readJson, writeJson, stateDirFor } from "./state-paths.mjs";
 
 // newestChainDir — chain directory selection by mtime
 // ---------------------------------------------------------------------------
@@ -1598,6 +1598,162 @@ describe("serve-stop fossil running records", () => {
       assert.equal(result.status, 0, `serve-stop --force failed: ${result.stdout} ${result.stderr}`);
       assert.match(result.stdout, /stopped opencode server \(pid \d+\)/);
       await waitPidDead(fx.sleeper.pid);
+    } finally {
+      fx.cleanup();
+    }
+  });
+});
+
+// chain finally — fossil `running` records must not block the chain's serve
+// stop (kusabi #175).  The chain driver's finally block stops the serve for
+// the cwd unless another GENUINELY running job exists, using the same
+// staleness rule as serve-stop: a fossil record (last activity older than
+// RUNNING_STALE_MS) must not pin the serve.  The driver runs in-process with
+// a fake dispatch/callTool; the recorded serve is a fake long-lived process.
+// ---------------------------------------------------------------------------
+
+describe("chain finally serve-stop fossil guard", () => {
+  const BRIEF = "Implement X.\n\n## Deliverables\n- src/foo.js\n";
+
+  // Accept at round 1: implement completes, review approves, probes are green
+  // (P1/P2/P3/P4 all pass against the fake callTool below).
+  function makeDispatch() {
+    return async (opts) => {
+      if (opts.kind === "review") {
+        return {
+          job: {
+            id: "job-rev-1", status: "completed", modelEntry: "fake/review", modelVariant: null,
+            fallbacks: null, sessionID: "sess-rev",
+            usage: { available: true, input: 2, output: 2, reasoning: 0, cacheRead: 0, cacheWrite: 0, cost: 0.01 },
+            error: null,
+          },
+          resultText: JSON.stringify({ verdict: "approve", findings: [], summary: "ok" }),
+        };
+      }
+      if (opts.kind === "task") {
+        return {
+          job: {
+            id: "job-imp-1", status: "completed", modelEntry: "fake/model", modelVariant: null,
+            fallbacks: null, sessionID: "sess-imp-1",
+            usage: { available: true, input: 1, output: 1, reasoning: 0, cacheRead: 0, cacheWrite: 0, cost: 0.01 },
+            error: null,
+          },
+          resultText: "implemented",
+        };
+      }
+      throw new Error("unexpected dispatch kind: " + opts.kind);
+    };
+  }
+
+  function makeCallTool() {
+    return async (toolName, params) => {
+      if (toolName === "verify_in_container") return { gate_passed: true };
+      if (toolName !== "sandbox_exec") return { output: "" };
+      const cmd = params.commands[0];
+      if (cmd.startsWith("cd /workspace &&") && cmd.includes("TMPIDX=")) return { output: "ERROR_NO_INDEX\n" };
+      if (cmd === "git rev-parse HEAD") return { output: "abc123\n" };
+      if (cmd === "git status --porcelain") return { output: " M src/foo.js\n" };
+      if (cmd === "git log --oneline -5") return { output: "abc123 latest change\n" };
+      if (cmd === "git diff") return { output: "diff --git a/src/foo.js b/src/foo.js\n" };
+      if (cmd === "git ls-files --others --exclude-standard") return { output: "untracked.txt\n" };
+      return { output: "" };
+    };
+  }
+
+  // State dir is resolved from cwd the same way the finally block's
+  // cmdServeStop(cwd) resolves it (KUSABI_STATE_DIR + sha256 hash), so the
+  // planted server.json / job record are exactly what the guard sees.
+  function chainFinallyFixture({ jobAgeMs }) {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-chainstop-"));
+    const cwd = path.join(tmp, "ws");
+    fs.mkdirSync(cwd, { recursive: true });
+    const prevStateEnv = process.env.KUSABI_STATE_DIR;
+    process.env.KUSABI_STATE_DIR = path.join(tmp, "state");
+    const stateDir = stateDirFor(cwd);
+    const serverFile = path.join(stateDir, "server.json");
+    const sleeper = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
+    fs.writeFileSync(serverFile, JSON.stringify({ pid: sleeper.pid, port: 0, password: "x", cwd }), "utf8");
+
+    // A non-chain job record: fossil (jobAgeMs old) or genuinely running.
+    if (jobAgeMs !== null) {
+      const jobsDir = path.join(stateDir, "jobs", "job-other");
+      fs.mkdirSync(jobsDir, { recursive: true });
+      const job = {
+        id: "job-other",
+        status: "running",
+        startedAt: new Date(Date.now() - jobAgeMs).toISOString(),
+        stats: { lastActivity: new Date(Date.now() - jobAgeMs).toISOString() },
+      };
+      fs.writeFileSync(path.join(jobsDir, "job.json"), JSON.stringify(job), "utf8");
+    }
+
+    const chainDir = path.join(stateDir, "chains", "chain-test");
+    fs.mkdirSync(chainDir, { recursive: true });
+    writeChainControl(chainDir, {
+      chainId: "chain-test", container: "cid-1", pid: process.pid,
+      status: "running", round: 0, startedAt: new Date().toISOString(),
+    });
+
+    function run() {
+      return runChainDriver({
+        cwd, stateDir, chainDir, chainId: "chain-test", container: "cid-1",
+        model: "fake/model", modelChain: [["fake/model"]], maxRounds: 1,
+        brief: BRIEF, orchestrator: null, baseSha: "abc123", worktreeBaseline: null,
+        callTool: makeCallTool(), dispatchWithFallback: makeDispatch(),
+        keepServe: false, signalReceived: () => false, resume: null,
+      });
+    }
+
+    return {
+      tmp, cwd, stateDir, chainDir, serverFile, sleeper, run,
+      cleanup() {
+        if (prevStateEnv === undefined) delete process.env.KUSABI_STATE_DIR;
+        else process.env.KUSABI_STATE_DIR = prevStateEnv;
+        try { process.kill(sleeper.pid, "SIGKILL"); } catch { /* already gone */ }
+        fs.rmSync(tmp, { recursive: true, force: true });
+      },
+    };
+  }
+
+  function pidAlive(pid) {
+    try { process.kill(pid, 0); return true; } catch { return false; }
+  }
+
+  async function waitPidDead(pid, timeoutMs = 5000) {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      if (!pidAlive(pid)) return;
+      await new Promise((r) => setTimeout(r, 50));
+    }
+    throw new Error(`pid ${pid} still alive after ${timeoutMs}ms`);
+  }
+
+  it("stops the serve on completion when the only running record is a fossil", async () => {
+    const fx = chainFinallyFixture({ jobAgeMs: 7 * 24 * 3600 * 1000 });
+    try {
+      const text = await fx.run();
+      assert.match(text, /accepted at round 1/);
+      // The finally block stopped the serve despite the fossil job record.
+      await waitPidDead(fx.sleeper.pid);
+      assert.ok(!fs.existsSync(fx.serverFile), "server.json must be removed by the chain finally stop");
+      const control = readChainControl(fx.chainDir);
+      assert.equal(control.status, "completed");
+    } finally {
+      fx.cleanup();
+    }
+  });
+
+  it("keeps the serve alive on completion when a genuinely running job exists", async () => {
+    const fx = chainFinallyFixture({ jobAgeMs: 3600 * 1000 });
+    try {
+      const text = await fx.run();
+      assert.match(text, /accepted at round 1/);
+      // The finally guard must still see the fresh running record and skip
+      // the serve stop, exactly as before the fossil fix.
+      assert.ok(pidAlive(fx.sleeper.pid), "the serve must survive while a live job is running");
+      assert.ok(fs.existsSync(fx.serverFile), "server.json must survive while a live job is running");
+      const control = readChainControl(fx.chainDir);
+      assert.equal(control.status, "completed");
     } finally {
       fx.cleanup();
     }
