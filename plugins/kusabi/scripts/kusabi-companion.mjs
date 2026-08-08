@@ -587,6 +587,17 @@ async function cmdCancel(cwd, { text }) {
   return `cancelled ${job.id} (session ${job.sessionID}).`;
 }
 
+// A `running` job record whose last activity is older than RUNNING_STALE_MS
+// is a fossil (the driver died without rewriting it) and does not count as a
+// live job — it must not block stopping the serve.  Shared by cmdServeStop
+// and the chain driver's finally guard so both use the same staleness rule
+// (kusabi #175).
+function liveRunningJobs(stateDir) {
+  return listJobs(stateDir).filter(function (j) {
+    return j.status === "running" && !runningRecordIsStale(j);
+  });
+}
+
 function cmdServeStop(cwd, { flags } = {}) {
   const stateDir = stateDirFor(cwd);
 
@@ -594,8 +605,7 @@ function cmdServeStop(cwd, { flags } = {}) {
   // A `running` record whose last activity is older than 6 hours is a fossil
   // (the driver died without rewriting it) and does not count — it must not
   // block stopping the serve (kusabi #162 follow-up).
-  const jobs = listJobs(stateDir);
-  const runningJobs = jobs.filter(function (j) { return j.status === "running" && !runningRecordIsStale(j); });
+  const runningJobs = liveRunningJobs(stateDir);
   if (runningJobs.length > 0) {
     if (!flags?.force) {
       const jobList = runningJobs.map(function (j) { return j.id; }).join(", ");
@@ -1284,8 +1294,10 @@ export async function runChainDriver({
     // Stop the serve for this cwd unless --keep-serve or another job is running
     if (!keepServe) {
       try {
-        const jobs = listJobs(stateDir);
-        const hasRunning = jobs.some(function (j) { return j.status === "running"; });
+        // liveRunningJobs applies the same fossil rule as cmdServeStop: a
+        // `running` record whose driver died (no activity for 6+ hours) does
+        // not count as a live job and must not pin the serve (kusabi #175).
+        const hasRunning = liveRunningJobs(stateDir).length > 0;
         if (!hasRunning) {
           cmdServeStop(cwd);
         }
