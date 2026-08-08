@@ -17,13 +17,28 @@
  *   | 2nd    | +1     | new      |
  *   | 3rd    | +1     | new      |
  *
+ * Anchoring override (kusabi #62), FIRST rework only: when the finished
+ * round's evidence shows the worker is anchored to a false claim, session
+ * continuity is the wrong lever even on the 1st rework — the tier stays,
+ * only the session lever moves.  Two evidence conditions trigger it:
+ *   - the reviewer verdict was `approve` while `probesGreen` was false
+ *     (a machine-refuted success claim), and
+ *   - `repeatedAreas` (same file area flagged across rounds) at reworkCount 0
+ *     (rare today, but the lever must not depend on that scheduling accident).
+ *
  * @param {object} opts
  * @param {number}  opts.reworkCount   — How many reworks have been done
  *                                       so far (0 = first rework).
  * @param {boolean} opts.strategized   — Whether a strategize was triggered.
+ * @param {"approve"|"approve-partial"|"needs-attention"|"discard"|undefined} [opts.verdict]
+ *                                     — The finished round's review verdict
+ *                                       (evidence for the anchoring override).
+ * @param {boolean} [opts.probesGreen] — Whether the finished round's
+ *                                       deterministic probes passed.
+ * @param {boolean} [opts.repeatedAreas] — Same file area flagged across rounds.
  * @returns {{ tierDelta: number, newSession: boolean, reason: string }}
  */
-export function deriveReworkStrategy({ reworkCount, strategized }) {
+export function deriveReworkStrategy({ reworkCount, strategized, verdict, probesGreen, repeatedAreas }) {
   // ---- Base values from the default ladder (B3) ----
   let tierDelta;
   let newSession;
@@ -34,6 +49,24 @@ export function deriveReworkStrategy({ reworkCount, strategized }) {
     tierDelta = 0;
     newSession = false;
     reason = "1st rework: same tier, continue session, keep artifacts";
+
+    // Anchoring override (kusabi #62).  No new tier escalation is introduced
+    // here — the tier stays, only the session lever moves.
+    const overrides = [];
+    if (verdict === "approve" && probesGreen === false) {
+      overrides.push("worker claimed done, probes red: anchoring break");
+    }
+    // Defensive guard: presently unreachable through the driver —
+    // deriveDisposition returns "rework" only when repeatedAreas is false,
+    // and recordReworkEscalation runs only for disposition "rework", so
+    // this trigger becomes live only if the disposition table changes.
+    if (repeatedAreas) {
+      overrides.push("same file area flagged across rounds: anchoring break");
+    }
+    if (overrides.length > 0) {
+      newSession = true;
+      reason = "1st rework: same tier, new session (" + overrides.join("; ") + "), keep artifacts";
+    }
   } else if (reworkCount === 1) {
     // 2nd rework: +1 tier, new session, keep artifacts
     tierDelta = 1;

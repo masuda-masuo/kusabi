@@ -270,4 +270,94 @@ describe("deriveReworkStrategy", () => {
   it("strategized=false is exercised in default ladder tests", () => {
     // Covered by 1st/2nd/3rd rework tests
   });
+
+  // ---- Anchoring override (kusabi #62) ----
+  // On the FIRST rework, machine-refuted success claims and cross-round
+  // repetition force a NEW session with the tier unchanged.  The lever
+  // function must not depend on the scheduling accident that repetition
+  // normally implies a later rework.
+
+  it("anchoring override: approve + probes red on 1st rework forces a new session with same tier", () => {
+    const result = deriveReworkStrategy({
+      reworkCount: 0,
+      strategized: false,
+      verdict: "approve",
+      probesGreen: false,
+      repeatedAreas: false,
+    });
+    assert.equal(result.newSession, true);
+    assert.equal(result.tierDelta, 0);
+    assert.match(result.reason, /worker claimed done, probes red: anchoring break/);
+    assert.match(result.reason, /1st rework/);
+    assert.match(result.reason, /same tier/);
+    assert.match(result.reason, /new session/);
+  });
+
+  it("anchoring override: repeatedAreas on 1st rework forces a new session with same tier", () => {
+    const result = deriveReworkStrategy({
+      reworkCount: 0,
+      strategized: false,
+      verdict: "needs-attention",
+      probesGreen: false,
+      repeatedAreas: true,
+    });
+    assert.equal(result.newSession, true);
+    assert.equal(result.tierDelta, 0);
+    assert.match(result.reason, /same file area flagged across rounds: anchoring break/);
+  });
+
+  it("anchoring override: both triggers on 1st rework name both in the reason", () => {
+    const result = deriveReworkStrategy({
+      reworkCount: 0,
+      strategized: false,
+      verdict: "approve",
+      probesGreen: false,
+      repeatedAreas: true,
+    });
+    assert.equal(result.newSession, true);
+    assert.equal(result.tierDelta, 0);
+    assert.match(result.reason, /worker claimed done, probes red: anchoring break/);
+    assert.match(result.reason, /same file area flagged across rounds: anchoring break/);
+  });
+
+  it("no override: needs-attention + probes red on 1st rework still continues the session", () => {
+    const result = deriveReworkStrategy({
+      reworkCount: 0,
+      strategized: false,
+      verdict: "needs-attention",
+      probesGreen: false,
+      repeatedAreas: false,
+    });
+    assert.equal(result.newSession, false);
+    assert.equal(result.tierDelta, 0);
+    assert.match(result.reason, /continue session/);
+  });
+
+  it("no override: approve + probes green on 1st rework is not triggered (not machine-refuted)", () => {
+    const result = deriveReworkStrategy({
+      reworkCount: 0,
+      strategized: false,
+      verdict: "approve",
+      probesGreen: true,
+      repeatedAreas: false,
+    });
+    assert.equal(result.newSession, false);
+    assert.equal(result.tierDelta, 0);
+    assert.match(result.reason, /continue session/);
+  });
+
+  it("override does not change the 2nd rework ladder row", () => {
+    const result = deriveReworkStrategy({
+      reworkCount: 1,
+      strategized: false,
+      verdict: "approve",
+      probesGreen: false,
+      repeatedAreas: true,
+    });
+    // 2nd rework row wins: +1 tier, new session, standard reason.
+    assert.equal(result.tierDelta, 1);
+    assert.equal(result.newSession, true);
+    assert.match(result.reason, /2nd rework/);
+    assert.match(result.reason, /escalate tier/);
+  });
 });

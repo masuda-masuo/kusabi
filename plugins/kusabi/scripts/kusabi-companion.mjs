@@ -934,8 +934,12 @@ export async function runChainDriver({
     } = probeCtx;
 
     // ---- phase 5: review (or skip when change set empty) ----
+    // Single conduit (kusabi #100): runReviewPhase writes everything that
+    // belongs on the record onto roundRecord and returns only what is not
+    // record state; the values the disposition phase needs that ARE record
+    // state (verdict, findingsText) are read back from roundRecord here.
     const {
-      chainVerdict, chainFindingsText, chainParsedReview, chainRepeatedAreas, skipReview,
+      chainParsedReview, chainRepeatedAreas, skipReview,
       reviewJobStatus, reviewJobError,
     } = await runReviewPhase({
       container, brief, modelChain, chainId, cwd, previousRecord, baseSha: effectiveBaseSha,
@@ -943,7 +947,8 @@ export async function runChainDriver({
       chainChangedPaths, chainNewlyChanged, chainStatusObserved, chainDeliverables,
       flagsModel, _dispatchWithFallback: injectedDispatch,
     });
-
+    const chainVerdict = roundRecord.verdict;
+    const chainFindingsText = roundRecord.findingsText;
     // ---- stop on review provider exhaustion ----
     if (reviewJobStatus === "provider-error") {
       const { chainState, outcome } = handleProviderExhaustion({
@@ -1015,6 +1020,11 @@ export async function runChainDriver({
         reworkCount,
         strategized,
         tierCount: modelChain ? modelChain.length : 0,
+        // Anchoring-override evidence (#62): verdict, probes and the
+        // cross-round repeated-areas signal from the finished round.
+        chainVerdict,
+        chainRepeatedAreas,
+        probesGreen,
       });
 
       // Update cross-round state for the next iteration

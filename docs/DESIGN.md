@@ -199,6 +199,17 @@ Verdict: 4-value + optional `unverified`:
 | `needs-attention` | Fixable defects found |
 | `discard` | Premise or policy is wrong. `discard_reason` required (`wrong_premise` / `needs_stronger_model`) |
 
+Each finding may carry an optional `kind` tag (`mechanical` | `design`,
+kusabi #60 step 1): `mechanical` means the fix is prescribed by the finding
+itself (rename, registration, message fix, dead code removal); `design` means
+fixing it requires a decision the finding does not itself make.  The tag is
+optional in the schema — old records and lenient recovery parses stay valid —
+and a missing/invalid `kind` is treated as `design` at the consumption point.
+The rework brief groups findings by kind: design findings FIRST, explicitly
+flagged as requiring deliberate individual treatment, mechanical findings
+after, as a checklist.  The reviewer prompt instructs: when unsure, use
+`design`.
+
 #### 3.5.4 Derive disposition (deriveDisposition)
 
 Pure function `deriveDisposition({verdict, probesGreen, round, maxRounds, repeatedAreas, findingSeverities, strategizeEligible})` in `plugins/kusabi/scripts/disposition.mjs`:
@@ -238,6 +249,16 @@ Three independent progression mechanisms (budget, model tier, session lifecycle)
 | 2nd    | +1    | new      |
 | 3rd+   | +1    | new      |
 
+**Anchoring-override rows** (kusabi #62), FIRST rework only — session
+continuity is the wrong lever when the finished round's evidence shows the
+worker is anchored to a false claim.  The tier stays (no new escalation is
+introduced by the override); only the session lever moves:
+
+| rework | trigger condition                              | tier  | session  |
+|--------|------------------------------------------------|-------|----------|
+| 1st    | reviewer verdict `approve` while `probesGreen` was false (machine-refuted success claim) | same | **new** |
+| 1st    | `repeatedAreas` (same file area flagged across rounds) — defensive guard, presently unreachable: `deriveDisposition` yields `rework` only when `repeatedAreas` is false, so this row becomes live only if the disposition table changes | same | **new** |
+
 Artifacts are always carried over — the chain never rolls the worktree back.
 `checkpoint_restore` has been removed from the chain (issue #114). A new session
 starts fresh on the existing worktree.
@@ -245,6 +266,13 @@ starts fresh on the existing worktree.
 Evidence inputs to `deriveReworkStrategy`:
 - `reworkCount` (0-indexed: 0 = first rework)
 - `strategized` — whether a strategize has occurred
+- `verdict` / `probesGreen` — the finished round's review verdict and
+  deterministic-probe result (feeding the anchoring override; the override
+  fires when `verdict === "approve"` and `probesGreen === false`, and the
+  recorded `reworkStrategyReason` names the trigger)
+- `repeatedAreas` — same file area flagged across rounds (also forces a new
+  session on the 1st rework; the lever must not depend on the scheduling
+  accident that repetition normally implies a later rework)
 
 The function returns:
 - `tierDelta` — how many tiers to advance (0 = same tier)

@@ -72,6 +72,7 @@ fix would affect more than half of the artifact, (3) the same area of findings
 persists for two consecutive rounds without resolution.
 Every finding must include:
 - the affected file (as a repository-relative path, e.g. `src/foo.js` not `/workspace/src/foo.js`)
+- `kind` — `mechanical` when the fix is prescribed by the finding itself (rename, registration, message fix, dead code removal); `design` when fixing it requires a decision the finding does not itself make. When unsure, use `design`.
 - `line_start` and `line_end`
 - a confidence score from 0 to 1
 - a concrete recommendation
