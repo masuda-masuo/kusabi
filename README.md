@@ -50,7 +50,7 @@ kusabi ships 7 agent definitions (`plugins/kusabi/opencode-agents/`) that are au
 | `kusabi-salvage` | salvage — recover stalled / dead jobs | read-only + structured report |
 | `kusabi-gofer` | gofer — evidence-gathering errands | sandbox_exec + read/verify tools **allow**; host write/shiori/sunaba mutation **deny** |
 
-Run `/kusabi:setup` or `kusabi-companion.mjs install-agents` to copy them to `OPENCODE_AGENT_DIR` (default `~/.config/opencode/agent/`). Legacy `oc-*` names are automatically cleaned up.
+Run `/kusabi:setup` or `kusabi-companion.mjs install-agents` to copy them to `OPENCODE_AGENT_DIR`. Legacy `oc-*` names are automatically cleaned up. The same command also copies kusabi's opencode skills (`plugins/kusabi/opencode-skills/`) to `OPENCODE_SKILL_DIR`, copy-and-overwrite only — the destination is never pruned. Both defaults follow opencode's own config dir (`$XDG_CONFIG_HOME/opencode`, else `~/.config/opencode`), which is where opencode actually scans. Note that `OPENCODE_SKILL_DIR` / `OPENCODE_AGENT_DIR` are placement overrides that opencode itself does not read (see `docs/DESIGN.md` §3.8).
 
 ## Commands
 
@@ -78,7 +78,7 @@ Everything else is a companion subcommand, invoked directly as
 | `metrics-ingest` | Ingest transcripts + chain records + delegated-job records into a durable SQLite store (read-only source, no LLM) |
 | `metrics-report` | Query/report over the SQLite metrics store (read-only, no LLM, never ingests) |
 | `serve-stop` | Stop the background opencode server and remove its state file; declines with running jobs unless `--force` |
-| `install-agents` | Copy phase agent definitions to `OPENCODE_AGENT_DIR` |
+| `install-agents` | Copy phase agent definitions to `OPENCODE_AGENT_DIR` and opencode skills to `OPENCODE_SKILL_DIR` |
 | `salvage <job-id>` | Recover a dead/stalled job: reads its prompt + events, launches a salvage agent to produce a structured report |
 
 The `kusabi:opencode-worker` subagent forwards delegation requests to `task` so the main Claude thread never carries the work.
