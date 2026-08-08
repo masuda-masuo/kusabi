@@ -905,11 +905,15 @@ describe("runChainDriver resume", () => {
       round: resolution.position.phase === "review" ? resolution.position.round : resolution.position.round - 1,
     });
     const tmp = path.dirname(path.dirname(chainDir));
+    const chainJson = readJson(path.join(chainDir, "chain.json"));
     return runChainDriver({
       cwd: tmp, stateDir: path.dirname(path.dirname(chainDir)), chainDir,
       chainId: "chain-test", container: "cid-1",
       model: "fake/model", modelChain: [["fake/model"], ["fake/pro"]], maxRounds: 4,
       brief: BRIEF, orchestrator: null, baseSha: "abc123", worktreeBaseline: null,
+      // Mirror cmdChainResume: reuse the verify baseline recorded in
+      // chain.json; never re-capture on the modified worktree (kusabi #173).
+      verifyBaseline: chainJson.verifyBaseline ?? null,
       callTool: callTool ?? fakeResumeCallTool({ statusOutput }),
       dispatchWithFallback: dispatch,
       keepServe: true,
@@ -1145,6 +1149,115 @@ describe("runChainDriver resume", () => {
     assert.equal(resolution.ok, true);
     assert.equal(resolution.position.phase, "review");
     assert.equal(resolution.position.round, 1);
+  });
+
+  it("reuses the chain-start verify baseline on resume and never re-captures on the modified worktree (kusabi #173)", async () => {
+    // Round 1 reworked (probes red on a dirty base).  chain.json carries the
+    // baseline recorded at chain start: lint 190, types 0.  The resumed round
+    // 2 keeps the same 190 lint violations (worker added none) and green tests
+    // after the tolerated re-run → P2 must PASS because the RESUME path reused
+    // the recorded baseline.  If resume re-captured the baseline from the
+    // modified worktree, captureVerifyBaseline would fire an extra
+    // verify_in_container call before round 2's probes — the call log below
+    // asserts that never happens.
+    const complete = {
+      round: 1,
+      resumeMethod: { type: "fresh_session" },
+      startedAt: "2026-08-01T00:00:00.000Z",
+      verdict: "needs-attention",
+      probesGreen: false,
+      modelEntry: "fake/model",
+      modelVariant: null,
+      fallbacks: null,
+      implementJobId: "job-imp-1",
+      reviewJobId: "job-rev-1",
+      sessionID: "sess-1",
+      implementUsage: null,
+      reviewUsage: null,
+      tierBefore: 0,
+      tierAfter: 1,
+      reworkCount: 1,
+      pendingReworkStrategy: { tierDelta: 1, newSession: true, reason: "2nd rework: escalate tier" },
+      disposition: { disposition: "rework", reason: "needs-attention" },
+      findingsText: "fix it",
+    };
+    const verifyBaseline = {
+      captured: true,
+      gate_passed: false,
+      lint: 190,
+      types: 0,
+      raw: { gate_passed: false },
+    };
+
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-resume-baseline-"));
+    const chainDir = path.join(tmp, "chains", "chain-test");
+    fs.mkdirSync(chainDir, { recursive: true });
+    writeJson(path.join(chainDir, "chain.json"), {
+      chainId: "chain-test", container: "cid-1", model: "fake/model",
+      modelChain: [["fake/model"], ["fake/pro"]], maxRounds: 4,
+      brief: BRIEF, orchestrator: null, records: [complete],
+      baseSha: "abc123",
+      chainTotals: computeChainTotals([complete]),
+      strategized: false, followupIssueDraft: null,
+      verifyBaseline,
+    });
+    writeChainControl(chainDir, {
+      chainId: "chain-test", container: "cid-1", pid: 0,
+      status: "cancelled", round: 1,
+      stopRequestedAt: "2026-08-01T00:00:00.000Z", stopRequestedBy: "cli",
+      finishedAt: "2026-08-01T00:00:00.000Z",
+    });
+
+    // Call log: verify_in_container calls plus the sandbox_exec commands.
+    const verifyCalls = [];
+    const lint190 = [];
+    for (let i = 0; i < 190; i++) {
+      lint190.push({ rule: "no-unused-vars", file: "/workspace/src/f" + i + ".py", line: 1, message: "x", severity: "error" });
+    }
+    const callTool = async (toolName, params) => {
+      if (toolName === "verify_in_container") {
+        verifyCalls.push(params);
+        if (verifyCalls.length === 1) {
+          // Round 2's P2: same 190 lint violations as the base, tests skipped.
+          return {
+            gate_passed: false,
+            lint: lint190,
+            types: [],
+            tests: { status: "skipped", message: "precondition gate failed; tests not run" },
+            gate_fail_reasons: ["lint (eslint): 190 violation(s)"],
+          };
+        }
+        // Tolerated re-run (skip_lint_gate): tests green.
+        return { gate_passed: true, lint: [], types: [], tests: { full: { status: "ok", passed: 1, total: 1 } } };
+      }
+      if (toolName !== "sandbox_exec") return { output: "" };
+      const cmd = params.commands[0];
+      if (cmd.startsWith("cd /workspace &&") && cmd.includes("TMPIDX=")) {
+        return { output: "ERROR_NO_INDEX\n" };
+      }
+      if (cmd === "git rev-parse HEAD") return { output: "abc123\n" };
+      if (cmd === "git status --porcelain") return { output: " M src/foo.js\n" };
+      if (cmd === "git log --oneline -5") return { output: "abc123 latest change\n" };
+      if (cmd === "git diff") return { output: "diff --git a/src/foo.js b/src/foo.js\n" };
+      if (cmd === "git ls-files --others --exclude-standard") return { output: "untracked.txt\n" };
+      return { output: "" };
+    };
+
+    const dispatch = makeFakeDispatch(); // review approves
+    const text = await resumeChain({ chainDir, dispatch, callTool });
+
+    assert.match(text, /accepted at round 2/);
+    // Exactly the round's P2 + tolerated re-run — NO extra baseline capture at
+    // resume time.
+    assert.equal(verifyCalls.length, 2, "resume must not re-capture the baseline");
+    assert.equal(verifyCalls[1].skip_lint_gate, true);
+
+    const round2 = readJson(path.join(chainDir, "round-2.json"));
+    const p2 = round2.probeResults.find((p) => p.probe === "P2: verify gate");
+    assert.equal(p2.passed, true);
+    assert.match(p2.detail, /lint 190 \(baseline 190, tolerated\)/);
+
+    fs.rmSync(tmp, { recursive: true, force: true });
   });
 });
 

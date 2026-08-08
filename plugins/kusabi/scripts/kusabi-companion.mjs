@@ -47,6 +47,7 @@ import { computeReport, renderReportText, renderReportJson, missingStoreReport, 
 import {
   createChainDir,
   captureBaseSha,
+  captureVerifyBaseline,
   resolveRoundResume,
 
   buildImplementText,
@@ -814,6 +815,16 @@ async function cmdChain(cwd, { flags, text }) {
   const baseSha = await captureBaseSha(callTool, container);
   const worktreeBaseline = await captureWorktreeState(callTool, container);
 
+  // ---- verify baseline (kusabi #173) ----
+  // The only moment the container worktree is guaranteed to be the pristine
+  // base is right here, BEFORE the round-1 implement dispatch.  Run the
+  // verify gate once and record the base's lint/type violation counts (and
+  // the raw verify JSON) on chain.json, so P2 can distinguish "the worker
+  // added lint/type debt" from "the repo already had it".  chain-resume
+  // reuses this recorded baseline and never re-captures on a modified
+  // worktree.
+  const verifyBaseline = await captureVerifyBaseline(callTool, container);
+
   // ---- chain-start output: state tiers, maxRounds, and ladder info (B7) ----
   const tierCount = modelChain ? modelChain.length : 0;
   if (tierCount > 0) {
@@ -832,7 +843,7 @@ async function cmdChain(cwd, { flags, text }) {
   try {
     return await runChainDriver({
       cwd, stateDir, chainDir, chainId, container, model, modelChain, maxRounds,
-      brief, orchestrator, baseSha, worktreeBaseline, callTool,
+      brief, orchestrator, baseSha, worktreeBaseline, verifyBaseline, callTool,
       initialSession: flags.session,
       flagsModel: flags.model,
       signalReceived: () => signalReceived,
@@ -871,6 +882,11 @@ async function cmdChain(cwd, { flags, text }) {
  * @param {object|null} opts.orchestrator
  * @param {string|null} opts.baseSha        — null → captured from the container.
  * @param {object|null} opts.worktreeBaseline — null → captured from the container.
+ * @param {object|null} opts.verifyBaseline — chain-start verify baseline
+ *        (kusabi #173).  Fresh chains: captured by cmdChain on the pristine
+ *        base.  Resumed chains: read from chain.json by cmdChainResume.  Never
+ *        re-captured here — a resumed worktree is modified, so a fresh capture
+ *        would measure the round's changes, not the base.
  * @param {Function} opts.callTool
  * @param {Function} [opts.dispatchWithFallback] — injection seam (defaults to
  *        the real dispatchWithFallback; phase functions receive it as their
@@ -884,7 +900,7 @@ async function cmdChain(cwd, { flags, text }) {
  */
 export async function runChainDriver({
   cwd, stateDir, chainDir, chainId, container, model, modelChain, maxRounds,
-  brief, orchestrator, baseSha, worktreeBaseline, callTool,
+  brief, orchestrator, baseSha, worktreeBaseline, verifyBaseline, callTool,
   dispatchWithFallback: injectedDispatch = dispatchWithFallback,
   initialSession, flagsModel = null, signalReceived = () => false,
   keepServe = false, resume = null,
@@ -898,6 +914,11 @@ export async function runChainDriver({
   // run measures what IT changes from here on.  The interrupted round's
   // review-resume path deliberately bypasses it (see collectReviewContext).
   const effectiveBaseline = worktreeBaseline ?? await captureWorktreeState(callTool, container);
+  // verifyBaseline (kusabi #173): NEVER re-captured here.  Fresh chains get it
+  // from cmdChain (pristine base); resumed chains reuse the value recorded in
+  // chain.json — the worktree is modified by resume time, so a re-capture
+  // would measure the round's changes and silently ratchet the baseline.
+  const effectiveVerifyBaseline = verifyBaseline ?? null;
 
   // ---- round loop state (cross-round) ----
   const records = resume ? resume.records : [];
@@ -967,6 +988,7 @@ export async function runChainDriver({
         chainId, round, container, model, modelChain,
         maxRounds, brief, orchestrator, baseSha: effectiveBaseSha,
         strategized, chainFollowupDraft: null,
+        verifyBaseline: effectiveVerifyBaseline,
       });
       writeJson(path.join(chainDir, "round-" + round + ".json"), roundRecord);
       writeJson(path.join(chainDir, "chain.json"), chainState);
@@ -1055,6 +1077,7 @@ export async function runChainDriver({
       chainDir, round, roundRecord, chainId, container, model, modelChain,
       maxRounds, brief, orchestrator, records, baseSha: effectiveBaseSha,
       chainTotals, strategized, chainFollowupDraft,
+      verifyBaseline: effectiveVerifyBaseline,
     });
 
     // Update the chain control round counter
@@ -1105,6 +1128,7 @@ export async function runChainDriver({
           chainId, round, container, model, modelChain,
           maxRounds, brief, orchestrator, baseSha: effectiveBaseSha,
           strategized, chainFollowupDraft,
+          verifyBaseline: effectiveVerifyBaseline,
         });
         writeJson(path.join(chainDir, "round-" + round + ".json"), roundRecord);
         writeJson(path.join(chainDir, "chain.json"), chainState);
@@ -1128,6 +1152,7 @@ export async function runChainDriver({
         chainDir, round, roundRecord, chainId, container, model, modelChain,
         maxRounds, brief, orchestrator, records, baseSha: effectiveBaseSha,
         chainTotals: updatedTotals, strategized: true, chainFollowupDraft,
+        verifyBaseline: effectiveVerifyBaseline,
       });
     }
     return { done: false };
@@ -1236,6 +1261,7 @@ export async function runChainDriver({
           chainId, round, container, model, modelChain,
           maxRounds, brief, orchestrator, baseSha: effectiveBaseSha,
           strategized, chainFollowupDraft: null,
+          verifyBaseline: effectiveVerifyBaseline,
         });
         writeJson(path.join(chainDir, "round-" + round + ".json"), roundRecord);
         writeJson(path.join(chainDir, "chain.json"), chainState);
@@ -1245,7 +1271,8 @@ export async function runChainDriver({
 
       // ---- phase 4: deterministic probes (P1–P4) ----
       const probeResult = await runProbePhase({
-        baseSha: effectiveBaseSha, container, brief, callTool, worktreeBaseline: effectiveBaseline,
+        baseSha: effectiveBaseSha, container, brief, callTool,
+        worktreeBaseline: effectiveBaseline, verifyBaseline: effectiveVerifyBaseline,
       });
       roundRecord.probesGreen = probeResult.probesGreen;
       roundRecord.probeResults = probeResult.probeResults;
@@ -1265,6 +1292,7 @@ export async function runChainDriver({
           maxRounds, brief, orchestrator, records, baseSha: effectiveBaseSha,
           chainTotals: partialTotals, strategized, chainFollowupDraft: null,
           interrupted: true,
+          verifyBaseline: effectiveVerifyBaseline,
         });
         finalizeChainControl({ chainDir, status: "cancelled", round });
         return `Chain ${chainId} cancelled during round ${round} (stop requested after probes, before review). Progress preserved — resume with chain-resume ${chainId}.`;
@@ -1414,6 +1442,9 @@ async function cmdChainResume(cwd, { flags, text }) {
       orchestrator: chainJson.orchestrator ?? null,
       baseSha: chainJson.baseSha ?? null,
       worktreeBaseline: null,
+      // verifyBaseline (kusabi #173): reuse the baseline recorded in
+      // chain.json at chain start — NEVER re-capture on a modified worktree.
+      verifyBaseline: chainJson.verifyBaseline ?? null,
       callTool,
       initialSession: position.session,
       flagsModel: null,
