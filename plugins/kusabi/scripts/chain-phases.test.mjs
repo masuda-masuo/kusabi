@@ -17,6 +17,8 @@ import {
   runSmokeProbe,
   runHeadCleanProbe,
   runVerifyProbe,
+  captureVerifyBaseline,
+  countVerifyViolations,
   runDeliverablesProbe,
   runProbePhase,
   runReviewPhase,
@@ -326,6 +328,265 @@ describe("runVerifyProbe", () => {
     const result = await runVerifyProbe({ callTool: fakeTool, container: "fake-cid" });
     const parsed = JSON.parse(result.detail);
     assert.equal(parsed.gate_passed, true);
+  });
+
+  // ---- kusabi #173: verify-baseline tolerance for pre-existing lint/type debt ----
+
+  // A lint-precondition failure whose counts mirror the real verify JSON
+  // shape: gate_passed false, tests.status "skipped" (tests never ran), a
+  // complete lint array, and the gate's summary in gate_fail_reasons.
+  function preconditionStub({ lintCount, typesCount = 0 }) {
+    const lint = [];
+    for (let i = 0; i < lintCount; i++) {
+      lint.push({ file: `/workspace/src/f${i}.py`, line: 1, rule: "no-unused-vars", message: "violation", severity: "error" });
+    }
+    const types = [];
+    for (let i = 0; i < typesCount; i++) {
+      types.push({ file: `/workspace/src/t${i}.py`, line: 1, message: "type error" });
+    }
+    const result = {
+      gate_passed: false,
+      lint,
+      types,
+      tests: { status: "skipped", message: "precondition gate failed; tests not run" },
+      gate_fail_reasons: [],
+    };
+    if (lintCount > 0) result.gate_fail_reasons.push(`lint (eslint): ${lintCount} violation(s)`);
+    if (typesCount > 0) result.gate_fail_reasons.push(`type_check (pyright): ${typesCount} error(s)`);
+    return result;
+  }
+
+  // callTool stub: the first verify_in_container returns `first`; a second
+  // call (the tolerated re-run) returns `retry`.  The params of each call are
+  // recorded so tests can assert the skip flags actually sent.
+  function stagedVerifyStub({ first, retry }) {
+    const calls = [];
+    const callTool = async (toolName, params) => {
+      if (toolName !== "verify_in_container") return { output: "" };
+      calls.push(params);
+      return calls.length === 1 ? first : retry;
+    };
+    callTool.calls = calls;
+    return callTool;
+  }
+
+  const baseline = { captured: true, gate_passed: false, lint: 190, types: 0, raw: {} };
+
+  it("tolerates lint count at baseline and passes when the re-run's tests are green", async () => {
+    const fakeTool = stagedVerifyStub({
+      first: preconditionStub({ lintCount: 190 }),
+      retry: { gate_passed: true, lint: [], types: [], tests: { full: { status: "ok", passed: 100, total: 100 } } },
+    });
+    const result = await runVerifyProbe({ callTool: fakeTool, container: "fake-cid", baseline });
+    assert.equal(result.passed, true);
+    assert.match(result.detail, /lint 190 \(baseline 190, tolerated\)/);
+    assert.match(result.detail, /tests ok/);
+    // The re-run carried the skip flag for the tolerated gate.
+    assert.equal(fakeTool.calls.length, 2);
+    assert.equal(fakeTool.calls[1].skip_lint_gate, true);
+    assert.equal(fakeTool.calls[1].skip_type_gate, undefined);
+  });
+
+  it("tolerates counts below baseline (worker removed debt) and passes", async () => {
+    const fakeTool = stagedVerifyStub({
+      first: preconditionStub({ lintCount: 100 }),
+      retry: { gate_passed: true, lint: [], types: [], tests: { full: { status: "ok", passed: 100, total: 100 } } },
+    });
+    const result = await runVerifyProbe({ callTool: fakeTool, container: "fake-cid", baseline });
+    assert.equal(result.passed, true);
+    assert.match(result.detail, /lint 100 \(baseline 190, tolerated\)/);
+  });
+
+  it("fails when lint count exceeds the baseline, naming the increment", async () => {
+    const fakeTool = stagedVerifyStub({ first: preconditionStub({ lintCount: 193 }), retry: null });
+    const result = await runVerifyProbe({ callTool: fakeTool, container: "fake-cid", baseline });
+    assert.equal(result.passed, false);
+    assert.match(result.detail, /lint 193 > baseline 190/);
+    // No re-run was attempted.
+    assert.equal(fakeTool.calls.length, 1);
+  });
+
+  it("tolerates types at baseline and passes", async () => {
+    const typesBaseline = { captured: true, gate_passed: false, lint: 0, types: 7, raw: {} };
+    const fakeTool = stagedVerifyStub({
+      first: preconditionStub({ typesCount: 7 }),
+      retry: { gate_passed: true, lint: [], types: [], tests: { full: { status: "ok", passed: 100, total: 100 } } },
+    });
+    const result = await runVerifyProbe({ callTool: fakeTool, container: "fake-cid", baseline: typesBaseline });
+    assert.equal(result.passed, true);
+    assert.match(result.detail, /types 7 \(baseline 7, tolerated\)/);
+    assert.equal(fakeTool.calls[1].skip_type_gate, true);
+  });
+
+  it("fails when types exceed the baseline, naming the increment", async () => {
+    const typesBaseline = { captured: true, gate_passed: false, lint: 0, types: 7, raw: {} };
+    const fakeTool = stagedVerifyStub({ first: preconditionStub({ typesCount: 9 }), retry: null });
+    const result = await runVerifyProbe({ callTool: fakeTool, container: "fake-cid", baseline: typesBaseline });
+    assert.equal(result.passed, false);
+    assert.match(result.detail, /types 9 > baseline 7/);
+  });
+
+  it("fails when the tolerated re-run's tests are not green (baseline never skips the test verdict)", async () => {
+    const fakeTool = stagedVerifyStub({
+      first: preconditionStub({ lintCount: 190 }),
+      retry: {
+        gate_passed: false,
+        lint: [],
+        types: [],
+        tests: { full: { status: "failed", passed: 99, total: 100, failed: 1, failures: [{ test: "x", error: "boom" }] } },
+        gate_fail_reasons: ["tests: 1 failure(s)"],
+      },
+    });
+    const result = await runVerifyProbe({ callTool: fakeTool, container: "fake-cid", baseline });
+    assert.equal(result.passed, false);
+    assert.match(result.detail, /tests not ok/);
+    assert.match(result.detail, /lint 190 \(baseline 190, tolerated\)/);
+  });
+
+  it("reports the real blocker when the tolerated re-run is still blocked before tests", async () => {
+    // The re-run skipped the tolerated lint gate but a different,
+    // untolerated precondition (patch_targets) still fails: tests never ran,
+    // so the detail must NOT claim "tests not ok" — it names the blocker.
+    const fakeTool = stagedVerifyStub({
+      first: preconditionStub({ lintCount: 190 }),
+      retry: {
+        gate_passed: false,
+        lint: [],
+        types: [],
+        tests: { status: "skipped", message: "precondition gate failed; tests not run" },
+        gate_fail_reasons: ["patch_targets: 2 orphan test(s)"],
+      },
+    });
+    const result = await runVerifyProbe({ callTool: fakeTool, container: "fake-cid", baseline });
+    assert.equal(result.passed, false);
+    assert.doesNotMatch(result.detail, /tests not ok/);
+    assert.match(result.detail, /still blocked before tests \(patch_targets: 2 orphan test\(s\)\)/);
+    assert.match(result.detail, /lint 190 \(baseline 190, tolerated\)/);
+  });
+
+  it("fails when tests ran and failed, even with a baseline (test verdict is authoritative)", async () => {
+    // Real test-failure shape: tests.full present with a failed verdict.
+    const fakeTool = async () => ({
+      gate_passed: false,
+      lint: [],
+      types: [],
+      tests: { full: { status: "failed", passed: 1, total: 2, failed: 1, failures: [{ test: "y", error: "boom" }] } },
+      gate_fail_reasons: ["tests: 1 failure(s)"],
+    });
+    const result = await runVerifyProbe({ callTool: fakeTool, container: "fake-cid", baseline });
+    assert.equal(result.passed, false);
+  });
+
+  it("fails strictly when no baseline is recorded, recording the limitation", async () => {
+    const fakeTool = stagedVerifyStub({ first: preconditionStub({ lintCount: 190 }), retry: null });
+    const result = await runVerifyProbe({ callTool: fakeTool, container: "fake-cid" });
+    assert.equal(result.passed, false);
+    assert.match(result.limitation, /no chain-start baseline/);
+    // Strict: no re-run was attempted.
+    assert.equal(fakeTool.calls.length, 1);
+  });
+
+  it("fails strictly when the baseline gate count is not a number (no reliable baseline count)", async () => {
+    const badBaseline = { captured: true, gate_passed: false, lint: null, types: 0, raw: {} };
+    const fakeTool = stagedVerifyStub({ first: preconditionStub({ lintCount: 5 }), retry: null });
+    const result = await runVerifyProbe({ callTool: fakeTool, container: "fake-cid", baseline: badBaseline });
+    assert.equal(result.passed, false);
+    assert.match(result.limitation, /baseline has no reliable lint count/);
+  });
+
+  it("fails strictly when no violation counts are reportable in the response", async () => {
+    // A precondition failure whose lint/types arrays and gate_fail_reasons are
+    // all absent — no reliable count exists, so P2 must not pass blind.
+    const fakeTool = async () => ({
+      gate_passed: false,
+      tests: { status: "skipped", message: "precondition gate failed; tests not run" },
+    });
+    const result = await runVerifyProbe({ callTool: fakeTool, container: "fake-cid", baseline });
+    assert.equal(result.passed, false);
+    assert.match(result.limitation, /no violation counts are reportable/);
+  });
+
+  it("counts from the gate_fail_reasons summary when the lint array is absent", async () => {
+    const fakeTool = stagedVerifyStub({
+      first: {
+        gate_passed: false,
+        tests: { status: "skipped", message: "precondition gate failed; tests not run" },
+        gate_fail_reasons: ["lint (eslint): 190 violation(s)"],
+      },
+      retry: { gate_passed: true, lint: [], types: [], tests: { full: { status: "ok", passed: 1, total: 1 } } },
+    });
+    const result = await runVerifyProbe({ callTool: fakeTool, container: "fake-cid", baseline });
+    assert.equal(result.passed, true);
+    assert.match(result.detail, /lint 190 \(baseline 190, tolerated\)/);
+  });
+});
+
+describe("countVerifyViolations", () => {
+  it("counts array length for a gate", () => {
+    assert.equal(
+      countVerifyViolations({ lint: [{ rule: "no-unused-vars" }, { rule: "no-undef" }], types: [] }, "lint"),
+      2,
+    );
+    assert.equal(
+      countVerifyViolations({ lint: [], types: [{ message: "x" }] }, "types"),
+      1,
+    );
+  });
+
+  it("falls back to the gate_fail_reasons summary when the array is absent", () => {
+    assert.equal(
+      countVerifyViolations({ gate_fail_reasons: ["lint (eslint): 3 violation(s)"] }, "lint"),
+      3,
+    );
+    assert.equal(
+      countVerifyViolations({ gate_fail_reasons: ["type_check (pyright): 5 error(s)"] }, "types"),
+      5,
+    );
+  });
+
+  it("returns null when no count is derivable", () => {
+    assert.equal(countVerifyViolations({}, "lint"), null);
+    assert.equal(countVerifyViolations(null, "lint"), null);
+  });
+});
+
+describe("captureVerifyBaseline", () => {
+  it("records gate_passed, counts, and the raw result from a gate-failing base", async () => {
+    const verifyResult = {
+      gate_passed: false,
+      lint: [{ rule: "no-unused-vars" }, { rule: "no-undef" }],
+      types: [],
+      tests: { status: "skipped", message: "precondition gate failed; tests not run" },
+      gate_fail_reasons: ["lint (eslint): 2 violation(s)"],
+    };
+    const fakeTool = async (toolName) => (toolName === "verify_in_container" ? verifyResult : { output: "" });
+    const baseline = await captureVerifyBaseline(fakeTool, "fake-cid");
+    assert.equal(baseline.captured, true);
+    assert.equal(baseline.gate_passed, false);
+    assert.equal(baseline.lint, 2);
+    assert.equal(baseline.types, 0);
+    assert.equal(baseline.raw, verifyResult);
+  });
+
+  it("records a clean gate-failing base with zero lint and types", async () => {
+    const fakeTool = async () => ({
+      gate_passed: true,
+      lint: [],
+      types: [],
+      tests: { full: { status: "ok", passed: 100, total: 100 } },
+    });
+    const baseline = await captureVerifyBaseline(fakeTool, "fake-cid");
+    assert.equal(baseline.captured, true);
+    assert.equal(baseline.gate_passed, true);
+    assert.equal(baseline.lint, 0);
+    assert.equal(baseline.types, 0);
+  });
+
+  it("degrades to captured:false when the RPC call throws", async () => {
+    const fakeTool = async () => { throw new Error("container unreachable"); };
+    const baseline = await captureVerifyBaseline(fakeTool, "fake-cid");
+    assert.equal(baseline.captured, false);
+    assert.match(baseline.error, /container unreachable/);
   });
 });
 
@@ -2112,6 +2373,84 @@ describe("runProbePhase return value", () => {
     assert.equal(result.chainDiff, "");
     assert.equal(result.chainUntracked, "");
   });
+
+  it("forwards the verify baseline into P2 so tolerated lint debt passes the round", async () => {
+    // The base has 190 pre-existing lint violations; the round's worktree has
+    // the same 190 (no added debt) and green tests after the tolerated re-run.
+    // With the baseline forwarded, P2 must PASS and the round must be green;
+    // without it, P2 would fail on the lint precondition.
+    const verifyCalls = [];
+    const callTool = async (toolName, params) => {
+      if (toolName === "verify_in_container") {
+        verifyCalls.push(params);
+        if (verifyCalls.length === 1) {
+          return {
+            gate_passed: false,
+            lint: [{ rule: "no-unused-vars", file: "/workspace/src/a.py", line: 1, message: "x", severity: "error" }],
+            types: [],
+            tests: { status: "skipped", message: "precondition gate failed; tests not run" },
+            gate_fail_reasons: ["lint (eslint): 1 violation(s)"],
+          };
+        }
+        return { gate_passed: true, lint: [], types: [], tests: { full: { status: "ok", passed: 1, total: 1 } } };
+      }
+      if (toolName !== "sandbox_exec") return { output: "" };
+      const cmd = params.commands[0];
+      if (cmd === "git status --porcelain") return { output: " M src/a.js\n" };
+      if (cmd === "git diff") return { output: "" };
+      if (cmd.startsWith("git ls-files --others")) return { output: "" };
+      return { output: "" };
+    };
+
+    const baseline = { captured: true, gate_passed: false, lint: 1, types: 0, raw: {} };
+    const result = await runProbePhase({
+      baseSha: "abc1234",
+      container: "fake-cid",
+      brief: "## Deliverables\n\n- `src/a.js`\n",
+      callTool,
+      verifyBaseline: baseline,
+    });
+
+    assert.equal(result.probesGreen, true);
+    const p2 = result.probeResults.find((p) => p.probe === "P2: verify gate");
+    assert.equal(p2.passed, true);
+    assert.match(p2.detail, /lint 1 \(baseline 1, tolerated\)/);
+    assert.equal(verifyCalls.length, 2, "P2 + tolerated re-run");
+    assert.equal(verifyCalls[1].skip_lint_gate, true);
+  });
+
+  it("keeps P2 strict when no verify baseline is provided", async () => {
+    // Without a baseline, a lint-precondition failure stays a hard FAIL and no
+    // re-run is attempted (byte-identical to the pre-#173 probe).
+    const verifyCalls = [];
+    const callTool = async (toolName, params) => {
+      if (toolName === "verify_in_container") {
+        verifyCalls.push(params);
+        return {
+          gate_passed: false,
+          lint: [{ rule: "no-unused-vars", file: "/workspace/src/a.py", line: 1, message: "x", severity: "error" }],
+          types: [],
+          tests: { status: "skipped", message: "precondition gate failed; tests not run" },
+          gate_fail_reasons: ["lint (eslint): 1 violation(s)"],
+        };
+      }
+      if (toolName !== "sandbox_exec") return { output: "" };
+      const cmd = params.commands[0];
+      if (cmd === "git diff") return { output: "" };
+      if (cmd.startsWith("git ls-files --others")) return { output: "" };
+      return { output: "" };
+    };
+
+    const result = await runProbePhase({
+      baseSha: "abc1234",
+      container: "fake-cid",
+      brief: "## Deliverables\n\n- `src/a.js`\n",
+      callTool,
+    });
+
+    assert.equal(result.probesGreen, false);
+    assert.equal(verifyCalls.length, 1, "no tolerated re-run without a baseline");
+  });
 });
 
 // diff_in_container in review input tool list
@@ -2711,6 +3050,40 @@ describe("persistChainState interrupted round", () => {
     });
     const chainJson = readJson(path.join(chainDir, "chain.json"));
     assert.equal(chainJson.records.length, 1);
+  });
+
+  it("persists the chain-start verify baseline into chain.json (kusabi #173)", () => {
+    const chainDir = makeChainDir();
+    fs.mkdirSync(chainDir, { recursive: true });
+    const roundRecord = { round: 1, implementJobId: "job-1" };
+    const verifyBaseline = {
+      captured: true,
+      gate_passed: false,
+      lint: 190,
+      types: 0,
+      raw: { gate_passed: false, lint: [{ rule: "x" }], types: [] },
+    };
+    persistChainState({
+      chainDir, round: 1, roundRecord, records: [roundRecord],
+      chainTotals: computeChainTotals([roundRecord]),
+      ...chainCtx,
+      verifyBaseline,
+    });
+    const chainJson = readJson(path.join(chainDir, "chain.json"));
+    assert.deepEqual(chainJson.verifyBaseline, verifyBaseline);
+  });
+
+  it("defaults chain.json verifyBaseline to null when not recorded", () => {
+    const chainDir = makeChainDir();
+    fs.mkdirSync(chainDir, { recursive: true });
+    const roundRecord = { round: 1, implementJobId: "job-1" };
+    persistChainState({
+      chainDir, round: 1, roundRecord, records: [roundRecord],
+      chainTotals: computeChainTotals([roundRecord]),
+      ...chainCtx,
+    });
+    const chainJson = readJson(path.join(chainDir, "chain.json"));
+    assert.equal(chainJson.verifyBaseline, null);
   });
 });
 

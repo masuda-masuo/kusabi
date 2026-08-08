@@ -156,6 +156,45 @@ export async function captureBaseSha(callTool, container) {
   }
 }
 
+/**
+ * Capture the chain-start verify baseline (kusabi #173).
+ *
+ * Runs `verify_in_container` ONCE on the pristine base worktree (before the
+ * round-1 implement dispatch) and records the base's lint/type violation
+ * counts plus the raw verify result.  This is the only moment the base is
+ * guaranteed unmodified — chain-resume REUSES the recorded baseline from
+ * chain.json and never re-captures on a modified worktree.
+ *
+ * The returned object is stored on chain.json as `verifyBaseline`:
+ *   { captured: true, gate_passed, lint, types, raw }
+ * When the RPC call itself fails the capture degrades to
+ *   { captured: false, error }
+ * — the chain still runs, but P2 falls back to today's strict behaviour
+ * (a missing baseline is never invented).
+ *
+ * Counting authority: the `lint` / `types` arrays of the verify result are
+ * complete (one element per violation; verified against live sunaba output),
+ * so array length is the authoritative count.  When an array is absent the
+ * gate's summary line in `gate_fail_reasons` (e.g. "lint (eslint): 3
+ * violation(s)") is the fallback; when neither yields a number the count is
+ * null and the probe records the limitation instead of passing blind.
+ *
+ * @param {Function} callTool
+ * @param {string}   container
+ * @returns {Promise<object>} Baseline record (see above).
+ */
+export async function captureVerifyBaseline(callTool, container) {
+  try {
+    const verifyResult = await callTool("verify_in_container", {
+      container_id: container,
+      path: ".",
+    });
+    return buildVerifyBaseline(verifyResult);
+  } catch (err) {
+    return { captured: false, error: err?.message ?? String(err) };
+  }
+}
+
 // =========================================================================
 // Per-round phases
 // =========================================================================
@@ -275,7 +314,7 @@ export async function runImplementPhase({
  *
  * Returns probe results and side data needed by the review phase.
  */
-export async function runProbePhase({ baseSha, container, brief, callTool, worktreeBaseline }) {
+export async function runProbePhase({ baseSha, container, brief, callTool, worktreeBaseline, verifyBaseline }) {
   const chainDeliverables = parseDeliverables(brief);
   let probesGreen = false;
   const probeResults = [];
@@ -289,7 +328,7 @@ export async function runProbePhase({ baseSha, container, brief, callTool, workt
     const p1Result = await runHeadCleanProbe({ baseSha, callTool, container, sourceLabel: "chain" });
     probeResults.push(p1Result);
 
-    const p2Result = await runVerifyProbe({ callTool, container });
+    const p2Result = await runVerifyProbe({ callTool, container, baseline: verifyBaseline });
     probeResults.push(p2Result);
 
     const p3Result = await runDeliverablesProbe({
@@ -706,7 +745,7 @@ export function computeChainTotals(records) {
 export function persistChainState({
   chainDir, round, roundRecord, chainId, container, model, modelChain,
   maxRounds, brief, orchestrator, records, baseSha, chainTotals,
-  strategized, chainFollowupDraft, interrupted = false,
+  strategized, chainFollowupDraft, interrupted = false, verifyBaseline = null,
 }) {
   if (interrupted) {
     roundRecord.interrupted = true;
@@ -738,6 +777,9 @@ export function persistChainState({
     chainTotals,
     strategized,
     followupIssueDraft: chainFollowupDraft,
+    // Chain-start verify baseline (kusabi #173): captured on the pristine
+    // base before round-1 implement, reused verbatim by chain-resume.
+    verifyBaseline,
   });
 }
 
@@ -1116,15 +1158,197 @@ export async function runHeadCleanProbe({ baseSha, callTool, container, sourceLa
 }
 
 /**
- * P2: Run the verify gate (verify_in_container) with no skip flags.
+ * Count the violations reported for one gate in a verify result.
+ *
+ * Counting authority (kusabi #173): the `lint` / `types` arrays in the
+ * verify result are complete — one element per violation (verified against
+ * live sunaba output 2026-08-08).  Array length is therefore the
+ * authoritative count.  When the array is absent (older responses, or the
+ * gate never ran) the gate's own summary line in `gate_fail_reasons` is the
+ * fallback, matching sunaba gate.py's real formats: "lint (<tool>): <N>
+ * violation(s)" and "type_check (<tool>): <N> error(s)".  When neither
+ * yields a number the count is null, and callers must treat null as "no reliable
+ * count" (the probe records the limitation and keeps today's strict
+ * behaviour instead of passing blind).
+ *
+ * @param {object|null} verifyResult  — the verify_in_container result.
+ * @param {"lint"|"types"} gate       — which gate to count.
+ * @returns {number|null} Violation count, or null when not countable.
  */
-export async function runVerifyProbe({ callTool, container }) {
+export function countVerifyViolations(verifyResult, gate) {
+  if (!verifyResult || typeof verifyResult !== "object") return null;
+  const arr = verifyResult[gate];
+  if (Array.isArray(arr)) return arr.length;
+  const reasons = Array.isArray(verifyResult.gate_fail_reasons)
+    ? verifyResult.gate_fail_reasons
+    : [];
+  // Real sunaba gate.py summary formats (verified against gate.py source and
+  // live output 2026-08-08): lint → "lint (<tool>): <N> violation(s)",
+  // types → "type_check (<tool>): <N> error(s)".
+  const re = gate === "types"
+    ? /^type_check\b[^:]*:\s*(\d+)\s+error/i
+    : /^lint\b[^:]*:\s*(\d+)\s+violation/i;
+  for (const reason of reasons) {
+    const m = String(reason).match(re);
+    if (m) return Number(m[1]);
+  }
+  return null;
+}
+
+/**
+ * Build the chain-start verify baseline record from a verify result.
+ *
+ * @param {object|null} verifyResult
+ * @returns {{ captured: true, gate_passed: boolean, lint: number|null, types: number|null, raw: object }}
+ */
+export function buildVerifyBaseline(verifyResult) {
+  return {
+    captured: true,
+    gate_passed: verifyResult?.gate_passed === true,
+    lint: countVerifyViolations(verifyResult, "lint"),
+    types: countVerifyViolations(verifyResult, "types"),
+    raw: verifyResult ?? null,
+  };
+}
+
+/**
+ * P2: Run the verify gate (verify_in_container) with no skip flags.
+ *
+ * Gate passed → PASS, byte-identical to the pre-#173 behaviour.  Gate failed
+ * with test failures → FAIL, unchanged.  Gate failed on the lint/type
+ * precondition (tests never ran) → the chain-start verify baseline decides:
+ * current violation counts ≤ baseline for every gate that failed → re-run
+ * verify with the tolerated gates skipped (so tests actually execute) and
+ * pass iff that run's tests are green; any count above baseline → FAIL naming
+ * the increment.  Without a baseline (or without a reliable count) the probe
+ * records the limitation and keeps today's strict FAIL rather than guessing.
+ *
+ * @param {object}   opts
+ * @param {Function} opts.callTool
+ * @param {string}   opts.container
+ * @param {object|null} [opts.baseline] — chain-start verify baseline
+ *        (`captureVerifyBaseline` output), or null for strict behaviour.
+ * @returns {Promise<object>} { probe, passed, detail }
+ */
+export async function runVerifyProbe({ callTool, container, baseline }) {
   const verifyResult = await callTool("verify_in_container", {
     container_id: container,
     path: ".",
   });
-  const passed = verifyResult?.gate_passed === true;
-  return { probe: "P2: verify gate", passed, detail: JSON.stringify(verifyResult) };
+
+  // Fast path: gate green → PASS (byte-identical to today).
+  if (verifyResult?.gate_passed === true) {
+    return { probe: "P2: verify gate", passed: true, detail: JSON.stringify(verifyResult) };
+  }
+
+  // Gate failed.  Distinguish "tests ran and failed" from "lint/type
+  // precondition failed (tests never ran)".  sunaba runs the lint/type gates
+  // as a precondition: when they fail, `tests` reports `status: "skipped"`
+  // and the test phase never ran.  When tests did run (`tests.full` exists),
+  // their verdict is authoritative — the baseline must never skip it.
+  const tests = verifyResult?.tests;
+  const testsRan = !!(tests && typeof tests === "object" && tests.full);
+  if (testsRan) {
+    return { probe: "P2: verify gate", passed: false, detail: JSON.stringify(verifyResult) };
+  }
+
+  // Precondition failure: only the baseline path can make this a PASS.
+  if (!baseline || baseline.captured !== true) {
+    return {
+      probe: "P2: verify gate",
+      passed: false,
+      detail: JSON.stringify(verifyResult),
+      limitation: "verify failed on the lint/type precondition but no chain-start baseline is recorded; P2 stayed strict",
+    };
+  }
+
+  const lintCount = countVerifyViolations(verifyResult, "lint");
+  const typesCount = countVerifyViolations(verifyResult, "types");
+  const tolerances = [];
+  const skips = {};
+
+  // A gate "failed" when it reports violations (count > 0).  For each failed
+  // gate, current ≤ baseline → tolerated (skip it on the re-run); current >
+  // baseline → FAIL naming the increment.
+  if (lintCount !== null && lintCount > 0) {
+    if (typeof baseline.lint !== "number") {
+      return {
+        probe: "P2: verify gate",
+        passed: false,
+        detail: JSON.stringify(verifyResult),
+        limitation: "lint gate failed but the baseline has no reliable lint count; P2 stayed strict",
+      };
+    }
+    if (lintCount > baseline.lint) {
+      return {
+        probe: "P2: verify gate",
+        passed: false,
+        detail: `lint ${lintCount} > baseline ${baseline.lint}`,
+      };
+    }
+    tolerances.push(`lint ${lintCount} (baseline ${baseline.lint}, tolerated)`);
+    skips.skip_lint_gate = true;
+  }
+  if (typesCount !== null && typesCount > 0) {
+    if (typeof baseline.types !== "number") {
+      return {
+        probe: "P2: verify gate",
+        passed: false,
+        detail: JSON.stringify(verifyResult),
+        limitation: "types gate failed but the baseline has no reliable types count; P2 stayed strict",
+      };
+    }
+    if (typesCount > baseline.types) {
+      return {
+        probe: "P2: verify gate",
+        passed: false,
+        detail: `types ${typesCount} > baseline ${baseline.types}`,
+      };
+    }
+    tolerances.push(`types ${typesCount} (baseline ${baseline.types}, tolerated)`);
+    skips.skip_type_gate = true;
+  }
+
+  // A gate failed (tests were skipped) but neither gate reports violations we
+  // can count → the failure is not a tolerable lint/type delta.  Record the
+  // limitation and keep strict behaviour rather than passing blind.
+  if (Object.keys(skips).length === 0) {
+    return {
+      probe: "P2: verify gate",
+      passed: false,
+      detail: JSON.stringify(verifyResult),
+      limitation: "verify failed on the lint/type precondition but no violation counts are reportable; P2 stayed strict",
+    };
+  }
+
+  // All failed gates are at or under their baseline → re-run with the
+  // tolerated gates skipped so the tests actually execute.
+  const retryResult = await callTool("verify_in_container", {
+    container_id: container,
+    path: ".",
+    ...skips,
+  });
+  const testsGreen = retryResult?.gate_passed === true;
+  // On a failed retry, distinguish "tests ran and failed" from "still blocked
+  // before tests" (an untolerated precondition gate — e.g. patch_targets — or
+  // an error envelope): claiming "tests not ok" when tests never ran is the
+  // exact mislabel this baseline path exists to fix.
+  let outcome;
+  if (testsGreen) {
+    outcome = "tests ok";
+  } else if (retryResult?.tests && typeof retryResult.tests === "object" && retryResult.tests.full) {
+    outcome = "tests not ok";
+  } else {
+    const reasons = Array.isArray(retryResult?.gate_fail_reasons) && retryResult.gate_fail_reasons.length > 0
+      ? retryResult.gate_fail_reasons.join("; ")
+      : "no gate_fail_reasons reported";
+    outcome = `still blocked before tests (${reasons})`;
+  }
+  return {
+    probe: "P2: verify gate",
+    passed: testsGreen,
+    detail: `${tolerances.join(", ")}; ${outcome}`,
+  };
 }
 
 /**
@@ -1315,6 +1539,7 @@ export function handleProviderExhaustion({
   baseSha,
   strategized,
   chainFollowupDraft = null,
+  verifyBaseline = null,
 }) {
   // Record the tier after this round
   roundRecord.tierAfter = currentTierIndex;
@@ -1345,6 +1570,9 @@ export function handleProviderExhaustion({
     chainTotals,
     strategized,
     followupIssueDraft: chainFollowupDraft,
+    // Chain-start verify baseline (kusabi #173) — carried on every chain.json
+    // write so chain-resume reuses the recorded baseline.
+    verifyBaseline,
   };
 
   // Render outcome
