@@ -34,7 +34,7 @@ import {
   collectChainStatuses,
 } from "./chain-control.mjs";
 import { jobDir, saveJob, loadJob, listJobs, latestJob } from "./job-store.mjs";
-import { opencodeBin, serverHealthy, ensureServer, reapIdleServes, reapOrphanedServes, runningRecordIsStale, api } from "./serve-lifecycle.mjs";
+import { opencodeBin, serverHealthy, ensureServer, reapIdleServes, reapOrphanedServes, runningRecordIsStale, isOurServe, api } from "./serve-lifecycle.mjs";
 import { runPrompt, dispatchWithFallback, resetFailedRoutes } from "./prompt-execution.mjs";
 import { openMetricsDb, openMetricsDbReadOnly } from "./metrics-db.mjs";
 import { ingestTranscriptDirectory } from "./transcript-ingest.mjs";
@@ -599,7 +599,7 @@ function liveRunningJobs(stateDir) {
   });
 }
 
-function cmdServeStop(cwd, { flags } = {}) {
+export function cmdServeStop(cwd, { flags } = {}) {
   const stateDir = stateDirFor(cwd);
 
   // Check for running jobs. If any exist, decline unless --force is passed.
@@ -623,6 +623,29 @@ function cmdServeStop(cwd, { flags } = {}) {
   const serverFile = path.join(stateDir, "server.json");
   const server = readJson(serverFile);
   if (!server?.pid) return "no server recorded for this directory.";
+
+  // Never signal a pid we cannot attribute to one of our own serves: the
+  // record can outlive the serve by days, and the pid may by then belong to
+  // something else entirely (a recycled pid, or a TID of an unrelated
+  // process).  The decline is said out loud: this is an explicit user-facing
+  // command, and going quiet would read as "stopped" when nothing was
+  // stopped (kusabi #181).
+  const identity = isOurServe(server.pid, { root: stateRoot(), stateDir });
+  if (!identity.ours) {
+    if (identity.class === "refuted") {
+      // The record positively names a process that is not our serve (or is
+      // gone): the record is what is invalid — delete it, kill nothing.
+      try { fs.unlinkSync(serverFile); } catch { /* best-effort */ }
+      return `declined to stop pid ${server.pid}: ${identity.reason} (server.json removed; no signal sent).`;
+    }
+    // 'unverifiable' (hidepid, older marker set, /proc-less platform): the
+    // pid may well be our serve — we just cannot prove it.  Deleting the
+    // record would strand a live serve (it could never be stopped again and
+    // the next dispatch would spawn a duplicate), so the record is kept and
+    // the next ensureServer() health probe can still reuse the serve.
+    return `declined to stop pid ${server.pid}: ${identity.reason} (server.json kept; no signal sent).`;
+  }
+
   try {
     process.kill(server.pid);
     try { fs.unlinkSync(serverFile); } catch { /* best-effort */ }
@@ -1932,7 +1955,11 @@ async function main() {
     const ttlMs = parseFloat(raw);
     const ttl = Number.isFinite(ttlMs) && ttlMs > 0 ? ttlMs : 30 * 60 * 1000;
     const root = stateRoot();
-    reapIdleServes(root, ttl);
+    // On a serve-stop invocation the sweep leaves identity-failed records in
+    // place: cmdServeStop adjudicates them itself and must say why it
+    // declined — if the reaper deleted the record first, the user would only
+    // ever see "no server recorded" (kusabi #181 follow-up).
+    reapIdleServes(root, ttl, { keepIdentityFailed: subcommand === "serve-stop" });
     reapOrphanedServes(root);
   } catch { /* best-effort */ }
 
