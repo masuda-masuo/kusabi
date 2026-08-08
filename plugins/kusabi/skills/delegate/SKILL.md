@@ -58,6 +58,11 @@ end up re-running a doomed cheap round three times.
 
 ## Writing the brief
 
+- **Consult past review records for the target area first.** Chains archive their
+  review record (verdicts, findings, how each finding was adjudicated and why) to the
+  archive repository; search there before drafting so a recurring finding type is
+  answered by precedent instead of re-adjudicated from scratch. Where the archive
+  lives and how to search it is per-environment wiring, not this file.
 - **Sign it.** A line among the first 5 — `Orchestrator: <model-id> | session <id> | <date>`
   — is parsed by the companion and recorded on the job/chain record. Without it, discard
   and rework rates cannot be attributed back to who wrote the brief.
@@ -117,6 +122,12 @@ Worker reports are claims, not evidence. They have been false before.
   drafts a follow-up; filing it is yours. `strategize` buys one diagnosis job, not a
   reprieve from deciding. Never conclude on a followup while a critical or high finding is
   open, and treat a wrong premise as a brief to rewrite, not a finding to defer.
+- **Close the loop on the review record.** A chain that reaches a terminal disposition
+  prints the path of its generated `review-record.md` (see DESIGN.md). After inspection,
+  fill its two fill-at-inspection sections — per-finding adjudication with reasons, and
+  any reusable precedent — and post it to the archive repository. Posting is
+  orchestrator-exclusive, by the same exit principle as publish; an unposted record is
+  write-only state the next brief cannot learn from.
 
 ## Publish
 
