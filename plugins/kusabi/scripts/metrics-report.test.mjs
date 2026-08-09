@@ -889,3 +889,159 @@ describe("delegated jobs section (#154)", () => {
     assert.equal(measured.cost, 0);
   });
 });
+
+// ---------------------------------------------------------------------------
+// By-backend split (kusabi #184 Job C)
+// ---------------------------------------------------------------------------
+
+/** A fixture whose window contains BOTH backends: claude chains/jobs and
+ * legacy (NULL backend) chains/jobs that must read as "opencode". */
+function buildBackendSplitFixture() {
+  const db = openMetricsDb(":memory:");
+  // Claude chain: 2 rounds, final disposition accept, cost 1.0.
+  upsertChain(db, {
+    chainId: "chain-claude",
+    orchModel: "claude-opus-5",
+    orchDate: "2026-07-26",
+    backend: "claude",
+    totalsCost: 1.0,
+    briefHasSmoke: 1,
+    briefChars: 300,
+    briefHasDeliverables: 1,
+  });
+  upsertRound(db, {
+    chainId: "chain-claude", round: 1,
+    startedAt: "2026-07-26T09:00:00.000Z",
+    startedMs: Date.parse("2026-07-26T09:00:00.000Z"),
+    backend: "claude",
+    disposition: "rework",
+  });
+  upsertRound(db, {
+    chainId: "chain-claude", round: 2,
+    startedAt: "2026-07-26T09:30:00.000Z",
+    startedMs: Date.parse("2026-07-26T09:30:00.000Z"),
+    backend: "claude",
+    disposition: "accept",
+  });
+  // Legacy chain: NULL backend (predates the split) — reads as "opencode".
+  upsertChain(db, {
+    chainId: "chain-legacy",
+    orchModel: "claude-sonnet-5",
+    orchDate: "2026-07-22",
+    backend: null,
+    totalsCost: 0.5,
+    briefHasSmoke: 0,
+    briefChars: 200,
+    briefHasDeliverables: 1,
+  });
+  upsertRound(db, {
+    chainId: "chain-legacy", round: 1,
+    startedAt: "2026-07-22T09:00:00.000Z",
+    startedMs: Date.parse("2026-07-22T09:00:00.000Z"),
+    backend: null,
+    disposition: "escalate",
+  });
+  // A claude job with measured usage.
+  upsertJob(db, {
+    jobId: "job-claude",
+    kind: "task",
+    status: "completed",
+    backend: "claude",
+    startedAt: "2026-07-26T10:00:00.000Z",
+    startedMs: Date.parse("2026-07-26T10:00:00.000Z"),
+    usageAvailable: 1,
+    usageOutput: 100,
+    usageCost: 0.25,
+  });
+  // A legacy job (NULL backend) with measured usage.
+  upsertJob(db, {
+    jobId: "job-legacy",
+    kind: "task",
+    status: "completed",
+    backend: null,
+    startedAt: "2026-07-22T10:00:00.000Z",
+    startedMs: Date.parse("2026-07-22T10:00:00.000Z"),
+    usageAvailable: 1,
+    usageOutput: 50,
+    usageCost: 0.75,
+  });
+  return db;
+}
+
+describe("by-backend split (kusabi #184 Job C)", () => {
+  it("groups chains and jobs by backend, counting NULL-backend rows under 'opencode'", () => {
+    const report = computeReport(buildBackendSplitFixture(), { dbPath: ":memory:" });
+    const chains = Object.fromEntries(report.byBackend.chains.map((c) => [c.backend, c]));
+    assert.deepEqual(Object.keys(chains).sort(), ["claude", "opencode"]);
+    assert.equal(chains.claude.chainCount, 1);
+    assert.deepEqual(chains.claude.dispositions, { accept: 1 });
+    assert.equal(chains.claude.roundsPerChain, 2);
+    assert.equal(chains.claude.costUnits, 1.0);
+    assert.equal(chains.opencode.chainCount, 1); // the NULL-backend chain
+    assert.deepEqual(chains.opencode.dispositions, { escalate: 1 });
+    assert.equal(chains.opencode.roundsPerChain, 1);
+    assert.equal(chains.opencode.costUnits, 0.5);
+
+    const jobs = Object.fromEntries(report.byBackend.jobs.map((j) => [j.backend, j]));
+    assert.deepEqual(Object.keys(jobs).sort(), ["claude", "opencode"]);
+    assert.equal(jobs.claude.jobCount, 1);
+    assert.equal(jobs.claude.costUnits, 0.25);
+    assert.equal(jobs.opencode.jobCount, 1);
+    assert.equal(jobs.opencode.costUnits, 0.75);
+  });
+
+  it("appears in the text when both backends are in the window, and is window-scoped", () => {
+    const allTime = renderReportText(computeReport(buildBackendSplitFixture(), { dbPath: ":memory:" }));
+    assert.match(allTime, /by dispatch backend/);
+    assert.match(allTime, /opencode/);
+    assert.match(allTime, /claude/);
+    assert.match(allTime, /dispositions accept 1/);
+
+    // A bound that keeps only the claude rows: single-backend window — the
+    // section must not be printed at all, and the split holds only claude.
+    const opts = { since: "2026-07-25T00:00:00.000Z", dbPath: ":memory:" };
+    const report = computeReport(buildBackendSplitFixture(), opts);
+    assert.deepEqual(report.byBackend.chains.map((c) => c.backend), ["claude"]);
+    assert.deepEqual(report.byBackend.jobs.map((j) => j.backend), ["claude"]);
+    const claudeOnly = renderReportText(report);
+    assert.doesNotMatch(claudeOnly, /by dispatch backend/);
+  });
+
+  it("--json always carries the backend fields, even when the text omits the section", () => {
+    const report = computeReport(buildBackendSplitFixture(), { dbPath: ":memory:" });
+    const parsed = JSON.parse(renderReportJson(report));
+    assert.deepEqual(parsed.byBackend.chains.map((c) => c.backend).sort(), ["claude", "opencode"]);
+    assert.deepEqual(parsed.byBackend.jobs.map((j) => j.backend).sort(), ["claude", "opencode"]);
+  });
+
+  it("a single-backend window renders byte-identically to a report without the split", () => {
+    const db = buildFixture(); // every row predates the split -> all "opencode"
+    const report = computeReport(db, { dbPath: ":memory:" });
+    const withSplit = renderReportText(report);
+    const withoutSplit = renderReportText({ ...report, byBackend: undefined });
+    assert.equal(withSplit, withoutSplit);
+    assert.doesNotMatch(withSplit, /by dispatch backend/);
+    // JSON still carries it, NULL-backend rows under "opencode".
+    const parsed = JSON.parse(renderReportJson(report));
+    assert.deepEqual(parsed.byBackend.chains.map((c) => c.backend), ["opencode"]);
+    assert.deepEqual(parsed.byBackend.jobs, []);
+  });
+
+  it("a store written before the backend columns existed degrades: all rows read as 'opencode'", () => {
+    const db = buildBackendSplitFixture();
+    // Simulate a pre-split store file (the read-only surface can never
+    // migrate): drop the backend columns the way the reader will encounter
+    // them.
+    db.exec("ALTER TABLE chain DROP COLUMN backend");
+    db.exec("ALTER TABLE round DROP COLUMN backend");
+    db.exec("ALTER TABLE job DROP COLUMN backend");
+
+    const report = computeReport(db, { dbPath: ":memory:" });
+    assert.deepEqual(report.byBackend.chains.map((c) => c.backend), ["opencode"]);
+    assert.deepEqual(report.byBackend.jobs.map((j) => j.backend), ["opencode"]);
+    assert.equal(report.byBackend.chains[0].chainCount, 2);
+    assert.equal(report.byBackend.jobs[0].jobCount, 2);
+    const text = renderReportText(report);
+    assert.doesNotMatch(text, /by dispatch backend/); // single backend -> no section
+  });
+});

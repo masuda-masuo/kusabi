@@ -764,3 +764,92 @@ describe("ingestJobDirectory", () => {
     fs.rmSync(stateRoot, { recursive: true, force: true });
   });
 });
+
+// ---------------------------------------------------------------------------
+// backend field (kusabi #184 Job C) — carried verbatim into the rows; a
+// record without the field stores NULL, never "opencode" (readers apply
+// the "NULL means opencode" contract at read time).
+// ---------------------------------------------------------------------------
+
+describe("backend field (kusabi #184 Job C)", () => {
+  it("carries backend from the records into chain and round rows; absent field stores NULL", () => {
+    // A post-split chain: every record carries backend: "claude".
+    const claudeChain = structuredClone(chainModernFixture());
+    for (const rec of claudeChain.records) rec.backend = "claude";
+    const parsed = parseChainRecord(claudeChain, { workspaceSlug: "ws1" });
+    assert.equal(parsed.chainRow.backend, "claude");
+    assert.ok(parsed.roundRows.length >= 1);
+    for (const r of parsed.roundRows) assert.equal(r.backend, "claude");
+
+    // A pre-split chain: no backend field anywhere — the rows must store
+    // NULL, NOT "opencode" (the report applies that default, not ingest).
+    const legacy = parseChainRecord(chainOldFixture(), { workspaceSlug: "ws1" });
+    assert.equal(legacy.chainRow.backend, null);
+    assert.ok(legacy.roundRows.length >= 1);
+    for (const r of legacy.roundRows) assert.equal(r.backend, null);
+  });
+
+  it("the chain row's backend comes from the LAST record — the chain-resume convention", () => {
+    const chain = structuredClone(chainModernFixture());
+    chain.records[0].backend = "opencode";
+    chain.records[chain.records.length - 1].backend = "claude";
+    const parsed = parseChainRecord(chain, { workspaceSlug: "ws1" });
+    assert.equal(parsed.chainRow.backend, "claude");
+    assert.equal(parsed.roundRows[0].backend, "opencode"); // per-record, verbatim
+  });
+
+  it("the chain walker stores what the files say: 'claude' verbatim, absent as NULL", () => {
+    const stateRoot = makeTempStateRoot();
+    const claudeChain = structuredClone(chainModernFixture());
+    for (const rec of claudeChain.records) rec.backend = "claude";
+    writeChainDir(stateRoot, "ws1", "chain-ms1g7lesd89b", claudeChain);
+    writeChainDir(stateRoot, "ws1", "chain-mrv4jobge6df", chainOldFixture());
+
+    const db = openMetricsDb(":memory:");
+    const result = ingestChainDirectory(db, stateRoot);
+    assert.equal(result.chainsIngested, 2);
+
+    const chainByBackend = Object.fromEntries(
+      db.prepare("SELECT chain_id, backend FROM chain").all().map((r) => [r.chain_id, r.backend]),
+    );
+    assert.equal(chainByBackend["chain-ms1g7lesd89b"], "claude");
+    assert.equal(chainByBackend["chain-mrv4jobge6df"], null);
+
+    const roundRows = db.prepare("SELECT chain_id, backend FROM round").all();
+    assert.equal(roundRows.filter((r) => r.chain_id === "chain-ms1g7lesd89b")
+      .every((r) => r.backend === "claude"), true);
+    assert.equal(roundRows.filter((r) => r.chain_id === "chain-mrv4jobge6df")
+      .every((r) => r.backend === null), true);
+
+    fs.rmSync(stateRoot, { recursive: true, force: true });
+  });
+
+  it("job records: backend carried verbatim into the job row; absent stays NULL", () => {
+    const claudeJob = structuredClone(completedJobFixture());
+    claudeJob.backend = "claude";
+    const parsed = parseJobRecord(claudeJob, completedUsageFixture(), { workspaceSlug: "ws1" });
+    assert.equal(parsed.jobRow.backend, "claude");
+
+    const legacy = parseJobRecord(completedJobFixture(), completedUsageFixture(), { workspaceSlug: "ws1" });
+    assert.equal(legacy.jobRow.backend, null);
+  });
+
+  it("the job walker stores backend verbatim ('claude'), absent as NULL", () => {
+    const stateRoot = makeTempStateRoot();
+    const claudeJob = { ...completedJobFixture(), id: "job-claude", backend: "claude" };
+    writeJobDir(stateRoot, "ws1", "job-claude", claudeJob, completedUsageFixture());
+    const legacyJob = { ...completedJobFixture(), id: "job-legacy" };
+    writeJobDir(stateRoot, "ws1", "job-legacy", legacyJob, completedUsageFixture());
+
+    const db = openMetricsDb(":memory:");
+    const result = ingestJobDirectory(db, stateRoot);
+    assert.equal(result.jobsIngested, 2);
+    const jobByBackend = Object.fromEntries(
+      db.prepare("SELECT job_id, backend FROM job").all().map((r) => [r.job_id, r.backend]),
+    );
+    assert.equal(jobByBackend["job-claude"], "claude");
+    assert.equal(jobByBackend["job-legacy"], null);
+
+    fs.rmSync(stateRoot, { recursive: true, force: true });
+  });
+});

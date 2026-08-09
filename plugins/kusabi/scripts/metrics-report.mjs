@@ -220,35 +220,47 @@ function fetchSessions(db) {
 }
 
 function fetchChains(db) {
-  return db.prepare(`
-    SELECT chain_id, orch_model, orch_session, orch_date,
-           totals_input, totals_output, totals_cost,
-           brief_has_smoke, brief_chars, brief_has_deliverables
-    FROM chain
-  `).all();
+  // `backend` (kusabi #184) may be absent from stores written before the
+  // split — this surface opens READ-ONLY and can never migrate, so the
+  // select degrades to omitting the column and rows read as "opencode".
+  const hasBackend = tableHasColumn(db, "chain", "backend");
+  const cols = [
+    "chain_id", "orch_model", "orch_session", "orch_date",
+    "totals_input", "totals_output", "totals_cost",
+    "brief_has_smoke", "brief_chars", "brief_has_deliverables",
+  ];
+  if (hasBackend) cols.push("backend");
+  return db.prepare(`SELECT ${cols.join(", ")} FROM chain`).all();
 }
 
 function fetchRounds(db) {
   // `worktree_changed` (#165) may be absent from stores written before the
   // column existed — this surface opens READ-ONLY and can never migrate, so
   // the select degrades to omitting the column and rows read as "unknown".
+  // Same for `backend` (kusabi #184): absent column -> rows read as
+  // "opencode" via the reader contract.
   const hasWorktreeChanged = tableHasColumn(db, "round", "worktree_changed");
-  const sql = hasWorktreeChanged
-    ? `SELECT chain_id, round, started_at, started_ms, disposition, worktree_changed FROM round`
-    : `SELECT chain_id, round, started_at, started_ms, disposition FROM round`;
-  return db.prepare(sql).all();
+  const hasBackend = tableHasColumn(db, "round", "backend");
+  const cols = ["chain_id", "round", "started_at", "started_ms", "disposition"];
+  if (hasBackend) cols.push("backend");
+  if (hasWorktreeChanged) cols.push("worktree_changed");
+  return db.prepare(`SELECT ${cols.join(", ")} FROM round`).all();
 }
 
 /** Callers must check `tableExists(db, "job")` first (pre-#154 store files
  * have no `job` table and this surface cannot migrate them). */
 function fetchJobs(db) {
-  return db.prepare(`
-    SELECT job_id, workspace_slug, kind, status, phase, model_entry,
-           started_at, started_ms, finished_at, finished_ms,
-           duration_seconds, steps,
-           usage_available, usage_input, usage_output, usage_reasoning, usage_cost
-    FROM job
-  `).all();
+  // `backend` (kusabi #184) may be absent from stores written before the
+  // split — degrade to omitting the column; rows then read as "opencode".
+  const hasBackend = tableHasColumn(db, "job", "backend");
+  const cols = [
+    "job_id", "workspace_slug", "kind", "status", "phase", "model_entry",
+    "started_at", "started_ms", "finished_at", "finished_ms",
+    "duration_seconds", "steps",
+    "usage_available", "usage_input", "usage_output", "usage_reasoning", "usage_cost",
+  ];
+  if (hasBackend) cols.push("backend");
+  return db.prepare(`SELECT ${cols.join(", ")} FROM job`).all();
 }
 
 /** A job's window key: started_ms, else finished_ms, else null (undated). */
@@ -637,6 +649,63 @@ function computeDelegatedJobs(inWindowJobs) {
 }
 
 // ---------------------------------------------------------------------------
+// by-backend split (kusabi #184 Job C)
+// ---------------------------------------------------------------------------
+
+/**
+ * Split the in-window chains and jobs by dispatch backend.  `backend` is
+ * stored verbatim (NULL when the record predates the split); the reader
+ * contract — the same one `chain-resume` and `--resume-last` use — is
+ * applied HERE: NULL means "opencode", never unknown.  Same grouping idiom
+ * as the by-model sections: groupBy + one block per key, sorted by key.
+ */
+function computeBackendSplit(inWindowChains, inWindowJobs, roundsByChain) {
+  const chainsByBackend = groupBy(inWindowChains, (c) => c.backend ?? "opencode");
+  const jobsByBackend = groupBy(inWindowJobs, (j) => j.backend ?? "opencode");
+
+  const chains = [];
+  for (const [backend, chainsOfBackend] of chainsByBackend) {
+    // Final-disposition counts use the same definition as section 7 (the
+    // disposition of the LAST round); chains with zero rounds are counted
+    // separately rather than silently dropped, matching briefOutcome.
+    const dispositions = {};
+    let chainsWithRounds = 0;
+    let totalRounds = 0;
+    for (const c of chainsOfBackend) {
+      const rounds = roundsByChain.get(c.chain_id) || [];
+      if (rounds.length === 0) continue;
+      chainsWithRounds += 1;
+      totalRounds += rounds.length;
+      const disp = finalDisposition(c.chain_id, roundsByChain) ?? "(no disposition)";
+      dispositions[disp] = (dispositions[disp] || 0) + 1;
+    }
+    chains.push({
+      backend,
+      chainCount: chainsOfBackend.length,
+      chainsWithNoRounds: chainsOfBackend.length - chainsWithRounds,
+      dispositions,
+      roundsPerChain: chainsWithRounds > 0 ? totalRounds / chainsWithRounds : null,
+      costUnits: sumNumericField(chainsOfBackend, "totals_cost"),
+    });
+  }
+  chains.sort((a, b) => String(a.backend).localeCompare(String(b.backend)));
+
+  const jobs = [];
+  for (const [backend, jobsOfBackend] of jobsByBackend) {
+    jobs.push({
+      backend,
+      jobCount: jobsOfBackend.length,
+      // Cost over jobs with a measured numeric cost — same semantics as the
+      // delegated-jobs totals (absent cost stays null, measured 0 stays 0).
+      costUnits: sumNumericField(jobsOfBackend, "usage_cost"),
+    });
+  }
+  jobs.sort((a, b) => String(a.backend).localeCompare(String(b.backend)));
+
+  return { chains, jobs };
+}
+
+// ---------------------------------------------------------------------------
 // top-level report
 // ---------------------------------------------------------------------------
 
@@ -666,6 +735,7 @@ export function missingStoreReport(dbPath) {
     chainJoin: [],
     briefOutcome: [],
     delegatedJobs: emptyDelegatedJobs(),
+    byBackend: { chains: [], jobs: [] },
   };
 }
 
@@ -700,6 +770,7 @@ export function computeReport(db, opts = {}) {
       chainJoin: [],
       briefOutcome: [],
       delegatedJobs: emptyDelegatedJobs(),
+      byBackend: { chains: [], jobs: [] },
     };
   }
 
@@ -736,6 +807,7 @@ export function computeReport(db, opts = {}) {
   const chainJoin = computeChainJoin(inWindowChains, sessionAggMap, allSessions);
   const briefOutcome = computeBriefOutcome(inWindowChains, roundsByChain);
   const delegatedJobs = computeDelegatedJobs(inWindowJobs);
+  const byBackend = computeBackendSplit(inWindowChains, inWindowJobs, roundsByChain);
 
   const status = (inWindowTurns.length === 0 && inWindowChains.length === 0 && inWindowJobs.length === 0)
     ? "empty_window"
@@ -761,6 +833,7 @@ export function computeReport(db, opts = {}) {
     chainJoin,
     briefOutcome,
     delegatedJobs,
+    byBackend,
   };
 }
 
@@ -974,6 +1047,40 @@ function renderDelegatedJobs(section) {
 }
 
 /**
+ * Render the by-backend split (kusabi #184).  Returns [] — no section at
+ * all — when the window contains at most one distinct backend, so a
+ * single-backend history renders byte-identically to before the split.
+ */
+function renderBackendSplit(split) {
+  if (!split) return [];
+  const backends = new Set();
+  for (const c of split.chains) backends.add(c.backend);
+  for (const j of split.jobs) backends.add(j.backend);
+  if (backends.size <= 1) return [];
+
+  const lines = [
+    "Chains and jobs by dispatch backend (a record without the field predates the split \u2014 counted as \"opencode\"):",
+  ];
+  for (const c of split.chains) {
+    const dispKeys = Object.keys(c.dispositions).sort();
+    const dispStr = dispKeys.length === 0
+      ? "(none)"
+      : dispKeys.map((d) => `${d} ${fmtCount(c.dispositions[d])}`).join(", ");
+    const noRounds = c.chainsWithNoRounds > 0 ? `  (${fmtCount(c.chainsWithNoRounds)} without rounds)` : "";
+    lines.push(
+      `  chains  ${c.backend.padEnd(8)} ${fmtCount(c.chainCount)}  dispositions ${dispStr}  `
+      + `rounds/chain ${fmtNum(c.roundsPerChain)}  cost ${fmtCost(c.costUnits)} units${noRounds}`,
+    );
+  }
+  for (const j of split.jobs) {
+    lines.push(
+      `  jobs    ${j.backend.padEnd(8)} ${fmtCount(j.jobCount)}  cost ${fmtCost(j.costUnits)} units`,
+    );
+  }
+  return lines;
+}
+
+/**
  * Render a computed report (from `computeReport` or `missingStoreReport`) as
  * plain aligned text.
  */
@@ -1002,6 +1109,11 @@ export function renderReportText(report) {
   lines.push(...renderBriefOutcome(report.briefOutcome));
   lines.push("");
   lines.push(...renderDelegatedJobs(report.delegatedJobs));
+  const backendSplitLines = renderBackendSplit(report.byBackend);
+  if (backendSplitLines.length > 0) {
+    lines.push("");
+    lines.push(...backendSplitLines);
+  }
   return lines.join("\n");
 }
 

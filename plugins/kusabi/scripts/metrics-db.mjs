@@ -70,6 +70,7 @@ CREATE TABLE IF NOT EXISTS chain (
   orch_model TEXT,
   orch_session TEXT,
   orch_date TEXT,
+  backend TEXT,
   base_sha TEXT,
   model TEXT,
   model_chain_json TEXT,
@@ -102,6 +103,7 @@ CREATE TABLE IF NOT EXISTS round (
   round INTEGER,
   started_at TEXT,
   started_ms INTEGER,
+  backend TEXT,
   model_entry TEXT,
   tier_before INTEGER,
   tier_after INTEGER,
@@ -152,6 +154,7 @@ CREATE TABLE IF NOT EXISTS job (
   title TEXT,
   status TEXT,
   phase TEXT,
+  backend TEXT,
   model_entry TEXT,
   started_at TEXT,
   started_ms INTEGER,
@@ -211,6 +214,13 @@ export function openMetricsDb(dbPath) {
   // (kusabi #165 — the escalate substantive/no-work split).  Old rows keep
   // NULL, which the report surfaces render as "unknown", never as no-work.
   ensureColumn(db, "round", "worktree_changed", "INTEGER");
+  // Migrations for databases created before the chain/round/job `backend`
+  // columns existed (kusabi #184 Job C — the claude dispatch backend split).
+  // Old rows keep NULL, which report readers treat as "opencode" (records
+  // without the field predate the split), never as unknown.
+  ensureColumn(db, "chain", "backend", "TEXT");
+  ensureColumn(db, "round", "backend", "TEXT");
+  ensureColumn(db, "job", "backend", "TEXT");
   return db;
 }
 
@@ -369,13 +379,13 @@ export function upsertTurn(db, row) {
 export function upsertChain(db, row) {
   db.prepare(`
     INSERT OR REPLACE INTO chain
-      (chain_id, workspace_slug, orch_model, orch_session, orch_date, base_sha, model,
+      (chain_id, workspace_slug, orch_model, orch_session, orch_date, backend, base_sha, model,
        model_chain_json, max_rounds, strategized,
        totals_input, totals_output, totals_reasoning, totals_cache_read, totals_cache_write, totals_cost,
        brief_text, brief_chars, brief_lines, brief_bullets,
        brief_has_deliverables, brief_deliverable_count, brief_has_smoke, brief_smoke_count)
     VALUES
-      ($chainId, $workspaceSlug, $orchModel, $orchSession, $orchDate, $baseSha, $model,
+      ($chainId, $workspaceSlug, $orchModel, $orchSession, $orchDate, $backend, $baseSha, $model,
        $modelChainJson, $maxRounds, $strategized,
        $totalsInput, $totalsOutput, $totalsReasoning, $totalsCacheRead, $totalsCacheWrite, $totalsCost,
        $briefText, $briefChars, $briefLines, $briefBullets,
@@ -386,6 +396,10 @@ export function upsertChain(db, row) {
     orchModel: row.orchModel ?? null,
     orchSession: row.orchSession ?? null,
     orchDate: row.orchDate ?? null,
+    // Dispatch backend (kusabi #184), stored verbatim — a row without the
+    // field stores NULL, never a default; readers apply the "NULL means
+    // opencode" contract at read time.
+    backend: row.backend ?? null,
     baseSha: row.baseSha ?? null,
     model: row.model ?? null,
     modelChainJson: row.modelChainJson ?? null,
@@ -419,11 +433,11 @@ export function upsertChain(db, row) {
 export function upsertRound(db, row) {
   db.prepare(`
     INSERT OR REPLACE INTO round
-      (chain_id, round, started_at, started_ms, model_entry, tier_before, tier_after,
+      (chain_id, round, started_at, started_ms, backend, model_entry, tier_before, tier_after,
        verdict, probes_green, worktree_changed, disposition, rework_count, findings_text,
        implement_in, implement_out, implement_cost, review_in, review_out, review_cost)
     VALUES
-      ($chainId, $round, $startedAt, $startedMs, $modelEntry, $tierBefore, $tierAfter,
+      ($chainId, $round, $startedAt, $startedMs, $backend, $modelEntry, $tierBefore, $tierAfter,
        $verdict, $probesGreen, $worktreeChanged, $disposition, $reworkCount, $findingsText,
        $implementIn, $implementOut, $implementCost, $reviewIn, $reviewOut, $reviewCost)
   `).run({
@@ -431,6 +445,9 @@ export function upsertRound(db, row) {
     round: row.round,
     startedAt: row.startedAt ?? null,
     startedMs: row.startedMs ?? null,
+    // Dispatch backend (kusabi #184), stored verbatim per record — NULL when
+    // the record predates the split; readers treat NULL as "opencode".
+    backend: row.backend ?? null,
     modelEntry: row.modelEntry ?? null,
     tierBefore: row.tierBefore ?? null,
     tierAfter: row.tierAfter ?? null,
@@ -496,13 +513,13 @@ export function upsertFinding(db, row) {
 export function upsertJob(db, row) {
   db.prepare(`
     INSERT OR REPLACE INTO job
-      (job_id, workspace_slug, kind, title, status, phase, model_entry,
+      (job_id, workspace_slug, kind, title, status, phase, backend, model_entry,
        started_at, started_ms, finished_at, finished_ms, duration_seconds,
        steps, error, usage_available, usage_model,
        usage_input, usage_output, usage_reasoning,
        usage_cache_read, usage_cache_write, usage_cost)
     VALUES
-      ($jobId, $workspaceSlug, $kind, $title, $status, $phase, $modelEntry,
+      ($jobId, $workspaceSlug, $kind, $title, $status, $phase, $backend, $modelEntry,
        $startedAt, $startedMs, $finishedAt, $finishedMs, $durationSeconds,
        $steps, $error, $usageAvailable, $usageModel,
        $usageInput, $usageOutput, $usageReasoning,
@@ -514,6 +531,9 @@ export function upsertJob(db, row) {
     title: row.title ?? null,
     status: row.status ?? null,
     phase: row.phase ?? null,
+    // Dispatch backend (kusabi #184), stored verbatim — NULL when the job
+    // record predates the split; readers treat NULL as "opencode".
+    backend: row.backend ?? null,
     modelEntry: row.modelEntry ?? null,
     startedAt: row.startedAt ?? null,
     startedMs: row.startedMs ?? null,
