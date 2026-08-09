@@ -430,7 +430,7 @@ describe("reviewDenyTools", () => {
 // selectRoutes — tiered chain route selection with clamp and failed-route memo
 // =========================================================================
 
-import { selectRoutes, validateChainEntries, firstRoute } from "./cli.mjs";
+import { selectRoutes, validateChainEntries, firstRoute, splitRouteBackend, resolveChainBackend, stripClaudePrefixChain } from "./cli.mjs";
 
 describe("selectRoutes", () => {
   const tiers = [
@@ -607,5 +607,81 @@ describe("firstRoute", () => {
   it("returns null when first tier is empty", () => {
     // This would be caught by validateChainEntries but firstRoute handles it gracefully.
     assert.equal(firstRoute([[]]), null);
+  });
+});
+
+// splitRouteBackend / resolveChainBackend / stripClaudePrefixChain \u2014 per-entry
+// backend prefix (kusabi #192)
+// =========================================================================
+
+describe("splitRouteBackend", () => {
+  it("claude/opus selects the claude backend with model opus", () => {
+    assert.deepEqual(splitRouteBackend("claude/opus"), { route: "opus", backend: "claude" });
+  });
+
+  it("claude/<full-model-id> selects the claude backend with the full id", () => {
+    assert.deepEqual(splitRouteBackend("claude/claude-sonnet-4-5"), { route: "claude-sonnet-4-5", backend: "claude" });
+  });
+
+  it("an unprefixed entry is an opencode route, byte-identical", () => {
+    assert.deepEqual(splitRouteBackend("opencode/deepseek-v4-flash-free:max"), {
+      route: "opencode/deepseek-v4-flash-free:max",
+      backend: "opencode",
+    });
+    assert.deepEqual(splitRouteBackend("p/a:max"), { route: "p/a:max", backend: "opencode" });
+  });
+
+  it("a claude/ entry with an empty model is a config error", () => {
+    assert.throws(() => splitRouteBackend("claude/"), /empty model/);
+  });
+});
+
+describe("resolveChainBackend", () => {
+  it("an all-claude array is claude", () => {
+    assert.equal(resolveChainBackend(["claude/opus", "claude/sonnet"]), "claude");
+    assert.equal(resolveChainBackend([["claude/opus"], ["claude/sonnet"]]), "claude");
+  });
+
+  it("an all-opencode array is opencode", () => {
+    assert.equal(resolveChainBackend(["opencode/x:max", "opencode-go/y:max"]), "opencode");
+  });
+
+  it("a flat array mixing backends throws with a clear message", () => {
+    assert.throws(
+      () => resolveChainBackend(["claude/opus", "opencode/x:max"]),
+      /mixes backends/,
+    );
+    assert.throws(
+      () => resolveChainBackend(["opencode/x:max", "claude/opus"]),
+      /single-backend/,
+    );
+  });
+
+  it("a tiered array mixing backends throws (even across tiers)", () => {
+    assert.throws(
+      () => resolveChainBackend([["claude/opus"], ["opencode/x:max"]]),
+      /mixes backends/,
+    );
+  });
+
+  it("an empty array is opencode (unreachable after validation, graceful anyway)", () => {
+    assert.equal(resolveChainBackend([]), "opencode");
+  });
+});
+
+describe("stripClaudePrefixChain", () => {
+  it("strips claude/ prefixes from a flat chain, preserving order", () => {
+    assert.deepEqual(stripClaudePrefixChain(["claude/opus", "claude/sonnet"]), ["opus", "sonnet"]);
+  });
+
+  it("strips claude/ prefixes from a tiered chain, preserving tier shape", () => {
+    assert.deepEqual(
+      stripClaudePrefixChain([["claude/opus", "claude/sonnet"], ["claude/opus"]]),
+      [["opus", "sonnet"], ["opus"]],
+    );
+  });
+
+  it("leaves unprefixed entries byte-identical", () => {
+    assert.deepEqual(stripClaudePrefixChain(["opencode/x:max", "claude/opus"]), ["opencode/x:max", "opus"]);
   });
 });

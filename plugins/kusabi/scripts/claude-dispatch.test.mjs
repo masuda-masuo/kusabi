@@ -35,6 +35,7 @@ import {
   claudeDispatch,
 } from "./claude-dispatch.mjs";
 import { resolveBackend, resolveDispatchBackend } from "./kusabi-companion.mjs";
+import { dispatchWithFallback } from "./prompt-execution.mjs";
 import { runImplementPhase } from "./chain-phases.mjs";
 import { WRITE_TOOL_NAMES, implementDenyTools, firstRoute } from "./cli.mjs";
 import { stateDirFor, readJson } from "./state-paths.mjs";
@@ -1375,5 +1376,171 @@ describe("resolveDispatchBackend (claude)", () => {
       }),
       /:variant suffix in model "opus:max"/,
     );
+  });
+});
+
+// Per-phase backend selection via the claude/ entry prefix (kusabi #192).
+describe("resolveDispatchBackend (per-phase mixing, kusabi #192)", () => {
+  it("no --backend flag: a claude/ chain selects the claude backend, prefix stripped", () => {
+    const r = resolveDispatchBackend({
+      flags: {},
+      phase: "implement",
+      config: { models: { phases: { implement: ["claude/opus"] } } },
+    });
+    assert.equal(r.backend, "claude");
+    assert.equal(r.dispatch, claudeDispatch);
+    assert.equal(r.model, "opus");
+    assert.deepEqual(r.chain, ["opus"]);
+  });
+
+  it("no --backend flag: an unprefixed chain stays on opencode, byte-identical route", () => {
+    const r = resolveDispatchBackend({
+      flags: {},
+      phase: "review",
+      config: { models: { phases: { review: ["opencode/deepseek-v4-flash-free:max"] } } },
+    });
+    assert.equal(r.backend, "opencode");
+    assert.equal(r.dispatch, dispatchWithFallback);
+    assert.deepEqual(r.model, { providerID: "opencode", modelID: "deepseek-v4-flash-free", variant: "max" });
+    assert.deepEqual(r.chain, ["opencode/deepseek-v4-flash-free:max"]);
+  });
+
+  it("implement and review resolve independently from models.phases (the mixing use case)", () => {
+    const config = {
+      models: {
+        phases: {
+          implement: ["claude/opus"],
+          review: ["opencode/deepseek-v4-flash-free:max"],
+        },
+      },
+    };
+    const impl = resolveDispatchBackend({ flags: {}, phase: "implement", config });
+    const rev = resolveDispatchBackend({ flags: {}, phase: "review", config });
+    assert.equal(impl.backend, "claude");
+    assert.equal(impl.model, "opus");
+    assert.deepEqual(impl.chain, ["opus"]);
+    assert.equal(rev.backend, "opencode");
+    assert.deepEqual(rev.chain, ["opencode/deepseek-v4-flash-free:max"]);
+  });
+
+  it("a full claude model id works as the prefixed entry's model", () => {
+    const r = resolveDispatchBackend({
+      flags: {},
+      phase: "implement",
+      config: { models: { phases: { implement: ["claude/claude-sonnet-4-5"] } } },
+    });
+    assert.equal(r.backend, "claude");
+    assert.equal(r.model, "claude-sonnet-4-5");
+  });
+
+  it("a claude/ chain from models.chain (no per-phase override) selects claude for every phase", () => {
+    const config = { models: { chain: ["claude/sonnet"] } };
+    const impl = resolveDispatchBackend({ flags: {}, phase: "implement", config });
+    const rev = resolveDispatchBackend({ flags: {}, phase: "review", config });
+    assert.equal(impl.backend, "claude");
+    assert.equal(impl.model, "sonnet");
+    assert.equal(rev.backend, "claude");
+    assert.equal(rev.model, "sonnet");
+  });
+
+  it("--model with a claude chain (no --backend) is a bare alias / full id, not provider/model", () => {
+    const r = resolveDispatchBackend({
+      flags: { model: "haiku" },
+      phase: "implement",
+      config: { models: { phases: { implement: ["claude/opus"] } } },
+    });
+    assert.equal(r.backend, "claude");
+    assert.equal(r.model, "haiku");
+    assert.deepEqual(r.chain, ["opus"]);
+  });
+
+  it("a phase array mixing backends fails loudly at command start", () => {
+    assert.throws(
+      () => resolveDispatchBackend({
+        flags: {},
+        phase: "implement",
+        config: { models: { phases: { implement: ["claude/opus", "opencode/x:max"] } } },
+      }),
+      /mixes backends/,
+    );
+    assert.throws(
+      () => resolveDispatchBackend({
+        flags: {},
+        phase: "implement",
+        config: { models: { phases: { implement: [["claude/opus"], ["opencode/x:max"]] } } },
+      }),
+      /mixes backends/,
+    );
+  });
+
+  it("a claude/<model>:variant entry fails loudly at command start", () => {
+    assert.throws(
+      () => resolveDispatchBackend({
+        flags: {},
+        phase: "implement",
+        config: { models: { phases: { implement: ["claude/opus:max"] } } },
+      }),
+      /:variant suffix in model "opus:max"/,
+    );
+    // Also under the explicit --backend claude flag.
+    assert.throws(
+      () => resolveDispatchBackend({
+        flags: { backend: "claude" },
+        phase: "implement",
+        config: { models: { phases: { implement: ["claude/opus:max"] } } },
+      }),
+      /:variant suffix in model "opus:max"/,
+    );
+  });
+
+  it("--backend claude strips a claude/ prefix on the flag path", () => {
+    const r = resolveDispatchBackend({
+      flags: { backend: "claude" },
+      phase: "implement",
+      config: { models: { phases: { implement: ["claude/opus"] } } },
+    });
+    assert.equal(r.backend, "claude");
+    assert.equal(r.model, "opus");
+    assert.deepEqual(r.chain, ["opus"]);
+  });
+
+  it("--backend claude with a mixed chain (no --model) still fails loudly at command start", () => {
+    assert.throws(
+      () => resolveDispatchBackend({
+        flags: { backend: "claude" },
+        phase: "implement",
+        config: { models: { phases: { implement: ["claude/opus", "opencode/x"] } } },
+      }),
+      /mixes backends/,
+    );
+  });
+
+  it("--backend claude + --model skips chain validation entirely (kusabi #186 carve-out), even for a mixed chain", () => {
+    const r = resolveDispatchBackend({
+      flags: { backend: "claude", model: "opus" },
+      phase: "implement",
+      config: { models: { chain: ["claude/opus", "opencode/x"] } },
+    });
+    assert.equal(r.backend, "claude");
+    assert.equal(r.model, "opus");
+    assert.deepEqual(r.chain, ["opus", "opencode/x"]);
+  });
+
+  it("--backend claude forces a claude/ phase onto claude with ITS phase model clamped", () => {
+    // Per-phase config says review runs claude/sonnet; the flag forces claude
+    // and the resolved phase model is sonnet (the clamp wrapper pins it).
+    const config = {
+      models: {
+        phases: {
+          implement: ["claude/opus"],
+          review: ["claude/sonnet"],
+        },
+      },
+    };
+    const rev = resolveDispatchBackend({ flags: { backend: "claude" }, phase: "review", config });
+    assert.equal(rev.backend, "claude");
+    assert.equal(rev.dispatch, claudeDispatch);
+    assert.equal(rev.model, "sonnet");
+    assert.deepEqual(rev.chain, ["sonnet"]);
   });
 });
