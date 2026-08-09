@@ -542,3 +542,75 @@ describe("chain/round/job backend migration (kusabi #184 Job C)", () => {
     assert.equal(jobRows[1].backend, null);
   });
 });
+
+// ---------------------------------------------------------------------------
+// round.review_backend column (kusabi #195)
+// ---------------------------------------------------------------------------
+
+describe("round.review_backend migration (kusabi #195)", () => {
+  it("adds review_backend to a post-#184 / pre-#195 database, preserving old rows as NULL", () => {
+    const dbPath = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-migrate-test-")), "metrics.db");
+
+    // A database written between #184 and #195: `round` already has
+    // `backend`, but no `review_backend` at all.
+    const legacyDb = new DatabaseSync(dbPath);
+    legacyDb.exec(`
+      CREATE TABLE round (
+        chain_id TEXT,
+        round INTEGER,
+        started_at TEXT,
+        started_ms INTEGER,
+        backend TEXT,
+        model_entry TEXT,
+        tier_before INTEGER,
+        tier_after INTEGER,
+        verdict TEXT,
+        probes_green INTEGER,
+        worktree_changed INTEGER,
+        disposition TEXT,
+        rework_count INTEGER,
+        findings_text TEXT,
+        implement_in INTEGER,
+        implement_out INTEGER,
+        implement_cost REAL,
+        review_in INTEGER,
+        review_out INTEGER,
+        review_cost REAL,
+        PRIMARY KEY (chain_id, round)
+      )
+    `);
+    legacyDb.prepare("INSERT INTO round (chain_id, round, backend, disposition) VALUES (?, ?, ?, ?)")
+      .run("chain-legacy", 1, "claude", "accept");
+    if (typeof legacyDb.close === "function") legacyDb.close();
+
+    // Re-opening through openMetricsDb migrates in place and must NOT
+    // backfill the old row's review backend from its `backend`: a record
+    // predating #192 never recorded one, and "unknown" is not "the same".
+    const db = openMetricsDb(dbPath);
+    const legacyRound = db.prepare("SELECT * FROM round WHERE chain_id = ?").get("chain-legacy");
+    assert.equal(legacyRound.review_backend, null);
+    assert.equal(legacyRound.backend, "claude"); // other columns untouched
+    assert.equal(legacyRound.disposition, "accept");
+
+    // New rows written after migration store both phases verbatim.
+    upsertRound(db, {
+      chainId: "chain-new", round: 1, backend: "claude", reviewBackend: "opencode", disposition: "accept",
+    });
+    const newRound = db.prepare("SELECT backend, review_backend FROM round WHERE chain_id = ? AND round = 1")
+      .get("chain-new");
+    assert.equal(newRound.backend, "claude");
+    assert.equal(newRound.review_backend, "opencode");
+
+    fs.rmSync(path.dirname(dbPath), { recursive: true, force: true });
+  });
+
+  it("stores review_backend verbatim — NULL when the row carries none, never a copy of backend", () => {
+    const db = openMetricsDb(":memory:");
+    upsertRound(db, { chainId: "chain-a", round: 1, backend: "claude", reviewBackend: "opencode" });
+    upsertRound(db, { chainId: "chain-b", round: 1, backend: "claude" });
+    upsertRound(db, { chainId: "chain-c", round: 1 });
+    const rows = db.prepare("SELECT chain_id, backend, review_backend FROM round ORDER BY chain_id").all();
+    assert.deepEqual(rows.map((r) => r.review_backend), ["opencode", null, null]);
+    assert.deepEqual(rows.map((r) => r.backend), ["claude", "claude", null]);
+  });
+});

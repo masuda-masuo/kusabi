@@ -238,7 +238,11 @@ function fetchRounds(db) {
   // column existed — this surface opens READ-ONLY and can never migrate, so
   // the select degrades to omitting the column and rows read as "unknown".
   // Same for `backend` (kusabi #184): absent column -> rows read as
-  // "opencode" via the reader contract.
+  // "opencode" via the reader contract.  `review_backend` (kusabi #195) is
+  // deliberately NOT selected: mixedness is decided at ingest and stored in
+  // `chain.backend`, and this read-only surface reads that verbatim — a
+  // store written before #195 simply has no "mixed" labels yet (re-ingest
+  // is the fix, not re-derivation).
   const hasWorktreeChanged = tableHasColumn(db, "round", "worktree_changed");
   const hasBackend = tableHasColumn(db, "round", "backend");
   const cols = ["chain_id", "round", "started_at", "started_ms", "disposition"];
@@ -649,15 +653,19 @@ function computeDelegatedJobs(inWindowJobs) {
 }
 
 // ---------------------------------------------------------------------------
-// by-backend split (kusabi #184 Job C)
+// by-backend split (kusabi #184 Job C, per-phase attribution kusabi #195)
 // ---------------------------------------------------------------------------
 
 /**
  * Split the in-window chains and jobs by dispatch backend.  `backend` is
- * stored verbatim (NULL when the record predates the split); the reader
- * contract — the same one `chain-resume` and `--resume-last` use — is
- * applied HERE: NULL means "opencode", never unknown.  Same grouping idiom
- * as the by-model sections: groupBy + one block per key, sorted by key.
+ * stored verbatim — NULL when the record predates the split, and `"mixed"`
+ * (kusabi #195) when ingest judged the chain's known phase backends to
+ * disagree — and the reader contract (the same one `chain-resume` and
+ * `--resume-last` use) is applied HERE: NULL means "opencode", never
+ * unknown.  Chains and jobs use the identical plain-field read; there is no
+ * report-side re-derivation, because mixedness was decided where the
+ * records were in hand (ingest).  Same grouping idiom as the by-model
+ * sections: groupBy + one block per key, sorted by key.
  */
 function computeBackendSplit(inWindowChains, inWindowJobs, roundsByChain) {
   const chainsByBackend = groupBy(inWindowChains, (c) => c.backend ?? "opencode");
@@ -1050,6 +1058,9 @@ function renderDelegatedJobs(section) {
  * Render the by-backend split (kusabi #184).  Returns [] — no section at
  * all — when the window contains at most one distinct backend, so a
  * single-backend history renders byte-identically to before the split.
+ * `"mixed"` (kusabi #195) is just another bucket key here: the ≤1 rule is
+ * unchanged, so a window holding only mixed chains and nothing else still
+ * prints no section.
  */
 function renderBackendSplit(split) {
   if (!split) return [];
@@ -1059,7 +1070,8 @@ function renderBackendSplit(split) {
   if (backends.size <= 1) return [];
 
   const lines = [
-    "Chains and jobs by dispatch backend (a record without the field predates the split \u2014 counted as \"opencode\"):",
+    "Chains and jobs by dispatch backend (a record without the field predates the split — counted as \"opencode\"; "
+    + "\"mixed\" = a chain whose known phase backends disagree):",
   ];
   for (const c of split.chains) {
     const dispKeys = Object.keys(c.dispositions).sort();

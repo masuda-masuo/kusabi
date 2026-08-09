@@ -103,7 +103,12 @@ CREATE TABLE IF NOT EXISTS round (
   round INTEGER,
   started_at TEXT,
   started_ms INTEGER,
+  -- backend is the backend the round's IMPLEMENT job actually used;
+  -- review_backend the backend its REVIEW job used (kusabi #192 made the
+  -- two independent, kusabi #195 stores the second one).  Both verbatim,
+  -- NULL when the record predates the field.
   backend TEXT,
+  review_backend TEXT,
   model_entry TEXT,
   tier_before INTEGER,
   tier_after INTEGER,
@@ -221,6 +226,12 @@ export function openMetricsDb(dbPath) {
   ensureColumn(db, "chain", "backend", "TEXT");
   ensureColumn(db, "round", "backend", "TEXT");
   ensureColumn(db, "job", "backend", "TEXT");
+  // Migration for databases created before `round.review_backend` existed
+  // (kusabi #195 — per-phase backend attribution, after #192 made review's
+  // backend independent of implement's).  Old rows keep NULL: those records
+  // predate `reviewBackend`, so their review backend is genuinely unknown
+  // and is never backfilled from the round's implement backend.
+  ensureColumn(db, "round", "review_backend", "TEXT");
   return db;
 }
 
@@ -433,11 +444,11 @@ export function upsertChain(db, row) {
 export function upsertRound(db, row) {
   db.prepare(`
     INSERT OR REPLACE INTO round
-      (chain_id, round, started_at, started_ms, backend, model_entry, tier_before, tier_after,
+      (chain_id, round, started_at, started_ms, backend, review_backend, model_entry, tier_before, tier_after,
        verdict, probes_green, worktree_changed, disposition, rework_count, findings_text,
        implement_in, implement_out, implement_cost, review_in, review_out, review_cost)
     VALUES
-      ($chainId, $round, $startedAt, $startedMs, $backend, $modelEntry, $tierBefore, $tierAfter,
+      ($chainId, $round, $startedAt, $startedMs, $backend, $reviewBackend, $modelEntry, $tierBefore, $tierAfter,
        $verdict, $probesGreen, $worktreeChanged, $disposition, $reworkCount, $findingsText,
        $implementIn, $implementOut, $implementCost, $reviewIn, $reviewOut, $reviewCost)
   `).run({
@@ -447,7 +458,14 @@ export function upsertRound(db, row) {
     startedMs: row.startedMs ?? null,
     // Dispatch backend (kusabi #184), stored verbatim per record — NULL when
     // the record predates the split; readers treat NULL as "opencode".
+    // `backend` is the IMPLEMENT phase's backend (round 1 the implement
+    // backend, a rework round the rework backend — each round's own field is
+    // already truthful).  `reviewBackend` (kusabi #192, ingested by #195) is
+    // the REVIEW phase's, stored verbatim and NULL for records written
+    // before the field existed — never backfilled from `backend`, because
+    // "unknown" and "same as implement" are different facts.
     backend: row.backend ?? null,
+    reviewBackend: row.reviewBackend ?? null,
     modelEntry: row.modelEntry ?? null,
     tierBefore: row.tierBefore ?? null,
     tierAfter: row.tierAfter ?? null,

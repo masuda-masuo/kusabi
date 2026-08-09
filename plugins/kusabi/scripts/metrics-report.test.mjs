@@ -1025,6 +1025,26 @@ describe("by-backend split (kusabi #184 Job C)", () => {
     const parsed = JSON.parse(renderReportJson(report));
     assert.deepEqual(parsed.byBackend.chains.map((c) => c.backend), ["opencode"]);
     assert.deepEqual(parsed.byBackend.jobs, []);
+
+    // kusabi #195: the same guarantee for a store that DOES carry per-phase
+    // backends, as long as they all agree.  A pure-claude history (implement
+    // AND review on claude, every round) is one bucket, so it too renders
+    // byte-identically to a report with no split at all.
+    const pure = openMetricsDb(":memory:");
+    upsertChain(pure, {
+      chainId: "chain-pure", orchModel: "claude-opus-5", orchDate: "2026-07-26",
+      backend: "claude", totalsCost: 1.0, briefHasSmoke: 1, briefChars: 300, briefHasDeliverables: 1,
+    });
+    upsertRound(pure, {
+      chainId: "chain-pure", round: 1,
+      startedAt: "2026-07-26T09:00:00.000Z", startedMs: Date.parse("2026-07-26T09:00:00.000Z"),
+      backend: "claude", reviewBackend: "claude", disposition: "accept",
+    });
+    const pureReport = computeReport(pure, { dbPath: ":memory:" });
+    assert.deepEqual(pureReport.byBackend.chains.map((c) => c.backend), ["claude"]);
+    const pureText = renderReportText(pureReport);
+    assert.equal(pureText, renderReportText({ ...pureReport, byBackend: undefined }));
+    assert.doesNotMatch(pureText, /by dispatch backend/);
   });
 
   it("a store written before the backend columns existed degrades: all rows read as 'opencode'", () => {
@@ -1034,6 +1054,7 @@ describe("by-backend split (kusabi #184 Job C)", () => {
     // them.
     db.exec("ALTER TABLE chain DROP COLUMN backend");
     db.exec("ALTER TABLE round DROP COLUMN backend");
+    db.exec("ALTER TABLE round DROP COLUMN review_backend");
     db.exec("ALTER TABLE job DROP COLUMN backend");
 
     const report = computeReport(db, { dbPath: ":memory:" });
@@ -1043,5 +1064,154 @@ describe("by-backend split (kusabi #184 Job C)", () => {
     assert.equal(report.byBackend.jobs[0].jobCount, 2);
     const text = renderReportText(report);
     assert.doesNotMatch(text, /by dispatch backend/); // single backend -> no section
+  });
+});
+
+// ---------------------------------------------------------------------------
+// per-phase backend attribution (kusabi #195)
+// ---------------------------------------------------------------------------
+
+/** A window holding a phase-mixed chain (implement claude / review opencode,
+ * ingested as chain.backend "mixed") alongside a pure-opencode one. */
+function buildMixedBackendFixture({ chainBackend = "mixed", reviewBackend = "opencode" } = {}) {
+  const db = openMetricsDb(":memory:");
+  upsertChain(db, {
+    chainId: "chain-mixed",
+    orchModel: "claude-opus-5",
+    orchDate: "2026-07-26",
+    backend: chainBackend,
+    totalsCost: 2.0,
+    briefHasSmoke: 1,
+    briefChars: 300,
+    briefHasDeliverables: 1,
+  });
+  upsertRound(db, {
+    chainId: "chain-mixed", round: 1,
+    startedAt: "2026-07-26T09:00:00.000Z",
+    startedMs: Date.parse("2026-07-26T09:00:00.000Z"),
+    backend: "claude",
+    reviewBackend,
+    disposition: "accept",
+  });
+  upsertChain(db, {
+    chainId: "chain-pure-opencode",
+    orchModel: "claude-opus-5",
+    orchDate: "2026-07-26",
+    backend: "opencode",
+    totalsCost: 0.5,
+    briefHasSmoke: 1,
+    briefChars: 200,
+    briefHasDeliverables: 1,
+  });
+  upsertRound(db, {
+    chainId: "chain-pure-opencode", round: 1,
+    startedAt: "2026-07-26T09:10:00.000Z",
+    startedMs: Date.parse("2026-07-26T09:10:00.000Z"),
+    backend: "opencode",
+    reviewBackend: "opencode",
+    disposition: "escalate",
+  });
+  return db;
+}
+
+describe("per-phase backend attribution (kusabi #195)", () => {
+  it("a phase-mixed chain gets its own 'mixed' bucket instead of polluting a real backend", () => {
+    const report = computeReport(buildMixedBackendFixture(), { dbPath: ":memory:" });
+    const chains = Object.fromEntries(report.byBackend.chains.map((c) => [c.backend, c]));
+    assert.deepEqual(Object.keys(chains).sort(), ["mixed", "opencode"]);
+    assert.equal(chains.mixed.chainCount, 1);
+    assert.equal(chains.mixed.costUnits, 2.0);
+    assert.deepEqual(chains.mixed.dispositions, { accept: 1 });
+    // The mixed chain's spend and outcome are NOT counted under opencode.
+    assert.equal(chains.opencode.chainCount, 1);
+    assert.equal(chains.opencode.costUnits, 0.5);
+    assert.deepEqual(chains.opencode.dispositions, { escalate: 1 });
+
+    const text = renderReportText(report);
+    assert.match(text, /by dispatch backend/);
+    assert.match(text, /chains {2}mixed/);
+  });
+
+  it("a store ingested before #195 keeps the stored chain.backend: this read-only surface reads it verbatim", () => {
+    // chain.backend says "claude" — what the pre-#195 ingest wrote (the last
+    // record's implement backend) — while the round rows record review on
+    // opencode.  The report deliberately does NOT re-derive mixedness from
+    // round rows (mixedness is decided at ingest, where the records are in
+    // hand); an old store's stale label survives until the chain directory
+    // is re-ingested.  This test pins that honest degrade.
+    const report = computeReport(
+      buildMixedBackendFixture({ chainBackend: "claude" }),
+      { dbPath: ":memory:" },
+    );
+    assert.deepEqual(report.byBackend.chains.map((c) => c.backend).sort(), ["claude", "opencode"]);
+    const claude = report.byBackend.chains.find((c) => c.backend === "claude");
+    assert.equal(claude.chainCount, 1);
+    assert.equal(claude.costUnits, 2.0);
+  });
+
+  it("a chain that switched backends BETWEEN rounds is ingested as 'mixed' and bucketed there", () => {
+    // The union rule at ingest (kusabi #195) labels a cross-round switch
+    // "mixed"; the fixture stores exactly what ingest writes, and the
+    // report reads it verbatim, so a chain that spent round 1 on opencode
+    // is not counted wholly as claude.
+    const db = openMetricsDb(":memory:");
+    upsertChain(db, {
+      chainId: "chain-switched", orchModel: "claude-opus-5", orchDate: "2026-07-26",
+      backend: "mixed", totalsCost: 3.0, briefHasSmoke: 1, briefChars: 300, briefHasDeliverables: 1,
+    });
+    upsertRound(db, {
+      chainId: "chain-switched", round: 1,
+      startedAt: "2026-07-26T09:00:00.000Z", startedMs: Date.parse("2026-07-26T09:00:00.000Z"),
+      backend: "opencode", reviewBackend: "opencode", disposition: "rework",
+    });
+    upsertRound(db, {
+      chainId: "chain-switched", round: 2,
+      startedAt: "2026-07-26T09:30:00.000Z", startedMs: Date.parse("2026-07-26T09:30:00.000Z"),
+      backend: "claude", reviewBackend: "claude", disposition: "accept",
+    });
+    const report = computeReport(db, { dbPath: ":memory:" });
+    assert.deepEqual(report.byBackend.chains.map((c) => c.backend), ["mixed"]);
+    assert.equal(report.byBackend.chains[0].costUnits, 3.0);
+  });
+
+  it("a chain whose phases agree stays in its own backend's bucket, never 'mixed'", () => {
+    const report = computeReport(
+      buildMixedBackendFixture({ chainBackend: "claude", reviewBackend: "claude" }),
+      { dbPath: ":memory:" },
+    );
+    assert.deepEqual(report.byBackend.chains.map((c) => c.backend).sort(), ["claude", "opencode"]);
+  });
+
+  it("a legacy chain with no backend facts at all is still counted under 'opencode'", () => {
+    const db = openMetricsDb(":memory:");
+    upsertChain(db, {
+      chainId: "chain-legacy", orchModel: "claude-fable-5", orchDate: "2026-07-22",
+      backend: null, totalsCost: 0.5, briefHasSmoke: 0, briefChars: 200, briefHasDeliverables: 1,
+    });
+    upsertRound(db, {
+      chainId: "chain-legacy", round: 1,
+      startedAt: "2026-07-22T09:00:00.000Z", startedMs: Date.parse("2026-07-22T09:00:00.000Z"),
+      backend: null, reviewBackend: null, disposition: "accept",
+    });
+    const report = computeReport(db, { dbPath: ":memory:" });
+    assert.deepEqual(report.byBackend.chains.map((c) => c.backend), ["opencode"]);
+    assert.equal(report.byBackend.chains[0].chainCount, 1);
+    assert.deepEqual(report.byBackend.chains[0].dispositions, { accept: 1 });
+  });
+
+  it("a store whose round table lacks review_backend does not throw \u2014 the report never reads that column", () => {
+    const db = buildMixedBackendFixture();
+    // A real pre-#195 store file: `review_backend` simply is not there, and
+    // the read-only report surface can never migrate it.  Mixedness lives
+    // in chain.backend (written by ingest), so the round column's absence
+    // changes nothing about bucketing.
+    db.exec("ALTER TABLE round DROP COLUMN review_backend");
+
+    let report;
+    assert.doesNotThrow(() => { report = computeReport(db, { dbPath: ":memory:" }); });
+    // chain.backend "mixed" still buckets correctly without the round column.
+    assert.deepEqual(report.byBackend.chains.map((c) => c.backend).sort(), ["mixed", "opencode"]);
+    assert.doesNotThrow(() => renderReportText(report));
+    assert.doesNotThrow(() => renderReportJson(report));
   });
 });

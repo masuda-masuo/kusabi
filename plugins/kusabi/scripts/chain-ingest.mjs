@@ -137,14 +137,35 @@ export function parseChainRecord(chainJson, ctx = {}) {
   const records = Array.isArray(chainJson.records) ? chainJson.records : [];
 
   // The chain record itself has no top-level `backend` (kusabi #184): the
-  // backend is stamped per round record, and the chain's backend is read
-  // from the LAST record of the records array — the same convention
-  // chain-resume uses.  Stored verbatim: a chain whose records predate the
-  // split stores NULL here, never "opencode" (readers apply that contract).
-  const lastRecord = records.length ? records[records.length - 1] : null;
-  const chainBackend = (lastRecord && typeof lastRecord.backend === "string")
-    ? lastRecord.backend
-    : null;
+  // backend is stamped per round record — `backend` (the implement phase's)
+  // and `reviewBackend` (the review phase's, since kusabi #192) — and the
+  // chain's backend is the UNION of every KNOWN phase backend across the
+  // records (kusabi #195).  The chain-resume convention (read the LAST
+  // record) and this union agree for every chain that never changed
+  // backend; they part company exactly where a single chain-level value
+  // stops describing the chain, and #195 resolves that by labelling:
+  //
+  //   - nothing known          -> NULL (readers apply the "opencode" read)
+  //   - every known value same -> that value, stored verbatim
+  //   - known values differ    -> "mixed" (its own bucket)
+  //
+  // "mixed" covers BOTH shapes: one round whose implement and review ran on
+  // different backends (the #192 per-phase shape), and a chain that
+  // switched backends between rounds.  No single chain-level value can
+  // describe either; filing such a chain under whichever backend happened
+  // to run last puts its whole spend and outcome on the wrong side of the
+  // by-backend split.  Only KNOWN values participate: an absent field
+  // contributes nothing, so a chain whose records carry no backend fields
+  // at all still stores NULL here, never "opencode".
+  const knownBackends = new Set();
+  for (const rec of records) {
+    if (!rec || typeof rec !== "object") continue;
+    if (typeof rec.backend === "string") knownBackends.add(rec.backend);
+    if (typeof rec.reviewBackend === "string") knownBackends.add(rec.reviewBackend);
+  }
+  let chainBackend = null;
+  if (knownBackends.size === 1) chainBackend = [...knownBackends][0];
+  else if (knownBackends.size > 1) chainBackend = "mixed";
 
   const chainRow = {
     chainId,
@@ -205,8 +226,15 @@ export function parseChainRecord(chainJson, ctx = {}) {
       startedAt: typeof rec.startedAt === "string" ? rec.startedAt : null,
       startedMs,
       // Dispatch backend (kusabi #184), stored verbatim per record — NULL
-      // when the record predates the split, never a default.
+      // when the record predates the split, never a default.  `backend` is
+      // the backend the round's IMPLEMENT job actually used (round 1 the
+      // implement backend, a rework round the rework backend), so it is
+      // already truthful for rework; `reviewBackend` (kusabi #192) is the
+      // separate fact the round row was missing until #195.  A record from
+      // before #192 has no `reviewBackend` at all: NULL, not a copy of
+      // `backend` — "unknown" must stay distinguishable from "the same".
       backend: typeof rec.backend === "string" ? rec.backend : null,
+      reviewBackend: typeof rec.reviewBackend === "string" ? rec.reviewBackend : null,
       modelEntry: typeof rec.modelEntry === "string" ? rec.modelEntry : null,
       tierBefore: typeof rec.tierBefore === "number" ? rec.tierBefore : null,
       tierAfter: typeof rec.tierAfter === "number" ? rec.tierAfter : null,
