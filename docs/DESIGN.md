@@ -1,7 +1,7 @@
 # kusabi Design Document
 
 Last updated: 2026-08-09
-Status: Design finalized + field-verified up to the phase chain, auto-chain (chain subcommand + sunaba-rpc) **implemented / reflected in main**. Decision 5 (accept-with-followup, §9.2) **implemented**. Decision 4 (strategist, §9.1) **implemented**. Fail-fast retry detection, tiered chain entries, and capacity fallback (issue #50) **implemented**. chain-stats (issue #124) **implemented**. The metrics store — ingest (§3.5.8) and query/report (§3.5.9) — **implemented**. chain-resume (§3.5.10) **implemented**. The review record (§3.5.7) and the P2 verify-gate baseline (§3.5.2) **implemented**. The claude dispatch backend (§3.5.11) **implemented** (fresh dispatch, session resume, and the metrics-DB backend columns with the report by-backend split). Stages C/D remain future work (§9.3).
+Status: Design finalized + field-verified up to the phase chain, auto-chain (chain subcommand + sunaba-rpc) **implemented / reflected in main**. Decision 5 (accept-with-followup, §9.2) **implemented**. Decision 4 (strategist, §9.1) **implemented**. Fail-fast retry detection, tiered chain entries, and capacity fallback (issue #50) **implemented**. chain-stats (issue #124) **implemented**. The metrics store — ingest (§3.5.8) and query/report (§3.5.9) — **implemented**. chain-resume (§3.5.10) **implemented**. The review record (§3.5.7) and the P2 verify-gate baseline (§3.5.2) **implemented**. The claude dispatch backend (§3.5.11) **implemented** (fresh dispatch, session resume, and the metrics-DB backend columns with the report by-backend split). Rework scheduling by finding kind (kusabi #60 step 2, §3.5.5a) **implemented** (mechanical findings cleaned up first in free rounds; design findings one per budget round; budget derived from records, never persisted). Stages C/D remain future work (§9.3).
 
 ## 1. Purpose and positioning
 
@@ -9,8 +9,6 @@ A plugin for using opencode (anomalyco/opencode) as a delegatable worker from Cl
 Establishes a division of labor where Claude Code serves as the **orchestrator** (planning, inspection/acceptance by the orchestrator, publish decisions) while opencode + deepseek serves as the **worker** (investigation, implementation, review).
 
 The motivation is cost structure: deepseek v4 Flash is cheap (zen's free-tier deepseek-v4-flash-free is also available) and empirically does better work than Haiku. This creates a structure where investigation and first-pass implementation run at essentially no cost, and only finishing work pays a small amount to Pro.
-
-Since #184 the worker slot is a backend choice: `--backend opencode|claude`, resolved once per command. opencode + deepseek remains the default for cost; the claude backend exists to run the same chain discipline over Claude models within a Max subscription — a separate quota from the orchestrator's own context. Mechanics and v1 limits are §3.5.11's contract, not restated here.
 
 Derived from: openai/codex-plugin-cc (Apache-2.0). Prompt assets (adversarial-review.md / review-output.schema.json) are transplanted with NOTICE attribution.
 
@@ -20,13 +18,10 @@ Derived from: openai/codex-plugin-cc (Apache-2.0). Prompt assets (adversarial-re
 Claude Code (orchestrator)
   └─ /kusabi:task etc. commands → dedicated transfer subagent (agents/opencode-worker.md)
        └─ scripts/kusabi-companion.mjs (context firewall)
-            ├─ opencode serve (HTTP API, 127.0.0.1 + OPENCODE_SERVER_PASSWORD, on-demand start)
-            │    └─ deepseek worker
-            │         └─ MCP: sunaba / shiori (configured in opencode.json on the opencode side)
-            │              └─ sunaba container (merges into existing container via sandbox_attach)
-            └─ claude -p (headless spawn, per job)
-                 └─ MCP: sunaba (--mcp-config generated from host ~/.claude.json entry)
-                      └─ sunaba container (merges into existing container via sandbox_attach)
+            └─ opencode serve (HTTP API, 127.0.0.1 + OPENCODE_SERVER_PASSWORD, on-demand start)
+                 └─ deepseek worker
+                      └─ MCP: sunaba / shiori (configured in opencode.json on the opencode side)
+                           └─ sunaba container (merges into existing container via sandbox_attach)
 ```
 
 ### Adopted and rejected approaches
@@ -43,7 +38,7 @@ Claude Code (orchestrator)
 
 ## 3. Phase chain (core of this design)
 
-Long sessions cause context pollution, so work is split into phases, with **each phase = a new worker session** — session-id shape (opencode `ses_*` vs claude UUID) and resume semantics per backend are §3.5.11's contract. Cross-phase session reuse is prohibited (`--resume-last` / `--session` are for follow-ups within the same phase only).
+Long sessions cause context pollution, so work is split into phases, with **each phase = a new opencode session**. Cross-phase session reuse is prohibited (`--resume-last` / `--session` are for follow-ups within the same phase only).
 
 ### 3.1 Phase and tool matrix
 
@@ -213,7 +208,9 @@ and a missing/invalid `kind` is treated as `design` at the consumption point.
 The rework brief groups findings by kind: design findings FIRST, explicitly
 flagged as requiring deliberate individual treatment, mechanical findings
 after, as a checklist.  The reviewer prompt instructs: when unsure, use
-`design`.
+`design`.  Rework rounds are then SCHEDULED by kind (§3.5.5a): mechanical
+findings are cleaned up first in free rounds that do not consume the round
+budget, and design findings are taken one per budget round.
 
 #### 3.5.4 Derive disposition (deriveDisposition)
 
@@ -290,6 +287,30 @@ The function returns:
 3. If even that fails, recording `reviewParseable: false` on the round record with verdict `"unparseable"` — a state distinct from `needs-attention`
 
 The shared function `recoverVerdictFromText` in `render.mjs` powers both the display layer (`renderReview`) and the decision layer (`runReviewPhase`), avoiding duplication.
+
+#### 3.5.5a Rework scheduling by finding kind (kusabi #60 step 2) — implemented
+
+Step 1 grouped findings by `kind` in the rework brief; step 2 schedules the rework rounds themselves so a design finding does not drown among mechanical ones and mechanical cleanup rounds do not eat the design budget.
+
+**Single decision point.** Pure function `resolveReworkScope(previousRecord)` in `chain-phases.mjs` maps the previous round's findings to the next round's scope, returning `{ scope, findings }`:
+
+| previous round's findings | scope | findings subset |
+|---|---|---|
+| none (probe-failure rework, old records) | `full` | `[]` — whole prior findingsText, unchanged behavior |
+| both kinds present (missing/invalid `kind` = design) | `mechanical` | the mechanical findings only |
+| all design, length > 1 | `design` | `[first]` — one design finding per round, array order |
+| all design, length == 1 | `design` | the single finding |
+| all mechanical | `mechanical` | all findings |
+
+**State address.** `roundRecord.reworkScope` records the scope the round was RUN with (`"full"` when not a scoped rework; old records without the field count as full). Nothing else is stored — budget is never persisted, it is DERIVED by counting records whose `reworkScope !== "mechanical"`, so chain-resume's records replay needs no new state.
+
+**Budget invariant.** `maxRounds` buys design/full rounds only; mechanical rounds are free. The loop continues while budget-used < `maxRounds`, except for the hard cap: total rounds ≤ 2 × `maxRounds` terminates unconditionally through the existing max-rounds escalate path (a chain never runs unbounded; every mechanical round is bought by the design/full round that preceded it). `deriveDisposition` receives the budget-adjusted round ordinal (`round` = the current round's position within the budget; mechanical rounds do not advance it) with `maxRounds` unchanged, so its `round >= maxRounds` terminal fires on budget, not raw round count. `deriveDisposition` itself is unchanged. The budget check sits after the review-resume branch so an interrupted round that already spent its last budget slot is still allowed to finish its review.
+
+**Resume gate mirrors the budget.** `resolveChainResume` refuses implement-resume only when the derived budget is spent (non-mechanical records ≥ `maxRounds`) or the hard cap would be exceeded (`nextRound > 2 × maxRounds`) — never on the raw round count alone, so a mechanical-tail chain whose round number legitimately exceeds `maxRounds` stays resumable. Records without a `reworkScope` field predate the scheduling change; for such chains the round number IS the budget (every round was full), so the legacy guard (`nextRound > maxRounds`) applies unchanged.
+
+**Max-rounds terminal records actual rounds.** When the loop ends on the budget/hard-cap terminal (rather than a `deriveDisposition` escalation), `finalizeChainControl` and the review record carry the ACTUAL number of completed rounds (`records.length`) — never the nominal `maxRounds` — so `control.round` and "Final disposition: max-rounds at round N of M" agree with the persisted `round-N.json` files even when mechanical rounds pushed the raw count past `maxRounds`.
+
+**Scoped implement brief.** When the scope is not `"full"`, `buildImplementText` renders the scoped subset with the existing grouped one-line renderer (`renderGroupedFindingsText`, the same renderer used for `findingsText`), prefixed by one sentence naming the scope — "This round resolves ONLY the following mechanical checklist / ONLY the following design finding; other known findings are deliberately out of scope this round." The full-scope path is byte-identical to the pre-scheduling text (pinned by a test).
 
 ### 3.5.6 chain-stats (read-only aggregation)
 

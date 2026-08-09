@@ -26,6 +26,7 @@ import {
   renderFollowupDraft,
   renderReviewRecord,
   renderGroupedFindingsText,
+  groupFindingsByKind,
   extractJson,
   recoverVerdictFromText,
 } from "./render.mjs";
@@ -222,14 +223,90 @@ export function resolveRoundResume({ useNewSession }) {
 
 
 /**
+ * Decide the scope of a rework round from the previous round's findings
+ * (kusabi #60 step 2: scheduling by finding kind).
+ *
+ * Single decision point for scoped reworks.  The budget invariant: maxRounds
+ * buys design/full rounds only; mechanical rounds are free (a mechanical
+ * checklist needs no design judgement, so it must not eat the design budget).
+ * Missing/invalid `kind` on a finding counts as design (same consumption-point
+ * default as groupFindingsByKind).
+ *
+ * Branch table:
+ *   - no findings (probe-failure rework, old records)            -> full, []
+ *   - previous round mechanical + any design finding present     -> design, [first]
+ *   - findings contain BOTH kinds                                -> mechanical, mechanicalOnly
+ *   - findings all design, length > 1                            -> design, [first]
+ *   - findings all design, length == 1                           -> design, all
+ *   - findings all mechanical                                    -> mechanical, all
+ *
+ * Array order is preserved: the scoped subset keeps the findings' original
+ * order, and the one-per-round design case takes the FIRST design finding in
+ * array order.
+ *
+ * @param {object|null|undefined} previousRecord
+ * @returns {{ scope: "full"|"mechanical"|"design", findings: Array }}
+ *   `findings` is the subset the round should resolve; for scope "full" it is
+ *   empty because the full path renders the entire prior-findings block.
+ */
+export function resolveReworkScope(previousRecord) {
+  if (!previousRecord) {
+    return { scope: "full", findings: [] };
+  }
+  const findings = previousRecord.findings;
+  if (!Array.isArray(findings) || findings.length === 0) {
+    // Probe-failure rework (or old records without structured findings):
+    // current behavior — whole prior findingsText.
+    return { scope: "full", findings: [] };
+  }
+  const { design, mechanical } = groupFindingsByKind(findings);
+  if (previousRecord.reworkScope === "mechanical" && design.length > 0) {
+    // Followup: no two consecutive mechanical rounds while a design finding
+    // is pending.  After a mechanical round, a pending design finding gets
+    // the next round even in a mixed set; the mechanical items wait for the
+    // following mechanical batch.  Unchanged for any other previous scope
+    // (including old records without a reworkScope field).
+    return { scope: "design", findings: [design[0]] };
+  }
+  if (design.length > 0 && mechanical.length > 0) {
+    // Mixed: the mechanical checklist first; design findings are held back.
+    return { scope: "mechanical", findings: mechanical };
+  }
+  if (design.length > 1) {
+    // All design, several: one per round, in array order.
+    return { scope: "design", findings: [design[0]] };
+  }
+  if (design.length === 1) {
+    return { scope: "design", findings: design };
+  }
+  if (mechanical.length === 0) {
+    // Findings array held nothing groupable (non-object entries): treat like
+    // no findings rather than claiming a scoped subset.
+    return { scope: "full", findings: [] };
+  }
+  return { scope: "mechanical", findings: mechanical };
+}
+
+/**
  * Build the implement prompt text for a chain round.
  *
  * When `container` is given, a header naming the exact container ID is
  * prepended to the returned text for every round (mirroring the review-prompt
  * injection). Without `container` the output is byte-for-byte what this
  * function produced before.
+ *
+ * `reworkScope` (kusabi #60 step 2) is the resolved scope for this round — the
+ * result of `resolveReworkScope(previousRecord)` — decided by the caller so
+ * the round loop's budget accounting and the prompt text can never disagree.
+ * When absent, or when its `scope` is "full", the output is byte-identical to
+ * the pre-scheduling text.  For a scoped round the prior-findings block is
+ * replaced by the scope sentence + the FULL per-finding rendering of the
+ * scoped subset (`renderPriorFindings` over a record-shaped subset — bodies,
+ * recommendations and the same budget bound as the full-scope path), keeping
+ * the rest of the prompt structure (instruction / strategist / acceptance
+ * criteria) unchanged.
  */
-export function buildImplementText({ round, brief, previousRecord, container }) {
+export function buildImplementText({ round, brief, previousRecord, container, reworkScope }) {
   let text;
   if (round === 1) {
     text = brief;
@@ -238,7 +315,21 @@ export function buildImplementText({ round, brief, previousRecord, container }) 
     if (previousRecord.strategistRecommendation) {
       strategistSection = "\n\n## Strategist recommendation (structural change for this rework)\n" + previousRecord.strategistRecommendation + "\n";
     }
-    const priorFindingsText = renderPriorFindings(previousRecord);
+    const scope = reworkScope || { scope: "full", findings: [] };
+    let priorFindingsText;
+    if (scope.scope === "full") {
+      // Byte-identical to the pre-scheduling text (kusabi #60 step 2).
+      priorFindingsText = renderPriorFindings(previousRecord);
+    } else {
+      const scopeSentence = scope.scope === "mechanical"
+        ? "This round resolves ONLY the following mechanical checklist; other known findings are deliberately out of scope this round."
+        : "This round resolves ONLY the following design finding; other known findings are deliberately out of scope this round.";
+      // Followup: a scoped round renders its subset with the FULL per-finding
+      // renderer (bodies + recommendations, same budget bound as the full
+      // path) - a scoped round must give its finding the same deliberate
+      // treatment the full path gives the whole set, not a one-line summary.
+      priorFindingsText = scopeSentence + "\n\n" + renderPriorFindings({ findings: scope.findings });
+    }
     text = "## Prior findings\n" + priorFindingsText + "\n\n## Instruction\nResolve each prior finding in this round. If a finding cannot be fully resolved, you must explain why and report what remains." + strategistSection + "\n\n## Acceptance criteria\n" + brief;
   } else {
     text = brief;
@@ -1682,7 +1773,24 @@ export function resolveChainResume({ control, chainJson }) {
       };
     }
     const nextRound = (last.round ?? records.length) + 1;
-    if (nextRound > maxRounds) {
+    // ---- budget-derived guard (kusabi #60 step 2) ----
+    // Mirrors the driver's budget semantics: maxRounds buys design/full
+    // rounds only, mechanical rounds are free, so the raw round number may
+    // legitimately exceed maxRounds (hard cap 2 × maxRounds).  Resume is
+    // refused only when the derived budget is spent or the hard cap would be
+    // exceeded — never on the raw round count alone.
+    //
+    // Records without a `reworkScope` field predate the scheduling change;
+    // for such chains the round number IS the budget (every round was full),
+    // so the legacy guard applies: nextRound > maxRounds means the budget is
+    // spent.  Once any record carries `reworkScope`, the budget is derived
+    // by counting non-mechanical records exactly as the driver does.
+    const anyScoped = records.some((r) => r.reworkScope !== undefined);
+    const budgetExhausted = anyScoped
+      ? records.filter((r) => r.reworkScope !== "mechanical").length >= maxRounds
+        || nextRound > 2 * maxRounds
+      : nextRound > maxRounds;
+    if (budgetExhausted) {
       return {
         ok: false,
         error: `max rounds (${maxRounds}) already reached at round ${last.round}`,

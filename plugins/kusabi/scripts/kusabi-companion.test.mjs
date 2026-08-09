@@ -1427,6 +1427,526 @@ describe("runChainDriver resume", () => {
 });
 
 // =========================================================================
+// runChainDriver — rework scheduling by finding kind (kusabi #60 step 2)
+// -------------------------------------------------------------------------
+// maxRounds buys design/full rounds only; mechanical rounds are free.  The
+// round loop derives the budget from the records alone (never persisted),
+// stops at the 2 × maxRounds hard cap, and hands deriveDisposition the
+// budget-adjusted round ordinal so its max-rounds terminal fires on budget.
+// =========================================================================
+
+describe("runChainDriver rework scheduling", () => {
+  const BRIEF = "Implement X.\n\n## Deliverables\n- src/foo.js\n";
+  const MECH_SENTENCE = "This round resolves ONLY the following mechanical checklist; other known findings are deliberately out of scope this round.";
+  const DESIGN_SENTENCE = "This round resolves ONLY the following design finding; other known findings are deliberately out of scope this round.";
+
+  function designFinding(n, file) {
+    return { severity: "high", title: "Design decision " + n, file, line_start: 1, kind: "design", body: "b", recommendation: "r" };
+  }
+  function mechFinding(n, file) {
+    return { severity: "medium", title: "Mechanical fix " + n, file, line_start: 10, kind: "mechanical", body: "b", recommendation: "r" };
+  }
+  function reviewResult(verdict, findings) {
+    return JSON.stringify({ verdict, findings, summary: "s" });
+  }
+
+  function makeCallTool() {
+    return async (toolName, params) => {
+      if (toolName === "verify_in_container") return { gate_passed: true };
+      if (toolName !== "sandbox_exec") return { output: "" };
+      const cmd = params.commands[0];
+      if (cmd.startsWith("cd /workspace &&") && cmd.includes("TMPIDX=")) return { output: "ERROR_NO_INDEX\n" };
+      if (cmd === "git rev-parse HEAD") return { output: "abc123\n" };
+      if (cmd === "git status --porcelain") return { output: " M src/foo.js\n" };
+      if (cmd === "git log --oneline -5") return { output: "abc123 latest change\n" };
+      if (cmd === "git diff") return { output: "diff --git a/src/foo.js b/src/foo.js\n" };
+      if (cmd === "git ls-files --others --exclude-standard") return { output: "untracked.txt\n" };
+      return { output: "" };
+    };
+  }
+
+  // Review results are consumed per review dispatch, in order; implement
+  // dispatches always complete.  `calls` records every dispatch option so
+  // tests can inspect the implement prompts.
+  function makeQueueDispatch(reviewResults) {
+    const calls = [];
+    let reviewIdx = 0;
+    const dispatch = async (opts) => {
+      calls.push(opts);
+      if (opts.kind === "review") {
+        const resultText = reviewResults[Math.min(reviewIdx, reviewResults.length - 1)];
+        reviewIdx += 1;
+        return {
+          job: {
+            id: "job-rev-" + reviewIdx, status: "completed", modelEntry: "fake/review",
+            modelVariant: null, fallbacks: null, sessionID: "sess-rev-" + reviewIdx,
+            usage: { available: true, input: 2, output: 2, reasoning: 0, cacheRead: 0, cacheWrite: 0, cost: 0.01 },
+            error: null,
+          },
+          resultText,
+        };
+      }
+      if (opts.kind === "task") {
+        return {
+          job: {
+            id: "job-imp-" + (opts.round ?? 1), status: "completed", modelEntry: "fake/model",
+            modelVariant: null, fallbacks: null, sessionID: "sess-imp-" + (opts.round ?? 1),
+            usage: { available: true, input: 1, output: 1, reasoning: 0, cacheRead: 0, cacheWrite: 0, cost: 0.01 },
+            error: null,
+          },
+          resultText: "implemented",
+        };
+      }
+      throw new Error("unexpected dispatch kind: " + opts.kind);
+    };
+    return { dispatch, calls };
+  }
+
+  function runFresh({ maxRounds, reviewResults }) {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-sched-"));
+    const chainDir = path.join(tmp, "chains", "chain-test");
+    fs.mkdirSync(chainDir, { recursive: true });
+    writeChainControl(chainDir, {
+      chainId: "chain-test", container: "cid-1", pid: process.pid,
+      status: "running", round: 0, startedAt: new Date().toISOString(),
+    });
+    const { dispatch, calls } = makeQueueDispatch(reviewResults);
+    return {
+      tmp, chainDir, calls,
+      run() {
+        return runChainDriver({
+          cwd: tmp, stateDir: tmp, chainDir, chainId: "chain-test", container: "cid-1",
+          model: "fake/model", modelChain: [["fake/model"]], maxRounds,
+          brief: BRIEF, orchestrator: null, baseSha: "abc123", worktreeBaseline: null,
+          callTool: makeCallTool(), dispatchWithFallback: dispatch,
+          keepServe: true, signalReceived: () => false, resume: null,
+        });
+      },
+    };
+  }
+
+  function makeChainState({ records, maxRounds }) {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-sched-resume-"));
+    const chainDir = path.join(tmp, "chains", "chain-test");
+    fs.mkdirSync(chainDir, { recursive: true });
+    writeJson(path.join(chainDir, "chain.json"), {
+      chainId: "chain-test", container: "cid-1", model: "fake/model",
+      modelChain: [["fake/model"]], maxRounds,
+      brief: BRIEF, orchestrator: null, records,
+      baseSha: "abc123",
+      chainTotals: computeChainTotals(records),
+      strategized: false, followupIssueDraft: null,
+    });
+    writeChainControl(chainDir, {
+      chainId: "chain-test", container: "cid-1", pid: 0,
+      status: "cancelled", round: records.length,
+      stopRequestedAt: "2026-08-01T00:00:00.000Z", stopRequestedBy: "cli",
+      finishedAt: "2026-08-01T00:00:00.000Z",
+    });
+    return { tmp, chainDir };
+  }
+
+  async function runResume({ chainDir, maxRounds, reviewResults }) {
+    const resolution = resolveChainResume({
+      control: readChainControl(chainDir),
+      chainJson: readJson(path.join(chainDir, "chain.json")),
+    });
+    assert.equal(resolution.ok, true);
+    rearmChainControl({
+      chainDir,
+      round: resolution.position.phase === "review" ? resolution.position.round : resolution.position.round - 1,
+    });
+    const { dispatch, calls } = makeQueueDispatch(reviewResults);
+    const stateDir = path.dirname(path.dirname(chainDir));
+    const text = await runChainDriver({
+      cwd: stateDir, stateDir, chainDir,
+      chainId: "chain-test", container: "cid-1",
+      model: "fake/model", modelChain: [["fake/model"]], maxRounds,
+      brief: BRIEF, orchestrator: null, baseSha: "abc123", worktreeBaseline: null,
+      callTool: makeCallTool(), dispatchWithFallback: dispatch,
+      keepServe: true, signalReceived: () => false,
+      resume: resolution.position,
+    });
+    return { text, calls };
+  }
+
+  it("runs a mechanical scope round after mixed findings without consuming the design budget", async () => {
+    const fx = runFresh({
+      maxRounds: 2,
+      reviewResults: [
+        reviewResult("needs-attention", [designFinding(1, "src/a.js"), mechFinding(1, "src/b.js")]),
+        reviewResult("needs-attention", [{ ...mechFinding(2, "src/c.js"), severity: "high" }]),
+        reviewResult("approve", []),
+      ],
+    });
+    try {
+      const text = await fx.run();
+      assert.match(text, /accepted at round 3/);
+
+      const round1 = readJson(path.join(fx.chainDir, "round-1.json"));
+      assert.equal(round1.reworkScope, "full");
+      const round2 = readJson(path.join(fx.chainDir, "round-2.json"));
+      assert.equal(round2.reworkScope, "mechanical");
+      // Round 2 is a free round: it sits at budget position 1 (not 2), so
+      // needs-attention reworks instead of hitting the max-rounds terminal.
+      assert.equal(round2.disposition.disposition, "rework");
+      const round3 = readJson(path.join(fx.chainDir, "round-3.json"));
+      assert.equal(round3.reworkScope, "mechanical");
+      assert.equal(round3.disposition.disposition, "accept");
+
+      // Round 2's implement brief is the scoped mechanical checklist: the
+      // design finding is deliberately held back.
+      const imp2 = fx.calls.find((c) => c.kind === "task" && c.round === 2);
+      assert.ok(imp2, "round 2 implement must be dispatched");
+      assert.ok(imp2.promptText.includes(MECH_SENTENCE));
+      assert.ok(imp2.promptText.includes("Mechanical fix 1"));
+      assert.ok(!imp2.promptText.includes("Design decision 1"));
+
+      const control = readChainControl(fx.chainDir);
+      assert.equal(control.status, "completed");
+      assert.equal(control.round, 3);
+    } finally {
+      fs.rmSync(fx.tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("repeated mixed reviews alternate mechanical/design (never two mechanical in a row) and the design round consumes budget", async () => {
+    // Followup: after a mechanical round, a mixed set schedules the design
+    // finding instead of a second mechanical batch.  With maxRounds=2 the
+    // chain must run full -> mechanical -> design and then escalate when the
+    // design round exhausts the budget at round 3 — never a 4-round
+    // mechanical tail ending on the 2 x maxRounds hard cap.
+    const fx = runFresh({
+      maxRounds: 2,
+      reviewResults: [
+        reviewResult("needs-attention", [designFinding(1, "src/a.js"), mechFinding(1, "src/b.js")]),
+        reviewResult("needs-attention", [designFinding(2, "src/c.js"), mechFinding(2, "src/d.js")]),
+        reviewResult("needs-attention", [designFinding(3, "src/e.js"), mechFinding(3, "src/f.js")]),
+        reviewResult("needs-attention", [designFinding(4, "src/g.js"), mechFinding(4, "src/h.js")]),
+      ],
+    });
+    try {
+      const text = await fx.run();
+      // Round 3 is the design round at budget position 2 of 2, so the
+      // max-rounds terminal fires there.
+      assert.match(text, /escalated at round 3: max rounds \(2\) reached without acceptance/);
+
+      const round1 = readJson(path.join(fx.chainDir, "round-1.json"));
+      assert.equal(round1.reworkScope, "full");
+      assert.equal(round1.disposition.disposition, "rework");
+      const round2 = readJson(path.join(fx.chainDir, "round-2.json"));
+      assert.equal(round2.reworkScope, "mechanical");
+      assert.equal(round2.disposition.disposition, "rework");
+      const round3 = readJson(path.join(fx.chainDir, "round-3.json"));
+      assert.equal(round3.reworkScope, "design");
+      // The design round consumed the last budget slot: escalate, not rework.
+      assert.equal(round3.disposition.disposition, "escalate");
+      // No second mechanical round after round 2, no round 4 at all.
+      assert.equal(fs.existsSync(path.join(fx.chainDir, "round-4.json")), false);
+      assert.equal(fx.calls.filter((c) => c.kind === "task").length, 3);
+
+      // Round 3's brief is the design scope over round 2's findings (the
+      // previous record) with the FULL per-finding rendering (followup):
+      // heading with severity/location, not the one-line
+      // "[high] Design decision 2 (src/c.js:1)" row.
+      const imp3 = fx.calls.find((c) => c.kind === "task" && c.round === 3);
+      assert.ok(imp3, "round 3 implement must be dispatched");
+      assert.ok(imp3.promptText.includes(DESIGN_SENTENCE));
+      assert.ok(imp3.promptText.includes("### [high] Design decision 2 (src/c.js:1)"));
+      assert.ok(imp3.promptText.includes("Design decision 2"));
+      assert.ok(!imp3.promptText.includes("Mechanical fix 2"));
+
+      const control = readChainControl(fx.chainDir);
+      assert.equal(control.status, "completed");
+      assert.equal(control.round, 3);
+    } finally {
+      fs.rmSync(fx.tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("repeated mixed reviews keep alternating across several rounds and stop inside the 2 x maxRounds hard cap", async () => {
+    // maxRounds=3: the chain must alternate full, mechanical, design,
+    // mechanical, design and escalate at round 5 when the second design
+    // round exhausts the budget (position 3 of 3) — inside the hard cap of
+    // 6, with round 6 never started.
+    const fx = runFresh({
+      maxRounds: 3,
+      reviewResults: [
+        reviewResult("needs-attention", [designFinding(1, "src/a.js"), mechFinding(1, "src/b.js")]),
+        reviewResult("needs-attention", [designFinding(2, "src/c.js"), mechFinding(2, "src/d.js")]),
+        reviewResult("needs-attention", [designFinding(3, "src/e.js"), mechFinding(3, "src/f.js")]),
+        reviewResult("needs-attention", [designFinding(4, "src/g.js"), mechFinding(4, "src/h.js")]),
+        reviewResult("needs-attention", [designFinding(5, "src/i.js"), mechFinding(5, "src/j.js")]),
+        reviewResult("approve", []),
+      ],
+    });
+    try {
+      const text = await fx.run();
+      assert.match(text, /escalated at round 5: max rounds \(3\) reached without acceptance/);
+
+      const scopes = [];
+      for (let r = 1; r <= 5; r++) {
+        const rec = readJson(path.join(fx.chainDir, "round-" + r + ".json"));
+        scopes.push(rec.reworkScope);
+      }
+      // full, mechanical, design, mechanical, design — never two mechanical
+      // in a row across five rounds of mixed reviews.
+      assert.deepEqual(scopes, ["full", "mechanical", "design", "mechanical", "design"]);
+      // Hard cap (2 x maxRounds = 6) respected: the budget exhausted first.
+      assert.equal(fs.existsSync(path.join(fx.chainDir, "round-6.json")), false);
+      assert.equal(fx.calls.filter((c) => c.kind === "task").length, 5);
+
+      const control = readChainControl(fx.chainDir);
+      assert.equal(control.status, "completed");
+      assert.equal(control.round, 5);
+    } finally {
+      fs.rmSync(fx.tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("a chain of only full rounds behaves exactly as today (same rounds, same disposition)", async () => {
+    const fx = runFresh({
+      maxRounds: 4,
+      reviewResults: [
+        reviewResult("needs-attention", []),
+        reviewResult("needs-attention", []),
+        reviewResult("needs-attention", []),
+        reviewResult("needs-attention", []),
+      ],
+    });
+    try {
+      const text = await fx.run();
+      // Round 4 hits the max-rounds terminal inside deriveDisposition and
+      // escalates — the same terminal and wording as the pre-scheduling loop.
+      assert.match(text, /escalated at round 4: max rounds \(4\) reached without acceptance/);
+
+      for (let r = 1; r <= 4; r++) {
+        const rec = readJson(path.join(fx.chainDir, "round-" + r + ".json"));
+        assert.equal(rec.reworkScope, "full");
+        if (r < 4) {
+          assert.equal(rec.disposition.disposition, "rework");
+        } else {
+          // The max-rounds terminal fires on BUDGET at the final full round,
+          // exactly as the pre-scheduling loop did on the raw round number.
+          assert.equal(rec.disposition.disposition, "escalate");
+          assert.match(rec.disposition.reason, /max rounds \(4\) reached without acceptance/);
+        }
+      }
+      // No extra mechanical rounds: every round consumed budget, so the loop
+      // stopped after maxRounds rounds exactly like today.
+      assert.equal(fx.calls.filter((c) => c.kind === "task").length, 4);
+      assert.equal(fs.existsSync(path.join(fx.chainDir, "round-5.json")), false);
+
+      const control = readChainControl(fx.chainDir);
+      assert.equal(control.status, "completed");
+      assert.equal(control.round, 4);
+    } finally {
+      fs.rmSync(fx.tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("the 2 × maxRounds hard cap terminates a mechanical-only tail via the max-rounds path", async () => {
+    const fx = runFresh({
+      maxRounds: 2,
+      reviewResults: [
+        reviewResult("needs-attention", [designFinding(1, "src/a.js"), mechFinding(1, "src/b.js")]),
+        reviewResult("needs-attention", [{ ...mechFinding(2, "src/c.js"), severity: "high" }]),
+        reviewResult("needs-attention", [{ ...mechFinding(3, "src/d.js"), severity: "high" }]),
+        reviewResult("needs-attention", [{ ...mechFinding(4, "src/e.js"), severity: "high" }]),
+      ],
+    });
+    try {
+      const text = await fx.run();
+      assert.match(text, /reached max rounds \(2\) without acceptance/);
+
+      // Four rounds ran with maxRounds=2 (1 full + 3 free mechanical rounds);
+      // the 2 × maxRounds hard cap stopped the loop, not the budget.
+      assert.equal(fx.calls.filter((c) => c.kind === "task").length, 4);
+      assert.equal(fs.existsSync(path.join(fx.chainDir, "round-5.json")), false);
+
+      const round1 = readJson(path.join(fx.chainDir, "round-1.json"));
+      assert.equal(round1.reworkScope, "full");
+      assert.equal(round1.disposition.disposition, "rework");
+      for (let r = 2; r <= 4; r++) {
+        const rec = readJson(path.join(fx.chainDir, "round-" + r + ".json"));
+        assert.equal(rec.reworkScope, "mechanical");
+        // Still at budget position 1 — never escalates on budget.
+        assert.equal(rec.disposition.disposition, "rework");
+      }
+
+      const control = readChainControl(fx.chainDir);
+      assert.equal(control.status, "completed");
+      // The max-rounds terminal records the ACTUAL last round (4), never the
+      // nominal maxRounds (2) — control.round and the review record must
+      // agree with the persisted round-N.json files (kusabi #60 step 2 review).
+      assert.equal(control.round, 4);
+      const recordText = fs.readFileSync(path.join(fx.chainDir, "review-record.md"), "utf8");
+      assert.match(recordText, /Final disposition: max-rounds at round 4 of 2/);
+    } finally {
+      fs.rmSync(fx.tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("a resumed chain recomputes the budget from records alone (no new persisted state)", async () => {
+    const r1 = {
+      round: 1, reworkScope: "full", resumeMethod: { type: "fresh_session" },
+      startedAt: "2026-08-01T00:00:00.000Z", verdict: "needs-attention", probesGreen: true,
+      modelEntry: "fake/model", modelVariant: null, fallbacks: null,
+      implementJobId: "job-imp-1", reviewJobId: "job-rev-1", sessionID: "sess-1",
+      implementUsage: null, reviewUsage: null, tierBefore: 0, tierAfter: 0, reworkCount: 0,
+      pendingReworkStrategy: { tierDelta: 0, newSession: false, reason: "1st rework: same tier, continue session, keep artifacts" },
+      disposition: { disposition: "rework", reason: "needs-attention" },
+      findings: [designFinding(1, "src/a.js"), mechFinding(1, "src/b.js")],
+      findingFiles: ["src/a.js", "src/b.js"],
+      findingsText: "mixed findings",
+    };
+    const r2 = {
+      round: 2, reworkScope: "mechanical", resumeMethod: { type: "continue_session" },
+      startedAt: "2026-08-01T00:00:00.000Z", verdict: "needs-attention", probesGreen: true,
+      modelEntry: "fake/model", modelVariant: null, fallbacks: null,
+      implementJobId: "job-imp-2", reviewJobId: "job-rev-2", sessionID: "sess-2",
+      implementUsage: null, reviewUsage: null, tierBefore: 0, tierAfter: 0, reworkCount: 1,
+      pendingReworkStrategy: { tierDelta: 0, newSession: false, reason: "1st rework: same tier, continue session, keep artifacts" },
+      disposition: { disposition: "rework", reason: "needs-attention" },
+      findings: [mechFinding(2, "src/c.js")],
+      findingFiles: ["src/c.js"],
+      findingsText: "mechanical findings",
+    };
+    const { tmp, chainDir } = makeChainState({ records: [r1, r2], maxRounds: 4 });
+    try {
+      const { text, calls } = await runResume({ chainDir, maxRounds: 4, reviewResults: [reviewResult("approve", [])] });
+      assert.match(text, /accepted at round 3/);
+
+      // The resumed round's scope is re-derived from round 2's
+      // mechanical-only findings — no persisted budget state is consulted.
+      const round3 = readJson(path.join(chainDir, "round-3.json"));
+      assert.equal(round3.reworkScope, "mechanical");
+      assert.equal(round3.disposition.disposition, "accept");
+
+      const imp3 = calls.find((c) => c.kind === "task" && c.round === 3);
+      assert.ok(imp3, "round 3 implement must be dispatched");
+      assert.ok(imp3.promptText.includes(MECH_SENTENCE));
+      assert.ok(!imp3.promptText.includes("Design decision 1"));
+
+      const chainJson = readJson(path.join(chainDir, "chain.json"));
+      assert.equal(chainJson.records.length, 3);
+      // Budget is derived by counting records, never persisted.
+      assert.equal(chainJson.budgetUsed, undefined);
+
+      const control = readChainControl(chainDir);
+      assert.equal(control.status, "completed");
+      assert.equal(control.round, 3);
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("resumes a mechanical-tail chain whose raw round count exceeds maxRounds while budget remains", async () => {
+    // maxRounds=2; round 1 full (mixed findings), round 2 mechanical
+    // (mechanical-only findings), both rework — chain cancelled after round 2.
+    // Budget used = 1 < 2, so the RESUME GATE (kusabi #60 step 2 review) must
+    // admit the chain even though nextRound 3 > maxRounds 2, and the driver
+    // must run rounds 3-4 (the 2 × maxRounds hard cap).
+    const r1 = {
+      round: 1, reworkScope: "full", resumeMethod: { type: "fresh_session" },
+      startedAt: "2026-08-01T00:00:00.000Z", verdict: "needs-attention", probesGreen: true,
+      modelEntry: "fake/model", modelVariant: null, fallbacks: null,
+      implementJobId: "job-imp-1", reviewJobId: "job-rev-1", sessionID: "sess-1",
+      implementUsage: null, reviewUsage: null, tierBefore: 0, tierAfter: 0, reworkCount: 0,
+      pendingReworkStrategy: { tierDelta: 0, newSession: false, reason: "1st rework: same tier, continue session, keep artifacts" },
+      disposition: { disposition: "rework", reason: "needs-attention" },
+      findings: [designFinding(1, "src/a.js"), mechFinding(1, "src/b.js")],
+      findingFiles: ["src/a.js", "src/b.js"],
+      findingsText: "mixed findings",
+    };
+    const r2 = {
+      round: 2, reworkScope: "mechanical", resumeMethod: { type: "continue_session" },
+      startedAt: "2026-08-01T00:00:00.000Z", verdict: "needs-attention", probesGreen: true,
+      modelEntry: "fake/model", modelVariant: null, fallbacks: null,
+      implementJobId: "job-imp-2", reviewJobId: "job-rev-2", sessionID: "sess-2",
+      implementUsage: null, reviewUsage: null, tierBefore: 0, tierAfter: 0, reworkCount: 1,
+      pendingReworkStrategy: { tierDelta: 0, newSession: false, reason: "1st rework: same tier, continue session, keep artifacts" },
+      disposition: { disposition: "rework", reason: "needs-attention" },
+      findings: [{ ...mechFinding(2, "src/c.js"), severity: "high" }],
+      findingFiles: ["src/c.js"],
+      findingsText: "mechanical findings",
+    };
+    const { tmp, chainDir } = makeChainState({ records: [r1, r2], maxRounds: 2 });
+    try {
+      const { text, calls } = await runResume({
+        chainDir, maxRounds: 2,
+        reviewResults: [
+          reviewResult("needs-attention", [{ ...mechFinding(3, "src/d.js"), severity: "high" }]),
+          reviewResult("approve", []),
+        ],
+      });
+      assert.match(text, /accepted at round 4/);
+
+      // The resumed run continued to raw round 4 with budget 1 of 2, then the
+      // 2 × maxRounds hard cap ended the loop (round 5 never ran).
+      const round3 = readJson(path.join(chainDir, "round-3.json"));
+      assert.equal(round3.reworkScope, "mechanical");
+      assert.equal(round3.disposition.disposition, "rework");
+      const round4 = readJson(path.join(chainDir, "round-4.json"));
+      assert.equal(round4.reworkScope, "mechanical");
+      assert.equal(round4.disposition.disposition, "accept");
+      assert.equal(fs.existsSync(path.join(chainDir, "round-5.json")), false);
+
+      // Round 3's implement brief is the scoped mechanical checklist.
+      const imp3 = calls.find((c) => c.kind === "task" && c.round === 3);
+      assert.ok(imp3, "round 3 implement must be dispatched");
+      assert.ok(imp3.promptText.includes(MECH_SENTENCE));
+
+      const chainJson = readJson(path.join(chainDir, "chain.json"));
+      assert.equal(chainJson.records.length, 4);
+      const control = readChainControl(chainDir);
+      assert.equal(control.status, "completed");
+      assert.equal(control.round, 4);
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("a review-resume completes the interrupted round even when it spent the last budget slot", async () => {
+    const complete = (round) => ({
+      round, reworkScope: "full", resumeMethod: { type: "fresh_session" },
+      startedAt: "2026-08-01T00:00:00.000Z", verdict: "needs-attention", probesGreen: true,
+      modelEntry: "fake/model", modelVariant: null, fallbacks: null,
+      implementJobId: "job-imp-" + round, reviewJobId: "job-rev-" + round, sessionID: "sess-" + round,
+      implementUsage: null, reviewUsage: null, tierBefore: 0, tierAfter: 0, reworkCount: round - 1,
+      pendingReworkStrategy: { tierDelta: 0, newSession: false, reason: "1st rework: same tier" },
+      disposition: { disposition: "rework", reason: "needs-attention" },
+      findings: [], findingFiles: [], findingsText: "(no structured findings)",
+    });
+    const partial = {
+      round: 4, reworkScope: "full", resumeMethod: { type: "continue_session" },
+      startedAt: "2026-08-01T00:00:00.000Z", verdict: null, probesGreen: true,
+      modelEntry: "fake/model", modelVariant: null, fallbacks: null,
+      implementJobId: "job-imp-4", sessionID: "sess-4", implementUsage: null,
+      tierBefore: 0, reworkCount: 3,
+      probeResults: [{ probe: "P1: HEAD clean", passed: true, detail: "ok" }],
+      worktreeChanged: true, interrupted: true, interruptedAfter: "probes",
+    };
+    const { tmp, chainDir } = makeChainState({ records: [complete(1), complete(2), complete(3), partial], maxRounds: 4 });
+    try {
+      const { text } = await runResume({ chainDir, maxRounds: 4, reviewResults: [reviewResult("approve", [])] });
+      assert.match(text, /accepted at round 4/);
+
+      const round4 = readJson(path.join(chainDir, "round-4.json"));
+      assert.equal(round4.disposition.disposition, "accept");
+      assert.equal(round4.resumed, true);
+      assert.equal(round4.reworkScope, "full");
+
+      const control = readChainControl(chainDir);
+      assert.equal(control.status, "completed");
+      assert.equal(control.round, 4);
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+});
+
+// =========================================================================
 // chain-resume CLI — subprocess error paths (kusabi #153①)
 // =========================================================================
 
