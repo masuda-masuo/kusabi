@@ -36,6 +36,7 @@ import {
 import { jobDir, saveJob, loadJob, listJobs, latestJob } from "./job-store.mjs";
 import { opencodeBin, serverHealthy, ensureServer, reapIdleServes, reapOrphanedServes, runningRecordIsStale, isOurServe, api } from "./serve-lifecycle.mjs";
 import { runPrompt, dispatchWithFallback, resetFailedRoutes } from "./prompt-execution.mjs";
+import { claudeDispatch, resolveClaudeModel, validateClaudeModel, validateClaudeChain, translateDenyTools, clampModelDispatch } from "./claude-dispatch.mjs";
 import { openMetricsDb, openMetricsDbReadOnly } from "./metrics-db.mjs";
 import { ingestTranscriptDirectory } from "./transcript-ingest.mjs";
 import { ingestChainDirectory, ingestJobDirectory } from "./chain-ingest.mjs";
@@ -278,6 +279,65 @@ export function readBriefFile(flags, text) {
 }
 
 // ---------------------------------------------------------------------------
+// dispatch backend selection (kusabi #184)
+// ---------------------------------------------------------------------------
+
+export const BACKENDS = ["opencode", "claude"];
+
+/**
+ * Resolve the dispatch backend from the `--backend` flag.  Resolved ONCE at
+ * command start (`task` / `chain`); every job and chain record written by
+ * the command carries the result as its `backend` field.  Old records
+ * without the field are treated as `"opencode"` by readers.
+ *
+ * @param {object} flags — parsed flags (may carry `backend`).
+ * @returns {"opencode"|"claude"}
+ * @throws {Error} For any unknown backend value.
+ */
+export function resolveBackend(flags) {
+  const backend = flags.backend || "opencode";
+  if (!BACKENDS.includes(backend)) {
+    throw new Error(`unknown backend: ${backend}. Use --backend opencode|claude`);
+  }
+  return backend;
+}
+
+/**
+ * Resolve `{ dispatch, backend }` for a job-creating command: the backend
+ * decides BOTH the dispatch function (claudeDispatch vs
+ * dispatchWithFallback — the single decision point; the chain phases stay
+ * backend-blind) and the model resolution syntax (claude models are bare
+ * aliases / full ids, opencode models are provider/model).
+ *
+ * @param {object} opts
+ * @param {object} opts.flags
+ * @param {string} [opts.phase]
+ * @param {object|null} opts.config
+ * @returns {{ dispatch: Function, backend: "opencode"|"claude",
+ *             model: object|string|undefined, chain: (string|string[])[] }}
+ */
+export function resolveDispatchBackend({ flags, phase, config }) {
+  const backend = resolveBackend(flags);
+  if (backend === "claude") {
+    const resolved = resolveClaudeModel({ flag: flags.model, phase, config });
+    // Validate the WHOLE chain, not just the command-start model (kusabi
+    // #184 finding 1): a rework/strategize/resume round derives its model
+    // from the chain, so an opencode-shaped models.chain would otherwise
+    // throw mid-flight after round 1 — a `:variant` error blaming a model
+    // string the user never typed.  Failing here means the error surfaces
+    // before createChainDir / before any job is dispatched.
+    validateClaudeChain(resolved.chain);
+    // A :variant suffix cannot be expressed on the claude backend — reject
+    // it up front (clear error, nonzero exit) instead of silently ignoring
+    // it at dispatch time.
+    if (resolved.model != null) validateClaudeModel(resolved.model);
+    return { dispatch: claudeDispatch, backend, model: resolved.model, chain: resolved.chain };
+  }
+  const resolved = resolveModel({ flag: flags.model, phase, config });
+  return { dispatch: dispatchWithFallback, backend, model: resolved.model, chain: resolved.chain };
+}
+
+// ---------------------------------------------------------------------------
 // subcommands
 // ---------------------------------------------------------------------------
 
@@ -316,8 +376,10 @@ async function cmdTask(cwd, { flags, text }) {
   }
   const stateDir = stateDirFor(cwd);
   const config = loadConfig(stateRoot());
-  const resolved = resolveModel({ flag: flags.model, phase, config });
-  const modelChain = resolved.chain;
+  // Backend resolved ONCE at command start: it picks the dispatch function
+  // AND the model syntax (claude: bare alias / full id; opencode:
+  // provider/model).
+  const { dispatch, backend, chain: modelChain } = resolveDispatchBackend({ flags, phase, config });
 
   let session = flags.session;
   if (!session && flags.resumeLast) {
@@ -340,6 +402,13 @@ async function cmdTask(cwd, { flags, text }) {
     tools = { ...(tools ?? {}) };
     for (const name of flags.deny.split(",").filter(Boolean)) tools[name] = false;
   }
+  // The user-facing deny map speaks the opencode vocabulary (bash, edit,
+  // write, ...); on the claude backend the tools that exist are the sunaba_*
+  // ones, so --read-only / --deny must be translated or they would silently
+  // no-op while the write tools stay granted (kusabi #184 finding 2).
+  // Phase-level deny maps (implementDenyTools / reviewDenyTools) are passed
+  // inside the chain phases and are intentionally NOT translated.
+  if (tools && backend === "claude") tools = translateDenyTools(tools);
   // ---- record baseSha before dispatching the job if --container (for probe comparison) ----
   let taskBaseSha = null;
   if (flags.container) {
@@ -354,7 +423,7 @@ async function cmdTask(cwd, { flags, text }) {
   }
 
   const guardrails = fs.readFileSync(path.join(PLUGIN_ROOT, "prompts", "task-guardrails.md"), "utf8").trim();
-  const { job, resultText } = await dispatchWithFallback({
+  const { job, resultText } = await dispatch({
     cwd,
     kind: "task",
     title: text.slice(0, 80),
@@ -370,9 +439,12 @@ async function cmdTask(cwd, { flags, text }) {
     explicitModel: flags.model || null,
   });
 
-  // Store the resolved model chain and orchestrator on the job record
+  // Store the resolved model chain, orchestrator, and backend on the job
+  // record (claudeDispatch already stamps backend:"claude"; this makes the
+  // opencode path record it too).
   job.modelChain = modelChain;
   job.orchestrator = orchestrator;
+  job.backend = backend;
 
   // ---- deterministic probes (when --container given) ----
   if (flags.container) {
@@ -909,7 +981,12 @@ async function cmdChain(cwd, { flags, text }) {
   // ---- setup ----
   const stateDir = stateDirFor(cwd);
   const config = loadConfig(stateRoot());
-  const { model, chain: modelChain } = resolveModel({ flag: flags.model, phase: "implement", config });
+  // Backend resolved ONCE at command start (kusabi #184): it picks the
+  // dispatch function threaded into every phase (implement / review /
+  // strategize) and the model syntax.  The :variant rejection for the
+  // claude backend also happens here, so a bad model fails with a clear
+  // error and a nonzero exit before any job is dispatched.
+  const { dispatch, backend, model, chain: modelChain } = resolveDispatchBackend({ flags, phase: "implement", config });
   const { chainId, chainDir } = createChainDir(stateDir);
   const container = flags.container;
   if (!container) throw new Error("chain requires --container <cid>");
@@ -968,6 +1045,11 @@ async function cmdChain(cwd, { flags, text }) {
     return await runChainDriver({
       cwd, stateDir, chainDir, chainId, container, model, modelChain, maxRounds,
       brief, orchestrator, baseSha, worktreeBaseline, verifyBaseline, callTool,
+      backend,
+      // claude: clamp later phases (rework implement, review, strategist)
+      // to the command-start model — the claude backend has no tier ladder,
+      // so the model never changes mid-chain (kusabi #184 finding 1).
+      dispatchWithFallback: backend === "claude" ? clampModelDispatch(dispatch, model) : dispatch,
       initialSession: flags.session,
       flagsModel: flags.model,
       signalReceived: () => signalReceived,
@@ -1014,7 +1096,11 @@ async function cmdChain(cwd, { flags, text }) {
  * @param {Function} opts.callTool
  * @param {Function} [opts.dispatchWithFallback] — injection seam (defaults to
  *        the real dispatchWithFallback; phase functions receive it as their
- *        own _dispatchWithFallback seam).
+ *        own _dispatchWithFallback seam).  claudeDispatch when the chain
+ *        runs on the claude backend (kusabi #184).
+ * @param {"opencode"|"claude"} [opts.backend] — dispatch backend, recorded
+ *        on every round record; readers treat a missing field as
+ *        "opencode".  Default "opencode".
  * @param {string} [opts.initialSession]
  * @param {string|null} [opts.flagsModel]
  * @param {Function} [opts.signalReceived]  — getter: has SIGTERM/SIGINT fired?
@@ -1026,6 +1112,7 @@ export async function runChainDriver({
   cwd, stateDir, chainDir, chainId, container, model, modelChain, maxRounds,
   brief, orchestrator, baseSha, worktreeBaseline, verifyBaseline, callTool,
   dispatchWithFallback: injectedDispatch = dispatchWithFallback,
+  backend = "opencode",
   initialSession, flagsModel = null, signalReceived = () => false,
   keepServe = false, resume = null,
 }) {
@@ -1367,6 +1454,13 @@ export async function runChainDriver({
       });
       session = resolvedSession;
 
+      // The chain record carries the dispatch backend (kusabi #184); the
+      // phase functions stay backend-blind, so it is stamped here.  Round
+      // records persist it via persistChainState (round-N.json and the
+      // records array in chain.json); readers treat a missing field as
+      // "opencode".
+      roundRecord.backend = backend;
+
       // Record lever info on the round record (B8)
       roundRecord.tierBefore = currentTierIndex;
       roundRecord.reworkStrategyReason = reworkStrategyReason;
@@ -1556,6 +1650,12 @@ async function cmdChainResume(cwd, { flags, text }) {
   process.on("SIGTERM", onSignal);
   process.on("SIGINT", onSignal);
 
+  // ---- dispatch backend (kusabi #184) ----
+  // The backend is not a flag here: resumption context comes from the saved
+  // chain state, and the chain record's backend field is part of it.  A
+  // missing field means the chain predates the backend split → opencode.
+  const resumeBackend = chainJson.records?.[chainJson.records.length - 1]?.backend || "opencode";
+
   try {
     return await runChainDriver({
       cwd, stateDir, chainDir, chainId, container,
@@ -1570,6 +1670,12 @@ async function cmdChainResume(cwd, { flags, text }) {
       // chain.json at chain start — NEVER re-capture on a modified worktree.
       verifyBaseline: chainJson.verifyBaseline ?? null,
       callTool,
+      backend: resumeBackend,
+      // claude: clamp every resumed phase to the chain's recorded model —
+      // no tier ladder, no mid-chain model switch (kusabi #184 finding 1).
+      dispatchWithFallback: resumeBackend === "claude"
+        ? clampModelDispatch(claudeDispatch, chainJson.model ?? null)
+        : undefined,
       initialSession: position.session,
       flagsModel: null,
       signalReceived: () => signalReceived,
@@ -1882,6 +1988,7 @@ function usage() {
     "Flags:",
     "  --read-only, --resume-last, --wait, --background",
     "  --base <ref>, --model <provider/model>, --agent <id>, --phase <name> (draft|investigate|implement|review|respond|salvage|gofer)",
+    "  --backend opencode|claude (task/chain: dispatch backend; default opencode. With claude, --model takes a bare alias (opus|sonnet|haiku) or a full model id \u2014 :variant suffixes are rejected)",
     "  --session <id>, --timeout <s>, --watchdog <s>, --deny <tools>",
     "  --brief-file <path> (task / chain: read the brief from a file; exclusive with inline text)",
     "  --container <cid> (chain/task: container to run deterministic probes in; NOT supported by review)",
@@ -1978,6 +2085,13 @@ async function main() {
   }
 
   const parsed = parseArgs(flat);
+
+  // --backend is a task/chain dispatch decision (kusabi #184); on any other
+  // subcommand it would be silently ignored — reject it out loud instead.
+  if (parsed.flags.backend && subcommand !== "task" && subcommand !== "chain") {
+    throw new Error(`--backend is only supported by task and chain (got subcommand ${subcommand ?? "(none)"})`);
+  }
+
   switch (subcommand) {
     case "setup":
       return cmdSetup(cwd);
