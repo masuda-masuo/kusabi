@@ -339,6 +339,33 @@ export function resolveDispatchBackend({ flags, phase, config }) {
   return { dispatch: dispatchWithFallback, backend, model: resolved.model, chain: resolved.chain };
 }
 
+/**
+ * Resolve the session for `--resume-last`: the sessionID of the most recent
+ * task job of the SAME backend as the current dispatch.  Both backends share
+ * ONE job store, and a session id is backend-specific \u2014 a claude UUID cannot
+ * be resumed on opencode, and an opencode `ses_*` id is rejected by the
+ * claude backend's cross-backend guard.  Without this filter,
+ * `--resume-last` on a claude dispatch could silently pick an opencode
+ * session (and vice versa).  Records without a `backend` field predate the
+ * backend split and count as "opencode".  This is SELECTION only \u2014 whether a
+ * given session may be resumed on the chosen backend is decided inside the
+ * dispatch (claudeDispatch's ses_* guard).
+ *
+ * @param {string} stateDir
+ * @param {object} opts
+ * @param {string|null|undefined} [opts.phase]
+ * @param {"opencode"|"claude"} opts.backend
+ * @returns {string|null} The session id, or null when no same-backend job.
+ */
+export function resolveResumeLastSession(stateDir, { phase, backend }) {
+  const prev = latestJob(stateDir, (j) =>
+    j.kind === "task"
+    && (!phase || j.phase === phase)
+    && (j.backend ?? "opencode") === backend
+  );
+  return prev?.sessionID ?? null;
+}
+
 // ---------------------------------------------------------------------------
 // subcommands
 // ---------------------------------------------------------------------------
@@ -385,12 +412,16 @@ async function cmdTask(cwd, { flags, text }) {
 
   let session = flags.session;
   if (!session && flags.resumeLast) {
-    const prev = latestJob(stateDir, (j) => j.kind === "task" && (!phase || j.phase === phase));
-    session = prev?.sessionID;
+    // --resume-last selects the previous job of the SAME backend as this
+    // dispatch: both backends share one job store, and a session id is
+    // backend-specific (a claude UUID cannot be resumed on opencode; an
+    // opencode ses_* id is rejected by the claude backend's guard).  Records
+    // without the backend field predate the backend split -> opencode.
+    session = resolveResumeLastSession(stateDir, { phase, backend });
     if (!session) {
       throw new Error(phase
-        ? `--resume-last: no previous ${phase} session found for this directory`
-        : "--resume-last: no previous task session found for this directory");
+        ? `--resume-last: no previous ${phase} ${backend} session found for this directory`
+        : `--resume-last: no previous ${backend} task session found for this directory`);
     }
   }
   if (session && phase) {

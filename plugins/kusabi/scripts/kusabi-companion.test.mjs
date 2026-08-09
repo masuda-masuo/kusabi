@@ -14,6 +14,7 @@ import {
   __testProbeBindings,
   publishWarningForBrief,
   runChainDriver,
+  resolveResumeLastSession,
 } from "./kusabi-companion.mjs";
 import {
   parseOrchestratorSignature,
@@ -400,6 +401,78 @@ describe("PHASE_AGENTS", () => {
       const filePath = path.join(agentsDir, `${agentName}.md`);
       assert.ok(fs.existsSync(filePath), `agent file missing: ${filePath}`);
     }
+  });
+});
+
+// resolveResumeLastSession — the --resume-last SELECTION seam (kusabi #184
+// Job B).  Both backends share one job store, so the previous job must be of
+// the SAME backend as the current dispatch; a missing `backend` field
+// predates the backend split and counts as "opencode".
+// ---------------------------------------------------------------------------
+
+describe("resolveResumeLastSession", () => {
+  let tmpDir;
+  let stateDir;
+
+  beforeEach(() => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-resume-last-"));
+    stateDir = path.join(tmpDir, "state");
+  });
+
+  afterEach(() => {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  function addJob(id, job) {
+    const dir = path.join(stateDir, "jobs", id);
+    fs.mkdirSync(dir, { recursive: true });
+    writeJson(path.join(dir, "job.json"), {
+      id,
+      kind: "task",
+      status: "completed",
+      startedAt: "2026-08-01T00:00:00.000Z",
+      ...job,
+    });
+  }
+
+  it("claude picks the last claude job, skipping a newer opencode job", () => {
+    addJob("job-newer-opencode", { sessionID: "ses_opencode_latest", startedAt: "2026-08-02T00:00:00.000Z" });
+    addJob("job-older-claude", { backend: "claude", sessionID: "claude-uuid-1", startedAt: "2026-08-01T00:00:00.000Z" });
+    assert.equal(resolveResumeLastSession(stateDir, { backend: "claude" }), "claude-uuid-1");
+  });
+
+  it("opencode picks the last opencode job, skipping a newer claude job", () => {
+    addJob("job-newer-claude", { backend: "claude", sessionID: "claude-uuid-2", startedAt: "2026-08-02T00:00:00.000Z" });
+    addJob("job-older-opencode", { sessionID: "ses_opencode_1", startedAt: "2026-08-01T00:00:00.000Z" });
+    assert.equal(resolveResumeLastSession(stateDir, { backend: "opencode" }), "ses_opencode_1");
+  });
+
+  it("a missing backend field counts as opencode (both directions)", () => {
+    addJob("job-no-backend", { sessionID: "ses_opencode_legacy", startedAt: "2026-08-02T00:00:00.000Z" });
+    addJob("job-claude", { backend: "claude", sessionID: "claude-uuid-3", startedAt: "2026-08-01T00:00:00.000Z" });
+    assert.equal(resolveResumeLastSession(stateDir, { backend: "opencode" }), "ses_opencode_legacy");
+    assert.equal(resolveResumeLastSession(stateDir, { backend: "claude" }), "claude-uuid-3");
+  });
+
+  it("honors the phase filter (task jobs of that phase only)", () => {
+    addJob("job-review-phase", { phase: "review", sessionID: "ses_review", startedAt: "2026-08-01T00:00:00.000Z" });
+    addJob("job-implement-phase", { phase: "implement", sessionID: "ses_implement", startedAt: "2026-08-02T00:00:00.000Z" });
+    assert.equal(resolveResumeLastSession(stateDir, { phase: "implement", backend: "opencode" }), "ses_implement");
+    assert.equal(resolveResumeLastSession(stateDir, { phase: "review", backend: "opencode" }), "ses_review");
+    // Without a phase: the newest task job of the backend wins.
+    assert.equal(resolveResumeLastSession(stateDir, { backend: "opencode" }), "ses_implement");
+  });
+
+  it("ignores non-task jobs", () => {
+    addJob("job-review", { kind: "review", sessionID: "ses_review", startedAt: "2026-08-02T00:00:00.000Z" });
+    addJob("job-task", { sessionID: "ses_task", startedAt: "2026-08-01T00:00:00.000Z" });
+    assert.equal(resolveResumeLastSession(stateDir, { backend: "opencode" }), "ses_task");
+  });
+
+  it("returns null when no same-backend job exists (the caller errors naming the backend)", () => {
+    addJob("job-claude-only", { backend: "claude", sessionID: "claude-uuid-4", startedAt: "2026-08-02T00:00:00.000Z" });
+    assert.equal(resolveResumeLastSession(stateDir, { backend: "opencode" }), null);
+    assert.equal(resolveResumeLastSession(stateDir, { backend: "claude" }), "claude-uuid-4");
   });
 });
 
@@ -1695,6 +1768,86 @@ describe("chain-resume CLI", () => {
       assert.equal(control.status, "running");
       assert.equal(control.resumedAt, undefined);
     } finally {
+      server.close();
+      server.closeAllConnections?.();
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("claude backend: the same DATA-shaped container absence refusal, and no claude dispatch ever starts", async () => {
+    // The known trap, exercised for the claude path: the container-liveness
+    // guard receives container absence as DATA — callTool RESOLVES with a
+    // JSON payload ({ status: "error", error: "Container ... not found" }),
+    // not a rejection.  The recorded backend (claude) changes nothing about
+    // the guard: the resume must be refused with the same "not reachable"
+    // error, the control record must not be re-armed, and the claude
+    // dispatch must never be invoked past the guard.
+    const { server, url } = await startSunabaStub({
+      toolResultText: {
+        status: "error",
+        error: "Container fake-cid not found",
+        recommended_next_action: "sandbox_list_containers to find running containers, or sandbox_initialize to start one",
+      },
+    });
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-resume-cli-"));
+    // A fake claude that would record an invocation — its log must stay
+    // empty, proving the guard fires before any dispatch.
+    const claudeArgsLog = path.join(tmp, "claude-args.ndjson");
+    fs.writeFileSync(claudeArgsLog, "", "utf8");
+    const claudeBinPath = path.join(tmp, "fake-claude.mjs");
+    fs.writeFileSync(
+      claudeBinPath,
+      "#!/usr/bin/env node\n" +
+      "import fs from \"node:fs\";\n" +
+      "fs.appendFileSync(process.env.FAKE_CLAUDE_ARGS_LOG, JSON.stringify(process.argv.slice(2)) + \"\\n\");\n" +
+      "process.stdout.write(JSON.stringify({ type: \"result\", is_error: false, result: \"ok\", session_id: \"claude-uuid-resume\" }));\n",
+      "utf8",
+    );
+    fs.chmodSync(claudeBinPath, 0o755);
+    const savedClaudeBin = process.env.CLAUDE_BIN;
+    const savedArgsLog = process.env.FAKE_CLAUDE_ARGS_LOG;
+    const savedMcpSource = process.env.KUSABI_CLAUDE_MCP_SOURCE;
+    process.env.CLAUDE_BIN = claudeBinPath;
+    process.env.FAKE_CLAUDE_ARGS_LOG = claudeArgsLog;
+    const mcpSource = path.join(tmp, "claude.json");
+    fs.writeFileSync(mcpSource, JSON.stringify({ mcpServers: { sunaba: { command: "npx" } } }), "utf8");
+    process.env.KUSABI_CLAUDE_MCP_SOURCE = mcpSource;
+    try {
+      const stateDir = hashedWorkspaceDir(path.join(tmp, "state"), tmp);
+      const chainJson = validChainJson();
+      // The chain ran on the claude backend: the record carries the backend
+      // and a claude-shaped model.
+      chainJson.records[0].backend = "claude";
+      chainJson.model = "sonnet";
+      chainJson.modelChain = [["sonnet"]];
+      makeChain(stateDir, "chain-claude", {
+        control: {
+          chainId: "chain-claude", container: "fake-cid", pid: 0, // dead pid → abnormal stop
+          status: "running", round: 1, startedAt: new Date().toISOString(),
+        },
+        chainJson,
+      });
+      const result = await runResumeAsync(["chain-claude"], {
+        stateDir: path.join(tmp, "state"),
+        cwd: tmp,
+        env: { KUSABI_SUNABA_URL: url },
+      });
+      assert.notEqual(result.status, 0);
+      assert.match(result.stdout, /not reachable/);
+      assert.match(result.stdout, /Container fake-cid not found/);
+      // The claude path never dispatched past the guard.
+      assert.equal(fs.readFileSync(claudeArgsLog, "utf8").trim(), "");
+      // The control record must NOT have been re-armed past the failure.
+      const control = readChainControl(path.join(stateDir, "chains", "chain-claude"));
+      assert.equal(control.status, "running");
+      assert.equal(control.resumedAt, undefined);
+    } finally {
+      if (savedClaudeBin === undefined) delete process.env.CLAUDE_BIN;
+      else process.env.CLAUDE_BIN = savedClaudeBin;
+      if (savedArgsLog === undefined) delete process.env.FAKE_CLAUDE_ARGS_LOG;
+      else process.env.FAKE_CLAUDE_ARGS_LOG = savedArgsLog;
+      if (savedMcpSource === undefined) delete process.env.KUSABI_CLAUDE_MCP_SOURCE;
+      else process.env.KUSABI_CLAUDE_MCP_SOURCE = savedMcpSource;
       server.close();
       server.closeAllConnections?.();
       fs.rmSync(tmp, { recursive: true, force: true });

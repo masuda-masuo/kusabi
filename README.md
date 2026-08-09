@@ -162,12 +162,16 @@ split (or without the field) are treated as `opencode` by readers.
 - **claude** — dispatch through the official Claude Code CLI in headless
   mode (`claude -p --output-format json`). v1 limits: one model per phase
   (the `--model` value, or the chain's first route — the tier ladder and
-  capacity fallback do not apply), no session resume (every dispatch starts
-  a fresh session), and `:variant` suffixes are rejected with an explicit
-  error (a `--model` value such as `opus:max` fails before any job is
-  dispatched). Model syntax is a bare alias (`opus`, `sonnet`, `haiku`) or a
-  full model id (e.g. `claude-sonnet-4-5`). The binary is resolved through
-  `CLAUDE_BIN` (default `claude`).
+  capacity fallback do not apply), and `:variant` suffixes are rejected with
+  an explicit error (a `--model` value such as `opus:max` fails before any
+  job is dispatched). Session resume IS supported: `--session <id>` /
+  `--resume-last`, chain rework rounds, and `chain-resume` continue the
+  previous session via `claude -p --resume <session-id>` (an opencode-shaped
+  `ses_*` id is rejected with a loud cross-backend error; `--resume-last`
+  only selects jobs of the same backend). Model syntax is a bare alias
+  (`opus`, `sonnet`, `haiku`) or a full model id (e.g.
+  `claude-sonnet-4-5`). The binary is resolved through `CLAUDE_BIN`
+  (default `claude`).
 
 The claude backend mirrors the opencode agents' permission tables with two
 hardcoded `--allowedTools` allowlists (implement, review; see

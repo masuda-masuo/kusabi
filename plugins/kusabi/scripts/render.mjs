@@ -48,9 +48,18 @@ export function renderHeader(job) {
     }
   }
 
+  // Backend-aware header/session lines (kusabi #184 Job B): a missing
+  // `backend` field predates the backend split and means opencode, so the
+  // opencode output stays byte-identical.  A claude job shows the claude
+  // continuation shape (`claude -p --resume <id>`); the session id is the
+  // one recorded on the job (a UUID for claude, ses_* for opencode).
+  const isClaude = job.backend === "claude";
+
   return [
-    `opencode ${job.kind} ${job.id} — ${job.status} (${durationS(job)}s)`,
-    `session: ${job.sessionID} (continue in opencode: \`opencode -s ${job.sessionID}\`)`,
+    `${isClaude ? "claude" : "opencode"} ${job.kind} ${job.id} — ${job.status} (${durationS(job)}s)`,
+    isClaude
+      ? `session: ${job.sessionID} (continue in claude: \`claude -p --resume ${job.sessionID}\`)`
+      : `session: ${job.sessionID} (continue in opencode: \`opencode -s ${job.sessionID}\`)`,
     ...(job.phase ? [`phase: ${job.phase}`] : []),
     ...(routeLine.length ? routeLine : []),
     ...usageLine,
