@@ -393,3 +393,152 @@ describe("upsertJob", () => {
     assert.equal(got.status, "totally-new-status");
   });
 });
+
+// ---------------------------------------------------------------------------
+// backend columns (kusabi #184 Job C)
+// ---------------------------------------------------------------------------
+
+describe("chain/round/job backend migration (kusabi #184 Job C)", () => {
+  it("adds the backend column to a database created before the split, preserving old rows as NULL", () => {
+    const dbPath = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-migrate-test-")), "metrics.db");
+
+    // Simulate a database written before the backend split existed — the
+    // full pre-#184 column set for all three tables, with no backend.
+    const legacyDb = new DatabaseSync(dbPath);
+    legacyDb.exec(`
+      CREATE TABLE chain (
+        chain_id TEXT PRIMARY KEY,
+        workspace_slug TEXT,
+        orch_model TEXT,
+        orch_session TEXT,
+        orch_date TEXT,
+        base_sha TEXT,
+        model TEXT,
+        model_chain_json TEXT,
+        max_rounds INTEGER,
+        strategized INTEGER,
+        totals_input INTEGER,
+        totals_output INTEGER,
+        totals_reasoning INTEGER,
+        totals_cache_read INTEGER,
+        totals_cache_write INTEGER,
+        totals_cost REAL,
+        brief_text TEXT,
+        brief_chars INTEGER,
+        brief_lines INTEGER,
+        brief_bullets INTEGER,
+        brief_has_deliverables INTEGER,
+        brief_deliverable_count INTEGER,
+        brief_has_smoke INTEGER,
+        brief_smoke_count INTEGER
+      );
+      CREATE TABLE round (
+        chain_id TEXT,
+        round INTEGER,
+        started_at TEXT,
+        started_ms INTEGER,
+        model_entry TEXT,
+        tier_before INTEGER,
+        tier_after INTEGER,
+        verdict TEXT,
+        probes_green INTEGER,
+        worktree_changed INTEGER,
+        disposition TEXT,
+        rework_count INTEGER,
+        findings_text TEXT,
+        implement_in INTEGER,
+        implement_out INTEGER,
+        implement_cost REAL,
+        review_in INTEGER,
+        review_out INTEGER,
+        review_cost REAL,
+        PRIMARY KEY (chain_id, round)
+      );
+      CREATE TABLE job (
+        job_id TEXT PRIMARY KEY,
+        workspace_slug TEXT,
+        kind TEXT,
+        title TEXT,
+        status TEXT,
+        phase TEXT,
+        model_entry TEXT,
+        started_at TEXT,
+        started_ms INTEGER,
+        finished_at TEXT,
+        finished_ms INTEGER,
+        duration_seconds REAL,
+        steps INTEGER,
+        error TEXT,
+        usage_available INTEGER,
+        usage_model TEXT,
+        usage_input INTEGER,
+        usage_output INTEGER,
+        usage_reasoning INTEGER,
+        usage_cache_read INTEGER,
+        usage_cache_write INTEGER,
+        usage_cost REAL
+      )
+    `);
+    legacyDb.prepare("INSERT INTO chain (chain_id, orch_model, orch_date) VALUES (?, ?, ?)")
+      .run("chain-legacy", "claude-opus-5", "2026-07-22");
+    legacyDb.prepare("INSERT INTO round (chain_id, round, started_at, started_ms, disposition) VALUES (?, ?, ?, ?, ?)")
+      .run("chain-legacy", 1, "2026-07-22T09:00:00.000Z", Date.parse("2026-07-22T09:00:00.000Z"), "accept");
+    legacyDb.prepare("INSERT INTO job (job_id, status, started_at) VALUES (?, ?, ?)")
+      .run("job-legacy", "completed", "2026-07-22T10:00:00.000Z");
+    if (typeof legacyDb.close === "function") legacyDb.close();
+
+    // Re-opening through openMetricsDb must migrate all three tables in
+    // place and must NOT rewrite the old rows' NULL backend — NULL means
+    // "predates the split", which readers resolve to "opencode", never to
+    // an invented value.
+    const db = openMetricsDb(dbPath);
+    const legacyChain = db.prepare("SELECT * FROM chain WHERE chain_id = ?").get("chain-legacy");
+    assert.equal(legacyChain.backend, null);
+    assert.equal(legacyChain.orch_model, "claude-opus-5"); // other columns untouched
+    const legacyRound = db.prepare("SELECT * FROM round WHERE chain_id = ?").get("chain-legacy");
+    assert.equal(legacyRound.backend, null);
+    assert.equal(legacyRound.disposition, "accept");
+    const legacyJob = db.prepare("SELECT * FROM job WHERE job_id = ?").get("job-legacy");
+    assert.equal(legacyJob.backend, null);
+    assert.equal(legacyJob.status, "completed");
+
+    // New rows written after migration store the backend verbatim.
+    upsertChain(db, { chainId: "chain-new", backend: "claude", orchModel: "claude-opus-5" });
+    const newChain = db.prepare("SELECT backend FROM chain WHERE chain_id = ?").get("chain-new");
+    assert.equal(newChain.backend, "claude");
+    upsertRound(db, { chainId: "chain-new", round: 1, backend: "claude", disposition: "accept" });
+    const newRound = db.prepare("SELECT backend FROM round WHERE chain_id = ? AND round = 1").get("chain-new");
+    assert.equal(newRound.backend, "claude");
+    upsertJob(db, { jobId: "job-new", backend: "opencode", status: "completed" });
+    const newJob = db.prepare("SELECT backend FROM job WHERE job_id = ?").get("job-new");
+    assert.equal(newJob.backend, "opencode");
+
+    fs.rmSync(path.dirname(dbPath), { recursive: true, force: true });
+  });
+
+  it("openMetricsDb is idempotent on a database that already has the backend columns", () => {
+    const dbPath = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-migrate-test-")), "metrics.db");
+    openMetricsDb(dbPath);
+    assert.doesNotThrow(() => openMetricsDb(dbPath));
+    fs.rmSync(path.dirname(dbPath), { recursive: true, force: true });
+  });
+
+  it("stores backend verbatim — NULL when the row carries no backend, never 'opencode'", () => {
+    const db = openMetricsDb(":memory:");
+    upsertChain(db, { chainId: "chain-a", backend: "claude" });
+    upsertChain(db, { chainId: "chain-b" });
+    upsertRound(db, { chainId: "chain-a", round: 1, backend: "claude" });
+    upsertRound(db, { chainId: "chain-b", round: 1 });
+    upsertJob(db, { jobId: "job-a", backend: "opencode" });
+    upsertJob(db, { jobId: "job-b" });
+    const chainRows = db.prepare("SELECT chain_id, backend FROM chain ORDER BY chain_id").all();
+    assert.equal(chainRows[0].backend, "claude");
+    assert.equal(chainRows[1].backend, null);
+    const roundRows = db.prepare("SELECT chain_id, backend FROM round ORDER BY chain_id").all();
+    assert.equal(roundRows[0].backend, "claude");
+    assert.equal(roundRows[1].backend, null);
+    const jobRows = db.prepare("SELECT job_id, backend FROM job ORDER BY job_id").all();
+    assert.equal(jobRows[0].backend, "opencode");
+    assert.equal(jobRows[1].backend, null);
+  });
+});

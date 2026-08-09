@@ -134,6 +134,17 @@ export function parseChainRecord(chainJson, ctx = {}) {
   const totals = (chainJson.chainTotals && typeof chainJson.chainTotals === "object")
     ? chainJson.chainTotals
     : {};
+  const records = Array.isArray(chainJson.records) ? chainJson.records : [];
+
+  // The chain record itself has no top-level `backend` (kusabi #184): the
+  // backend is stamped per round record, and the chain's backend is read
+  // from the LAST record of the records array — the same convention
+  // chain-resume uses.  Stored verbatim: a chain whose records predate the
+  // split stores NULL here, never "opencode" (readers apply that contract).
+  const lastRecord = records.length ? records[records.length - 1] : null;
+  const chainBackend = (lastRecord && typeof lastRecord.backend === "string")
+    ? lastRecord.backend
+    : null;
 
   const chainRow = {
     chainId,
@@ -142,6 +153,7 @@ export function parseChainRecord(chainJson, ctx = {}) {
     orchModel: orchestrator && typeof orchestrator.model === "string" ? orchestrator.model : null,
     orchSession: orchestrator && typeof orchestrator.session === "string" ? orchestrator.session : null,
     orchDate: orchestrator && typeof orchestrator.date === "string" ? orchestrator.date : null,
+    backend: chainBackend,
     baseSha: typeof chainJson.baseSha === "string" ? chainJson.baseSha : null,
     model: modelRouteString(chainJson.model),
     modelChainJson: Array.isArray(chainJson.modelChain) ? JSON.stringify(chainJson.modelChain) : null,
@@ -166,7 +178,6 @@ export function parseChainRecord(chainJson, ctx = {}) {
     briefSmokeCount: briefText !== null ? parseSmoke(briefText).length : null,
   };
 
-  const records = Array.isArray(chainJson.records) ? chainJson.records : [];
   const roundRows = [];
   const findingRows = [];
   let hasStructuredFindings = false;
@@ -193,6 +204,9 @@ export function parseChainRecord(chainJson, ctx = {}) {
       round: rec.round,
       startedAt: typeof rec.startedAt === "string" ? rec.startedAt : null,
       startedMs,
+      // Dispatch backend (kusabi #184), stored verbatim per record — NULL
+      // when the record predates the split, never a default.
+      backend: typeof rec.backend === "string" ? rec.backend : null,
       modelEntry: typeof rec.modelEntry === "string" ? rec.modelEntry : null,
       tierBefore: typeof rec.tierBefore === "number" ? rec.tierBefore : null,
       tierAfter: typeof rec.tierAfter === "number" ? rec.tierAfter : null,
@@ -420,7 +434,9 @@ export function ingestChainDirectory(db, stateRoot) {
  *   numbers.  Absent usage and measured-zero usage must never collapse.
  * - `usageCost` 0 is a real measurement (free tier) and is preserved as 0.
  *
- * `status` is copied verbatim — no enum. `durationSeconds` prefers the
+ * `status` is copied verbatim — no enum. `backend` (kusabi #184) is copied
+ * verbatim too — a job record without the field stores NULL, never a
+ * default; readers treat NULL as "opencode". `durationSeconds` prefers the
  * value usage.json recorded; when that is absent it is derived from
  * startedAt/finishedAt when both parse, else `null`.
  *
@@ -487,6 +503,9 @@ export function parseJobRecord(jobJson, usageJson, ctx = {}) {
       title: typeof jobJson.title === "string" ? jobJson.title : null,
       status: typeof jobJson.status === "string" ? jobJson.status : null,
       phase: typeof jobJson.phase === "string" ? jobJson.phase : null,
+      // Dispatch backend (kusabi #184), stored verbatim — NULL when the job
+      // record predates the split; readers treat NULL as "opencode".
+      backend: typeof jobJson.backend === "string" ? jobJson.backend : null,
       modelEntry: typeof jobJson.modelEntry === "string" ? jobJson.modelEntry : null,
       startedAt,
       startedMs,
