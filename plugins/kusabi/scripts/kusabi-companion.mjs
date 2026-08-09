@@ -52,6 +52,7 @@ import {
   resolveRoundResume,
 
   buildImplementText,
+  resolveReworkScope,
   runImplementPhase,
   runProbePhase,
   runReviewPhase,
@@ -1246,10 +1247,22 @@ export async function runChainDriver({
       ? chainParsedReview.findings.map(function (f) { return f.severity; })
       : undefined;
 
+    // Budget-adjusted round (kusabi #60 step 2): maxRounds buys design/full
+    // rounds only; mechanical rounds are free.  The `round` handed to
+    // deriveDisposition is the current round's ordinal WITHIN the budget (a
+    // mechanical round does not advance it), so the `round >= maxRounds`
+    // terminal fires on budget, not raw round count.  The count comes from
+    // the records alone (budget is never persisted); a review-resumed round
+    // is already in `records`, so it is excluded before counting.
+    const budgetUsedBefore = records.filter(function (r) {
+      return r !== roundRecord && r.reworkScope !== "mechanical";
+    }).length;
+    const budgetRound = budgetUsedBefore + (roundRecord.reworkScope !== "mechanical" ? 1 : 0);
+
     const disposition = deriveDisposition({
       verdict: chainVerdict || "needs-attention",
       probesGreen,
-      round,
+      round: budgetRound,
       maxRounds,
       repeatedAreas: chainRepeatedAreas,
       findingSeverities,
@@ -1403,7 +1416,12 @@ export async function runChainDriver({
   }
 
   try {
-    for (let round = startRound; round <= maxRounds; round++) {
+    // Round loop (kusabi #60 step 2).  The for-condition is the HARD CAP:
+    // total rounds never exceed 2 × maxRounds (every mechanical round is
+    // bought by the design/full round that preceded it), so a chain can never
+    // run unbounded.  The budget check inside the body stops the loop when
+    // maxRounds design/full rounds are spent.
+    for (let round = startRound; round <= 2 * maxRounds; round++) {
       // ---- stop check: honour file-based stop request or signal ----
       if (shouldStopNow({ chainDir, signalReceived: signalReceived() })) {
         finalizeChainControl({ chainDir, status: "cancelled", round: round - 1 });
@@ -1450,6 +1468,24 @@ export async function runChainDriver({
         continue;
       }
 
+      // ---- budget check (kusaba #60 step 2) ----
+      // maxRounds buys design/full rounds only; mechanical rounds are free.
+      // Budget is DERIVED from the records (never persisted), so a resumed
+      // chain recomputes it from records alone.  Placed after the
+      // review-resume branch: a resumed interrupted round already spent its
+      // budget slot and must be allowed to finish its review.
+      const budgetUsed = records.filter(function (r) {
+        return r.reworkScope !== "mechanical";
+      }).length;
+      if (budgetUsed >= maxRounds) break;
+
+      // ---- rework scope for this round (kusabi #60 step 2) ----
+      // Single decision point: resolveReworkScope maps the previous round's
+      // findings to "full" | "mechanical" | "design" plus the scoped subset.
+      // The result feeds both the implement brief and the budget accounting;
+      // the round record stores the scope it was RUN with.
+      const scopeResolution = resolveReworkScope(previousRecord);
+
       // ---- phase 1: resume strategy (B2: derive rework levers when rework) ----
       let useNewSession = false;
       let reworkStrategyReason = null;
@@ -1473,7 +1509,7 @@ export async function runChainDriver({
       // runReviewPhase which passes round=1 to dispatchWithFallback.
 
       // ---- phase 3: implement text + dispatch ----
-      const implementText = buildImplementText({ round, brief, previousRecord, container });
+      const implementText = buildImplementText({ round, brief, previousRecord, container, reworkScope: scopeResolution });
       const {
         roundRecord,
         session: resolvedSession,
@@ -1498,6 +1534,12 @@ export async function runChainDriver({
       roundRecord.tierBefore = currentTierIndex;
       roundRecord.reworkStrategyReason = reworkStrategyReason;
       roundRecord.reworkCount = reworkCount;
+
+      // The scope this round was RUN with (kusabi #60 step 2): "full" when
+      // not a scoped rework.  Stored verbatim like every other record field;
+      // budget is never persisted — it is derived by counting records whose
+      // reworkScope is not "mechanical".
+      roundRecord.reworkScope = scopeResolution.scope;
 
       // Resume trace: this round was (re)started by chain-resume.
       if (resume && resume.phase === "implement" && round === resume.round) {
@@ -1559,11 +1601,17 @@ export async function runChainDriver({
     }
 
     // ---- max rounds reached without acceptance ----
-    finalizeChainControl({ chainDir, status: "completed", round: maxRounds });
+    // The budget/hard-cap terminal can fire after more than maxRounds RAW
+    // rounds (mechanical rounds are free), so the recorded round is the
+    // actual number of completed rounds — never the nominal maxRounds —
+    // keeping control.round and the review record consistent with the
+    // persisted round-N.json files (kusabi #60 step 2 review).
+    const actualRounds = records.length;
+    finalizeChainControl({ chainDir, status: "completed", round: actualRounds });
     return finaliseChain(
       renderMaxRoundsOutcome({ chainId, maxRounds, records, orchestrator }),
-      { disposition: "max-rounds", round: maxRounds },
-      maxRounds,
+      { disposition: "max-rounds", round: actualRounds },
+      actualRounds,
     );
   } catch (err) {
     // Exception thrown mid-round — record failure and rethrow

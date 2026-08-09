@@ -5,6 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import {
   buildImplementText,
+  resolveReworkScope,
   shouldSkipReview,
   computeChainTotals,
   resolveRoundResume,
@@ -958,6 +959,200 @@ describe("buildImplementText", () => {
     assert.ok(result.includes("## Prior findings"));
     assert.ok(result.includes("(none)"));
     assert.ok(result.includes("## Acceptance criteria"));
+  });
+});
+
+// resolveReworkScope — kusabi #60 step 2: rework scheduling by finding kind
+// =========================================================================
+// Single decision point mapping the previous round's findings to the scope
+// of the next rework round: "full" | "mechanical" | "design" plus the scoped
+// subset.  Missing/invalid kind counts as design (same consumption-point
+// default as groupFindingsByKind); subset order follows array order.
+
+describe("resolveReworkScope", () => {
+  const mech = (n, file) => ({ severity: "medium", title: "Mech " + n, file, line_start: 1, kind: "mechanical" });
+  const design = (n, file) => ({ severity: "high", title: "Design " + n, file, line_start: 1, kind: "design" });
+
+  it("returns full scope with no findings when there is no previous record", () => {
+    assert.deepEqual(resolveReworkScope(null), { scope: "full", findings: [] });
+    assert.deepEqual(resolveReworkScope(undefined), { scope: "full", findings: [] });
+  });
+
+  it("returns full scope when the previous round has no findings (probe-failure rework)", () => {
+    assert.deepEqual(resolveReworkScope({ findings: [] }), { scope: "full", findings: [] });
+    assert.deepEqual(resolveReworkScope({}), { scope: "full", findings: [] });
+    // Old records without a structured findings array keep today's behavior.
+    assert.deepEqual(resolveReworkScope({ findingsText: "(no structured findings)" }), { scope: "full", findings: [] });
+  });
+
+  it("returns full scope when the findings array holds nothing groupable", () => {
+    assert.deepEqual(resolveReworkScope({ findings: [42, "x"] }), { scope: "full", findings: [] });
+  });
+
+  it("returns mechanical scope with only the mechanical findings when both kinds are present", () => {
+    const findings = [design(1, "src/a.js"), mech(1, "src/b.js"), mech(2, "src/c.js")];
+    const result = resolveReworkScope({ findings });
+    assert.equal(result.scope, "mechanical");
+    assert.deepEqual(result.findings, [findings[1], findings[2]]);
+  });
+
+  it("after a mechanical round a mixed set schedules the FIRST design finding (no two mechanical rounds in a row)", () => {
+    // Followup: the mixed -> mechanical branch must not starve a pending
+    // design finding; the mechanical items wait for the next batch.
+    const findings = [design(1, "src/a.js"), mech(1, "src/b.js"), mech(2, "src/c.js")];
+    const result = resolveReworkScope({ findings, reworkScope: "mechanical" });
+    assert.equal(result.scope, "design");
+    assert.deepEqual(result.findings, [findings[0]]);
+  });
+
+  it("mixed sets stay mechanical-first when the previous round was NOT mechanical-scoped", () => {
+    const findings = [design(1, "src/a.js"), mech(1, "src/b.js")];
+    // Explicit other scopes and old records without a reworkScope field all
+    // keep the pre-followup behavior.
+    assert.equal(resolveReworkScope({ findings, reworkScope: "full" }).scope, "mechanical");
+    assert.equal(resolveReworkScope({ findings, reworkScope: "design" }).scope, "mechanical");
+    assert.equal(resolveReworkScope({ findings }).scope, "mechanical");
+    assert.equal(resolveReworkScope({ findings, reworkScope: undefined }).scope, "mechanical");
+  });
+
+  it("mechanical-only sets stay mechanical even right after a mechanical round (no design pending)", () => {
+    const findings = [mech(1, "src/b.js"), mech(2, "src/c.js")];
+    const result = resolveReworkScope({ findings, reworkScope: "mechanical" });
+    assert.equal(result.scope, "mechanical");
+    assert.deepEqual(result.findings, findings);
+  });
+
+  it("all-design sets are unaffected by the previous round's scope", () => {
+    const findings = [design(1, "src/a.js"), design(2, "src/b.js")];
+    const result = resolveReworkScope({ findings, reworkScope: "mechanical" });
+    assert.equal(result.scope, "design");
+    assert.deepEqual(result.findings, [findings[0]]);
+    const single = resolveReworkScope({ findings: [findings[0]], reworkScope: "mechanical" });
+    assert.equal(single.scope, "design");
+    assert.deepEqual(single.findings, [findings[0]]);
+  });
+
+  it("treats a missing kind as design when grouping mixed findings", () => {
+    const findings = [
+      { severity: "high", title: "No kind", file: "src/a.js", line_start: 1 },
+      mech(1, "src/b.js"),
+    ];
+    const result = resolveReworkScope({ findings });
+    assert.equal(result.scope, "mechanical");
+    assert.deepEqual(result.findings, [findings[1]]);
+  });
+
+  it("returns design scope with the FIRST design finding in array order when all design and length > 1", () => {
+    const findings = [design(1, "src/a.js"), design(2, "src/b.js"), design(3, "src/c.js")];
+    const result = resolveReworkScope({ findings });
+    assert.equal(result.scope, "design");
+    assert.deepEqual(result.findings, [findings[0]]);
+    // Array-order stability: the first finding in the array wins, regardless
+    // of title/severity.
+    const reversed = [design(9, "src/z.js"), design(2, "src/b.js")];
+    assert.deepEqual(resolveReworkScope({ findings: reversed }).findings, [reversed[0]]);
+  });
+
+  it("returns design scope with the single finding when all design and length == 1", () => {
+    const findings = [design(1, "src/a.js")];
+    const result = resolveReworkScope({ findings });
+    assert.equal(result.scope, "design");
+    assert.deepEqual(result.findings, findings);
+  });
+
+  it("returns mechanical scope with all findings when every finding is mechanical", () => {
+    const findings = [mech(1, "src/b.js"), mech(2, "src/c.js")];
+    const result = resolveReworkScope({ findings });
+    assert.equal(result.scope, "mechanical");
+    assert.deepEqual(result.findings, findings);
+  });
+});
+
+// buildImplementText — scoped rework brief (kusabi #60 step 2)
+// =========================================================================
+// A scoped round renders ONLY its subset with the FULL per-finding renderer
+// (bodies + recommendations, same budget bound as the full path — followup),
+// prefixed by one sentence naming the scope.  The full-scope path must stay
+// byte-identical to the pre-scheduling output.
+
+describe("buildImplementText scoped rework brief", () => {
+  const brief = "# Fix the bug\n\nMake foo return bar.";
+  const mechFinding = {
+    severity: "medium", title: "Rename variable", file: "src/b.js", line_start: 10,
+    kind: "mechanical", body: "bad name", recommendation: "rename it",
+  };
+  const designFinding = {
+    severity: "high", title: "API shape decision", file: "src/a.js", line_start: 1,
+    kind: "design", body: "needs a decision", recommendation: "decide",
+  };
+
+  it("mechanical scope renders the mechanical subset with the scope sentence", () => {
+    const prev = { findings: [designFinding, mechFinding] };
+    const result = buildImplementText({ round: 2, brief, previousRecord: prev, reworkScope: resolveReworkScope(prev) });
+    assert.ok(result.includes("This round resolves ONLY the following mechanical checklist; other known findings are deliberately out of scope this round."));
+    assert.ok(result.includes("## Mechanical findings (checklist)"));
+    assert.ok(result.includes("Rename variable"));
+    assert.ok(!result.includes("API shape decision"));
+    // Followup: the scoped block is the FULL per-finding rendering — heading
+    // with severity/location, body and recommendation, exactly like the
+    // full-scope path — not a one-line summary.
+    assert.ok(result.includes("### [medium] Rename variable (src/b.js:10)"));
+    assert.ok(result.includes("bad name"));
+    assert.ok(result.includes("**Recommendation:** rename it"));
+    // The held-back design finding must not leak, including its body.
+    assert.ok(!result.includes("needs a decision"));
+    // Prompt structure stays intact around the scoped block.
+    assert.ok(result.includes("## Instruction"));
+    assert.ok(result.includes("Resolve each prior finding"));
+    assert.ok(result.includes("## Acceptance criteria"));
+    assert.ok(result.includes(brief));
+  });
+
+  it("design scope renders the single design finding with the scope sentence", () => {
+    const second = { ...designFinding, title: "Second design", body: "second body" };
+    const prev = { findings: [designFinding, second] };
+    const result = buildImplementText({ round: 2, brief, previousRecord: prev, reworkScope: resolveReworkScope(prev) });
+    assert.ok(result.includes("This round resolves ONLY the following design finding; other known findings are deliberately out of scope this round."));
+    assert.ok(result.includes("## Design findings (require deliberate individual treatment)"));
+    assert.ok(result.includes("API shape decision"));
+    assert.ok(!result.includes("Second design"));
+    // Followup: full per-finding rendering of the scoped subset (heading,
+    // body, recommendation); the held-back second finding's body stays out.
+    assert.ok(result.includes("### [high] API shape decision (src/a.js:1)"));
+    assert.ok(result.includes("needs a decision"));
+    assert.ok(result.includes("**Recommendation:** decide"));
+    assert.ok(!result.includes("second body"));
+  });
+
+  it("scoped brief keeps the container header first and the scope block after it", () => {
+    const prev = { findings: [mechFinding] };
+    const result = buildImplementText({ round: 2, brief, previousRecord: prev, container: "abc123def456", reworkScope: resolveReworkScope(prev) });
+    assert.equal(result.indexOf("The workspace lives inside container"), 0);
+    assert.ok(result.includes("ONLY the following mechanical checklist"));
+  });
+
+  it("full scope is byte-identical with and without reworkScope", () => {
+    const prev = { findings: [designFinding, mechFinding] };
+    const plain = buildImplementText({ round: 2, brief, previousRecord: prev, container: "abc123def456" });
+    const withScope = buildImplementText({ round: 2, brief, previousRecord: prev, container: "abc123def456", reworkScope: { scope: "full", findings: [] } });
+    assert.equal(withScope, plain);
+  });
+
+  it("full scope is byte-identical even when reworkScope carries a findings subset", () => {
+    // The full path ignores the subset — only the scope label decides.
+    const prev = { findings: [mechFinding] };
+    const plain = buildImplementText({ round: 2, brief, previousRecord: prev });
+    const withScope = buildImplementText({ round: 2, brief, previousRecord: prev, reworkScope: { scope: "full", findings: [mechFinding] } });
+    assert.equal(withScope, plain);
+  });
+
+  it("reworkScope absent falls back to the pre-scheduling full text", () => {
+    const prev = { findings: [designFinding, mechFinding] };
+    const result = buildImplementText({ round: 2, brief, previousRecord: prev });
+    // No scope sentence, both findings present via renderPriorFindings.
+    assert.ok(!result.includes("ONLY the following"));
+    assert.ok(result.includes("API shape decision"));
+    assert.ok(result.includes("Rename variable"));
   });
 });
 
@@ -3444,6 +3639,80 @@ describe("resolveChainResume", () => {
     const result = resolveChainResume({ control, chainJson: baseChainJson({ records: [complete], maxRounds: 4 }) });
     assert.equal(result.ok, false);
     assert.match(result.error, /max rounds \(4\) already reached/);
+  });
+
+  // kusabi #60 step 2: the resume gate mirrors the driver's budget semantics.
+  // The raw round number may exceed maxRounds when mechanical rounds ran for
+  // free; resume is refused only when the derived budget is spent or the
+  // 2 × maxRounds hard cap would be exceeded.
+  it("allows resume when mechanical rounds pushed the round number past maxRounds but budget remains", () => {
+    const control = { chainId: "chain-test", container: "cid-1", pid: 0, status: "cancelled", round: 2 };
+    const reworkRecord = (round, reworkScope) => ({
+      round,
+      reworkScope,
+      implementJobId: "job-imp-" + round,
+      reviewJobId: "job-rev-" + round,
+      verdict: "needs-attention",
+      disposition: { disposition: "rework", reason: "needs-attention" },
+    });
+    const result = resolveChainResume({
+      control,
+      chainJson: baseChainJson({
+        records: [reworkRecord(1, "full"), reworkRecord(2, "mechanical")],
+        maxRounds: 2,
+      }),
+    });
+    // Round 2 is the last completed round (nextRound 3 > maxRounds 2), but
+    // only round 1 consumed budget (1 < 2) and 3 ≤ 2 × 2 — resume is valid.
+    assert.equal(result.ok, true);
+    assert.equal(result.position.phase, "implement");
+    assert.equal(result.position.round, 3);
+    assert.equal(result.position.records.length, 2);
+  });
+
+  it("refuses resume when the derived budget is spent even while rounds remain under the hard cap", () => {
+    const control = { chainId: "chain-test", container: "cid-1", pid: 0, status: "cancelled", round: 3 };
+    const reworkRecord = (round) => ({
+      round,
+      reworkScope: "full",
+      implementJobId: "job-imp-" + round,
+      reviewJobId: "job-rev-" + round,
+      verdict: "needs-attention",
+      disposition: { disposition: "rework", reason: "needs-attention" },
+    });
+    const result = resolveChainResume({
+      control,
+      chainJson: baseChainJson({ records: [1, 2, 3].map(reworkRecord), maxRounds: 3 }),
+    });
+    assert.equal(result.ok, false);
+    assert.match(result.error, /max rounds \(3\) already reached/);
+  });
+
+  it("refuses resume when the 2 × maxRounds hard cap would be exceeded even with budget remaining", () => {
+    const control = { chainId: "chain-test", container: "cid-1", pid: 0, status: "cancelled", round: 4 };
+    const reworkRecord = (round, reworkScope) => ({
+      round,
+      reworkScope,
+      implementJobId: "job-imp-" + round,
+      reviewJobId: "job-rev-" + round,
+      verdict: "needs-attention",
+      disposition: { disposition: "rework", reason: "needs-attention" },
+    });
+    const result = resolveChainResume({
+      control,
+      chainJson: baseChainJson({
+        records: [
+          reworkRecord(1, "full"),
+          reworkRecord(2, "mechanical"),
+          reworkRecord(3, "mechanical"),
+          reworkRecord(4, "mechanical"),
+        ],
+        maxRounds: 2,
+      }),
+    });
+    // Budget 1 < 2 remains, but round 5 > 2 × 2 would break the hard cap.
+    assert.equal(result.ok, false);
+    assert.match(result.error, /max rounds \(2\) already reached/);
   });
 
   it("errors when chain.json has no modelChain", () => {
