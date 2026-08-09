@@ -320,13 +320,15 @@ export function resolveDispatchBackend({ flags, phase, config }) {
   const backend = resolveBackend(flags);
   if (backend === "claude") {
     const resolved = resolveClaudeModel({ flag: flags.model, phase, config });
-    // Validate the WHOLE chain, not just the command-start model (kusabi
-    // #184 finding 1): a rework/strategize/resume round derives its model
-    // from the chain, so an opencode-shaped models.chain would otherwise
-    // throw mid-flight after round 1 — a `:variant` error blaming a model
-    // string the user never typed.  Failing here means the error surfaces
-    // before createChainDir / before any job is dispatched.
-    validateClaudeChain(resolved.chain);
+    // The chain is validated iff it can be consulted by a dispatch (kusabi
+    // #186).  With an explicit --model, clampModelDispatch pins EVERY phase
+    // (chain start and chain-resume alike) to that model, so the config
+    // chain is never read and an opencode-shaped models.chain must not block
+    // startup.  Without --model, a rework/strategize/resume round derives
+    // its model from the chain, so a bad models.chain must fail LOUDLY here
+    // — before createChainDir / before any job is dispatched — never
+    // mid-flight after round 1 (kusabi #184 finding 1).
+    if (!flags.model) validateClaudeChain(resolved.chain);
     // A :variant suffix cannot be expressed on the claude backend — reject
     // it up front (clear error, nonzero exit) instead of silently ignoring
     // it at dispatch time.

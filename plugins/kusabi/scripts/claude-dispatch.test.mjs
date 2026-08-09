@@ -1009,14 +1009,47 @@ describe("resolveDispatchBackend (claude)", () => {
     );
   });
 
-  it("--model does not bypass whole-chain validation", () => {
+  it("--model is explicit: whole-chain validation is skipped (the chain is never consulted)", () => {
+    const r = resolveDispatchBackend({
+      flags: { backend: "claude", model: "opus" },
+      phase: "implement",
+      config: { models: { chain: [["sonnet"], ["opencode-go/deepseek-v4-pro:max"]] } },
+    });
+    assert.equal(r.backend, "claude");
+    assert.equal(r.model, "opus");
+    assert.deepEqual(r.chain, [["sonnet"], ["opencode-go/deepseek-v4-pro:max"]]);
+  });
+
+  it("--model haiku with an opencode-shaped models.chain resolves (kusabi #186)", () => {
+    const r = resolveDispatchBackend({
+      flags: { backend: "claude", model: "haiku" },
+      phase: "implement",
+      config: { models: { chain: ["opencode/deepseek-v4-flash-free:max"] } },
+    });
+    assert.equal(r.backend, "claude");
+    assert.equal(r.model, "haiku");
+    assert.deepEqual(r.chain, ["opencode/deepseek-v4-flash-free:max"]);
+  });
+
+  it("without --model, an opencode-shaped models.chain still throws at command start", () => {
     assert.throws(
       () => resolveDispatchBackend({
-        flags: { backend: "claude", model: "opus" },
+        flags: { backend: "claude" },
         phase: "implement",
-        config: { models: { chain: [["sonnet"], ["opencode-go/deepseek-v4-pro:max"]] } },
+        config: { models: { chain: ["opencode/deepseek-v4-flash-free:max"] } },
       }),
-      /chain entry "opencode-go\/deepseek-v4-pro:max"/,
+      /chain entry "opencode\/deepseek-v4-flash-free:max" is not a claude model/,
+    );
+  });
+
+  it("--model opus:max with an opencode-shaped chain still fails fast on the :variant error", () => {
+    assert.throws(
+      () => resolveDispatchBackend({
+        flags: { backend: "claude", model: "opus:max" },
+        phase: "implement",
+        config: { models: { chain: ["opencode/deepseek-v4-flash-free:max"] } },
+      }),
+      /:variant suffix in model "opus:max"/,
     );
   });
 });
