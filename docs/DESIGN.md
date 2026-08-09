@@ -10,6 +10,8 @@ Establishes a division of labor where Claude Code serves as the **orchestrator**
 
 The motivation is cost structure: deepseek v4 Flash is cheap (zen's free-tier deepseek-v4-flash-free is also available) and empirically does better work than Haiku. This creates a structure where investigation and first-pass implementation run at essentially no cost, and only finishing work pays a small amount to Pro.
 
+Since #184 the worker slot is a backend choice: `--backend opencode|claude`, resolved once per command. opencode + deepseek remains the default for cost; the claude backend exists to run the same chain discipline over Claude models within a Max subscription — a separate quota from the orchestrator's own context. Mechanics and v1 limits are §3.5.11's contract, not restated here.
+
 Derived from: openai/codex-plugin-cc (Apache-2.0). Prompt assets (adversarial-review.md / review-output.schema.json) are transplanted with NOTICE attribution.
 
 ## 2. Architecture
@@ -18,10 +20,13 @@ Derived from: openai/codex-plugin-cc (Apache-2.0). Prompt assets (adversarial-re
 Claude Code (orchestrator)
   └─ /kusabi:task etc. commands → dedicated transfer subagent (agents/opencode-worker.md)
        └─ scripts/kusabi-companion.mjs (context firewall)
-            └─ opencode serve (HTTP API, 127.0.0.1 + OPENCODE_SERVER_PASSWORD, on-demand start)
-                 └─ deepseek worker
-                      └─ MCP: sunaba / shiori (configured in opencode.json on the opencode side)
-                           └─ sunaba container (merges into existing container via sandbox_attach)
+            ├─ opencode serve (HTTP API, 127.0.0.1 + OPENCODE_SERVER_PASSWORD, on-demand start)
+            │    └─ deepseek worker
+            │         └─ MCP: sunaba / shiori (configured in opencode.json on the opencode side)
+            │              └─ sunaba container (merges into existing container via sandbox_attach)
+            └─ claude -p (headless spawn, per job)
+                 └─ MCP: sunaba (--mcp-config generated from host ~/.claude.json entry)
+                      └─ sunaba container (merges into existing container via sandbox_attach)
 ```
 
 ### Adopted and rejected approaches
@@ -38,7 +43,7 @@ Claude Code (orchestrator)
 
 ## 3. Phase chain (core of this design)
 
-Long sessions cause context pollution, so work is split into phases, with **each phase = a new opencode session**. Cross-phase session reuse is prohibited (`--resume-last` / `--session` are for follow-ups within the same phase only).
+Long sessions cause context pollution, so work is split into phases, with **each phase = a new worker session** — session-id shape (opencode `ses_*` vs claude UUID) and resume semantics per backend are §3.5.11's contract. Cross-phase session reuse is prohibited (`--resume-last` / `--session` are for follow-ups within the same phase only).
 
 ### 3.1 Phase and tool matrix
 

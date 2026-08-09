@@ -1,20 +1,21 @@
-# kusabi (formerly opencode-plugin-cc)
+# kusabi
 
-Use [opencode](https://opencode.ai) from inside Claude Code — delegate tasks or run adversarial code reviews — without flooding Claude's context with opencode's intermediate output.
-
-Modeled on [openai/codex-plugin-cc](https://github.com/openai/codex-plugin-cc) (see [NOTICE](./NOTICE)), but built on opencode's HTTP server instead of a stdio broker.
+Use kusabi from inside Claude Code to delegate tasks or run adversarial code reviews to a worker backend — [opencode](https://opencode.ai) by default, or the Claude Code CLI in headless mode (`--backend claude`) — without flooding Claude's context with the worker's intermediate output.
 
 ## How it works
 
 ```
-Claude Code ——/kusabi:* slash command——> kusabi-companion.mjs ——HTTP——> opencode serve (127.0.0.1, on-demand)
-                                                │
-                                                ├─ SSE /event: progress tracking + automatic permission replies
-                                                ├─ state dir: full event log, job records, stored results
-                                                └─ stdout: rendered final result ONLY
+Claude Code ——/kusabi:* slash command——> kusabi-companion.mjs —┬—HTTP——> opencode serve (127.0.0.1, on-demand)
+                                                               └—spawn——> claude -p (headless, no server)
+                                                               │
+                                                               ├─ SSE /event: progress tracking + automatic permission replies
+                                                               ├─ state dir: full event log, job records, stored results
+                                                               └─ stdout: rendered final result ONLY
 ```
 
-The companion script is a context firewall: opencode's narration, tool logs, and raw events are persisted under `~/.kusabi/<dir-hash>/` and never reach Claude. Claude only sees the rendered final result (or a compact status summary).
+With `--backend claude` there is no serve process — the companion spawns `claude -p` per job and the same state-dir/stdout contract applies (see [Backends](#backends) for flags and v1 limits).
+
+The companion script is a context firewall: the worker's narration, tool logs, and raw events are persisted under `~/.kusabi/<dir-hash>/` and never reach Claude. Claude only sees the rendered final result (or a compact status summary).
 
 Key mechanics:
 
@@ -24,7 +25,7 @@ Key mechanics:
 
 ## Requirements
 
-- [opencode CLI](https://opencode.ai) installed and authenticated (`opencode auth login`)
+- [opencode CLI](https://opencode.ai) installed and authenticated (`opencode auth login`) — or the Claude Code CLI (`claude`) for `--backend claude` (binary via `CLAUDE_BIN`, default `claude`)
 - Node.js 18.18 or later
 
 ## Install
@@ -96,7 +97,7 @@ The `delegate` skill intentionally points at `--help` and `docs/DESIGN.md` for t
 surface and the chain semantics instead of restating them, so that improving kusabi does
 not silently make the skill wrong.
 
-Every result includes the opencode session ID; continue the same session in the opencode TUI with `opencode -s <session-id>`.
+Every result includes the backend's session ID — an opencode `ses_*` id, or the Claude Code CLI's UUID with `--backend claude`; continue an opencode session in the opencode TUI with `opencode -s <session-id>`.
 
 ## Model configuration
 
@@ -238,3 +239,5 @@ is visible in `status` and `result` output for each round.
 - `opencode serve` is started on demand and healthy servers are reused; a chain stops its serve on completion unless `--keep-serve` is passed. Idle serves with no running jobs are reaped on the next companion invocation after `KUSABI_SERVE_TTL_MS` (default 30 min). `serve-stop` (`node plugins/kusabi/scripts/kusabi-companion.mjs serve-stop`) kills the serve and removes its state file; while jobs are running it declines and points at `chain-cancel` unless `--force` is passed — stopping the serve does not stop a chain, which spawns a new serve on its next dispatch.
 - A chain holds the container it was given for its whole run. `status` names the chains that are running and the containers they hold; `chain-cancel <chainId>` is the way to stop one.
 - The opencode HTTP API is mid-migration (v1 → v2); the companion targets the v1 surface present in opencode ≥ 1.17.
+
+The adversarial-review prompt assets (`plugins/kusabi/prompts/adversarial-review.md`, `plugins/kusabi/schemas/review-output.schema.json`) are adapted from [openai/codex-plugin-cc](https://github.com/openai/codex-plugin-cc) (Apache-2.0, see [NOTICE](./NOTICE)).
