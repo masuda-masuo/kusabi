@@ -789,13 +789,23 @@ describe("backend field (kusabi #184 Job C)", () => {
     for (const r of legacy.roundRows) assert.equal(r.backend, null);
   });
 
-  it("the chain row's backend comes from the LAST record — the chain-resume convention", () => {
-    const chain = structuredClone(chainModernFixture());
-    chain.records[0].backend = "opencode";
-    chain.records[chain.records.length - 1].backend = "claude";
-    const parsed = parseChainRecord(chain, { workspaceSlug: "ws1" });
-    assert.equal(parsed.chainRow.backend, "claude");
+  it("a chain whose records agree stores that backend; a chain that switched backends between rounds is 'mixed' (kusabi #195)", () => {
+    // The chain-resume convention reads the LAST record — which equals the
+    // union of known phase backends for every chain that never changed
+    // backend.  A chain that DID switch (round 1 opencode, last round
+    // claude) has no single truthful value: kusabi #195 labels it "mixed"
+    // at ingest instead of the last record's value, so the by-backend split
+    // never counts the whole chain as whichever backend ran last.
+    const switched = structuredClone(chainModernFixture());
+    switched.records[0].backend = "opencode";
+    switched.records[switched.records.length - 1].backend = "claude";
+    const parsed = parseChainRecord(switched, { workspaceSlug: "ws1" });
+    assert.equal(parsed.chainRow.backend, "mixed");
     assert.equal(parsed.roundRows[0].backend, "opencode"); // per-record, verbatim
+
+    const pure = structuredClone(chainModernFixture());
+    for (const rec of pure.records) rec.backend = "claude";
+    assert.equal(parseChainRecord(pure, { workspaceSlug: "ws1" }).chainRow.backend, "claude");
   });
 
   it("the chain walker stores what the files say: 'claude' verbatim, absent as NULL", () => {
@@ -849,6 +859,127 @@ describe("backend field (kusabi #184 Job C)", () => {
     );
     assert.equal(jobByBackend["job-claude"], "claude");
     assert.equal(jobByBackend["job-legacy"], null);
+
+    fs.rmSync(stateRoot, { recursive: true, force: true });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// per-phase backend attribution (kusabi #195) — kusabi #192 made backend a
+// per-phase property (implement vs review can differ within one round), so
+// the round row carries `reviewBackend` too and a chain whose known phase
+// backends disagree is labelled "mixed" instead of the last record's value.
+// ---------------------------------------------------------------------------
+
+describe("per-phase backend attribution (kusabi #195)", () => {
+  it("carries reviewBackend per round and labels a phase-mixed chain 'mixed'", () => {
+    // The #192 shape: implement on claude, review on opencode, in every round.
+    const mixedChain = structuredClone(chainModernFixture());
+    for (const rec of mixedChain.records) {
+      rec.backend = "claude";
+      rec.reviewBackend = "opencode";
+    }
+    const parsed = parseChainRecord(mixedChain, { workspaceSlug: "ws1" });
+
+    assert.ok(parsed.roundRows.length >= 1);
+    for (const r of parsed.roundRows) {
+      assert.equal(r.backend, "claude");
+      assert.equal(r.reviewBackend, "opencode");
+    }
+    // NOT "claude" (the last record's implement backend): a chain whose
+    // phases disagree gets its own bucket rather than polluting one side.
+    assert.equal(parsed.chainRow.backend, "mixed");
+  });
+
+  it("a chain whose phases all agree keeps the last record's backend verbatim", () => {
+    const pureChain = structuredClone(chainModernFixture());
+    for (const rec of pureChain.records) {
+      rec.backend = "claude";
+      rec.reviewBackend = "claude";
+    }
+    const parsed = parseChainRecord(pureChain, { workspaceSlug: "ws1" });
+    assert.equal(parsed.chainRow.backend, "claude");
+    for (const r of parsed.roundRows) assert.equal(r.reviewBackend, "claude");
+  });
+
+  it("a cross-round backend switch is labelled 'mixed' at ingest; each round stays verbatim", () => {
+    // Rework rounds ARE implement rounds, so each round's own `backend` is
+    // already truthful (kusabi #194) and the per-round rows carry the switch
+    // losslessly.  The CHAIN row, though, cannot honestly be either backend:
+    // the union rule (kusabi #195) labels a chain that switched between
+    // rounds "mixed", exactly like a within-round phase mix.
+    const chain = structuredClone(chainModernFixture());
+    assert.ok(chain.records.length >= 2, "fixture needs at least 2 rounds");
+    chain.records[0].backend = "opencode";
+    chain.records[0].reviewBackend = "opencode";
+    chain.records[chain.records.length - 1].backend = "claude";
+    chain.records[chain.records.length - 1].reviewBackend = "claude";
+    const parsed = parseChainRecord(chain, { workspaceSlug: "ws1" });
+    assert.equal(parsed.chainRow.backend, "mixed");
+    assert.equal(parsed.roundRows[0].backend, "opencode"); // still verbatim
+    assert.equal(parsed.roundRows[0].reviewBackend, "opencode");
+    assert.equal(parsed.roundRows[parsed.roundRows.length - 1].backend, "claude");
+  });
+
+  it("one phase-mixed round is enough to label the whole chain 'mixed'", () => {
+    const chain = structuredClone(chainModernFixture());
+    assert.ok(chain.records.length >= 2, "fixture needs at least 2 rounds");
+    for (const rec of chain.records) {
+      rec.backend = "opencode";
+      rec.reviewBackend = "opencode";
+    }
+    chain.records[0].reviewBackend = "claude"; // one round ran two backends
+    const parsed = parseChainRecord(chain, { workspaceSlug: "ws1" });
+    assert.equal(parsed.chainRow.backend, "mixed");
+  });
+
+  it("a legacy chain with no backend fields anywhere ingests exactly as before: all NULL", () => {
+    const legacy = parseChainRecord(chainOldFixture(), { workspaceSlug: "ws1" });
+    assert.equal(legacy.chainRow.backend, null);
+    assert.ok(legacy.roundRows.length >= 1);
+    for (const r of legacy.roundRows) {
+      assert.equal(r.backend, null);
+      // Never backfilled from `backend`: a pre-#192 record's review backend
+      // is genuinely unknown, which is not the same fact as "the same".
+      assert.equal(r.reviewBackend, null);
+    }
+  });
+
+  it("a pre-#192 record (backend but no reviewBackend) leaves review_backend NULL and the chain unmixed", () => {
+    const chain = structuredClone(chainModernFixture());
+    for (const rec of chain.records) rec.backend = "claude";
+    const parsed = parseChainRecord(chain, { workspaceSlug: "ws1" });
+    assert.equal(parsed.chainRow.backend, "claude");
+    for (const r of parsed.roundRows) assert.equal(r.reviewBackend, null);
+  });
+
+  it("the chain walker stores review_backend and the 'mixed' chain label in the database", () => {
+    const stateRoot = makeTempStateRoot();
+    const mixedChain = structuredClone(chainModernFixture());
+    for (const rec of mixedChain.records) {
+      rec.backend = "claude";
+      rec.reviewBackend = "opencode";
+    }
+    writeChainDir(stateRoot, "ws1", "chain-ms1g7lesd89b", mixedChain);
+    writeChainDir(stateRoot, "ws1", "chain-mrv4jobge6df", chainOldFixture());
+
+    const db = openMetricsDb(":memory:");
+    const result = ingestChainDirectory(db, stateRoot);
+    assert.equal(result.chainsIngested, 2);
+
+    const chainByBackend = Object.fromEntries(
+      db.prepare("SELECT chain_id, backend FROM chain").all().map((r) => [r.chain_id, r.backend]),
+    );
+    assert.equal(chainByBackend["chain-ms1g7lesd89b"], "mixed");
+    assert.equal(chainByBackend["chain-mrv4jobge6df"], null);
+
+    const roundRows = db.prepare("SELECT chain_id, backend, review_backend FROM round").all();
+    const mixedRounds = roundRows.filter((r) => r.chain_id === "chain-ms1g7lesd89b");
+    assert.ok(mixedRounds.length >= 1);
+    assert.equal(mixedRounds.every((r) => r.backend === "claude"), true);
+    assert.equal(mixedRounds.every((r) => r.review_backend === "opencode"), true);
+    assert.equal(roundRows.filter((r) => r.chain_id === "chain-mrv4jobge6df")
+      .every((r) => r.review_backend === null), true);
 
     fs.rmSync(stateRoot, { recursive: true, force: true });
   });
