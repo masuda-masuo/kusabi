@@ -17,9 +17,13 @@
 //     the command-start model, so the model can never change — or fail —
 //     mid-chain.  The default chain is claude-native (CLAUDE_DEFAULT_CHAIN);
 //     the opencode built-in chain is never used by this backend.
-//   - No session resume: the `session` option is ignored and every dispatch
-//     starts a fresh `claude -p` session (resume is Job B).  The fresh
-//     session id is recorded on the job record like the opencode path does.
+//   - Session resume: the `session` option is honored \u2014 `--resume
+//     <session-id>` is appended to argv, so chain rework rounds, chain-resume,
+//     and `--session` / `--resume-last` continue the previous session instead
+//     of starting blank.  The session id recorded on the job record always
+//     comes from the CLI's JSON result (the single capture source); an
+//     opencode-shaped session id (`ses_*`) is rejected with a loud
+//     cross-backend error before anything is spawned.
 //   - watchdogS (stall detection) is a NO-OP in v1: the child is bounded
 //     only by timeoutS, which SIGKILLs the child's WHOLE process group
 //     (claude + its children — MCP server, running tool commands) so no
@@ -531,14 +535,18 @@ export function disallowedToolsForAgent(agent) {
  * Contract (field-verified, kusabi #184): `claude -p --strict-mcp-config
  * --setting-sources "" --output-format json --model <m> --allowedTools <csv>
  * --disallowedTools <csv> --mcp-config <path>
- * [--append-system-prompt <agent-body>]`.  The prompt is NOT on argv (I5) —
- * it is written to the child's stdin, so it cannot leak into `ps` output or
- * argv-logged transcripts, and it is never length-limited by the argv cap.
- * `--strict-mcp-config` + `--setting-sources ""` (I2) isolate the session
- * from ambient settings: only the generated `--mcp-config` applies, so an
- * MCP tool call without a matching `--allowedTools` entry is blocked (the
- * deny-by-default posture).  `--disallowedTools` (I1/I3) is the
- * belt-and-braces deny for tools that must never run.
+ * [--append-system-prompt <agent-body>] [--resume <session-id>]`.  The prompt
+ * is NOT on argv (I5) — it is written to the child's stdin, so it cannot leak
+ * into `ps` output or argv-logged transcripts, and it is never
+ * length-limited by the argv cap.  `--strict-mcp-config` + `--setting-sources
+ * ""` (I2) isolate the session from ambient settings: only the generated
+ * `--mcp-config` applies, so an MCP tool call without a matching
+ * `--allowedTools` entry is blocked (the deny-by-default posture).
+ * `--disallowedTools` (I1/I3) is the belt-and-braces deny for tools that must
+ * never run.  `--resume <session-id>` is appended when a session is given —
+ * a resumed session gets the SAME isolation flags (strict MCP config,
+ * allow/deny lists) as a fresh one; resume is a transport detail, not a
+ * permission change.
  *
  * @param {object} opts
  * @param {string} opts.model
@@ -546,9 +554,12 @@ export function disallowedToolsForAgent(agent) {
  * @param {string} opts.disallowedTools — CSV.
  * @param {string} opts.mcpConfigPath
  * @param {string|null} [opts.systemPrompt]
+ * @param {string|null|undefined} [opts.session] — when present, append
+ *        `--resume <session>`.  The opencode-shaped `ses_*` guard lives in
+ *        claudeDispatch (the single decision point), not here.
  * @returns {string[]}
  */
-export function buildClaudeArgs({ model, allowedTools, disallowedTools, mcpConfigPath, systemPrompt }) {
+export function buildClaudeArgs({ model, allowedTools, disallowedTools, mcpConfigPath, systemPrompt, session }) {
   const args = [
     "-p",
     "--strict-mcp-config",
@@ -561,6 +572,9 @@ export function buildClaudeArgs({ model, allowedTools, disallowedTools, mcpConfi
   ];
   if (systemPrompt) {
     args.push("--append-system-prompt", systemPrompt);
+  }
+  if (session) {
+    args.push("--resume", session);
   }
   return args;
 }
@@ -731,8 +745,13 @@ export function runClaudeProcess({ bin, args, cwd, timeoutS, promptText }) {
  * @param {string} [opts.promptText]
  * @param {string|null} [opts.agent]
  * @param {string|null} [opts.phase]
- * @param {string|null|undefined} [opts.session] — IGNORED in v1 (resume is
- *        Job B): every dispatch starts a fresh session.
+ * @param {string|null|undefined} [opts.session] — when present, the dispatch
+ *        resumes that session via `claude -p --resume <session>` (chain
+ *        rework rounds, chain-resume, and `--session` / `--resume-last` all
+ *        resolve to this).  An opencode-shaped id (`ses_*`) is rejected with
+ *        a cross-backend error before anything is spawned.  The session id
+ *        recorded on the job comes from the CLI's JSON result, never from
+ *        this option.
  * @param {object|null|undefined} [opts.tools]  — deny map, applied to the
  *        allowlist so explicit denies are never silently ignored (user
  *        flags are translated to mcp__sunaba__* tool names by cmdTask
@@ -747,6 +766,21 @@ export function runClaudeProcess({ bin, args, cwd, timeoutS, promptText }) {
  * @returns {Promise<{ job: object, resultText: string, stateDir: string }>}
  */
 export async function claudeDispatch(opts) {
+  // ---- cross-backend session guard (the single decision point for "may
+  // this session be resumed here") ----
+  // An opencode session id (`ses_*`) can never be resumed on the claude
+  // backend: transcripts live under different roots and `claude -p --resume`
+  // would silently start a fresh-looking session the user thinks continues
+  // their opencode work.  Fail LOUDLY, before any process is spawned or any
+  // job record exists — this is a config-level error, not a failed job.
+  if (typeof opts.session === "string" && opts.session.startsWith("ses_")) {
+    throw new Error(
+      `opencode session ${opts.session} cannot be resumed on the claude backend \u2014 ` +
+      "ses_* session ids belong to opencode; run the command without --backend claude " +
+      "(or resume the claude session id on this backend)"
+    );
+  }
+
   // v1 model selection: explicit model, else the chain's first route.
   // tiers/round/tierIndex are accepted for contract parity but the tier
   // ladder is NOT walked — one model per phase.  The fallback route below
@@ -773,6 +807,12 @@ export async function claudeDispatch(opts) {
     disallowedTools,
     mcpConfigPath,
     systemPrompt,
+    // Resume: the session (from --session / --resume-last / a chain rework
+    // round / chain-resume) becomes `--resume <session-id>` on argv.  The
+    // ses_* guard above already rejected opencode-shaped ids; the id
+    // recorded on the job comes from the CLI's JSON result (below), never
+    // from this option.
+    session: opts.session,
   });
 
   // ---- job record (opencode-path shape + backend) ----

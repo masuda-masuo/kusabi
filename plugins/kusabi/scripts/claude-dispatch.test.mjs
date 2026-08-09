@@ -12,6 +12,7 @@ import assert from "node:assert/strict";
 import os from "node:os";
 import path from "node:path";
 import fs from "node:fs";
+import crypto from "node:crypto";
 import { spawnSync } from "node:child_process";
 
 import {
@@ -34,6 +35,7 @@ import {
   claudeDispatch,
 } from "./claude-dispatch.mjs";
 import { resolveBackend, resolveDispatchBackend } from "./kusabi-companion.mjs";
+import { runImplementPhase } from "./chain-phases.mjs";
 import { WRITE_TOOL_NAMES, implementDenyTools, firstRoute } from "./cli.mjs";
 import { stateDirFor, readJson } from "./state-paths.mjs";
 import { loadJob, jobDir } from "./job-store.mjs";
@@ -219,6 +221,39 @@ describe("buildClaudeArgs", () => {
     const sourcesIdx = args.indexOf("--setting-sources");
     assert.ok(sourcesIdx > 0);
     assert.equal(args[sourcesIdx + 1], "");
+  });
+
+  it("appends --resume <session> when a session is given (nothing else changes)", () => {
+    const fresh = buildClaudeArgs({
+      model: "opus",
+      allowedTools: "a,b",
+      disallowedTools: "Bash",
+      mcpConfigPath: "/tmp/mcp.json",
+      systemPrompt: null,
+    });
+    const resumed = buildClaudeArgs({
+      model: "opus",
+      allowedTools: "a,b",
+      disallowedTools: "Bash",
+      mcpConfigPath: "/tmp/mcp.json",
+      systemPrompt: null,
+      session: "claude-session-abc123",
+    });
+    // The resume flag is appended at the END: strict flags, stdin transport,
+    // and allow/deny lists are byte-identical to a fresh dispatch.
+    assert.deepEqual(resumed.slice(0, fresh.length), fresh);
+    assert.deepEqual(resumed.slice(fresh.length), ["--resume", "claude-session-abc123"]);
+  });
+
+  it("omits --resume when no session is given", () => {
+    const args = buildClaudeArgs({
+      model: "opus",
+      allowedTools: "a",
+      disallowedTools: "Bash",
+      mcpConfigPath: "/tmp/mcp.json",
+      systemPrompt: null,
+    });
+    assert.ok(!args.includes("--resume"));
   });
 });
 
@@ -516,11 +551,18 @@ if (mode === "slow" || mode === "slow-with-child") {
   }
   setInterval(() => {}, 1000); // never writes, never exits — the dispatch timeout must kill us
 } else {
+  const argv = process.argv.slice(2);
+  const resumeAt = argv.indexOf("--resume");
+  // "resume-echo" models the real CLI contract: when resumed, the JSON
+  // result carries the SAME session id that was passed via --resume.
+  const sessionId = mode === "resume-echo" && resumeAt >= 0
+    ? argv[resumeAt + 1]
+    : "claude-session-abc123";
   const result = {
     type: "result",
     is_error: false,
     result: "implemented the thing per the brief",
-    session_id: "claude-session-abc123",
+    session_id: sessionId,
     usage: {
       input_tokens: 1000,
       output_tokens: 500,
@@ -802,13 +844,129 @@ describe("claudeDispatch (fake claude binary)", () => {
     assert.ok(csv.includes("mcp__sunaba__verify_in_container"));
   });
 
-  it("ignores the session option in v1 and records the fresh session id", async () => {
+  it("resumes a session: --resume <id> reaches argv, the job keeps the result's session id", async () => {
     const { job } = await claudeDispatch(ctx.dispatchOptions({
-      session: "old-session-xyz",
+      session: "claude-session-round1",
     }));
-    // Resume is Job B: the dispatch always starts a fresh claude session.
+
+    // The fake claude observed --resume <session> on its argv.
+    const args = JSON.parse(fs.readFileSync(ctx.argsLog, "utf8").trim());
+    const resumeIdx = args.indexOf("--resume");
+    assert.ok(resumeIdx > 0, "a given session must be passed via --resume");
+    assert.equal(args[resumeIdx + 1], "claude-session-round1");
+    // Resume is a transport detail: the isolation flags stay exactly as a
+    // fresh dispatch builds them (strict MCP, empty setting sources, the
+    // allowlist; the prompt still travels on stdin).
+    assert.equal(args[1], "--strict-mcp-config");
+    assert.equal(args[2], "--setting-sources");
+    assert.equal(args[3], "");
+    assert.equal(args[9], ALLOWED_TOOLS.implement);
+    // The prompt still travels on stdin (I5), never on argv.
+    assert.ok(!args.includes("Do the thing."));
+    assert.equal(fs.readFileSync(ctx.stdinLog, "utf8"), "Do the thing.");
+
+    // The recorded session id comes from the CLI's JSON result (the single
+    // capture source) — never pre-filled from the option.
+    assert.equal(job.status, "completed");
     assert.equal(job.sessionID, "claude-session-abc123");
-    assert.notEqual(job.sessionID, "old-session-xyz");
+  });
+
+  it("chain rework round on the claude backend: round 2 receives the round-1 sessionID, end to end", async () => {
+    // The context-continuity fix pinned at BOTH seams: chain-phases derives
+    // the rework round's session from previousRecord.sessionID, and the
+    // claude dispatch honors it as `--resume` on argv (instead of starting
+    // blank).  runImplementPhase is imported UNCHANGED from chain-phases.mjs.
+    const calls = [];
+    const stubDispatch = async (opts) => {
+      calls.push(opts);
+      const round = opts.round ?? 1;
+      return {
+        job: {
+          id: `job-imp-${round}`,
+          status: "completed",
+          modelEntry: "opus",
+          modelVariant: null,
+          fallbacks: null,
+          sessionID: `claude-uuid-round${round}`,
+          usage: null,
+          error: null,
+        },
+        resultText: "implemented",
+      };
+    };
+    const common = {
+      cwd: ctx.cwd,
+      chainId: "chain-x",
+      implementText: "Do the thing.",
+      modelChain: [["opus"]],
+      tierIndex: 0,
+      flagsModel: null,
+      resumeMethod: { type: "continue_session" },
+      _dispatchWithFallback: stubDispatch,
+    };
+
+    // Round 1: fresh dispatch — no session to continue.
+    await runImplementPhase({
+      ...common, round: 1, isFirstRound: true, previousRecord: null,
+      session: undefined, useNewSession: false,
+    });
+    assert.equal(calls[0].session, undefined);
+
+    // Round 2 (rework): chain-phases resolves the session from the previous
+    // round's record — the claude chain must NOT start blank.
+    const second = await runImplementPhase({
+      ...common, round: 2, isFirstRound: false,
+      previousRecord: { sessionID: "claude-uuid-round1" },
+      session: undefined, useNewSession: false,
+    });
+    assert.equal(calls[1].session, "claude-uuid-round1");
+    assert.equal(second.session, "claude-uuid-round1");
+
+    // The journey's end: that same session reaches the claude CLI as
+    // `--resume <id>` via the real dispatch.
+    const { job } = await claudeDispatch(ctx.dispatchOptions({
+      round: 2,
+      session: calls[1].session,
+    }));
+    const lines = fs.readFileSync(ctx.argsLog, "utf8").trim().split("\n");
+    const round2Args = JSON.parse(lines[lines.length - 1]);
+    const resumeIdx = round2Args.indexOf("--resume");
+    assert.ok(resumeIdx > 0, "a rework round must resume the previous session");
+    assert.equal(round2Args[resumeIdx + 1], "claude-uuid-round1");
+    assert.equal(job.status, "completed");
+  });
+
+  it("resume keeps the session id through the CLI's JSON result (single capture source)", async () => {
+    ctx.restore();
+    ctx = fakeClaudeContext("resume-echo");
+    const { job } = await claudeDispatch(ctx.dispatchOptions({
+      session: "claude-uuid-echo-1",
+    }));
+    assert.equal(job.status, "completed");
+    // The fake modeled the real CLI contract: `--resume <id>` in, the SAME
+    // id out in the JSON result — and the job keeps it via the EXISTING
+    // capture path (parsed.session_id), never pre-filled from opts.
+    assert.equal(job.sessionID, "claude-uuid-echo-1");
+    const args = JSON.parse(fs.readFileSync(ctx.argsLog, "utf8").trim());
+    assert.equal(args[args.indexOf("--resume") + 1], "claude-uuid-echo-1");
+  });
+
+  it("rejects an opencode-shaped session id (ses_*) loudly, before any process or job record", async () => {
+    await assert.rejects(
+      () => claudeDispatch(ctx.dispatchOptions({ session: "ses_xyz" })),
+      (err) => {
+        // The error names BOTH backends: the opencode session and the claude
+        // backend it cannot be resumed on.
+        assert.match(err.message, /opencode session ses_xyz cannot be resumed on the claude backend/);
+        assert.match(err.message, /ses_\* session ids belong to opencode/);
+        return true;
+      },
+    );
+    // Nothing was spawned...
+    assert.equal(fs.readFileSync(ctx.argsLog, "utf8").trim(), "");
+    assert.equal(fs.readFileSync(ctx.pidsLog, "utf8").trim(), "");
+    // ...and no job record was left behind (nothing recorded "running").
+    assert.deepEqual(fs.readdirSync(path.join(ctx.stateDir, "jobs")), []);
   });
 
   it("rejects a :variant model at dispatch time too", async () => {
@@ -952,6 +1110,172 @@ describe("CLI --read-only wiring (subprocess)", () => {
       assert.ok(!args.includes("do the thing"));
       assert.match(fs.readFileSync(stdinLog, "utf8"), /do the thing/);
       assert.match(fs.readFileSync(stdinLog, "utf8"), /<task>/);
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+});
+
+// =========================================================================
+// CLI session wiring (subprocess) — kusabi #184 Job B
+// =========================================================================
+// Both backends share ONE job store, so `--resume-last` must select the
+// previous job of the SAME backend as the current dispatch.  These tests
+// drive the real CLI (cmdTask) with fixture job records and observe the
+// session that actually reaches the fake claude on argv.
+
+describe("CLI session wiring (subprocess)", () => {
+  const COMPANION_SCRIPT = path.join(import.meta.dirname, "kusabi-companion.mjs");
+
+  // The subprocess resolves its workspace state dir via stateDirFor(cwd),
+  // which hashes the cwd under the state root — replicate that here so the
+  // fixture jobs land where cmdTask looks for them.
+  function hashedWorkspaceDir(stateRootDir, cwd) {
+    const hash = crypto.createHash("sha256").update(cwd).digest("hex").slice(0, 12);
+    return path.join(stateRootDir, hash);
+  }
+
+  function writeFixtureJob(jobsDir, id, job) {
+    const dir = path.join(jobsDir, id);
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, "job.json"), JSON.stringify({ id, ...job }), "utf8");
+  }
+
+  function setup(tmp, { jobs }) {
+    const binPath = path.join(tmp, "fake-claude.mjs");
+    fs.writeFileSync(binPath, FAKE_CLAUDE_SOURCE, "utf8");
+    fs.chmodSync(binPath, 0o755);
+    const argsLog = path.join(tmp, "args.ndjson");
+    const pidsLog = path.join(tmp, "pids");
+    const stdinLog = path.join(tmp, "stdin.txt");
+    fs.writeFileSync(argsLog, "", "utf8");
+    fs.writeFileSync(pidsLog, "", "utf8");
+    fs.writeFileSync(stdinLog, "", "utf8");
+    const mcpSource = path.join(tmp, "claude.json");
+    fs.writeFileSync(mcpSource, JSON.stringify({ mcpServers: { sunaba: SUNABA_MCP } }), "utf8");
+
+    const stateRoot = path.join(tmp, "state");
+    const jobsDir = path.join(hashedWorkspaceDir(stateRoot, tmp), "jobs");
+    for (const job of jobs) writeFixtureJob(jobsDir, job.id, job);
+
+    const env = { ...process.env };
+    delete env.KUSABI_WORKER_CONTEXT;
+    env.CLAUDE_BIN = binPath;
+    env.KUSABI_CLAUDE_MCP_SOURCE = mcpSource;
+    env.KUSABI_STATE_DIR = stateRoot;
+    env.FAKE_CLAUDE_MODE = "ok";
+    env.FAKE_CLAUDE_ARGS_LOG = argsLog;
+    env.FAKE_CLAUDE_PIDS = pidsLog;
+    env.FAKE_CLAUDE_STDIN_LOG = stdinLog;
+    return { env, argsLog, stdinLog };
+  }
+
+  it("--backend claude --resume-last resumes the last CLAUDE job, skipping a newer opencode job", () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-claude-resume-last-"));
+    try {
+      const { env, argsLog } = setup(tmp, {
+        jobs: [
+          // Newer job: opencode (missing backend field = opencode).
+          { id: "job-opencode", kind: "task", status: "completed", sessionID: "ses_opencode_latest", startedAt: "2026-08-02T00:00:00.000Z" },
+          // Older job: claude.
+          { id: "job-claude", kind: "task", status: "completed", backend: "claude", sessionID: "claude-uuid-older", startedAt: "2026-08-01T00:00:00.000Z" },
+        ],
+      });
+
+      const result = spawnSync(
+        process.execPath,
+        [COMPANION_SCRIPT, "task", "--backend", "claude", "--resume-last", "do the thing"],
+        { encoding: "utf8", cwd: tmp, env, timeout: 20_000 },
+      );
+      assert.equal(result.status, 0, `expected success, got: ${result.stdout} ${result.stderr}`);
+      const args = JSON.parse(fs.readFileSync(argsLog, "utf8").trim());
+      const resumeIdx = args.indexOf("--resume");
+      assert.ok(resumeIdx > 0, "--resume-last must pass --resume to the claude dispatch");
+      assert.equal(args[resumeIdx + 1], "claude-uuid-older");
+      assert.notEqual(args[resumeIdx + 1], "ses_opencode_latest");
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("--backend claude --resume-last errors naming the backend when only opencode jobs exist", () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-claude-resume-last-"));
+    try {
+      const { env, argsLog } = setup(tmp, {
+        jobs: [
+          { id: "job-opencode", kind: "task", status: "completed", sessionID: "ses_opencode_only", startedAt: "2026-08-02T00:00:00.000Z" },
+        ],
+      });
+
+      const result = spawnSync(
+        process.execPath,
+        [COMPANION_SCRIPT, "task", "--backend", "claude", "--resume-last", "do the thing"],
+        { encoding: "utf8", cwd: tmp, env, timeout: 20_000 },
+      );
+      assert.notEqual(result.status, 0);
+      assert.match(result.stdout, /--resume-last: no previous claude task session found for this directory/);
+      // Nothing was dispatched — the selection error fires before the run.
+      assert.equal(fs.readFileSync(argsLog, "utf8").trim(), "");
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("--backend claude --session <id> passes the session through cmdTask as --resume", () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-claude-session-"));
+    try {
+      const { env, argsLog } = setup(tmp, { jobs: [] });
+
+      const result = spawnSync(
+        process.execPath,
+        [COMPANION_SCRIPT, "task", "--backend", "claude", "--session", "claude-uuid-cli", "do the thing"],
+        { encoding: "utf8", cwd: tmp, env, timeout: 20_000 },
+      );
+      assert.equal(result.status, 0, `expected success, got: ${result.stdout} ${result.stderr}`);
+      const args = JSON.parse(fs.readFileSync(argsLog, "utf8").trim());
+      const resumeIdx = args.indexOf("--resume");
+      assert.ok(resumeIdx > 0, "--session must pass --resume to the claude dispatch");
+      assert.equal(args[resumeIdx + 1], "claude-uuid-cli");
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("--backend claude --session ses_* fails loudly through the CLI, before any dispatch", () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-claude-session-"));
+    try {
+      const { env, argsLog } = setup(tmp, { jobs: [] });
+
+      const result = spawnSync(
+        process.execPath,
+        [COMPANION_SCRIPT, "task", "--backend", "claude", "--session", "ses_opencode_1", "do the thing"],
+        { encoding: "utf8", cwd: tmp, env, timeout: 20_000 },
+      );
+      assert.notEqual(result.status, 0);
+      assert.match(result.stdout, /opencode session ses_opencode_1 cannot be resumed on the claude backend/);
+      // The guard fires before the process spawns and before any job record:
+      // nothing was dispatched and nothing was left recorded "running".
+      assert.equal(fs.readFileSync(argsLog, "utf8").trim(), "");
+      const jobsDir = path.join(hashedWorkspaceDir(path.join(tmp, "state"), tmp), "jobs");
+      assert.deepEqual(fs.readdirSync(jobsDir), []);
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("--backend claude --phase <p> --resume-last errors naming the phase and the backend", () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-claude-resume-last-"));
+    try {
+      const { env, argsLog } = setup(tmp, { jobs: [] });
+
+      const result = spawnSync(
+        process.execPath,
+        [COMPANION_SCRIPT, "task", "--backend", "claude", "--phase", "implement", "--resume-last", "do the thing"],
+        { encoding: "utf8", cwd: tmp, env, timeout: 20_000 },
+      );
+      assert.notEqual(result.status, 0);
+      assert.match(result.stdout, /--resume-last: no previous implement claude session found for this directory/);
+      assert.equal(fs.readFileSync(argsLog, "utf8").trim(), "");
     } finally {
       fs.rmSync(tmp, { recursive: true, force: true });
     }
