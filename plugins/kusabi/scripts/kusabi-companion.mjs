@@ -7,7 +7,7 @@
 // session never sees intermediate narration, tool logs, or raw events.
 
 
-import { parseArgs, parseModel, resolveModel, reviewDenyTools, WRITE_TOOL_NAMES, validateChainEntries } from "./cli.mjs";
+import { parseArgs, parseModel, resolveModel, firstRoute, reviewDenyTools, WRITE_TOOL_NAMES, validateChainEntries, splitRouteBackend, resolveChainBackend, stripClaudePrefixChain } from "./cli.mjs";
 import { renderReview, renderChainShow, renderJobLine, renderHeader, extractJson, renderFollowupDraft } from "./render.mjs";
 import { hasSectionHeading, parseDeliverables, parseSmoke, parseOrchestratorSignature, briefRequestsPublish } from "./brief-parsing.mjs";
 import { deriveDisposition } from "./disposition.mjs";
@@ -304,11 +304,27 @@ export function resolveBackend(flags) {
 }
 
 /**
- * Resolve `{ dispatch, backend }` for a job-creating command: the backend
- * decides BOTH the dispatch function (claudeDispatch vs
- * dispatchWithFallback — the single decision point; the chain phases stay
- * backend-blind) and the model resolution syntax (claude models are bare
- * aliases / full ids, opencode models are provider/model).
+ * Resolve `{ dispatch, backend, model, chain }` for ONE phase of a
+ * job-creating command.  The backend decides BOTH the dispatch function
+ * (claudeDispatch vs dispatchWithFallback — the single decision point; the
+ * chain phases stay backend-blind) and the model resolution syntax (claude
+ * models are bare aliases / full ids, opencode models are provider/model).
+ *
+ * Backend selection (kusabi #192): the `--backend` flag, when given, forces
+ * EVERY phase onto that backend and wins over the config (current behaviour,
+ * including clampModelDispatch on claude).  With NO `--backend` flag, the
+ * per-entry prefixes decide: a chain whose entries carry `claude/` selects
+ * the claude backend for this phase; otherwise opencode.  `chain` resolves
+ * the implement route-chain and the review route-chain independently, each
+ * from `models.phases.<phase>` with fallback to `models.chain`, then the
+ * built-in default — same precedence as resolveModel / resolveClaudeModel.
+ * The built-in default chain remains opencode.
+ *
+ * Invariant (kusabi #192): one phase's chain array is single-backend — an
+ * array mixing `claude/` and opencode entries fails LOUDLY here, at command
+ * start, before createChainDir / before any job is dispatched.  The check is
+ * skipped only when the chain is never consulted (explicit `--backend claude`
+ * plus `--model` pins every phase — kusabi #186's carve-out).
  *
  * @param {object} opts
  * @param {object} opts.flags
@@ -318,9 +334,15 @@ export function resolveBackend(flags) {
  *             model: object|string|undefined, chain: (string|string[])[] }}
  */
 export function resolveDispatchBackend({ flags, phase, config }) {
-  const backend = resolveBackend(flags);
-  if (backend === "claude") {
+  const backendFlag = resolveBackend(flags);
+
+  if (backendFlag === "claude") {
     const resolved = resolveClaudeModel({ flag: flags.model, phase, config });
+    // Entries written for the per-phase syntax may carry the claude/ prefix;
+    // the flag already forced this backend, so the prefix is redundant but
+    // must not leak into models — strip it before validating/deriving.
+    const chain = stripClaudePrefixChain(resolved.chain);
+    const model = resolved.model == null ? undefined : splitRouteBackend(String(resolved.model)).route;
     // The chain is validated iff it can be consulted by a dispatch (kusabi
     // #186).  With an explicit --model, clampModelDispatch pins EVERY phase
     // (chain start and chain-resume alike) to that model, so the config
@@ -328,16 +350,67 @@ export function resolveDispatchBackend({ flags, phase, config }) {
     // startup.  Without --model, a rework/strategize/resume round derives
     // its model from the chain, so a bad models.chain must fail LOUDLY here
     // — before createChainDir / before any job is dispatched — never
-    // mid-flight after round 1 (kusabi #184 finding 1).
-    if (!flags.model) validateClaudeChain(resolved.chain);
+    // mid-flight after round 1 (kusabi #184 finding 1).  The single-backend
+    // invariant (kusabi #192) is checked on the RAW chain: an opencode entry
+    // with no :variant would otherwise pass validateClaudeChain and silently
+    // run as a claude model.
+    if (!flags.model) {
+      resolveChainBackend(resolved.chain);
+      validateClaudeChain(chain);
+    }
     // A :variant suffix cannot be expressed on the claude backend — reject
     // it up front (clear error, nonzero exit) instead of silently ignoring
     // it at dispatch time.
-    if (resolved.model != null) validateClaudeModel(resolved.model);
-    return { dispatch: claudeDispatch, backend, model: resolved.model, chain: resolved.chain };
+    if (model != null) validateClaudeModel(model);
+    return { dispatch: claudeDispatch, backend: "claude", model, chain };
   }
+
+  // No --backend flag (or an explicit opencode flag): the entries decide.
+  // The chain is resolved FIRST (independent of the flag) because the
+  // backend decision — and therefore the --model syntax — depends on it: a
+  // claude-native chain takes a bare alias / full id for --model, an
+  // opencode chain takes provider/model.  The single-backend invariant runs
+  // on every chain a dispatch reads, so a mixed array fails at command start
+  // regardless of which phase resolved it.
+  const chainSource = resolveModel({ flag: undefined, phase, config });
+  const chainBackend = resolveChainBackend(chainSource.chain);
+  // Explicit `--backend opencode` forces EVERY phase onto opencode (kusabi
+  // #192 flag precedence: the flag wins over the config).  A phase whose
+  // chain is claude-native therefore CONTRADICTS the flag: throw at command
+  // start, naming the flag, the phase and the offending config key \u2014 never
+  // silently switch backends, never dispatch claude/... routes as opencode
+  // (the pre-fix code treated "no --backend flag" and "explicit --backend
+  // opencode" identically and let the entries decide).  No flag: the
+  // entries-decide behaviour below is unchanged.
+  if (flags.backend === "opencode" && chainBackend === "claude") {
+    const chainKey = (phase && config?.models?.phases?.[phase])
+      ? `models.phases.${phase}`
+      : (config?.models?.chain ? "models.chain" : "the built-in default chain");
+    throw new Error(
+      `--backend opencode conflicts with the claude-native chain of the ${phase ?? "task"} phase ` +
+      `(${chainKey}: ${JSON.stringify(chainSource.chain)}) \u2014 an explicit --backend forces every phase ` +
+      `onto that backend; remove --backend opencode or point ${chainKey} at opencode entries`
+    );
+  }
+  if (chainBackend === "claude") {
+    // The phase's chain is claude-native — claude backend with claude model
+    // syntax: `--model` (if given) is a bare alias / full id (a `:variant` or
+    // an opencode-shaped --model is rejected, exactly as on the flag path);
+    // otherwise the model is the chain's first route.
+    const chain = stripClaudePrefixChain(chainSource.chain);
+    const model = flags.model
+      ? splitRouteBackend(String(flags.model)).route
+      : (firstRoute(chain) ?? undefined);
+    if (model != null) validateClaudeModel(model);
+    // With --model the chain is never consulted for a model (same principle
+    // as the flag path above); without it the whole chain must be claude-valid.
+    if (!flags.model) validateClaudeChain(chain);
+    return { dispatch: claudeDispatch, backend: "claude", model, chain };
+  }
+
+  // opencode: --model is provider/model syntax (parseModel), chain verbatim.
   const resolved = resolveModel({ flag: flags.model, phase, config });
-  return { dispatch: dispatchWithFallback, backend, model: resolved.model, chain: resolved.chain };
+  return { dispatch: dispatchWithFallback, backend: "opencode", model: resolved.model, chain: resolved.chain };
 }
 
 /**
@@ -1015,12 +1088,18 @@ async function cmdChain(cwd, { flags, text }) {
   // ---- setup ----
   const stateDir = stateDirFor(cwd);
   const config = loadConfig(stateRoot());
-  // Backend resolved ONCE at command start (kusabi #184): it picks the
-  // dispatch function threaded into every phase (implement / review /
-  // strategize) and the model syntax.  The :variant rejection for the
-  // claude backend also happens here, so a bad model fails with a clear
-  // error and a nonzero exit before any job is dispatched.
-  const { dispatch, backend, model, chain: modelChain } = resolveDispatchBackend({ flags, phase: "implement", config });
+  // Backend resolves PER PHASE at command start (kusabi #192): the
+  // implement route-chain and the review route-chain resolve independently,
+  // each from models.phases.<phase> with fallback to models.chain, then the
+  // built-in default.  A `claude/<model>` entry prefix selects the claude
+  // backend for that phase; `--backend` forces every phase onto one backend
+  // (flag wins).  The strategist follows the implement resolution.  The
+  // :variant rejection for the claude backend and the single-backend-per-
+  // phase invariant also happen here, so a bad config fails with a clear
+  // error and a nonzero exit before createChainDir / before any job is
+  // dispatched.
+  const implementDispatch = resolveDispatchBackend({ flags, phase: "implement", config });
+  const reviewDispatch = resolveDispatchBackend({ flags, phase: "review", config });
   const { chainId, chainDir } = createChainDir(stateDir);
   const container = flags.container;
   if (!container) throw new Error("chain requires --container <cid>");
@@ -1061,7 +1140,7 @@ async function cmdChain(cwd, { flags, text }) {
   const verifyBaseline = await captureVerifyBaseline(callTool, container);
 
   // ---- chain-start output: state tiers, maxRounds, and ladder info (B7) ----
-  const tierCount = modelChain ? modelChain.length : 0;
+  const tierCount = implementDispatch.chain ? implementDispatch.chain.length : 0;
   if (tierCount > 0) {
     // The ladder can climb to tier (tierCount - 1). With the default ladder,
     // the 1st rework uses tier 0 (same), 2nd uses tier 1 (+1), 3rd uses tier 2 (+1).
@@ -1077,13 +1156,23 @@ async function cmdChain(cwd, { flags, text }) {
 
   try {
     return await runChainDriver({
-      cwd, stateDir, chainDir, chainId, container, model, modelChain, maxRounds,
+      cwd, stateDir, chainDir, chainId, container, model: implementDispatch.model,
+      modelChain: implementDispatch.chain, reviewModel: reviewDispatch.model,
+      reviewModelChain: reviewDispatch.chain, maxRounds,
       brief, orchestrator, baseSha, worktreeBaseline, verifyBaseline, callTool,
-      backend,
+      backend: implementDispatch.backend,
+      reviewBackend: reviewDispatch.backend,
       // claude: clamp later phases (rework implement, review, strategist)
-      // to the command-start model — the claude backend has no tier ladder,
-      // so the model never changes mid-chain (kusabi #184 finding 1).
-      dispatchWithFallback: backend === "claude" ? clampModelDispatch(dispatch, model) : dispatch,
+      // to the phase's command-start model — the claude backend has no tier
+      // ladder, so the model never changes mid-chain (kusabi #184 finding 1).
+      // Each phase clamps to ITS OWN resolved model, so implement and review
+      // can run on different backends with different models (kusabi #192).
+      dispatchWithFallback: implementDispatch.backend === "claude"
+        ? clampModelDispatch(implementDispatch.dispatch, implementDispatch.model)
+        : implementDispatch.dispatch,
+      reviewDispatchWithFallback: reviewDispatch.backend === "claude"
+        ? clampModelDispatch(reviewDispatch.dispatch, reviewDispatch.model)
+        : reviewDispatch.dispatch,
       initialSession: flags.session,
       flagsModel: flags.model,
       signalReceived: () => signalReceived,
@@ -1099,6 +1188,94 @@ async function cmdChain(cwd, { flags, text }) {
 // ---------------------------------------------------------------------------
 // chain driver — shared by `chain` and `chain-resume` (kusabi #153①)
 // ---------------------------------------------------------------------------
+
+/**
+ * Resolve the review phase's dispatch for runChainDriver.
+ *
+ * An explicit `injectedReviewDispatch` wins.  Otherwise the implement
+ * dispatch is reused ONLY when the review backend equals the implement
+ * backend — the pre-#192 single-dispatch contract (one dispatch threaded
+ * through every phase).  Under per-phase mixing the implement dispatch
+ * belongs to the OTHER backend, so reusing it for review would silently run
+ * the review job on the wrong backend while the round record claims
+ * `reviewBackend` — the chain-resume bug this resolves (kusabi #192):
+ * cmdChainResume used to pass an undefined review seam for an opencode
+ * review, and the driver fell back to the claude implement dispatch.  The
+ * fallback for a differing backend is the CANONICAL dispatch of the review
+ * backend (claudeDispatch for claude, dispatchWithFallback for opencode).
+ *
+ * @param {object} opts
+ * @param {Function|null|undefined} [opts.injectedReviewDispatch] — explicit
+ *        review seam (always given by cmdChain; cmdChainResume passes one
+ *        too, so this fallback mainly serves legacy single-dispatch callers).
+ * @param {Function} [opts.injectedDispatch] — the implement dispatch.
+ * @param {"opencode"|"claude"} opts.backend — implement backend.
+ * @param {"opencode"|"claude"} opts.reviewBackend — review backend.
+ * @returns {Function} The dispatch the review phase will use.
+ */
+export function resolveReviewDispatch({ injectedReviewDispatch, injectedDispatch, backend, reviewBackend }) {
+  if (injectedReviewDispatch) return injectedReviewDispatch;
+  if (reviewBackend === backend) return injectedDispatch ?? dispatchWithFallback;
+  return reviewBackend === "claude" ? claudeDispatch : dispatchWithFallback;
+}
+
+/**
+ * Resolve the implement and review dispatch seams for chain-resume.
+ *
+ * The implement seam mirrors the pre-#192 shape (clamped claude dispatch for
+ * a claude chain, undefined \u2192 the driver's real dispatchWithFallback for
+ * opencode).  The review seam is ALWAYS explicit: an undefined seam would
+ * make runChainDriver fall back to the implement dispatch, which belongs to
+ * the OTHER backend on a mixed chain \u2014 the review job would silently run on
+ * the wrong backend (claude CLI with the implement's model) while the round
+ * record claims the recorded reviewBackend (kusabi #192 finding).  An
+ * opencode review gets the plain opencode dispatch; a claude review gets the
+ * clamped claude dispatch pinned to the recorded review model.
+ *
+ * @param {object} opts
+ * @param {"opencode"|"claude"} opts.resumeBackend       \u2014 implement backend
+ *        (last record's `backend`).
+ * @param {"opencode"|"claude"} opts.resumeReviewBackend \u2014 review backend
+ *        (last record's `reviewBackend`, falling back to its `backend`).
+ * @param {string|null} [opts.model]        \u2014 recorded implement model.
+ * @param {string|null} [opts.reviewModel]  \u2014 recorded review model.
+ * @returns {{ dispatchWithFallback: Function|undefined,
+ *             reviewDispatchWithFallback: Function }}
+ */
+/**
+ * Resolve the per-phase review dispatch context for chain-resume from the
+ * persisted chain.json (kusabi #192).  Exported for testing.
+ *
+ * A #192-era chain.json carries `reviewModel` / `reviewModelChain` \u2014 possibly
+ * null on a mixed chain whose review runs on opencode.  That persisted null
+ * must stay null: the opencode review dispatch ignores it, and substituting
+ * the implement chain would re-dispatch the review with the OTHER backend's
+ * chain (a later chain-resume would fall back `reviewModelChain ?? modelChain`
+ * and re-run the review on the implement's claude chain).  A pre-#192
+ * chain.json has NO such keys: key ABSENCE is the legacy marker \u2014 fall back
+ * to the implement model/chain (pre-#192 clamped the whole chain to
+ * `chainJson.model`).
+ *
+ * @param {object} chainJson \u2014 the persisted chain record.
+ * @returns {{ reviewModel: string|object|null, reviewModelChain: Array|null }}
+ */
+export function resolveResumeReviewContext(chainJson) {
+  return {
+    reviewModel: ("reviewModel" in chainJson) ? chainJson.reviewModel : (chainJson.model ?? null),
+    reviewModelChain: ("reviewModelChain" in chainJson) ? chainJson.reviewModelChain : (chainJson.modelChain ?? null),
+  };
+}
+
+export function resolveResumeDispatches({ resumeBackend, resumeReviewBackend, model, reviewModel }) {
+  return {
+    dispatchWithFallback: resumeBackend === "claude"
+      ? clampModelDispatch(claudeDispatch, model ?? null)
+      : undefined,
+    reviewDispatchWithFallback: resumeReviewBackend === "claude"
+      ? clampModelDispatch(claudeDispatch, reviewModel ?? null)
+      : dispatchWithFallback,
+  };
+}
 
 /**
  * Run the chain round loop.  Shared by cmdChain (fresh chain) and
@@ -1128,13 +1305,31 @@ async function cmdChain(cwd, { flags, text }) {
  *        re-captured here — a resumed worktree is modified, so a fresh capture
  *        would measure the round's changes, not the base.
  * @param {Function} opts.callTool
- * @param {Function} [opts.dispatchWithFallback] — injection seam (defaults to
- *        the real dispatchWithFallback; phase functions receive it as their
- *        own _dispatchWithFallback seam).  claudeDispatch when the chain
- *        runs on the claude backend (kusabi #184).
- * @param {"opencode"|"claude"} [opts.backend] — dispatch backend, recorded
- *        on every round record; readers treat a missing field as
+ * @param {Function} [opts.dispatchWithFallback] — injection seam for the
+ *        IMPLEMENT phase and the strategist (defaults to the real
+ *        dispatchWithFallback; phase functions receive it as their own
+ *        _dispatchWithFallback seam).  claudeDispatch when the chain's
+ *        implement phase runs on the claude backend (kusabi #184).
+ * @param {Function} [opts.reviewDispatchWithFallback] — injection seam for
+ *        the REVIEW phase; when not given, resolveReviewDispatch picks it
+ *        from the backends: the implement dispatch for a same-backend review
+ *        (single-backend chains behave exactly as before), else the canonical
+ *        dispatch of the review backend — never the other backend's dispatch
+ *        (kusabi #192).  Resolved per phase from models.phases.review.
+ * @param {"opencode"|"claude"} [opts.backend] — implement dispatch backend,
+ *        recorded on every round record; readers treat a missing field as
  *        "opencode".  Default "opencode".
+ * @param {"opencode"|"claude"} [opts.reviewBackend] — review dispatch
+ *        backend, recorded as `reviewBackend` on every round record (always
+ *        set; readers treat a missing field as the record's implement
+ *        backend).  Defaults to the implement backend (legacy
+ *        single-dispatch callers run the whole chain on one backend).
+ * @param {Array} [opts.reviewModelChain] — the review phase's route chain
+ *        (defaults to modelChain for single-chain chains).  Persisted to
+ *        chain.json so chain-resume re-dispatches review on the same route.
+ * @param {string|object|null} [opts.reviewModel] — the review phase's
+ *        command-start resolved model (claude string, or opencode parseModel
+ *        object); persisted for chain-resume.
  * @param {string} [opts.initialSession]
  * @param {string|null} [opts.flagsModel]
  * @param {Function} [opts.signalReceived]  — getter: has SIGTERM/SIGINT fired?
@@ -1147,9 +1342,33 @@ export async function runChainDriver({
   brief, orchestrator, baseSha, worktreeBaseline, verifyBaseline, callTool,
   dispatchWithFallback: injectedDispatch = dispatchWithFallback,
   backend = "opencode",
+  reviewDispatchWithFallback: injectedReviewDispatch = null,
+  // Default reviewBackend to the implement backend: a caller that threads a
+  // single dispatch (every pre-#192 caller) runs the whole chain on one
+  // backend, so its records should claim that backend for review too.
+  reviewBackend = backend,
+  reviewModelChain = null,
+  reviewModel = null,
   initialSession, flagsModel = null, signalReceived = () => false,
   keepServe = false, resume = null,
 }) {
+  // Per-phase dispatch (kusabi #192): the review phase dispatches through its
+  // own backend-specific dispatch unless the caller threads a single one
+  // (single-backend chains — and every pre-#192 caller — stay identical).
+  // The fallback is backend-aware: the implement dispatch is reused only for
+  // a same-backend review; under mixing the review phase gets the canonical
+  // dispatch of ITS backend, never the other backend's dispatch (kusabi #192
+  // finding — chain-resume used to route review through the claude implement
+  // dispatch while recording reviewBackend=opencode).
+  const reviewDispatch = resolveReviewDispatch({
+    injectedReviewDispatch,
+    injectedDispatch,
+    backend,
+    reviewBackend,
+  });
+  // The review phase's route chain: its own when per-phase config resolved
+  // one, else the implement chain (pre-#192 behaviour).
+  const effectiveReviewChain = reviewModelChain ?? modelChain;
   // baseSha: a resume keeps the ORIGINAL chain base — the resumed round's diff
   // is measured against it (P1 auto-resets HEAD to it); a fresh chain captures
   // it from the container.
@@ -1218,10 +1437,10 @@ export async function runChainDriver({
       chainParsedReview, chainRepeatedAreas, skipReview,
       reviewJobStatus, reviewJobError,
     } = await runReviewPhase({
-      container, brief, modelChain, chainId, cwd, previousRecord, baseSha: effectiveBaseSha,
+      container, brief, modelChain: effectiveReviewChain, chainId, cwd, previousRecord, baseSha: effectiveBaseSha,
       chainStatusOutput, chainBaseLog, chainDiff, chainUntracked, roundRecord,
       chainChangedPaths, chainNewlyChanged, chainStatusObserved, chainDeliverables,
-      flagsModel, _dispatchWithFallback: injectedDispatch,
+      flagsModel, _dispatchWithFallback: reviewDispatch,
     });
     const chainVerdict = roundRecord.verdict;
     const chainFindingsText = roundRecord.findingsText;
@@ -1231,6 +1450,7 @@ export async function runChainDriver({
         records, roundRecord,
         currentTierIndex, phase: "review", jobError: reviewJobError,
         chainId, round, container, model, modelChain,
+        reviewModel, reviewModelChain,
         maxRounds, brief, orchestrator, baseSha: effectiveBaseSha,
         strategized, chainFollowupDraft: null,
         verifyBaseline: effectiveVerifyBaseline,
@@ -1332,6 +1552,7 @@ export async function runChainDriver({
 
     persistChainState({
       chainDir, round, roundRecord, chainId, container, model, modelChain,
+      reviewModel, reviewModelChain,
       maxRounds, brief, orchestrator, records, baseSha: effectiveBaseSha,
       chainTotals, strategized, chainFollowupDraft,
       verifyBaseline: effectiveVerifyBaseline,
@@ -1383,6 +1604,7 @@ export async function runChainDriver({
           records, roundRecord,
           currentTierIndex, phase: "strategize", jobError: strategistJobError,
           chainId, round, container, model, modelChain,
+          reviewModel, reviewModelChain,
           maxRounds, brief, orchestrator, baseSha: effectiveBaseSha,
           strategized, chainFollowupDraft,
           verifyBaseline: effectiveVerifyBaseline,
@@ -1407,6 +1629,7 @@ export async function runChainDriver({
       const updatedTotals = computeChainTotals(records);
       persistChainState({
         chainDir, round, roundRecord, chainId, container, model, modelChain,
+        reviewModel, reviewModelChain,
         maxRounds, brief, orchestrator, records, baseSha: effectiveBaseSha,
         chainTotals: updatedTotals, strategized: true, chainFollowupDraft,
         verifyBaseline: effectiveVerifyBaseline,
@@ -1508,6 +1731,18 @@ export async function runChainDriver({
       // For review, the reviewer stays on tier 0 (round 1) — that's handled in
       // runReviewPhase which passes round=1 to dispatchWithFallback.
 
+      // ---- session lineage guard (kusabi #192 invariant 5) ----
+      // A session never crosses backends: a rework implement round may only
+      // continue a session created by the implement backend; otherwise it
+      // starts fresh.  The cross-round `session` is the implement job's
+      // session, so when it traces to a record of the OTHER backend (only
+      // possible across a chain-resume) it is dropped here, and the same
+      // guard inside runImplementPhase covers its previousRecord.sessionID
+      // fallback.
+      if (session && !isFirstRound && previousRecord && (previousRecord.backend ?? "opencode") !== backend) {
+        session = null;
+      }
+
       // ---- phase 3: implement text + dispatch ----
       const implementText = buildImplementText({ round, brief, previousRecord, container, reworkScope: scopeResolution });
       const {
@@ -1519,16 +1754,19 @@ export async function runChainDriver({
         cwd, chainId, round, isFirstRound, implementText, modelChain,
         tierIndex: currentTierIndex,
         useNewSession, session, previousRecord, resumeMethod, flagsModel,
+        backend,
         _dispatchWithFallback: injectedDispatch,
       });
       session = resolvedSession;
 
-      // The chain record carries the dispatch backend (kusabi #184); the
-      // phase functions stay backend-blind, so it is stamped here.  Round
-      // records persist it via persistChainState (round-N.json and the
-      // records array in chain.json); readers treat a missing field as
-      // "opencode".
+      // The chain record carries the dispatch backends (kusabi #184 / #192);
+      // the phase functions stay backend-blind, so they are stamped here.
+      // Round records persist them via persistChainState (round-N.json and
+      // the records array in chain.json); readers treat a missing `backend`
+      // field as "opencode" and a missing `reviewBackend` as the record's
+      // implement backend.  `reviewBackend` is always set.
       roundRecord.backend = backend;
+      roundRecord.reviewBackend = reviewBackend;
 
       // Record lever info on the round record (B8)
       roundRecord.tierBefore = currentTierIndex;
@@ -1552,6 +1790,7 @@ export async function runChainDriver({
           records, roundRecord,
           currentTierIndex, phase: "implement", jobError: implementJobError,
           chainId, round, container, model, modelChain,
+          reviewModel, reviewModelChain,
           maxRounds, brief, orchestrator, baseSha: effectiveBaseSha,
           strategized, chainFollowupDraft: null,
           verifyBaseline: effectiveVerifyBaseline,
@@ -1582,6 +1821,7 @@ export async function runChainDriver({
         const partialTotals = computeChainTotals([...records, roundRecord]);
         persistChainState({
           chainDir, round, roundRecord, chainId, container, model, modelChain,
+          reviewModel, reviewModelChain,
           maxRounds, brief, orchestrator, records, baseSha: effectiveBaseSha,
           chainTotals: partialTotals, strategized, chainFollowupDraft: null,
           interrupted: true,
@@ -1731,17 +1971,45 @@ async function cmdChainResume(cwd, { flags, text }) {
   process.on("SIGTERM", onSignal);
   process.on("SIGINT", onSignal);
 
-  // ---- dispatch backend (kusabi #184) ----
-  // The backend is not a flag here: resumption context comes from the saved
-  // chain state, and the chain record's backend field is part of it.  A
-  // missing field means the chain predates the backend split → opencode.
-  const resumeBackend = chainJson.records?.[chainJson.records.length - 1]?.backend || "opencode";
+  // ---- dispatch backends (kusabi #184 / #192) ----
+  // The backends are not flags here: resumption context comes from the saved
+  // chain state, and the chain record's backend fields are part of it.  The
+  // implement backend is the last record's `backend`; the review backend is
+  // the last record's `reviewBackend`, falling back to the record's
+  // implement backend on records predating the per-phase split.  A missing
+  // `backend` field means the chain predates the backend split → opencode.
+  const lastResumeRecord = chainJson.records?.[chainJson.records.length - 1] ?? null;
+  const resumeBackend = lastResumeRecord?.backend || "opencode";
+  const resumeReviewBackend = lastResumeRecord?.reviewBackend ?? resumeBackend;
+
+  // The dispatch seams for the resumed run.  The REVIEW seam is always
+  // explicit (resolveResumeDispatches): an opencode review gets the plain
+  // opencode dispatch, so a mixed chain (implement claude / review opencode)
+  // resumes review on opencode — never on the claude implement dispatch
+  // (kusabi #192 finding).  Each claude phase clamps to ITS OWN recorded
+  // model — no tier ladder, no mid-chain model switch (kusabi #184 finding 1).
+  // Per-phase review dispatch context (kusabi #192): a #192-era chain.json
+  // persists reviewModel/reviewModelChain \u2014 persisted null on a mixed chain
+  // (opencode review) must stay null, never silently borrow the implement
+  // chain; a pre-#192 chain.json has neither key, and key ABSENCE is the
+  // legacy marker \u2014 fall back to the implement model/chain (pre-#192
+  // clamped the whole chain to chainJson.model).
+  const { reviewModel: resumeReviewModel, reviewModelChain: resumeReviewModelChain } =
+    resolveResumeReviewContext(chainJson);
+  const resumeDispatches = resolveResumeDispatches({
+    resumeBackend,
+    resumeReviewBackend,
+    model: chainJson.model ?? null,
+    reviewModel: resumeReviewModel,
+  });
 
   try {
     return await runChainDriver({
       cwd, stateDir, chainDir, chainId, container,
       model: chainJson.model ?? null,
       modelChain: chainJson.modelChain,
+      reviewModel: resumeReviewModel,
+      reviewModelChain: resumeReviewModelChain,
       maxRounds: chainJson.maxRounds ?? 4,
       brief: chainJson.brief ?? "",
       orchestrator: chainJson.orchestrator ?? null,
@@ -1752,11 +2020,9 @@ async function cmdChainResume(cwd, { flags, text }) {
       verifyBaseline: chainJson.verifyBaseline ?? null,
       callTool,
       backend: resumeBackend,
-      // claude: clamp every resumed phase to the chain's recorded model —
-      // no tier ladder, no mid-chain model switch (kusabi #184 finding 1).
-      dispatchWithFallback: resumeBackend === "claude"
-        ? clampModelDispatch(claudeDispatch, chainJson.model ?? null)
-        : undefined,
+      reviewBackend: resumeReviewBackend,
+      dispatchWithFallback: resumeDispatches.dispatchWithFallback,
+      reviewDispatchWithFallback: resumeDispatches.reviewDispatchWithFallback,
       initialSession: position.session,
       flagsModel: null,
       signalReceived: () => signalReceived,
@@ -2069,7 +2335,7 @@ function usage() {
     "Flags:",
     "  --read-only, --resume-last, --wait, --background",
     "  --base <ref>, --model <provider/model>, --agent <id>, --phase <name> (draft|investigate|implement|review|respond|salvage|gofer)",
-    "  --backend opencode|claude (task/chain: dispatch backend; default opencode. With claude, --model takes a bare alias (opus|sonnet|haiku) or a full model id \u2014 :variant suffixes are rejected)",
+    "  --backend opencode|claude (task/chain: dispatch backend; default opencode. With claude, --model takes a bare alias (opus|sonnet|haiku) or a full model id \u2014 :variant suffixes are rejected. Without --backend, config chain entries may carry a claude/ prefix for per-phase backend mixing \u2014 models.phases.<phase> (or models.chain) entries select the claude backend per phase; one phase's chain must be single-backend)",
     "  --session <id>, --timeout <s>, --watchdog <s>, --deny <tools>",
     "  --brief-file <path> (task / chain: read the brief from a file; exclusive with inline text)",
     "  --container <cid> (chain/task: container to run deterministic probes in; NOT supported by review)",

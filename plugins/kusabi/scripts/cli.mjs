@@ -192,6 +192,92 @@ export function firstRoute(chain) {
   return null;
 }
 
+// ---------------------------------------------------------------------------
+// per-entry backend prefix (kusabi #192)
+// ---------------------------------------------------------------------------
+// Config chain entries may carry an explicit backend prefix: an entry of the
+// form `claude/<model>` selects the claude backend with model `<model>` (a
+// bare alias like `opus` or a full model id); any entry WITHOUT the prefix is
+// an opencode `provider/model[:variant]` route, byte-identical to before the
+// prefix existed.  `claude` is not an opencode provider name, so the prefix
+// is unambiguous.  The `:variant` suffix stays rejected on the claude
+// backend exactly as today (see claude-dispatch.mjs validateClaudeModel).
+
+export const CLAUDE_ENTRY_PREFIX = "claude/";
+
+/**
+ * Split one route entry into its backend and its backend-specific model
+ * spelling.  `claude/opus` → `{ route: "opus", backend: "claude" }`;
+ * `opencode/x:max` (and any other unprefixed entry) → itself with backend
+ * "opencode".  A bare `claude/` (empty model) is a config error.
+ *
+ * @param {string} route
+ * @returns {{ route: string, backend: "opencode"|"claude" }}
+ * @throws {Error} On a `claude/` entry with an empty model.
+ */
+export function splitRouteBackend(route) {
+  if (typeof route === "string" && route.startsWith(CLAUDE_ENTRY_PREFIX)) {
+    const model = route.slice(CLAUDE_ENTRY_PREFIX.length);
+    if (!model) {
+      throw new Error(
+        `kusabi config: chain entry "claude/" has an empty model — use claude/<model> (bare alias or full model id)`
+      );
+    }
+    return { route: model, backend: "claude" };
+  }
+  return { route, backend: "opencode" };
+}
+
+/**
+ * Determine the single backend of a (tiered) chain array from its entries.
+ *
+ * kusabi #192 invariant: one phase's chain array is single-backend.  An
+ * array mixing `claude/` entries with opencode entries is a config error and
+ * throws — the per-phase backend would be ambiguous.  The check runs at
+ * command start (resolveDispatchBackend), before createChainDir and before
+ * any job is dispatched.  Per-route mixed ladders within one phase are out of
+ * scope by design.
+ *
+ * @param {(string|string[])[]} chain
+ * @returns {"opencode"|"claude"} The chain's single backend ("opencode" for
+ *          an empty/unknown chain, which callers never reach post-validation).
+ * @throws {Error} When the array mixes claude/ and opencode entries.
+ */
+export function resolveChainBackend(chain) {
+  let backend = null;
+  for (const tier of Array.isArray(chain) ? chain : []) {
+    const routes = Array.isArray(tier) ? tier : [tier];
+    for (const route of routes) {
+      const b = splitRouteBackend(route).backend;
+      if (backend === null) {
+        backend = b;
+      } else if (backend !== b) {
+        throw new Error(
+          `kusabi config: chain mixes backends — one chain array contains both claude/ and opencode entries ` +
+          `(${JSON.stringify(chain)}); each phase's chain must be single-backend (per-phase mixing is ` +
+          `across phases, never within one array)`
+        );
+      }
+    }
+  }
+  return backend ?? "opencode";
+}
+
+/**
+ * Strip the `claude/` prefix from every route of a (tiered) chain, preserving
+ * the tier shape.  Used once the claude backend is decided: the downstream
+ * claude dispatch expects bare aliases / full model ids, never the prefix.
+ *
+ * @param {(string|string[])[]} chain
+ * @returns {(string|string[])[]}
+ */
+export function stripClaudePrefixChain(chain) {
+  return chain.map((tier) => {
+    if (Array.isArray(tier)) return tier.map((r) => splitRouteBackend(r).route);
+    return splitRouteBackend(tier).route;
+  });
+}
+
 export function resolveModel({ flag, phase, config }) {
   // Determine the full ordered chain (may be tiered: string|string[])
   let chain;

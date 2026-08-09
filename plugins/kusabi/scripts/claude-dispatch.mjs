@@ -17,6 +17,12 @@
 //     the command-start model, so the model can never change — or fail —
 //     mid-chain.  The default chain is claude-native (CLAUDE_DEFAULT_CHAIN);
 //     the opencode built-in chain is never used by this backend.
+//   - Per-entry `claude/` prefixes (kusabi #192) are handled UPSTREAM:
+//     resolveDispatchBackend (kusabi-companion.mjs) strips the prefix before
+//     this module ever sees a chain or model, so claudeDispatch /
+//     validateClaudeChain / resolveClaudeModel receive only bare aliases and
+//     full model ids — exactly the pre-#192 shapes.  This module is
+//     intentionally prefix-unaware.
 //   - Session resume: the `session` option is honored \u2014 `--resume
 //     <session-id>` is appended to argv, so chain rework rounds, chain-resume,
 //     and `--session` / `--resume-last` continue the previous session instead
@@ -131,7 +137,9 @@ export function validateClaudeChain(chain) {
  * precedence (explicit flag → per-phase chain → global chain → built-in
  * default) but with claude model syntax: the entries are passed through
  * verbatim (no `provider/model` split), so bare aliases and full model ids
- * both work.
+ * both work.  `claude/`-prefixed entries (kusabi #192) are stripped by
+ * resolveDispatchBackend AFTER this returns — the caller is responsible for
+ * prefix handling; this mirror stays prefix-unaware.
  *
  * @param {object}   opts
  * @param {string}   [opts.flag]   — `--model` flag value.

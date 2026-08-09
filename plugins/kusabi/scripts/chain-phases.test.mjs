@@ -5,6 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import {
   buildImplementText,
+  runImplementPhase,
   resolveReworkScope,
   shouldSkipReview,
   computeChainTotals,
@@ -1903,6 +1904,52 @@ describe("handleProviderExhaustion", () => {
     assert.equal(round2InState.length, 1, "chainState records must contain round 2 exactly once");
   });
 
+  it("chainState carries reviewModel / reviewModelChain verbatim (mixed-chain resume context)", () => {
+    // persistChainState persists both; handleProviderExhaustion must too, or
+    // an implement provider-exhaustion on a mixed chain loses the review
+    // dispatch context and a later chain-resume falls back
+    // reviewModelChain ?? modelChain — re-dispatching the review with the
+    // implement's claude chain.
+    const records = makeRecords([1]);
+    const roundRecord = { round: 2, modelEntry: "provider/model-2" };
+
+    const result = handleProviderExhaustion({
+      records, roundRecord,
+      currentTierIndex: 0,
+      phase: "implement",
+      jobError: "error detail",
+      chainFollowupDraft: null,
+      reviewModel: "deepseek/x",
+      reviewModelChain: [["deepseek/x"]],
+      ...baseState, round: 2,
+    });
+
+    assert.equal(result.chainState.reviewModel, "deepseek/x", "reviewModel persisted verbatim");
+    assert.deepEqual(result.chainState.reviewModelChain, [["deepseek/x"]], "reviewModelChain persisted verbatim");
+  });
+
+  it("chainState without review context defaults both fields to null (never missing)", () => {
+    // Key presence (even null) is what chain-resume reads to distinguish a
+    // NEW chain from a legacy one — a missing key would silently re-enable
+    // the legacy fallback on a chain that legitimately has no review context.
+    const records = makeRecords([1]);
+    const roundRecord = { round: 2, modelEntry: "provider/model-2" };
+
+    const result = handleProviderExhaustion({
+      records, roundRecord,
+      currentTierIndex: 0,
+      phase: "review",
+      jobError: "error detail",
+      chainFollowupDraft: null,
+      ...baseState, round: 2,
+    });
+
+    assert.equal("reviewModel" in result.chainState, true, "reviewModel key always present");
+    assert.equal(result.chainState.reviewModel, null);
+    assert.equal("reviewModelChain" in result.chainState, true, "reviewModelChain key always present");
+    assert.equal(result.chainState.reviewModelChain, null);
+  });
+
   // ---- the push decision is derived, not supplied ----
 
   it("never duplicates a round that is already in records, whatever the phase", () => {
@@ -3279,6 +3326,122 @@ describe("persistChainState interrupted round", () => {
     });
     const chainJson = readJson(path.join(chainDir, "chain.json"));
     assert.equal(chainJson.verifyBaseline, null);
+  });
+
+  it("persists the review-phase model and chain for chain-resume (kusabi #192)", () => {
+    const chainDir = makeChainDir();
+    fs.mkdirSync(chainDir, { recursive: true });
+    const roundRecord = { round: 1, implementJobId: "job-1" };
+    persistChainState({
+      chainDir, round: 1, roundRecord, records: [roundRecord],
+      chainTotals: computeChainTotals([roundRecord]),
+      ...chainCtx,
+      reviewModel: "opus",
+      reviewModelChain: [["opus"]],
+    });
+    const chainJson = readJson(path.join(chainDir, "chain.json"));
+    assert.equal(chainJson.reviewModel, "opus");
+    assert.deepEqual(chainJson.reviewModelChain, [["opus"]]);
+  });
+
+  it("defaults chain.json review fields to null when not given (pre-#192 chains)", () => {
+    const chainDir = makeChainDir();
+    fs.mkdirSync(chainDir, { recursive: true });
+    const roundRecord = { round: 1, implementJobId: "job-1" };
+    persistChainState({
+      chainDir, round: 1, roundRecord, records: [roundRecord],
+      chainTotals: computeChainTotals([roundRecord]),
+      ...chainCtx,
+    });
+    const chainJson = readJson(path.join(chainDir, "chain.json"));
+    assert.equal(chainJson.reviewModel, null);
+    assert.equal(chainJson.reviewModelChain, null);
+  });
+});
+
+// =========================================================================
+// runImplementPhase — session lineage guard (kusabi #192 invariant 5)
+// -------------------------------------------------------------------------
+// A rework implement round may only continue a session created by the
+// implement backend; a session attributable to a record of the OTHER backend
+// is dropped and the round starts fresh.  Records without a `backend` field
+// predate the backend split and count as "opencode".
+// =========================================================================
+
+describe("runImplementPhase session lineage guard (kusabi #192)", () => {
+  function makeStubDispatch() {
+    const calls = [];
+    const dispatch = async (opts) => {
+      calls.push(opts);
+      return {
+        job: {
+          id: "job-imp", status: "completed", modelEntry: "opus",
+          modelVariant: null, fallbacks: null, sessionID: "claude-uuid-new",
+          usage: { available: true, input: 1, output: 1, reasoning: 0, cacheRead: 0, cacheWrite: 0, cost: 0.01 },
+          error: null,
+        },
+        resultText: "implemented",
+      };
+    };
+    return { dispatch, calls };
+  }
+
+  const base = {
+    cwd: "/tmp", chainId: "chain-test", round: 2, isFirstRound: false,
+    implementText: "brief", modelChain: [["opus"]], tierIndex: 0,
+    useNewSession: false, session: undefined, resumeMethod: { type: "continue_session", detail: "" },
+    flagsModel: null, backend: "claude",
+  };
+
+  it("continues the previous session when the previous record ran on the implement backend", async () => {
+    const { dispatch, calls } = makeStubDispatch();
+    await runImplementPhase({
+      ...base,
+      previousRecord: { sessionID: "claude-uuid-1", backend: "claude" },
+      _dispatchWithFallback: dispatch,
+    });
+    assert.equal(calls[0].session, "claude-uuid-1");
+  });
+
+  it("drops a previous session created by the other backend (starts fresh)", async () => {
+    const { dispatch, calls } = makeStubDispatch();
+    await runImplementPhase({
+      ...base,
+      previousRecord: { sessionID: "ses_opencode_1", backend: "opencode" },
+      _dispatchWithFallback: dispatch,
+    });
+    assert.ok(calls[0].session == null, "foreign opencode session must not be continued on claude");
+  });
+
+  it("a record without a backend field counts as opencode (both directions)", async () => {
+    // opencode implement may continue the legacy (backend-less) session.
+    const opencode = makeStubDispatch();
+    await runImplementPhase({
+      ...base, backend: "opencode",
+      previousRecord: { sessionID: "ses_legacy_1" },
+      _dispatchWithFallback: opencode.dispatch,
+    });
+    assert.equal(opencode.calls[0].session, "ses_legacy_1");
+
+    // claude implement may NOT continue the legacy (opencode-attributed) session.
+    const claude = makeStubDispatch();
+    await runImplementPhase({
+      ...base, backend: "claude",
+      previousRecord: { sessionID: "ses_legacy_1" },
+      _dispatchWithFallback: claude.dispatch,
+    });
+    assert.ok(claude.calls[0].session == null, "legacy opencode-attributed session must not run on claude");
+  });
+
+  it("useNewSession still starts fresh regardless of backend attribution", async () => {
+    const { dispatch, calls } = makeStubDispatch();
+    await runImplementPhase({
+      ...base,
+      useNewSession: true,
+      previousRecord: { sessionID: "claude-uuid-1", backend: "claude" },
+      _dispatchWithFallback: dispatch,
+    });
+    assert.equal(calls[0].session, undefined);
   });
 });
 

@@ -350,11 +350,17 @@ export function buildImplementText({ round, brief, previousRecord, container, re
 export async function runImplementPhase({
   cwd, chainId, round, isFirstRound, implementText, modelChain, tierIndex,
   useNewSession, session, previousRecord, resumeMethod, flagsModel,
+  backend = "opencode",
   _dispatchWithFallback: _dispatch = dispatchWithFallback,
 }) {
   let resolvedSession = session;
   if (!resolvedSession && !isFirstRound && previousRecord?.sessionID) {
-    if (!useNewSession) {
+    // Session lineage guard (kusabi #192 invariant 5): a rework implement
+    // round may only continue a session created by the implement backend; a
+    // session attributable to a record of the OTHER backend is dropped and
+    // the round starts fresh.  Records without a `backend` field predate the
+    // backend split and count as "opencode" (readers' convention).
+    if (!useNewSession && (previousRecord.backend ?? "opencode") === backend) {
       resolvedSession = previousRecord.sessionID;
     }
   }
@@ -835,6 +841,7 @@ export function computeChainTotals(records) {
  */
 export function persistChainState({
   chainDir, round, roundRecord, chainId, container, model, modelChain,
+  reviewModel = null, reviewModelChain = null,
   maxRounds, brief, orchestrator, records, baseSha, chainTotals,
   strategized, chainFollowupDraft, interrupted = false, verifyBaseline = null,
 }) {
@@ -860,6 +867,12 @@ export function persistChainState({
     container,
     model,
     modelChain,
+    // Per-phase review dispatch context (kusabi #192): the review phase's
+    // own model + route chain, so chain-resume re-dispatches review on the
+    // same backend/model it originally ran on.  Old chain.json files lack
+    // these; chain-resume falls back to modelChain / the record's backend.
+    reviewModel,
+    reviewModelChain,
     maxRounds,
     brief,
     orchestrator,
@@ -1602,6 +1615,10 @@ export function recordReworkEscalation({ roundRecord, currentTierIndex, reworkCo
  * @param {string} opts.container
  * @param {string} opts.model
  * @param {Array}  opts.modelChain
+ * @param {string|object|null} [opts.reviewModel=null]       \u2014 review dispatch
+ *        model, persisted verbatim so chain-resume keeps the review context.
+ * @param {Array|null} [opts.reviewModelChain=null]          \u2014 review dispatch
+ *        route chain, persisted verbatim (same contract as persistChainState).
  * @param {number} opts.maxRounds
  * @param {string} opts.brief
  * @param {string} opts.orchestrator
@@ -1624,6 +1641,8 @@ export function handleProviderExhaustion({
   container,
   model,
   modelChain,
+  reviewModel = null,
+  reviewModelChain = null,
   maxRounds,
   brief,
   orchestrator,
@@ -1653,6 +1672,13 @@ export function handleProviderExhaustion({
     container,
     model,
     modelChain,
+    // Per-phase review dispatch context (kusabi #192): carried verbatim so
+    // provider-exhaustion chain.json writes keep the review context that
+    // persistChainState would have persisted \u2014 a later chain-resume must not
+    // fall back reviewModelChain ?? modelChain and re-dispatch the review on
+    // the implement's claude chain.
+    reviewModel,
+    reviewModelChain,
     maxRounds,
     brief,
     orchestrator,

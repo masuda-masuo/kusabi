@@ -15,7 +15,12 @@ import {
   publishWarningForBrief,
   runChainDriver,
   resolveResumeLastSession,
+  resolveReviewDispatch,
+  resolveResumeDispatches,
+  resolveResumeReviewContext,
 } from "./kusabi-companion.mjs";
+import { dispatchWithFallback } from "./prompt-execution.mjs";
+import { claudeDispatch } from "./claude-dispatch.mjs";
 import {
   parseOrchestratorSignature,
 } from "./brief-parsing.mjs";
@@ -1427,6 +1432,682 @@ describe("runChainDriver resume", () => {
 });
 
 // =========================================================================
+// runChainDriver — per-phase backend mixing (kusabi #192)
+// -------------------------------------------------------------------------
+// The driver threads TWO backend-specific dispatches: one for the implement
+// phase (and the strategist, which follows the implement resolution) and one
+// for the review phase.  Round records carry `backend` (implement) and
+// `reviewBackend` (review, always set).  Session lineage never crosses
+// backends: a rework implement round only continues a session created by the
+// implement backend.
+// =========================================================================
+
+describe("runChainDriver per-phase backends (kusabi #192)", () => {
+  const BRIEF = "Implement X.\n\n## Deliverables\n- src/foo.js\n";
+  const APPROVE = JSON.stringify({ verdict: "approve", findings: [], summary: "ok" });
+  const REWORK = JSON.stringify({
+    verdict: "needs-attention",
+    findings: [{ severity: "high", file: "src/foo.js", description: "fix the parser" }],
+  });
+
+  function fakeCallTool({ statusOutput = " M src/foo.js\n" } = {}) {
+    return async (toolName, params) => {
+      if (toolName === "verify_in_container") {
+        return { gate_passed: true };
+      }
+      if (toolName !== "sandbox_exec") return { output: "" };
+      const cmd = params.commands[0];
+      if (cmd.startsWith("cd /workspace &&") && cmd.includes("TMPIDX=")) {
+        return { output: "ERROR_NO_INDEX\n" };
+      }
+      if (cmd === "git rev-parse HEAD") return { output: "abc123\n" };
+      if (cmd === "git status --porcelain") return { output: statusOutput };
+      if (cmd === "git log --oneline -5") return { output: "abc123 latest change\n" };
+      if (cmd === "git diff") return { output: "diff --git a/src/foo.js b/src/foo.js\n" };
+      if (cmd === "git ls-files --others --exclude-standard") return { output: "untracked.txt\n" };
+      return { output: "" };
+    };
+  }
+
+  // The implement-side fake: claude-shaped (bare-alias modelEntry, UUID
+  // session ids).  Records every dispatch options object.
+  function makeImplementDispatch() {
+    const calls = [];
+    const dispatch = async (opts) => {
+      calls.push(opts);
+      if (opts.kind === "task") {
+        return {
+          job: {
+            id: "job-imp-" + (opts.round ?? 1), status: "completed",
+            modelEntry: "opus", modelVariant: null, fallbacks: null,
+            sessionID: "claude-uuid-" + (opts.round ?? 1),
+            usage: { available: true, input: 1, output: 1, reasoning: 0, cacheRead: 0, cacheWrite: 0, cost: 0.01 },
+            error: null,
+          },
+          resultText: "implemented",
+        };
+      }
+      if (opts.kind === "strategist") {
+        return {
+          job: {
+            id: "job-strat-1", status: "completed",
+            modelEntry: "opus", modelVariant: null, fallbacks: null,
+            sessionID: "claude-uuid-strat",
+            usage: { available: true, input: 1, output: 1, reasoning: 0, cacheRead: 0, cacheWrite: 0, cost: 0.01 },
+            error: null,
+          },
+          resultText: "restructure the module",
+        };
+      }
+      throw new Error("unexpected implement dispatch kind: " + opts.kind);
+    };
+    return { dispatch, calls };
+  }
+
+  // The review-side fake: opencode-shaped (provider/model modelEntry, ses_*
+  // session ids).  Records every dispatch options object.  `reviewResult`
+  // may be a value or a function (opts) => string, so tests can switch the
+  // verdict between rounds.
+  function makeReviewDispatch({ reviewResult = APPROVE } = {}) {
+    const calls = [];
+    const dispatch = async (opts) => {
+      calls.push(opts);
+      if (opts.kind === "review") {
+        return {
+          job: {
+            id: "job-rev-" + (opts.round ?? 1), status: "completed",
+            modelEntry: "opencode/deepseek-v4-flash-free", modelVariant: "max",
+            fallbacks: null, sessionID: "ses_review_" + (opts.round ?? 1),
+            usage: { available: true, input: 2, output: 2, reasoning: 0, cacheRead: 0, cacheWrite: 0, cost: 0.01 },
+            error: null,
+          },
+          resultText: typeof reviewResult === "function" ? reviewResult(opts) : reviewResult,
+        };
+      }
+      throw new Error("unexpected review dispatch kind: " + opts.kind);
+    };
+    return { dispatch, calls };
+  }
+
+  function makeChainDir() {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-phase-backend-"));
+    const chainDir = path.join(tmp, "chains", "chain-test");
+    fs.mkdirSync(chainDir, { recursive: true });
+    writeChainControl(chainDir, {
+      chainId: "chain-test", container: "cid-1", pid: process.pid,
+      status: "running", round: 0, startedAt: new Date().toISOString(),
+    });
+    return { tmp, chainDir };
+  }
+
+  it("dispatches implement on claude and review on opencode, recording both backends and per-phase models/agents", async () => {
+    const { tmp, chainDir } = makeChainDir();
+    const implement = makeImplementDispatch();
+    const review = makeReviewDispatch();
+
+    const text = await runChainDriver({
+      cwd: tmp, stateDir: tmp, chainDir, chainId: "chain-test", container: "cid-1",
+      model: "opus", modelChain: [["opus"]],
+      reviewModel: { providerID: "opencode", modelID: "deepseek-v4-flash-free", variant: "max" },
+      reviewModelChain: [["opencode/deepseek-v4-flash-free:max"]],
+      maxRounds: 1,
+      brief: BRIEF, orchestrator: null, baseSha: "abc123", worktreeBaseline: null,
+      callTool: fakeCallTool(),
+      backend: "claude", reviewBackend: "opencode",
+      dispatchWithFallback: implement.dispatch,
+      reviewDispatchWithFallback: review.dispatch,
+      keepServe: true,
+      signalReceived: () => false,
+      resume: null,
+    });
+
+    assert.match(text, /accepted at round 1/);
+
+    // The implement dispatch ran on the claude-shaped fake: one task call
+    // with the claude model chain and the implement agent.
+    assert.equal(implement.calls.length, 1);
+    assert.equal(implement.calls[0].kind, "task");
+    assert.equal(implement.calls[0].agent, "kusabi-implement");
+    assert.deepEqual(implement.calls[0].tiers, [["opus"]]);
+
+    // The review dispatch ran on the opencode-shaped fake: one review call
+    // with the review route chain and the review agent.
+    assert.equal(review.calls.length, 1);
+    assert.equal(review.calls[0].kind, "review");
+    assert.equal(review.calls[0].agent, "kusabi-review");
+    assert.deepEqual(review.calls[0].tiers, [["opencode/deepseek-v4-flash-free:max"]]);
+
+    // Round record: backend = implement backend, reviewBackend = review
+    // backend (always set), reviewModelEntry from the review job.
+    const round1 = readJson(path.join(chainDir, "round-1.json"));
+    assert.equal(round1.backend, "claude");
+    assert.equal(round1.reviewBackend, "opencode");
+    assert.equal(round1.reviewModelEntry, "opencode/deepseek-v4-flash-free");
+
+    const chainJson = readJson(path.join(chainDir, "chain.json"));
+    assert.equal(chainJson.records[0].backend, "claude");
+    assert.equal(chainJson.records[0].reviewBackend, "opencode");
+    // The review-phase context is persisted for chain-resume.
+    assert.deepEqual(chainJson.reviewModelChain, [["opencode/deepseek-v4-flash-free:max"]]);
+
+    const control = readChainControl(chainDir);
+    assert.equal(control.status, "completed");
+
+    fs.rmSync(tmp, { recursive: true, force: true });
+  });
+
+  it("session lineage stays within the implement backend across rework rounds (never the review backend's session)", async () => {
+    const { tmp, chainDir } = makeChainDir();
+    const implement = makeImplementDispatch();
+    // Review finds problems in round 1 (rework); the review dispatch then
+    // switches to approve so round 2 accepts.
+    let reviewCount = 0;
+    const reviewInner = makeReviewDispatch({
+      reviewResult: () => (++reviewCount === 1 ? REWORK : APPROVE),
+    });
+    const review = reviewInner.dispatch;
+    review.calls = reviewInner.calls;
+
+    const text = await runChainDriver({
+      cwd: tmp, stateDir: tmp, chainDir, chainId: "chain-test", container: "cid-1",
+      model: "opus", modelChain: [["opus"]],
+      reviewModelChain: [["opencode/deepseek-v4-flash-free:max"]],
+      maxRounds: 2,
+      brief: BRIEF, orchestrator: null, baseSha: "abc123", worktreeBaseline: null,
+      callTool: fakeCallTool(),
+      backend: "claude", reviewBackend: "opencode",
+      dispatchWithFallback: implement.dispatch,
+      reviewDispatchWithFallback: review,
+      keepServe: true,
+      signalReceived: () => false,
+      resume: null,
+    });
+
+    assert.match(text, /accepted at round 2/);
+
+    // Two implement rounds: round 1 starts fresh, round 2 (rework) continues
+    // round 1's implement session — never the review backend's ses_* id.
+    const implementCalls = implement.calls.filter((c) => c.kind === "task");
+    assert.equal(implementCalls.length, 2);
+    assert.equal(implementCalls[0].session, undefined);
+    assert.equal(implementCalls[1].session, "claude-uuid-1");
+    for (const c of implementCalls) {
+      assert.ok(c.session === undefined || c.session.startsWith("claude-uuid-"),
+        "implement must never receive the review backend's session");
+    }
+
+    // The review backend's session ids never entered the record lineage.
+    const round1 = readJson(path.join(chainDir, "round-1.json"));
+    assert.equal(round1.sessionID, "claude-uuid-1");
+    const round2 = readJson(path.join(chainDir, "round-2.json"));
+    assert.equal(round2.sessionID, "claude-uuid-2");
+    assert.equal(round2.backend, "claude");
+    assert.equal(round2.reviewBackend, "opencode");
+
+    fs.rmSync(tmp, { recursive: true, force: true });
+  });
+
+  it("resume drops a session created by the other backend: the rework implement round starts fresh", async () => {
+    // Adversarial seam test for invariant 5: the resume position carries a
+    // session whose record ran on the OTHER backend (an opencode ses_* id
+    // being resumed on a claude implement — and the reverse).  The driver
+    // must drop it, and runImplementPhase's previousRecord fallback must
+    // also refuse it, so the round starts fresh.
+    const previousOpencode = {
+      round: 1, resumeMethod: { type: "continue_session" },
+      startedAt: "2026-08-01T00:00:00.000Z",
+      verdict: "needs-attention", probesGreen: false,
+      modelEntry: "fake/model", modelVariant: null, fallbacks: null,
+      implementJobId: "job-imp-1", reviewJobId: "job-rev-1",
+      sessionID: "ses_opencode_1", implementUsage: null, reviewUsage: null,
+      tierBefore: 0, tierAfter: 1, reworkCount: 1,
+      pendingReworkStrategy: { tierDelta: 1, newSession: false, reason: "rework" },
+      disposition: { disposition: "rework", reason: "needs-attention" },
+      findingsText: "fix the parser",
+      backend: "opencode",
+    };
+    const previousClaude = {
+      ...previousOpencode,
+      sessionID: "claude-uuid-1",
+      backend: "claude",
+    };
+
+    async function driveResume({ previous, driverBackend }) {
+      const { tmp, chainDir } = makeChainDir();
+      writeJson(path.join(chainDir, "chain.json"), {
+        chainId: "chain-test", container: "cid-1", model: "opus",
+        modelChain: [["opus"]], maxRounds: 4,
+        brief: BRIEF, orchestrator: null, records: [previous],
+        baseSha: "abc123", chainTotals: computeChainTotals([previous]),
+        strategized: false, followupIssueDraft: null,
+      });
+      const implement = makeImplementDispatch();
+      const review = makeReviewDispatch();
+      const text = await runChainDriver({
+        cwd: tmp, stateDir: tmp, chainDir, chainId: "chain-test", container: "cid-1",
+        model: "opus", modelChain: [["opus"]], maxRounds: 4,
+        brief: BRIEF, orchestrator: null, baseSha: "abc123", worktreeBaseline: null,
+        callTool: fakeCallTool(),
+        backend: driverBackend, reviewBackend: "opencode",
+        dispatchWithFallback: implement.dispatch,
+        reviewDispatchWithFallback: review.dispatch,
+        keepServe: true,
+        signalReceived: () => false,
+        resume: {
+          phase: "implement", round: 2, roundRecord: null, records: [previous],
+          reworkCount: 1, currentTierIndex: 0, strategized: false,
+          session: previous.sessionID, baseSha: "abc123",
+        },
+      });
+      const impRound2 = implement.calls.find((c) => c.kind === "task" && c.round === 2);
+      fs.rmSync(tmp, { recursive: true, force: true });
+      return { text, impRound2 };
+    }
+
+    // claude implement must not continue an opencode session.
+    const a = await driveResume({ previous: previousOpencode, driverBackend: "claude" });
+    assert.ok(a.impRound2, "round-2 implement must be dispatched");
+    assert.ok(a.impRound2.session == null, "foreign opencode session must be dropped (fresh start)");
+    assert.match(a.text, /accepted at round 2/);
+
+    // opencode implement must not continue a claude session (the direction
+    // the existing ses_* guard in claudeDispatch does not cover).
+    const b = await driveResume({ previous: previousClaude, driverBackend: "opencode" });
+    assert.ok(b.impRound2, "round-2 implement must be dispatched");
+    assert.ok(b.impRound2.session == null, "foreign claude session must be dropped (fresh start)");
+    assert.match(b.text, /accepted at round 2/);
+  });
+});
+
+// =========================================================================
+// per-phase backend config validation at command start (kusabi #192)
+// -------------------------------------------------------------------------
+// A phase array mixing claude/ and opencode entries, and a claude/<model>
+// :variant entry, each fail at command start (before createChainDir, before
+// any dispatch) with a clear message and a nonzero exit — the same fail-loud
+// principle as kusabi #184 finding 1.
+// =========================================================================
+
+describe("chain per-phase config validation (kusabi #192)", () => {
+  const COMPANION_SCRIPT = path.join(import.meta.dirname, "kusabi-companion.mjs");
+
+  function runCompanion(args, cwd, stateDir) {
+    const env = { ...process.env, KUSABI_STATE_DIR: stateDir };
+    delete env.KUSABI_WORKER_CONTEXT;
+    return spawnSync(process.execPath, [COMPANION_SCRIPT, ...args], {
+      encoding: "utf8",
+      cwd,
+      env,
+      timeout: 15_000,
+    });
+  }
+
+  function makeState(config) {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-phase-config-"));
+    const stateDir = path.join(tmp, "state");
+    fs.mkdirSync(stateDir, { recursive: true });
+    fs.writeFileSync(path.join(stateDir, "config.json"), JSON.stringify(config));
+    return { tmp, stateDir };
+  }
+
+  it("a phase array mixing backends fails before chain-dir creation with a nonzero exit", () => {
+    const { tmp, stateDir } = makeState({
+      models: { phases: { implement: ["claude/opus", "opencode/x:max"] } },
+    });
+    try {
+      const result = runCompanion(["chain", "--container", "abc123", "brief text"], tmp, stateDir);
+      assert.notEqual(result.status, 0, `expected failure, got: ${result.stdout}`);
+      assert.match(result.stdout, /mixes backends/);
+      assert.match(result.stdout, /single-backend/);
+      // Failed at command start: no chain directory was created.
+      const hash = crypto.createHash("sha256").update(tmp).digest("hex").slice(0, 12);
+      assert.equal(fs.existsSync(path.join(stateDir, hash, "chains")), false);
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("a mixed models.chain fails task --phase review at command start too", () => {
+    const { tmp, stateDir } = makeState({
+      models: { chain: ["claude/opus", "opencode/x:max"] },
+    });
+    try {
+      const result = runCompanion(["task", "--phase", "review", "do the review"], tmp, stateDir);
+      assert.notEqual(result.status, 0, `expected failure, got: ${result.stdout}`);
+      assert.match(result.stdout, /mixes backends/);
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("a claude/<model>:variant entry fails at command start with a nonzero exit", () => {
+    const { tmp, stateDir } = makeState({
+      models: { phases: { implement: ["claude/opus:max"] } },
+    });
+    try {
+      const result = runCompanion(["chain", "--container", "abc123", "brief text"], tmp, stateDir);
+      assert.notEqual(result.status, 0, `expected failure, got: ${result.stdout}`);
+      assert.match(result.stdout, /:variant suffix in model "opus:max"/);
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("explicit --backend opencode with a claude-native phase chain fails at command start naming the flag, the phase and the config key", () => {
+    const { tmp, stateDir } = makeState({
+      models: { phases: { implement: ["claude/opus"] } },
+    });
+    try {
+      const result = runCompanion(["chain", "--backend", "opencode", "--container", "abc123", "brief text"], tmp, stateDir);
+      assert.notEqual(result.status, 0, `expected failure, got: ${result.stdout}`);
+      assert.match(result.stdout, /--backend opencode/);
+      assert.match(result.stdout, /implement/);
+      assert.match(result.stdout, /models\.phases\.implement/);
+      // Failed at command start: no chain directory was created.
+      const hash = crypto.createHash("sha256").update(tmp).digest("hex").slice(0, 12);
+      assert.equal(fs.existsSync(path.join(stateDir, hash, "chains")), false);
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("explicit --backend opencode with a claude-native models.chain fails task --phase review too, naming models.chain", () => {
+    const { tmp, stateDir } = makeState({
+      models: { chain: ["claude/opus"] },
+    });
+    try {
+      const result = runCompanion(["task", "--phase", "review", "--backend", "opencode", "do the review"], tmp, stateDir);
+      assert.notEqual(result.status, 0, `expected failure, got: ${result.stdout}`);
+      assert.match(result.stdout, /--backend opencode/);
+      assert.match(result.stdout, /models\.chain/);
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("no --backend flag: a claude-native phase chain still auto-selects claude (entries decide, unchanged)", () => {
+    const { tmp, stateDir } = makeState({
+      models: { phases: { implement: ["claude/opus"] } },
+    });
+    try {
+      // chain without --backend and without --container: resolution passes
+      // (both phases resolve at command start), so the failure is the
+      // container requirement \u2014 NOT a backend conflict.
+      const result = runCompanion(["chain", "brief text"], tmp, stateDir);
+      assert.notEqual(result.status, 0);
+      assert.doesNotMatch(result.stdout, /--backend opencode/);
+      assert.doesNotMatch(result.stdout, /conflicts with the claude-native chain/);
+      assert.match(result.stdout, /chain requires --container/);
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("backward compat: an opencode-only config passes command-start resolution", () => {
+    const { tmp, stateDir } = makeState({
+      models: { phases: { implement: ["opencode/deepseek-v4-flash-free:max"] } },
+    });
+    try {
+      // chain with no container fails on the container requirement — NOT on
+      // the config: proves the config was accepted at command start.
+      const result = runCompanion(["chain", "brief text"], tmp, stateDir);
+      assert.notEqual(result.status, 0);
+      assert.doesNotMatch(result.stdout, /mixes backends/);
+      assert.match(result.stdout, /chain requires --container/);
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+});
+
+// =========================================================================
+// chain-resume review dispatch fallback (kusabi #192 finding)
+// -------------------------------------------------------------------------
+// cmdChainResume used to pass an UNDEFINED review seam for an opencode
+// review on a mixed chain (implement claude / review opencode).  runChainDriver
+// then fell back to the implement dispatch — the CLAUDE dispatch — so the
+// review job silently ran on the claude CLI with the implement's model while
+// the round record claimed reviewBackend=opencode.  The driver fallback is
+// now backend-aware (resolveReviewDispatch) and the resume wiring always
+// passes an explicit review seam (resolveResumeDispatches).
+// =========================================================================
+
+describe("chain-resume review dispatch fallback (kusabi #192 finding)", () => {
+  const BRIEF = "Implement X.\n\n## Deliverables\n- src/foo.js\n";
+
+  function fakeCallTool() {
+    return async (toolName, params) => {
+      if (toolName === "verify_in_container") {
+        return { gate_passed: true };
+      }
+      if (toolName !== "sandbox_exec") return { output: "" };
+      const cmd = params.commands[0];
+      if (cmd.startsWith("cd /workspace &&") && cmd.includes("TMPIDX=")) {
+        return { output: "ERROR_NO_INDEX\n" };
+      }
+      if (cmd === "git rev-parse HEAD") return { output: "abc123\n" };
+      if (cmd === "git status --porcelain") return { output: " M src/foo.js\n" };
+      if (cmd === "git log --oneline -5") return { output: "abc123 latest change\n" };
+      if (cmd === "git diff") return { output: "diff --git a/src/foo.js b/src/foo.js\n" };
+      if (cmd === "git ls-files --others --exclude-standard") return { output: "untracked.txt\n" };
+      return { output: "" };
+    };
+  }
+
+  it("resolveReviewDispatch: an undefined review seam on a mixed chain never yields the claude implement dispatch", () => {
+    const claudeFake = async () => { throw new Error("review must not reach the claude dispatch"); };
+    // The prescribed scenario: undefined review seam + claude implement
+    // dispatch + reviewBackend opencode.
+    const r = resolveReviewDispatch({
+      injectedReviewDispatch: null,
+      injectedDispatch: claudeFake,
+      backend: "claude",
+      reviewBackend: "opencode",
+    });
+    assert.equal(r, dispatchWithFallback);
+    assert.notEqual(r, claudeFake);
+  });
+
+  it("resolveReviewDispatch: same-backend chains keep the single dispatch (pre-#192 contract)", () => {
+    const fake = async () => {};
+    assert.equal(
+      resolveReviewDispatch({ injectedReviewDispatch: null, injectedDispatch: fake, backend: "claude", reviewBackend: "claude" }),
+      fake,
+    );
+    assert.equal(
+      resolveReviewDispatch({ injectedReviewDispatch: null, injectedDispatch: fake, backend: "opencode", reviewBackend: "opencode" }),
+      fake,
+    );
+  });
+
+  it("resolveReviewDispatch: an explicit review seam wins; reverse mixing falls back to claudeDispatch", () => {
+    const fake = async () => {};
+    const seam = async () => {};
+    assert.equal(
+      resolveReviewDispatch({ injectedReviewDispatch: seam, injectedDispatch: fake, backend: "claude", reviewBackend: "opencode" }),
+      seam,
+    );
+    assert.equal(
+      resolveReviewDispatch({ injectedReviewDispatch: null, injectedDispatch: fake, backend: "opencode", reviewBackend: "claude" }),
+      claudeDispatch,
+    );
+  });
+
+  it("resolveResumeDispatches: a mixed chain resumes review on the opencode dispatch, never undefined", () => {
+    const d = resolveResumeDispatches({
+      resumeBackend: "claude",
+      resumeReviewBackend: "opencode",
+      model: "opus",
+      reviewModel: null,
+    });
+    assert.equal(d.reviewDispatchWithFallback, dispatchWithFallback);
+    // The implement seam stays the clamped claude dispatch.
+    assert.equal(typeof d.dispatchWithFallback, "function");
+    assert.notEqual(d.dispatchWithFallback, dispatchWithFallback);
+    assert.notEqual(d.dispatchWithFallback, claudeDispatch);
+  });
+
+  it("resolveResumeDispatches: a claude review resumes on the clamped claude dispatch; legacy opencode chains keep today's seams", () => {
+    const claude = resolveResumeDispatches({
+      resumeBackend: "claude",
+      resumeReviewBackend: "claude",
+      model: "opus",
+      reviewModel: "sonnet",
+    });
+    assert.equal(typeof claude.reviewDispatchWithFallback, "function");
+    assert.notEqual(claude.reviewDispatchWithFallback, dispatchWithFallback);
+    assert.notEqual(claude.reviewDispatchWithFallback, claudeDispatch);
+    // clampModelDispatch pins the recorded review model (semantics covered by
+    // the clampModelDispatch tests; here the wrapper shape is asserted).
+    assert.equal(typeof claude.dispatchWithFallback, "function");
+
+    // Pre-#192 chains (no reviewBackend recorded -> falls back to backend):
+    // opencode resume keeps the pre-#192 seams — implement seam undefined
+    // (driver default dispatchWithFallback), review seam now explicit but
+    // identical in effect.
+    const legacy = resolveResumeDispatches({
+      resumeBackend: "opencode",
+      resumeReviewBackend: "opencode",
+      model: null,
+      reviewModel: null,
+    });
+    assert.equal(legacy.dispatchWithFallback, undefined);
+    assert.equal(legacy.reviewDispatchWithFallback, dispatchWithFallback);
+  });
+
+  it("runChainDriver with the buggy seam values (undefined review seam, claude implement, reviewBackend opencode) never sends the review job to the claude dispatch", async () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-fallback-fix-"));
+    const chainDir = path.join(tmp, "chains", "chain-test");
+    fs.mkdirSync(chainDir, { recursive: true });
+    writeChainControl(chainDir, {
+      chainId: "chain-test", container: "cid-1", pid: process.pid,
+      status: "running", round: 0, startedAt: new Date().toISOString(),
+    });
+
+    let claudeCalls = 0;
+    const claudeImplement = async (opts) => {
+      claudeCalls += 1;
+      if (opts.kind === "task") {
+        return {
+          job: {
+            id: "job-imp-1", status: "completed", modelEntry: "opus",
+            modelVariant: null, fallbacks: null, sessionID: "claude-uuid-1",
+            usage: { available: true, input: 1, output: 1, reasoning: 0, cacheRead: 0, cacheWrite: 0, cost: 0.01 },
+            error: null,
+          },
+          resultText: "implemented",
+        };
+      }
+      throw new Error("review must not reach the claude dispatch");
+    };
+
+    const text = await runChainDriver({
+      cwd: tmp, stateDir: tmp, chainDir, chainId: "chain-test", container: "cid-1",
+      model: "opus", modelChain: [["opus"]],
+      // Empty review chain: the REAL opencode dispatch (dispatchWithFallback)
+      // fails fast with a "No available routes" provider-error job — no
+      // serve spawn, no hang — while still proving WHICH dispatch the review
+      // phase used: the opencode one, never the claude fake.
+      reviewModelChain: [],
+      maxRounds: 1,
+      brief: BRIEF, orchestrator: null, baseSha: "abc123", worktreeBaseline: null,
+      callTool: fakeCallTool(),
+      backend: "claude", reviewBackend: "opencode",
+      dispatchWithFallback: claudeImplement,
+      reviewDispatchWithFallback: undefined, // the buggy cmdChainResume seam value
+      keepServe: true,
+      signalReceived: () => false,
+      resume: null,
+    });
+
+    // The chain stops at review provider exhaustion (the opencode dispatch's
+    // empty-chain job), and the claude dispatch was called exactly once: the
+    // implement round.  The review job never reached it.
+    assert.match(text, /review provider exhausted/);
+    assert.match(text, /No available routes/);
+    assert.equal(claudeCalls, 1, "the claude dispatch must serve implement only");
+
+    // Records stay truthful: implement claude, review opencode — and the
+    // review job id is the opencode dispatch's provider-error job.
+    const round1 = readJson(path.join(chainDir, "round-1.json"));
+    assert.equal(round1.backend, "claude");
+    assert.equal(round1.reviewBackend, "opencode");
+    assert.match(round1.reviewJobId, /^no-route-/);
+
+    fs.rmSync(tmp, { recursive: true, force: true });
+  });
+});
+
+// =========================================================================
+// resolveResumeReviewContext — legacy chain.json review-model fallback
+// -------------------------------------------------------------------------
+// cmdChainResume feeds chain.json's review dispatch context into
+// resolveResumeDispatches.  A pre-#192 chain.json has NO reviewModel /
+// reviewModelChain keys: key absence is the legacy marker, and the review
+// clamp must fall back to the implement model/chain (pre-#192 clamped the
+// whole chain to chainJson.model).  A #192-era chain.json may persist null
+// on a mixed chain (opencode review) — that null must stay null and never
+// silently borrow the implement values.
+// =========================================================================
+describe("resolveResumeReviewContext (kusabi #192 legacy fallback)", () => {
+  it("legacy chain.json (no reviewModel key): the review clamp receives the implement model", () => {
+    const legacy = {
+      model: "sonnet",
+      modelChain: [["opus"]],
+    };
+    const ctx = resolveResumeReviewContext(legacy);
+    assert.equal(ctx.reviewModel, "sonnet", "key absence falls back to the implement model");
+    assert.deepEqual(ctx.reviewModelChain, [["opus"]], "key absence falls back to the implement chain");
+  });
+
+  it("legacy chain.json with a missing model too: falls back to null, never undefined", () => {
+    const ctx = resolveResumeReviewContext({ modelChain: [["opus"]] });
+    assert.equal(ctx.reviewModel, null);
+    assert.deepEqual(ctx.reviewModelChain, [["opus"]]);
+  });
+
+  it("a NEW chain.json persisting reviewModel: null / reviewModelChain: null keeps null (no borrowing from the implement chain)", () => {
+    const mixed = {
+      model: "opus",
+      modelChain: [["opus"]],
+      reviewModel: null,
+      reviewModelChain: null,
+    };
+    const ctx = resolveResumeReviewContext(mixed);
+    assert.equal(ctx.reviewModel, null, "persisted null must stay null");
+    assert.equal(ctx.reviewModelChain, null, "persisted null must stay null");
+  });
+
+  it("a NEW chain.json with recorded review values returns them verbatim", () => {
+    const mixed = {
+      model: "opus",
+      modelChain: [["opus"]],
+      reviewModel: "deepseek/x",
+      reviewModelChain: [["deepseek/x"]],
+    };
+    const ctx = resolveResumeReviewContext(mixed);
+    assert.equal(ctx.reviewModel, "deepseek/x");
+    assert.deepEqual(ctx.reviewModelChain, [["deepseek/x"]]);
+  });
+
+  it("composition: the legacy fallback feeds resolveResumeDispatches, so a claude review resumes clamped to the implement model", () => {
+    const legacy = { model: "sonnet", modelChain: [["opus"]] };
+    const ctx = resolveResumeReviewContext(legacy);
+    const d = resolveResumeDispatches({
+      resumeBackend: "claude",
+      resumeReviewBackend: "claude",
+      model: legacy.model ?? null,
+      reviewModel: ctx.reviewModel,
+    });
+    // Clamped claude wrapper: neither the raw claude dispatch nor the
+    // opencode dispatch — the review pins the recorded (implement) model.
+    assert.equal(typeof d.reviewDispatchWithFallback, "function");
+    assert.notEqual(d.reviewDispatchWithFallback, claudeDispatch);
+    assert.notEqual(d.reviewDispatchWithFallback, dispatchWithFallback);
+  });
+});
+
+// =========================================================================
 // runChainDriver — rework scheduling by finding kind (kusabi #60 step 2)
 // -------------------------------------------------------------------------
 // maxRounds buys design/full rounds only; mechanical rounds are free.  The
@@ -2361,6 +3042,85 @@ describe("chain-resume CLI", () => {
       const control = readChainControl(path.join(stateDir, "chains", "chain-claude"));
       assert.equal(control.status, "running");
       assert.equal(control.resumedAt, undefined);
+    } finally {
+      if (savedClaudeBin === undefined) delete process.env.CLAUDE_BIN;
+      else process.env.CLAUDE_BIN = savedClaudeBin;
+      if (savedArgsLog === undefined) delete process.env.FAKE_CLAUDE_ARGS_LOG;
+      else process.env.FAKE_CLAUDE_ARGS_LOG = savedArgsLog;
+      if (savedMcpSource === undefined) delete process.env.KUSABI_CLAUDE_MCP_SOURCE;
+      else process.env.KUSABI_CLAUDE_MCP_SOURCE = savedMcpSource;
+      server.close();
+      server.closeAllConnections?.();
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("legacy claude chain.json (no reviewModel key): the resumed review clamps to the pinned implement model", async () => {
+    // Pre-#192 chain.json: the record carries backend claude (kusabi #184)
+    // but chain.json has NO reviewModel / reviewModelChain keys.  chain-resume
+    // must treat key absence as legacy and clamp the resumed review to the
+    // implement model: the review dispatches `claude -p --model <pinned>` —
+    // never the chain's first route, which may differ from the pinned
+    // --model (the legacy bug re-derived the review from the first route).
+    const { server, url } = await startSunabaStub({
+      toolResultText: { output: " M src/foo.js\n" },
+    });
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-resume-legacy-claude-"));
+    const claudeArgsLog = path.join(tmp, "claude-args.ndjson");
+    fs.writeFileSync(claudeArgsLog, "", "utf8");
+    const claudeBinPath = path.join(tmp, "fake-claude.mjs");
+    fs.writeFileSync(
+      claudeBinPath,
+      "#!/usr/bin/env node\n" +
+      "import fs from \"node:fs\";\n" +
+      "fs.appendFileSync(process.env.FAKE_CLAUDE_ARGS_LOG, JSON.stringify(process.argv.slice(2)) + \"\\n\");\n" +
+      "process.stdout.write(JSON.stringify({ type: \"result\", is_error: false, result: \"ok\", session_id: \"claude-uuid-resume\" }));\n",
+      "utf8",
+    );
+    fs.chmodSync(claudeBinPath, 0o755);
+    const savedClaudeBin = process.env.CLAUDE_BIN;
+    const savedArgsLog = process.env.FAKE_CLAUDE_ARGS_LOG;
+    const savedMcpSource = process.env.KUSABI_CLAUDE_MCP_SOURCE;
+    process.env.CLAUDE_BIN = claudeBinPath;
+    process.env.FAKE_CLAUDE_ARGS_LOG = claudeArgsLog;
+    const mcpSource = path.join(tmp, "claude.json");
+    fs.writeFileSync(mcpSource, JSON.stringify({ mcpServers: { sunaba: { command: "npx" } } }), "utf8");
+    process.env.KUSABI_CLAUDE_MCP_SOURCE = mcpSource;
+    try {
+      const stateDir = hashedWorkspaceDir(path.join(tmp, "state"), tmp);
+      const chainJson = validChainJson();
+      // Legacy claude chain: backend on the record, pinned model whose value
+      // DIFFERS from the chain's first route — the legacy bug would re-derive
+      // the review from the first route ("opus") instead of the pinned
+      // implement model ("sonnet").
+      chainJson.records[0].backend = "claude";
+      chainJson.model = "sonnet";
+      chainJson.modelChain = [["opus"]];
+      makeChain(stateDir, "chain-legacy", {
+        control: {
+          chainId: "chain-legacy", container: "cid-1", pid: 0, // dead pid → abnormal stop
+          status: "running", round: 1, startedAt: new Date().toISOString(),
+        },
+        chainJson,
+      });
+      const result = await runResumeAsync(["chain-legacy"], {
+        stateDir: path.join(tmp, "state"),
+        cwd: tmp,
+        env: { KUSABI_SUNABA_URL: url },
+      });
+      // The resumed review ran on the fake claude binary (an unparseable
+      // review result is retried once, so up to two dispatch lines).  EVERY
+      // line must pin the recorded implement model — never the chain's first
+      // route.
+      const lines = fs.readFileSync(claudeArgsLog, "utf8").trim().split("\n").filter(Boolean);
+      assert.ok(lines.length >= 1,
+        `review dispatch never reached the claude binary: ${result.stdout} ${result.stderr}`);
+      for (const line of lines) {
+        assert.match(line, /--model","sonnet"/,
+          `resumed review must clamp to the pinned implement model, got: ${line}`);
+        assert.doesNotMatch(line, /--model","opus"/,
+          "resumed review must not re-derive from the chain's first route");
+      }
     } finally {
       if (savedClaudeBin === undefined) delete process.env.CLAUDE_BIN;
       else process.env.CLAUDE_BIN = savedClaudeBin;
