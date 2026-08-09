@@ -682,6 +682,47 @@ describe("review --container rejection", () => {
   });
 });
 
+// --backend is a task/chain dispatch decision (kusabi #184): on any other
+// subcommand it must be rejected out loud instead of silently ignored, and
+// an unknown backend value must be a clear error with a nonzero exit.
+describe("--backend flag guard", () => {
+  const COMPANION_SCRIPT = path.join(import.meta.dirname, "kusabi-companion.mjs");
+
+  function runCompanion(args, cwd) {
+    const env = { ...process.env };
+    delete env.KUSABI_WORKER_CONTEXT;
+    return spawnSync(process.execPath, [COMPANION_SCRIPT, ...args], {
+      encoding: "utf8",
+      cwd,
+      env,
+      timeout: 15_000,
+    });
+  }
+
+  it("rejects --backend on a non-task/chain subcommand with guidance", () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-backend-guard-"));
+    try {
+      const result = runCompanion(["review", "--backend", "claude", "focus"], tmpDir);
+      assert.notEqual(result.status, 0, `expected failure, got: ${result.stdout}`);
+      assert.match(result.stdout, /--backend is only supported by task and chain/);
+      assert.doesNotMatch(result.stdout, /worker context/i);
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects an unknown backend value for task with a clear error", () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-backend-guard2-"));
+    try {
+      const result = runCompanion(["task", "--backend", "bogus", "do it"], tmpDir);
+      assert.notEqual(result.status, 0, `expected failure, got: ${result.stdout}`);
+      assert.match(result.stdout, /unknown backend: bogus/);
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+});
+
 // standalone review — git failure produces a clear error, not a forEach crash
 // (kusabi #153 #2)
 // ---------------------------------------------------------------------------
@@ -1256,6 +1297,57 @@ describe("runChainDriver resume", () => {
     const p2 = round2.probeResults.find((p) => p.probe === "P2: verify gate");
     assert.equal(p2.passed, true);
     assert.match(p2.detail, /lint 190 \(baseline 190, tolerated\)/);
+
+    fs.rmSync(tmp, { recursive: true, force: true });
+  });
+
+  // The chain driver records the dispatch backend on the round record and
+  // threads the backend-specific dispatch through every phase (kusabi #184).
+  // A backend:"claude" chain must dispatch through the injected dispatch
+  // (claudeDispatch in production) and persist backend on round-N.json and
+  // chain.json records, with modelEntry/modelVariant taken from the job
+  // result, not from flags.
+  it("records backend claude on the round and persists it in chain state", async () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-chain-backend-"));
+    const chainDir = path.join(tmp, "chains", "chain-test");
+    fs.mkdirSync(chainDir, { recursive: true });
+    writeChainControl(chainDir, {
+      chainId: "chain-test", container: "cid-1", pid: process.pid,
+      status: "running", round: 0, startedAt: new Date().toISOString(),
+    });
+
+    const dispatch = makeFakeDispatch();
+    const text = await runChainDriver({
+      cwd: tmp, stateDir: tmp, chainDir, chainId: "chain-test", container: "cid-1",
+      model: "fake/model", modelChain: [["fake/model"]], maxRounds: 1,
+      brief: BRIEF, orchestrator: null, baseSha: "abc123", worktreeBaseline: null,
+      callTool: fakeResumeCallTool(),
+      dispatchWithFallback: dispatch,
+      backend: "claude",
+      keepServe: true,
+      signalReceived: () => false,
+      resume: null,
+    });
+
+    assert.match(text, /accepted at round 1/);
+    // The chain actually dispatched through the injected (backend-specific)
+    // dispatch — implement + review both fired.
+    assert.equal(dispatch.calls.length, 2);
+    assert.ok(dispatch.calls.every((c) => c.kind === "task" || c.kind === "review"));
+
+    const round1 = readJson(path.join(chainDir, "round-1.json"));
+    assert.equal(round1.backend, "claude");
+    assert.equal(round1.modelEntry, "fake/model");
+    assert.equal(round1.modelVariant, null);
+
+    const chainJson = readJson(path.join(chainDir, "chain.json"));
+    assert.equal(chainJson.records.length, 1);
+    assert.equal(chainJson.records[0].backend, "claude");
+    assert.equal(chainJson.records[0].modelEntry, "fake/model");
+
+    const control = readChainControl(chainDir);
+    assert.equal(control.status, "completed");
+    assert.equal(control.round, 1);
 
     fs.rmSync(tmp, { recursive: true, force: true });
   });

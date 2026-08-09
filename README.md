@@ -149,6 +149,36 @@ each chain round record or the `variant` field in `job.modelChain` entries via
 
 A trailing colon (`p/a:`) or missing `/` are fatal parse errors.
 
+### Backends
+
+`chain` and `task` accept `--backend opencode|claude` (default `opencode`).
+The backend is resolved once at command start and recorded as `backend` on
+every job record and chain round record; records written before the backend
+split (or without the field) are treated as `opencode` by readers.
+
+- **opencode** (default) — dispatch through `opencode serve`, with the
+  tiered chain, capacity fallback, and `provider/model[:variant]` model
+  syntax described above.
+- **claude** — dispatch through the official Claude Code CLI in headless
+  mode (`claude -p --output-format json`). v1 limits: one model per phase
+  (the `--model` value, or the chain's first route — the tier ladder and
+  capacity fallback do not apply), no session resume (every dispatch starts
+  a fresh session), and `:variant` suffixes are rejected with an explicit
+  error (a `--model` value such as `opus:max` fails before any job is
+  dispatched). Model syntax is a bare alias (`opus`, `sonnet`, `haiku`) or a
+  full model id (e.g. `claude-sonnet-4-5`). The binary is resolved through
+  `CLAUDE_BIN` (default `claude`).
+
+The claude backend mirrors the opencode agents' permission tables with two
+hardcoded `--allowedTools` allowlists (implement, review; see
+`plugins/kusabi/scripts/claude-dispatch.mjs`) and passes the agent body from
+`plugins/kusabi/opencode-agents/<agent>.md` (YAML frontmatter stripped) via
+`--append-system-prompt`. The sunaba MCP server entry is extracted from the
+host `~/.claude.json` (`mcpServers.sunaba`) into a generated
+`--mcp-config` file containing only that entry — override the source file
+with `KUSABI_CLAUDE_MCP_SOURCE`; a missing entry is a clear error. See
+`docs/DESIGN.md` §3.5.11 for the v1 limits and failure semantics.
+
 ### Resolution precedence (highest to lowest)
 
 1. **Explicit `--model` flag** — wins for the phases it applies to: a single `task` dispatch, a chain's round-1 implement, and every chain review. A chain's rework rounds follow the tier ladder instead (see "Chain round escalation" below).
