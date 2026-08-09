@@ -334,8 +334,29 @@ export function resolveBackend(flags) {
  *             model: object|string|undefined, chain: (string|string[])[] }}
  */
 export function resolveDispatchBackend({ flags, phase, config }) {
+  // Unknown-backend errors are about the flag, not the phase's config key:
+  // resolve it before the per-phase resolution so it never gets key context
+  // appended below.
   const backendFlag = resolveBackend(flags);
+  try {
+    return resolveDispatchBackendForPhase({ flags, phase, config, backendFlag });
+  } catch (err) {
+    // Per-phase resolution errors must name the config key that produced
+    // them (kusabi #192 axis 2): a bad models.phases.rework array fails with
+    // "… (models.phases.rework)" so the operator knows WHICH phase key to
+    // fix — the same fail-loud principle as the mixed-backend / :variant
+    // rejections.  Appended only when the phase actually has its own config
+    // key (an error from models.chain must not be misattributed to a phase
+    // that has no key), and only once.
+    const key = phase && config?.models?.phases?.[phase] ? `models.phases.${phase}` : null;
+    if (key && err instanceof Error && !err.message.includes(key)) {
+      throw new Error(`${err.message} (${key})`);
+    }
+    throw err;
+  }
+}
 
+function resolveDispatchBackendForPhase({ flags, phase, config, backendFlag }) {
   if (backendFlag === "claude") {
     const resolved = resolveClaudeModel({ flag: flags.model, phase, config });
     // Entries written for the per-phase syntax may carry the claude/ prefix;
@@ -1068,6 +1089,40 @@ async function cmdSalvage(cwd, { flags, text }) {
 // chain
 // ---------------------------------------------------------------------------
 
+// Ladder accounting is backend-aware (kusabi #192 follow-up): a claude-native
+// chain never walks its tiers — claudeDispatch pins every phase to the
+// command-start model — so everywhere a tier count feeds ACCOUNTING (the
+// chain-start banner, the recordReworkEscalation clamp) a claude chain has an
+// effective tier count of min(1, length).  Dispatch behaviour is untouched;
+// this only makes printed/recorded numbers match the ladder the backend
+// actually climbs.  opencode chains keep their full length.
+export function effectiveTierCount(chain, backend) {
+  if (!chain) return 0;
+  if (backend === "claude") return Math.min(1, chain.length);
+  return chain.length;
+}
+
+// The chain-start banner line (B7).  Returns null when there is no ladder to
+// describe (no implement chain); the caller skips the write.  The
+// can-reach-top claim is computed against the chain the ladder ACTUALLY
+// climbs: the REWORK chain's effective tier count when a models.phases.rework
+// key is configured, the implement chain's otherwise (kusabi #192 axis 2).
+export function renderChainBanner({ chainId, tierCount, reworkTierCount, reworkKeyConfigured, maxRounds }) {
+  if (tierCount <= 0) return null;
+  const ladderTierCount = reworkKeyConfigured ? reworkTierCount : tierCount;
+  // The ladder can climb to tier (ladderTierCount - 1). With the default
+  // ladder, the 1st rework uses tier 0 (same), 2nd uses tier 1 (+1), 3rd
+  // uses tier 2 (+1).  The top tier is reached at round:
+  // 1 (initial) + (ladderTierCount) reworks.
+  const roundsToTopTier = 1 + ladderTierCount; // initial + one rework per tier beyond 0
+  const canReachTop = maxRounds >= roundsToTopTier;
+  return "Chain " + chainId + ": tiers=" + tierCount +
+    (reworkKeyConfigured ? ", reworkTiers=" + reworkTierCount : "") +
+    ", maxRounds=" + maxRounds +
+    (canReachTop ? " (can reach top tier)" : " (maxRounds insufficient to reach top tier)") +
+    "\n";
+}
+
 async function cmdChain(cwd, { flags, text }) {
   // ---- brief-file resolution ----
   text = readBriefFile(flags, text);
@@ -1098,7 +1153,18 @@ async function cmdChain(cwd, { flags, text }) {
   // phase invariant also happen here, so a bad config fails with a clear
   // error and a nonzero exit before createChainDir / before any job is
   // dispatched.
+  //
+  // Rework rounds (implement rounds after round 1) resolve from
+  // models.phases.rework with the exact same machinery (kusabi #192 axis 2):
+  // entry prefixes, single-backend invariant, :variant rejection, and the
+  // explicit --backend flag forcing it like every other phase.  Key absence
+  // must mean "byte-identical to today": rework rounds keep the implement
+  // resolution (its chain AND its ladder) \u2014 never models.chain directly.
   const implementDispatch = resolveDispatchBackend({ flags, phase: "implement", config });
+  const reworkKeyConfigured = !!config?.models?.phases?.rework;
+  const reworkDispatch = reworkKeyConfigured
+    ? resolveDispatchBackend({ flags, phase: "rework", config })
+    : implementDispatch;
   const reviewDispatch = resolveDispatchBackend({ flags, phase: "review", config });
   const { chainId, chainDir } = createChainDir(stateDir);
   const container = flags.container;
@@ -1140,19 +1206,24 @@ async function cmdChain(cwd, { flags, text }) {
   const verifyBaseline = await captureVerifyBaseline(callTool, container);
 
   // ---- chain-start output: state tiers, maxRounds, and ladder info (B7) ----
-  const tierCount = implementDispatch.chain ? implementDispatch.chain.length : 0;
-  if (tierCount > 0) {
-    // The ladder can climb to tier (tierCount - 1). With the default ladder,
-    // the 1st rework uses tier 0 (same), 2nd uses tier 1 (+1), 3rd uses tier 2 (+1).
-    // The top tier is reached at round: 1 (initial) + (tierCount) reworks.
-    const roundsToTopTier = 1 + tierCount; // initial + one rework per tier beyond 0
-    const canReachTop = maxRounds >= roundsToTopTier;
-    process.stdout.write(
-      "Chain " + chainId + ": tiers=" + tierCount + ", maxRounds=" + maxRounds +
-      (canReachTop ? " (can reach top tier)" : " (maxRounds insufficient to reach top tier)") +
-      "\n"
-    );
-  }
+  // The ladder claim must not lie when a rework chain is configured (kusabi
+  // #192 axis 2): the implement chain serves round 1 only — the ladder that
+  // climbs across rework rounds is the REWORK chain's.  Print both tier
+  // counts so the claim is explicit; the can-reach-top claim is computed
+  // against the chain the ladder actually climbs (rework when configured,
+  // implement otherwise).
+  // The counts are backend-aware (kusabi #192 follow-up): a claude-native
+  // chain has an effective tier count of min(1, length) — claudeDispatch
+  // pins every phase to the command-start model, so its ladder never climbs
+  // and the banner must not claim a multi-tier ladder that cannot be walked.
+  const tierCount = effectiveTierCount(implementDispatch.chain, implementDispatch.backend);
+  const reworkTierCount = reworkKeyConfigured
+    ? effectiveTierCount(reworkDispatch.chain, reworkDispatch.backend)
+    : 0;
+  const bannerLine = renderChainBanner({
+    chainId, tierCount, reworkTierCount, reworkKeyConfigured, maxRounds,
+  });
+  if (bannerLine != null) process.stdout.write(bannerLine);
 
   try {
     return await runChainDriver({
@@ -1162,6 +1233,15 @@ async function cmdChain(cwd, { flags, text }) {
       brief, orchestrator, baseSha, worktreeBaseline, verifyBaseline, callTool,
       backend: implementDispatch.backend,
       reviewBackend: reviewDispatch.backend,
+      // Rework rounds (implement rounds after round 1) dispatch from the
+      // rework resolution when models.phases.rework is configured; absent
+      // key → reworkDispatch IS the implement dispatch and the driver's
+      // effective values collapse to the implement resolution (byte-identical
+      // to today).  Round records stamp each round's own backend, so a
+      // mixed chain (round 1 claude, rework opencode) stays truthful.
+      reworkModel: reworkDispatch.model,
+      reworkModelChain: reworkDispatch.chain,
+      reworkBackend: reworkDispatch.backend,
       // claude: clamp later phases (rework implement, review, strategist)
       // to the phase's command-start model — the claude backend has no tier
       // ladder, so the model never changes mid-chain (kusabi #184 finding 1).
@@ -1173,6 +1253,9 @@ async function cmdChain(cwd, { flags, text }) {
       reviewDispatchWithFallback: reviewDispatch.backend === "claude"
         ? clampModelDispatch(reviewDispatch.dispatch, reviewDispatch.model)
         : reviewDispatch.dispatch,
+      reworkDispatchWithFallback: reworkDispatch.backend === "claude"
+        ? clampModelDispatch(reworkDispatch.dispatch, reworkDispatch.model)
+        : reworkDispatch.dispatch,
       initialSession: flags.session,
       flagsModel: flags.model,
       signalReceived: () => signalReceived,
@@ -1266,6 +1349,33 @@ export function resolveResumeReviewContext(chainJson) {
   };
 }
 
+/**
+ * Resolve the per-round REWORK dispatch context for chain-resume from the
+ * persisted chain.json (kusabi #192 axis 2) \u2014 the rework mirror of
+ * resolveResumeReviewContext, with the same key-absence-is-legacy rule.
+ *
+ * An axis-2 chain.json carries `reworkModel` / `reworkModelChain` /
+ * `reworkBackend` \u2014 null when no models.phases.rework key was configured
+ * at chain start (rework rounds then continue on the implement resolution,
+ * which the driver derives from the nulls).  A pre-axis-2 chain.json has NO
+ * such keys: key ABSENCE is the legacy marker \u2014 fall back to the implement
+ * model/chain exactly like the review context does, so legacy chains resume
+ * byte-identically.  `reworkBackend` has no implement-side value to fall
+ * back to here; the caller resolves null \u2192 the implement backend (the
+ * same `?? backend` rule the driver uses for a fresh chain).
+ *
+ * @param {object} chainJson \u2014 the persisted chain record.
+ * @returns {{ reworkModel: string|object|null, reworkModelChain: Array|null,
+ *             reworkBackend: "opencode"|"claude"|null }}
+ */
+export function resolveResumeReworkContext(chainJson) {
+  return {
+    reworkModel: ("reworkModel" in chainJson) ? chainJson.reworkModel : (chainJson.model ?? null),
+    reworkModelChain: ("reworkModelChain" in chainJson) ? chainJson.reworkModelChain : (chainJson.modelChain ?? null),
+    reworkBackend: ("reworkBackend" in chainJson) ? chainJson.reworkBackend : null,
+  };
+}
+
 export function resolveResumeDispatches({ resumeBackend, resumeReviewBackend, model, reviewModel }) {
   return {
     dispatchWithFallback: resumeBackend === "claude"
@@ -1330,6 +1440,24 @@ export function resolveResumeDispatches({ resumeBackend, resumeReviewBackend, mo
  * @param {string|object|null} [opts.reviewModel] — the review phase's
  *        command-start resolved model (claude string, or opencode parseModel
  *        object); persisted for chain-resume.
+ * @param {Array} [opts.reworkModelChain] — the rework phase's route chain
+ *        (kusabi #192 axis 2).  Implement rounds AFTER round 1 (rework
+ *        rounds) dispatch from it, and the tier ladder climbs over it; null
+ *        (no models.phases.rework key) keeps rework rounds on the implement
+ *        chain and ladder — byte-identical to today.  Persisted to
+ *        chain.json so chain-resume re-dispatches rework rounds on the same
+ *        route.
+ * @param {string|object|null} [opts.reworkModel] — the rework phase's
+ *        command-start resolved model; persisted for chain-resume.
+ * @param {"opencode"|"claude"|null} [opts.reworkBackend] — the rework
+ *        phase's dispatch backend; null/absent means rework rounds keep the
+ *        implement backend.  Recorded on every rework round record's
+ *        `backend` field; persisted to chain.json for chain-resume.
+ * @param {Function} [opts.reworkDispatchWithFallback] — injection seam for
+ *        REWORK implement rounds (rounds after round 1); when not given the
+ *        implement dispatch is used (no rework key configured).  claude
+ *        rework rounds get the clamped claude dispatch pinned to the rework
+ *        model (kusabi #184 finding 1 applies per phase).
  * @param {string} [opts.initialSession]
  * @param {string|null} [opts.flagsModel]
  * @param {Function} [opts.signalReceived]  — getter: has SIGTERM/SIGINT fired?
@@ -1349,6 +1477,13 @@ export async function runChainDriver({
   reviewBackend = backend,
   reviewModelChain = null,
   reviewModel = null,
+  // Rework context (kusabi #192 axis 2): defaults collapse to the implement
+  // resolution, so callers without a models.phases.rework key (and every
+  // pre-axis-2 caller) get byte-identical behaviour.
+  reworkModelChain = null,
+  reworkModel = null,
+  reworkBackend = null,
+  reworkDispatchWithFallback = null,
   initialSession, flagsModel = null, signalReceived = () => false,
   keepServe = false, resume = null,
 }) {
@@ -1369,6 +1504,13 @@ export async function runChainDriver({
   // The review phase's route chain: its own when per-phase config resolved
   // one, else the implement chain (pre-#192 behaviour).
   const effectiveReviewChain = reviewModelChain ?? modelChain;
+  // The REWORK phase's effective resolution (kusabi #192 axis 2): its own
+  // chain / backend / dispatch when a models.phases.rework key resolved one,
+  // else the implement resolution — the `??` collapses exactly to it, so
+  // chains without the key (and every pre-axis-2 caller) are byte-identical.
+  const effectiveReworkChain = reworkModelChain ?? modelChain;
+  const effectiveReworkBackend = reworkBackend ?? backend;
+  const effectiveReworkDispatch = reworkDispatchWithFallback ?? injectedDispatch;
   // baseSha: a resume keeps the ORIGINAL chain base — the resumed round's diff
   // is measured against it (P1 auto-resets HEAD to it); a fresh chain captures
   // it from the container.
@@ -1451,6 +1593,7 @@ export async function runChainDriver({
         currentTierIndex, phase: "review", jobError: reviewJobError,
         chainId, round, container, model, modelChain,
         reviewModel, reviewModelChain,
+        reworkModel, reworkModelChain, reworkBackend,
         maxRounds, brief, orchestrator, baseSha: effectiveBaseSha,
         strategized, chainFollowupDraft: null,
         verifyBaseline: effectiveVerifyBaseline,
@@ -1523,12 +1666,20 @@ export async function runChainDriver({
       // recorded tier must match the model actually used — never "0 → 1"
       // on a single-tier chain.  The clamp fields (tierClamped /
       // tierClampReason) land on the round record here.
+      // The tier ladder climbs over the chain the NEXT round dispatches on
+      // (kusabi #192 axis 2): a rework round addresses the REWORK chain, so
+      // the escalation clamps against its tier count — the implement chain's
+      // count when no rework chain is configured (unchanged behaviour).
+      // The count is backend-aware (kusabi #192 follow-up): a claude-native
+      // ladder has an effective tier count of min(1, length), so tierAfter
+      // can never exceed 0 on a claude ladder — the model never changes
+      // there, and a recorded 0 → 1 would contradict the pinned model.
       const escalation = recordReworkEscalation({
         roundRecord,
         currentTierIndex,
         reworkCount,
         strategized,
-        tierCount: modelChain ? modelChain.length : 0,
+        tierCount: effectiveTierCount(effectiveReworkChain, effectiveReworkBackend),
         // Anchoring-override evidence (#62): verdict, probes and the
         // cross-round repeated-areas signal from the finished round.
         chainVerdict,
@@ -1553,6 +1704,7 @@ export async function runChainDriver({
     persistChainState({
       chainDir, round, roundRecord, chainId, container, model, modelChain,
       reviewModel, reviewModelChain,
+      reworkModel, reworkModelChain, reworkBackend,
       maxRounds, brief, orchestrator, records, baseSha: effectiveBaseSha,
       chainTotals, strategized, chainFollowupDraft,
       verifyBaseline: effectiveVerifyBaseline,
@@ -1605,6 +1757,7 @@ export async function runChainDriver({
           currentTierIndex, phase: "strategize", jobError: strategistJobError,
           chainId, round, container, model, modelChain,
           reviewModel, reviewModelChain,
+          reworkModel, reworkModelChain, reworkBackend,
           maxRounds, brief, orchestrator, baseSha: effectiveBaseSha,
           strategized, chainFollowupDraft,
           verifyBaseline: effectiveVerifyBaseline,
@@ -1630,6 +1783,7 @@ export async function runChainDriver({
       persistChainState({
         chainDir, round, roundRecord, chainId, container, model, modelChain,
         reviewModel, reviewModelChain,
+        reworkModel, reworkModelChain, reworkBackend,
         maxRounds, brief, orchestrator, records, baseSha: effectiveBaseSha,
         chainTotals: updatedTotals, strategized: true, chainFollowupDraft,
         verifyBaseline: effectiveVerifyBaseline,
@@ -1731,15 +1885,29 @@ export async function runChainDriver({
       // For review, the reviewer stays on tier 0 (round 1) — that's handled in
       // runReviewPhase which passes round=1 to dispatchWithFallback.
 
+      // ---- per-round implement dispatch context (kusabi #192 axis 2) ----
+      // Round 1 dispatches from the implement resolution; every LATER round
+      // is a rework round and dispatches from the rework resolution when
+      // models.phases.rework is configured (absent key \u2192 the implement
+      // resolution \u2014 byte-identical to today).  The tier ladder climbs over
+      // the same chain the round dispatches on: currentTierIndex addresses
+      // the implement chain during round 1 and the rework chain from
+      // round 2 on (the first rework starts at the rework chain's tier 0).
+      const isReworkRound = !isFirstRound;
+      const roundModelChain = isReworkRound ? effectiveReworkChain : modelChain;
+      const roundBackend = isReworkRound ? effectiveReworkBackend : backend;
+      const roundDispatch = isReworkRound ? effectiveReworkDispatch : injectedDispatch;
+
       // ---- session lineage guard (kusabi #192 invariant 5) ----
       // A session never crosses backends: a rework implement round may only
-      // continue a session created by the implement backend; otherwise it
-      // starts fresh.  The cross-round `session` is the implement job's
-      // session, so when it traces to a record of the OTHER backend (only
-      // possible across a chain-resume) it is dropped here, and the same
-      // guard inside runImplementPhase covers its previousRecord.sessionID
-      // fallback.
-      if (session && !isFirstRound && previousRecord && (previousRecord.backend ?? "opencode") !== backend) {
+      // continue a session created by the backend THIS round dispatches on
+      // (the rework backend on rework rounds); otherwise it starts fresh.
+      // The cross-round `session` is the implement job's session, so when it
+      // traces to a record of the OTHER backend (only possible across a
+      // chain-resume or a round-1/rework backend switch) it is dropped here,
+      // and the same guard inside runImplementPhase covers its
+      // previousRecord.sessionID fallback.
+      if (session && !isFirstRound && previousRecord && (previousRecord.backend ?? "opencode") !== roundBackend) {
         session = null;
       }
 
@@ -1751,11 +1919,11 @@ export async function runChainDriver({
         implementJobStatus,
         implementJobError,
       } = await runImplementPhase({
-        cwd, chainId, round, isFirstRound, implementText, modelChain,
+        cwd, chainId, round, isFirstRound, implementText, modelChain: roundModelChain,
         tierIndex: currentTierIndex,
         useNewSession, session, previousRecord, resumeMethod, flagsModel,
-        backend,
-        _dispatchWithFallback: injectedDispatch,
+        backend: roundBackend,
+        _dispatchWithFallback: roundDispatch,
       });
       session = resolvedSession;
 
@@ -1764,8 +1932,10 @@ export async function runChainDriver({
       // Round records persist them via persistChainState (round-N.json and
       // the records array in chain.json); readers treat a missing `backend`
       // field as "opencode" and a missing `reviewBackend` as the record's
-      // implement backend.  `reviewBackend` is always set.
-      roundRecord.backend = backend;
+      // implement backend.  `reviewBackend` is always set.  Each round's
+      // `backend` is the backend its implement job ACTUALLY used \u2014 round 1
+      // the implement backend, rework rounds the rework backend (axis 2).
+      roundRecord.backend = roundBackend;
       roundRecord.reviewBackend = reviewBackend;
 
       // Record lever info on the round record (B8)
@@ -1791,6 +1961,7 @@ export async function runChainDriver({
           currentTierIndex, phase: "implement", jobError: implementJobError,
           chainId, round, container, model, modelChain,
           reviewModel, reviewModelChain,
+          reworkModel, reworkModelChain, reworkBackend,
           maxRounds, brief, orchestrator, baseSha: effectiveBaseSha,
           strategized, chainFollowupDraft: null,
           verifyBaseline: effectiveVerifyBaseline,
@@ -1822,6 +1993,7 @@ export async function runChainDriver({
         persistChainState({
           chainDir, round, roundRecord, chainId, container, model, modelChain,
           reviewModel, reviewModelChain,
+          reworkModel, reworkModelChain, reworkBackend,
           maxRounds, brief, orchestrator, records, baseSha: effectiveBaseSha,
           chainTotals: partialTotals, strategized, chainFollowupDraft: null,
           interrupted: true,
@@ -2003,6 +2175,26 @@ async function cmdChainResume(cwd, { flags, text }) {
     reviewModel: resumeReviewModel,
   });
 
+  // Per-round rework dispatch context (kusabi #192 axis 2): an axis-2
+  // chain.json persists reworkModel/reworkModelChain/reworkBackend (null on
+  // chains without the models.phases.rework key, in which case rework rounds
+  // keep the implement resolution — byte-identical); key ABSENCE is the
+  // legacy marker, falling back to the implement values exactly like the
+  // review context above.  The rework seam follows the same rule as the
+  // review seam: a claude rework backend resumes on the clamped claude
+  // dispatch pinned to the recorded rework model, an opencode rework backend
+  // on the plain opencode dispatch — never on the implement dispatch of the
+  // other backend (mirror of the kusabi #192 review finding).
+  const {
+    reworkModel: resumeReworkModel,
+    reworkModelChain: resumeReworkModelChain,
+    reworkBackend: resumeReworkBackend,
+  } = resolveResumeReworkContext(chainJson);
+  // A null rework backend (no rework key: new chain or legacy chain.json)
+  // means rework rounds keep the implement backend — the same `?? backend`
+  // rule the fresh-chain driver applies.
+  const reworkBackendForResume = resumeReworkBackend ?? resumeBackend;
+
   try {
     return await runChainDriver({
       cwd, stateDir, chainDir, chainId, container,
@@ -2010,6 +2202,9 @@ async function cmdChainResume(cwd, { flags, text }) {
       modelChain: chainJson.modelChain,
       reviewModel: resumeReviewModel,
       reviewModelChain: resumeReviewModelChain,
+      reworkModel: resumeReworkModel,
+      reworkModelChain: resumeReworkModelChain,
+      reworkBackend: reworkBackendForResume,
       maxRounds: chainJson.maxRounds ?? 4,
       brief: chainJson.brief ?? "",
       orchestrator: chainJson.orchestrator ?? null,
@@ -2023,6 +2218,9 @@ async function cmdChainResume(cwd, { flags, text }) {
       reviewBackend: resumeReviewBackend,
       dispatchWithFallback: resumeDispatches.dispatchWithFallback,
       reviewDispatchWithFallback: resumeDispatches.reviewDispatchWithFallback,
+      reworkDispatchWithFallback: reworkBackendForResume === "claude"
+        ? clampModelDispatch(claudeDispatch, resumeReworkModel ?? null)
+        : dispatchWithFallback,
       initialSession: position.session,
       flagsModel: null,
       signalReceived: () => signalReceived,

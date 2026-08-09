@@ -842,6 +842,7 @@ export function computeChainTotals(records) {
 export function persistChainState({
   chainDir, round, roundRecord, chainId, container, model, modelChain,
   reviewModel = null, reviewModelChain = null,
+  reworkModel = null, reworkModelChain = null, reworkBackend = null,
   maxRounds, brief, orchestrator, records, baseSha, chainTotals,
   strategized, chainFollowupDraft, interrupted = false, verifyBaseline = null,
 }) {
@@ -873,6 +874,16 @@ export function persistChainState({
     // these; chain-resume falls back to modelChain / the record's backend.
     reviewModel,
     reviewModelChain,
+    // Per-round rework dispatch context (kusabi #192 axis 2): the rework
+    // phase's own model, route chain and backend, so chain-resume
+    // re-dispatches rework rounds on the same backend/model they originally
+    // ran on.  Null on chains without models.phases.rework (rework rounds
+    // then continue on the implement resolution); chain.json files written
+    // before the key existed lack these keys and chain-resume treats key
+    // absence as legacy.
+    reworkModel,
+    reworkModelChain,
+    reworkBackend,
     maxRounds,
     brief,
     orchestrator,
@@ -1619,6 +1630,14 @@ export function recordReworkEscalation({ roundRecord, currentTierIndex, reworkCo
  *        model, persisted verbatim so chain-resume keeps the review context.
  * @param {Array|null} [opts.reviewModelChain=null]          \u2014 review dispatch
  *        route chain, persisted verbatim (same contract as persistChainState).
+ * @param {string|object|null} [opts.reworkModel=null]       \u2014 rework dispatch
+ *        model, persisted verbatim so chain-resume keeps the rework context
+ *        (kusabi #192 axis 2).
+ * @param {Array|null} [opts.reworkModelChain=null]          \u2014 rework dispatch
+ *        route chain, persisted verbatim (same contract as persistChainState).
+ * @param {\"opencode\"|\"claude\"|null} [opts.reworkBackend=null] \u2014 rework
+ *        dispatch backend, persisted verbatim so chain-resume re-dispatches
+ *        rework rounds on the backend they originally ran on.
  * @param {number} opts.maxRounds
  * @param {string} opts.brief
  * @param {string} opts.orchestrator
@@ -1643,6 +1662,9 @@ export function handleProviderExhaustion({
   modelChain,
   reviewModel = null,
   reviewModelChain = null,
+  reworkModel = null,
+  reworkModelChain = null,
+  reworkBackend = null,
   maxRounds,
   brief,
   orchestrator,
@@ -1679,6 +1701,14 @@ export function handleProviderExhaustion({
     // the implement's claude chain.
     reviewModel,
     reviewModelChain,
+    // Per-round rework dispatch context (kusabi #192 axis 2): carried
+    // verbatim for the same reason \u2014 provider-exhaustion chain.json writes
+    // must keep the rework context persistChainState would have persisted,
+    // or a later chain-resume re-dispatches rework rounds on the implement
+    // resolution (wrong backend / wrong chain).
+    reworkModel,
+    reworkModelChain,
+    reworkBackend,
     maxRounds,
     brief,
     orchestrator,
@@ -1734,6 +1764,14 @@ export function handleProviderExhaustion({
  * Cross-round state (reworkCount, currentTierIndex, strategized, session,
  * baseSha) is derived from the record fields so the resumed run continues the
  * ladder exactly where the original left off.
+ *
+ * `currentTierIndex` addresses the chain the NEXT round dispatches on
+ * (kusabi #192 axis 2): the implement chain for a round-1 resume, the REWORK
+ * chain from round 2 on when a models.phases.rework chain was configured
+ * (rework rounds run the tier ladder over the rework chain; the persisted
+ * tierAfter/tierBefore were recorded against it).  The driver re-dispatches
+ * rework rounds on the rework resolution restored from chain.json, so the
+ * index is applied to the same chain it was recorded against.
  *
  * @param {object}  opts
  * @param {object|null} opts.control    — control.json record.

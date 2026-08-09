@@ -14,10 +14,13 @@ import {
   __testProbeBindings,
   publishWarningForBrief,
   runChainDriver,
+  effectiveTierCount,
+  renderChainBanner,
   resolveResumeLastSession,
   resolveReviewDispatch,
   resolveResumeDispatches,
   resolveResumeReviewContext,
+  resolveResumeReworkContext,
 } from "./kusabi-companion.mjs";
 import { dispatchWithFallback } from "./prompt-execution.mjs";
 import { claudeDispatch } from "./claude-dispatch.mjs";
@@ -1720,6 +1723,630 @@ describe("runChainDriver per-phase backends (kusabi #192)", () => {
 });
 
 // =========================================================================
+// runChainDriver — per-round rework tiering (kusabi #192 axis 2)
+// -------------------------------------------------------------------------
+// models.phases.rework: implement rounds AFTER round 1 dispatch from the
+// rework resolution — own chain, own backend, own dispatch — while the
+// tier ladder climbs over the REWORK chain (first rework at its tier 0).
+// Absent key → rework rounds keep the implement resolution byte-identically.
+// Round records stamp the backend each round's implement job ACTUALLY used.
+// =========================================================================
+
+describe("runChainDriver per-round rework tiering (kusabi #192 axis 2)", () => {
+  const BRIEF = "Implement X.\n\n## Deliverables\n- src/foo.js\n";
+  const APPROVE = JSON.stringify({ verdict: "approve", findings: [], summary: "ok" });
+  const REWORK = JSON.stringify({
+    verdict: "needs-attention",
+    findings: [{ severity: "high", file: "src/foo.js", description: "fix the parser" }],
+  });
+
+  function fakeCallTool({ statusOutput = " M src/foo.js\n" } = {}) {
+    return async (toolName, params) => {
+      if (toolName === "verify_in_container") {
+        return { gate_passed: true };
+      }
+      if (toolName !== "sandbox_exec") return { output: "" };
+      const cmd = params.commands[0];
+      if (cmd.startsWith("cd /workspace &&") && cmd.includes("TMPIDX=")) {
+        return { output: "ERROR_NO_INDEX\n" };
+      }
+      if (cmd === "git rev-parse HEAD") return { output: "abc123\n" };
+      if (cmd === "git status --porcelain") return { output: statusOutput };
+      if (cmd === "git log --oneline -5") return { output: "abc123 latest change\n" };
+      if (cmd === "git diff") return { output: "diff --git a/src/foo.js b/src/foo.js\n" };
+      if (cmd === "git ls-files --others --exclude-standard") return { output: "untracked.txt\n" };
+      return { output: "" };
+    };
+  }
+
+  // One dispatch fake per phase seam.  `kind` gates the accepted phase
+  // (task = implement, review = review); `sessionPrefix` gives ids of the
+  // shape that phase's backend would produce (claude-uuid-* for the claude
+  // fake, ses_* for the opencode fakes) so session lineage assertions can
+  // tell the fakes apart.
+  function makePhaseDispatch({ kind, modelEntry, sessionPrefix, resultText }) {
+    const calls = [];
+    const dispatch = async (opts) => {
+      calls.push(opts);
+      // The strategist runs on the IMPLEMENT seam (runStrategizePhase threads
+      // the implement dispatch); a task fake must answer it so a strategize
+      // disposition in a fixture does not crash the chain.
+      if (opts.kind === "strategist" && kind === "task") {
+        return {
+          job: {
+            id: "strategist-job-" + (opts.round ?? 1), status: "completed",
+            modelEntry, modelVariant: null, fallbacks: null,
+            sessionID: sessionPrefix + "-strat",
+            usage: { available: true, input: 1, output: 1, reasoning: 0, cacheRead: 0, cacheWrite: 0, cost: 0.01 },
+            error: null,
+          },
+          resultText: "restructure the module",
+        };
+      }
+      if (opts.kind !== kind) {
+        throw new Error("unexpected dispatch kind: " + opts.kind + " on the " + kind + " seam");
+      }
+      return {
+        job: {
+          id: kind + "-job-" + (opts.round ?? 1), status: "completed",
+          modelEntry, modelVariant: null, fallbacks: null,
+          sessionID: sessionPrefix + (opts.round ?? 1),
+          usage: { available: true, input: 1, output: 1, reasoning: 0, cacheRead: 0, cacheWrite: 0, cost: 0.01 },
+          error: null,
+        },
+        resultText,
+      };
+    };
+    return { dispatch, calls };
+  }
+
+  function makeReviewDispatch({ reviewResults }) {
+    const calls = [];
+    let idx = 0;
+    const dispatch = async (opts) => {
+      calls.push(opts);
+      if (opts.kind !== "review") {
+        throw new Error("unexpected dispatch kind on the review seam: " + opts.kind);
+      }
+      const resultText = reviewResults[Math.min(idx, reviewResults.length - 1)];
+      idx += 1;
+      return {
+        job: {
+          id: "review-job-" + (opts.round ?? 1), status: "completed",
+          modelEntry: "opencode-go/deepseek-v4-flash", modelVariant: null, fallbacks: null,
+          sessionID: "ses_review_" + (opts.round ?? 1),
+          usage: { available: true, input: 2, output: 2, reasoning: 0, cacheRead: 0, cacheWrite: 0, cost: 0.01 },
+          error: null,
+        },
+        resultText,
+      };
+    };
+    return { dispatch, calls };
+  }
+
+  function makeChainDir() {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-rework-tier-"));
+    const chainDir = path.join(tmp, "chains", "chain-test");
+    fs.mkdirSync(chainDir, { recursive: true });
+    writeChainControl(chainDir, {
+      chainId: "chain-test", container: "cid-1", pid: process.pid,
+      status: "running", round: 0, startedAt: new Date().toISOString(),
+    });
+    return { tmp, chainDir };
+  }
+
+  it("mixed backends: round 1 dispatches claude/opus, a rework round dispatches the opencode flash route with a FRESH session, and records carry each round's true backend", async () => {
+    const { tmp, chainDir } = makeChainDir();
+    const implement = makePhaseDispatch({ kind: "task", modelEntry: "opus", sessionPrefix: "claude-uuid-", resultText: "implemented" });
+    const rework = makePhaseDispatch({ kind: "task", modelEntry: "opencode-go/deepseek-v4-flash", sessionPrefix: "ses_rework_", resultText: "implemented" });
+    const review = makeReviewDispatch({ reviewResults: [REWORK, APPROVE] });
+
+    const text = await runChainDriver({
+      cwd: tmp, stateDir: tmp, chainDir, chainId: "chain-test", container: "cid-1",
+      model: "opus", modelChain: [["opus"]],
+      reworkModel: "deepseek-v4-flash", reworkModelChain: [["opencode-go/deepseek-v4-flash"]],
+      reworkBackend: "opencode",
+      reviewModelChain: [["opencode-go/deepseek-v4-flash"]],
+      maxRounds: 2,
+      brief: BRIEF, orchestrator: null, baseSha: "abc123", worktreeBaseline: null,
+      callTool: fakeCallTool(),
+      backend: "claude", reviewBackend: "opencode",
+      dispatchWithFallback: implement.dispatch,
+      reworkDispatchWithFallback: rework.dispatch,
+      reviewDispatchWithFallback: review.dispatch,
+      keepServe: true,
+      signalReceived: () => false,
+      resume: null,
+    });
+
+    assert.match(text, /accepted at round 2/);
+
+    // Round 1 implement: the claude fake, implement chain, no session.
+    assert.equal(implement.calls.length, 1);
+    assert.equal(implement.calls[0].round, 1);
+    assert.deepEqual(implement.calls[0].tiers, [["opus"]]);
+    assert.ok(implement.calls[0].session == null);
+
+    // Round 2 (rework): the opencode rework fake, REWORK chain, FRESH
+    // session — the claude round's session id never crosses backends.
+    assert.equal(rework.calls.length, 1);
+    assert.equal(rework.calls[0].round, 2);
+    assert.deepEqual(rework.calls[0].tiers, [["opencode-go/deepseek-v4-flash"]]);
+    assert.ok(rework.calls[0].session == null, "rework round must start fresh across backends");
+
+    // Round records: backend reflects the route each round ACTUALLY used.
+    const round1 = readJson(path.join(chainDir, "round-1.json"));
+    assert.equal(round1.backend, "claude");
+    assert.equal(round1.modelEntry, "opus");
+    assert.equal(round1.sessionID, "claude-uuid-1");
+    const round2 = readJson(path.join(chainDir, "round-2.json"));
+    assert.equal(round2.backend, "opencode");
+    assert.equal(round2.modelEntry, "opencode-go/deepseek-v4-flash");
+    assert.equal(round2.sessionID, "ses_rework_2");
+
+    // chain.json persists the rework dispatch context for chain-resume.
+    const chainJson = readJson(path.join(chainDir, "chain.json"));
+    assert.deepEqual(chainJson.reworkModelChain, [["opencode-go/deepseek-v4-flash"]]);
+    assert.equal(chainJson.reworkModel, "deepseek-v4-flash");
+    assert.equal(chainJson.reworkBackend, "opencode");
+
+    fs.rmSync(tmp, { recursive: true, force: true });
+  });
+
+  it("same-backend tiering: a rework round continues the session and dispatches the rework chain's route", async () => {
+    const { tmp, chainDir } = makeChainDir();
+    const implement = makePhaseDispatch({ kind: "task", modelEntry: "opencode-go/deepseek-v4-pro", sessionPrefix: "ses_imp_", resultText: "implemented" });
+    const rework = makePhaseDispatch({ kind: "task", modelEntry: "opencode-go/deepseek-v4-flash", sessionPrefix: "ses_rework_", resultText: "implemented" });
+    const review = makeReviewDispatch({ reviewResults: [REWORK, APPROVE] });
+
+    const text = await runChainDriver({
+      cwd: tmp, stateDir: tmp, chainDir, chainId: "chain-test", container: "cid-1",
+      model: { providerID: "opencode-go", modelID: "deepseek-v4-pro" },
+      modelChain: [["opencode-go/deepseek-v4-pro"]],
+      reworkModel: "deepseek-v4-flash", reworkModelChain: [["opencode-go/deepseek-v4-flash"]],
+      reworkBackend: "opencode",
+      reviewModelChain: [["opencode-go/deepseek-v4-flash"]],
+      maxRounds: 2,
+      brief: BRIEF, orchestrator: null, baseSha: "abc123", worktreeBaseline: null,
+      callTool: fakeCallTool(),
+      backend: "opencode", reviewBackend: "opencode",
+      dispatchWithFallback: implement.dispatch,
+      reworkDispatchWithFallback: rework.dispatch,
+      reviewDispatchWithFallback: review.dispatch,
+      keepServe: true,
+      signalReceived: () => false,
+      resume: null,
+    });
+
+    assert.match(text, /accepted at round 2/);
+
+    // Round 1 on the implement seam with the implement chain.
+    assert.equal(implement.calls.length, 1);
+    assert.deepEqual(implement.calls[0].tiers, [["opencode-go/deepseek-v4-pro"]]);
+    // Round 2 (rework) on the rework seam with the flash route, session
+    // CONTINUED — the lineage guard passes on a same-backend rework.
+    assert.equal(rework.calls.length, 1);
+    assert.deepEqual(rework.calls[0].tiers, [["opencode-go/deepseek-v4-flash"]]);
+    assert.equal(rework.calls[0].session, "ses_imp_1", "same-backend rework continues the implement session");
+
+    const round1 = readJson(path.join(chainDir, "round-1.json"));
+    const round2 = readJson(path.join(chainDir, "round-2.json"));
+    assert.equal(round1.backend, "opencode");
+    assert.equal(round2.backend, "opencode");
+    assert.equal(round2.sessionID, "ses_rework_2");
+
+    fs.rmSync(tmp, { recursive: true, force: true });
+  });
+
+  it("the tier ladder climbs over the REWORK chain: first rework at its tier 0, next rework at its tier 1", async () => {
+    const { tmp, chainDir } = makeChainDir();
+    const implement = makePhaseDispatch({ kind: "task", modelEntry: "opencode-go/deepseek-v4-pro", sessionPrefix: "ses_imp_", resultText: "implemented" });
+    const rework = makePhaseDispatch({ kind: "task", modelEntry: "opencode-go/deepseek-v4-flash", sessionPrefix: "ses_rework_", resultText: "implemented" });
+    // Distinct finding files per round: same-file repeats would trigger the
+    // strategize lever instead of the plain rework this test exercises.
+    const reworkA = JSON.stringify({
+      verdict: "needs-attention",
+      findings: [{ severity: "high", file: "src/a.js", description: "fix the parser" }],
+    });
+    const reworkB = JSON.stringify({
+      verdict: "needs-attention",
+      findings: [{ severity: "high", file: "src/b.js", description: "fix the parser" }],
+    });
+    const review = makeReviewDispatch({ reviewResults: [reworkA, reworkB, APPROVE] });
+
+    const text = await runChainDriver({
+      cwd: tmp, stateDir: tmp, chainDir, chainId: "chain-test", container: "cid-1",
+      model: "deepseek-v4-pro", modelChain: [["opencode-go/deepseek-v4-pro"]],
+      reworkModel: "deepseek-v4-flash",
+      reworkModelChain: [["opencode-go/deepseek-v4-flash"], ["opencode-go/deepseek-v4-pro"]],
+      reworkBackend: "opencode",
+      reviewModelChain: [["opencode-go/deepseek-v4-flash"]],
+      maxRounds: 3,
+      brief: BRIEF, orchestrator: null, baseSha: "abc123", worktreeBaseline: null,
+      callTool: fakeCallTool(),
+      backend: "opencode", reviewBackend: "opencode",
+      dispatchWithFallback: implement.dispatch,
+      reworkDispatchWithFallback: rework.dispatch,
+      reviewDispatchWithFallback: review.dispatch,
+      keepServe: true,
+      signalReceived: () => false,
+      resume: null,
+    });
+
+    assert.match(text, /accepted at round 3/);
+
+    // Both rework rounds went to the rework seam with the REWORK chain; the
+    // tier index climbed 0 → 1 within it.
+    const reworkCalls = rework.calls.filter((c) => c.round >= 2);
+    assert.equal(reworkCalls.length, 2);
+    assert.equal(reworkCalls[0].round, 2);
+    assert.equal(reworkCalls[0].tierIndex, 0, "first rework starts at the rework chain's tier 0");
+    assert.equal(reworkCalls[1].round, 3);
+    assert.equal(reworkCalls[1].tierIndex, 1, "second rework escalates within the rework chain");
+    for (const c of reworkCalls) {
+      assert.deepEqual(c.tiers, [["opencode-go/deepseek-v4-flash"], ["opencode-go/deepseek-v4-pro"]],
+        "rework rounds address the rework chain");
+    }
+
+    const round2 = readJson(path.join(chainDir, "round-2.json"));
+    assert.equal(round2.tierBefore, 0);
+    const round3 = readJson(path.join(chainDir, "round-3.json"));
+    assert.equal(round3.tierBefore, 1);
+    assert.equal(round3.tierAfter, 1);
+
+    fs.rmSync(tmp, { recursive: true, force: true });
+  });
+
+  it("a single-tier rework chain clamps the escalation exactly as today, over the rework chain", async () => {
+    const { tmp, chainDir } = makeChainDir();
+    const implement = makePhaseDispatch({ kind: "task", modelEntry: "opencode-go/deepseek-v4-pro", sessionPrefix: "ses_imp_", resultText: "implemented" });
+    const rework = makePhaseDispatch({ kind: "task", modelEntry: "opencode-go/deepseek-v4-flash", sessionPrefix: "ses_rework_", resultText: "implemented" });
+    const reworkA = JSON.stringify({
+      verdict: "needs-attention",
+      findings: [{ severity: "high", file: "src/a.js", description: "fix the parser" }],
+    });
+    const reworkB = JSON.stringify({
+      verdict: "needs-attention",
+      findings: [{ severity: "high", file: "src/b.js", description: "fix the parser" }],
+    });
+    const review = makeReviewDispatch({ reviewResults: [reworkA, reworkB, APPROVE] });
+
+    const text = await runChainDriver({
+      cwd: tmp, stateDir: tmp, chainDir, chainId: "chain-test", container: "cid-1",
+      model: "deepseek-v4-pro", modelChain: [["opencode-go/deepseek-v4-pro"]],
+      reworkModel: "deepseek-v4-flash", reworkModelChain: [["opencode-go/deepseek-v4-flash"]],
+      reworkBackend: "opencode",
+      reviewModelChain: [["opencode-go/deepseek-v4-flash"]],
+      maxRounds: 3,
+      brief: BRIEF, orchestrator: null, baseSha: "abc123", worktreeBaseline: null,
+      callTool: fakeCallTool(),
+      backend: "opencode", reviewBackend: "opencode",
+      dispatchWithFallback: implement.dispatch,
+      reworkDispatchWithFallback: rework.dispatch,
+      reviewDispatchWithFallback: review.dispatch,
+      keepServe: true,
+      signalReceived: () => false,
+      resume: null,
+    });
+
+    assert.match(text, /accepted at round 3/);
+
+    const reworkCalls = rework.calls.filter((c) => c.round >= 2);
+    assert.equal(reworkCalls.length, 2);
+    assert.equal(reworkCalls[1].tierIndex, 0, "escalation clamps at the single-tier rework chain's top");
+    const round2 = readJson(path.join(chainDir, "round-2.json"));
+    assert.equal(round2.tierClamped, true);
+    assert.match(round2.tierClampReason, /single-tier chain/);
+
+    fs.rmSync(tmp, { recursive: true, force: true });
+  });
+
+  it("chain-resume with the key re-dispatches the rework round on the rework backend/model; a legacy chain.json resumes on the implement resolution", async () => {
+    function previousRecord({ backend, sessionID }) {
+      return {
+        round: 1, resumeMethod: { type: "continue_session" },
+        startedAt: "2026-08-01T00:00:00.000Z",
+        verdict: "needs-attention", probesGreen: true,
+        modelEntry: backend === "claude" ? "opus" : "opencode-go/deepseek-v4-pro",
+        modelVariant: null, fallbacks: null,
+        implementJobId: "job-imp-1", reviewJobId: "job-rev-1",
+        sessionID, implementUsage: null, reviewUsage: null,
+        tierBefore: 0, tierAfter: 0, reworkCount: 0,
+        pendingReworkStrategy: { tierDelta: 0, newSession: false, reason: "rework" },
+        disposition: { disposition: "rework", reason: "needs-attention" },
+        findingsText: "fix the parser",
+        backend,
+      };
+    }
+
+    async function driveResume({ previous, reworkCtx, reworkBackend }) {
+      const { tmp, chainDir } = makeChainDir();
+      writeJson(path.join(chainDir, "chain.json"), {
+        chainId: "chain-test", container: "cid-1", model: "opus",
+        modelChain: [["opus"]], maxRounds: 2,
+        brief: BRIEF, orchestrator: null, records: [previous],
+        baseSha: "abc123", chainTotals: computeChainTotals([previous]),
+        strategized: false, followupIssueDraft: null,
+        ...reworkCtx,
+      });
+      const implement = makePhaseDispatch({ kind: "task", modelEntry: "opencode-go/deepseek-v4-pro", sessionPrefix: "ses_imp_", resultText: "implemented" });
+      const rework = makePhaseDispatch({ kind: "task", modelEntry: "opencode-go/deepseek-v4-flash", sessionPrefix: "ses_rework_", resultText: "implemented" });
+      const review = makeReviewDispatch({ reviewResults: [APPROVE] });
+      const text = await runChainDriver({
+        cwd: tmp, stateDir: tmp, chainDir, chainId: "chain-test", container: "cid-1",
+        model: "opus", modelChain: [["opus"]],
+        reworkModel: reworkCtx.reworkModel ?? null,
+        reworkModelChain: reworkCtx.reworkModelChain ?? null,
+        reworkBackend,
+        maxRounds: 2,
+        brief: BRIEF, orchestrator: null, baseSha: "abc123", worktreeBaseline: null,
+        callTool: fakeCallTool(),
+        backend: "opencode", reviewBackend: "opencode",
+        dispatchWithFallback: implement.dispatch,
+        // A rework seam only exists when the chain.json carried rework keys
+        // (legacy: null → the driver falls back to the implement dispatch).
+        reworkDispatchWithFallback: reworkCtx.reworkModelChain ? rework.dispatch : null,
+        reviewDispatchWithFallback: review.dispatch,
+        keepServe: true,
+        signalReceived: () => false,
+        resume: {
+          phase: "implement", round: 2, roundRecord: null, records: [previous],
+          reworkCount: 1, currentTierIndex: 0, strategized: false,
+          session: previous.sessionID, baseSha: "abc123",
+        },
+      });
+      const round2 = readJson(path.join(chainDir, "round-2.json"));
+      fs.rmSync(tmp, { recursive: true, force: true });
+      return { text, round2, implementCalls: implement.calls, reworkCalls: rework.calls };
+    }
+
+    // Axis-2 chain.json (rework key present): the rework round re-dispatches
+    // on the rework seam with the rework chain; same-backend session lineage
+    // continues the implement session.
+    const axis2 = await driveResume({
+      previous: previousRecord({ backend: "opencode", sessionID: "ses_imp_1" }),
+      reworkCtx: {
+        reworkModel: "deepseek-v4-flash",
+        reworkModelChain: [["opencode-go/deepseek-v4-flash"]],
+        reworkBackend: "opencode",
+      },
+      reworkBackend: "opencode",
+    });
+    assert.match(axis2.text, /accepted at round 2/);
+    assert.equal(axis2.implementCalls.length, 0, "round 2 must NOT dispatch on the implement seam");
+    assert.equal(axis2.reworkCalls.length, 1);
+    assert.deepEqual(axis2.reworkCalls[0].tiers, [["opencode-go/deepseek-v4-flash"]]);
+    assert.equal(axis2.reworkCalls[0].session, "ses_imp_1", "same-backend rework continues the session");
+    assert.equal(axis2.round2.backend, "opencode");
+
+    // Axis-2 chain.json, cross-backend: the claude round's session must not
+    // reach the opencode rework dispatch (fresh start), and the rework round
+    // still uses the rework chain.
+    const cross = await driveResume({
+      previous: previousRecord({ backend: "claude", sessionID: "claude-uuid-1" }),
+      reworkCtx: {
+        reworkModel: "deepseek-v4-flash",
+        reworkModelChain: [["opencode-go/deepseek-v4-flash"]],
+        reworkBackend: "opencode",
+      },
+      reworkBackend: "opencode",
+    });
+    assert.match(cross.text, /accepted at round 2/);
+    assert.equal(cross.reworkCalls.length, 1);
+    assert.ok(cross.reworkCalls[0].session == null, "foreign claude session dropped on the opencode rework round");
+    assert.equal(cross.round2.backend, "opencode");
+
+    // Legacy chain.json (NO rework keys): rework rounds keep the implement
+    // resolution — the implement seam dispatches round 2 with the
+    // implement chain, byte-identical to today.
+    const legacy = await driveResume({
+      previous: previousRecord({ backend: "opencode", sessionID: "ses_imp_1" }),
+      reworkCtx: {},
+      reworkBackend: null,
+    });
+    assert.match(legacy.text, /accepted at round 2/);
+    assert.equal(legacy.reworkCalls.length, 0, "no rework seam on a legacy chain.json");
+    assert.equal(legacy.implementCalls.length, 1);
+    assert.equal(legacy.implementCalls[0].round, 2);
+    assert.deepEqual(legacy.implementCalls[0].tiers, [["opus"]], "legacy rework round uses the implement chain");
+    assert.equal(legacy.implementCalls[0].session, "ses_imp_1", "legacy rework round continues the session");
+    assert.equal(legacy.round2.backend, "opencode");
+  });
+
+  it("a multi-entry claude REWORK ladder never records tierAfter > 0 (backend-aware clamp, kusabi #192 follow-up)", async () => {
+    const { tmp, chainDir } = makeChainDir();
+    const implement = makePhaseDispatch({ kind: "task", modelEntry: "opus", sessionPrefix: "claude-uuid-", resultText: "implemented" });
+    const rework = makePhaseDispatch({ kind: "task", modelEntry: "sonnet", sessionPrefix: "claude-uuid-rw-", resultText: "implemented" });
+    const reworkA = JSON.stringify({
+      verdict: "needs-attention",
+      findings: [{ severity: "high", file: "src/a.js", description: "fix the parser" }],
+    });
+    const reworkB = JSON.stringify({
+      verdict: "needs-attention",
+      findings: [{ severity: "high", file: "src/b.js", description: "fix the parser" }],
+    });
+    const review = makeReviewDispatch({ reviewResults: [reworkA, reworkB, APPROVE] });
+
+    const text = await runChainDriver({
+      cwd: tmp, stateDir: tmp, chainDir, chainId: "chain-test", container: "cid-1",
+      model: "opus", modelChain: [["opus"]],
+      reworkModel: "sonnet",
+      // Multi-entry claude chain — legal config (kusabi #184), but the
+      // claude backend never walks its tiers: the model is pinned to the
+      // rework command-start model on every rework round.
+      reworkModelChain: [["opus"], ["sonnet"]],
+      reworkBackend: "claude",
+      reviewModelChain: [["opencode-go/deepseek-v4-flash"]],
+      maxRounds: 3,
+      brief: BRIEF, orchestrator: null, baseSha: "abc123", worktreeBaseline: null,
+      callTool: fakeCallTool(),
+      backend: "claude", reviewBackend: "opencode",
+      dispatchWithFallback: implement.dispatch,
+      reworkDispatchWithFallback: rework.dispatch,
+      reviewDispatchWithFallback: review.dispatch,
+      keepServe: true,
+      signalReceived: () => false,
+      resume: null,
+    });
+
+    assert.match(text, /accepted at round 3/);
+
+    // Both rework rounds dispatch at tier 0 — the clamp pins the tier index
+    // to the claude ladder's single effective tier.
+    const reworkCalls = rework.calls.filter((c) => c.round >= 2);
+    assert.equal(reworkCalls.length, 2);
+    assert.equal(reworkCalls[0].tierIndex, 0, "first rework at the claude ladder's only tier");
+    assert.equal(reworkCalls[1].tierIndex, 0, "second rework stays clamped at tier 0");
+
+    // Records: tierAfter never exceeds 0 on a claude ladder — kusabi #153's
+    // recorded-tier-vs-actual-model contradiction must not return through
+    // the claude rework surface (the modelEntry never changes: "sonnet" on
+    // every rework round while the raw chain length would claim 0 → 1).
+    const round2 = readJson(path.join(chainDir, "round-2.json"));
+    assert.equal(round2.tierBefore, 0);
+    assert.equal(round2.tierAfter, 0, "claude ladder: tierAfter must never exceed 0");
+    assert.equal(round2.tierClamped, true);
+    assert.match(round2.tierClampReason, /single-tier chain/);
+    assert.equal(round2.modelEntry, "sonnet");
+    const round3 = readJson(path.join(chainDir, "round-3.json"));
+    assert.equal(round3.tierBefore, 0);
+    assert.equal(round3.tierAfter, 0, "claude ladder: tierAfter must never exceed 0");
+
+    fs.rmSync(tmp, { recursive: true, force: true });
+  });
+
+  it("a multi-entry claude IMPLEMENT ladder (no rework key) also clamps: tierAfter stays 0 (pre-existing base surface, kusabi #192 follow-up)", async () => {
+    const { tmp, chainDir } = makeChainDir();
+    const implement = makePhaseDispatch({ kind: "task", modelEntry: "opus", sessionPrefix: "claude-uuid-", resultText: "implemented" });
+    const reworkA = JSON.stringify({
+      verdict: "needs-attention",
+      findings: [{ severity: "high", file: "src/a.js", description: "fix the parser" }],
+    });
+    const reworkB = JSON.stringify({
+      verdict: "needs-attention",
+      findings: [{ severity: "high", file: "src/b.js", description: "fix the parser" }],
+    });
+    const review = makeReviewDispatch({ reviewResults: [reworkA, reworkB, APPROVE] });
+
+    const text = await runChainDriver({
+      cwd: tmp, stateDir: tmp, chainDir, chainId: "chain-test", container: "cid-1",
+      model: "opus",
+      // Multi-entry claude IMPLEMENT chain, no models.phases.rework key:
+      // rework rounds keep the implement resolution (effectiveReworkChain is
+      // the implement chain) — the base surface the follow-up also fixes.
+      modelChain: [["opus"], ["sonnet"]],
+      reviewModelChain: [["opencode-go/deepseek-v4-flash"]],
+      maxRounds: 3,
+      brief: BRIEF, orchestrator: null, baseSha: "abc123", worktreeBaseline: null,
+      callTool: fakeCallTool(),
+      backend: "claude", reviewBackend: "opencode",
+      dispatchWithFallback: implement.dispatch,
+      reworkDispatchWithFallback: null,
+      reviewDispatchWithFallback: review.dispatch,
+      keepServe: true,
+      signalReceived: () => false,
+      resume: null,
+    });
+
+    assert.match(text, /accepted at round 3/);
+
+    // Rework rounds run on the implement seam (no rework key) at tier 0.
+    const implementCalls = implement.calls.filter((c) => c.round >= 2);
+    assert.equal(implementCalls.length, 2);
+    assert.equal(implementCalls[0].tierIndex, 0);
+    assert.equal(implementCalls[1].tierIndex, 0, "claude implement ladder never escalates");
+
+    const round2 = readJson(path.join(chainDir, "round-2.json"));
+    assert.equal(round2.tierBefore, 0);
+    assert.equal(round2.tierAfter, 0, "claude implement ladder: tierAfter must never exceed 0");
+    assert.equal(round2.tierClamped, true);
+    assert.match(round2.tierClampReason, /single-tier chain/);
+    const round3 = readJson(path.join(chainDir, "round-3.json"));
+    assert.equal(round3.tierAfter, 0);
+
+    fs.rmSync(tmp, { recursive: true, force: true });
+  });
+});
+
+// =========================================================================
+// chain-start banner (kusabi #192 follow-up) — backend-aware tier counts
+// -------------------------------------------------------------------------
+// The banner line (B7) had zero coverage before this block.  A claude-native
+// chain has an effective tier count of min(1, length): claudeDispatch pins
+// every phase to the command-start model, so its ladder never climbs and the
+// banner must not claim tiers it cannot walk (reworkTiers=2 on a claude
+// rework chain of 2 was a false "can reach top tier" claim at maxRounds >= 3).
+// =========================================================================
+
+describe("chain-start banner (kusabi #192 follow-up)", () => {
+  const OPENCODE_IMPLEMENT_1 = [["opencode-go/deepseek-v4-pro"]];
+  const OPENCODE_REWORK_2 = [["opencode-go/deepseek-v4-flash"], ["opencode-go/deepseek-v4-pro"]];
+  const CLAUDE_IMPLEMENT_1 = [["claude/opus"]];
+  const CLAUDE_REWORK_2 = [["claude/opus"], ["claude/sonnet-4-5"]];
+
+  it("opencode rework chain of 2: unchanged semantics — can reach top with maxRounds >= 3", () => {
+    const tierCount = effectiveTierCount(OPENCODE_IMPLEMENT_1, "opencode");
+    const reworkTierCount = effectiveTierCount(OPENCODE_REWORK_2, "opencode");
+    assert.equal(tierCount, 1);
+    assert.equal(reworkTierCount, 2, "opencode chains keep their full length");
+    // roundsToTopTier = 1 + 2 = 3: the top tier needs three rounds.
+    assert.equal(
+      renderChainBanner({ chainId: "c1", tierCount, reworkTierCount, reworkKeyConfigured: true, maxRounds: 3 }),
+      "Chain c1: tiers=1, reworkTiers=2, maxRounds=3 (can reach top tier)\n");
+    assert.equal(
+      renderChainBanner({ chainId: "c1", tierCount, reworkTierCount, reworkKeyConfigured: true, maxRounds: 2 }),
+      "Chain c1: tiers=1, reworkTiers=2, maxRounds=2 (maxRounds insufficient to reach top tier)\n");
+  });
+
+  it("claude-native rework chain of 2: effective tier count is 1 — the claim never exceeds ladderTierCount 1", () => {
+    const tierCount = effectiveTierCount(CLAUDE_IMPLEMENT_1, "claude");
+    const reworkTierCount = effectiveTierCount(CLAUDE_REWORK_2, "claude");
+    assert.equal(tierCount, 1);
+    assert.equal(reworkTierCount, 1, "a claude chain counts as one tier");
+    // roundsToTopTier = 1 + 1 = 2: maxRounds 2 already reaches the (only)
+    // top tier.  The pre-fix code computed roundsToTopTier = 3 from the raw
+    // length 2 and falsely claimed the top was unreachable at maxRounds 2.
+    assert.equal(
+      renderChainBanner({ chainId: "c1", tierCount, reworkTierCount, reworkKeyConfigured: true, maxRounds: 2 }),
+      "Chain c1: tiers=1, reworkTiers=1, maxRounds=2 (can reach top tier)\n");
+    // At maxRounds 3 the pre-fix banner printed reworkTiers=2 and claimed
+    // can-reach-top from a 2-tier ladder the claude backend never walks.
+    assert.equal(
+      renderChainBanner({ chainId: "c1", tierCount, reworkTierCount, reworkKeyConfigured: true, maxRounds: 3 }),
+      "Chain c1: tiers=1, reworkTiers=1, maxRounds=3 (can reach top tier)\n");
+    assert.equal(
+      renderChainBanner({ chainId: "c1", tierCount, reworkTierCount, reworkKeyConfigured: true, maxRounds: 1 }),
+      "Chain c1: tiers=1, reworkTiers=1, maxRounds=1 (maxRounds insufficient to reach top tier)\n");
+  });
+
+  it("no rework key: today's banner byte-identical (opencode implement chain of 2)", () => {
+    const tierCount = effectiveTierCount(OPENCODE_REWORK_2, "opencode");
+    assert.equal(tierCount, 2);
+    assert.equal(
+      renderChainBanner({ chainId: "c1", tierCount, reworkTierCount: 0, reworkKeyConfigured: false, maxRounds: 3 }),
+      "Chain c1: tiers=2, maxRounds=3 (can reach top tier)\n");
+  });
+
+  it("no rework key, claude implement chain of 2: the implement surface clamps to one tier too", () => {
+    const tierCount = effectiveTierCount(CLAUDE_REWORK_2, "claude");
+    assert.equal(tierCount, 1);
+    // Pre-fix: tiers=2 with roundsToTopTier=3 — a false claim at maxRounds 2.
+    assert.equal(
+      renderChainBanner({ chainId: "c1", tierCount, reworkTierCount: 0, reworkKeyConfigured: false, maxRounds: 2 }),
+      "Chain c1: tiers=1, maxRounds=2 (can reach top tier)\n");
+    assert.equal(
+      renderChainBanner({ chainId: "c1", tierCount, reworkTierCount: 0, reworkKeyConfigured: false, maxRounds: 3 }),
+      "Chain c1: tiers=1, maxRounds=3 (can reach top tier)\n");
+  });
+
+  it("no implement chain: no banner line (the caller skips the write)", () => {
+    assert.equal(
+      renderChainBanner({ chainId: "c1", tierCount: 0, reworkTierCount: 0, reworkKeyConfigured: false, maxRounds: 4 }),
+      null);
+  });
+});
+
+// =========================================================================
 // per-phase backend config validation at command start (kusabi #192)
 // -------------------------------------------------------------------------
 // A phase array mixing claude/ and opencode entries, and a claude/<model>
@@ -1832,7 +2459,7 @@ describe("chain per-phase config validation (kusabi #192)", () => {
     try {
       // chain without --backend and without --container: resolution passes
       // (both phases resolve at command start), so the failure is the
-      // container requirement \u2014 NOT a backend conflict.
+      // container requirement — NOT a backend conflict.
       const result = runCompanion(["chain", "brief text"], tmp, stateDir);
       assert.notEqual(result.status, 0);
       assert.doesNotMatch(result.stdout, /--backend opencode/);
@@ -1854,6 +2481,102 @@ describe("chain per-phase config validation (kusabi #192)", () => {
       assert.notEqual(result.status, 0);
       assert.doesNotMatch(result.stdout, /mixes backends/);
       assert.match(result.stdout, /chain requires --container/);
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  // ---- models.phases.rework (kusabi #192 axis 2) — same fail-loud rules ----
+
+  it("a mixed-backend rework array fails before chain-dir creation naming models.phases.rework", () => {
+    const { tmp, stateDir } = makeState({
+      models: {
+        phases: {
+          implement: ["claude/opus"],
+          rework: ["claude/opus", "opencode/x:max"],
+        },
+      },
+    });
+    try {
+      const result = runCompanion(["chain", "--container", "abc123", "brief text"], tmp, stateDir);
+      assert.notEqual(result.status, 0, `expected failure, got: ${result.stdout}`);
+      assert.match(result.stdout, /mixes backends/);
+      assert.match(result.stdout, /single-backend/);
+      assert.match(result.stdout, /models\.phases\.rework/, "the error must name the offending config key");
+      // Failed at command start: no chain directory was created.
+      const hash = crypto.createHash("sha256").update(tmp).digest("hex").slice(0, 12);
+      assert.equal(fs.existsSync(path.join(stateDir, hash, "chains")), false);
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("a claude/<model>:variant entry in the rework chain fails at command start naming models.phases.rework", () => {
+    const { tmp, stateDir } = makeState({
+      models: { phases: { rework: ["claude/opus:max"] } },
+    });
+    try {
+      const result = runCompanion(["chain", "--container", "abc123", "brief text"], tmp, stateDir);
+      assert.notEqual(result.status, 0, `expected failure, got: ${result.stdout}`);
+      assert.match(result.stdout, /:variant suffix in model "opus:max"/);
+      assert.match(result.stdout, /models\.phases\.rework/, "the error must name the offending config key");
+      const hash = crypto.createHash("sha256").update(tmp).digest("hex").slice(0, 12);
+      assert.equal(fs.existsSync(path.join(stateDir, hash, "chains")), false);
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("explicit --backend opencode with a claude-native rework chain fails at command start naming the flag and models.phases.rework", () => {
+    const { tmp, stateDir } = makeState({
+      models: { phases: { rework: ["claude/opus"] } },
+    });
+    try {
+      const result = runCompanion(["chain", "--backend", "opencode", "--container", "abc123", "brief text"], tmp, stateDir);
+      assert.notEqual(result.status, 0, `expected failure, got: ${result.stdout}`);
+      assert.match(result.stdout, /--backend opencode/);
+      assert.match(result.stdout, /models\.phases\.rework/);
+      // Failed at command start: no chain directory was created.
+      const hash = crypto.createHash("sha256").update(tmp).digest("hex").slice(0, 12);
+      assert.equal(fs.existsSync(path.join(stateDir, hash, "chains")), false);
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("a valid three-phase config (implement claude / rework opencode / review opencode) passes command-start resolution", () => {
+    const { tmp, stateDir } = makeState({
+      models: {
+        phases: {
+          implement: ["claude/opus"],
+          rework: ["opencode-go/deepseek-v4-flash"],
+          review: ["opencode-go/deepseek-v4-flash"],
+        },
+      },
+    });
+    try {
+      // chain with no container fails on the container requirement — NOT on
+      // the config: proves implement + rework + review all resolved.
+      const result = runCompanion(["chain", "brief text"], tmp, stateDir);
+      assert.notEqual(result.status, 0);
+      assert.doesNotMatch(result.stdout, /mixes backends/);
+      assert.doesNotMatch(result.stdout, /--backend opencode/);
+      assert.doesNotMatch(result.stdout, /models\.phases\.rework/);
+      assert.match(result.stdout, /chain requires --container/);
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("task --phase rework stays invalid even with a models.phases.rework key (no rework agent exists)", () => {
+    const { tmp, stateDir } = makeState({
+      models: { phases: { rework: ["opencode-go/deepseek-v4-flash"] } },
+    });
+    try {
+      const result = runCompanion(["task", "--phase", "rework", "do it"], tmp, stateDir);
+      assert.notEqual(result.status, 0, `expected failure, got: ${result.stdout}`);
+      assert.match(result.stdout, /unknown phase: rework/);
+      assert.doesNotMatch(result.stdout, /mixes backends/);
     } finally {
       fs.rmSync(tmp, { recursive: true, force: true });
     }
@@ -2104,6 +2827,63 @@ describe("resolveResumeReviewContext (kusabi #192 legacy fallback)", () => {
     assert.equal(typeof d.reviewDispatchWithFallback, "function");
     assert.notEqual(d.reviewDispatchWithFallback, claudeDispatch);
     assert.notEqual(d.reviewDispatchWithFallback, dispatchWithFallback);
+  });
+});
+
+// =========================================================================
+// resolveResumeReworkContext — legacy chain.json rework-model fallback
+// -------------------------------------------------------------------------
+// The rework mirror of resolveResumeReviewContext (kusabi #192 axis 2): a
+// pre-axis-2 chain.json has NO reworkModel / reworkModelChain /
+// reworkBackend keys — key absence is the legacy marker, and the rework
+// rounds continue on the implement model/chain.  A NEW chain.json persists
+// the keys (null when no models.phases.rework key was configured), and a
+// persisted null must stay null — never silently borrow the implement
+// chain.
+// =========================================================================
+
+describe("resolveResumeReworkContext (kusabi #192 axis 2 legacy fallback)", () => {
+  it("a legacy chain.json (no rework keys) falls back to the implement model and chain", () => {
+    const legacy = { model: "sonnet", modelChain: [["opus"], ["claude-sonnet-4-5"]] };
+    const ctx = resolveResumeReworkContext(legacy);
+    assert.equal(ctx.reworkModel, "sonnet", "key absence falls back to the implement model");
+    assert.deepEqual(ctx.reworkModelChain, [["opus"], ["claude-sonnet-4-5"]],
+      "key absence falls back to the implement chain");
+    assert.equal(ctx.reworkBackend, null, "no implement-side backend to fall back to; caller resolves null → implement backend");
+  });
+
+  it("a legacy chain.json without even a model still yields nulls, not undefined", () => {
+    const ctx = resolveResumeReworkContext({ modelChain: [["opus"]] });
+    assert.equal(ctx.reworkModel, null);
+    assert.deepEqual(ctx.reworkModelChain, [["opus"]]);
+  });
+
+  it("a NEW chain.json persisting nulls keeps them (no borrowing from the implement chain)", () => {
+    const mixed = {
+      model: "opus",
+      modelChain: [["opus"]],
+      reworkModel: null,
+      reworkModelChain: null,
+      reworkBackend: null,
+    };
+    const ctx = resolveResumeReworkContext(mixed);
+    assert.equal(ctx.reworkModel, null, "persisted null must stay null");
+    assert.equal(ctx.reworkModelChain, null, "persisted null must stay null");
+    assert.equal(ctx.reworkBackend, null, "persisted null must stay null");
+  });
+
+  it("an axis-2 chain.json carries the rework context verbatim", () => {
+    const mixed = {
+      model: "opus",
+      modelChain: [["opus"]],
+      reworkModel: "deepseek-v4-flash",
+      reworkModelChain: [["opencode-go/deepseek-v4-flash"]],
+      reworkBackend: "opencode",
+    };
+    const ctx = resolveResumeReworkContext(mixed);
+    assert.equal(ctx.reworkModel, "deepseek-v4-flash");
+    assert.deepEqual(ctx.reworkModelChain, [["opencode-go/deepseek-v4-flash"]]);
+    assert.equal(ctx.reworkBackend, "opencode");
   });
 });
 
@@ -3121,6 +3901,122 @@ describe("chain-resume CLI", () => {
         assert.doesNotMatch(line, /--model","opus"/,
           "resumed review must not re-derive from the chain's first route");
       }
+    } finally {
+      if (savedClaudeBin === undefined) delete process.env.CLAUDE_BIN;
+      else process.env.CLAUDE_BIN = savedClaudeBin;
+      if (savedArgsLog === undefined) delete process.env.FAKE_CLAUDE_ARGS_LOG;
+      else process.env.FAKE_CLAUDE_ARGS_LOG = savedArgsLog;
+      if (savedMcpSource === undefined) delete process.env.KUSABI_CLAUDE_MCP_SOURCE;
+      else process.env.KUSABI_CLAUDE_MCP_SOURCE = savedMcpSource;
+      server.close();
+      server.closeAllConnections?.();
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("axis 2: a chain.json with rework keys resumes the rework round on the rework backend/model (claude, pinned rework model, fresh session)", async () => {
+    // The round-1 record ran implement on OPENCODE (backend field + an
+    // opencode ses_* session) with disposition rework, so the resume lands
+    // at round 2's IMPLEMENT phase.  chain.json carries the rework context
+    // (reworkBackend claude / reworkModel sonnet) — the resumed rework round
+    // must dispatch on the clamped claude dispatch pinned to sonnet, NEVER
+    // on the implement resolution (opus), and must NOT carry the opencode
+    // round's session across the backend switch.
+    const { server, url } = await startSunabaStub({
+      toolResultText: { output: " M src/foo.js\n" },
+    });
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-resume-rework-cli-"));
+    const claudeArgsLog = path.join(tmp, "claude-args.ndjson");
+    fs.writeFileSync(claudeArgsLog, "", "utf8");
+    const claudeBinPath = path.join(tmp, "fake-claude.mjs");
+    fs.writeFileSync(
+      claudeBinPath,
+      "#!/usr/bin/env node\n" +
+      "import fs from \"node:fs\";\n" +
+      "fs.appendFileSync(process.env.FAKE_CLAUDE_ARGS_LOG, JSON.stringify(process.argv.slice(2)) + \"\\n\");\n" +
+      "process.stdout.write(JSON.stringify({ type: \"result\", is_error: false, result: \"ok\", session_id: \"claude-uuid-resume\" }));\n",
+      "utf8",
+    );
+    fs.chmodSync(claudeBinPath, 0o755);
+    const savedClaudeBin = process.env.CLAUDE_BIN;
+    const savedArgsLog = process.env.FAKE_CLAUDE_ARGS_LOG;
+    const savedMcpSource = process.env.KUSABI_CLAUDE_MCP_SOURCE;
+    process.env.CLAUDE_BIN = claudeBinPath;
+    process.env.FAKE_CLAUDE_ARGS_LOG = claudeArgsLog;
+    const mcpSource = path.join(tmp, "claude.json");
+    fs.writeFileSync(mcpSource, JSON.stringify({ mcpServers: { sunaba: { command: "npx" } } }), "utf8");
+    process.env.KUSABI_CLAUDE_MCP_SOURCE = mcpSource;
+    try {
+      const stateDir = hashedWorkspaceDir(path.join(tmp, "state"), tmp);
+      const chainJson = {
+        chainId: "chain-rework",
+        container: "cid-1",
+        model: "opus",
+        modelChain: [["opus"]],
+        // Per-phase review context: review runs on claude with haiku.
+        reviewModel: "haiku",
+        reviewModelChain: [["haiku"]],
+        // Per-round rework context (kusabi #192 axis 2): rework rounds run
+        // on claude with sonnet — a different backend than round 1.
+        reworkModel: "sonnet",
+        reworkModelChain: [["sonnet"]],
+        reworkBackend: "claude",
+        maxRounds: 4,
+        brief: "Implement X.",
+        orchestrator: null,
+        records: [{
+          round: 1,
+          resumeMethod: { type: "continue_session" },
+          implementJobId: "job-imp-1",
+          reviewJobId: "job-rev-1",
+          verdict: "needs-attention",
+          probesGreen: false,
+          modelEntry: "opencode-go/deepseek-v4-pro",
+          modelVariant: null, fallbacks: null,
+          sessionID: "ses_opencode_1",
+          implementUsage: null, reviewUsage: null,
+          tierBefore: 0, tierAfter: 0, reworkCount: 0,
+          pendingReworkStrategy: { tierDelta: 0, newSession: false, reason: "1st rework: same tier, continue session, keep artifacts" },
+          disposition: { disposition: "rework", reason: "needs-attention" },
+          findingsText: "fix the parser",
+          backend: "opencode",
+          reviewBackend: "claude",
+        }],
+        baseSha: "abc123",
+        chainTotals: { input: 0, output: 0, reasoning: 0, cacheRead: 0, cacheWrite: 0, cost: 0 },
+        strategized: false,
+        followupIssueDraft: null,
+      };
+      makeChain(stateDir, "chain-rework", {
+        control: {
+          chainId: "chain-rework", container: "cid-1", pid: 0, // dead pid → abnormal stop
+          status: "running", round: 1, startedAt: new Date().toISOString(),
+        },
+        chainJson,
+      });
+      const result = await runResumeAsync(["chain-rework"], {
+        stateDir: path.join(tmp, "state"),
+        cwd: tmp,
+        env: { KUSABI_SUNABA_URL: url },
+      });
+      const lines = fs.readFileSync(claudeArgsLog, "utf8").trim().split("\n").filter(Boolean);
+      assert.ok(lines.length >= 1,
+        `rework dispatch never reached the claude binary: ${result.stdout} ${result.stderr}`);
+      // The prompt (with the round title) goes to stdin, not argv — the
+      // pinned --model distinguishes the phases: sonnet = rework implement
+      // (rework resolution), haiku = review (review resolution).
+      const reworkImplementLines = lines.filter((l) => l.includes("--model\",\"sonnet\""));
+      assert.ok(reworkImplementLines.length >= 1,
+        `no rework implement dispatch found in: ${lines.join("\n")}`);
+      for (const line of lines) {
+        assert.doesNotMatch(line, /--model\",\"opus\"/,
+          "resumed rework implement must not fall back to the implement model");
+        assert.doesNotMatch(line, /ses_opencode_1/,
+          "the opencode round's session must not cross into the claude rework round (fresh start)");
+        assert.match(line, /--model\",\"(sonnet|haiku)\"/,
+          `every resumed claude dispatch must pin its own phase's model, got: ${line}`);
+      }
+      assert.equal(result.status, 0, `resumed chain should complete: ${result.stdout} ${result.stderr}`);
     } finally {
       if (savedClaudeBin === undefined) delete process.env.CLAUDE_BIN;
       else process.env.CLAUDE_BIN = savedClaudeBin;

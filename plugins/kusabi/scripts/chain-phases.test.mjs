@@ -1950,6 +1950,56 @@ describe("handleProviderExhaustion", () => {
     assert.equal(result.chainState.reviewModelChain, null);
   });
 
+  it("chainState carries reworkModel / reworkModelChain / reworkBackend verbatim (rework-round resume context)", () => {
+    // persistChainState persists all three; handleProviderExhaustion must
+    // too, or a rework implement provider-exhaustion loses the rework
+    // dispatch context and a later chain-resume re-dispatches the rework
+    // round on the implement resolution (wrong backend / wrong chain).
+    const records = makeRecords([1]);
+    const roundRecord = { round: 2, modelEntry: "provider/model-2" };
+
+    const result = handleProviderExhaustion({
+      records, roundRecord,
+      currentTierIndex: 0,
+      phase: "implement",
+      jobError: "error detail",
+      chainFollowupDraft: null,
+      reworkModel: "deepseek-v4-flash",
+      reworkModelChain: [["opencode-go/deepseek-v4-flash"]],
+      reworkBackend: "opencode",
+      ...baseState, round: 2,
+    });
+
+    assert.equal(result.chainState.reworkModel, "deepseek-v4-flash", "reworkModel persisted verbatim");
+    assert.deepEqual(result.chainState.reworkModelChain, [["opencode-go/deepseek-v4-flash"]],
+      "reworkModelChain persisted verbatim");
+    assert.equal(result.chainState.reworkBackend, "opencode", "reworkBackend persisted verbatim");
+  });
+
+  it("chainState without rework context defaults all three rework fields to null (never missing)", () => {
+    // Key presence (even null) is what chain-resume reads to distinguish a
+    // NEW chain from a legacy one — a missing key would silently re-enable
+    // the legacy fallback on a chain that legitimately has no rework context.
+    const records = makeRecords([1]);
+    const roundRecord = { round: 2, modelEntry: "provider/model-2" };
+
+    const result = handleProviderExhaustion({
+      records, roundRecord,
+      currentTierIndex: 0,
+      phase: "review",
+      jobError: "error detail",
+      chainFollowupDraft: null,
+      ...baseState, round: 2,
+    });
+
+    assert.equal("reworkModel" in result.chainState, true, "reworkModel key always present");
+    assert.equal(result.chainState.reworkModel, null);
+    assert.equal("reworkModelChain" in result.chainState, true, "reworkModelChain key always present");
+    assert.equal(result.chainState.reworkModelChain, null);
+    assert.equal("reworkBackend" in result.chainState, true, "reworkBackend key always present");
+    assert.equal(result.chainState.reworkBackend, null);
+  });
+
   // ---- the push decision is derived, not supplied ----
 
   it("never duplicates a round that is already in records, whatever the phase", () => {
@@ -3356,6 +3406,39 @@ describe("persistChainState interrupted round", () => {
     const chainJson = readJson(path.join(chainDir, "chain.json"));
     assert.equal(chainJson.reviewModel, null);
     assert.equal(chainJson.reviewModelChain, null);
+  });
+
+  it("persists the rework-phase model, chain and backend for chain-resume (kusabi #192 axis 2)", () => {
+    const chainDir = makeChainDir();
+    fs.mkdirSync(chainDir, { recursive: true });
+    const roundRecord = { round: 1, implementJobId: "job-1" };
+    persistChainState({
+      chainDir, round: 1, roundRecord, records: [roundRecord],
+      chainTotals: computeChainTotals([roundRecord]),
+      ...chainCtx,
+      reworkModel: "deepseek-v4-flash",
+      reworkModelChain: [["opencode-go/deepseek-v4-flash"]],
+      reworkBackend: "opencode",
+    });
+    const chainJson = readJson(path.join(chainDir, "chain.json"));
+    assert.equal(chainJson.reworkModel, "deepseek-v4-flash");
+    assert.deepEqual(chainJson.reworkModelChain, [["opencode-go/deepseek-v4-flash"]]);
+    assert.equal(chainJson.reworkBackend, "opencode");
+  });
+
+  it("defaults chain.json rework fields to null when not given (no models.phases.rework key)", () => {
+    const chainDir = makeChainDir();
+    fs.mkdirSync(chainDir, { recursive: true });
+    const roundRecord = { round: 1, implementJobId: "job-1" };
+    persistChainState({
+      chainDir, round: 1, roundRecord, records: [roundRecord],
+      chainTotals: computeChainTotals([roundRecord]),
+      ...chainCtx,
+    });
+    const chainJson = readJson(path.join(chainDir, "chain.json"));
+    assert.equal(chainJson.reworkModel, null);
+    assert.equal(chainJson.reworkModelChain, null);
+    assert.equal(chainJson.reworkBackend, null);
   });
 });
 
