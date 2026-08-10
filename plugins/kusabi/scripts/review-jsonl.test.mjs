@@ -351,3 +351,111 @@ describe("parseReviewJsonl — malformed and non-JSONL input", () => {
     assert.deepEqual(result.review.findings, [assembled(FINDING_A)]);
   });
 });
+
+
+describe("parseReviewJsonl — a legacy blob wearing a `type` key (kusabi #205)", () => {
+  const CRITICAL = {
+    severity: "critical",
+    title: "REAL DEFECT",
+    body: "a defect that must not disappear",
+    file: "src/a.mjs",
+    line_start: 1,
+    line_end: 2,
+    confidence: 0.9,
+    recommendation: "fix it",
+  };
+
+  it("is not a record, so its findings are never dropped", () => {
+    // Regression: detection accepted any object carrying a known `type`, so a
+    // reviewer emitting the legacy whole-review object while copying the
+    // `type` discriminator out of the prompt's own examples parsed as ONE
+    // verdict record — verdict `approve`, findings [], partial false — and
+    // the critical finding sitting beside it was never read.  With green
+    // probes that is an accept, and the raw text is not persisted, so the
+    // finding vanished without a trace.
+    const legacy = JSON.stringify({
+      type: "verdict",
+      verdict: "approve",
+      summary: "looks fine",
+      findings: [CRITICAL],
+      next_steps: [],
+    });
+
+    assert.equal(parseReviewJsonl(legacy), null);
+  });
+
+  it("abandons JSONL for the whole stream, not just the blob's line", () => {
+    // The first attempt at this fix skipped the blob as prose.  Any other
+    // record then kept the stream in JSONL mode, so the blob's findings were
+    // dropped just as silently as before — the bug moved rather than closed.
+    const stream = [
+      JSON.stringify({ type: "next_step", text: "Fix tests" }),
+      JSON.stringify({ type: "verdict", verdict: "approve", summary: "s", findings: [CRITICAL] }),
+    ].join("\n");
+
+    assert.equal(parseReviewJsonl(stream), null, "a blob anywhere means the output was not JSONL");
+  });
+
+  it("treats a NON-EMPTY legacy array as the signal, on any of the three keys", () => {
+    for (const key of ["findings", "next_steps", "unverified"]) {
+      const blob = JSON.stringify({
+        type: "verdict", verdict: "approve", summary: "s", [key]: ["payload"],
+      });
+      assert.equal(parseReviewJsonl(blob), null, `non-empty ${key} marks a legacy blob`);
+    }
+  });
+
+  it("keeps a record that merely pads an empty legacy array", () => {
+    // A model that writes `"findings": []` on a finding record is saying
+    // "none here", not emitting a whole review.  Rejecting it threw the
+    // record away and produced a findings-free approve — the very outcome
+    // this check exists to prevent.
+    const stream = [
+      JSON.stringify({ type: "finding", ...CRITICAL, findings: [] }),
+      JSON.stringify({ type: "verdict", verdict: "approve", summary: "LGTM" }),
+    ].join("\n");
+
+    const parsed = parseReviewJsonl(stream);
+    assert.ok(parsed, "padded record must not abandon JSONL");
+    assert.equal(parsed.review.findings.length, 1);
+    assert.equal(parsed.review.findings[0].title, "REAL DEFECT");
+  });
+
+  it("never yields an approval that reports no findings, whatever the shape", () => {
+    // The invariant, stated once: a misdetection may land on unparseable or
+    // partial — both escalate — but must never become `approve` with the
+    // findings gone.
+    const shapes = [
+      JSON.stringify({ type: "verdict", verdict: "approve", summary: "s", findings: [CRITICAL] }),
+      [
+        JSON.stringify({ type: "next_step", text: "x" }),
+        JSON.stringify({ type: "verdict", verdict: "approve", summary: "s", findings: [CRITICAL] }),
+      ].join("\n"),
+      [
+        JSON.stringify({ type: "finding", ...CRITICAL, findings: [] }),
+        JSON.stringify({ type: "verdict", verdict: "approve", summary: "s" }),
+      ].join("\n"),
+    ];
+
+    for (const shape of shapes) {
+      const parsed = parseReviewJsonl(shape);
+      const approvedWithNothing =
+        parsed !== null && parsed.review.verdict === "approve" && parsed.review.findings.length === 0;
+      assert.equal(approvedWithNothing, false, `silent approval for: ${shape.slice(0, 60)}`);
+    }
+  });
+
+  it("still accepts a real verdict record, which carries none of those keys", () => {
+    const stream = [
+      JSON.stringify({ type: "finding", ...CRITICAL }),
+      JSON.stringify({ type: "verdict", verdict: "needs-attention", summary: "one critical" }),
+    ].join("\n");
+
+    const parsed = parseReviewJsonl(stream);
+    assert.ok(parsed);
+    assert.equal(parsed.review.verdict, "needs-attention");
+    assert.equal(parsed.review.findings.length, 1);
+    assert.equal(parsed.review.findings[0].title, "REAL DEFECT");
+    assert.equal(parsed.partial, false);
+  });
+});
