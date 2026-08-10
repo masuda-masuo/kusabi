@@ -39,6 +39,54 @@ describe("deriveDisposition", () => {
     assert.deepEqual(result, { disposition: "escalate", reason: "reviewer discarded the work" });
   });
 
+  // ---- partial review (kusabi #202) ----
+  // A JSONL stream with findings but no verdict line: the review is
+  // INCOMPLETE.  It escalates to the orchestrator — it is not an approval and
+  // it must not silently buy a rework round.
+
+  it("escalate: partial (stream ended before the verdict line)", () => {
+    const result = deriveDisposition({ verdict: "partial", probesGreen: true, round: 1, maxRounds: 3, repeatedAreas: false });
+    assert.deepEqual(result, { disposition: "escalate", reason: "partial review: stream ended before the verdict line" });
+  });
+
+  it("partial does not take the accept-with-followup cutoff even with probes green and only minor findings", () => {
+    // The same evidence under `needs-attention` returns accept-with-followup.
+    // Partial must not ship on partial coverage.
+    const partial = deriveDisposition({
+      verdict: "partial", probesGreen: true, round: 1, maxRounds: 3,
+      repeatedAreas: false, findingSeverities: ["low", "medium"],
+    });
+    const needsAttention = deriveDisposition({
+      verdict: "needs-attention", probesGreen: true, round: 1, maxRounds: 3,
+      repeatedAreas: false, findingSeverities: ["low", "medium"],
+    });
+
+    assert.equal(partial.disposition, "escalate");
+    assert.equal(needsAttention.disposition, "accept-with-followup");
+  });
+
+  it("partial never reworks or strategizes, whatever the other evidence says", () => {
+    const cases = [
+      { probesGreen: false, repeatedAreas: false, strategizeEligible: true },
+      { probesGreen: true, repeatedAreas: true, strategizeEligible: true },
+      { probesGreen: false, repeatedAreas: true, strategizeEligible: false },
+    ];
+    for (const evidence of cases) {
+      const result = deriveDisposition({ verdict: "partial", round: 1, maxRounds: 3, ...evidence });
+      assert.equal(result.disposition, "escalate", JSON.stringify(evidence));
+    }
+  });
+
+  it("partial is not reported as an unexpected verdict", () => {
+    // The `default` branch's wording would read like an internal error; the
+    // partial state is a decision with its own reason.
+    const partial = deriveDisposition({ verdict: "partial", probesGreen: true, round: 1, maxRounds: 3, repeatedAreas: false });
+    const unknown = deriveDisposition({ verdict: "who-knows", probesGreen: true, round: 1, maxRounds: 3, repeatedAreas: false });
+
+    assert.doesNotMatch(partial.reason, /unexpected verdict/);
+    assert.match(unknown.reason, /unexpected verdict: who-knows/);
+  });
+
   it("escalate: max rounds reached without accept", () => {
     const result = deriveDisposition({ verdict: "needs-attention", probesGreen: false, round: 3, maxRounds: 3, repeatedAreas: false });
     assert.deepEqual(result, { disposition: "escalate", reason: "max rounds (3) reached without acceptance" });

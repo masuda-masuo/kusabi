@@ -11,6 +11,7 @@ import { parseArgs, parseModel, resolveModel, firstRoute, reviewDenyTools, WRITE
 import { renderReview, renderChainShow, renderJobLine, renderHeader, extractJson, renderFollowupDraft } from "./render.mjs";
 import { hasSectionHeading, parseDeliverables, parseSmoke, parseOrchestratorSignature, briefRequestsPublish } from "./brief-parsing.mjs";
 import { deriveDisposition } from "./disposition.mjs";
+import { parseReviewJsonl } from "./review-jsonl.mjs";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -678,7 +679,12 @@ async function cmdReview(cwd, { flags, text }) {
   // Strip trailing VERDICT token line before JSON parsing so the token
   // does not make extractJson fail on well-formed JSON.
   const stripped = resultText.replace(/\s*VERDICT:\s*(approve-partial|approve|needs-attention|discard)\s*$/i, "");
-  const rendered = renderReview(extractJson(stripped), resultText);
+  // Same two input formats as the chain (kusabi #202): JSONL first, the
+  // single JSON object when the output is not JSONL.  This surface shares the
+  // reviewer prompt with the chain, so it has to read what that prompt now
+  // asks for; a reviewer still emitting one object renders as it did before.
+  const jsonl = parseReviewJsonl(resultText);
+  const rendered = renderReview(jsonl ? jsonl.review : extractJson(stripped), resultText);
   fs.writeFileSync(path.join(jobDir(stateDirFor(cwd), job.id), "result.md"), rendered, "utf8");
   return `${renderHeader(job)}${rendered}`;
 }

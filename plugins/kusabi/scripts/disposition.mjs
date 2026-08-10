@@ -90,7 +90,10 @@ export function deriveReworkStrategy({ reworkCount, strategized, verdict, probes
 
 /**
  * @param {object} opts
- * @param {"approve"|"approve-partial"|"needs-attention"|"discard"} opts.verdict
+ * @param {"approve"|"approve-partial"|"needs-attention"|"discard"|"partial"|"unparseable"} opts.verdict
+ *   — the four schema verdicts, plus the two states the parser can produce:
+ *     `"partial"` (JSONL stream with findings but no verdict line, kusabi
+ *     #202) and `"unparseable"`; both escalate.
  * @param {boolean} opts.probesGreen  — all deterministic probes passed
  * @param {number}  opts.round        — 1-based current round number
  * @param {number}  opts.maxRounds
@@ -185,6 +188,18 @@ export function deriveDisposition({ verdict, probesGreen, round, maxRounds, repe
     case "discard":
       disposition = "escalate";
       reason = "reviewer discarded the work";
+      break;
+
+    // A partial review (kusabi #202): the reviewer's JSONL stream carried
+    // findings but ended before the verdict line.  It is NOT an approval and
+    // must not silently buy a rework round — the review is incomplete, and
+    // only a human can judge whether partial coverage suffices.  Named
+    // explicitly rather than left to the `default` branch below, so the
+    // escalation is a decision with an honest reason instead of reading like
+    // an internal error.
+    case "partial":
+      disposition = "escalate";
+      reason = "partial review: stream ended before the verdict line";
       break;
 
     default:

@@ -57,11 +57,41 @@ A finding should answer:
 </finding_bar>
 
 <structured_output_contract>
-Return only valid JSON matching the schema in <output_schema>. No prose, no markdown fences around it.
+Emit your review as JSONL: ONE JSON OBJECT PER LINE, each written the moment
+that piece of the review is decided. Do not save the review for the end — a
+single large object emitted last is lost in full if you run out of room,
+while a line already written is already banked.
+
+One record per line, compact, no markdown fences, no pretty-printing (a
+record must never span lines):
+
+{"type":"finding","severity":"high","kind":"design","title":"...","body":"...","file":"src/a.mjs","line_start":12,"line_end":18,"confidence":0.8,"recommendation":"..."}
+{"type":"unverified","text":"could not exercise the timeout path"}
+{"type":"next_step","text":"..."}
+{"type":"verdict","verdict":"needs-attention","summary":"..."}
+
+- A `finding` record carries exactly the finding fields the schema in
+  <output_schema> defines — `severity`, `kind`, `title`, `body`, `file`,
+  `line_start`, `line_end`, `confidence`, `recommendation` — spelled exactly
+  as the schema spells them, plus `"type":"finding"`. JSONL changes how the
+  pieces arrive, not what a finding contains.
+- Write each finding as soon as you have concluded it. Do not batch them.
+- The `verdict` record comes LAST, because it genuinely depends on the
+  findings. It carries `verdict` and `summary` (plus `discard_reason` when
+  the verdict is `discard`).
+- A line that is not valid JSON is IGNORED by the harness, so you may think
+  aloud between records: narrate the checklist, say what you are about to
+  check, record what you ruled out. Such prose is never mistaken for a
+  record. It is not free, though — it is spent from the same budget as the
+  records, so let it lead to the next record rather than stand in for one.
+- A stream that ends before the `verdict` record is recorded as a PARTIAL
+  review: the findings you already emitted are kept and escalated to a
+  human. That is a safety net, not a target — always reach the verdict line.
+
 Keep the output compact and specific.
 Use `needs-attention` if there is any material risk worth blocking on.
 Use `approve` only if you cannot support any substantive adversarial finding from the provided context.
-Use `approve-partial` if some acceptance criteria could not be verified (e.g. missing tools, inaccessible environment); list the unverified items in `unverified`.
+Use `approve-partial` if some acceptance criteria could not be verified (e.g. missing tools, inaccessible environment); emit one `unverified` record per item you could not verify.
 Use `discard` when the change premise itself is wrong — do not attempt to fix
 it with local rework. Use discard_reason `wrong_premise` when the brief or
 instructions misread reality (the issue is with the brief, not the
@@ -77,10 +107,8 @@ Every finding must include:
 - a confidence score from 0 to 1
 - a concrete recommendation
 Write the summary like a terse ship/no-ship assessment, not a neutral recap.
-After the JSON, output on the final line exactly `VERDICT: approve`,
-`VERDICT: approve-partial`, `VERDICT: needs-attention`, or `VERDICT: discard`
-and nothing else on that line. The JSON is authoritative; the token is a
-fast-path fallback for the harness.
+The `verdict` record is the whole verdict mechanism — there is no separate
+trailing token to emit.
 </structured_output_contract>
 
 <grounding_rules>
@@ -119,6 +147,11 @@ Before finalizing, check that each finding is:
 </final_check>
 
 <output_schema>
+This schema defines the FIELD NAMES and enums of a review — the verdict
+values, and every field of a finding. It is the same contract as before; the
+JSONL records in <structured_output_contract> are how those pieces reach the
+harness. Do not emit this object as one blob.
+
 {{OUTPUT_SCHEMA}}
 </output_schema>
 
