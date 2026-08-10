@@ -2293,6 +2293,221 @@ describe("parseReviewResult", () => {
   });
 });
 
+// =========================================================================
+// parseReviewResult — JSONL input (kusabi #202)
+//
+// JSONL is a WIRE format: the records assemble into the same in-memory shape
+// the single-object path produces.  The single-object path itself is
+// unchanged, which the byte-identical findingsText assertion below pins down.
+// =========================================================================
+
+describe("parseReviewResult — JSONL review stream (kusabi #202)", () => {
+  // One review, expressed both ways.  Shared so the equivalence assertion
+  // cannot drift into comparing two different reviews.
+  const DESIGN_FINDING = {
+    severity: "high",
+    kind: "design",
+    title: "Retry spends the budget that just failed",
+    body: "The retry re-dispatches with identical options.",
+    file: "plugins/kusabi/scripts/chain-phases.mjs",
+    line_start: 12,
+    line_end: 18,
+    confidence: 0.8,
+    recommendation: "Gate the retry on the failure being transient.",
+  };
+  const MECHANICAL_FINDING = {
+    severity: "low",
+    kind: "mechanical",
+    title: "Stale comment names the removed helper",
+    body: "The comment refers to stripVerdict, deleted in #170.",
+    file: "plugins/kusabi/scripts/render.mjs",
+    line_start: 3,
+    line_end: 3,
+    confidence: 0.9,
+    recommendation: "Delete the comment.",
+  };
+  const SUMMARY = "One real defect and one nit; do not ship as is.";
+  const REVIEW_OBJECT = {
+    verdict: "needs-attention",
+    summary: SUMMARY,
+    findings: [DESIGN_FINDING, MECHANICAL_FINDING],
+    next_steps: ["add a truncation test"],
+    unverified: ["could not exercise the timeout path"],
+  };
+
+  // The historical wire shape: fenced pretty-printed object + VERDICT token.
+  const LEGACY_PAYLOAD = [
+    "```json",
+    JSON.stringify(REVIEW_OBJECT, null, 2),
+    "```",
+    "",
+    "VERDICT: needs-attention",
+  ].join("\n");
+
+  // The same review as JSONL, emitted piece by piece.
+  const JSONL_PAYLOAD = [
+    JSON.stringify({ type: "finding", ...DESIGN_FINDING }),
+    JSON.stringify({ type: "finding", ...MECHANICAL_FINDING }),
+    JSON.stringify({ type: "unverified", text: "could not exercise the timeout path" }),
+    JSON.stringify({ type: "next_step", text: "add a truncation test" }),
+    JSON.stringify({ type: "verdict", verdict: "needs-attention", summary: SUMMARY }),
+  ].join("\n");
+
+  // The exact findingsText the single-object path produces today, spelled out
+  // so a change to either path shows up as a diff on this literal.
+  const EXPECTED_FINDINGS_TEXT = [
+    "## Design findings (require deliberate individual treatment)",
+    "",
+    "[high] Retry spends the budget that just failed (plugins/kusabi/scripts/chain-phases.mjs:12)",
+    "",
+    "## Mechanical findings (checklist)",
+    "",
+    "[low] Stale comment names the removed helper (plugins/kusabi/scripts/render.mjs:3)",
+  ].join("\n");
+
+  it("assembles a JSONL stream into the shape the single-object path produces", () => {
+    const jsonl = parseReviewResult(JSONL_PAYLOAD);
+    const legacy = parseReviewResult(LEGACY_PAYLOAD);
+
+    assert.deepEqual(jsonl.chainParsedReview, legacy.chainParsedReview);
+    assert.equal(jsonl.chainFindingsText, legacy.chainFindingsText);
+    assert.equal(jsonl.chainVerdict, legacy.chainVerdict);
+    assert.equal(jsonl.reviewParseable, legacy.reviewParseable);
+    // Spelled out, not just "equal to the other path":
+    assert.deepEqual(jsonl.chainParsedReview, REVIEW_OBJECT);
+    assert.equal(jsonl.chainVerdict, "needs-attention");
+    assert.equal(jsonl.reviewParseable, true);
+    assert.equal(jsonl.reviewPartial, false);
+    assert.equal(jsonl.reviewFindingCount, 2);
+  });
+
+  it("keeps a single JSON object byte-identical (findingsText) to today", () => {
+    const legacy = parseReviewResult(LEGACY_PAYLOAD);
+
+    assert.equal(legacy.chainFindingsText, EXPECTED_FINDINGS_TEXT);
+    assert.equal(legacy.chainVerdict, "needs-attention");
+    assert.equal(legacy.reviewParseable, true);
+    assert.equal(legacy.reviewPartial, false);
+    // The JSONL path must reach exactly the same bytes.
+    assert.equal(parseReviewResult(JSONL_PAYLOAD).chainFindingsText, EXPECTED_FINDINGS_TEXT);
+  });
+
+  it("keeps findings in emission order, not schema or severity order", () => {
+    const reversed = [
+      JSON.stringify({ type: "finding", ...MECHANICAL_FINDING }),
+      JSON.stringify({ type: "finding", ...DESIGN_FINDING }),
+      JSON.stringify({ type: "verdict", verdict: "needs-attention", summary: SUMMARY }),
+    ].join("\n");
+
+    const result = parseReviewResult(reversed);
+
+    assert.deepEqual(
+      result.chainParsedReview.findings.map(function (f) { return f.title; }),
+      [MECHANICAL_FINDING.title, DESIGN_FINDING.title],
+    );
+  });
+
+  it("ignores prose interleaved between records", () => {
+    const narrated = [
+      "Checklist point 1 — retry semantics. Reading chain-phases.mjs now.",
+      JSON.stringify({ type: "finding", ...DESIGN_FINDING }),
+      "Point 2 — comments. One is stale:",
+      JSON.stringify({ type: "finding", ...MECHANICAL_FINDING }),
+      JSON.stringify({ type: "unverified", text: "could not exercise the timeout path" }),
+      "Nothing else I can defend from the diff.",
+      JSON.stringify({ type: "next_step", text: "add a truncation test" }),
+      JSON.stringify({ type: "verdict", verdict: "needs-attention", summary: SUMMARY }),
+    ].join("\n");
+
+    const result = parseReviewResult(narrated);
+
+    assert.deepEqual(result.chainParsedReview, REVIEW_OBJECT);
+    assert.equal(result.chainFindingsText, EXPECTED_FINDINGS_TEXT);
+  });
+
+  it("a stream truncated after the findings is a partial review carrying them", () => {
+    const truncated = [
+      JSON.stringify({ type: "finding", ...DESIGN_FINDING }),
+      JSON.stringify({ type: "finding", ...MECHANICAL_FINDING }),
+      "Point 3 — I still need to check the empty-strea",
+    ].join("\n");
+
+    const result = parseReviewResult(truncated);
+
+    assert.equal(result.chainVerdict, "partial");
+    assert.equal(result.reviewPartial, true);
+    assert.equal(result.reviewFindingCount, 2);
+    // Partial is NOT unparseable: we read the output fine, so the review is
+    // parseable and the §3.5 retry (gated on "unparseable") cannot fire.
+    assert.equal(result.reviewParseable, true);
+    assert.notEqual(result.chainVerdict, "unparseable");
+    // The findings it did carry are rendered like any other findings.
+    assert.equal(result.chainFindingsText, EXPECTED_FINDINGS_TEXT);
+    assert.deepEqual(result.chainParsedReview.findings, [DESIGN_FINDING, MECHANICAL_FINDING]);
+    assert.equal(result.chainParsedReview.verdict, "partial");
+    assert.match(result.chainParsedReview.summary, /partial review/);
+    assert.match(result.chainParsedReview.summary, /2 findings/);
+  });
+
+  it("a stream with a verdict line yields that verdict and is not partial", () => {
+    for (const verdict of ["approve", "approve-partial", "needs-attention", "discard"]) {
+      const stream = [
+        JSON.stringify({ type: "finding", ...MECHANICAL_FINDING }),
+        JSON.stringify({ type: "verdict", verdict, summary: "s" }),
+      ].join("\n");
+
+      const result = parseReviewResult(stream);
+
+      assert.equal(result.chainVerdict, verdict);
+      assert.equal(result.reviewPartial, false);
+      assert.equal(result.reviewParseable, true);
+    }
+  });
+
+  it("a malformed line among valid ones costs only that line", () => {
+    const stream = [
+      JSON.stringify({ type: "finding", ...DESIGN_FINDING }),
+      '{"type":"finding","severity":"high",,,"title":"broken record"}',
+      JSON.stringify({ type: "finding", ...MECHANICAL_FINDING }),
+      JSON.stringify({ type: "unverified", text: "could not exercise the timeout path" }),
+      JSON.stringify({ type: "next_step", text: "add a truncation test" }),
+      JSON.stringify({ type: "verdict", verdict: "needs-attention", summary: SUMMARY }),
+    ].join("\n");
+
+    const result = parseReviewResult(stream);
+
+    // Identical to the clean stream: the broken line took nothing with it.
+    assert.deepEqual(result.chainParsedReview, REVIEW_OBJECT);
+    assert.equal(result.chainFindingsText, EXPECTED_FINDINGS_TEXT);
+    assert.equal(result.reviewFindingCount, 2);
+  });
+
+  it("an empty or whitespace-only stream is the existing unparseable state, not a crash", () => {
+    for (const payload of ["", "   ", "\n\n \n"]) {
+      const result = parseReviewResult(payload);
+
+      assert.equal(result.chainVerdict, "unparseable");
+      assert.equal(result.reviewParseable, false);
+      assert.equal(result.reviewPartial, false);
+      assert.equal(result.chainParsedReview, null);
+      assert.equal(result.chainFindingsText, "(review output could not be parsed)");
+    }
+  });
+
+  it("a JSONL stream with no findings and a verdict is an ordinary review", () => {
+    const stream = JSON.stringify({ type: "verdict", verdict: "approve", summary: "Nothing to block on." });
+
+    const result = parseReviewResult(stream);
+
+    assert.equal(result.chainVerdict, "approve");
+    assert.equal(result.reviewPartial, false);
+    assert.equal(result.chainFindingsText, "(no structured findings)");
+    assert.deepEqual(result.chainParsedReview, {
+      verdict: "approve", summary: "Nothing to block on.", findings: [], next_steps: [],
+    });
+  });
+});
+
 // applyTierEscalation — tier clamping (kusabi #153)
 // =========================================================================
 
@@ -3261,6 +3476,140 @@ describe("runReviewPhase — unparseable-output retry (issue #145)", () => {
     assert.equal(roundRecord.reviewUnparseableRetried, undefined);
     assert.equal(roundRecord.reviewFirstUsage, undefined);
     assert.equal(roundRecord.reviewFirstFallbacks, undefined);
+  });
+});
+
+// =========================================================================
+// runReviewPhase — partial JSONL review (kusabi #202)
+//
+// A JSONL stream with findings but no verdict line is a partial review.  It
+// must NOT trigger the unparseable retry (#145): the output was read fine,
+// the model ran out of room, and re-dispatching spends the budget that just
+// proved insufficient.  The round record has to show that it was partial and
+// how many findings it carried.
+// =========================================================================
+
+describe("runReviewPhase — partial JSONL review (kusabi #202)", () => {
+  function makeDispatch(results) {
+    const calls = [];
+    function stubbedDispatch(options) {
+      calls.push(options);
+      return results.shift();
+    }
+    return { stubbedDispatch, calls };
+  }
+
+  function fakeJob(id, resultText, extra = {}) {
+    return {
+      job: {
+        id, status: "completed", modelEntry: "test-org/test-review-model",
+        modelVariant: null, fallbacks: null, usage: null, error: null, ...extra,
+      },
+      resultText,
+    };
+  }
+
+  const FINDING_1 = {
+    type: "finding", severity: "high", kind: "design", title: "Unbounded retry",
+    body: "b", file: "src/a.mjs", line_start: 12, line_end: 18,
+    confidence: 0.8, recommendation: "r",
+  };
+  const FINDING_2 = {
+    type: "finding", severity: "low", kind: "mechanical", title: "Stale comment",
+    body: "b", file: "src/b.mjs", line_start: 3, line_end: 3,
+    confidence: 0.9, recommendation: "r",
+  };
+
+  // Two findings emitted, then the stream stops mid-thought.
+  const TRUNCATED = [
+    "Checklist point 1 — retry semantics:",
+    JSON.stringify(FINDING_1),
+    "Point 2 — comments:",
+    JSON.stringify(FINDING_2),
+    "Point 3 — I still need to check the empty-st",
+  ].join("\n");
+
+  const COMPLETE = [
+    JSON.stringify(FINDING_1),
+    JSON.stringify({ type: "verdict", verdict: "needs-attention", summary: "One defect." }),
+  ].join("\n");
+
+  async function runWith(results, extra = {}) {
+    const { stubbedDispatch, calls } = makeDispatch(results);
+    const roundRecord = { round: 1 };
+    const result = await runReviewPhase({
+      container: "test", brief: "test brief",
+      modelChain: ["test-org/test-flash", "test-org/test-pro"],
+      chainId: "test-chain", cwd: process.cwd(), previousRecord: null,
+      baseSha: "abc123", chainStatusOutput: "", chainBaseLog: "", chainDiff: "",
+      chainUntracked: "", roundRecord, chainChangedPaths: [],
+      chainStatusObserved: false, chainDeliverables: [], flagsModel: null,
+      _dispatchWithFallback: stubbedDispatch, ...extra,
+    });
+    return { result, roundRecord, calls };
+  }
+
+  it("records partial with its finding count and does NOT retry", async () => {
+    const { result, roundRecord, calls } = await runWith([
+      fakeJob("job-truncated", TRUNCATED),
+    ]);
+
+    // The retry (#145) is for output we could not read.  Not this.
+    assert.equal(calls.length, 1);
+    assert.equal(roundRecord.reviewUnparseableRetried, undefined);
+    assert.equal(roundRecord.reviewFirstJobId, undefined);
+
+    assert.equal(roundRecord.verdict, "partial");
+    assert.equal(roundRecord.reviewParseable, true);
+    assert.equal(roundRecord.reviewPartial, true);
+    assert.equal(roundRecord.reviewFindingCount, 2);
+    // Not a token recovery — the stream was genuinely parsed.
+    assert.equal(roundRecord.verdictSource, undefined);
+
+    // The findings survive and are recorded/rendered like any others.
+    assert.equal(roundRecord.findings.length, 2);
+    assert.deepEqual(
+      roundRecord.findings.map(function (f) { return f.title; }),
+      ["Unbounded retry", "Stale comment"],
+    );
+    assert.deepEqual(roundRecord.findingFiles, ["src/a.mjs", "src/b.mjs"]);
+    assert.ok(roundRecord.findingsText.includes("[high] Unbounded retry (src/a.mjs:12)"));
+    assert.ok(roundRecord.findingsText.includes("[low] Stale comment (src/b.mjs:3)"));
+    assert.equal(result.chainParsedReview.verdict, "partial");
+    assert.equal(result.skipReview, false);
+  });
+
+  // What the chain then DOES with verdict "partial" (escalate, never accept)
+  // is deriveDisposition's decision and is asserted in disposition.test.mjs.
+
+  it("a complete JSONL stream records its verdict and is not marked partial", async () => {
+    const { roundRecord, calls } = await runWith([
+      fakeJob("job-complete", COMPLETE),
+    ]);
+
+    assert.equal(calls.length, 1);
+    assert.equal(roundRecord.verdict, "needs-attention");
+    assert.equal(roundRecord.reviewParseable, true);
+    assert.equal(roundRecord.reviewPartial, undefined);
+    assert.equal(roundRecord.reviewFindingCount, undefined);
+    assert.equal(roundRecord.findings.length, 1);
+  });
+
+  it("a garbage first attempt that retries into a partial stream stays partial", async () => {
+    const { roundRecord, calls } = await runWith([
+      fakeJob("job-garbage", "definitely not JSON and no VERDICT token here"),
+      fakeJob("job-truncated", TRUNCATED),
+    ]);
+
+    // The first attempt was unreadable, so the retry fires as before; the
+    // second attempt is readable but incomplete, so the round is partial.
+    assert.equal(calls.length, 2);
+    assert.equal(roundRecord.reviewUnparseableRetried, true);
+    assert.equal(roundRecord.reviewFirstJobId, "job-garbage");
+    assert.equal(roundRecord.reviewJobId, "job-truncated");
+    assert.equal(roundRecord.verdict, "partial");
+    assert.equal(roundRecord.reviewPartial, true);
+    assert.equal(roundRecord.reviewFindingCount, 2);
   });
 });
 

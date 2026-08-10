@@ -39,6 +39,9 @@ import {
 import {
   checkSmokeProbe,
 } from "./probe-decisions.mjs";
+// The JSONL review wire format (kusabi #202).  Tried before extractJson;
+// a reviewer that still emits one JSON object takes the path below unchanged.
+import { parseReviewJsonl } from "./review-jsonl.mjs";
 import { deriveReworkStrategy } from "./disposition.mjs";
 // resolveRoundResume is defined below and is the only resume-resolution
 // mechanism.  checkpoint_restore was removed in issue #114 — the chain
@@ -585,7 +588,48 @@ export async function collectReviewContext({ container, brief, callTool, worktre
 }
 
 
+/**
+ * Parse the reviewer's raw output into the chain's in-memory review shape.
+ *
+ * Two input formats, in this order (kusabi #202):
+ *
+ *  1. JSONL — one self-delimiting record per line, written as each piece is
+ *     decided (`review-jsonl.mjs`).  Non-JSON lines between records are
+ *     ignored, so the reviewer may narrate.  A stream that carried findings
+ *     but no `verdict` line is a PARTIAL review: `chainVerdict` is
+ *     `"partial"`, a state of its own.  It is not an approval and does not
+ *     buy a rework round — it escalates (see deriveDisposition) with the
+ *     findings recorded and rendered like any other findings.  It is
+ *     `reviewParseable: true`, which is what keeps it out of the §3.5
+ *     unparseable retry: we READ this output fine, the model ran out of
+ *     room, and re-dispatching spends the budget that just proved
+ *     insufficient.
+ *
+ *  2. A single JSON object, via `extractJson` + VERDICT-token recovery —
+ *     unchanged, byte for byte, for every historical record and every
+ *     reviewer not yet emitting JSONL.
+ *
+ * @param {string} reviewResultText
+ * @returns {{ chainParsedReview: object|null, chainVerdict: string,
+ *             chainFindingsText: string, reviewParseable: boolean,
+ *             reviewPartial: boolean, reviewFindingCount: number }}
+ */
 export function parseReviewResult(reviewResultText) {
+  // ---- JSONL first (kusabi #202) ----
+  // Returns null for anything that is not JSONL (including an empty stream),
+  // which falls through to the single-object path below untouched.
+  const jsonl = parseReviewJsonl(reviewResultText);
+  if (jsonl) {
+    return {
+      chainParsedReview: jsonl.review,
+      chainVerdict: jsonl.review.verdict,
+      chainFindingsText: renderGroupedFindingsText(jsonl.review.findings),
+      reviewParseable: true,
+      reviewPartial: jsonl.partial,
+      reviewFindingCount: jsonl.findingCount,
+    };
+  }
+
   // ---- parse review result ----
   // Part A: handle VERDICT token inside the JSON fence.
   // First try stripping a trailing VERDICT token, then try extractJson.
@@ -620,14 +664,16 @@ export function parseReviewResult(reviewResultText) {
     // The raw findings (including any `kind` tags) still flow through to
     // roundRecord.findings untouched — this is consumption-point rendering.
     const chainFindingsText = renderGroupedFindingsText(findingsArray);
-    return { chainParsedReview: parsed, chainVerdict, chainFindingsText, reviewParseable };
+    // The single-object path is never partial: the object either carries a
+    // verdict or it is not this path at all.
+    return { chainParsedReview: parsed, chainVerdict, chainFindingsText, reviewParseable, reviewPartial: false, reviewFindingCount: findingsArray.length };
   }
 
   // A2: unparseable review is recorded as a distinct state
   const recoveredV = recoverVerdictFromText(reviewResultText);
   const chainVerdict = recoveredV ? recoveredV.verdict : "unparseable";
   const chainFindingsText = "(review output could not be parsed)";
-  return { chainParsedReview: null, chainVerdict, chainFindingsText, reviewParseable };
+  return { chainParsedReview: null, chainVerdict, chainFindingsText, reviewParseable, reviewPartial: false, reviewFindingCount: 0 };
 }
 
 /**
@@ -734,6 +780,7 @@ export async function runReviewPhase({
     let {
       chainParsedReview: _parsed, chainVerdict: _verdict,
       chainFindingsText: _findings, reviewParseable: _parseable,
+      reviewPartial: _partial, reviewFindingCount: _findingCount,
     } = parseReviewResult(reviewResultText);
 
     // ---- retry once on unparseable output ----
@@ -752,6 +799,12 @@ export async function runReviewPhase({
     // degraded environments where it is known-futile.  Only a completed job
     // whose output was garbage gets a second attempt; a hard failure
     // escalates after a single attempt, exactly as before the retry existed.
+    //
+    // A PARTIAL review (kusabi #202) is deliberately NOT a retry case: the
+    // JSONL stream was read fine (`_parseable` is true and `_verdict` is
+    // "partial", so both guards below already exclude it), the model simply
+    // ran out of room.  Re-dispatching spends the budget that just proved
+    // insufficient; the partial review escalates with its findings instead.
     if (!_parseable && _verdict === "unparseable" && reviewJob.status === "completed") {
       roundRecord.reviewUnparseableRetried = true;
       roundRecord.reviewFirstJobId = reviewJob.id;
@@ -762,7 +815,8 @@ export async function runReviewPhase({
       roundRecord.reviewFirstFallbacks = reviewJob.fallbacks || null;
       ({ job: reviewJob, resultText: reviewResultText } = await _dispatch(reviewDispatchOptions));
       ({ chainParsedReview: _parsed, chainVerdict: _verdict,
-         chainFindingsText: _findings, reviewParseable: _parseable } = parseReviewResult(reviewResultText));
+         chainFindingsText: _findings, reviewParseable: _parseable,
+         reviewPartial: _partial, reviewFindingCount: _findingCount } = parseReviewResult(reviewResultText));
     }
 
     roundRecord.reviewJobId = reviewJob.id;
@@ -781,6 +835,13 @@ export async function runReviewPhase({
     roundRecord.verdict = chainVerdict;
     if (!reviewParseable) {
       roundRecord.verdictSource = "recovered-from-token";
+    }
+    // Partial review (kusabi #202): the record must make it visible that the
+    // review was incomplete, and how many findings it did carry.  Written
+    // only when partial, so records for complete reviews are unchanged.
+    if (_partial) {
+      roundRecord.reviewPartial = true;
+      roundRecord.reviewFindingCount = _findingCount;
     }
     roundRecord.findingsText = chainFindingsText;
 
