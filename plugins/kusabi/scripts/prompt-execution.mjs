@@ -9,6 +9,7 @@ import { newJobId, saveJob, jobDir, appendEvent } from "./job-store.mjs";
 import { writeJson, stateRoot } from "./state-paths.mjs";
 import { durationS } from "./render.mjs";
 import { parseModel, selectRoutes } from "./cli.mjs";
+import { resolveCompletedResult } from "./result-recovery.mjs";
 
 // =========================================================================
 // fail-fast retry decision — pure, exported, unit-testable
@@ -318,6 +319,25 @@ async function fetchFinalMessage(server, sessionID) {
     .map((p) => p.text)
     .join("\n")
     .trim();
+}
+
+/**
+ * Ask the server for the final assistant message, reporting HOW it went.
+ *
+ * `fetchFinalMessage` collapses two very different outcomes into "": a
+ * transport failure (our side broke — the answer may well exist on the
+ * server) and a session that genuinely never produced a final assistant
+ * message (nothing to fetch).  Only the first is a bug on our side, so the
+ * caller is handed the distinction instead of an empty string.
+ *
+ * @returns {Promise<{ok: true, text: string}|{ok: false, error: string}>}
+ */
+async function fetchFinalMessageOutcome(server, sessionID) {
+  try {
+    return { ok: true, text: await fetchFinalMessage(server, sessionID) };
+  } catch (err) {
+    return { ok: false, error: String(err?.message ?? err) };
+  }
 }
 
 /**
@@ -678,8 +698,31 @@ export async function runPrompt({ cwd, kind, title, promptText, agent, model, se
 
   let resultText = "";
   if (job.status === "completed") {
-    resultText = await fetchFinalMessage(server, sessionID).catch(() => "");
-    fs.writeFileSync(path.join(jobDir(stateDir, job.id), "result.md"), resultText, "utf8");
+    // A session can go idle with the model still mid-analysis: it never emits
+    // a final assistant message, so there is nothing for fetchFinalMessage to
+    // return — while the whole output sits in the events we just recorded.
+    // Recover from those (deterministically, no LLM, no extra request) rather
+    // than write an empty result.md.  The record also keeps "could not ask"
+    // apart from "there was nothing to ask for" (result-recovery.mjs).
+    const fetched = await fetchFinalMessageOutcome(server, sessionID);
+    const dir = jobDir(stateDir, job.id);
+    const resolved = resolveCompletedResult({
+      backend: "opencode",
+      fetched,
+      coords: { eventsPath: path.join(dir, "events.ndjson") },
+    });
+    resultText = resolved.text;
+    job.result = resolved.record;
+    if (resolved.record.recovered) {
+      appendEvent(stateDir, job.id, {
+        type: "companion.result.recovered",
+        source: resolved.record.recovery.source,
+        chars: resolved.record.recovery.chars,
+        fetchFailed: resolved.record.fetchFailed,
+        fetchError: resolved.record.fetchError,
+      });
+    }
+    fs.writeFileSync(path.join(dir, "result.md"), resultText, "utf8");
   }
   saveJob(stateDir, job);
   return { job, resultText, stateDir };
