@@ -50,6 +50,7 @@ import { firstRoute } from "./cli.mjs";
 import { newJobId, saveJob, jobDir, appendEvent } from "./job-store.mjs";
 import { stateDirFor, writeJson } from "./state-paths.mjs";
 import { durationS } from "./render.mjs";
+import { resolveCompletedResult } from "./result-recovery.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const PLUGIN_ROOT = path.resolve(HERE, "..");
@@ -616,6 +617,33 @@ export function parseClaudeResult(stdout) {
 }
 
 /**
+ * Report the final message the CLI handed back, and HOW that went — the same
+ * `{ok, text}` / `{ok, error}` shape the opencode path reports from its
+ * final-message fetch, so both backends can share `resolveCompletedResult`.
+ *
+ * The two outcomes this keeps apart:
+ *
+ *   ok: true  — the CLI's JSON carried a `result`.  An EMPTY one is a real
+ *     answer to the question: the run genuinely produced no final message
+ *     (it was cancelled, or the model stopped talking mid-analysis).
+ *   ok: false — the JSON carried no `result` field at all.  We could not read
+ *     the final message, which is the claude-side equivalent of a failed
+ *     fetch: the answer may exist, we just did not get it.
+ *
+ * A non-string `result` keeps its long-standing JSON.stringify rendering so a
+ * job that does have a final message writes exactly the bytes it always has.
+ *
+ * @param {object|null} parsed — output of `parseClaudeResult`.
+ * @returns {{ok: true, text: string}|{ok: false, error: string}}
+ */
+export function claudeFinalMessage(parsed) {
+  const result = parsed?.result;
+  if (typeof result === "string") return { ok: true, text: result };
+  if (result !== null && result !== undefined) return { ok: true, text: JSON.stringify(result) };
+  return { ok: false, error: "claude result JSON carried no result field" };
+}
+
+/**
  * Map a claude result's usage fields onto the kusabi usage shape
  * (test-asserted mapping):
  *   input_tokens                   → input
@@ -913,7 +941,28 @@ export async function claudeDispatch(opts) {
 
   let resultText = "";
   if (job.status === "completed" && parsed !== null) {
-    resultText = typeof parsed.result === "string" ? parsed.result : JSON.stringify(parsed.result ?? "");
+    // A run can end with no final message and the whole output still on disk
+    // — for this backend in Claude Code's own transcript, since `claude -p`
+    // is a child process and there is no stream of ours to record.  Recover
+    // from it (deterministically, no LLM, no extra request) rather than write
+    // an empty result.md (result-recovery.mjs).
+    const resolved = resolveCompletedResult({
+      backend: CLAUDE_BACKEND,
+      fetched: claudeFinalMessage(parsed),
+      coords: { sessionId: job.sessionID },
+    });
+    resultText = resolved.text;
+    job.result = resolved.record;
+    if (resolved.record.recovered) {
+      appendEvent(stateDir, job.id, {
+        type: "companion.result.recovered",
+        source: resolved.record.recovery.source,
+        chars: resolved.record.recovery.chars,
+        fetchFailed: resolved.record.fetchFailed,
+        fetchError: resolved.record.fetchError,
+      });
+    }
+    saveJob(stateDir, job);
     fs.writeFileSync(path.join(jobDir(stateDir, job.id), "result.md"), resultText, "utf8");
   }
 

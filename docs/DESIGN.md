@@ -793,6 +793,29 @@ The recovery path is **the same path as quality-failure retries** (diff inspecti
 
 Timeout layering: sunaba exec < opencode `experimental.mcp_timeout` (raised to 600000; full verify's MCP call measured at 110s, only 10s shy of the default 120s cliff) < companion watchdog.
 
+### 6.1 A completed job that never produced a final message
+
+A worker can go silent without dying. The session goes idle while the model is still mid-analysis: no final assistant message is ever emitted, so the dispatch has nothing to fetch and writes a 0-byte `result.md`. From outside, the job is `completed`, the token spend is real (tens of thousands), and the result reads `(empty result)` — the reviewer looks silent, and is not. Empirical (`job-msn8ktw24af4`, 2026-08-10): `events.ndjson` 1,820,562 B holding 32,870 characters of substantive review, `result.md` 0 B. Observed three times the same day.
+
+The output is never actually lost. **Both backends keep a complete record; only its location differs:**
+
+| Backend | Where the full record is | Why there |
+|---|---|---|
+| `opencode` | the job's own `events.ndjson` | The companion subscribes to the serve's SSE stream and appends every event it accepts (empirical: on 18 of 18 sampled jobs, the existing `result.md` text is fully contained in what the stream yields) |
+| `claude` | Claude Code's own transcript, `~/.claude/projects/<mangled-cwd>/<session-id>.jsonl` | `claude -p` is a child process — there is no stream of ours to record (empirical: `events.ndjson` holds 2 bookkeeping events, 208 B, on all 7 sampled jobs, while one cancelled job's transcript held 111 lines / 25,477 characters of assistant text) |
+
+Recovery is therefore a per-backend **source behind one interface** (`result-recovery.mjs`), not an opencode path with a claude special case bolted on: a recovery that handles one backend and not the other is half a fix. What holds regardless of source:
+
+- **Deterministic, local-only.** Recovery reads files already on disk and nothing else: no LLM, no network call, no re-dispatch. The same recorded input yields the same text byte for byte. This is the line against `salvage`, which hands the last 50 events to a model for a post-mortem — useful, but not reproducible and not a result.
+- **The model's output, not its input.** The prompt is in both sources (a `user` message in the stream, `type:"user"` records in the transcript). A recovery that collects every piece of text it can find hands the brief back to the operator as if the model had written it. Provenance decides what is kept: for opencode, only parts of messages whose recorded role is `assistant`; for claude, only main-chain `assistant` records.
+- **Each piece once.** The opencode stream carries a part's text more than once — on `message.part.delta` and again on the later `message.part.updated`. Naive concatenation doubles the answer.
+- **Marked, and possibly truncated.** A recovered `result.md` opens with `<!-- kusabi:recovered-result -->` and a banner saying where it came from, because it may break off mid-sentence — the real one does. Neither an operator nor the `result` subcommand may mistake it for a final message. The banner deliberately contains no braces and no fence, so verdict extraction (`extractJson`) reads a recovered review exactly as it reads any other.
+- **The transcript is not ours.** It is located by searching `~/.claude/projects/*/` for `<session-id>.jsonl`, never by recomputing the mangled directory name from the cwd: that mangling is Claude Code's rule, so reproducing it breaks silently the day it changes, while a search on the session id is exact and self-correcting. Unknown record types and missing fields are tolerated rather than asserted on, and an absent transcript (pruned, or the job ran on another machine) is a normal outcome, not an error.
+
+**"No final message" and "failed to fetch" are different failures**, and the job record keeps them apart (`result.fetchFailed`, `result.fetchError`). `fetchFinalMessage(...).catch(() => "")` collapsed both into one empty string; only the second is a bug on our side — the answer may well exist and we did not get it — while the first says the model genuinely stopped talking. `result.source` names the outcome: `final-message`, `recovered`, `none` (asked, nothing there), `unavailable` (could not ask, and nothing recovered).
+
+Recovery changes nothing upstream of itself: a job that does have a final message is written exactly as before, and `session.idle` without one is still classified `completed`.
+
 ## 7. opencode constraints identified through testing (1.17.x → 1.18.3)
 
 | Constraint | Impact | Mitigation |
