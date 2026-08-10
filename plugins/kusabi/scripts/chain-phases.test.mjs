@@ -33,6 +33,8 @@ import {
   persistChainState,
   writeReviewRecord,
   collectContainerDiffContext,
+  collectContainerReviewInput,
+  assertContainerBaseRef,
   collectReviewContext,
   resolveChainResume,
 } from "./chain-phases.mjs";
@@ -2960,20 +2962,30 @@ describe("runProbePhase return value", () => {
   });
 });
 
-// diff_in_container in review input tool list
+// Review input tool list — deliberately no source guard here (kusabi #204)
 // ---------------------------------------------------------------------------
-
-describe("review input tool list", () => {
-  // Source-level guard, not a behavioural test: the tool list is built inline
-  // inside runReviewPhase, and reaching it means dispatching a real review job.
-  // This only catches the line being deleted, which is what it is for.
-  it("names diff_in_container in the review input tool list (source guard)", () => {
-    assert.ok(
-      runReviewPhase.toString().includes("diff_in_container"),
-      "runReviewPhase should offer diff_in_container in the tool list",
-    );
-  });
-});
+//
+// There used to be `assert.ok(runReviewPhase.toString().includes("diff_in_container"))`.
+// The tool list now lives in renderContainerReviewInput (render.mjs), so that
+// assertion survived only on the strength of a comment naming the tool:
+// with line comments stripped, the string is absent from runReviewPhase.
+// A test green for a reason unrelated to its claim is worse than no test.
+//
+// Two replacements were tried and both were worse than nothing.  Matching a
+// call shape against comment-stripped source cannot tell code from prose: a
+// `/* renderContainerReviewInput( */` breadcrumb still matches, while a URL
+// on the same line as a real call destroys it, so the guard both misses
+// regressions and breaks valid refactors.
+//
+// What actually covers this is behavioural and already present: the chain
+// review prompt byte-identity tests below run runReviewPhase through a stub
+// dispatch and compare the whole rendered prompt.  Verified by mutation —
+// changing one line of the tool list inside renderContainerReviewInput fails
+// exactly 2 tests in this file.  That catches the tool list changing AND
+// runReviewPhase ceasing to delegate, which is strictly more than the source
+// guard ever did.
+//
+// If you are tempted to re-add a `.toString()` guard here, read the above.
 
 // ---------------------------------------------------------------------------
 // runReviewPhase / runStrategizePhase — stubbed dispatch route recording
@@ -4413,5 +4425,270 @@ describe("collectReviewContext", () => {
     assert.equal(diffCtx.chainBaseLog, "abc123 latest change\n");
     assert.equal(diffCtx.chainDiff, "diff --git a/src/foo.js b/src/foo.js\n");
     assert.equal(diffCtx.chainUntracked, "untracked.txt\n");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// chain review prompt — byte-identity guard (kusabi #204)
+// ---------------------------------------------------------------------------
+// The container review input moved out of runReviewPhase into
+// renderContainerReviewInput so `task --phase review --container` can send the
+// same block.  The chain is the REFERENCE path: whatever else changes, what it
+// sends must not.  GOLDEN_CHAIN_REVIEW_INPUT below was captured from the
+// pre-extraction code by running runReviewPhase with exactly the inputs used
+// here; it is a recording, not a description.
+
+const GOLDEN_CHAIN_REVIEW_INPUT = [
+  "## Review target",
+  "",
+  "The artifact under review lives inside container `cafe1234beef`.",
+  "You may use the following Sunaba read/verify tools to inspect it:",
+  "- `read_file_range` - read file contents from the container",
+  "- `search_in_container` - grep/search within the container",
+  "- `diff_in_container` - inspect the actual diff in the container",
+  "- `verify_in_container` / `lint_in_container` / `type_check_in_container` - re-run the project's gates in the container",
+  "",
+  "Do NOT rely on host cwd git state; the actual changes are in the container.",
+  "",
+  "### Base change-set context (machine-recorded)",
+  "",
+  "- Base commit: `0123456789abcdef`",
+  "",
+  "Recent base history (top 5):",
+  "```",
+  "abc1234 first",
+  "def5678 second",
+  "",
+  "```",
+  "",
+  "Actual change set (`git status --porcelain`):",
+  "```",
+  " M src/foo.js",
+  "?? src/new.js",
+  "",
+  "```",
+  "",
+  "Diff content:",
+  "```diff",
+  "diff --git a/src/foo.js b/src/foo.js",
+  "@@ -1 +1 @@",
+  "-old",
+  "+new",
+  "",
+  "```",
+  "",
+  "New (untracked) files:",
+  "- `src/new.js`",
+  "",
+  "Use `read_file_range` to inspect these new files.",
+  "",
+  "Review ONLY this change set. Code that is already part of the base (see the log above) is NOT scope creep and must not be flagged as such.",
+].join("\n");
+
+describe("chain review prompt byte-identity", () => {
+  const PLUGIN_DIR = path.resolve(import.meta.dirname, "..");
+
+  async function capturePrompt() {
+    let captured = null;
+    function stubbedDispatch(opts) {
+      captured = opts.promptText;
+      return {
+        job: { id: "review-golden", status: "completed", modelEntry: "m", modelVariant: null, fallbacks: null, usage: null, error: null },
+        resultText: JSON.stringify({ verdict: "approve", findings: [] }),
+      };
+    }
+    await runReviewPhase({
+      container: "cafe1234beef",
+      brief: "GOLDEN BRIEF TEXT",
+      modelChain: ["test-org/test-flash"],
+      chainId: "chain-golden",
+      cwd: process.cwd(),
+      previousRecord: null,
+      baseSha: "0123456789abcdef",
+      chainStatusOutput: " M src/foo.js\n?? src/new.js\n",
+      chainBaseLog: "abc1234 first\ndef5678 second\n",
+      chainDiff: "diff --git a/src/foo.js b/src/foo.js\n@@ -1 +1 @@\n-old\n+new\n",
+      chainUntracked: "src/new.js\n",
+      roundRecord: { round: 2 },
+      chainChangedPaths: ["src/foo.js"],
+      chainStatusObserved: true,
+      chainDeliverables: ["src/foo.js"],
+      flagsModel: null,
+      _dispatchWithFallback: stubbedDispatch,
+    });
+    return captured;
+  }
+
+  it("sends the exact review-input block it sent before the extraction", async () => {
+    const prompt = await capturePrompt();
+    assert.ok(prompt.includes(GOLDEN_CHAIN_REVIEW_INPUT), "chain review input drifted from the captured golden");
+  });
+
+  it("sends a prompt that is byte-identical end to end for fixed inputs", async () => {
+    const prompt = await capturePrompt();
+    const template = fs.readFileSync(path.join(PLUGIN_DIR, "prompts", "adversarial-review.md"), "utf8");
+    const schemaJson = JSON.parse(fs.readFileSync(path.join(PLUGIN_DIR, "schemas", "review-output.schema.json"), "utf8"));
+    const expected = template
+      .replaceAll("{{TARGET_LABEL}}", "container cafe1234beef changes")
+      .replaceAll("{{USER_FOCUS}}", "GOLDEN BRIEF TEXT")
+      .replaceAll("{{OUTPUT_SCHEMA}}", JSON.stringify(schemaJson))
+      .replaceAll("{{REVIEW_INPUT}}", GOLDEN_CHAIN_REVIEW_INPUT)
+      .replaceAll("{{PRIOR_FINDINGS}}", "(none -- first review round)");
+    assert.equal(prompt, expected);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// collectContainerReviewInput — the task path's review input (kusabi #204)
+// ---------------------------------------------------------------------------
+
+describe("collectContainerReviewInput", () => {
+  // Records every command issued so the tests can assert on what was actually
+  // run in the container, not only on the rendered text.
+  function recordingTool(handler) {
+    const commands = [];
+    return {
+      commands,
+      callTool: async (tool, params) => {
+        const cmd = params.commands?.[0] ?? "";
+        commands.push(cmd);
+        return handler(cmd);
+      },
+    };
+  }
+
+  const DIFF = "diff --git a/src/foo.js b/src/foo.js\n@@ -1 +1 @@\n-old\n+new\n";
+
+  function defaultHandler(cmd) {
+    if (cmd === "git rev-parse HEAD") return { output: "deadbeefcafe\n" };
+    if (cmd === "git status --porcelain") return { output: " M src/foo.js\n" };
+    if (cmd === "git log --oneline -5") return { output: "deadbee latest\n" };
+    if (cmd === "git diff") return { output: DIFF };
+    if (cmd === "git ls-files --others --exclude-standard") return { output: "src/new.js\n" };
+    return { output: "" };
+  }
+
+  it("without --base, renders the container block and inlines the working diff", async () => {
+    const { commands, callTool } = recordingTool(defaultHandler);
+    const input = await collectContainerReviewInput({ container: "cid123", callTool });
+
+    assert.ok(input.startsWith("## Review target"));
+    assert.ok(input.includes("container `cid123`"));
+    assert.ok(input.includes("`diff_in_container`"));
+    // The diff itself — this is the promise the agent definition makes.
+    assert.ok(input.includes("diff --git a/src/foo.js b/src/foo.js"));
+    assert.ok(input.includes("+new"));
+    assert.ok(input.includes("- Base commit: `deadbeefcafe`"));
+    assert.ok(input.includes(" M src/foo.js"));
+    assert.ok(input.includes("- `src/new.js`"));
+    // Same default the chain uses: HEAD, plain `git diff`.
+    assert.ok(commands.includes("git rev-parse HEAD"));
+    assert.ok(commands.includes("git diff"));
+    assert.ok(!commands.some((c) => c.includes("git diff '")));
+  });
+
+  it("with --base, diffs against that ref and reports it as the base commit", async () => {
+    const { commands, callTool } = recordingTool((cmd) => {
+      if (cmd.startsWith("git rev-parse --verify")) return { output: "c355fa61a7fee5402ed7ba999bd2fe2eeb46a842\n" };
+      if (cmd === "git status --porcelain") return { output: " M src/foo.js\n" };
+      if (cmd === "git log --oneline -5") return { output: "c355fa6 base\n" };
+      if (cmd === "git diff 'c355fa6'") return { output: DIFF };
+      return { output: "" };
+    });
+    const input = await collectContainerReviewInput({ container: "cid123", callTool, base: "c355fa6" });
+
+    assert.ok(commands.some((c) => c.startsWith("git rev-parse --verify --quiet 'c355fa6^{commit}'")));
+    assert.ok(commands.includes("git diff 'c355fa6'"), `expected a based diff, got: ${JSON.stringify(commands)}`);
+    assert.ok(!commands.includes("git diff"));
+    assert.ok(input.includes("- Base commit: `c355fa61a7fee5402ed7ba999bd2fe2eeb46a842`"));
+    assert.ok(input.includes("diff --git a/src/foo.js b/src/foo.js"));
+  });
+
+  it("throws when --base does not resolve in the container", async () => {
+    const { callTool } = recordingTool((cmd) => {
+      if (cmd.startsWith("git rev-parse --verify")) return { output: "__KUSABI_BASE_UNRESOLVED__\n" };
+      return { output: "" };
+    });
+    await assert.rejects(
+      () => collectContainerReviewInput({ container: "cid123", callTool, base: "nosuchref" }),
+      /--base nosuchref is not a valid revision in container cid123/,
+    );
+  });
+
+  it("throws when the base lookup itself fails, naming the container", async () => {
+    const callTool = async () => { throw new Error("sunaba-rpc: tools/call failed (HTTP 500)"); };
+    await assert.rejects(
+      () => collectContainerReviewInput({ container: "cid123", callTool, base: "c355fa6" }),
+      /--base c355fa6 could not be resolved in container cid123/,
+    );
+  });
+
+  it("rejects a base ref with shell metacharacters before issuing any command", async () => {
+    const { commands, callTool } = recordingTool(defaultHandler);
+    await assert.rejects(
+      () => collectContainerReviewInput({ container: "cid123", callTool, base: "abc'; rm -rf /; echo '" }),
+      /is not a usable git revision/,
+    );
+    assert.deepEqual(commands, []);
+  });
+
+  it("degrades to (unavailable) instead of throwing when the container is unreachable", async () => {
+    const callTool = async () => { throw new Error("sunaba-rpc: initialize failed (HTTP 502)"); };
+    const input = await collectContainerReviewInput({ container: "cid123", callTool });
+    assert.ok(input.includes("## Review target"));
+    assert.ok(input.includes("- Base commit: (unavailable)"));
+    assert.ok(input.includes("Diff content: (unavailable)"));
+  });
+
+  it("produces a well-formed input when the change set is empty", async () => {
+    const { callTool } = recordingTool((cmd) => {
+      if (cmd === "git rev-parse HEAD") return { output: "deadbeefcafe\n" };
+      if (cmd === "git log --oneline -5") return { output: "deadbee latest\n" };
+      return { output: "" };
+    });
+    const input = await collectContainerReviewInput({ container: "cid123", callTool });
+    assert.ok(input.includes("(empty change set)"));
+    assert.ok(input.includes("Diff content: (unavailable)"));
+    assert.ok(!input.includes("```diff"));
+    // Balanced fences: an empty diff must not leave the prompt half-fenced.
+    assert.equal((input.match(/```/g) || []).length % 2, 0);
+    assert.ok(input.endsWith("must not be flagged as such."));
+  });
+});
+
+describe("assertContainerBaseRef", () => {
+  it("accepts the ref shapes git actually uses", () => {
+    for (const ref of ["c355fa6", "main", "origin/main", "HEAD~3", "v1.2.3", "HEAD^{commit}", "refs/heads/feature-x"]) {
+      assert.doesNotThrow(() => assertContainerBaseRef(ref));
+    }
+  });
+
+  it("rejects anything that could break out of the shell word", () => {
+    for (const ref of ["a b", "a'b", 'a"b', "a;b", "a$(b)", "a&&b", "a|b", "`b`"]) {
+      assert.throws(() => assertContainerBaseRef(ref), /is not a usable git revision/);
+    }
+  });
+});
+
+describe("collectContainerDiffContext base argument", () => {
+  it("keeps the chain's plain `git diff` when no base is given", async () => {
+    const commands = [];
+    const callTool = async (tool, params) => {
+      commands.push(params.commands?.[0] ?? "");
+      return { output: "" };
+    };
+    await collectContainerDiffContext(callTool, "cid123");
+    assert.ok(commands.includes("git diff"));
+  });
+
+  it("diffs against the base when one is given", async () => {
+    const commands = [];
+    const callTool = async (tool, params) => {
+      commands.push(params.commands?.[0] ?? "");
+      return { output: "" };
+    };
+    await collectContainerDiffContext(callTool, "cid123", "c355fa6");
+    assert.ok(commands.includes("git diff 'c355fa6'"));
+    assert.ok(!commands.includes("git diff"));
   });
 });

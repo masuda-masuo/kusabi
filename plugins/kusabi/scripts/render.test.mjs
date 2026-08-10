@@ -7,6 +7,7 @@ import {
   renderJobLine,
   renderHeader,
   renderBaseFacts,
+  renderContainerReviewInput,
   renderFollowupDraft,
   renderStrategistPrompt,
   renderReviewRecord,
@@ -1522,5 +1523,72 @@ describe("renderReviewRecord", () => {
     });
     assert.match(text, /Round 3 — model: \?, verdict: \? \(parsed\), disposition: \?, changed: unknown/);
     assert.match(text, /_No findings were produced by this chain — nothing to adjudicate\._/);
+  });
+});
+
+// renderContainerReviewInput — the one container review input (kusabi #204)
+// ---------------------------------------------------------------------------
+// The chain review and `task --phase review --container` both render their
+// review input here.  The chain-side byte-identity contract is pinned in
+// chain-phases.test.mjs against a golden captured before the extraction; these
+// tests cover what the block must CONTAIN, which is what the reviewer needs.
+
+describe("renderContainerReviewInput", () => {
+  const FACTS = {
+    container: "cafe1234beef",
+    baseSha: "0123456789abcdef",
+    baseLog: "abc1234 first\ndef5678 second\n",
+    statusOutput: " M src/foo.js\n",
+    diffContent: "diff --git a/src/foo.js b/src/foo.js\n@@ -1 +1 @@\n-old\n+new\n",
+    untrackedFiles: "src/new.js\n",
+  };
+
+  it("names the container and the read-side tools", () => {
+    const out = renderContainerReviewInput(FACTS);
+    assert.ok(out.startsWith("## Review target"));
+    assert.ok(out.includes("container `cafe1234beef`"));
+    assert.ok(out.includes("`read_file_range`"));
+    assert.ok(out.includes("`search_in_container`"));
+    assert.ok(out.includes("`diff_in_container`"));
+    assert.ok(out.includes("`verify_in_container`"));
+    assert.ok(out.includes("Do NOT rely on host cwd git state"));
+  });
+
+  it("inlines the diff and the rest of the base facts", () => {
+    const out = renderContainerReviewInput(FACTS);
+    // The whole point of the block: the reviewer must not have to rebuild the
+    // change set by hand.
+    assert.ok(out.includes("diff --git a/src/foo.js b/src/foo.js"));
+    assert.ok(out.includes("+new"));
+    assert.ok(out.includes("- Base commit: `0123456789abcdef`"));
+    assert.ok(out.includes("abc1234 first"));
+    assert.ok(out.includes(" M src/foo.js"));
+    assert.ok(out.includes("- `src/new.js`"));
+  });
+
+  it("embeds renderBaseFacts verbatim, separated by a blank line", () => {
+    const out = renderContainerReviewInput(FACTS);
+    const facts = renderBaseFacts(FACTS);
+    assert.ok(out.endsWith("\n\n" + facts));
+  });
+
+  it("stays well-formed when there is no diff at all", () => {
+    const out = renderContainerReviewInput({ container: "c1" });
+    assert.ok(out.startsWith("## Review target"));
+    assert.ok(out.includes("container `c1`"));
+    // Degraded, not malformed: every section is present and says what is
+    // missing, and no fence is left open.
+    assert.ok(out.includes("- Base commit: (unavailable)"));
+    assert.ok(out.includes("Diff content: (unavailable)"));
+    assert.ok(out.includes("(empty change set)"));
+    assert.ok(!out.includes("```diff"));
+    assert.equal((out.match(/```/g) || []).length % 2, 0);
+    assert.ok(out.endsWith("must not be flagged as such."));
+  });
+
+  it("does not throw when called with no arguments", () => {
+    const out = renderContainerReviewInput();
+    assert.ok(out.includes("## Review target"));
+    assert.ok(out.includes("Diff content: (unavailable)"));
   });
 });
