@@ -204,6 +204,7 @@ Reviewer (kusabi-review) permissions:
 - **deny**: all mutation tools (sandbox_exec, write_file, edit_file, checkout, publish, etc.) — because if the reviewer starts fixing, independence is lost
 - **deny**: `sunaba_sandbox_issue_write` and `sunaba_sandbox_pr_review_write` — outward writes are the orchestrator's exclusive exit; the reviewer's deliverable is the structured final report, not issue comments or PR reviews
 - The chain review prompt is augmented with machine-collected base facts (`baseSha`, recent base history, actual change set from `git status --porcelain`) so the reviewer receives "what is this task's change set" as data rather than guessing. See `renderBaseFacts` in `render.mjs`.
+- **All three review routes inline the diff** (kusabi #204): the chain's review phase, the standalone `review` subcommand (host worktree, via `buildReviewInput`), and `task --phase review --container <cid>` — the two container routes render one shared block, `renderContainerReviewInput` in `render.mjs` (review target + base facts + diff), so the reviewer prompt's promise that "the diff is already inlined in your review input" holds on every route rather than only two; on the task route `--base <ref>` selects the diff's base (`git diff <ref>`, committed and uncommitted work since it) and is rejected loudly anywhere else on `task` rather than silently dropped.
 
 Verdict: 4-value + optional `unverified`:
 

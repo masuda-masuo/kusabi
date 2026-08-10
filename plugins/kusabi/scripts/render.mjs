@@ -298,6 +298,52 @@ export function renderBaseFacts({ baseSha, baseLog, statusOutput, diffContent, u
   return parts.join("\n");
 }
 
+/**
+ * The reviewer's input for a CONTAINER review: the review-target block (which
+ * container holds the artifact, and the read-side sunaba tools that reach it)
+ * followed by `renderBaseFacts` (base commit, base log, change set, diff,
+ * untracked files).
+ *
+ * Single source of the container-flavoured review input (kusabi #204).  Both
+ * routes that review a container render it from here:
+ *
+ *   - the chain's review phase (`runReviewPhase`, chain-phases.mjs), and
+ *   - `task --phase review --container <cid>` (cmdTask, kusabi-companion.mjs).
+ *
+ * The agent definition tells the reviewer the diff is already inlined in its
+ * input; that promise was kept on the chain path and broken on the task path,
+ * which built no review input at all.  Two divergent copies of this block is
+ * how that happened, so there is exactly one.
+ *
+ * The output is byte-identical to what the chain built inline before the
+ * extraction (render.test.mjs pins it against a captured golden).
+ *
+ * @param {object} opts
+ * @param {string} opts.container        Container ID holding the artifact.
+ * @param {string} [opts.baseSha]        Commit the change set is measured against.
+ * @param {string} [opts.baseLog]        `git log --oneline -5` output.
+ * @param {string} [opts.statusOutput]   `git status --porcelain` output.
+ * @param {string} [opts.diffContent]    The diff itself.
+ * @param {string} [opts.untrackedFiles] Newline-separated untracked paths.
+ * @returns {string}
+ */
+export function renderContainerReviewInput({ container, baseSha, baseLog, statusOutput, diffContent, untrackedFiles } = {}) {
+  const parts = [
+    "## Review target",
+    "",
+    "The artifact under review lives inside container `" + container + "`.",
+    "You may use the following Sunaba read/verify tools to inspect it:",
+    "- `read_file_range` - read file contents from the container",
+    "- `search_in_container` - grep/search within the container",
+    "- `diff_in_container` - inspect the actual diff in the container",
+    "- `verify_in_container` / `lint_in_container` / `type_check_in_container` - re-run the project's gates in the container",
+    "",
+    "Do NOT rely on host cwd git state; the actual changes are in the container.",
+  ];
+  parts.push("", renderBaseFacts({ baseSha, baseLog, statusOutput, diffContent, untrackedFiles }));
+  return parts.join("\n");
+}
+
 const FINDING_DESIGN_HEADING = "## Design findings (require deliberate individual treatment)";
 const FINDING_MECHANICAL_HEADING = "## Mechanical findings (checklist)";
 

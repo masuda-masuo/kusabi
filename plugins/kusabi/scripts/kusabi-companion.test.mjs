@@ -21,6 +21,7 @@ import {
   resolveResumeDispatches,
   resolveResumeReviewContext,
   resolveResumeReworkContext,
+  buildTaskReviewInput,
 } from "./kusabi-companion.mjs";
 import { dispatchWithFallback } from "./prompt-execution.mjs";
 import { claudeDispatch } from "./claude-dispatch.mjs";
@@ -4684,5 +4685,123 @@ describe("install-agents skills distribution", () => {
     assert.equal(entries[0][0], "*");
     assert.equal(entries[0][1], "deny");
     assert.deepEqual(permission.skill, { "kusabi-*": "allow" });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// buildTaskReviewInput — `task --phase review --container` gets the diff (#204)
+// ---------------------------------------------------------------------------
+// The task path built no review input at all: the reviewer was told the diff
+// was inlined, found none, and rebuilt the change by hand.  This is the seam
+// cmdTask calls, so it is where the behaviour is pinned — including the two
+// dispatches that must be untouched (another phase, and review without a
+// container) and the --base decision.
+
+describe("buildTaskReviewInput", () => {
+  const DIFF = "diff --git a/src/foo.js b/src/foo.js\n@@ -1 +1 @@\n-old\n+new\n";
+
+  function containerTool(overrides = {}) {
+    const commands = [];
+    const callTool = async (tool, params) => {
+      const cmd = params.commands?.[0] ?? "";
+      commands.push(cmd);
+      if (Object.prototype.hasOwnProperty.call(overrides, cmd)) return { output: overrides[cmd] };
+      if (cmd === "git rev-parse HEAD") return { output: "deadbeefcafe\n" };
+      if (cmd === "git status --porcelain") return { output: " M src/foo.js\n" };
+      if (cmd === "git log --oneline -5") return { output: "deadbee latest\n" };
+      if (cmd === "git diff") return { output: DIFF };
+      if (cmd.startsWith("git rev-parse --verify")) return { output: "c355fa61a7fee5402ed7ba999bd2fe2eeb46a842\n" };
+      if (cmd.startsWith("git diff '")) return { output: DIFF };
+      return { output: "" };
+    };
+    return { commands, callTool };
+  }
+
+  it("builds the container review input for --phase review --container", async () => {
+    const { callTool } = containerTool();
+    const input = await buildTaskReviewInput({
+      phase: "review",
+      flags: { container: "cid123" },
+      callTool,
+    });
+    assert.ok(input, "a container review must carry a review input");
+    assert.ok(input.includes("## Review target"));
+    assert.ok(input.includes("container `cid123`"));
+    assert.ok(input.includes("`diff_in_container`"));
+    // Content, not length: the diff must actually be there.
+    assert.ok(input.includes("diff --git a/src/foo.js b/src/foo.js"));
+    assert.ok(input.includes("+new"));
+    assert.ok(input.includes("### Base change-set context (machine-recorded)"));
+  });
+
+  it("reflects --base in the input it builds", async () => {
+    const { commands, callTool } = containerTool();
+    const input = await buildTaskReviewInput({
+      phase: "review",
+      flags: { container: "cid123", base: "c355fa6" },
+      callTool,
+    });
+    assert.ok(commands.includes("git diff 'c355fa6'"), `expected a based diff, got: ${JSON.stringify(commands)}`);
+    assert.ok(input.includes("- Base commit: `c355fa61a7fee5402ed7ba999bd2fe2eeb46a842`"));
+    assert.ok(input.includes("diff --git a/src/foo.js b/src/foo.js"));
+  });
+
+  it("rejects --base loudly when it cannot take effect (implement phase)", async () => {
+    const { commands, callTool } = containerTool();
+    await assert.rejects(
+      () => buildTaskReviewInput({ phase: "implement", flags: { container: "cid123", base: "c355fa6" }, callTool }),
+      /task --base applies only to a container review/,
+    );
+    // Nothing was read from the container: the flag is refused, not half-honoured.
+    assert.deepEqual(commands, []);
+  });
+
+  it("rejects --base loudly for a review without a container", async () => {
+    const { callTool } = containerTool();
+    await assert.rejects(
+      () => buildTaskReviewInput({ phase: "review", flags: { base: "c355fa6" }, callTool }),
+      /task --base applies only to a container review/,
+    );
+  });
+
+  it("rejects a --base that does not resolve in the container", async () => {
+    const { callTool } = containerTool({ "git rev-parse --verify --quiet 'nosuchref^{commit}' || echo __KUSABI_BASE_UNRESOLVED__": "__KUSABI_BASE_UNRESOLVED__\n" });
+    await assert.rejects(
+      () => buildTaskReviewInput({ phase: "review", flags: { container: "cid123", base: "nosuchref" }, callTool }),
+      /--base nosuchref is not a valid revision in container cid123/,
+    );
+  });
+
+  it("leaves --phase implement --container exactly as it was (no review input)", async () => {
+    const { commands, callTool } = containerTool();
+    const input = await buildTaskReviewInput({
+      phase: "implement",
+      flags: { container: "cid123" },
+      callTool,
+    });
+    assert.equal(input, null);
+    assert.deepEqual(commands, [], "a non-review phase must not read the container here");
+  });
+
+  it("leaves review without --container exactly as it was (no review input)", async () => {
+    const { commands, callTool } = containerTool();
+    const input = await buildTaskReviewInput({ phase: "review", flags: {}, callTool });
+    assert.equal(input, null);
+    assert.deepEqual(commands, []);
+  });
+
+  it("returns null for a task with no phase at all", async () => {
+    const { callTool } = containerTool();
+    assert.equal(await buildTaskReviewInput({ phase: null, flags: { container: "cid123" }, callTool }), null);
+  });
+
+  it("is what cmdTask appends to the task prompt (source guard)", async () => {
+    // cmdTask is not exported; this pins the wiring — the review input is
+    // built before dispatch and concatenated onto the prompt that is sent.
+    const source = fs.readFileSync(path.join(import.meta.dirname, "kusabi-companion.mjs"), "utf8");
+    const cmdTaskSource = source.slice(source.indexOf("async function cmdTask("), source.indexOf("async function cmdReview("));
+    assert.ok(cmdTaskSource.includes("await buildTaskReviewInput({ phase, flags })"));
+    assert.ok(cmdTaskSource.includes("promptText: taskPromptText"));
+    assert.ok(cmdTaskSource.includes("${taskReviewInput}"));
   });
 });

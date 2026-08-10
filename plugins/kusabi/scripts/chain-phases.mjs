@@ -19,7 +19,7 @@ import {
   reviewDenyTools,
 } from "./cli.mjs";
 import {
-  renderBaseFacts,
+  renderContainerReviewInput,
   renderPriorFindings,
   renderStrategistPrompt,
   renderReview,
@@ -487,9 +487,14 @@ export async function runProbePhase({ baseSha, container, brief, callTool, workt
  *
  * @param {Function} callTool   The RPC callTool function (injectable).
  * @param {string}   container  Container ID.
+ * @param {string|null} [base]  Ref to diff against (`git diff <base>`, which
+ *        covers committed AND uncommitted work since that ref).  null -- the
+ *        chain's default -- keeps the plain `git diff` (uncommitted vs HEAD).
+ *        Callers MUST validate the ref first (assertContainerBaseRef); it is
+ *        interpolated into a shell command here.
  * @returns {Promise<{ chainBaseLog: string, chainDiff: string, chainUntracked: string }>}
  */
-export async function collectContainerDiffContext(callTool, container) {
+export async function collectContainerDiffContext(callTool, container, base = null) {
   // Base log for review context (own try/catch so failure does not affect probesGreen)
   let chainBaseLog = "";
   try {
@@ -506,7 +511,7 @@ export async function collectContainerDiffContext(callTool, container) {
   try {
     const diffResult = await callTool("sandbox_exec", {
       container_id: container,
-      commands: ["git diff"],
+      commands: [base ? `git diff '${base}'` : "git diff"],
     });
     chainDiff = diffResult?.output ?? "";
 
@@ -518,6 +523,104 @@ export async function collectContainerDiffContext(callTool, container) {
   } catch { /* chainDiff and chainUntracked stay "" */ }
 
   return { chainBaseLog, chainDiff, chainUntracked };
+}
+
+// A base ref is interpolated into a single-quoted shell word inside the
+// container, so the character set is restricted to what git refs and object
+// expressions actually use.  Anything else -- quotes, spaces, `$`, `;`, `&` --
+// is rejected rather than escaped: an unusable ref must fail loudly, never be
+// mangled into a diff of something else.
+const BASE_REF_PATTERN = /^[A-Za-z0-9._@\/^~{}:+-]+$/;
+
+/**
+ * Validate a user-supplied base ref before it reaches a shell command.
+ *
+ * @param {string} base
+ * @throws {Error} when the ref contains characters outside BASE_REF_PATTERN.
+ */
+export function assertContainerBaseRef(base) {
+  if (!BASE_REF_PATTERN.test(base)) {
+    throw new Error(`--base ${base} is not a usable git revision (allowed characters: letters, digits and ._@/^~{}:+-)`);
+  }
+}
+
+/**
+ * Build the reviewer's input for a container review, reading the container
+ * through the existing sunaba RPC tooling (kusabi #204).
+ *
+ * This is the collection half of the container review input; the rendering
+ * half is `renderContainerReviewInput`.  The chain's review phase already has
+ * these facts from its probes and renders them directly, so it does not call
+ * this; `task --phase review --container <cid>` does, because nothing else on
+ * that path reads the container's git state before the job is dispatched.
+ *
+ * `base`:
+ *   - null (the chain's default) -- base commit is HEAD and the diff is the
+ *     plain `git diff`, exactly what the chain's review renders.
+ *   - a ref -- base commit is that ref resolved to a sha, and the diff is
+ *     `git diff <ref>`, which covers committed AND uncommitted work since it.
+ *
+ * An unusable `--base` throws: the caller asked for a specific comparison and
+ * silently reviewing a different one (or nothing) is the failure mode this
+ * whole change exists to remove.  Every OTHER read degrades to "(unavailable)"
+ * the way the chain's does -- a flaky container must not abort the review.
+ *
+ * @param {object}   opts
+ * @param {string}   opts.container
+ * @param {Function} opts.callTool        RPC callTool (injectable).
+ * @param {string|null} [opts.base=null]  Ref to diff against.
+ * @returns {Promise<string>} The rendered review input.
+ * @throws {Error} when `base` is malformed or does not resolve in the container.
+ */
+export async function collectContainerReviewInput({ container, callTool, base = null }) {
+  let baseSha = "";
+  if (base) {
+    assertContainerBaseRef(base);
+    // `|| echo <sentinel>` keeps the exit status zero so the transport reports
+    // the outcome in the output rather than as an RPC-level failure.
+    let revOutput;
+    try {
+      const revResult = await callTool("sandbox_exec", {
+        container_id: container,
+        commands: [`git rev-parse --verify --quiet '${base}^{commit}' || echo __KUSABI_BASE_UNRESOLVED__`],
+      });
+      revOutput = (revResult?.output ?? "").trim();
+    } catch (err) {
+      throw new Error(`--base ${base} could not be resolved in container ${container}: ${err.message}`);
+    }
+    if (!revOutput || revOutput.includes("__KUSABI_BASE_UNRESOLVED__")) {
+      throw new Error(`--base ${base} is not a valid revision in container ${container}`);
+    }
+    baseSha = revOutput.split("\n").pop().trim();
+  } else {
+    try {
+      const headResult = await callTool("sandbox_exec", {
+        container_id: container,
+        commands: ["git rev-parse HEAD"],
+      });
+      baseSha = (headResult?.output ?? "").trim();
+    } catch { /* baseSha stays "" -> renderBaseFacts says "(unavailable)" */ }
+  }
+
+  let statusOutput = "";
+  try {
+    const statusResult = await callTool("sandbox_exec", {
+      container_id: container,
+      commands: ["git status --porcelain"],
+    });
+    statusOutput = statusResult?.output ?? "";
+  } catch { /* statusOutput stays "" -> "(empty change set)" */ }
+
+  const diffCtx = await collectContainerDiffContext(callTool, container, base);
+
+  return renderContainerReviewInput({
+    container,
+    baseSha,
+    baseLog: diffCtx.chainBaseLog,
+    statusOutput,
+    diffContent: diffCtx.chainDiff,
+    untrackedFiles: diffCtx.chainUntracked,
+  });
 }
 
 /**
@@ -726,21 +829,22 @@ export async function runReviewPhase({
   if (!skipReview) {
     const promptTemplate = fs.readFileSync(path.join(PLUGIN_ROOT, "prompts", "adversarial-review.md"), "utf8");
     const schemaJson = JSON.parse(fs.readFileSync(path.join(PLUGIN_ROOT, "schemas", "review-output.schema.json"), "utf8"));
-    const reviewInputParts = [
-      "## Review target",
-      "",
-      "The artifact under review lives inside container `" + container + "`.",
-      "You may use the following Sunaba read/verify tools to inspect it:",
-      "- `read_file_range` - read file contents from the container",
-      "- `search_in_container` - grep/search within the container",
-      "- `diff_in_container` - inspect the actual diff in the container",
-      "- `verify_in_container` / `lint_in_container` / `type_check_in_container` - re-run the project's gates in the container",
-      "",
-      "Do NOT rely on host cwd git state; the actual changes are in the container.",
-    ];
-    const baseFactsBlock = renderBaseFacts({ baseSha, baseLog: chainBaseLog, statusOutput: chainStatusOutput, diffContent: chainDiff, untrackedFiles: chainUntracked });
-    reviewInputParts.push("", baseFactsBlock);
-    const reviewInput = reviewInputParts.join("\n");
+    // The review input (the review-target block naming this container and the
+    // read-side tools -- `read_file_range`, `search_in_container`,
+    // `diff_in_container`, the verify gates -- followed by the base facts and
+    // the inlined diff) is rendered by renderContainerReviewInput in
+    // render.mjs.  It used to be built inline here; `task --phase review
+    // --container` sent no review input at all, so the extraction gives both
+    // routes the same block from one place (kusabi #204).  What this phase
+    // sends is unchanged, byte for byte.
+    const reviewInput = renderContainerReviewInput({
+      container,
+      baseSha,
+      baseLog: chainBaseLog,
+      statusOutput: chainStatusOutput,
+      diffContent: chainDiff,
+      untrackedFiles: chainUntracked,
+    });
     const priorFindings = previousRecord?.findingsText || "(none -- first review round)";
 
     const reviewPromptText = promptTemplate

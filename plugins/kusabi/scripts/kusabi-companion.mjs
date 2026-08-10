@@ -69,6 +69,7 @@ import {
   recordReworkEscalation,
   resolveChainResume,
   collectReviewContext,
+  collectContainerReviewInput,
 } from "./chain-phases.mjs";
 
 // Import the probe functions locally so cmdTask can call them directly.
@@ -199,6 +200,51 @@ function buildReviewInput(cwd, base) {
   }
   const input = `## git status\n${status}\n## diff (${label})\n${diff}${truncated}`;
   return { label, input };
+}
+
+/**
+ * The review input `task` inlines into its prompt, and the home of the
+ * `--base` decision for that command (kusabi #204).
+ *
+ * `task --phase review --container <cid>` dispatches the same reviewer the
+ * chain does, and its agent definition promises the diff is already inlined in
+ * its input -- but the task path built no review input at all, so the reviewer
+ * rebuilt the change by hand (147 tool calls / 876s in one measured job, twice
+ * running out of budget before it could review anything).  It now sends the
+ * container-flavoured review input the chain sends, from the same renderer.
+ *
+ * `--base` was accepted and silently dropped on this path.  It is now:
+ *   - honoured on the container review, where the reviewer's diff is taken
+ *     against that ref (committed and uncommitted work since it), and
+ *   - rejected loudly anywhere else on `task`, following the precedent
+ *     `review --container` set in kusabi #153: a flag that cannot take effect
+ *     must say so rather than pretend.
+ *
+ * Everything else about `task` is untouched: another phase, or `review`
+ * without `--container`, returns null and the prompt is what it was.
+ *
+ * @param {object}  opts
+ * @param {string|null} opts.phase          The resolved --phase, or null.
+ * @param {object}  opts.flags              Parsed CLI flags.
+ * @param {Function} [opts.callTool=null]   RPC callTool (injectable; loaded
+ *        from sunaba-rpc.mjs on demand so non-container tasks never touch it).
+ * @returns {Promise<string|null>} The review input, or null when this dispatch
+ *          is not a container review.
+ * @throws {Error} on --base outside the container review, an unusable --base,
+ *          or a --base that does not resolve inside the container.
+ */
+export async function buildTaskReviewInput({ phase, flags, callTool = null }) {
+  const base = flags.base || null;
+  const isContainerReview = phase === "review" && !!flags.container;
+  if (base && !isContainerReview) {
+    throw new Error(
+      "task --base applies only to a container review; it has no effect here. " +
+      "Use: task --phase review --container <cid> --base " + base,
+    );
+  }
+  if (!isContainerReview) return null;
+  const call = callTool ?? (await import("./sunaba-rpc.mjs")).callTool;
+  return collectContainerReviewInput({ container: flags.container, callTool: call, base });
 }
 
 // ---------------------------------------------------------------------------
@@ -551,12 +597,21 @@ async function cmdTask(cwd, { flags, text }) {
     } catch { /* probe will handle missing baseSha */ }
   }
 
+  // ---- review input (container review only) ----
+  // Runs before dispatch: a container review must carry the diff into the
+  // prompt, and a --base that cannot be honoured must abort before a job is
+  // created rather than after (kusabi #204).
+  const taskReviewInput = await buildTaskReviewInput({ phase, flags });
+
   const guardrails = fs.readFileSync(path.join(PLUGIN_ROOT, "prompts", "task-guardrails.md"), "utf8").trim();
+  const taskPromptText = taskReviewInput
+    ? `${guardrails}\n\n<task>\n${text}\n</task>\n\n${taskReviewInput}`
+    : `${guardrails}\n\n<task>\n${text}\n</task>`;
   const { job, resultText } = await dispatch({
     cwd,
     kind: "task",
     title: text.slice(0, 80),
-    promptText: `${guardrails}\n\n<task>\n${text}\n</task>`,
+    promptText: taskPromptText,
     agent,
     phase,
     session,
@@ -2538,7 +2593,7 @@ function usage() {
     "",
     "Flags:",
     "  --read-only, --resume-last, --wait, --background",
-    "  --base <ref>, --model <provider/model>, --agent <id>, --phase <name> (draft|investigate|implement|review|respond|salvage|gofer)",
+    "  --base <ref> (review: branch diff base; task: diff base for --phase review --container, rejected elsewhere), --model <provider/model>, --agent <id>, --phase <name> (draft|investigate|implement|review|respond|salvage|gofer)",
     "  --backend opencode|claude (task/chain: dispatch backend; default opencode. With claude, --model takes a bare alias (opus|sonnet|haiku) or a full model id \u2014 :variant suffixes are rejected. Without --backend, config chain entries may carry a claude/ prefix for per-phase backend mixing \u2014 models.phases.<phase> (or models.chain) entries select the claude backend per phase; one phase's chain must be single-backend)",
     "  --session <id>, --timeout <s>, --watchdog <s>, --deny <tools>",
     "  --brief-file <path> (task / chain: read the brief from a file; exclusive with inline text)",
