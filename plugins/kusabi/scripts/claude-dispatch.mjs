@@ -71,6 +71,20 @@
 // new logic.  The guard fails OPEN in every other case, records what it saw
 // on the job record either way, and is off unless the config asks for it
 // (see resolveClaudeSessionGuard).
+//
+// Write-tool watchdog (kusabi #215 item 3): the silence watchdog above only
+// asks whether events ARRIVE, so a worker that reads files forever holds it
+// off indefinitely — the recorded incident was an implement job that ran
+// 256s, cost $2.39 and made zero edits.  On an implement-phase dispatch, and
+// only when `claude.writeWatchdog` is configured, a second clock measures the
+// time since the last FILE-MUTATING tool call: at `warnS` it warns once
+// (`companion.write-watchdog.warned`, also recorded on the job), and at
+// `killS` — opt-in on top of the warning, and only when it is later than
+// `warnS` — it kills the child's process group exactly as the silence
+// watchdog does, finishing the job `status: "stalled"` with its own distinct
+// error text.  Off by default, warn-only unless a kill bound is configured,
+// never killing on a malformed config, and fail-open throughout (see
+// resolveClaudeWriteWatchdog).
 
 import path from "node:path";
 import fs from "node:fs";
@@ -1326,6 +1340,235 @@ export function renderClaudeSessionGuardRefusal(observation) {
 }
 
 // =========================================================================
+// write-tool watchdog — pure helpers (kusabi #215 item 3)
+// =========================================================================
+//
+// The silence watchdog above measures whether ANY parsed stream event
+// arrives.  A worker that reads files forever holds it off indefinitely —
+// which is exactly the recorded incident (kusabi #215): an implement-phase
+// job that ran 256s, cost $2.39, and produced ZERO edits.  This watchdog
+// measures the other quantity: how long a phase whose whole job is to
+// produce edits has gone without calling a file-mutating tool.
+//
+// Three deliberate conservatisms, because a false positive here KILLS a
+// live job (unlike the session guard, which merely refuses to start one):
+//   - OFF unless the config asks for it (no config key → byte-identical to
+//     the pre-#215-item-3 dispatch),
+//   - it WARNS before it kills, and killing is opt-in on top of warning
+//     (`killS` absent or 0 → warn-only forever), and
+//   - a malformed config resolves to warn-only, NEVER to a killing
+//     configuration.  This deliberately differs from the session guard's
+//     "malformed → default ON" rule: refusing a dispatch is conservative,
+//     killing a live job is destructive.
+
+// The default warn bound (seconds) used when the feature is enabled without
+// a readable `warnS`.  Five minutes: long enough that legitimate long reads
+// (a big diff, a slow verify, a wide search sweep) do not trip it.
+export const CLAUDE_WRITE_WATCHDOG_DEFAULT_WARN_S = 300;
+
+// Phases whose deliverable IS a file edit.  Review / investigate / draft /
+// respond / salvage / gofer legitimately never write, so the watchdog must
+// never be armed for them.  Chain REWORK rounds are covered: they dispatch
+// through runImplementPhase (chain-phases.mjs), which passes
+// `phase: "implement"` for every round — `models.phases.rework` selects the
+// MODEL for those rounds, it is not a dispatch phase name.
+const WRITE_WATCHDOG_PHASES = new Set(["implement"]);
+
+/**
+ * Is this a phase the write watchdog may be armed for?
+ *
+ * @param {string|null|undefined} phase
+ * @returns {boolean} false for every non-implement phase, and for no phase
+ *          at all (a dispatch that names no phase is never gated on).
+ */
+export function writeWatchdogAppliesToPhase(phase) {
+  return typeof phase === "string" && WRITE_WATCHDOG_PHASES.has(phase);
+}
+
+// What counts as "the worker actually changed a file".  The sunaba MCP
+// mutators (addressed as `mcp__sunaba__<tool>`, but matched on the bare name
+// so a differently-named server still matches) plus the CLI's own native
+// editing tools — a worker running outside the sunaba sandbox edits through
+// those.  Reads, searches, `sandbox_exec`, `verify_in_container` and
+// `checkpoint` are deliberately absent: they are what a busy-but-producing-
+// nothing worker does all day, and counting them would recreate the blind
+// spot this watchdog exists to close.  `checkpoint_restore` IS here (it
+// mutates the tree) while `checkpoint` is not (it only commits what is
+// already there).
+const CLAUDE_WRITE_TOOL_NAMES = new Set([
+  "write_file",
+  "edit_file",
+  "transform_file",
+  "undo_file_edit",
+  "checkpoint_restore",
+  // Claude Code's native editing tools.
+  "Write",
+  "Edit",
+  "MultiEdit",
+  "NotebookEdit",
+]);
+
+/**
+ * Does this `tool_use` name denote a file-mutating tool?
+ *
+ * The `mcp__<server>__` prefix is stripped before matching, so the same
+ * table covers `mcp__sunaba__edit_file`, a differently-named MCP server,
+ * and the native `Edit`.  Matching is case-sensitive: the native tools are
+ * capitalized and the MCP ones are not, and the CLI reports both verbatim.
+ *
+ * @param {unknown} name
+ * @returns {boolean}
+ */
+export function isClaudeWriteToolName(name) {
+  if (typeof name !== "string" || !name) return false;
+  const bare = /^mcp__(.+?)__(.+)$/.exec(name)?.[2] ?? name;
+  return CLAUDE_WRITE_TOOL_NAMES.has(bare);
+}
+
+/**
+ * Does this parsed stream event carry at least one write-tool call?
+ *
+ * Reads the same `assistant` → `message.content[] → tool_use` path
+ * `applyClaudeStreamEvent` folds, so the two can never disagree about what
+ * a tool call is.
+ *
+ * @param {object|null} evt — one parsed stream event.
+ * @returns {boolean}
+ */
+export function eventHasClaudeWriteTool(evt) {
+  if (!evt || typeof evt !== "object" || evt.type !== "assistant") return false;
+  const message = evt.message;
+  if (!message || typeof message !== "object") return false;
+  const content = Array.isArray(message.content) ? message.content : [];
+  for (const block of content) {
+    if (block && typeof block === "object" && block.type === "tool_use" && isClaudeWriteToolName(block.name)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * A positive number of seconds from a config value.
+ *
+ * @param {unknown} raw
+ * @returns {{ kind: "absent" } | { kind: "value", seconds: number } | { kind: "zero" } | { kind: "malformed" }}
+ */
+function watchdogSeconds(raw) {
+  if (raw === undefined || raw === null) return { kind: "absent" };
+  const parsed = typeof raw === "number"
+    ? raw
+    : (typeof raw === "string" && raw.trim() !== "" ? Number(raw) : NaN);
+  if (!Number.isFinite(parsed)) return { kind: "malformed" };
+  if (parsed === 0) return { kind: "zero" };
+  if (parsed < 0) return { kind: "malformed" };
+  return { kind: "value", seconds: parsed };
+}
+
+/**
+ * The write watchdog's settings for this dispatch.
+ *
+ * Config shape (`~/.kusabi/config.json`, the same file the session guard
+ * reads):
+ *
+ *   { "claude": { "writeWatchdog": { "warnS": 300, "killS": 900 } } }
+ *
+ * Resolution table:
+ *
+ *   - no config file / not an object     → OFF, `no-config`
+ *   - `claude.writeWatchdog` absent      → OFF, `absent`  (byte-identical
+ *                                          to the pre-item-3 dispatch)
+ *   - `false` / `0` / a negative number
+ *     (quoted or not)                    → OFF, `disabled` (the session
+ *                                          guard's `false / 0 / <0 → OFF`
+ *                                          convention, same config file)
+ *   - `true`                             → warn-only at the default warnS,
+ *                                          `default`
+ *   - `{ warnS }`                        → warn-only at warnS, `configured`
+ *   - `{ warnS, killS }` with killS>warnS→ warn then kill, `configured`
+ *   - `killS` absent / `0`               → warn-only (killing is opt-in ON
+ *                                          TOP of warning)
+ *   - `killS <= warnS`                   → warn-only, `kill-not-after-warn`.
+ *                                          NORMALIZING it upward would kill
+ *                                          a job on a bound the operator
+ *                                          never wrote; the watchdog's whole
+ *                                          contract is "warn BEFORE kill", so
+ *                                          a kill that cannot come after the
+ *                                          warning is dropped, not moved.
+ *   - any malformed value (a string, a
+ *     positive bare number, an array; or
+ *     malformed warnS/killS fields)      → warn-only at the default (or at a
+ *                                          readable warnS), `malformed-setting`.
+ *                                          A malformed config NEVER yields a
+ *                                          killing configuration.
+ *
+ * @param {object|null|undefined} config — output of loadClaudeGuardConfig().
+ * @returns {{ enabled: boolean, warnS: number|null, killS: number|null, reason: string }}
+ */
+export function resolveClaudeWriteWatchdog(config) {
+  const off = (reason) => ({ enabled: false, warnS: null, killS: null, reason });
+  if (config === null || config === undefined || typeof config !== "object" || Array.isArray(config)) {
+    return off("no-config");
+  }
+  const claude = config.claude === null || typeof config.claude !== "object" || Array.isArray(config.claude)
+    ? undefined
+    : config.claude;
+  const raw = claude?.writeWatchdog;
+  if (raw === undefined || raw === null) return off("absent");
+  if (raw === false) return off("disabled");
+  // `0` (and any non-positive number, quoted or not) is OFF, matching the
+  // session guard's documented `false / 0 / <0 → OFF` convention — and its
+  // string coercion — in this same config file: an operator who disables
+  // one guard with 0 (or "0") must not silently arm the other.
+  const sectionNum = typeof raw === "number"
+    ? raw
+    : (typeof raw === "string" && raw.trim() !== "" ? Number(raw) : NaN);
+  if (Number.isFinite(sectionNum) && sectionNum <= 0) return off("disabled");
+  if (raw === true) {
+    return { enabled: true, warnS: CLAUDE_WRITE_WATCHDOG_DEFAULT_WARN_S, killS: null, reason: "default" };
+  }
+  if (typeof raw !== "object" || Array.isArray(raw)) {
+    // The operator asked for the feature in a shape this does not
+    // understand: honor the ask at its most conservative setting rather
+    // than silently ignoring it, but never with a kill.
+    return { enabled: true, warnS: CLAUDE_WRITE_WATCHDOG_DEFAULT_WARN_S, killS: null, reason: "malformed-setting" };
+  }
+
+  const warn = watchdogSeconds(raw.warnS);
+  const kill = watchdogSeconds(raw.killS);
+  // `warnS: 0` is not "warn immediately" — it is a value nobody means, so it
+  // reads as malformed rather than as an instant warning on every job.
+  const warnMalformed = warn.kind === "malformed" || warn.kind === "zero";
+  const warnS = warn.kind === "value" ? warn.seconds : CLAUDE_WRITE_WATCHDOG_DEFAULT_WARN_S;
+
+  if (warnMalformed || kill.kind === "malformed") {
+    return { enabled: true, warnS, killS: null, reason: "malformed-setting" };
+  }
+  if (kill.kind === "absent" || kill.kind === "zero") {
+    return { enabled: true, warnS, killS: null, reason: warn.kind === "value" ? "configured" : "default" };
+  }
+  if (kill.seconds <= warnS) {
+    return { enabled: true, warnS, killS: null, reason: "kill-not-after-warn" };
+  }
+  return { enabled: true, warnS, killS: kill.seconds, reason: "configured" };
+}
+
+/**
+ * The job's `error` text when the write watchdog killed the run.  Distinct
+ * from the silence watchdog's wording on purpose: the two failures have
+ * different causes and different fixes, and a reader must never have to
+ * guess which one fired.  The bound named is the CONFIGURED `killS` (the
+ * measured idle seconds go into the events, exactly as the silence watchdog
+ * splits them).
+ *
+ * @param {number} killS
+ * @returns {string}
+ */
+export function renderClaudeWriteWatchdogError(killS) {
+  return `write-watchdog: no write-tool call for ${killS}s on an implement phase (process killed)`;
+}
+
+// =========================================================================
 // spawn — one child per dispatch, bounded by timeoutS
 // =========================================================================
 
@@ -1613,10 +1856,19 @@ export async function stopRecordedProcess(recorded, { waitMs, pollMs = KILL_CONF
  *        issued (`kind: "kill"`), in that order.  The caller turns these into
  *        the job's watchdog audit events; only the watchdog path calls it (a
  *        timeout kill is a different failure and reports itself elsewhere).
+ * @param {{warnS: number, killS: number|null}|null} [opts.writeWatchdog] — the
+ *        write-tool watchdog's resolved bounds (kusabi #215 item 3), or null
+ *        (the default) to leave it entirely off.  `killS: null` is warn-only:
+ *        the warning is reported and the child is never killed by it.
+ * @param {(event: {kind: "warned"|"fired"|"kill", idleS?: number}) => void} [opts.onWriteWatchdog]
+ *        — called once with `kind: "warned"` when `warnS` passes with no
+ *        write-tool call, and (kill mode only) with `fired` then `kill`
+ *        around the group kill, mirroring onWatchdog's pair.
  * @returns {Promise<{ code: number|null, stdout: string, stderr: string,
- *                     timedOut: boolean, stalled: boolean, spawnError: Error|null }>}
+ *                     timedOut: boolean, stalled: boolean, writeStalled: boolean,
+ *                     spawnError: Error|null }>}
  */
-export function runClaudeProcess({ bin, args, cwd, timeoutS, watchdogS, promptText, onStart, onLine, onWatchdog }) {
+export function runClaudeProcess({ bin, args, cwd, timeoutS, watchdogS, promptText, onStart, onLine, onWatchdog, writeWatchdog = null, onWriteWatchdog }) {
   return new Promise((resolve) => {
     const child = spawn(bin, args, {
       cwd,
@@ -1646,9 +1898,15 @@ export function runClaudeProcess({ bin, args, cwd, timeoutS, watchdogS, promptTe
     let stderr = "";
     let timedOut = false;
     let stalled = false;
+    let writeStalled = false;
     let spawnError = null;
     let lineBuffer = "";
     let lastEventAt = Date.now();
+    // The write-tool clock (kusabi #215 item 3).  Starts at spawn, like the
+    // silence clock: a worker that never writes anything at all must trip
+    // this, not be held off by the absence of a first write to measure from.
+    let lastWriteAt = Date.now();
+    let writeWarned = false;
 
     // Delivers one complete NDJSON line to the caller and resets the
     // silence clock the watchdog measures against — the clock starts at
@@ -1658,7 +1916,17 @@ export function runClaudeProcess({ bin, args, cwd, timeoutS, watchdogS, promptTe
     // warning) is stream noise, not activity — it must not masquerade as
     // an event and hold the watchdog off (kusabi #215 Job B item 3).
     function deliverLine(line) {
-      if (parseClaudeStreamLine(line) !== null) lastEventAt = Date.now();
+      const parsedLine = parseClaudeStreamLine(line);
+      if (parsedLine !== null) lastEventAt = Date.now();
+      // The write clock resets ONLY on a file-mutating tool call (kusabi
+      // #215 item 3) — reads, searches and execs are exactly what the
+      // incident job did all day.  Wrapped: a detection bug must never
+      // break line delivery or the silence watchdog that shares this path.
+      if (writeWatchdog && parsedLine !== null) {
+        try {
+          if (eventHasClaudeWriteTool(parsedLine)) lastWriteAt = Date.now();
+        } catch { /* fail open: no reset, never a broken stream */ }
+      }
       if (typeof onLine === "function") {
         try { onLine(line); } catch { /* a stats-fold bug must not take down the dispatch */ }
       }
@@ -1703,7 +1971,13 @@ export function runClaudeProcess({ bin, args, cwd, timeoutS, watchdogS, promptTe
     };
     const watchdogTimer = watchdogS && watchdogS > 0
       ? setInterval(() => {
-          if (timedOut || stalled) return;
+          // `writeStalled` joins the existing guards for one reason: once the
+          // WRITE watchdog has killed the group the stream stops, so silence
+          // would grow and this watchdog would report a stall it did not
+          // cause (and overwrite the distinct error text).  With the write
+          // watchdog off, writeStalled is false forever and this reads
+          // exactly as it did before (kusabi #215 item 3).
+          if (timedOut || stalled || writeStalled) return;
           const silenceMs = Date.now() - lastEventAt;
           if (silenceMs > watchdogS * 1000) {
             stalled = true;
@@ -1716,11 +1990,71 @@ export function runClaudeProcess({ bin, args, cwd, timeoutS, watchdogS, promptTe
           }
         }, 250)
       : null;
+
+    // Write-tool watchdog (kusabi #215 item 3).  A SEPARATE interval from
+    // the silence watchdog on purpose: the two measure different clocks, and
+    // a fault in this one must not be able to take the silence kill down
+    // with it.  Same 250ms resolution, same group kill, and the whole body
+    // is wrapped — an exception thrown inside a timer callback is an
+    // uncaught exception that would kill the parent process, and this
+    // feature's contract is to fail open.
+    const notifyWriteWatchdog = (event) => {
+      if (typeof onWriteWatchdog !== "function") return;
+      try { onWriteWatchdog(event); } catch { /* best-effort audit trail */ }
+    };
+    const writeWatchdogTimer = writeWatchdog && writeWatchdog.warnS > 0
+      ? setInterval(() => {
+          try {
+            if (timedOut || stalled || writeStalled) return;
+            const idleMs = Date.now() - lastWriteAt;
+            const idleS = Math.round(idleMs / 1000);
+            if (!writeWarned && idleMs > writeWatchdog.warnS * 1000) {
+              // Exactly once per job: a repeating warning is noise the
+              // operator learns to ignore (and is an explicit non-goal).
+              writeWarned = true;
+              notifyWriteWatchdog({ kind: "warned", idleS });
+            }
+            const killS = writeWatchdog.killS;
+            if (killS && idleMs > killS * 1000) {
+              writeStalled = true;
+              clearInterval(writeWatchdogTimer);
+              // Measured idle seconds here; the configured bound is what the
+              // job's error text names (renderClaudeWriteWatchdogError) —
+              // the same split the silence watchdog makes.
+              notifyWriteWatchdog({ kind: "fired", idleS });
+              killProcessGroup(child);
+              notifyWriteWatchdog({ kind: "kill" });
+            }
+          } catch { /* fail open: never take the dispatch down */ }
+        }, 250)
+      : null;
+
     child.on("close", (code) => {
       if (timer) clearTimeout(timer);
       if (watchdogTimer) clearInterval(watchdogTimer);
+      if (writeWatchdogTimer) clearInterval(writeWatchdogTimer);
       if (lineBuffer) deliverLine(lineBuffer);
-      resolve({ code, stdout, stderr, timedOut, stalled, spawnError });
+      // Final write-clock reading (kusabi #215 item 3).  A polled interval
+      // can be beaten to the finish line: when this process is descheduled
+      // the child's whole output can arrive buffered together with its exit,
+      // and the close callback (poll phase) then clears the interval before
+      // the timers phase ever gets to observe the idle time.  The warning is
+      // an audit fact about the run, not a property of scheduler luck, so it
+      // is evaluated once more here — same condition, same measurement, so
+      // this can only emit a warning the interval would have emitted itself.
+      // Deliberately AFTER the final line is delivered (a write on the last
+      // line still resets the clock) and never on a run some other bound
+      // already killed: those carry their own diagnosis.
+      if (writeWatchdog && !writeWarned && !writeStalled && !stalled && !timedOut) {
+        try {
+          const idleMs = Date.now() - lastWriteAt;
+          if (idleMs > writeWatchdog.warnS * 1000) {
+            writeWarned = true;
+            notifyWriteWatchdog({ kind: "warned", idleS: Math.round(idleMs / 1000) });
+          }
+        } catch { /* fail open */ }
+      }
+      resolve({ code, stdout, stderr, timedOut, stalled, writeStalled, spawnError });
     });
   });
 }
@@ -1758,7 +2092,9 @@ export function runClaudeProcess({ bin, args, cwd, timeoutS, watchdogS, promptTe
  * @param {string} [opts.title]
  * @param {string} [opts.promptText]
  * @param {string|null} [opts.agent]
- * @param {string|null} [opts.phase]
+ * @param {string|null} [opts.phase] — also the write watchdog's gate: it is
+ *        armed only for `implement` (which is what every chain rework round
+ *        dispatches under), and only when the config configures it.
  * @param {string|null|undefined} [opts.session] — when present, the dispatch
  *        resumes that session via `claude -p --resume <session>` (chain
  *        rework rounds, chain-resume, and `--session` / `--resume-last` all
@@ -1966,6 +2302,37 @@ export async function claudeDispatch(opts) {
     }
   }
 
+  // ---- write-tool watchdog (kusabi #215 item 3) ----
+  // Resolved independently of the session guard above (its own config read,
+  // its own try/catch): the two guards must not be able to break each other,
+  // and this one is the destructive one.  Off unless BOTH the config asks
+  // for it and the phase is one whose deliverable is an edit — a review or
+  // investigate job legitimately never writes a file.
+  let writeWatchdog;
+  try {
+    writeWatchdog = resolveClaudeWriteWatchdog(loadClaudeGuardConfig());
+  } catch (err) {
+    // Reading a settings file must never be the thing that fails a dispatch.
+    writeWatchdog = { enabled: false, warnS: null, killS: null, reason: `config-unreadable: ${err.message}` };
+  }
+  if (writeWatchdog.enabled && !writeWatchdogAppliesToPhase(opts.phase)) {
+    writeWatchdog = { enabled: false, warnS: null, killS: null, reason: "phase-not-gated" };
+  }
+  if (writeWatchdog.enabled) {
+    // Recorded ONLY when armed: a dispatch with the feature off must leave a
+    // job record byte-identical to the pre-item-3 one (no new key at all).
+    job.writeWatchdog = {
+      warnS: writeWatchdog.warnS,
+      killS: writeWatchdog.killS,
+      reason: writeWatchdog.reason,
+      warned: false,
+      warnedAt: null,
+      idleS: null,
+      killed: false,
+    };
+    saveJob(stateDir, job);
+  }
+
   // ---- run: parse the NDJSON stream as it arrives (kusabi #215 Job B) ----
   const streamAcc = initClaudeStreamAccumulator();
   let malformedLines = 0;
@@ -2001,7 +2368,7 @@ export async function claudeDispatch(opts) {
     }
   };
 
-  const { code, stdout, stderr, timedOut, stalled, spawnError } = await runClaudeProcess({
+  const { code, stdout, stderr, timedOut, stalled, writeStalled, spawnError } = await runClaudeProcess({
     bin,
     args,
     cwd: opts.cwd,
@@ -2030,6 +2397,38 @@ export async function claudeDispatch(opts) {
         appendEvent(stateDir, job.id, { type: "companion.watchdog.kill" });
       }
     },
+    // Null unless the config armed it AND the phase is one that must edit.
+    writeWatchdog: writeWatchdog.enabled ? { warnS: writeWatchdog.warnS, killS: writeWatchdog.killS } : null,
+    // Naming parity with the silence pair from day one (kusabi #215 finding
+    // 4): `companion.write-watchdog.{warned,fired,kill}`, so stall auditing
+    // over events.ndjson needs no second vocabulary.  The warn is ALSO put
+    // on the job record — a warning nobody can see in `kusabi status` is a
+    // warning that changes nothing.
+    onWriteWatchdog: ({ kind, idleS }) => {
+      if (kind === "warned") {
+        // Trail first, record second: this callback is wrapped end to end,
+        // so a failing record save must not be able to swallow the audit
+        // event that is the warning's whole point.
+        appendEvent(stateDir, job.id, {
+          type: "companion.write-watchdog.warned",
+          idleS,
+          warnS: writeWatchdog.warnS,
+          killS: writeWatchdog.killS,
+          phase: job.phase,
+        });
+        if (job.writeWatchdog) {
+          job.writeWatchdog.warned = true;
+          job.writeWatchdog.warnedAt = new Date().toISOString();
+          job.writeWatchdog.idleS = idleS;
+          saveJob(stateDir, job);
+        }
+      } else if (kind === "fired") {
+        appendEvent(stateDir, job.id, { type: "companion.write-watchdog.fired", idleS, killS: writeWatchdog.killS });
+      } else {
+        if (job.writeWatchdog) job.writeWatchdog.killed = true;
+        appendEvent(stateDir, job.id, { type: "companion.write-watchdog.kill" });
+      }
+    },
   });
 
   job.finishedAt = new Date().toISOString();
@@ -2039,6 +2438,16 @@ export async function claudeDispatch(opts) {
   if (spawnError) {
     job.status = "error";
     job.error = `claude dispatch failed: could not start ${bin}: ${spawnError.message}`;
+  } else if (writeStalled) {
+    // The write-tool watchdog killed the group (kusabi #215 item 3).  Same
+    // `stalled` STATUS as the silence watchdog — a chain must treat both the
+    // same way — but a DISTINCT error text, because the two failures have
+    // different causes and different fixes: this one says the worker was
+    // busy and producing nothing, not that it went quiet.  Checked BEFORE
+    // the silence branch so the kill that actually happened is the one
+    // reported.
+    job.status = "stalled";
+    job.error = renderClaudeWriteWatchdogError(writeWatchdog.killS);
   } else if (stalled) {
     // Mirrors the opencode watchdog's own status and wording exactly (kusabi
     // #215 Job B item 3), so a chain treats a stalled claude worker like a
