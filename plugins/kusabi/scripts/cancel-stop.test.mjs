@@ -27,7 +27,7 @@ import { once } from "node:events";
 
 import { cmdCancel, commandOutcome } from "./kusabi-companion.mjs";
 import { claudeDispatch, processStartToken, readProcessStat } from "./claude-dispatch.mjs";
-import { saveJob, loadJob, latestJob } from "./job-store.mjs";
+import { saveJob, loadJob, latestJob, jobDir } from "./job-store.mjs";
 import { stateDirFor, writeJson } from "./state-paths.mjs";
 
 // ---------------------------------------------------------------------------
@@ -484,5 +484,223 @@ describe("commandOutcome", () => {
   it("treats a missing or empty return as a silent success", () => {
     assert.deepEqual(commandOutcome(undefined), { text: "", exitCode: 0 });
     assert.deepEqual(commandOutcome(null), { text: "", exitCode: 0 });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// the terminal status is sticky (kusabi #213)
+//
+// `cancel` and the dispatch are two processes writing one record, and neither
+// owns it: after the cancel proves the stop and writes `cancelled`, the still
+// living dispatch observes its killed child, calls it a failure and writes
+// `error` over the top — so a deliberate cancel used to be indistinguishable
+// from a genuine dispatch failure in everything that aggregates these records.
+//
+// These tests assert the INVARIANT, not a sequence: once the on-disk record
+// says `cancelled`, no later save changes its verdict, whatever that save is
+// and whichever backend wrote it.
+// ---------------------------------------------------------------------------
+
+describe("saveJob keeps a cancelled record cancelled (kusabi #213)", () => {
+  let sb;
+
+  beforeEach(() => {
+    sb = sandbox();
+  });
+
+  afterEach(() => {
+    sb.restore();
+  });
+
+  // The record as `cancel` leaves it: proven stop, terminal verdict on disk.
+  function cancelledOnDisk(overrides = {}) {
+    const job = runningJob({ failure: null, ...overrides });
+    saveJob(sb.stateDir, job);
+    const cancelled = loadJob(sb.stateDir, job.id);
+    cancelled.status = "cancelled";
+    cancelled.finishedAt = new Date().toISOString();
+    saveJob(sb.stateDir, cancelled);
+    return cancelled;
+  }
+
+  it("demotes a later `error` save and preserves the verdict it tried to write", () => {
+    const cancelled = cancelledOnDisk();
+
+    // The dispatch's finalize block: its own in-memory record, classified as a
+    // failure now that the child it never started is gone.
+    const dispatchView = {
+      ...cancelled,
+      status: "error",
+      error: "claude exited with code null: (no output)",
+      failure: { kind: "quota-exhaustion", quota: "session", backendBlocked: true, reset: null },
+      finishedAt: new Date(Date.parse(cancelled.finishedAt) + 5000).toISOString(),
+      sessionID: "ses_from_the_stream",
+    };
+    saveJob(sb.stateDir, dispatchView);
+
+    const onDisk = loadJob(sb.stateDir, cancelled.id);
+    assert.equal(onDisk.status, "cancelled", "a cancelled job must never end up `error`");
+    assert.equal(onDisk.error, cancelled.error);
+    assert.equal(onDisk.finishedAt, cancelled.finishedAt);
+    assert.equal(onDisk.failure, null, "the failure classification belongs to the demoted verdict");
+
+    // Demoted, not discarded — machine-readable, never prose on `error`.
+    assert.deepEqual(onDisk.overridden.map((o) => o.status), ["error"]);
+    assert.equal(onDisk.overridden[0].error, "claude exited with code null: (no output)");
+    assert.equal(onDisk.overridden[0].failure.kind, "quota-exhaustion");
+    assert.ok(Date.parse(onDisk.overridden[0].at) > 0, "the attempted verdict is timestamped");
+
+    // Fields only the dispatch knows are still merged.
+    assert.equal(onDisk.sessionID, "ses_from_the_stream");
+
+    // The caller's object agrees with disk, so its later saves and its
+    // rendering do not contradict the record (claude-dispatch saves again).
+    assert.equal(dispatchView.status, "cancelled");
+    assert.equal(dispatchView.error, cancelled.error);
+    assert.equal(dispatchView.finishedAt, cancelled.finishedAt);
+    assert.equal(dispatchView.failure, null);
+  });
+
+  it("never resurrects a cancelled record to `running` (the stats cadence)", () => {
+    const cancelled = cancelledOnDisk();
+
+    // claude-dispatch re-saves ITS copy — still `running` — roughly once a
+    // second for as long as the child lives.  The same object each time.
+    const live = { ...cancelled, status: "running", finishedAt: null };
+    saveJob(sb.stateDir, live);
+    assert.equal(loadJob(sb.stateDir, cancelled.id).status, "cancelled");
+
+    live.stats = { ...live.stats, events: 42 };
+    saveJob(sb.stateDir, live);
+    const onDisk = loadJob(sb.stateDir, cancelled.id);
+
+    assert.equal(onDisk.status, "cancelled");
+    assert.equal(onDisk.finishedAt, cancelled.finishedAt);
+    assert.equal(onDisk.stats.events, 42, "the cadence's actual payload still lands");
+    // One attempt recorded, not one per save: the first demotion brought the
+    // caller into line, so the saves after it are not fresh verdicts.
+    assert.deepEqual(onDisk.overridden.map((o) => o.status), ["running"]);
+  });
+
+  it("is not sequence-bound: any later verdict is demoted, in any order", () => {
+    const cancelled = cancelledOnDisk();
+
+    for (const verdict of [
+      { status: "error", error: "agy exited with code null" },
+      { status: "provider-error", error: "quota exhausted" },
+      { status: "completed", error: null },
+      { status: "timeout", error: "timed out after 900s" },
+    ]) {
+      saveJob(sb.stateDir, { ...cancelled, ...verdict, finishedAt: new Date().toISOString() });
+      const onDisk = loadJob(sb.stateDir, cancelled.id);
+      assert.equal(onDisk.status, "cancelled", `${verdict.status} must not overwrite the cancel`);
+      assert.equal(onDisk.error, cancelled.error);
+      assert.equal(onDisk.finishedAt, cancelled.finishedAt);
+    }
+
+    assert.deepEqual(
+      loadJob(sb.stateDir, cancelled.id).overridden.map((o) => o.status),
+      ["error", "provider-error", "completed", "timeout"],
+      "every demoted verdict is kept, in the order it was attempted",
+    );
+  });
+
+  it("leaves a record that was never cancelled byte-identical to what it is passed", () => {
+    const job = runningJob();
+    const file = path.join(jobDir(sb.stateDir, job.id), "job.json");
+
+    saveJob(sb.stateDir, job);
+    assert.equal(fs.readFileSync(file, "utf8"), `${JSON.stringify(job, null, 2)}\n`);
+
+    // The happy path all three backends take: `running` → terminal.  Nothing
+    // is added, nothing is held back.
+    job.status = "completed";
+    job.finishedAt = new Date().toISOString();
+    saveJob(sb.stateDir, job);
+    assert.equal(fs.readFileSync(file, "utf8"), `${JSON.stringify(job, null, 2)}\n`);
+    assert.equal("overridden" in loadJob(sb.stateDir, job.id), false);
+  });
+
+  it("makes only `cancelled` sticky — a failed record can still be rewritten", () => {
+    const job = runningJob({ status: "error", error: "claude exited with code 1: boom" });
+    saveJob(sb.stateDir, job);
+
+    saveJob(sb.stateDir, { ...job, status: "completed", error: null });
+
+    const onDisk = loadJob(sb.stateDir, job.id);
+    assert.equal(onDisk.status, "completed");
+    assert.equal(onDisk.error, null);
+    assert.equal("overridden" in onDisk, false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #213 end to end, through the real dispatch: cancelled while the child is
+// killed, and still cancelled after the dispatch has had its say.
+// ---------------------------------------------------------------------------
+
+describe("a cancelled claude dispatch stays cancelled through finalize (kusabi #213)", () => {
+  let sb;
+
+  beforeEach(() => {
+    sb = sandbox();
+  });
+
+  afterEach(() => {
+    sb.restore();
+  });
+
+  it("ends `cancelled`, with the dispatch's failure verdict preserved", async () => {
+    const binPath = path.join(sb.tmp, "fake-claude.mjs");
+    fs.writeFileSync(binPath, FAKE_CLAUDE_SOURCE, "utf8");
+    fs.chmodSync(binPath, 0o755);
+    const mcpSource = path.join(sb.tmp, "claude.json");
+    fs.writeFileSync(mcpSource, JSON.stringify({ mcpServers: { sunaba: { command: "echo" } } }), "utf8");
+
+    process.env.CLAUDE_BIN = binPath;
+    process.env.KUSABI_CLAUDE_MCP_SOURCE = mcpSource;
+    process.env.FAKE_CLAUDE_CHILD_PID = path.join(sb.tmp, "fake-claude-child.pid");
+
+    const pending = claudeDispatch({
+      cwd: sb.cwd,
+      kind: "task",
+      title: "a job that gets cancelled mid-flight",
+      promptText: "Do the thing.",
+      agent: "kusabi-implement",
+      phase: null,
+      tools: null,
+      timeoutS: 120,
+      watchdogS: 900,
+      tiers: [["sonnet"]],
+      round: 1,
+      explicitModel: null,
+    });
+
+    const job = await waitFor(() => latestJob(sb.stateDir, (j) => j.process?.pid), {
+      what: "the job record to carry a process id",
+    });
+    assert.ok(alive(job.process.pid), "the dispatched process must be running before the cancel");
+
+    const { text, exitCode } = commandOutcome(await cmdCancel(sb.cwd, { text: job.id }));
+    assert.equal(exitCode, 0, text);
+    const cancelled = loadJob(sb.stateDir, job.id);
+    assert.equal(cancelled.status, "cancelled");
+
+    // The dispatch process is still alive at this point.  It now sees its
+    // child close with no exit code (SIGKILL), classifies that as a failure
+    // and finalises — the write this whole change exists to demote.
+    const settled = await pending;
+
+    const final = loadJob(sb.stateDir, job.id);
+    assert.equal(final.status, "cancelled", "the dispatch must not rewrite a cancel as `error`");
+    assert.equal(final.error, null);
+    assert.equal(final.finishedAt, cancelled.finishedAt);
+
+    assert.deepEqual(final.overridden.map((o) => o.status), ["error"]);
+    assert.match(final.overridden[0].error, /claude exited with code null/);
+
+    // The dispatch's own return value is the record, not a contradiction of it.
+    assert.equal(settled.job.status, "cancelled");
+    assert.equal(settled.job.error, null);
   });
 });
