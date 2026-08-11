@@ -38,7 +38,16 @@ import {
   clampModelDispatch,
   extractSunabaMcp,
   claudeDispatch,
+  CLAUDE_SESSION_GUARD_DEFAULT_PERCENT,
+  resolveClaudeSessionGuard,
+  claudeUsageProbeArgs,
+  parseClaudeSessionUsage,
+  probeClaudeSessionUsage,
+  claudeSessionGuardObservation,
+  renderClaudeSessionGuardRefusal,
+  usageProbeTimeoutMs,
 } from "./claude-dispatch.mjs";
+import { agyDispatch } from "./agy-dispatch.mjs";
 import { resolveBackend, resolveDispatchBackend } from "./kusabi-companion.mjs";
 import { dispatchWithFallback } from "./prompt-execution.mjs";
 import { runImplementPhase } from "./chain-phases.mjs";
@@ -2695,5 +2704,693 @@ describe("CLI --model backend routing (subprocess, kusabi #210)", () => {
     } finally {
       fs.rmSync(tmp, { recursive: true, force: true });
     }
+  });
+});
+
+// =========================================================================
+// pre-dispatch session-quota guard — pure helpers (kusabi #215)
+// =========================================================================
+
+describe("resolveClaudeSessionGuard", () => {
+  it("no config file at all leaves the guard off (documented boundary)", () => {
+    for (const absent of [null, undefined]) {
+      const g = resolveClaudeSessionGuard(absent);
+      assert.equal(g.enabled, false);
+      assert.equal(g.threshold, null);
+      assert.equal(g.reason, "no-config");
+    }
+  });
+
+  it("a config with no guard key takes the default threshold", () => {
+    for (const config of [{}, { models: { chain: [["opus"]] } }, { claude: {} }]) {
+      const g = resolveClaudeSessionGuard(config);
+      assert.equal(g.enabled, true);
+      assert.equal(g.threshold, CLAUDE_SESSION_GUARD_DEFAULT_PERCENT);
+      assert.equal(g.threshold, 90);
+      assert.equal(g.reason, "default");
+    }
+  });
+
+  it("true takes the default; a positive number is the threshold", () => {
+    assert.deepEqual(
+      resolveClaudeSessionGuard({ claude: { sessionGuardPercent: true } }),
+      { enabled: true, threshold: 90, reason: "default" },
+    );
+    assert.deepEqual(
+      resolveClaudeSessionGuard({ claude: { sessionGuardPercent: 50 } }),
+      { enabled: true, threshold: 50, reason: "configured" },
+    );
+    // A JSON config may carry the number as a string; it still reads.
+    assert.deepEqual(
+      resolveClaudeSessionGuard({ claude: { sessionGuardPercent: "75" } }),
+      { enabled: true, threshold: 75, reason: "configured" },
+    );
+  });
+
+  it("false / 0 / a negative number disable the guard", () => {
+    for (const raw of [false, 0, -1, "0"]) {
+      const g = resolveClaudeSessionGuard({ claude: { sessionGuardPercent: raw } });
+      assert.equal(g.enabled, false, `expected ${JSON.stringify(raw)} to disable the guard`);
+      assert.equal(g.reason, "disabled");
+    }
+  });
+
+  it("an unreadable threshold falls back to the default, never to off", () => {
+    // A typo in the threshold must not silently remove the guard: that would
+    // be the one failure mode the guard exists to prevent.
+    for (const raw of ["ninety", {}, [], "", NaN]) {
+      const g = resolveClaudeSessionGuard({ claude: { sessionGuardPercent: raw } });
+      assert.equal(g.enabled, true, `expected ${JSON.stringify(raw)} to keep the guard on`);
+      assert.equal(g.threshold, 90);
+      assert.equal(g.reason, "unreadable-setting");
+    }
+  });
+
+  it("a non-object config (or a non-object claude section) never throws", () => {
+    assert.equal(resolveClaudeSessionGuard("nope").enabled, false);
+    assert.equal(resolveClaudeSessionGuard([1, 2]).enabled, false);
+    assert.equal(resolveClaudeSessionGuard({ claude: "yes" }).enabled, true);
+    assert.equal(resolveClaudeSessionGuard({ claude: null }).enabled, true);
+  });
+});
+
+describe("claudeUsageProbeArgs", () => {
+  it("is exactly the measured control-plane invocation, and nothing else", () => {
+    assert.deepEqual(claudeUsageProbeArgs(), ["-p", "--output-format", "json", "/usage"]);
+    // No model, no MCP config, no allow/deny lists: every extra flag is a
+    // flag that can make a free probe fail.
+    for (const flag of ["--model", "--mcp-config", "--allowedTools", "--disallowedTools", "--resume"]) {
+      assert.ok(!claudeUsageProbeArgs().includes(flag), `probe must not pass ${flag}`);
+    }
+  });
+});
+
+describe("usageProbeTimeoutMs", () => {
+  const saved = process.env.KUSABI_CLAUDE_USAGE_PROBE_TIMEOUT_MS;
+
+  afterEach(() => {
+    if (saved === undefined) delete process.env.KUSABI_CLAUDE_USAGE_PROBE_TIMEOUT_MS;
+    else process.env.KUSABI_CLAUDE_USAGE_PROBE_TIMEOUT_MS = saved;
+  });
+
+  it("defaults to a few seconds and honors the env override", () => {
+    delete process.env.KUSABI_CLAUDE_USAGE_PROBE_TIMEOUT_MS;
+    assert.equal(usageProbeTimeoutMs(), 5000);
+    process.env.KUSABI_CLAUDE_USAGE_PROBE_TIMEOUT_MS = "250";
+    assert.equal(usageProbeTimeoutMs(), 250);
+    for (const bad of ["", "soon", "0", "-5"]) {
+      process.env.KUSABI_CLAUDE_USAGE_PROBE_TIMEOUT_MS = bad;
+      assert.equal(usageProbeTimeoutMs(), 5000, `${JSON.stringify(bad)} must fall back to the default`);
+    }
+  });
+});
+
+describe("parseClaudeSessionUsage", () => {
+  // The REAL answer shape (kusabi #215, measured 2026-08-11): three prose
+  // lines inside the `--output-format json` envelope's `result` field.
+  const REAL_PROSE = [
+    "Current session: 41% used · resets Aug 11, 1:59pm (Asia/Tokyo)",
+    "Current week (all models): 37% used · resets Aug 16, 1:59am (Asia/Tokyo)",
+    "Current week (Fable): 42% used · resets Aug 16, 1:59am (Asia/Tokyo)",
+  ].join("\n");
+
+  it("reads the session line out of the json envelope, with its own reset", () => {
+    const envelope = JSON.stringify({
+      type: "result", subtype: "success", is_error: false, result: REAL_PROSE,
+      total_cost_usd: 0, num_turns: 0, duration_api_ms: 0,
+    });
+    assert.deepEqual(parseClaudeSessionUsage(envelope), {
+      percent: 41,
+      // The reset on the SESSION line — never the weekly one, which is days away.
+      reset: "Aug 11, 1:59pm (Asia/Tokyo)",
+    });
+  });
+
+  it("reads bare prose too (the answer shape has no contract)", () => {
+    assert.deepEqual(parseClaudeSessionUsage(REAL_PROSE), {
+      percent: 41,
+      reset: "Aug 11, 1:59pm (Asia/Tokyo)",
+    });
+  });
+
+  it("a weekly line is never mistaken for the session line", () => {
+    const weeklyOnly = [
+      "Current week (all models): 37% used · resets Aug 16, 1:59am (Asia/Tokyo)",
+      "Current week (Fable): 99% used · resets Aug 16, 1:59am (Asia/Tokyo)",
+    ].join("\n");
+    assert.deepEqual(parseClaudeSessionUsage(weeklyOnly), { percent: null, reset: null });
+  });
+
+  it("accepts a decimal reading and a line with no reset", () => {
+    assert.deepEqual(parseClaudeSessionUsage("Current session: 12.5% used"), { percent: 12.5, reset: null });
+    assert.deepEqual(parseClaudeSessionUsage("Current session: 100% used"), { percent: 100, reset: null });
+  });
+
+  it("anything else reads as no reading at all — the caller then proceeds", () => {
+    for (const text of [
+      "", "   ", "this is not the usage output",
+      "Usage: claude [options] [command]",
+      JSON.stringify({ type: "result", is_error: false, result: "" }),
+      JSON.stringify({ type: "result", is_error: true, result: "unknown command: /usage" }),
+      null, undefined, 42,
+    ]) {
+      assert.deepEqual(parseClaudeSessionUsage(text), { percent: null, reset: null },
+        `expected no reading from ${JSON.stringify(text)}`);
+    }
+  });
+});
+
+describe("claudeSessionGuardObservation", () => {
+  const readable = (percent, reset = "Aug 11, 1:59pm (Asia/Tokyo)") =>
+    ({ readable: true, percent, reset, reason: null, detail: null, elapsedMs: 450 });
+
+  it("refuses at and above the threshold, proceeds below it", () => {
+    const guard = { enabled: true, threshold: 90, reason: "default" };
+    assert.equal(claudeSessionGuardObservation(guard, readable(95)).decision, "refused");
+    assert.equal(claudeSessionGuardObservation(guard, readable(90)).decision, "refused");
+    assert.equal(claudeSessionGuardObservation(guard, readable(89.9)).decision, "proceeded");
+    assert.equal(claudeSessionGuardObservation(guard, readable(41)).decision, "proceeded");
+  });
+
+  it("honors a custom threshold", () => {
+    const guard = { enabled: true, threshold: 50, reason: "configured" };
+    assert.equal(claudeSessionGuardObservation(guard, readable(60)).decision, "refused");
+    assert.equal(claudeSessionGuardObservation(guard, readable(41)).decision, "proceeded");
+  });
+
+  it("an unreadable probe NEVER refuses, and says why it could not read", () => {
+    const guard = { enabled: true, threshold: 90, reason: "default" };
+    const obs = claudeSessionGuardObservation(
+      guard,
+      { readable: false, percent: null, reset: null, reason: "timeout", detail: "no answer within 400ms", elapsedMs: 401 },
+    );
+    assert.equal(obs.decision, "proceeded");
+    assert.equal(obs.readable, false);
+    assert.equal(obs.percent, null);
+    assert.equal(obs.reason, "timeout");
+    assert.match(obs.detail, /no answer within 400ms/);
+    assert.equal(obs.threshold, 90);
+    assert.equal(obs.probeMs, 401);
+  });
+
+  it("records the reading, the reset and the threshold on a proceeded dispatch", () => {
+    const obs = claudeSessionGuardObservation({ threshold: 90 }, readable(41), "2026-08-11T02:00:00.000Z");
+    assert.deepEqual(obs, {
+      threshold: 90,
+      percent: 41,
+      reset: "Aug 11, 1:59pm (Asia/Tokyo)",
+      readable: true,
+      reason: null,
+      detail: null,
+      decision: "proceeded",
+      observedAt: "2026-08-11T02:00:00.000Z",
+      probeMs: 450,
+    });
+  });
+});
+
+describe("renderClaudeSessionGuardRefusal", () => {
+  it("says pre-dispatch guard, the reading, the threshold, and that nothing ran", () => {
+    const text = renderClaudeSessionGuardRefusal({ percent: 95, threshold: 90 });
+    assert.match(text, /pre-dispatch session-quota guard refused/);
+    assert.match(text, /95%/);
+    assert.match(text, /refuse at 90%/);
+    assert.match(text, /No worker was started/);
+    assert.match(text, /did not fail mid-flight/);
+  });
+
+  it("composes with the existing quota renderer into the session-limit advice", () => {
+    const failure = { quota: "session", reset: "Aug 11, 1:59pm (Asia/Tokyo)" };
+    const text = renderClaudeQuotaError(failure, renderClaudeSessionGuardRefusal({ percent: 95, threshold: 90 }));
+    assert.match(text, /pre-dispatch session-quota guard refused/);
+    assert.match(text, /session limit exhausted \(resets Aug 11, 1:59pm \(Asia\/Tokyo\)\)/);
+    assert.match(text, /the whole claude backend is blocked/);
+    assert.match(text, /Switch the phase to the opencode backend/);
+    assert.match(text, /do not retry claude/);
+  });
+});
+
+// =========================================================================
+// pre-dispatch session-quota guard — integration (fake claude binary)
+// =========================================================================
+//
+// One fake binary answers BOTH invocations and logs them to SEPARATE files:
+// the /usage probe (control plane) and the worker dispatch.  "the worker was
+// never spawned" is the whole assertion of the refusal test, so it must not
+// depend on picking argv apart in a shared log.
+
+const FAKE_GUARD_CLAUDE_SOURCE = `#!/usr/bin/env node
+import fs from "node:fs";
+
+const NL = String.fromCharCode(10);
+const argv = process.argv.slice(2);
+
+if (argv.includes("/usage")) {
+  fs.appendFileSync(process.env.FAKE_CLAUDE_USAGE_LOG, JSON.stringify(argv) + NL);
+  fs.appendFileSync(process.env.FAKE_CLAUDE_USAGE_PIDS, String(process.pid) + NL);
+  const mode = process.env.FAKE_CLAUDE_USAGE_MODE || "at-41";
+  if (mode === "hang") {
+    // Never answers, never exits: the guard's own timeout must kill this
+    // whole group and degrade to "could not read the quota".
+    setInterval(() => {}, 1000);
+  } else if (mode === "exit") {
+    process.stderr.write("claude: /usage failed (not logged in)" + NL);
+    process.exit(7);
+  } else if (mode === "garbage") {
+    process.stdout.write("Usage: claude [options] [command]" + NL);
+    process.exit(0);
+  } else {
+    // The REAL /usage answer shape (measured 2026-08-11): prose in the json
+    // envelope's result field, zero cost, zero turns, no model called.
+    const percent = mode.indexOf("at-") === 0 ? mode.slice(3) : "41";
+    process.stdout.write(JSON.stringify({
+      type: "result",
+      subtype: "success",
+      is_error: false,
+      result: "Current session: " + percent + "% used \\u00b7 resets Aug 11, 1:59pm (Asia/Tokyo)" + NL +
+        "Current week (all models): 37% used \\u00b7 resets Aug 16, 1:59am (Asia/Tokyo)" + NL +
+        "Current week (Fable): 42% used \\u00b7 resets Aug 16, 1:59am (Asia/Tokyo)",
+      session_id: null,
+      usage: {},
+      total_cost_usd: 0,
+      duration_ms: 450,
+      duration_api_ms: 0,
+      num_turns: 0,
+    }));
+    process.exit(0);
+  }
+} else {
+  fs.readFileSync(0, "utf8");
+  fs.appendFileSync(process.env.FAKE_CLAUDE_WORKER_LOG, JSON.stringify(argv) + NL);
+  process.stdout.write(JSON.stringify({
+    type: "result",
+    is_error: false,
+    result: "implemented the thing per the brief",
+    session_id: "claude-guard-session-1",
+    usage: { input_tokens: 10, output_tokens: 5 },
+    total_cost_usd: 0.001,
+    duration_ms: 10,
+    num_turns: 1,
+  }) + NL);
+  process.exit(0);
+}
+`;
+
+const FAKE_AGY_FOR_GUARD_SOURCE = `#!/usr/bin/env node
+import fs from "node:fs";
+
+const NL = String.fromCharCode(10);
+fs.appendFileSync(process.env.FAKE_AGY_ARGS_LOG, JSON.stringify(process.argv.slice(2)) + NL);
+process.stdout.write(JSON.stringify({
+  conversation_id: "6f5f0f1e-0000-4a1b-9c2d-1122334455aa",
+  status: "SUCCESS",
+  response: "implemented the thing per the brief",
+  duration_seconds: 1.5,
+  num_turns: 1,
+  usage: { input_tokens: 10, output_tokens: 5 },
+}));
+process.exit(0);
+`;
+
+/**
+ * A dispatch sandbox for the guard: a temp state root whose config.json is
+ * whatever the test says (or absent), and a fake claude that answers the
+ * /usage probe per FAKE_CLAUDE_USAGE_MODE.
+ */
+function guardContext({ config = {}, usageMode = "at-41" } = {}) {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-claude-guard-"));
+  const binPath = path.join(tmp, "fake-claude.mjs");
+  fs.writeFileSync(binPath, FAKE_GUARD_CLAUDE_SOURCE, "utf8");
+  fs.chmodSync(binPath, 0o755);
+  const agyBinPath = path.join(tmp, "fake-agy.mjs");
+  fs.writeFileSync(agyBinPath, FAKE_AGY_FOR_GUARD_SOURCE, "utf8");
+  fs.chmodSync(agyBinPath, 0o755);
+
+  const usageLog = path.join(tmp, "usage.ndjson");
+  const usagePids = path.join(tmp, "usage.pids");
+  const workerLog = path.join(tmp, "worker.ndjson");
+  const agyArgsLog = path.join(tmp, "agy-args.ndjson");
+  for (const file of [usageLog, usagePids, workerLog, agyArgsLog]) fs.writeFileSync(file, "", "utf8");
+
+  const stateRootDir = path.join(tmp, "state");
+  fs.mkdirSync(stateRootDir, { recursive: true });
+  if (config !== null) {
+    fs.writeFileSync(path.join(stateRootDir, "config.json"), JSON.stringify(config, null, 2), "utf8");
+  }
+
+  const cwd = path.join(tmp, "cwd");
+  fs.mkdirSync(cwd, { recursive: true });
+  const mcpSource = path.join(tmp, "claude.json");
+  fs.writeFileSync(mcpSource, JSON.stringify({ mcpServers: { sunaba: SUNABA_MCP } }), "utf8");
+
+  const saved = {
+    CLAUDE_BIN: process.env.CLAUDE_BIN,
+    AGY_BIN: process.env.AGY_BIN,
+    KUSABI_STATE_DIR: process.env.KUSABI_STATE_DIR,
+    KUSABI_CLAUDE_MCP_SOURCE: process.env.KUSABI_CLAUDE_MCP_SOURCE,
+    KUSABI_CLAUDE_USAGE_PROBE_TIMEOUT_MS: process.env.KUSABI_CLAUDE_USAGE_PROBE_TIMEOUT_MS,
+    FAKE_CLAUDE_USAGE_MODE: process.env.FAKE_CLAUDE_USAGE_MODE,
+    FAKE_CLAUDE_USAGE_LOG: process.env.FAKE_CLAUDE_USAGE_LOG,
+    FAKE_CLAUDE_USAGE_PIDS: process.env.FAKE_CLAUDE_USAGE_PIDS,
+    FAKE_CLAUDE_WORKER_LOG: process.env.FAKE_CLAUDE_WORKER_LOG,
+    FAKE_AGY_ARGS_LOG: process.env.FAKE_AGY_ARGS_LOG,
+  };
+  process.env.CLAUDE_BIN = binPath;
+  process.env.AGY_BIN = agyBinPath;
+  process.env.KUSABI_STATE_DIR = stateRootDir;
+  process.env.KUSABI_CLAUDE_MCP_SOURCE = mcpSource;
+  // The hang test must not sit out the real 5s bound.
+  process.env.KUSABI_CLAUDE_USAGE_PROBE_TIMEOUT_MS = "400";
+  process.env.FAKE_CLAUDE_USAGE_MODE = usageMode;
+  process.env.FAKE_CLAUDE_USAGE_LOG = usageLog;
+  process.env.FAKE_CLAUDE_USAGE_PIDS = usagePids;
+  process.env.FAKE_CLAUDE_WORKER_LOG = workerLog;
+  process.env.FAKE_AGY_ARGS_LOG = agyArgsLog;
+
+  const lines = (file) => {
+    const text = fs.readFileSync(file, "utf8").trim();
+    return text ? text.split("\n").filter(Boolean) : [];
+  };
+
+  return {
+    tmp,
+    cwd,
+    binPath,
+    stateDir: stateDirFor(cwd),
+    probes: () => lines(usageLog).map((l) => JSON.parse(l)),
+    probePids: () => lines(usagePids).map(Number),
+    workerRuns: () => lines(workerLog).map((l) => JSON.parse(l)),
+    agyRuns: () => lines(agyArgsLog).map((l) => JSON.parse(l)),
+    dispatchOptions(overrides = {}) {
+      return {
+        cwd,
+        kind: "task",
+        title: "session guard test",
+        promptText: "Do the thing.",
+        agent: "kusabi-implement",
+        phase: "implement",
+        tools: null,
+        timeoutS: 20,
+        watchdogS: 900,
+        tiers: [["opus"]],
+        round: 1,
+        explicitModel: null,
+        ...overrides,
+      };
+    },
+    restore() {
+      for (const [key, value] of Object.entries(saved)) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+      fs.rmSync(tmp, { recursive: true, force: true });
+    },
+  };
+}
+
+describe("claudeDispatch — pre-dispatch session-quota guard (kusabi #215)", () => {
+  let ctx;
+
+  afterEach(() => {
+    if (ctx) ctx.restore();
+    ctx = null;
+  });
+
+  it("criterion 1: at 95% the dispatch is REFUSED before any worker is spawned", async () => {
+    ctx = guardContext({ config: {}, usageMode: "at-95" });
+
+    const { job, resultText, stateDir } = await claudeDispatch(ctx.dispatchOptions());
+
+    // The probe ran exactly once, with the measured control-plane argv...
+    assert.deepEqual(ctx.probes(), [["-p", "--output-format", "json", "/usage"]]);
+    // ...and the worker binary was NEVER invoked: nothing was spent.
+    assert.deepEqual(ctx.workerRuns(), []);
+    assert.equal(job.process, null, "no child was spawned, so there is no pid to record");
+    assert.equal(resultText, "");
+
+    // Finalised as a session-quota failure through the EXISTING machinery, so
+    // the chain's provider-exhaustion stop needs no new logic.
+    assert.equal(job.status, "provider-error");
+    assert.deepEqual(job.failure, {
+      kind: "quota-exhaustion",
+      quota: "session",
+      backendBlocked: true,
+      reset: "Aug 11, 1:59pm (Asia/Tokyo)",
+    });
+
+    // The error text names the guard, the reading, the reset and the advice.
+    assert.match(job.error, /pre-dispatch session-quota guard refused/);
+    assert.match(job.error, /95% of the claude session window already used/);
+    assert.match(job.error, /refuse at 90%/);
+    assert.match(job.error, /No worker was started/);
+    assert.match(job.error, /session limit exhausted \(resets Aug 11, 1:59pm \(Asia\/Tokyo\)\)/);
+    assert.match(job.error, /Switch the phase to the opencode backend/);
+    // It must not read as a mid-run death.
+    assert.ok(!/exited with code/.test(job.error), job.error);
+
+    // The observation is on the record, machine-readable.
+    assert.equal(job.sessionGuard.decision, "refused");
+    assert.equal(job.sessionGuard.percent, 95);
+    assert.equal(job.sessionGuard.threshold, 90);
+    assert.equal(job.sessionGuard.readable, true);
+    assert.equal(job.sessionGuard.reason, null);
+    assert.equal(job.sessionGuard.reset, "Aug 11, 1:59pm (Asia/Tokyo)");
+    assert.equal(typeof job.sessionGuard.observedAt, "string");
+
+    // And persisted, with the finishedAt of a job that is over.
+    const persisted = loadJob(stateDir, job.id);
+    assert.equal(persisted.status, "provider-error");
+    assert.equal(persisted.sessionGuard.decision, "refused");
+    assert.deepEqual(persisted.failure, job.failure);
+    assert.equal(typeof persisted.finishedAt, "string");
+    assert.equal(persisted.stats.events, 0);
+    // No result.md: nothing produced a result.
+    assert.equal(fs.existsSync(path.join(jobDir(stateDir, job.id), "result.md")), false);
+    // The prompt is still on disk — a refused dispatch is auditable.
+    assert.equal(fs.readFileSync(path.join(jobDir(stateDir, job.id), "prompt.md"), "utf8"), "Do the thing.");
+
+    // The events trail shows the observation AND the refusal.
+    const events = readJobEvents(stateDir, job.id);
+    assert.deepEqual(events.map((e) => e.type), [
+      "companion.claude.dispatch",
+      "companion.claude.session-guard",
+      "companion.claude.dispatch-refused",
+      "companion.claude.finished",
+    ]);
+    const observed = events.find((e) => e.type === "companion.claude.session-guard");
+    assert.equal(observed.percent, 95);
+    assert.equal(observed.threshold, 90);
+    assert.equal(observed.decision, "refused");
+    const refused = events.find((e) => e.type === "companion.claude.dispatch-refused");
+    assert.equal(refused.reason, "session-quota-guard");
+    assert.equal(refused.percent, 95);
+    assert.equal(refused.reset, "Aug 11, 1:59pm (Asia/Tokyo)");
+    const finished = events.find((e) => e.type === "companion.claude.finished");
+    assert.equal(finished.status, "provider-error");
+    assert.equal(finished.spawned, false, "the trail must say no worker ran");
+    assert.equal(finished.exitCode, null);
+  });
+
+  it("criterion 2: at 41% the dispatch proceeds, carrying what the guard saw", async () => {
+    ctx = guardContext({ config: {}, usageMode: "at-41" });
+
+    const { job, resultText, stateDir } = await claudeDispatch(ctx.dispatchOptions());
+
+    assert.equal(job.status, "completed");
+    assert.equal(resultText, "implemented the thing per the brief");
+    assert.equal(ctx.probes().length, 1);
+    assert.equal(ctx.workerRuns().length, 1, "the worker must run");
+    assert.equal(job.failure, null);
+
+    assert.equal(job.sessionGuard.decision, "proceeded");
+    assert.equal(job.sessionGuard.percent, 41);
+    assert.equal(job.sessionGuard.threshold, 90);
+    assert.equal(job.sessionGuard.readable, true);
+    assert.equal(job.sessionGuard.reset, "Aug 11, 1:59pm (Asia/Tokyo)");
+
+    const persisted = loadJob(stateDir, job.id);
+    assert.equal(persisted.sessionGuard.percent, 41);
+    assert.equal(persisted.sessionGuard.decision, "proceeded");
+
+    const events = readJobEvents(stateDir, job.id);
+    const observed = events.find((e) => e.type === "companion.claude.session-guard");
+    assert.equal(observed.percent, 41);
+    assert.equal(observed.decision, "proceeded");
+    assert.ok(!events.some((e) => e.type === "companion.claude.dispatch-refused"));
+  });
+
+  it("criterion 3a: a probe that exits nonzero → proceed, quota unreadable", async () => {
+    ctx = guardContext({ config: {}, usageMode: "exit" });
+
+    const { job } = await claudeDispatch(ctx.dispatchOptions());
+
+    assert.equal(job.status, "completed");
+    assert.equal(ctx.workerRuns().length, 1);
+    assert.equal(job.sessionGuard.decision, "proceeded");
+    assert.equal(job.sessionGuard.readable, false);
+    assert.equal(job.sessionGuard.percent, null);
+    assert.equal(job.sessionGuard.reason, "exit-nonzero");
+    assert.match(job.sessionGuard.detail, /exited with code 7/);
+    assert.match(job.sessionGuard.detail, /not logged in/);
+    assert.equal(job.failure, null);
+  });
+
+  it("criterion 3b: a probe that prints garbage → proceed, quota unreadable", async () => {
+    ctx = guardContext({ config: {}, usageMode: "garbage" });
+
+    const { job, stateDir } = await claudeDispatch(ctx.dispatchOptions());
+
+    assert.equal(job.status, "completed");
+    assert.equal(ctx.workerRuns().length, 1);
+    assert.equal(job.sessionGuard.readable, false);
+    assert.equal(job.sessionGuard.reason, "unparsed");
+    assert.match(job.sessionGuard.detail, /Current session/);
+    assert.match(job.sessionGuard.detail, /Usage: claude/);
+    const observed = readJobEvents(stateDir, job.id).find((e) => e.type === "companion.claude.session-guard");
+    assert.equal(observed.readable, false);
+    assert.equal(observed.decision, "proceeded");
+  });
+
+  it("criterion 3c: a probe that hangs is killed and → proceed, quota unreadable", async () => {
+    ctx = guardContext({ config: {}, usageMode: "hang" });
+
+    const started = Date.now();
+    const { job } = await claudeDispatch(ctx.dispatchOptions());
+    const elapsed = Date.now() - started;
+
+    assert.equal(job.status, "completed");
+    assert.equal(ctx.workerRuns().length, 1);
+    assert.equal(job.sessionGuard.readable, false);
+    assert.equal(job.sessionGuard.reason, "timeout");
+    assert.match(job.sessionGuard.detail, /did not answer within 400ms/);
+    assert.equal(job.sessionGuard.percent, null);
+    assert.equal(job.sessionGuard.decision, "proceeded");
+    // The bound is real: the dispatch was not held up for the 20s timeoutS.
+    assert.ok(elapsed < 15000, `the guard must not hold the dispatch open: ${elapsed}ms`);
+    // And the hung probe is not still sitting in the operator's session.
+    const pids = ctx.probePids();
+    assert.equal(pids.length, 1);
+    assert.equal(isAlive(pids[0]), false, "a killed probe must not leak a process");
+  });
+
+  it("criterion 4: the guard disabled by config → no probe at all, trail unchanged", async () => {
+    ctx = guardContext({ config: { claude: { sessionGuardPercent: false } }, usageMode: "at-95" });
+
+    const { job, resultText, stateDir } = await claudeDispatch(ctx.dispatchOptions());
+
+    assert.deepEqual(ctx.probes(), [], "a disabled guard must not spawn the probe");
+    assert.equal(ctx.workerRuns().length, 1);
+    assert.equal(job.status, "completed");
+    assert.equal(resultText, "implemented the thing per the brief");
+    assert.equal(job.sessionGuard, null);
+    // Byte-identical trail to a pre-#215 dispatch.
+    assert.deepEqual(readJobEvents(stateDir, job.id).map((e) => e.type), [
+      "companion.claude.dispatch",
+      "companion.claude.finished",
+    ]);
+  });
+
+  it("criterion 4: threshold 0 disables it too", async () => {
+    ctx = guardContext({ config: { claude: { sessionGuardPercent: 0 } }, usageMode: "at-95" });
+
+    const { job } = await claudeDispatch(ctx.dispatchOptions());
+
+    assert.deepEqual(ctx.probes(), []);
+    assert.equal(job.status, "completed");
+    assert.equal(job.sessionGuard, null);
+  });
+
+  it("a workspace with no config.json at all is left byte-identical (documented boundary)", async () => {
+    ctx = guardContext({ config: null, usageMode: "at-95" });
+
+    const { job } = await claudeDispatch(ctx.dispatchOptions());
+
+    assert.deepEqual(ctx.probes(), []);
+    assert.equal(job.status, "completed");
+    assert.equal(job.sessionGuard, null);
+  });
+
+  it("criterion 5: a custom threshold is honored — 50 refuses at 60%", async () => {
+    ctx = guardContext({ config: { claude: { sessionGuardPercent: 50 } }, usageMode: "at-60" });
+
+    const { job } = await claudeDispatch(ctx.dispatchOptions());
+
+    assert.equal(job.status, "provider-error");
+    assert.deepEqual(ctx.workerRuns(), []);
+    assert.equal(job.sessionGuard.threshold, 50);
+    assert.equal(job.sessionGuard.percent, 60);
+    assert.match(job.error, /60% of the claude session window already used/);
+    assert.match(job.error, /refuse at 50%/);
+    assert.equal(job.failure.quota, "session");
+    assert.equal(job.failure.backendBlocked, true);
+  });
+
+  it("criterion 5: the same custom threshold still lets 41% through", async () => {
+    ctx = guardContext({ config: { claude: { sessionGuardPercent: 50 } }, usageMode: "at-41" });
+
+    const { job } = await claudeDispatch(ctx.dispatchOptions());
+
+    assert.equal(job.status, "completed");
+    assert.equal(ctx.workerRuns().length, 1);
+    assert.equal(job.sessionGuard.decision, "proceeded");
+    assert.equal(job.sessionGuard.threshold, 50);
+  });
+
+  it("negative control: the SAME 95% fake dispatches normally with the guard off", async () => {
+    // The refusal above must be caused by the guard and by nothing else in
+    // the fixture: same binary, same 95% answer, guard disabled → the worker
+    // runs and the job completes.
+    ctx = guardContext({ config: { claude: { sessionGuardPercent: false } }, usageMode: "at-95" });
+
+    const { job } = await claudeDispatch(ctx.dispatchOptions());
+
+    assert.equal(job.status, "completed");
+    assert.notEqual(job.status, "provider-error");
+    assert.equal(job.failure, null);
+    assert.equal(ctx.workerRuns().length, 1, "with the guard off, the 95% window does not stop the worker");
+    assert.deepEqual(ctx.probes(), []);
+  });
+
+  it("criterion 6: the agy backend is never probed, even with the guard enabled", async () => {
+    ctx = guardContext({ config: { claude: { sessionGuardPercent: 90 } }, usageMode: "at-95" });
+
+    const { job } = await agyDispatch({
+      ...ctx.dispatchOptions(),
+      agent: "kusabi-implement",
+      tiers: [["gemini-3.6-flash-high"]],
+    });
+
+    assert.equal(job.status, "completed");
+    assert.equal(job.backend, "agy");
+    assert.equal(ctx.agyRuns().length, 1, "the agy worker must run");
+    // The claude control plane was not touched: agy is a separate wallet.
+    assert.deepEqual(ctx.probes(), []);
+    assert.deepEqual(ctx.workerRuns(), []);
+    assert.equal(job.sessionGuard, undefined, "the agy record has no claude guard field");
+  });
+
+  it("criterion 6: the opencode dispatch path knows nothing about the guard", () => {
+    // The opencode backend is a different account, so its dispatch must not
+    // reach the claude session guard at all.  Asserted at the module boundary
+    // (prompt-execution.mjs imports nothing from claude-dispatch.mjs), which
+    // is what makes the "no probe on that path" claim structural rather than
+    // a property of one scenario.
+    const source = fs.readFileSync(new URL("./prompt-execution.mjs", import.meta.url), "utf8");
+    assert.ok(!source.includes("claude-dispatch.mjs"), "the opencode dispatch must not import the claude dispatch");
+    assert.ok(!source.includes("/usage"), "the opencode dispatch must not run the /usage probe");
+    assert.ok(!source.includes("sessionGuard"), "the opencode dispatch must not carry the guard");
+  });
+});
+
+describe("probeClaudeSessionUsage — direct", () => {
+  it("a binary that cannot be started is unreadable, never a throw", async () => {
+    const probe = await probeClaudeSessionUsage({
+      bin: path.join(os.tmpdir(), "kusabi-no-such-claude-binary-xyz"),
+      timeoutMs: 2000,
+    });
+    assert.equal(probe.readable, false);
+    assert.equal(probe.reason, "spawn-failed");
+    assert.equal(probe.percent, null);
+    assert.match(probe.detail, /could not start/);
   });
 });
