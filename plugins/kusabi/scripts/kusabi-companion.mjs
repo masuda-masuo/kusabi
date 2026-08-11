@@ -37,7 +37,7 @@ import {
 import { jobDir, saveJob, loadJob, listJobs, latestJob } from "./job-store.mjs";
 import { opencodeBin, serverHealthy, ensureServer, reapIdleServes, reapOrphanedServes, runningRecordIsStale, isOurServe, api } from "./serve-lifecycle.mjs";
 import { runPrompt, dispatchWithFallback, resetFailedRoutes } from "./prompt-execution.mjs";
-import { claudeDispatch, resolveClaudeModel, validateClaudeModel, validateClaudeChain, translateDenyTools, clampModelDispatch } from "./claude-dispatch.mjs";
+import { claudeDispatch, resolveClaudeModel, validateClaudeModel, validateClaudeChain, translateDenyTools, clampModelDispatch, stopRecordedProcess, CLAUDE_BACKEND } from "./claude-dispatch.mjs";
 import { openMetricsDb, openMetricsDbReadOnly } from "./metrics-db.mjs";
 import { ingestTranscriptDirectory } from "./transcript-ingest.mjs";
 import { ingestChainDirectory, ingestJobDirectory } from "./chain-ingest.mjs";
@@ -810,19 +810,147 @@ function cmdResult(cwd, { text }) {
   return `${renderHeader(job)}${body}`;
 }
 
-async function cmdCancel(cwd, { text }) {
+/**
+ * Stop the process behind a running job, per backend, and report what was
+ * OBSERVED (kusabi #209).
+ *
+ * The incident this exists for: a claude-backend job was "cancelled", the
+ * record was rewritten and `cancelled <id>` printed, and the process kept
+ * writing files into the container for another 17 minutes.  The damage came
+ * from the false confirmation, not from the failure to kill — an operator
+ * told the job stopped goes on to reuse the container.
+ *
+ * `note` describes a stop that actually happened (or a process proven
+ * already gone).  `failure` is non-null whenever the job may still be
+ * running: the caller must then leave the record `running` and exit nonzero.
+ * Exactly one of the two is set.
+ *
+ * @param {string} stateDir
+ * @param {object} job
+ * @returns {Promise<{note: string|null, failure: string|null}>}
+ */
+async function stopRunningJob(stateDir, job) {
+  // Records written before the backend split carry no `backend` field and
+  // are opencode by definition (same rule every other reader uses).
+  if ((job.backend ?? "opencode") === CLAUDE_BACKEND) {
+    return stopClaudeJob(job);
+  }
+  return stopOpencodeJob(stateDir, job);
+}
+
+// claude backend: there is no session to abort — the record's sessionID is
+// null by construction until the CLI returns one — so the recorded process
+// is the only lever, and it is verified before it is signalled.
+async function stopClaudeJob(job) {
+  const stop = await stopRecordedProcess(job.process);
+  const tail = "The record is left `running`; nothing here proves the job stopped.";
+  switch (stop.outcome) {
+    case "stopped":
+      return { note: `Stopped process group ${stop.pid} (SIGKILL): the claude process and its children are gone.`, failure: null };
+    case "already-gone":
+      return { note: `Nothing to signal — ${stop.reason}. The record is finalised.`, failure: null };
+    case "identity-mismatch":
+      // Refusing to signal here is the point: a recorded pid outlives its
+      // process, and one recycled pid already cost an unrelated live server
+      // 22 minutes of downtime.  The job's own process is gone.
+      return { note: `Not signalled: ${stop.reason}. This job's own process is gone; the record is finalised.`, failure: null };
+    case "no-record":
+      // #175/#176: a `running` record whose driver died without rewriting it
+      // is a fossil.  With no pid recorded there is no process to observe, so
+      // the staleness rule is the only evidence available — and it can only
+      // ever conclude "gone", never "stopped".
+      if (runningRecordIsStale(job)) {
+        return { note: `${job.id} names no process and has had no activity for over 6 hours — a fossil record (its driver died without rewriting it). Nothing to signal; the record is finalised.`, failure: null };
+      }
+      return {
+        note: null,
+        failure: [
+          `could not stop ${job.id}: the job record names no process id, so there is nothing to signal.`,
+          "This record predates process recording (kusabi #209). The job may still be running — find it (ps) and kill it by hand.",
+          tail,
+        ].join("\n"),
+      };
+    case "unverifiable":
+      return {
+        note: null,
+        failure: [
+          `could not stop ${job.id}: pid ${stop.pid} could not be verified as this job's process — ${stop.reason}.`,
+          "Refusing to signal a pid that may belong to something else. The job may still be running; check pid " +
+            `${stop.pid} and kill it by hand if it is this job's.`,
+          tail,
+        ].join("\n"),
+      };
+    default: // "alive" — signalled, and something survived
+      return {
+        note: null,
+        failure: [
+          `could not stop ${job.id}: ${stop.reason}.`,
+          `pid ${stop.pid} is STILL RUNNING and still writing into its container — do not reuse that container.`,
+          `Kill it by hand (kill -9 -${stop.pid}) and re-run cancel.`,
+          tail,
+        ].join("\n"),
+      };
+  }
+}
+
+// opencode backend: the executor is the serve, and the lever is the session
+// abort.  The request's outcome is now surfaced — a failed abort used to be
+// swallowed by a bare `.catch(() => {})` and still print `cancelled`.
+async function stopOpencodeJob(stateDir, job) {
+  const server = readJson(path.join(stateDir, "server.json"));
+  if (!(await serverHealthy(server))) {
+    // No live serve answers for this workspace, so nothing is executing the
+    // session: the record is a fossil to finalise, not a running job
+    // (#175/#176).  Said out loud rather than implied by silence.
+    return { note: "No healthy opencode serve answers for this workspace, so nothing can still be executing this job. Nothing was aborted; the record is finalised.", failure: null };
+  }
+  if (typeof job.sessionID !== "string" || job.sessionID === "") {
+    // Never build `/session/null/abort`: it aborts nothing and its failure
+    // is exactly what used to be swallowed.
+    return {
+      note: null,
+      failure: [
+        `could not stop ${job.id}: the record names no session, so there is nothing to abort on the serve.`,
+        "The serve is healthy, so the job may still be running. Stop it by hand (kusabi-companion serve-stop --force stops the whole serve).",
+        "The record is left `running`; nothing here proves the job stopped.",
+      ].join("\n"),
+    };
+  }
+  try {
+    await api(server, "POST", `/session/${job.sessionID}/abort`);
+  } catch (err) {
+    return {
+      note: null,
+      failure: [
+        `could not stop ${job.id}: the abort request for session ${job.sessionID} failed — ${err.message}`,
+        "The job may still be running. The record is left `running`; nothing here proves the job stopped.",
+      ].join("\n"),
+    };
+  }
+  return { note: `Aborted opencode session ${job.sessionID} on the serve.`, failure: null };
+}
+
+export async function cmdCancel(cwd, { text }) {
   const stateDir = stateDirFor(cwd);
   const jobId = text.split(/\s+/).filter(Boolean)[0];
   const job = jobId ? loadJob(stateDir, jobId) : latestJob(stateDir, (j) => j.status === "running");
   if (!job) return jobId ? `no such job: ${jobId}` : "no running jobs to cancel.";
   if (job.status !== "running") return `${job.id} is not running (status: ${job.status}).`;
-  const server = readJson(path.join(stateDir, "server.json"));
-  if (await serverHealthy(server)) {
-    await api(server, "POST", `/session/${job.sessionID}/abort`).catch(() => {});
+
+  const { note, failure } = await stopRunningJob(stateDir, job);
+  if (failure) {
+    // The record stays `running` because, as far as anything here can prove,
+    // it IS running.  The nonzero exit is the other half: a caller that only
+    // reads the status code must not be able to mistake this for a cancel.
+    return { text: failure, exitCode: 1 };
   }
+
   job.status = "cancelled";
   job.finishedAt = new Date().toISOString();
   saveJob(stateDir, job);
+
+  const lines = [`cancelled ${job.id}${job.sessionID ? ` (session ${job.sessionID})` : ""}.`];
+  if (note) lines.push(note);
 
   // A job that belongs to a chain does not stop the chain: cancelling it only
   // ends one phase, and the chain starts the next round.  Say so — but say what
@@ -831,7 +959,6 @@ async function cmdCancel(cwd, { text }) {
   if (chainId) {
     const control = readChainControl(path.join(stateDir, "chains", chainId));
     const { status } = effectiveStatus(control);
-    const lines = [`cancelled ${job.id} (session ${job.sessionID}).`];
     if (status === "running" || status === "stopping") {
       lines.push(`This job belongs to chain ${chainId}, which is still running — cancelling a job does not stop the chain.`);
       lines.push(`To stop the chain itself: kusabi-companion chain-cancel ${chainId}`);
@@ -844,10 +971,9 @@ async function cmdCancel(cwd, { text }) {
     } else {
       lines.push(`This job belongs to chain ${chainId}, which is already ${status}.`);
     }
-    return lines.join("\n");
   }
 
-  return `cancelled ${job.id} (session ${job.sessionID}).`;
+  return lines.join("\n");
 }
 
 // A `running` job record whose last activity is older than RUNNING_STALE_MS
@@ -2743,11 +2869,34 @@ async function main() {
   }
 }
 
+/**
+ * Normalise what a subcommand returned into the two things the shell sees.
+ *
+ * A subcommand returns either the text to print, or `{ text, exitCode }`
+ * when its OUTCOME must reach the exit code too.  Printing a failure and
+ * still exiting 0 is exactly the false confirmation `cancel` now guards
+ * against (kusabi #209): a caller that checks `$?` would read the
+ * could-not-stop path as a successful cancel.
+ *
+ * @param {string|{text?: string, exitCode?: number}|null|undefined} output
+ * @returns {{text: string, exitCode: number}}
+ */
+export function commandOutcome(output) {
+  if (output && typeof output === "object" && !Array.isArray(output)) {
+    return {
+      text: typeof output.text === "string" ? output.text : "",
+      exitCode: Number.isInteger(output.exitCode) ? output.exitCode : 0,
+    };
+  }
+  return { text: typeof output === "string" ? output : "", exitCode: 0 };
+}
+
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
   main()
     .then((output) => {
-      if (output) process.stdout.write(`${output}\n`);
-      process.exit(0);
+      const { text, exitCode } = commandOutcome(output);
+      if (text) process.stdout.write(`${text}\n`);
+      process.exit(exitCode);
     })
     .catch((err) => {
       process.stdout.write(`kusabi-companion error: ${err.message}\n`);
