@@ -175,7 +175,8 @@ split (or without the field) are treated as `opencode` by readers.
   only selects jobs of the same backend). Model syntax is a bare alias
   (`opus`, `sonnet`, `haiku`) or a full model id (e.g.
   `claude-sonnet-4-5`). The binary is resolved through `CLAUDE_BIN`
-  (default `claude`).
+  (default `claude`). A **pre-dispatch session-quota guard** can refuse a
+  dispatch before it starts — see below.
 - **agy** — dispatch through the Antigravity CLI in headless mode
   (`agy -p <prompt> --output-format json --model <id>`; a single JSON object
   on stdout). It buys a separate quota pool (Gemini, metered apart from both
@@ -205,6 +206,52 @@ host `~/.claude.json` (`mcpServers.sunaba`) into a generated
 `--mcp-config` file containing only that entry — override the source file
 with `KUSABI_CLAUDE_MCP_SOURCE`; a missing entry is a clear error. See
 `docs/design/phase-chain.md` §3.5.11 for the v1 limits and failure semantics.
+
+### Pre-dispatch session-quota guard (claude backend only)
+
+A claude dispatch can start into a session window that is nearly exhausted:
+the job then dies mid-run on the session limit (measured: $2.39 and 256s for
+zero edits), and because `claude -p` shares the operator's own account window,
+that failed spend also eats the operator's remaining session. Before spawning
+a worker, the claude backend can therefore ask the CLI how much of the session
+window is already used — `claude -p --output-format json "/usage"`, a free
+control-plane call with no inference (measured: `cost_usd: 0`, `num_turns: 0`,
+`api_ms: 0`, ~450ms) — and refuse the dispatch at or above a threshold. Only
+the *session* line is read; the weekly lines are ignored.
+
+```json
+{
+  "claude": { "sessionGuardPercent": 90 }
+}
+```
+
+- `90` (or any positive number) — refuse at that percentage.
+- `true` — refuse at the default 90.
+- `false` / `0` — guard off: no probe, byte-identical to a dispatch without it.
+- **key absent, but `config.json` exists** — guard on at the default 90.
+- **no `config.json` at all** — guard off. The threshold is an operator
+  decision and the dispatch has no other channel to receive one, so an
+  unconfigured workspace is left exactly as it was; add the two lines above
+  (`"sessionGuardPercent": true` takes the default) to switch it on.
+
+A refused dispatch is recorded as a failed job with the same structured
+session-quota classification a mid-run session limit produces
+(`status: "provider-error"`, `failure.quota: "session"`,
+`failure.backendBlocked: true`), so a chain stops exactly as it does then; the
+error text says it was a pre-dispatch guard, names the measured percentage and
+reset time, and repeats the switch-to-opencode advice. Either way the reading
+is persisted on the job record (`job.sessionGuard`) and on the events trail
+(`companion.claude.session-guard`, plus `companion.claude.dispatch-refused`
+when it refused).
+
+The guard **fails open**: a probe that cannot be started, times out (bounded
+at 5s, `KUSABI_CLAUDE_USAGE_PROBE_TIMEOUT_MS`), exits nonzero, or whose prose
+no longer matches degrades to "quota unreadable" and the dispatch proceeds,
+with that recorded on the record. `/usage` output has no stability contract
+and its number counts this machine only (a lower bound), so a guard that
+failed closed on it would be worse than no guard. The probe runs once per
+dispatch, never cached. opencode and agy are separate accounts and are never
+probed.
 
 The agy backend has no permission flags to mirror: it carries the agent body
 inside the prompt (the CLI has no `--append-system-prompt`) and reaches
