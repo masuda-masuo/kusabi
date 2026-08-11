@@ -32,7 +32,8 @@ import {
   recordReworkEscalation,
   persistChainState,
   writeReviewRecord,
-  collectContainerDiffContext,
+  collectContainerBaseContext,
+  readExecCapture,
   collectContainerReviewInput,
   assertContainerBaseRef,
   collectReviewContext,
@@ -2832,7 +2833,7 @@ describe("hasRepeatedAreas", () => {
 describe("runProbePhase return value", () => {
   // runProbePhase takes callTool as a parameter, so the capture is driven with
   // a stub that answers the two git commands with known output.
-  function captureCallTool({ diff = "", untracked = "", throwOn = null } = {}) {
+  function captureCallTool({ untracked = "", status = "", statusEnvelope = null, throwOn = null } = {}) {
     const commands = [];
     return {
       commands,
@@ -2841,16 +2842,15 @@ describe("runProbePhase return value", () => {
         const cmd = params.commands[0];
         commands.push(cmd);
         if (throwOn && cmd.startsWith(throwOn)) throw new Error("container is gone");
-        if (cmd === "git diff") return { output: diff };
+        if (cmd === "git status --porcelain") return statusEnvelope ?? { output: status };
         if (cmd.startsWith("git ls-files --others")) return { output: untracked };
         return { output: "" };
       },
     };
   }
 
-  it("returns the captured diff content and untracked file list", async () => {
-    const diff = "diff --git a/src/a.js b/src/a.js\n@@ -1 +1,2 @@\n+const added = 1;\n";
-    const { commands, callTool } = captureCallTool({ diff, untracked: "src/brand-new.js\n" });
+  it("returns the untracked file list and never captures a diff", async () => {
+    const { commands, callTool } = captureCallTool({ untracked: "src/brand-new.js\n" });
 
     const result = await runProbePhase({
       baseSha: "abc1234",
@@ -2859,17 +2859,23 @@ describe("runProbePhase return value", () => {
       callTool,
     });
 
-    assert.match(result.chainDiff, /\+const added = 1;/);
     assert.equal(result.chainUntracked.trim(), "src/brand-new.js");
-    assert.ok(commands.includes("git diff"), "capture must run `git diff`");
     assert.ok(
       commands.some((c) => c.startsWith("git ls-files --others")),
       "capture must list untracked files",
     );
+    // The diff capture is gone, not widened (kusabi #208): it was one
+    // default-paged sandbox_exec call, so it could only ever return page one,
+    // and the reviewer fetches the diff itself with `diff_in_container`.
+    assert.ok(
+      !commands.some((c) => c.startsWith("git diff")),
+      `no git diff may be captured, got: ${JSON.stringify(commands)}`,
+    );
+    assert.equal(result.chainDiff, undefined);
   });
 
-  it("leaves both fields empty when the capture call throws", async () => {
-    const { callTool } = captureCallTool({ throwOn: "git diff" });
+  it("leaves the untracked field empty when the capture call throws", async () => {
+    const { callTool } = captureCallTool({ throwOn: "git ls-files --others" });
 
     const result = await runProbePhase({
       baseSha: "abc1234",
@@ -2879,8 +2885,42 @@ describe("runProbePhase return value", () => {
     });
 
     // Degrades rather than throwing: renderBaseFacts then says "(unavailable)".
-    assert.equal(result.chainDiff, "");
     assert.equal(result.chainUntracked, "");
+  });
+
+  it("carries what sandbox_exec said about each capture's own paging", async () => {
+    // The status list is the one that can genuinely exceed a page, and the
+    // rendered input must be able to say so.  The flags come from the server,
+    // never from counting lines.
+    //
+    // The envelope mimics the live server: on a CUT response `shown` equals
+    // `total_lines` (it is not the number of lines returned) and `next_offset`
+    // is the count of lines returned.  A stub that set `shown` to 50 here
+    // could not reproduce the defect that `shown` is unusable.
+    const { callTool } = captureCallTool({
+      statusEnvelope: {
+        output: Array.from({ length: 50 }, (_, i) => " M src/f" + i + ".js").join("\n") + "\n",
+        shown: 137,
+        total_lines: 137,
+        truncated: true,
+        has_more: true,
+        next_offset: 50,
+      },
+      untracked: "src/brand-new.js\n",
+    });
+
+    const result = await runProbePhase({
+      baseSha: "abc1234",
+      container: "fake-cid",
+      brief: "## Deliverables\n\n- `src/f0.js`\n",
+      callTool,
+    });
+
+    // No shown-count is carried: the numerator is derived from the rendered
+    // block, and `shown` from the response is never read.
+    assert.deepEqual(result.chainTruncation.status, { truncated: true, total: 137 });
+    assert.equal(result.chainTruncation.untracked.truncated, false);
+    assert.equal(result.chainTruncation.baseLog.truncated, false);
   });
 
   it("forwards the verify baseline into P2 so tolerated lint debt passes the round", async () => {
@@ -3020,7 +3060,6 @@ describe("runReviewPhase — stubbed dispatch route recording", () => {
       baseSha: "abc123",
       chainStatusOutput: "",
       chainBaseLog: "",
-      chainDiff: "",
       chainUntracked: "",
       roundRecord,
       chainChangedPaths: [],
@@ -3066,7 +3105,6 @@ describe("runReviewPhase — stubbed dispatch route recording", () => {
       baseSha: "abc123",
       chainStatusOutput: "",
       chainBaseLog: "",
-      chainDiff: "",
       chainUntracked: "",
       roundRecord,
       chainChangedPaths: ["some/file"],
@@ -3163,7 +3201,6 @@ describe("runReviewPhase fallback trail fidelity", () => {
       baseSha: "abc123",
       chainStatusOutput: "",
       chainBaseLog: "",
-      chainDiff: "",
       chainUntracked: "",
       roundRecord,
       chainChangedPaths: [],
@@ -3234,7 +3271,6 @@ describe("runReviewPhase \u2014 single result conduit (kusabi #100)", () => {
       baseSha: "abc123",
       chainStatusOutput: "",
       chainBaseLog: "",
-      chainDiff: "",
       chainUntracked: "",
       roundRecord,
       chainChangedPaths: [],
@@ -3353,7 +3389,6 @@ describe("runReviewPhase — unparseable-output retry (issue #145)", () => {
       baseSha: "abc123",
       chainStatusOutput: "",
       chainBaseLog: "",
-      chainDiff: "",
       chainUntracked: "",
       roundRecord,
       chainChangedPaths: [],
@@ -3553,7 +3588,7 @@ describe("runReviewPhase — partial JSONL review (kusabi #202)", () => {
       container: "test", brief: "test brief",
       modelChain: ["test-org/test-flash", "test-org/test-pro"],
       chainId: "test-chain", cwd: process.cwd(), previousRecord: null,
-      baseSha: "abc123", chainStatusOutput: "", chainBaseLog: "", chainDiff: "",
+      baseSha: "abc123", chainStatusOutput: "", chainBaseLog: "",
       chainUntracked: "", roundRecord, chainChangedPaths: [],
       chainStatusObserved: false, chainDeliverables: [], flagsModel: null,
       _dispatchWithFallback: stubbedDispatch, ...extra,
@@ -4350,13 +4385,12 @@ describe("collectReviewContext", () => {
       const cmd = params.commands[0];
       if (cmd === "git status --porcelain") return { output: statusOutput };
       if (cmd === "git log --oneline -5") return { output: "abc123 latest change\n" };
-      if (cmd === "git diff") return { output: "diff --git a/src/foo.js b/src/foo.js\n" };
       if (cmd === "git ls-files --others --exclude-standard") return { output: "untracked.txt\n" };
       return { output: "" };
     };
   }
 
-  it("collects status/changed paths, base log, diff and untracked without running probes", async () => {
+  it("collects status/changed paths, base log and untracked without running probes", async () => {
     const callTool = fakeReviewContextCallTool({ statusOutput: " M src/foo.js\n" });
     const ctx = await collectReviewContext({
       container: "fake-cid",
@@ -4370,9 +4404,32 @@ describe("collectReviewContext", () => {
     assert.equal(ctx.chainStatusObserved, true);
     assert.equal(ctx.chainStatusOutput, " M src/foo.js\n");
     assert.equal(ctx.chainBaseLog, "abc123 latest change\n");
-    assert.equal(ctx.chainDiff, "diff --git a/src/foo.js b/src/foo.js\n");
     assert.equal(ctx.chainUntracked, "untracked.txt\n");
     assert.deepEqual(ctx.chainDeliverables, ["src/foo.js"]);
+    // No diff is collected on the resume path either (kusabi #208).
+    assert.equal(ctx.chainDiff, undefined);
+  });
+
+  it("carries the paging facts of the captures it made", async () => {
+    const callTool = async (toolName, params) => {
+      if (toolName !== "sandbox_exec") return { output: "" };
+      const cmd = params.commands[0];
+      if (cmd === "git status --porcelain") {
+        // Live-server shape for a cut response: shown === total_lines, and
+        // next_offset is the number of lines actually returned.
+        return { output: " M src/foo.js\n", shown: 137, total_lines: 137, truncated: true, has_more: true, next_offset: 1 };
+      }
+      if (cmd === "git ls-files --others --exclude-standard") return { output: "untracked.txt\n" };
+      return { output: "" };
+    };
+    const ctx = await collectReviewContext({
+      container: "fake-cid",
+      brief: "Implement X.\n\n## Deliverables\n- src/foo.js\n",
+      callTool,
+      worktreeBaseline: null,
+    });
+    assert.deepEqual(ctx.chainTruncation.status, { truncated: true, total: 137 });
+    assert.equal(ctx.chainTruncation.untracked.truncated, false);
   });
 
   it("yields empty strings for unreadable context calls instead of throwing", async () => {
@@ -4389,9 +4446,11 @@ describe("collectReviewContext", () => {
       worktreeBaseline: null,
     });
     assert.equal(ctx.chainBaseLog, "");
-    assert.equal(ctx.chainDiff, "");
     assert.equal(ctx.chainUntracked, "");
     assert.deepEqual(ctx.chainChangedPaths, []);
+    // A capture that never happened is not a capture that was cut.
+    assert.equal(ctx.chainTruncation.baseLog, null);
+    assert.equal(ctx.chainTruncation.untracked, null);
   });
 
   it("degrades to unobserved status when the probe RPC fails instead of throwing (#153①)", async () => {
@@ -4419,24 +4478,100 @@ describe("collectReviewContext", () => {
     );
   });
 
-  it("collectContainerDiffContext alone returns the three context strings", async () => {
+  it("collectContainerBaseContext alone returns the two context strings", async () => {
     const callTool = fakeReviewContextCallTool({});
-    const diffCtx = await collectContainerDiffContext(callTool, "fake-cid");
-    assert.equal(diffCtx.chainBaseLog, "abc123 latest change\n");
-    assert.equal(diffCtx.chainDiff, "diff --git a/src/foo.js b/src/foo.js\n");
-    assert.equal(diffCtx.chainUntracked, "untracked.txt\n");
+    const baseCtx = await collectContainerBaseContext(callTool, "fake-cid");
+    assert.equal(baseCtx.chainBaseLog, "abc123 latest change\n");
+    assert.equal(baseCtx.chainUntracked, "untracked.txt\n");
+    assert.equal(baseCtx.chainDiff, undefined);
+  });
+
+  it("collectContainerBaseContext issues no git diff at all", async () => {
+    // The capture is removed, not widened: it read one default-paged page and
+    // the reviewer fetches the diff itself (kusabi #208).
+    const commands = [];
+    const callTool = async (tool, params) => {
+      commands.push(params.commands?.[0] ?? "");
+      return { output: "" };
+    };
+    await collectContainerBaseContext(callTool, "fake-cid");
+    assert.deepEqual(commands, ["git log --oneline -5", "git ls-files --others --exclude-standard"]);
   });
 });
 
 // ---------------------------------------------------------------------------
-// chain review prompt — byte-identity guard (kusabi #204)
+// readExecCapture — believe the server about its own paging (kusabi #208)
+// ---------------------------------------------------------------------------
+
+describe("readExecCapture", () => {
+  it("reads text and the complete-capture case", () => {
+    // The live envelope shape: { status, output, shown, total_lines,
+    // truncated, next_offset, has_more }.
+    const capture = readExecCapture({
+      status: "ok", output: "a\nb\n", shown: 2, total_lines: 2,
+      truncated: false, next_offset: null, has_more: false,
+    });
+    assert.equal(capture.text, "a\nb\n");
+    assert.deepEqual(capture.truncation, { truncated: false, total: 2 });
+  });
+
+  it("treats truncated:true as cut", () => {
+    // Cut response as the live server sends it: 10 lines returned out of 101,
+    // reported as shown=101 (== total_lines), next_offset=10.
+    const capture = readExecCapture({
+      output: Array.from({ length: 10 }, (_, i) => String(i + 1)).join("\n") + "\n",
+      shown: 101, total_lines: 101, truncated: true, next_offset: 10, has_more: true,
+    });
+    assert.deepEqual(capture.truncation, { truncated: true, total: 101 });
+  });
+
+  it("treats has_more:true as cut even when truncated is false", () => {
+    // Paging and summary truncation are independent layers; either one means
+    // the text is not the whole output.  Measured on the live server:
+    // `seq 1 60` at limit=25 comes back cut with truncated=false.
+    const capture = readExecCapture({
+      output: Array.from({ length: 25 }, (_, i) => String(i + 1)).join("\n") + "\n",
+      shown: 61, total_lines: 61, truncated: false, next_offset: 25, has_more: true,
+    });
+    assert.equal(capture.truncation.truncated, true);
+  });
+
+  it("never carries the response's own shown-count", () => {
+    // `shown` equals `total_lines` even on a cut response, so it cannot be
+    // the numerator of "showing N of M".  It must not be carried at all: a
+    // field named `shown` on the truncation object would be read as the
+    // number of lines shown by anyone who found it there.
+    const capture = readExecCapture({
+      output: "1\n2\n", shown: 137, total_lines: 137, truncated: true, next_offset: 2, has_more: true,
+    });
+    assert.equal("shown" in capture.truncation, false);
+    assert.deepEqual(Object.keys(capture.truncation).sort(), ["total", "truncated"]);
+  });
+
+  it("does not invent counts that are absent", () => {
+    const capture = readExecCapture({ output: "a\n", truncated: true });
+    assert.deepEqual(capture.truncation, { truncated: true, total: null });
+  });
+
+  it("degrades on a missing or shapeless result", () => {
+    assert.deepEqual(readExecCapture(undefined), { text: "", truncation: { truncated: false, total: null } });
+    assert.deepEqual(readExecCapture({}), { text: "", truncation: { truncated: false, total: null } });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// chain review prompt — byte-identity guard (kusabi #204, re-recorded for #208)
 // ---------------------------------------------------------------------------
 // The container review input moved out of runReviewPhase into
 // renderContainerReviewInput so `task --phase review --container` can send the
 // same block.  The chain is the REFERENCE path: whatever else changes, what it
-// sends must not.  GOLDEN_CHAIN_REVIEW_INPUT below was captured from the
-// pre-extraction code by running runReviewPhase with exactly the inputs used
-// here; it is a recording, not a description.
+// sends must not drift unnoticed.  GOLDEN_CHAIN_REVIEW_INPUT below is a
+// recording of the whole block, not a description of it.
+//
+// It was re-recorded for kusabi #208, which removed the inlined diff body: the
+// `Diff content:` fenced block is gone and the instruction naming the base and
+// the tool stands in its place.  Everything else is unchanged from the #204
+// recording, so the two can be read against each other as a diff.
 
 const GOLDEN_CHAIN_REVIEW_INPUT = [
   "## Review target",
@@ -4445,7 +4580,7 @@ const GOLDEN_CHAIN_REVIEW_INPUT = [
   "You may use the following Sunaba read/verify tools to inspect it:",
   "- `read_file_range` - read file contents from the container",
   "- `search_in_container` - grep/search within the container",
-  "- `diff_in_container` - inspect the actual diff in the container",
+  "- `diff_in_container` - fetch the diff itself; it is NOT inlined below",
   "- `verify_in_container` / `lint_in_container` / `type_check_in_container` - re-run the project's gates in the container",
   "",
   "Do NOT rely on host cwd git state; the actual changes are in the container.",
@@ -4468,14 +4603,9 @@ const GOLDEN_CHAIN_REVIEW_INPUT = [
   "",
   "```",
   "",
-  "Diff content:",
-  "```diff",
-  "diff --git a/src/foo.js b/src/foo.js",
-  "@@ -1 +1 @@",
-  "-old",
-  "+new",
+  "**The diff itself is NOT included in this input.** The change set above names WHICH files changed, not WHAT changed inside them -- do not review the file list as if it were the change.",
   "",
-  "```",
+  "Fetching the diff is YOUR job: call `diff_in_container` with `base` set to `0123456789abcdef` (that covers committed AND uncommitted work since that commit), and page through it with `offset` / `limit` until `has_more` is false.",
   "",
   "New (untracked) files:",
   "- `src/new.js`",
@@ -4507,7 +4637,6 @@ describe("chain review prompt byte-identity", () => {
       baseSha: "0123456789abcdef",
       chainStatusOutput: " M src/foo.js\n?? src/new.js\n",
       chainBaseLog: "abc1234 first\ndef5678 second\n",
-      chainDiff: "diff --git a/src/foo.js b/src/foo.js\n@@ -1 +1 @@\n-old\n+new\n",
       chainUntracked: "src/new.js\n",
       roundRecord: { round: 2 },
       chainChangedPaths: ["src/foo.js"],
@@ -4519,9 +4648,39 @@ describe("chain review prompt byte-identity", () => {
     return captured;
   }
 
-  it("sends the exact review-input block it sent before the extraction", async () => {
+  it("sends the exact recorded review-input block", async () => {
     const prompt = await capturePrompt();
     assert.ok(prompt.includes(GOLDEN_CHAIN_REVIEW_INPUT), "chain review input drifted from the captured golden");
+  });
+
+  it("sends no diff body, and names the base and the tool instead", async () => {
+    // Stated separately from the golden so the reason the recording changed is
+    // pinned by its own assertion rather than by a wall of text.
+    const prompt = await capturePrompt();
+    const input = prompt.slice(prompt.indexOf("## Review target"));
+    assert.ok(!input.includes("diff --git"), "the diff body must not be inlined");
+    assert.ok(!input.includes("```diff"));
+    assert.ok(input.includes("Fetching the diff is YOUR job"));
+    assert.ok(input.includes("`base` set to `0123456789abcdef`"));
+  });
+
+  it("renders the same block as the task route for the same container facts", async () => {
+    // Both container routes must render from the one implementation; the
+    // proof is that the same facts produce the same bytes on both.
+    const prompt = await capturePrompt();
+    const taskInput = await collectContainerReviewInput({
+      container: "cafe1234beef",
+      callTool: async (tool, params) => {
+        const cmd = params.commands?.[0] ?? "";
+        if (cmd === "git rev-parse HEAD") return { output: "0123456789abcdef\n" };
+        if (cmd === "git status --porcelain") return { output: " M src/foo.js\n?? src/new.js\n" };
+        if (cmd === "git log --oneline -5") return { output: "abc1234 first\ndef5678 second\n" };
+        if (cmd === "git ls-files --others --exclude-standard") return { output: "src/new.js\n" };
+        return { output: "" };
+      },
+    });
+    assert.equal(taskInput, GOLDEN_CHAIN_REVIEW_INPUT);
+    assert.ok(prompt.includes(taskInput));
   });
 
   it("sends a prompt that is byte-identical end to end for fixed inputs", async () => {
@@ -4557,51 +4716,125 @@ describe("collectContainerReviewInput", () => {
     };
   }
 
-  const DIFF = "diff --git a/src/foo.js b/src/foo.js\n@@ -1 +1 @@\n-old\n+new\n";
-
   function defaultHandler(cmd) {
     if (cmd === "git rev-parse HEAD") return { output: "deadbeefcafe\n" };
     if (cmd === "git status --porcelain") return { output: " M src/foo.js\n" };
     if (cmd === "git log --oneline -5") return { output: "deadbee latest\n" };
-    if (cmd === "git diff") return { output: DIFF };
     if (cmd === "git ls-files --others --exclude-standard") return { output: "src/new.js\n" };
     return { output: "" };
   }
 
-  it("without --base, renders the container block and inlines the working diff", async () => {
+  it("without --base, renders the container block against HEAD and captures no diff", async () => {
     const { commands, callTool } = recordingTool(defaultHandler);
     const input = await collectContainerReviewInput({ container: "cid123", callTool });
 
     assert.ok(input.startsWith("## Review target"));
     assert.ok(input.includes("container `cid123`"));
     assert.ok(input.includes("`diff_in_container`"));
-    // The diff itself — this is the promise the agent definition makes.
-    assert.ok(input.includes("diff --git a/src/foo.js b/src/foo.js"));
-    assert.ok(input.includes("+new"));
     assert.ok(input.includes("- Base commit: `deadbeefcafe`"));
     assert.ok(input.includes(" M src/foo.js"));
     assert.ok(input.includes("- `src/new.js`"));
-    // Same default the chain uses: HEAD, plain `git diff`.
+    // The base is what the reviewer cannot derive, so it is named as the ref
+    // to fetch against; the diff body is not captured at all (kusabi #208).
+    assert.ok(input.includes("Fetching the diff is YOUR job"));
+    assert.ok(input.includes("`base` set to `deadbeefcafe`"));
+    assert.ok(!input.includes("diff --git"));
+    // Same default the chain uses: HEAD.
     assert.ok(commands.includes("git rev-parse HEAD"));
-    assert.ok(commands.includes("git diff"));
-    assert.ok(!commands.some((c) => c.includes("git diff '")));
+    assert.ok(
+      !commands.some((c) => c.startsWith("git diff")),
+      `no git diff may be issued, got: ${JSON.stringify(commands)}`,
+    );
   });
 
-  it("with --base, diffs against that ref and reports it as the base commit", async () => {
+  it("with --base, resolves that ref and names it as the ref to diff against", async () => {
     const { commands, callTool } = recordingTool((cmd) => {
       if (cmd.startsWith("git rev-parse --verify")) return { output: "c355fa61a7fee5402ed7ba999bd2fe2eeb46a842\n" };
       if (cmd === "git status --porcelain") return { output: " M src/foo.js\n" };
       if (cmd === "git log --oneline -5") return { output: "c355fa6 base\n" };
-      if (cmd === "git diff 'c355fa6'") return { output: DIFF };
       return { output: "" };
     });
     const input = await collectContainerReviewInput({ container: "cid123", callTool, base: "c355fa6" });
 
     assert.ok(commands.some((c) => c.startsWith("git rev-parse --verify --quiet 'c355fa6^{commit}'")));
-    assert.ok(commands.includes("git diff 'c355fa6'"), `expected a based diff, got: ${JSON.stringify(commands)}`);
-    assert.ok(!commands.includes("git diff"));
+    assert.ok(
+      !commands.some((c) => c.startsWith("git diff")),
+      `--base must reach the reviewer as an instruction, not a capture, got: ${JSON.stringify(commands)}`,
+    );
     assert.ok(input.includes("- Base commit: `c355fa61a7fee5402ed7ba999bd2fe2eeb46a842`"));
-    assert.ok(input.includes("diff --git a/src/foo.js b/src/foo.js"));
+    assert.ok(input.includes("`base` set to `c355fa61a7fee5402ed7ba999bd2fe2eeb46a842`"));
+  });
+
+  it("labels a change-set list the container paged, counting the lines it actually shows", async () => {
+    // The defect #208 fixes: a one-page capture that reads as the whole thing.
+    // What is captured now is a file list, and a file list can page too.
+    //
+    // The envelope is the live server's cut shape: 50 lines returned out of
+    // 137, reported as shown=137 (== total_lines) with next_offset=50.  The
+    // numerator in the label must come from the 50 lines in the block, NOT
+    // from `shown` -- rendering `shown` gives "showing 137 of 137", a
+    // truncation label that says nothing was withheld.
+    const { callTool } = recordingTool((cmd) => {
+      if (cmd === "git rev-parse HEAD") return { output: "deadbeefcafe\n" };
+      if (cmd === "git status --porcelain") {
+        return {
+          status: "ok",
+          output: Array.from({ length: 50 }, (_, i) => " M src/f" + i + ".js").join("\n") + "\n",
+          shown: 137,
+          total_lines: 137,
+          truncated: true,
+          next_offset: 50,
+          has_more: true,
+        };
+      }
+      return { output: "" };
+    });
+    const input = await collectContainerReviewInput({ container: "cid123", callTool });
+    assert.ok(input.includes("**Change set truncated (showing 50 of 137 lines).**"));
+    assert.ok(!input.includes("showing 137 of 137"), "the response's own shown-count must never be rendered");
+    assert.ok(input.includes("`diff_in_container` reports the complete file list"));
+
+    // The label's own numbers must agree with the label: a numerator that is
+    // not strictly below the denominator announces a cut and then denies it.
+    const counts = /showing (\d+) of (\d+) lines/.exec(input);
+    assert.ok(counts, "the paged label must carry counts");
+    assert.ok(Number(counts[1]) < Number(counts[2]), `numerator must be below the denominator, got ${counts[0]}`);
+  });
+
+  it("labels a change set the container cut with truncated:false and has_more:true", async () => {
+    // Measured on the live server: paging can cut the output while
+    // `truncated` stays false (that flag is the summary layer).  Reading
+    // `truncated` alone would let this one through unlabelled.
+    const { callTool } = recordingTool((cmd) => {
+      if (cmd === "git rev-parse HEAD") return { output: "deadbeefcafe\n" };
+      if (cmd === "git status --porcelain") {
+        return {
+          status: "ok",
+          output: Array.from({ length: 25 }, (_, i) => " M src/f" + i + ".js").join("\n") + "\n",
+          shown: 61,
+          total_lines: 61,
+          truncated: false,
+          next_offset: 25,
+          has_more: true,
+        };
+      }
+      return { output: "" };
+    });
+    const input = await collectContainerReviewInput({ container: "cid123", callTool });
+    assert.ok(input.includes("**Change set truncated (showing 25 of 61 lines).**"));
+  });
+
+  it("labels nothing when the container reports every capture complete", async () => {
+    const { callTool } = recordingTool((cmd) => {
+      const complete = (output) => ({ status: "ok", output, shown: 1, total_lines: 1, truncated: false, next_offset: null, has_more: false });
+      if (cmd === "git rev-parse HEAD") return complete("deadbeefcafe\n");
+      if (cmd === "git status --porcelain") return complete(" M src/foo.js\n");
+      if (cmd === "git log --oneline -5") return complete("deadbee latest\n");
+      if (cmd === "git ls-files --others --exclude-standard") return complete("src/new.js\n");
+      return complete("");
+    });
+    const input = await collectContainerReviewInput({ container: "cid123", callTool });
+    assert.ok(!input.includes("truncated"), "a complete capture must not be labelled as cut");
   });
 
   it("throws when --base does not resolve in the container", async () => {
@@ -4637,7 +4870,10 @@ describe("collectContainerReviewInput", () => {
     const input = await collectContainerReviewInput({ container: "cid123", callTool });
     assert.ok(input.includes("## Review target"));
     assert.ok(input.includes("- Base commit: (unavailable)"));
-    assert.ok(input.includes("Diff content: (unavailable)"));
+    // No base to name: the instruction says so and names the fallback rather
+    // than disappearing.
+    assert.ok(input.includes("Fetching the diff is YOUR job"));
+    assert.ok(input.includes("`worktree: true`"));
   });
 
   it("produces a well-formed input when the change set is empty", async () => {
@@ -4648,7 +4884,7 @@ describe("collectContainerReviewInput", () => {
     });
     const input = await collectContainerReviewInput({ container: "cid123", callTool });
     assert.ok(input.includes("(empty change set)"));
-    assert.ok(input.includes("Diff content: (unavailable)"));
+    assert.ok(input.includes("`base` set to `deadbeefcafe`"));
     assert.ok(!input.includes("```diff"));
     // Balanced fences: an empty diff must not leave the prompt half-fenced.
     assert.equal((input.match(/```/g) || []).length % 2, 0);
@@ -4670,25 +4906,43 @@ describe("assertContainerBaseRef", () => {
   });
 });
 
-describe("collectContainerDiffContext base argument", () => {
-  it("keeps the chain's plain `git diff` when no base is given", async () => {
+// The base ref used to select which `git diff` was captured; that capture is
+// gone (kusabi #208), so what these pin is the seam it moved to: the ref
+// reaches the reviewer as the base named in the fetch instruction, and no diff
+// is ever run in the container on either route.
+
+describe("base ref reaches the reviewer as an instruction, not a capture", () => {
+  function recorder() {
     const commands = [];
-    const callTool = async (tool, params) => {
-      commands.push(params.commands?.[0] ?? "");
-      return { output: "" };
+    return {
+      commands,
+      callTool: async (tool, params) => {
+        const cmd = params.commands?.[0] ?? "";
+        commands.push(cmd);
+        if (cmd.startsWith("git rev-parse --verify")) return { output: "c355fa61a7fee5402ed7ba999bd2fe2eeb46a842\n" };
+        if (cmd === "git rev-parse HEAD") return { output: "deadbeefcafe\n" };
+        return { output: "" };
+      },
     };
-    await collectContainerDiffContext(callTool, "cid123");
-    assert.ok(commands.includes("git diff"));
+  }
+
+  it("names HEAD when no base is given, and runs no diff", async () => {
+    const { commands, callTool } = recorder();
+    const input = await collectContainerReviewInput({ container: "cid123", callTool });
+    assert.ok(input.includes("`base` set to `deadbeefcafe`"));
+    assert.ok(!commands.some((c) => c.startsWith("git diff")));
   });
 
-  it("diffs against the base when one is given", async () => {
-    const commands = [];
-    const callTool = async (tool, params) => {
-      commands.push(params.commands?.[0] ?? "");
-      return { output: "" };
-    };
-    await collectContainerDiffContext(callTool, "cid123", "c355fa6");
-    assert.ok(commands.includes("git diff 'c355fa6'"));
-    assert.ok(!commands.includes("git diff"));
+  it("names the resolved base when one is given, and runs no diff", async () => {
+    const { commands, callTool } = recorder();
+    const input = await collectContainerReviewInput({ container: "cid123", callTool, base: "c355fa6" });
+    assert.ok(input.includes("`base` set to `c355fa61a7fee5402ed7ba999bd2fe2eeb46a842`"));
+    assert.ok(!commands.some((c) => c.startsWith("git diff")));
+  });
+
+  it("collectContainerBaseContext takes no base argument to honour", async () => {
+    const { commands, callTool } = recorder();
+    await collectContainerBaseContext(callTool, "cid123");
+    assert.deepEqual(commands, ["git log --oneline -5", "git ls-files --others --exclude-standard"]);
   });
 });

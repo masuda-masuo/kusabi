@@ -235,10 +235,126 @@ export function renderReview(parsed, rawText) {
   return lines.join("\n");
 }
 
+// Character budget for every captured block the review input carries.  Named
+// for the diff it was introduced for; the diff body is no longer inlined
+// (kusabi #208), but the budget and its truncation vocabulary still bound the
+// lists that are.
 const DIFF_BUDGET = 30000;
 const PRIOR_FINDINGS_BUDGET = 8000;
 
-export function renderBaseFacts({ baseSha, baseLog, statusOutput, diffContent, untrackedFiles } = {}) {
+/**
+ * Lines actually present in a rendered block.  A trailing newline is not a
+ * line: "a\nb\n" is two lines and "" is none.
+ *
+ * @param {string|null|undefined} text
+ * @returns {number}
+ */
+function countRenderedLines(text) {
+  if (!text) return 0;
+  const body = text.endsWith("\n") ? text.slice(0, -1) : text;
+  return body === "" ? 0 : body.split("\n").length;
+}
+
+/**
+ * The "this was cut" label for one captured block, or null when nothing was
+ * cut.
+ *
+ * Two independent things can cut a capture short and both are labelled here:
+ * sunaba's own paging (`truncated` / `has_more` on the sandbox_exec response,
+ * with `total_lines` for the denominator) and this renderer's character
+ * budget.  WHETHER a capture was cut is taken from what the server reports
+ * about itself, never inferred from a line count -- "exactly 50 lines" is
+ * indistinguishable from a genuinely 50-line output, which is how a one-page
+ * capture reached the reviewer looking complete (kusabi #208).
+ *
+ * The numerator, by contrast, is counted HERE, from the block that was just
+ * rendered.  Two reasons, in order:
+ *
+ *   - The response's own `shown` cannot be used: measured against the live
+ *     server it equals `total_lines` even when the output was cut, so it
+ *     rendered "truncated (showing 61 of 61 lines)" -- a label that announces
+ *     a cut and then prints numbers saying nothing was withheld, which is the
+ *     "fragment that looks complete" failure all over again.
+ *   - Of the two honest sources (the lines in the returned text, and
+ *     `next_offset`), only a count taken here survives this renderer's own
+ *     character budget slicing the body further.  `next_offset` describes the
+ *     server's page; this describes the block the reviewer is looking at,
+ *     which is what the label claims to describe.
+ *
+ * The count can understate by one against `total_lines`, which counts the
+ * trailing newline as a line where this does not.  That direction is the safe
+ * one: it can only overstate how much was withheld, never claim the block
+ * holds more than it does.
+ *
+ * @param {string} label
+ * @param {{truncated?: boolean, total?: number}|null|undefined} truncation
+ * @param {boolean} overBudget
+ * @param {string} [hint]        Sentence appended after the label.
+ * @param {number} [shownLines]  Lines in the block actually rendered.
+ * @returns {string|null}
+ */
+function captureCutNote(label, truncation, overBudget, hint, shownLines) {
+  const paged = truncation?.truncated === true;
+  if (!paged && !overBudget) return null;
+  // Counts are printed only when they say something is missing.  A numerator
+  // that is not strictly below the denominator would restate the very
+  // contradiction this label exists to remove, so the label goes out bare
+  // instead: "truncated" alone is honest, "showing 61 of 61" is not.
+  const total = Number.isInteger(truncation?.total) ? truncation.total : null;
+  const counts = paged && total !== null && Number.isInteger(shownLines) && shownLines < total
+    ? " (showing " + shownLines + " of " + total + " lines)"
+    : "";
+  return "**" + label + " truncated" + counts + ".**" + (hint || "");
+}
+
+/**
+ * Push one captured command output as a fenced block, labelled when it was
+ * cut short.
+ */
+function pushCapture(parts, { title, label, text, placeholder, truncation, hint }) {
+  const raw = text || "";
+  const overBudget = raw.length > DIFF_BUDGET;
+  const body = overBudget ? raw.slice(0, DIFF_BUDGET) : raw;
+  parts.push(title + (overBudget ? " (truncated to " + DIFF_BUDGET + " characters)" : "") + ":");
+  parts.push("```");
+  parts.push(body || placeholder);
+  parts.push("```");
+  parts.push("");
+  // `body` -- not `raw` -- is what the fence holds, so it is what the count
+  // describes.  The placeholder is not content: an empty capture shows zero
+  // lines.
+  const note = captureCutNote(label, truncation, overBudget, hint, countRenderedLines(body));
+  if (note) {
+    parts.push(note);
+    parts.push("");
+  }
+}
+
+/**
+ * The base change-set context of a container review input.
+ *
+ * What the reviewer is handed is the REFERENCE POINT (base commit, base
+ * history) and the SHAPE of the change (which files changed, which are new) --
+ * never the diff body.  The reviewer already has `diff_in_container`, which is
+ * paginated and purpose-built; inlining a second, cruder copy of it here only
+ * added a copy that silently stopped at one page while looking complete
+ * (kusabi #208).  What the reviewer genuinely cannot work out for itself is
+ * which ref to diff against, so that -- and whose job the fetch is -- is what
+ * this block states.
+ *
+ * @param {object} [opts]
+ * @param {string} [opts.baseSha]         Commit the change set is measured against.
+ * @param {string} [opts.baseLog]         `git log --oneline -5` output.
+ * @param {string} [opts.statusOutput]    `git status --porcelain` output.
+ * @param {string} [opts.untrackedFiles]  Newline-separated untracked paths.
+ * @param {object} [opts.truncation]      What sandbox_exec reported about its
+ *        own paging for each capture: `baseLog`, `status`, `untracked`, each
+ *        `{ truncated, total }` (absent = nothing was cut).  The shown-count
+ *        is not carried here -- it is counted off the rendered block; see
+ *        `captureCutNote`.
+ * @returns {string}
+ */
+export function renderBaseFacts({ baseSha, baseLog, statusOutput, untrackedFiles, truncation } = {}) {
   const parts = [];
   parts.push("### Base change-set context (machine-recorded)");
   parts.push("");
@@ -248,47 +364,50 @@ export function renderBaseFacts({ baseSha, baseLog, statusOutput, diffContent, u
     parts.push("- Base commit: (unavailable)");
   }
   parts.push("");
-  parts.push("Recent base history (top 5):");
-  parts.push("```");
-  parts.push(baseLog || "(unavailable)");
-  parts.push("```");
-  parts.push("");
-  parts.push("Actual change set (`git status --porcelain`):");
-  parts.push("```");
-  parts.push(statusOutput || "(empty change set)");
-  parts.push("```");
-  parts.push("");
+  pushCapture(parts, {
+    title: "Recent base history (top 5)",
+    label: "Base history",
+    text: baseLog,
+    placeholder: "(unavailable)",
+    truncation: truncation?.baseLog,
+  });
+  pushCapture(parts, {
+    title: "Actual change set (`git status --porcelain`)",
+    label: "Change set",
+    text: statusOutput,
+    placeholder: "(empty change set)",
+    truncation: truncation?.status,
+    hint: " More files changed than are listed above; `diff_in_container` reports the complete file list.",
+  });
 
-  // Diff content (with character budget)
-  if (diffContent && diffContent.trim()) {
-    const truncated = diffContent.length > DIFF_BUDGET;
-    const content = truncated ? diffContent.slice(0, DIFF_BUDGET) : diffContent;
-    const budgetNote = truncated
-      ? " (truncated to " + DIFF_BUDGET + " characters)"
-      : "";
-    parts.push("Diff content" + budgetNote + ":");
-    parts.push("```diff");
-    parts.push(content);
-    parts.push("```");
-    parts.push("");
-    if (truncated) {
-      parts.push("**Diff truncated.** Use `diff_in_container` to see the full diff.");
-      parts.push("");
-    }
+  // The diff body is deliberately absent, so the input says so in the words a
+  // reviewer cannot misread as "the file list is the change".
+  parts.push("**The diff itself is NOT included in this input.** The change set above names WHICH files changed, not WHAT changed inside them -- do not review the file list as if it were the change.");
+  parts.push("");
+  if (baseSha) {
+    parts.push("Fetching the diff is YOUR job: call `diff_in_container` with `base` set to `" + baseSha + "` (that covers committed AND uncommitted work since that commit), and page through it with `offset` / `limit` until `has_more` is false.");
   } else {
-    parts.push("Diff content: (unavailable)");
-    parts.push("");
+    parts.push("Fetching the diff is YOUR job: call `diff_in_container` -- the base commit could not be read here, so pass `worktree: true` for the uncommitted change set -- and page through it with `offset` / `limit` until `has_more` is false.");
   }
+  parts.push("");
 
   // Untracked files
   if (untrackedFiles && untrackedFiles.trim()) {
-    const untrackedList = untrackedFiles.split("\n").filter(function (l) { return l.trim(); }).map(function (l) { return l.trim(); });
+    const overBudget = untrackedFiles.length > DIFF_BUDGET;
+    const body = overBudget ? untrackedFiles.slice(0, DIFF_BUDGET) : untrackedFiles;
+    const untrackedList = body.split("\n").filter(function (l) { return l.trim(); }).map(function (l) { return l.trim(); });
     if (untrackedList.length > 0) {
-      parts.push("New (untracked) files:");
+      parts.push("New (untracked) files" + (overBudget ? " (truncated to " + DIFF_BUDGET + " characters)" : "") + ":");
       for (const f of untrackedList) {
         parts.push("- `" + f + "`");
       }
       parts.push("");
+      // The rendered block is the bullet list, so its length is the count.
+      const note = captureCutNote("Untracked list", truncation?.untracked, overBudget, " More untracked files exist than are listed above.", untrackedList.length);
+      if (note) {
+        parts.push(note);
+        parts.push("");
+      }
       parts.push("Use `read_file_range` to inspect these new files.");
       parts.push("");
     }
@@ -301,8 +420,8 @@ export function renderBaseFacts({ baseSha, baseLog, statusOutput, diffContent, u
 /**
  * The reviewer's input for a CONTAINER review: the review-target block (which
  * container holds the artifact, and the read-side sunaba tools that reach it)
- * followed by `renderBaseFacts` (base commit, base log, change set, diff,
- * untracked files).
+ * followed by `renderBaseFacts` (base commit, base log, change set, the
+ * instruction to fetch the diff, untracked files).
  *
  * Single source of the container-flavoured review input (kusabi #204).  Both
  * routes that review a container render it from here:
@@ -310,24 +429,23 @@ export function renderBaseFacts({ baseSha, baseLog, statusOutput, diffContent, u
  *   - the chain's review phase (`runReviewPhase`, chain-phases.mjs), and
  *   - `task --phase review --container <cid>` (cmdTask, kusabi-companion.mjs).
  *
- * The agent definition tells the reviewer the diff is already inlined in its
- * input; that promise was kept on the chain path and broken on the task path,
- * which built no review input at all.  Two divergent copies of this block is
- * how that happened, so there is exactly one.
- *
- * The output is byte-identical to what the chain built inline before the
- * extraction (render.test.mjs pins it against a captured golden).
+ * The block used to inline the diff body as well.  It was captured with one
+ * default-paged `sandbox_exec` call, so across 91 review prompts on the live
+ * installation not one carried more than 50 diff lines -- a truncated copy of
+ * a diff the reviewer was fetching itself anyway (91% of review jobs called
+ * `diff_in_container`).  What the reviewer could NOT determine was the base,
+ * so #208 removed the body and kept the reference point (kusabi #208).
  *
  * @param {object} opts
  * @param {string} opts.container        Container ID holding the artifact.
  * @param {string} [opts.baseSha]        Commit the change set is measured against.
  * @param {string} [opts.baseLog]        `git log --oneline -5` output.
  * @param {string} [opts.statusOutput]   `git status --porcelain` output.
- * @param {string} [opts.diffContent]    The diff itself.
  * @param {string} [opts.untrackedFiles] Newline-separated untracked paths.
+ * @param {object} [opts.truncation]     Per-capture paging facts; see renderBaseFacts.
  * @returns {string}
  */
-export function renderContainerReviewInput({ container, baseSha, baseLog, statusOutput, diffContent, untrackedFiles } = {}) {
+export function renderContainerReviewInput({ container, baseSha, baseLog, statusOutput, untrackedFiles, truncation } = {}) {
   const parts = [
     "## Review target",
     "",
@@ -335,12 +453,12 @@ export function renderContainerReviewInput({ container, baseSha, baseLog, status
     "You may use the following Sunaba read/verify tools to inspect it:",
     "- `read_file_range` - read file contents from the container",
     "- `search_in_container` - grep/search within the container",
-    "- `diff_in_container` - inspect the actual diff in the container",
+    "- `diff_in_container` - fetch the diff itself; it is NOT inlined below",
     "- `verify_in_container` / `lint_in_container` / `type_check_in_container` - re-run the project's gates in the container",
     "",
     "Do NOT rely on host cwd git state; the actual changes are in the container.",
   ];
-  parts.push("", renderBaseFacts({ baseSha, baseLog, statusOutput, diffContent, untrackedFiles }));
+  parts.push("", renderBaseFacts({ baseSha, baseLog, statusOutput, untrackedFiles, truncation }));
   return parts.join("\n");
 }
 
