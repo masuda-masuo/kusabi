@@ -765,10 +765,10 @@ export async function collectReviewContext({ container, brief, callTool, worktre
  *     `"partial"`, a state of its own.  It is not an approval and does not
  *     buy a rework round — it escalates (see deriveDisposition) with the
  *     findings recorded and rendered like any other findings.  It is
- *     `reviewParseable: true`, which is what keeps it out of the §3.5
- *     unparseable retry: we READ this output fine, the model ran out of
- *     room, and re-dispatching spends the budget that just proved
- *     insufficient.
+ *     `reviewParseable: true`, which is what keeps it out of the
+ *     docs/design/phase-chain.md §3.5 unparseable retry: we READ this
+ *     output fine, the model ran out of room, and re-dispatching spends
+ *     the budget that just proved insufficient.
  *
  *  2. A single JSON object, via `extractJson` + VERDICT-token recovery —
  *     unchanged, byte for byte, for every historical record and every

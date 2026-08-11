@@ -2046,12 +2046,13 @@ export async function runChainDriver({
 
       strategized = true;
 
-      // The next round must use a fresh session to break anchoring (§3.4).
+      // The next round must use a fresh session to break anchoring
+      // (docs/design/phase-chain.md §3.4).
       // Set a pendingReworkStrategy so the loop picks it up at phase 1.
       roundRecord.pendingReworkStrategy = {
         tierDelta: 0,
         newSession: true,
-        reason: "strategized: new session (anchoring break per §3.4)",
+        reason: "strategized: new session (anchoring break per docs/design/phase-chain.md §3.4)",
       };
 
       // Re-persist after strategize updates roundRecord and strategized flag
@@ -2745,7 +2746,7 @@ function cmdMetricsIngest(cwd, { flags }) {
  * Pure-reader query/report surface over the SQLite metrics store built by
  * `metrics-ingest` (issues #83 / #81). Never ingests, never opens the
  * writable handle (`openMetricsDb`) -- only `openMetricsDbReadOnly`. See
- * DESIGN.md 3.5.9.
+ * docs/design/phase-chain.md 3.5.9.
  */
 function cmdMetricsReport(cwd, { flags }) {
   if (flags.compare) {
