@@ -96,6 +96,34 @@ describe("runningRecordIsStale", () => {
     assert.equal(runningRecordIsStale(job), true);
   });
 
+  it("claude v1 record shape (stats.lastActivity null, instrumented false) still falls back to startedAt", () => {
+    // The claude backend's structural stats carry `lastActivity: null` (no
+    // event stream, kusabi #215) — the `?? startedAt` fallback must keep
+    // working, so a claude job whose driver died is still reaped as stale.
+    const job = {
+      status: "running",
+      startedAt: new Date(Date.now() - 7 * 24 * HOUR).toISOString(),
+      stats: {
+        instrumented: false,
+        events: null,
+        steps: null,
+        lastTool: null,
+        permissionsAllowed: null,
+        permissionsRejected: null,
+        lastActivity: null,
+        models: [],
+      },
+    };
+    assert.equal(runningRecordIsStale(job), true);
+    // And a recent claude job is NOT stale (startedAt within the window).
+    const recent = {
+      status: "running",
+      startedAt: new Date(Date.now() - HOUR).toISOString(),
+      stats: { instrumented: false, lastActivity: null },
+    };
+    assert.equal(runningRecordIsStale(recent), false);
+  });
+
   it("boundary: just under 6 hours is still running, just over is stale", () => {
     const now = Date.now();
     const justUnder = { status: "running", startedAt: new Date(now - RUNNING_STALE_MS + 1000).toISOString() };

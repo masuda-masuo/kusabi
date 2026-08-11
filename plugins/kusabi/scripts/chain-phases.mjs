@@ -405,6 +405,12 @@ export async function runImplementPhase({
     },
     implementJobStatus: job.status,
     implementJobError: job.error || null,
+    // Structured terminal-failure classification (kusabi #215): null for
+    // generic failures; { kind: "quota-exhaustion", ... } when the dispatch
+    // classified the terminal payload.  The chain's provider-exhaustion
+    // renderer uses it to show the classification instead of the generic
+    // capacity advice.
+    implementJobFailure: job.failure || null,
     session: resolvedSession,
   };
 }
@@ -994,6 +1000,10 @@ export async function runReviewPhase({
     roundRecord.reviewFallbacks = reviewJob.fallbacks || null;
     reviewJobStatus = reviewJob.status;
     reviewJobError = reviewJob.error || null;
+    // Structured terminal-failure classification (kusabi #215), carried on
+    // the record (single conduit) so the caller's provider-exhaustion
+    // branch can render the classification instead of the generic advice.
+    roundRecord.reviewJobFailure = reviewJob.failure || null;
 
     chainParsedReview = _parsed;
     chainVerdict = _verdict;
@@ -1234,6 +1244,10 @@ export async function runStrategizePhase({ cwd, chainId, round, brief, previousR
   return {
     strategistJobStatus: strategistJob.status,
     strategistJobError: strategistJob.error || null,
+    // Structured terminal-failure classification (kusabi #215): null for
+    // generic failures; { kind: "quota-exhaustion", ... } when the dispatch
+    // classified the terminal payload (see implementJobFailure).
+    strategistJobFailure: strategistJob.failure || null,
   };
 }
 
@@ -1327,11 +1341,22 @@ export function renderMaxRoundsOutcome({ chainId, maxRounds, records, orchestrat
  * @param {string}   opts.jobError      — Error message from the exhausted job
  *                                        (already contains the "All routes
  *                                        exhausted:" text from the wrapper).
+ * @param {object|null} [opts.jobFailure=null] — Structured terminal-failure
+ *                                        classification (kusabi #215): when the
+ *                                        exhausted job's record carries
+ *                                        `{ kind: "quota-exhaustion", ... }`,
+ *                                        the classified job error (which
+ *                                        already holds the operator-facing
+ *                                        advice) is shown WITHOUT the generic
+ *                                        "Retry when provider is available"
+ *                                        capacity footer — that advice is
+ *                                        actively wrong for a session-limit
+ *                                        block.
  * @param {object[]} opts.records       — Round records so far (includes the
  *                                        aborted partial round).
  * @returns {string}
  */
-export function renderProviderExhaustedOutcome({ chainId, round, phase, jobError, records }) {
+export function renderProviderExhaustedOutcome({ chainId, round, phase, jobError, records, jobFailure = null }) {
   const lines = [
     "Chain " + chainId + " stopped at round " + round + ": " + phase + " provider exhausted.",
     "",
@@ -1356,7 +1381,18 @@ export function renderProviderExhaustedOutcome({ chainId, round, phase, jobError
     lines.push("");
   }
 
-  lines.push("Capacity problem — not a quality failure. Retry when provider is available.");
+  if (jobFailure?.kind === "quota-exhaustion") {
+    // Classified quota failures: the job error already carries the
+    // operator-facing advice (which quota, reset time, backend blocked,
+    // what to do instead of retrying — set by the dispatch, kusabi #215).
+    // The generic capacity footer below would CONTRADICT it ("Retry when
+    // provider is available" is exactly wrong for a session-limit block),
+    // so it is omitted and the machine-readable classification is pointed
+    // at instead.
+    lines.push("Quota exhaustion — the failed job record's `failure` field carries the classification.");
+  } else {
+    lines.push("Capacity problem — not a quality failure. Retry when provider is available.");
+  }
   return lines.join("\n");
 }
 
@@ -1857,6 +1893,13 @@ export function recordReworkEscalation({ roundRecord, currentTierIndex, reworkCo
  * @param {number} opts.currentTierIndex     - Tier index to record as `tierAfter`.
  * @param {string} opts.phase               - Phase name ("implement", "review", "strategize").
  * @param {string|null} [opts.jobError=null] - Provider error detail.
+ * @param {object|null} [opts.jobFailure=null] - Structured terminal-failure
+ *        classification from the failed job record (kusabi #215):
+ *        `{ kind: "quota-exhaustion", quota, backendBlocked, reset }` when
+ *        the dispatch classified quota exhaustion, else null.  The renderer
+ *        uses it to show the classification instead of the generic capacity
+ *        advice ("Retry when provider is available" is exactly wrong for a
+ *        session-limit block).
  * @param {string} opts.chainId
  * @param {number} opts.round
  * @param {string} opts.container
@@ -1891,6 +1934,7 @@ export function handleProviderExhaustion({
   currentTierIndex,
   phase,
   jobError = null,
+  jobFailure = null,
   chainId,
   round,
   container,
@@ -1964,6 +2008,7 @@ export function handleProviderExhaustion({
     round,
     phase,
     jobError,
+    jobFailure,
     records,
   });
 

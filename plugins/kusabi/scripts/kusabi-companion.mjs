@@ -836,11 +836,22 @@ function cmdStatus(cwd, { text }) {
     if (!job) return `no such job: ${jobId}`;
     // Check chain ownership for this job
     const s = job.stats ?? {};
+    // A stats object marked `instrumented: false` (the claude v1 backend)
+    // carries STRUCTURAL counters, never measured ones — presenting them
+    // as `events: 0, steps: 0, …` would report structural zeros as
+    // measured (kusabi #215).  The marker is the signal; `backend` is
+    // never consulted.  Records without the marker (opencode and legacy)
+    // render the counters as before.
+    const statsLines = s.instrumented === false
+      ? ["stats: not instrumented (no event stream in v1)"]
+      : [
+          `events: ${s.events ?? 0}, steps: ${s.steps ?? 0}, last tool: ${s.lastTool ?? "-"}`,
+          `permissions: ${s.permissionsAllowed ?? 0} allowed, ${s.permissionsRejected ?? 0} rejected`,
+          `last activity: ${s.lastActivity ?? "-"}`,
+        ];
     const lines = [
       renderHeader(job).trimEnd(),
-      `events: ${s.events ?? 0}, steps: ${s.steps ?? 0}, last tool: ${s.lastTool ?? "-"}`,
-      `permissions: ${s.permissionsAllowed ?? 0} allowed, ${s.permissionsRejected ?? 0} rejected`,
-      `last activity: ${s.lastActivity ?? "-"}`,
+      ...statsLines,
       ...(job.error ? [`error: ${job.error}`] : []),
     ];
     const jobChain = chainIdForJob(job);
@@ -1867,6 +1878,7 @@ export async function runChainDriver({
       const { chainState, outcome } = handleProviderExhaustion({
         records, roundRecord,
         currentTierIndex, phase: "review", jobError: reviewJobError,
+        jobFailure: roundRecord.reviewJobFailure || null,
         chainId, round, container, model, modelChain,
         reviewModel, reviewModelChain,
         reworkModel, reworkModelChain, reworkBackend,
@@ -2019,7 +2031,7 @@ export async function runChainDriver({
 
     // ---- phase 9: strategize (structural re-diagnosis before next rework) ----
     if (disposition.disposition === "strategize") {
-      const { strategistJobStatus, strategistJobError } = await runStrategizePhase({
+      const { strategistJobStatus, strategistJobError, strategistJobFailure } = await runStrategizePhase({
         cwd, chainId, round, brief, previousRecord, roundRecord, modelChain,
         _dispatchWithFallback: injectedDispatch,
       });
@@ -2031,6 +2043,7 @@ export async function runChainDriver({
         const { chainState, outcome } = handleProviderExhaustion({
           records, roundRecord,
           currentTierIndex, phase: "strategize", jobError: strategistJobError,
+          jobFailure: strategistJobFailure,
           chainId, round, container, model, modelChain,
           reviewModel, reviewModelChain,
           reworkModel, reworkModelChain, reworkBackend,
@@ -2195,6 +2208,7 @@ export async function runChainDriver({
         session: resolvedSession,
         implementJobStatus,
         implementJobError,
+        implementJobFailure,
       } = await runImplementPhase({
         cwd, chainId, round, isFirstRound, implementText, modelChain: roundModelChain,
         tierIndex: currentTierIndex,
@@ -2236,6 +2250,7 @@ export async function runChainDriver({
         const { chainState, outcome } = handleProviderExhaustion({
           records, roundRecord,
           currentTierIndex, phase: "implement", jobError: implementJobError,
+          jobFailure: implementJobFailure,
           chainId, round, container, model, modelChain,
           reviewModel, reviewModelChain,
           reworkModel, reworkModelChain, reworkBackend,

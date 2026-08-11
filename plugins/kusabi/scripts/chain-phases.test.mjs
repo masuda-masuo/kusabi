@@ -1746,6 +1746,49 @@ describe("renderProviderExhaustedOutcome", () => {
     // The current round appears only in the header, not as a "Round 3:" line.
     assert.ok(result.includes("stopped at round 3"));
   });
+
+  it("quota-classified exhaustion shows the classification and NOT the generic retry advice (kusabi #215)", () => {
+    const jobError = "claude dispatch failed: You've hit your session limit · resets 1:20am (Asia/Tokyo) — " +
+      "session limit exhausted (resets 1:20am (Asia/Tokyo)): the whole claude backend is blocked, " +
+      "including your own Claude Code session (same account window). Switch the phase to the opencode " +
+      "backend (--model <provider>/<model>); do not retry claude.";
+    const result = renderProviderExhaustedOutcome({
+      chainId,
+      round: 2,
+      phase: "implement",
+      jobError,
+      records: [],
+      jobFailure: {
+        kind: "quota-exhaustion",
+        quota: "session",
+        backendBlocked: true,
+        reset: "1:20am (Asia/Tokyo)",
+      },
+    });
+
+    // The classified job error is the surface body.
+    assert.ok(result.includes("implement provider exhausted"));
+    assert.ok(result.includes("whole claude backend is blocked"));
+    assert.ok(result.includes("do not retry claude"));
+    // The generic capacity footer would CONTRADICT the classification
+    // ("Retry when provider is available" is exactly wrong for a
+    // session-limit block) — it must be gone.
+    assert.ok(!result.includes("Retry when provider is available"));
+    assert.ok(!result.includes("Capacity problem"));
+    // The machine-readable classification is pointed at.
+    assert.ok(result.includes("Quota exhaustion"));
+  });
+
+  it("unclassified exhaustion keeps the generic capacity footer byte-identical", () => {
+    const result = renderProviderExhaustedOutcome({
+      chainId,
+      round: 2,
+      phase: "implement",
+      jobError: "All routes exhausted: route/a — rate_limit at attempt 3",
+      records: [],
+    });
+    assert.ok(result.includes("Capacity problem — not a quality failure. Retry when provider is available."));
+  });
 });
 
 // handleProviderExhaustion — pure, testable
@@ -2077,6 +2120,141 @@ describe("handleProviderExhaustion", () => {
         "outcome must name the phase: " + phase,
       );
     }
+  });
+
+  // ---- structured failure classification (kusabi #215) ----
+
+  it("threads a classified jobFailure into the outcome (classification shown, generic retry advice dropped)", () => {
+    const records = makeRecords([1]);
+    const roundRecord = { round: 2, modelEntry: "provider/model-2", verdict: null };
+
+    const result = handleProviderExhaustion({
+      records,
+      roundRecord,
+      currentTierIndex: 0,
+      phase: "implement",
+      jobError: "claude dispatch failed: You've hit your session limit · resets 1:20am (Asia/Tokyo) — " +
+        "session limit exhausted: the whole claude backend is blocked; do not retry claude.",
+      jobFailure: {
+        kind: "quota-exhaustion",
+        quota: "session",
+        backendBlocked: true,
+        reset: "1:20am (Asia/Tokyo)",
+      },
+      chainFollowupDraft: null,
+      ...baseState,
+    });
+
+    assert.ok(result.outcome.includes("whole claude backend is blocked"));
+    assert.ok(result.outcome.includes("do not retry claude"));
+    assert.ok(!result.outcome.includes("Retry when provider is available"),
+      "the generic capacity footer must not contradict the classification");
+  });
+
+  it("a null jobFailure keeps the generic outcome byte-identical", () => {
+    const records = makeRecords([1]);
+    const roundRecord = { round: 2, modelEntry: "provider/model-2", verdict: null };
+
+    const result = handleProviderExhaustion({
+      records,
+      roundRecord,
+      currentTierIndex: 0,
+      phase: "implement",
+      jobError: "All routes exhausted",
+      jobFailure: null,
+      chainFollowupDraft: null,
+      ...baseState,
+    });
+
+    assert.ok(result.outcome.includes("All routes exhausted"));
+    assert.ok(result.outcome.includes("Capacity problem — not a quality failure. Retry when provider is available."));
+  });
+});
+
+// =========================================================================
+// phase functions carry the failure classification (kusabi #215)
+// =========================================================================
+
+describe("phase functions carry the failure classification (kusabi #215)", () => {
+  const QUOTA_FAILURE = {
+    kind: "quota-exhaustion",
+    quota: "session",
+    backendBlocked: true,
+    reset: "1:20am (Asia/Tokyo)",
+  };
+
+  function failingDispatch(status, failure) {
+    return async () => ({
+      job: {
+        id: "job-fail", status, modelEntry: "opus", modelVariant: null,
+        fallbacks: null, sessionID: null,
+        usage: null, error: "claude dispatch failed: session limit",
+        failure: failure ?? null,
+      },
+      resultText: "",
+    });
+  }
+
+  it("runImplementPhase returns implementJobFailure from the failed job's record", async () => {
+    const result = await runImplementPhase({
+      cwd: "/tmp", chainId: "chain-test", round: 1, isFirstRound: true,
+      implementText: "brief", modelChain: [["opus"]], tierIndex: 0,
+      useNewSession: false, session: undefined, resumeMethod: { type: "fresh_session" },
+      flagsModel: null, backend: "claude",
+      _dispatchWithFallback: failingDispatch("provider-error", QUOTA_FAILURE),
+    });
+    assert.deepEqual(result.implementJobFailure, QUOTA_FAILURE);
+    assert.equal(result.implementJobStatus, "provider-error");
+  });
+
+  it("runImplementPhase returns null implementJobFailure for a generic failure", async () => {
+    const result = await runImplementPhase({
+      cwd: "/tmp", chainId: "chain-test", round: 1, isFirstRound: true,
+      implementText: "brief", modelChain: [["opus"]], tierIndex: 0,
+      useNewSession: false, session: undefined, resumeMethod: { type: "fresh_session" },
+      flagsModel: null, backend: "claude",
+      _dispatchWithFallback: failingDispatch("error", null),
+    });
+    assert.equal(result.implementJobFailure, null);
+    assert.equal(result.implementJobStatus, "error");
+  });
+
+  it("runReviewPhase writes reviewJobFailure onto the round record (single conduit)", async () => {
+    const roundRecord = { round: 1 };
+    const dispatch = async () => {
+      // A review job that died on quota exhaustion — no output to parse.
+      return {
+        job: {
+          id: "job-rev-fail", status: "provider-error", modelEntry: "opus",
+          modelVariant: null, fallbacks: null, sessionID: null,
+          usage: null, error: "claude dispatch failed: session limit",
+          failure: QUOTA_FAILURE,
+        },
+        resultText: "",
+      };
+    };
+    const result = await runReviewPhase({
+      container: "cid-1", brief: "brief", modelChain: [["opus"]], chainId: "chain-test",
+      cwd: "/tmp", previousRecord: null, baseSha: "abc123",
+      chainStatusOutput: "", chainBaseLog: "", chainUntracked: "", chainTruncation: null,
+      roundRecord,
+      chainChangedPaths: ["src/a.js"], chainNewlyChanged: ["src/a.js"],
+      chainStatusObserved: true, chainDeliverables: [],
+      flagsModel: null,
+      _dispatchWithFallback: dispatch,
+    });
+    assert.equal(result.reviewJobStatus, "provider-error");
+    assert.deepEqual(roundRecord.reviewJobFailure, QUOTA_FAILURE);
+  });
+
+  it("runStrategizePhase returns strategistJobFailure from the failed job's record", async () => {
+    const result = await runStrategizePhase({
+      cwd: "/tmp", chainId: "chain-test", round: 1, brief: "brief",
+      previousRecord: null, roundRecord: { round: 1 }, modelChain: [["opus"]],
+      _dispatchWithFallback: failingDispatch("provider-error", QUOTA_FAILURE),
+    });
+    assert.equal(result.strategistJobStatus, "provider-error");
+    assert.deepEqual(result.strategistJobFailure, QUOTA_FAILURE);
   });
 });
 

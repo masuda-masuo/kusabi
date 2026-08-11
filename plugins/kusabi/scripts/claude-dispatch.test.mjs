@@ -26,6 +26,8 @@ import {
   buildClaudeArgs,
   parseClaudeResult,
   mapClaudeUsage,
+  classifyClaudeTerminalFailure,
+  renderClaudeQuotaError,
   allowedToolsForAgent,
   disallowedToolsForAgent,
   applyToolDenies,
@@ -350,6 +352,177 @@ describe("mapClaudeUsage", () => {
   });
 });
 
+// =========================================================================
+// classifyClaudeTerminalFailure — quota exhaustion classification (kusabi
+// #215): the real 2026-08-11 session-limit payload and its neighbours.
+// =========================================================================
+
+describe("classifyClaudeTerminalFailure", () => {
+  // The REAL incident payload (job-msnf4qph5ccd, 2026-08-11): an implement
+  // phase that ran 256s, cost $2.39, made zero edits, and died on the
+  // account's session limit.
+  const REAL_SESSION_LIMIT_PAYLOAD = {
+    type: "result",
+    is_error: true,
+    api_error_status: 429,
+    terminal_reason: "api_error",
+    subtype: "success", // never a success signal
+    result: "You've hit your session limit · resets 1:20am (Asia/Tokyo)",
+    total_cost_usd: 2.391763,
+  };
+
+  it("classifies the real session-limit 429 payload (quota, backend blocked, reset)", () => {
+    const f = classifyClaudeTerminalFailure(REAL_SESSION_LIMIT_PAYLOAD);
+    assert.deepEqual(f, {
+      kind: "quota-exhaustion",
+      quota: "session",
+      backendBlocked: true,
+      reset: "1:20am (Asia/Tokyo)",
+    });
+  });
+
+  it("ignores `subtype` entirely — `subtype: success` next to is_error still classifies by quota text", () => {
+    const f = classifyClaudeTerminalFailure(REAL_SESSION_LIMIT_PAYLOAD);
+    assert.equal(f.kind, "quota-exhaustion");
+    assert.equal(f.quota, "session");
+  });
+
+  it("returns null for a generic is_error payload without quota markers", () => {
+    assert.equal(
+      classifyClaudeTerminalFailure({ type: "result", is_error: true, api_error_status: 500, result: "boom: tool call failed" }),
+      null,
+    );
+    assert.equal(
+      classifyClaudeTerminalFailure({ type: "result", is_error: true, terminal_reason: "api_error", result: "Internal server error" }),
+      null,
+    );
+    // "exhausted" alone is NOT a quota marker (e.g. "context window
+    // exhausted") — classification must stay conservative so generic errors
+    // fail exactly as today.
+    assert.equal(
+      classifyClaudeTerminalFailure({ type: "result", is_error: true, result: "context window exhausted" }),
+      null,
+    );
+  });
+
+  it("does not classify a generic error containing the bare word 'reset'", () => {
+    // Regression (kusabi #215 review finding): a bare `resets?` alternative in
+    // QUOTA_TEXT_RE turned survivable generic errors ("git reset failed") into
+    // quota-exhaustion, which hard-stops the chain with wrong advice.  The
+    // reset TIME is extracted separately and must not gate classification.
+    for (const result of [
+      "fatal: failed to reset the workspace",
+      "git reset --hard exited with code 128",
+      "context reset by peer",
+      // Bare "quota" is likewise unqualified: a filesystem EDQUOT must not
+      // become a chain-stopping provider-error.
+      "write failed: disk quota exceeded on /workspace",
+    ]) {
+      assert.equal(
+        classifyClaudeTerminalFailure({ type: "result", is_error: true, result }),
+        null,
+        `must stay null for: ${result}`,
+      );
+    }
+  });
+
+  it("classifies a rate-limit text without HTTP 429 as rate quota, backend NOT blocked", () => {
+    const f = classifyClaudeTerminalFailure({
+      type: "result", is_error: true,
+      result: "Rate limit reached. Please retry your request again later.",
+    });
+    assert.deepEqual(f, {
+      kind: "quota-exhaustion",
+      quota: "rate",
+      backendBlocked: false,
+      reset: null,
+    });
+  });
+
+  it("does not call a non-rate quota phrase 'rate': monthly spend limit classifies as unknown", () => {
+    // The kind reported to the operator must come from the text: only an
+    // explicit rate-limit phrase may be labelled "rate" (review finding on
+    // the earlier is429-precedence derivation).
+    const f = classifyClaudeTerminalFailure({
+      type: "result", is_error: true,
+      result: "Your monthly spend limit has been reached.",
+    });
+    assert.equal(f.kind, "quota-exhaustion");
+    assert.equal(f.quota, "unknown");
+    assert.equal(f.backendBlocked, false);
+  });
+
+  it("keeps 'rate' for an explicit rate-limit phrase even with HTTP 429", () => {
+    const f = classifyClaudeTerminalFailure({
+      type: "result", is_error: true, api_error_status: 429,
+      result: "Rate limit reached. Please retry your request again later.",
+    });
+    assert.equal(f.quota, "rate");
+  });
+
+  it("classifies a bare 429 (no quota text) as quota-exhaustion with quota unknown", () => {
+    const f = classifyClaudeTerminalFailure({
+      type: "result", is_error: true, api_error_status: 429,
+      result: "API Error: 429",
+    });
+    assert.equal(f.kind, "quota-exhaustion");
+    assert.equal(f.quota, "unknown");
+    assert.equal(f.backendBlocked, false);
+  });
+
+  it("reads a structured reset field when the payload carries one", () => {
+    const f = classifyClaudeTerminalFailure({
+      type: "result", is_error: true, api_error_status: 429,
+      resetAt: "2026-08-12T00:00:00Z",
+      result: "rate limit reached",
+    });
+    assert.equal(f.reset, "2026-08-12T00:00:00Z");
+  });
+
+  it("returns null for a non-object payload", () => {
+    assert.equal(classifyClaudeTerminalFailure(null), null);
+    assert.equal(classifyClaudeTerminalFailure(undefined), null);
+    assert.equal(classifyClaudeTerminalFailure("result"), null);
+  });
+});
+
+describe("renderClaudeQuotaError", () => {
+  it("session: names the quota, the reset, the whole-backend block, and the opencode switch", () => {
+    const text = renderClaudeQuotaError(
+      { quota: "session", reset: "1:20am (Asia/Tokyo)" },
+      "You've hit your session limit · resets 1:20am (Asia/Tokyo)",
+    );
+    assert.match(text, /claude dispatch failed: You've hit your session limit/); // raw text preserved
+    assert.match(text, /session limit exhausted \(resets 1:20am \(Asia\/Tokyo\)\)/);
+    assert.match(text, /whole claude backend is blocked/);
+    assert.match(text, /your own Claude Code session/);
+    assert.match(text, /Switch the phase to the opencode backend/);
+    assert.match(text, /do not retry claude/);
+  });
+
+  it("rate: advises against walking other claude models, does not claim the backend is blocked", () => {
+    const text = renderClaudeQuotaError({ quota: "rate", reset: null }, "Rate limit reached");
+    assert.match(text, /claude rate limit active/);
+    assert.match(text, /walking other claude models will not help/);
+    assert.ok(!text.includes("whole claude backend is blocked"));
+    assert.ok(!text.includes("do not retry claude"));
+  });
+
+  it("unknown: never asserts 'rate limit', says the kind is unknown, promises no retry", () => {
+    // Regression (kusabi #215 review finding): a bare 429 classifies as
+    // quota "unknown"; the message must not assert a kind the classifier
+    // did not determine (it may in fact be the session limit without its
+    // text marker), and must not say "a retry later may succeed" when the
+    // chain driver hard-stops on this status.
+    const text = renderClaudeQuotaError({ quota: "unknown", reset: null }, "API Error: 429");
+    assert.match(text, /kind unknown/);
+    assert.ok(!text.includes("rate limit active"));
+    assert.ok(!text.includes("retry later may succeed"));
+    assert.match(text, /not retried automatically/);
+    assert.match(text, /walking other claude models will not help/);
+  });
+});
+
 describe("allowedToolsForAgent", () => {
   it("maps the implement agent to the implement allowlist (mirrors kusabi-implement.md)", () => {
     const csv = allowedToolsForAgent("kusabi-implement");
@@ -535,9 +708,25 @@ if (mode === "garbage") {
   process.exit(0);
 }
 if (mode === "is-error") {
+  // "subtype: success" next to "is_error: true" is the real 2026-08-11
+  // session-limit shape: subtype must NEVER influence success/failure.
   process.stdout.write(JSON.stringify({
     type: "result", is_error: true, result: "boom: tool call failed",
+    subtype: "success",
     session_id: "sess-err", usage: {}, total_cost_usd: 0, duration_ms: 5, num_turns: 1,
+  }));
+  process.exit(0);
+}
+if (mode === "quota-session") {
+  // The REAL incident terminal payload (job-msnf4qph5ccd, 2026-08-11): an
+  // implement phase that ran 256s, cost $2.39, made zero edits, and died
+  // on the account's session limit.
+  process.stdout.write(JSON.stringify({
+    type: "result", is_error: true, api_error_status: 429,
+    terminal_reason: "api_error", subtype: "success",
+    result: "You've hit your session limit · resets 1:20am (Asia/Tokyo)",
+    session_id: null, usage: {}, total_cost_usd: 2.391763,
+    duration_ms: 256000, num_turns: 8,
   }));
   process.exit(0);
 }
@@ -1006,13 +1195,67 @@ describe("claudeDispatch (fake claude binary)", () => {
     assert.equal(job.fallbacks, null);
   });
 
-  it("fails the dispatch when the result carries is_error", async () => {
+  it("fails the dispatch when the result carries is_error — even with subtype: success (kusabi #215)", async () => {
+    // The fake's is-error payload carries `subtype: "success"` (the real
+    // 2026-08-11 shape): subtype must never influence success/failure.
     ctx.restore();
     ctx = fakeClaudeContext("is-error");
     const { job } = await claudeDispatch(ctx.dispatchOptions());
 
     assert.equal(job.status, "error");
     assert.match(job.error, /boom: tool call failed/);
+    // No quota markers in this payload → no classification, no
+    // provider-error: it fails exactly as before the classification.
+    assert.equal(job.failure, null);
+  });
+
+  it("classifies the real session-limit 429 payload as quota exhaustion (provider-error)", async () => {
+    ctx.restore();
+    ctx = fakeClaudeContext("quota-session");
+    const { job } = await claudeDispatch(ctx.dispatchOptions());
+
+    // Failed job, machine-readable classification on the record (never by
+    // grepping `error` prose).
+    assert.equal(job.status, "provider-error");
+    assert.deepEqual(job.failure, {
+      kind: "quota-exhaustion",
+      quota: "session",
+      backendBlocked: true,
+      reset: "1:20am (Asia/Tokyo)",
+    });
+    // Operator-facing message: which quota, the reset, the whole-backend
+    // block, and what to do instead of retrying claude.
+    assert.match(job.error, /session limit exhausted \(resets 1:20am \(Asia\/Tokyo\)\)/);
+    assert.match(job.error, /whole claude backend is blocked/);
+    assert.match(job.error, /Switch the phase to the opencode backend/);
+    assert.match(job.error, /do not retry claude/);
+    // The raw terminal text is preserved on the record.
+    assert.match(job.error, /You've hit your session limit/);
+    assert.equal(job.retry, null);
+    assert.equal(job.fallbacks, null);
+    assert.equal(job.result, undefined);
+    // The failure record is persisted with the classification.
+    const persisted = loadJob(ctx.stateDir, job.id);
+    assert.equal(persisted.status, "provider-error");
+    assert.deepEqual(persisted.failure, job.failure);
+  });
+
+  it("marks claude stats as not instrumented — structural counters, distinguishable from measured zeros", async () => {
+    const { job } = await claudeDispatch(ctx.dispatchOptions());
+
+    // `instrumented: false` is the marker; a reader never guesses from
+    // `backend`.  Counters are null / empty (not absent) so readers that
+    // render them with `?? 0` keep working.
+    assert.equal(job.stats.instrumented, false);
+    assert.equal(job.stats.events, null);
+    assert.equal(job.stats.steps, null);
+    assert.equal(job.stats.lastTool, null);
+    assert.equal(job.stats.permissionsAllowed, null);
+    assert.equal(job.stats.permissionsRejected, null);
+    assert.equal(job.stats.lastActivity, null);
+    assert.deepEqual(job.stats.models, []);
+    // The idle-reap fallback (serve-lifecycle) reads lastActivity ?? startedAt.
+    assert.equal(job.stats.lastActivity ?? job.startedAt, job.startedAt);
   });
 
   it("times out: kills the child AND its process group, reports the opencode timeout status", async () => {
