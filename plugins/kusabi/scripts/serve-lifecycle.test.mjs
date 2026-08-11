@@ -124,6 +124,31 @@ describe("runningRecordIsStale", () => {
     assert.equal(runningRecordIsStale(recent), false);
   });
 
+  it("instrumented claude record (kusabi #215 Job B): a real streamed lastActivity is judged directly, not via the startedAt fallback", () => {
+    // Since kusabi #215 Job B the claude backend streams real events and
+    // marks new dispatches `instrumented: true` with a MEASURED
+    // `lastActivity` (see claude-dispatch.test.mjs's "trickle" test for the
+    // on-disk proof that this value moves while the child is still
+    // running).  The `?? startedAt` fallback above still exists for
+    // marker-false/legacy records; an instrumented record must never need
+    // it: a stale `lastActivity` reaps the job even when `startedAt` is
+    // recent, and a fresh `lastActivity` keeps it running even when
+    // `startedAt` is old.
+    const staleActivity = {
+      status: "running",
+      startedAt: new Date(Date.now() - HOUR).toISOString(),
+      stats: { instrumented: true, events: 40, steps: 6, lastTool: "mcp__sunaba__edit_file", lastActivity: new Date(Date.now() - 7 * 24 * HOUR).toISOString(), models: ["claude-sonnet-4-5"] },
+    };
+    assert.equal(runningRecordIsStale(staleActivity), true);
+
+    const freshActivity = {
+      status: "running",
+      startedAt: new Date(Date.now() - 7 * 24 * HOUR).toISOString(),
+      stats: { instrumented: true, events: 40, steps: 6, lastTool: "mcp__sunaba__edit_file", lastActivity: new Date(Date.now() - HOUR).toISOString(), models: ["claude-sonnet-4-5"] },
+    };
+    assert.equal(runningRecordIsStale(freshActivity), false);
+  });
+
   it("boundary: just under 6 hours is still running, just over is stale", () => {
     const now = Date.now();
     const justUnder = { status: "running", startedAt: new Date(now - RUNNING_STALE_MS + 1000).toISOString() };

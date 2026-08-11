@@ -26,18 +26,40 @@
 //   - Session resume: the `session` option is honored \u2014 `--resume
 //     <session-id>` is appended to argv, so chain rework rounds, chain-resume,
 //     and `--session` / `--resume-last` continue the previous session instead
-//     of starting blank.  The session id recorded on the job record always
-//     comes from the CLI's JSON result (the single capture source); an
+//     of starting blank.  The session id recorded on the job record comes
+//     from the CLI's terminal result event, falling back to the stream's
+//     `system`/`init` event when the run died before a result (never from
+//     the `session` option); an
 //     opencode-shaped session id (`ses_*`) is rejected with a loud
 //     cross-backend error before anything is spawned.
-//   - watchdogS (stall detection) is a NO-OP in v1: the child is bounded
-//     only by timeoutS, which SIGKILLs the child's WHOLE process group
-//     (claude + its children — MCP server, running tool commands) so no
-//     orphaned work keeps running in the shared container.  Documented, not
-//     silently dropped — see the comment at the spawn site.
 //   - `:variant` model suffixes are rejected with an explicit error (never
 //     silently ignored): `--allowedTools` has no variant concept and the
 //     opencode variant knob has no claude equivalent.
+//
+// Real event stream (kusabi #215 Job B): the child runs with
+// `--output-format stream-json --verbose` (the CLI refuses stream-json
+// without --verbose) and stdout is NDJSON, one event object per line — the
+// terminal `result` event carries the SAME shape the old `--output-format
+// json` single object did, so quota classification and usage mapping apply
+// unchanged.  Lines that fail to parse as JSON are skipped and counted,
+// never fatal: the real CLI has been observed printing a non-JSON warning
+// line ahead of the stream.  `job.stats` is populated from the parsed
+// events (events/steps/lastTool/lastActivity/models) and marked
+// `instrumented: true`; the on-disk job record is saved at a bounded
+// cadence while the child runs, so `kusabi status` shows live movement
+// instead of a frozen record.  `instrumented: false` now marks only
+// legacy/pre-#215 records — kusabi-companion.mjs's "not instrumented"
+// rendering is a reader concession to those, not something this dispatch
+// writes anymore.  `watchdogS` is LIVE: no parsed stream event for
+// `watchdogS` seconds kills the child's whole process group (the same kill
+// `timeoutS` uses) and the job finishes `status: "stalled"`, with the
+// opencode watchdog's own wording, so chains treat a stalled claude worker
+// exactly like a stalled opencode one.  `timeoutS` is unchanged — an
+// absolute wall-clock bound, independent of stream activity.  A stream
+// that ends with no terminal `result` event (killed, stalled, crashed)
+// still yields a failed job record carrying whatever was learned: the
+// session id from `system`/`init` when the CLI got that far, and the stats
+// accumulated up to that point.
 
 import path from "node:path";
 import fs from "node:fs";
@@ -542,8 +564,8 @@ export function disallowedToolsForAgent(agent) {
  * Build the argv for a `claude -p` dispatch.
  *
  * Contract (field-verified, kusabi #184): `claude -p --strict-mcp-config
- * --setting-sources "" --output-format json --model <m> --allowedTools <csv>
- * --disallowedTools <csv> --mcp-config <path>
+ * --setting-sources "" --output-format stream-json --verbose --model <m>
+ * --allowedTools <csv> --disallowedTools <csv> --mcp-config <path>
  * [--append-system-prompt <agent-body>] [--resume <session-id>]`.  The prompt
  * is NOT on argv (I5) — it is written to the child's stdin, so it cannot leak
  * into `ps` output or argv-logged transcripts, and it is never
@@ -573,7 +595,8 @@ export function buildClaudeArgs({ model, allowedTools, disallowedTools, mcpConfi
     "-p",
     "--strict-mcp-config",
     "--setting-sources", "",
-    "--output-format", "json",
+    "--output-format", "stream-json",
+    "--verbose",
     "--model", model,
     "--allowedTools", allowedTools,
     "--disallowedTools", disallowedTools,
@@ -589,8 +612,13 @@ export function buildClaudeArgs({ model, allowedTools, disallowedTools, mcpConfi
 }
 
 /**
- * Parse the single JSON object `claude -p --output-format json` prints on
- * stdout.
+ * Parse the terminal `result` event — the shape `claude -p` prints as its
+ * last `--output-format stream-json` line, and as its single
+ * `--output-format json` object before kusabi #215 Job B (the two are the
+ * same object).  Kept as a pure, exported parse for the legacy single-
+ * object call shape and for unit tests; the dispatch itself now takes the
+ * result event from the NDJSON stream (applyClaudeStreamEvent) and no
+ * longer calls this.
  *
  * Contract shape: `{ type: "result", is_error, result, session_id,
  * usage: { input_tokens, output_tokens, cache_creation_input_tokens,
@@ -671,6 +699,117 @@ export function mapClaudeUsage(result) {
 }
 
 // =========================================================================
+// NDJSON stream parsing — pure (kusabi #215 Job B)
+// =========================================================================
+//
+// `claude -p --output-format stream-json --verbose` prints one JSON event
+// object per stdout line.  These two functions are the whole parse/fold
+// contract, kept pure and separate from the spawn/IO code so they are cheap
+// to unit-test against fixture event sequences.
+
+/**
+ * Parse one line of the NDJSON stream.
+ *
+ * Returns null for anything that is not a JSON object on that line —
+ * blank lines, and non-JSON prose (the real CLI has been observed printing
+ * a "no stdin data" warning line ahead of the stream).  The caller counts
+ * nulls for debugging but never treats one as fatal.
+ *
+ * @param {string} line
+ * @returns {object|null}
+ */
+export function parseClaudeStreamLine(line) {
+  const trimmed = typeof line === "string" ? line.trim() : "";
+  if (!trimmed) return null;
+  let obj;
+  try {
+    obj = JSON.parse(trimmed);
+  } catch {
+    return null;
+  }
+  if (obj === null || typeof obj !== "object" || Array.isArray(obj)) return null;
+  return obj;
+}
+
+/**
+ * A fresh accumulator for folding a claude NDJSON stream into job stats.
+ *
+ * @returns {{ events: number, steps: number, lastTool: string|null,
+ *             lastActivity: string|null, models: string[],
+ *             sessionIdFromInit: string|null, resultEvent: object|null,
+ *             rateLimit: {info: object, observedAt: string}|null }}
+ */
+export function initClaudeStreamAccumulator() {
+  return {
+    events: 0,
+    steps: 0,
+    lastTool: null,
+    lastActivity: null,
+    models: [],
+    sessionIdFromInit: null,
+    resultEvent: null,
+    rateLimit: null,
+  };
+}
+
+/**
+ * Fold one parsed stream event into the accumulator (mutates and returns
+ * it).  Every recognized event type contributes:
+ *
+ *   - `system` / `init`      — the session id, kept in case the stream ends
+ *                               with no terminal `result` event.
+ *   - `rate_limit_event`     — the live quota feed (kusabi #215 Job B item
+ *                               4): the most recent `rate_limit_info`,
+ *                               stamped with when it was observed.
+ *   - `assistant`            — `message.model` (deduped into `models`) and
+ *                               each `tool_use` content block (`steps` +
+ *                               `lastTool`).
+ *   - `result`               — kept as `resultEvent`; a later one replaces
+ *                               an earlier one, so a stream carrying more
+ *                               than one keeps the LAST (the terminal one).
+ *
+ * `events` and `lastActivity` update for every recognized call regardless
+ * of type: `events` is "parsed event lines", not "assistant events".
+ *
+ * @param {object} acc — an accumulator from `initClaudeStreamAccumulator`.
+ * @param {object} evt — one parsed stream event.
+ * @param {string} [now] — ISO timestamp; overridable for tests.
+ * @returns {object} The same accumulator, mutated.
+ */
+export function applyClaudeStreamEvent(acc, evt, now = new Date().toISOString()) {
+  acc.events += 1;
+  acc.lastActivity = now;
+
+  const type = evt?.type;
+  if (type === "system" && evt.subtype === "init") {
+    if (typeof evt.session_id === "string" && evt.session_id) {
+      acc.sessionIdFromInit = evt.session_id;
+    }
+  } else if (type === "rate_limit_event") {
+    if (evt.rate_limit_info && typeof evt.rate_limit_info === "object") {
+      acc.rateLimit = { info: evt.rate_limit_info, observedAt: now };
+    }
+  } else if (type === "assistant") {
+    const message = evt.message;
+    if (message && typeof message === "object") {
+      if (typeof message.model === "string" && message.model && !acc.models.includes(message.model)) {
+        acc.models.push(message.model);
+      }
+      const content = Array.isArray(message.content) ? message.content : [];
+      for (const block of content) {
+        if (block && typeof block === "object" && block.type === "tool_use") {
+          acc.steps += 1;
+          if (typeof block.name === "string" && block.name) acc.lastTool = block.name;
+        }
+      }
+    }
+  } else if (type === "result") {
+    acc.resultEvent = evt;
+  }
+  return acc;
+}
+
+// =========================================================================
 // terminal failure classification — quota exhaustion (kusabi #215)
 // =========================================================================
 //
@@ -716,8 +855,14 @@ const RATE_LIMIT_RE = /\b(rate[\s_-]?limit|too[\s_-]?many[\s_-]?requests)\b/i;
  *   backendBlocked: boolean,
  *   reset: string | null,
  * }} `null` when the payload carries no quota marker.
+ *
+ * @param {object} [ctx]
+ * @param {{info: object, observedAt: string}|null} [ctx.rateLimit] — the
+ *        most recent `rate_limit_event` seen on the stream (kusabi #215 Job
+ *        B item 4).  Consulted ONLY as a reset fallback, when the payload
+ *        itself names none — payload text always wins when present.
  */
-export function classifyClaudeTerminalFailure(parsed) {
+export function classifyClaudeTerminalFailure(parsed, { rateLimit } = {}) {
   if (!parsed || typeof parsed !== "object") return null;
   const is429 = parsed.api_error_status === 429;
   const reason = typeof parsed.terminal_reason === "string" ? parsed.terminal_reason : "";
@@ -737,8 +882,24 @@ export function classifyClaudeTerminalFailure(parsed) {
     // Claude Code session shares the same account window); per-model /
     // per-request rate limits do not.
     backendBlocked: quota === "session",
-    reset: extractClaudeQuotaReset(parsed),
+    reset: extractClaudeQuotaReset(parsed) ?? extractResetFromRateLimitInfo(rateLimit),
   };
+}
+
+/**
+ * The reset time from a streamed `rate_limit_event` (kusabi #215 Job B item
+ * 4) — the fallback used ONLY when the terminal payload itself names no
+ * reset.  `resetsAt` is epoch seconds on the live quota feed; rendered as
+ * an ISO timestamp so it prints the same way a structured payload
+ * `resetAt` would.
+ *
+ * @param {{info: object, observedAt: string}|null|undefined} rateLimit
+ * @returns {string|null}
+ */
+function extractResetFromRateLimitInfo(rateLimit) {
+  const resetsAt = rateLimit?.info?.resetsAt;
+  if (typeof resetsAt !== "number" || !Number.isFinite(resetsAt)) return null;
+  return new Date(resetsAt * 1000).toISOString();
 }
 
 /**
@@ -1053,29 +1214,34 @@ export async function stopRecordedProcess(recorded, { waitMs, pollMs = KILL_CONF
  * to the child's stdin and the stream is ended (I5) — `claude -p` with no
  * prompt argument reads it from stdin, so the prompt never appears on argv.
  * The child runs in its own process group (detached) and the WHOLE GROUP is
- * killed (SIGKILL) when timeoutS elapses; watchdogS (stall detection) is a
- * NO-OP in v1 — the child either exits or is killed by the timeout, so a
- * stalled claude costs at most timeoutS (the opencode path's watchdog is
- * not ported because there is no SSE stream to measure silence against).
- * A process that deliberately detaches itself (setsid) escapes the group
- * kill — that is the documented v1 limit, everything else dies with the
- * timeout.
+ * killed (SIGKILL) when timeoutS elapses (absolute wall-clock bound) OR when
+ * watchdogS elapses with no parsed stream event (silence bound, kusabi #215
+ * Job B) — whichever fires first; once either has fired the other's check
+ * is a no-op.  A process that deliberately detaches itself (setsid) escapes
+ * the group kill — that is the documented v1 limit, everything else dies
+ * with either bound.
  *
  * @param {object} opts
  * @param {string} opts.bin
  * @param {string[]} opts.args
  * @param {string} [opts.cwd]
  * @param {number} [opts.timeoutS]
+ * @param {number} [opts.watchdogS] — silence bound in seconds; <= 0 disables it.
  * @param {string} [opts.promptText] — written to child stdin, then closed.
  * @param {(proc: {pid: number, startTime: string|null}) => void} [opts.onStart]
  *        — called once, synchronously, as soon as the child exists, with the
  *        pid and the identity token to persist alongside it.  This is the
  *        only moment the pid is knowable, and `cancel` (a different process)
  *        can stop nothing the record does not name (kusabi #209).
+ * @param {(line: string) => void} [opts.onLine] — called synchronously for
+ *        each complete stdout line (plus a final unterminated one at close),
+ *        AS IT ARRIVES — this is what lets the caller fold stats and reset
+ *        the silence clock while the child is still running, not only after
+ *        it exits.
  * @returns {Promise<{ code: number|null, stdout: string, stderr: string,
- *                     timedOut: boolean, spawnError: Error|null }>}
+ *                     timedOut: boolean, stalled: boolean, spawnError: Error|null }>}
  */
-export function runClaudeProcess({ bin, args, cwd, timeoutS, promptText, onStart }) {
+export function runClaudeProcess({ bin, args, cwd, timeoutS, watchdogS, promptText, onStart, onLine }) {
   return new Promise((resolve) => {
     const child = spawn(bin, args, {
       cwd,
@@ -1104,20 +1270,68 @@ export function runClaudeProcess({ bin, args, cwd, timeoutS, promptText, onStart
     let stdout = "";
     let stderr = "";
     let timedOut = false;
+    let stalled = false;
     let spawnError = null;
+    let lineBuffer = "";
+    let lastEventAt = Date.now();
 
-    child.stdout.on("data", (d) => { stdout += d; });
+    // Delivers one complete NDJSON line to the caller and resets the
+    // silence clock the watchdog measures against — the clock starts at
+    // spawn (above), not at the first event, so a child that never prints
+    // anything at all still trips the watchdog.  Only a PARSED event
+    // resets the clock: an unparseable prose line (the real CLI's leading
+    // warning) is stream noise, not activity — it must not masquerade as
+    // an event and hold the watchdog off (kusabi #215 Job B item 3).
+    function deliverLine(line) {
+      if (parseClaudeStreamLine(line) !== null) lastEventAt = Date.now();
+      if (typeof onLine === "function") {
+        try { onLine(line); } catch { /* a stats-fold bug must not take down the dispatch */ }
+      }
+    }
+
+    // UTF-8 decoding must be stream-level, not chunk-level: a multibyte
+    // character split across two "data" chunks decodes to U+FFFD under
+    // per-chunk toString(), corrupting the JSON line it sits in — and a
+    // corrupted terminal result line is a lost run (and a lost quota
+    // classification).  setEncoding routes chunks through a StringDecoder
+    // that holds partial byte sequences back until they complete.
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
+    child.stdout.on("data", (chunk) => {
+      stdout += chunk;
+      lineBuffer += chunk;
+      const lines = lineBuffer.split("\n");
+      lineBuffer = lines.pop(); // last element: an unterminated partial line, or ""
+      for (const line of lines) deliverLine(line);
+    });
     child.stderr.on("data", (d) => { stderr += d; });
     child.on("error", (err) => { spawnError = err; });
+
     const timer = timeoutS && timeoutS > 0
       ? setTimeout(() => {
           timedOut = true;
           killProcessGroup(child);
         }, timeoutS * 1000)
       : null;
+    // Silence watchdog (kusabi #215 Job B): polled rather than a single
+    // deadline timer, since the bound restarts on every stream event.
+    // 250ms resolution keeps a small test watchdogS tight without adding
+    // meaningful overhead against the real multi-minute defaults.
+    const watchdogTimer = watchdogS && watchdogS > 0
+      ? setInterval(() => {
+          if (timedOut || stalled) return;
+          if (Date.now() - lastEventAt > watchdogS * 1000) {
+            stalled = true;
+            clearInterval(watchdogTimer);
+            killProcessGroup(child);
+          }
+        }, 250)
+      : null;
     child.on("close", (code) => {
       if (timer) clearTimeout(timer);
-      resolve({ code, stdout, stderr, timedOut, spawnError });
+      if (watchdogTimer) clearInterval(watchdogTimer);
+      if (lineBuffer) deliverLine(lineBuffer);
+      resolve({ code, stdout, stderr, timedOut, stalled, spawnError });
     });
   });
 }
@@ -1162,7 +1376,9 @@ export function runClaudeProcess({ bin, args, cwd, timeoutS, promptText, onStart
  *        first; phase-level maps' bare sunaba_* names are normalized
  *        inside applyToolDenies).
  * @param {number} [opts.timeoutS]
- * @param {number} [opts.watchdogS] — NO-OP in v1 (see runClaudeProcess).
+ * @param {number} [opts.watchdogS] — silence bound in seconds; no parsed
+ *        stream event for this long kills the process group and finishes
+ *        the job `status: "stalled"` (kusabi #215 Job B; see runClaudeProcess).
  * @param {(string|string[])[]} [opts.tiers]
  * @param {number} [opts.round]
  * @param {number} [opts.tierIndex]
@@ -1239,24 +1455,30 @@ export async function claudeDispatch(opts) {
     modelVariant: null,
     startedAt: new Date().toISOString(),
     finishedAt: null,
-    // v1 has no event stream (`--output-format json`): every counter here
-    // is STRUCTURAL, never measured.  `instrumented: false` marks the whole
-    // object as not-measured so a reader can tell it apart from the opencode
-    // path's measured zeros WITHOUT guessing from `backend` (kusabi #215).
-    // Counters stay present (null / empty, not absent) so readers that
-    // render them with `?? 0` / `?? "-"` keep working unchanged; the
-    // serve-lifecycle idle-reap fallback (`stats.lastActivity ??
-    // startedAt`) still lands on startedAt.
+    // The child runs `--output-format stream-json --verbose`, so counters
+    // here are MEASURED from the parsed event stream, not structural
+    // (kusabi #215 Job B).  `instrumented: true` marks every dispatch this
+    // module makes from here on; `instrumented: false` now identifies only
+    // legacy/pre-#215 records on disk — kusabi-companion.mjs keeps its "not
+    // instrumented" rendering for those.  `lastActivity` starts null (no
+    // event has arrived yet); the serve-lifecycle idle-reap fallback
+    // (`stats.lastActivity ?? startedAt`) covers that gap the same way it
+    // always has.
     stats: {
-      instrumented: false,
-      events: null,
-      steps: null,
+      instrumented: true,
+      events: 0,
+      steps: 0,
       lastTool: null,
-      permissionsAllowed: null,
-      permissionsRejected: null,
+      permissionsAllowed: 0,
+      permissionsRejected: 0,
       lastActivity: null,
       models: [],
     },
+    // The most recent `rate_limit_event` observed on the stream (kusabi
+    // #215 Job B item 4): `{ info: <rate_limit_info>, observedAt }`, or
+    // null when the stream never carried one.  Machine-readable — this is
+    // the live quota feed, independent of whether the job ever fails.
+    rateLimit: null,
     error: null,
     // Terminal-failure classification (kusabi #215): null for generic
     // failures; { kind: "quota-exhaustion", quota, backendBlocked, reset }
@@ -1275,12 +1497,47 @@ export async function claudeDispatch(opts) {
     bin,
   });
 
-  // ---- run ----
-  const { code, stdout, stderr, timedOut, spawnError } = await runClaudeProcess({
+  // ---- run: parse the NDJSON stream as it arrives (kusabi #215 Job B) ----
+  const streamAcc = initClaudeStreamAccumulator();
+  let malformedLines = 0;
+  let lastStatsSaveAt = 0;
+  const STATS_SAVE_INTERVAL_MS = 1000;
+  const onLine = (rawLine) => {
+    const evt = parseClaudeStreamLine(rawLine);
+    if (evt === null) {
+      // Not fatal (a leading non-JSON warning line has been observed on
+      // the real CLI) — just not countable as a parsed event.
+      malformedLines += 1;
+      return;
+    }
+    applyClaudeStreamEvent(streamAcc, evt);
+    job.stats = {
+      instrumented: true,
+      events: streamAcc.events,
+      steps: streamAcc.steps,
+      lastTool: streamAcc.lastTool,
+      permissionsAllowed: 0,
+      permissionsRejected: 0,
+      lastActivity: streamAcc.lastActivity,
+      models: streamAcc.models,
+    };
+    if (streamAcc.rateLimit) job.rateLimit = streamAcc.rateLimit;
+    // Bounded cadence, not every line: a chatty stream must not turn into a
+    // write per event, but `kusabi status` still needs to see the job
+    // record move while the child is running, not only once it exits.
+    const now = Date.now();
+    if (now - lastStatsSaveAt >= STATS_SAVE_INTERVAL_MS) {
+      lastStatsSaveAt = now;
+      saveJob(stateDir, job);
+    }
+  };
+
+  const { code, stdout, stderr, timedOut, stalled, spawnError } = await runClaudeProcess({
     bin,
     args,
     cwd: opts.cwd,
     timeoutS: opts.timeoutS,
+    watchdogS: opts.watchdogS,
     promptText: opts.promptText || "",
     // Persist the child's identity on the record while it is still running,
     // so `cancel` can verify and stop it (kusabi #209).
@@ -1288,6 +1545,7 @@ export async function claudeDispatch(opts) {
       job.process = { pid, startTime, recordedAt: new Date().toISOString() };
       saveJob(stateDir, job);
     },
+    onLine,
   });
 
   job.finishedAt = new Date().toISOString();
@@ -1297,6 +1555,15 @@ export async function claudeDispatch(opts) {
   if (spawnError) {
     job.status = "error";
     job.error = `claude dispatch failed: could not start ${bin}: ${spawnError.message}`;
+  } else if (stalled) {
+    // Mirrors the opencode watchdog's own status and wording exactly (kusabi
+    // #215 Job B item 3), so a chain treats a stalled claude worker like a
+    // stalled opencode one.  The kill always ran (runClaudeProcess only sets
+    // `stalled` after killProcessGroup), so the wording always names it —
+    // there is no "declined kill" case here, unlike the opencode serve
+    // watchdog: this process is ours alone, nothing to verify ownership of.
+    job.status = "stalled";
+    job.error = `watchdog: no events for ${opts.watchdogS}s (process killed)`;
   } else if (timedOut) {
     // Same failure status/text the opencode path uses for timeouts.
     job.status = "timeout";
@@ -1305,46 +1572,53 @@ export async function claudeDispatch(opts) {
     job.status = "error";
     const detail = (stderr || stdout || "(no output)").trim();
     job.error = `claude exited with code ${code}: ${detail}`;
+  } else if (streamAcc.resultEvent === null) {
+    // The process exited 0 but the stream never carried a terminal `result`
+    // event — garbage output, or a shape this parser does not recognize.
+    // Still a failed job, never a stuck "running" record.
+    job.status = "error";
+    const snippet = stdout.trim().slice(0, 300);
+    job.error = `claude stream produced no terminal result event ` +
+      `(${streamAcc.events} parsed, ${malformedLines} unparseable line(s)): ${snippet || "(empty stdout)"}`;
   } else {
-    try {
-      parsed = parseClaudeResult(stdout);
-    } catch (err) {
-      job.status = "error";
-      const snippet = stdout.trim().slice(0, 300);
-      job.error = `claude produced unparseable output (${err.message}): ${snippet || "(empty stdout)"}`;
-    }
-    if (parsed !== null) {
-      if (parsed.is_error === true) {
-        // `subtype` is NEVER consulted here: a terminal payload can carry
-        // `subtype: "success"` next to `is_error: true` (real 2026-08-11
-        // session-limit payload) — the failure signal is is_error alone.
-        const failure = classifyClaudeTerminalFailure(parsed);
-        const detail = typeof parsed.result === "string" && parsed.result.trim()
-          ? parsed.result.trim()
-          : "claude reported is_error: true";
-        job.failure = failure;
-        if (failure) {
-          // Quota exhaustion gets the provider-error status so the chain's
-          // provider-exhaustion stop renders the classification instead of
-          // the generic error text (kusabi #215); the error text carries
-          // the operator-facing advice (which quota, reset, what to do).
-          job.status = "provider-error";
-          job.error = renderClaudeQuotaError(failure, detail);
-        } else {
-          job.status = "error";
-          job.error = `claude dispatch failed: ${detail}`;
-        }
+    parsed = streamAcc.resultEvent;
+    if (parsed.is_error === true) {
+      // `subtype` is NEVER consulted here: a terminal payload can carry
+      // `subtype: "success"` next to `is_error: true` (real 2026-08-11
+      // session-limit payload) — the failure signal is is_error alone.
+      const failure = classifyClaudeTerminalFailure(parsed, { rateLimit: job.rateLimit });
+      const detail = typeof parsed.result === "string" && parsed.result.trim()
+        ? parsed.result.trim()
+        : "claude reported is_error: true";
+      job.failure = failure;
+      if (failure) {
+        // Quota exhaustion gets the provider-error status so the chain's
+        // provider-exhaustion stop renders the classification instead of
+        // the generic error text (kusabi #215); the error text carries
+        // the operator-facing advice (which quota, reset, what to do).
+        job.status = "provider-error";
+        job.error = renderClaudeQuotaError(failure, detail);
       } else {
-        job.status = "completed";
-        job.sessionID = parsed.session_id ?? null;
-        job.usage = {
-          ...mapClaudeUsage(parsed),
-          phase: job.phase,
-          durationSeconds: durationS(job),
-        };
-        writeJson(path.join(jobDir(stateDir, job.id), "usage.json"), job.usage);
+        job.status = "error";
+        job.error = `claude dispatch failed: ${detail}`;
       }
+    } else {
+      job.status = "completed";
+      job.sessionID = parsed.session_id ?? null;
+      job.usage = {
+        ...mapClaudeUsage(parsed),
+        phase: job.phase,
+        durationSeconds: durationS(job),
+      };
+      writeJson(path.join(jobDir(stateDir, job.id), "usage.json"), job.usage);
     }
+  }
+
+  // A stream that never reached (or never carried) a terminal `result`
+  // event still leaves whatever `system`/`init` reported — the only source
+  // of a session id when nothing else names one (kusabi #215 Job B item 5).
+  if (!job.sessionID && streamAcc.sessionIdFromInit) {
+    job.sessionID = streamAcc.sessionIdFromInit;
   }
 
   appendEvent(stateDir, job.id, {
@@ -1352,6 +1626,8 @@ export async function claudeDispatch(opts) {
     status: job.status,
     sessionId: job.sessionID,
     exitCode: code,
+    streamEvents: streamAcc.events,
+    malformedLines,
   });
   saveJob(stateDir, job);
 

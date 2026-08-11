@@ -161,7 +161,9 @@ split (or without the field) are treated as `opencode` by readers.
   tiered chain, capacity fallback, and `provider/model[:variant]` model
   syntax described above.
 - **claude** — dispatch through the official Claude Code CLI in headless
-  mode (`claude -p --output-format json`). v1 limits: one model per phase
+  mode (`claude -p --output-format stream-json --verbose`; stdout is an
+  NDJSON event stream since kusabi #215 Job B, terminal `result` event
+  mapped onto the job record). v1 limits: one model per phase
   (the `--model` value, or the chain's first route — the tier ladder and
   capacity fallback do not apply), and `:variant` suffixes are rejected with
   an explicit error (a `--model` value such as `opus:max` fails before any
