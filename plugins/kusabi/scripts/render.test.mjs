@@ -1139,82 +1139,178 @@ describe("renderChainShow fallbacks", () => {
   });
 });
 
-// renderBaseFacts diff content — new block-level diff rendering
+// renderBaseFacts diff instruction — the diff body is NOT inlined (kusabi #208)
 // ---------------------------------------------------------------------------
+// The block used to inline a `git diff` capture.  That capture was a single
+// default-paged sandbox_exec call, so what the reviewer received was page one
+// of the diff presented as the whole change.  These tests replace the ones
+// that pinned the inlined body: what must hold now is that there is no body at
+// all, and that the input names the ref to diff against and says whose job the
+// fetch is.
 
-describe("renderBaseFacts diff content", () => {
-  it("renders diff content when diffContent is supplied", () => {
+describe("renderBaseFacts diff instruction", () => {
+  it("carries no diff body at all", () => {
     const result = renderBaseFacts({
       baseSha: "abc",
       baseLog: "log",
       statusOutput: " M src/foo.js",
-      diffContent: "diff --git a/src/foo.js b/src/foo.js\nindex abc..def 100644\n--- a/src/foo.js\n+++ b/src/foo.js\n@@ -1 +1 @@\n-old\n+new",
+      untrackedFiles: "src/new.js",
     });
-    assert.match(result, /Diff content:/);
-    assert.match(result, /```diff/);
-    assert.match(result, /diff --git a\/src\/foo.js/);
-    assert.match(result, /\+new/);
-    assert.doesNotMatch(result, /truncated/);
-    assert.doesNotMatch(result, /\(unavailable\)/);
+    assert.doesNotMatch(result, /diff --git/);
+    assert.doesNotMatch(result, /```diff/);
+    assert.doesNotMatch(result, /Diff content/);
   });
 
-  it("marks diff as unavailable when diffContent is absent", () => {
+  it("names the base sha and the tool, and says the fetch is the reviewer's job", () => {
+    const result = renderBaseFacts({ baseSha: "0123456789abcdef", statusOutput: " M src/foo.js" });
+    assert.ok(result.includes("Fetching the diff is YOUR job"));
+    assert.ok(result.includes("`diff_in_container`"));
+    assert.ok(result.includes("`base` set to `0123456789abcdef`"));
+  });
+
+  it("says in as many words that the file list is not the change", () => {
+    const result = renderBaseFacts({ baseSha: "abc", statusOutput: " M src/foo.js" });
+    assert.ok(result.includes("**The diff itself is NOT included in this input.**"));
+    assert.ok(result.includes("names WHICH files changed, not WHAT changed inside them"));
+  });
+
+  it("falls back to the worktree diff when the base commit could not be read", () => {
+    const result = renderBaseFacts({ statusOutput: " M src/foo.js" });
+    assert.ok(result.includes("Fetching the diff is YOUR job"));
+    assert.ok(result.includes("`worktree: true`"));
+    assert.doesNotMatch(result, /`base` set to/);
+  });
+
+  it("tells the reviewer to page until has_more is false", () => {
+    // The defect this replaces was a first page taken for the whole thing; an
+    // instruction that stopped at "call diff_in_container" would invite it
+    // back one level down.
+    const result = renderBaseFacts({ baseSha: "abc" });
+    assert.ok(result.includes("`has_more` is false"));
+  });
+});
+
+// renderBaseFacts truncation labels — what was cut says so (kusabi #208)
+// ---------------------------------------------------------------------------
+// Truncation is taken from what sandbox_exec reports about its own paging, not
+// inferred from a line count: page one of a 137-line change set and a genuine
+// 50-line one are indistinguishable by length.
+
+describe("renderBaseFacts truncation labels", () => {
+  const LONG_STATUS = Array.from({ length: 50 }, (_, i) => " M src/f" + i + ".js").join("\n") + "\n";
+
+  it("labels a change-set list the server paged, counting the block it rendered", () => {
+    // The numerator is the number of lines in the block above the label, not
+    // a count carried in the truncation facts: the server's own `shown`
+    // equals `total_lines` even on a cut response, so a carried numerator
+    // rendered "showing 137 of 137" under a truncation label.
     const result = renderBaseFacts({
       baseSha: "abc",
-      baseLog: "log",
-      statusOutput: " M src/foo.js",
+      statusOutput: LONG_STATUS,
+      truncation: { status: { truncated: true, total: 137 } },
     });
-    assert.match(result, /Diff content: \(unavailable\)/);
+    assert.ok(result.includes("**Change set truncated (showing 50 of 137 lines).**"));
+    assert.ok(result.includes("`diff_in_container` reports the complete file list"));
   });
 
-  it("marks diff as unavailable when diffContent is empty string", () => {
+  it("labels a paged change-set list even when the denominator is missing", () => {
     const result = renderBaseFacts({
-      diffContent: "",
+      baseSha: "abc",
+      statusOutput: LONG_STATUS,
+      truncation: { status: { truncated: true, total: null } },
     });
-    assert.match(result, /Diff content: \(unavailable\)/);
+    assert.ok(result.includes("**Change set truncated.**"));
   });
 
-  it("marks diff as unavailable when diffContent is only whitespace", () => {
+  it("drops the counts rather than printing a numerator that is not below the denominator", () => {
+    // "showing 50 of 50" under a truncation label is the contradiction this
+    // label exists to remove.  A bare "truncated" is honest; matching counts
+    // are not, whatever produced them.
     const result = renderBaseFacts({
-      diffContent: "   ",
+      baseSha: "abc",
+      statusOutput: LONG_STATUS,
+      truncation: { status: { truncated: true, total: 50 } },
     });
-    assert.match(result, /Diff content: \(unavailable\)/);
+    assert.ok(result.includes("**Change set truncated.**"));
+    assert.doesNotMatch(result, /showing \d+ of \d+ lines/);
   });
 
-  it("marks truncation when diff exceeds the budget", () => {
-    // DIFF_BUDGET is 30000; create content larger than that
-    const bigContent = "diff --git a/x b/x\n" + "x\n".repeat(30000);
+  it("labels a paged untracked list", () => {
     const result = renderBaseFacts({
-      diffContent: bigContent,
+      untrackedFiles: "src/a.js\nsrc/b.js\n",
+      truncation: { untracked: { truncated: true, total: 92 } },
     });
-    assert.match(result, /Diff content \(truncated to 30000 characters\):/);
-    assert.match(result, /Diff truncated/);
+    assert.ok(result.includes("**Untracked list truncated (showing 2 of 92 lines).**"));
+    assert.ok(result.includes("More untracked files exist than are listed above."));
   });
 
-  it("does not mark truncation when diff is under the budget", () => {
-    const smallContent = "diff --git a/x b/x\n+small change";
+  it("labels a paged base history", () => {
     const result = renderBaseFacts({
-      diffContent: smallContent,
+      baseLog: "abc1234 first",
+      truncation: { baseLog: { truncated: true, total: 60 } },
     });
-    assert.match(result, /Diff content:/);
+    assert.ok(result.includes("**Base history truncated (showing 1 of 60 lines).**"));
+  });
+
+  it("never renders a numerator equal to its denominator on any capture", () => {
+    // Every capture at once, each cut, each with the live server's numbers
+    // (the response reports shown === total_lines).  Whatever is labelled,
+    // no label may claim the block holds the whole output.
+    const result = renderBaseFacts({
+      baseSha: "abc",
+      baseLog: "abc1234 first\ndef5678 second\n",
+      statusOutput: LONG_STATUS,
+      untrackedFiles: "src/a.js\nsrc/b.js\n",
+      truncation: {
+        baseLog: { truncated: true, total: 60 },
+        status: { truncated: true, total: 137 },
+        untracked: { truncated: true, total: 92 },
+      },
+    });
+    const counts = [...result.matchAll(/showing (\d+) of (\d+) lines/g)];
+    assert.equal(counts.length, 3, "each cut capture must be labelled with counts");
+    for (const [text, shown, total] of counts) {
+      assert.ok(Number(shown) < Number(total), `numerator must be below the denominator, got ${text}`);
+    }
+    assert.deepEqual(counts.map((c) => c[1]), ["2", "50", "2"]);
+  });
+
+  it("labels nothing when the server says every capture was complete", () => {
+    // A full page that was NOT cut must not be labelled: an exactly-50-line
+    // change set is a real change set.
+    const result = renderBaseFacts({
+      baseSha: "abc",
+      baseLog: "abc1234 first",
+      statusOutput: LONG_STATUS,
+      untrackedFiles: "src/new.js\n",
+      truncation: {
+        baseLog: { truncated: false, total: 1 },
+        status: { truncated: false, total: 50 },
+        untracked: { truncated: false, total: 1 },
+      },
+    });
     assert.doesNotMatch(result, /truncated/);
-    assert.doesNotMatch(result, /Diff truncated/);
   });
 
-  it("joins existing fields with diff content", () => {
-    const result = renderBaseFacts({
-      baseSha: "sha1",
-      baseLog: "logline",
-      statusOutput: " M src/bar.js",
-      diffContent: "diff --git a/src/bar.js b/src/bar.js\n+new",
-    });
-    // Existing fields still present
-    assert.match(result, /Base commit: `sha1`/);
-    assert.match(result, /logline/);
-    assert.match(result, /src\/bar\.js/);
-    // Diff present
-    assert.match(result, /Diff content:/);
-    assert.match(result, /\+new/);
+  it("labels nothing when no truncation facts are supplied at all", () => {
+    const result = renderBaseFacts({ baseSha: "abc", statusOutput: " M src/foo.js", untrackedFiles: "src/new.js" });
+    assert.doesNotMatch(result, /truncated/);
+  });
+
+  it("still applies the character budget, in its existing vocabulary", () => {
+    // DIFF_BUDGET is 30000; the budget and its phrasing outlive the diff body
+    // they were introduced for.
+    const huge = "?? src/generated/f.js\n".repeat(2000);
+    const result = renderBaseFacts({ statusOutput: huge });
+    assert.ok(result.includes("Actual change set (`git status --porcelain`) (truncated to 30000 characters):"));
+    assert.ok(result.includes("**Change set truncated.**"));
+  });
+
+  it("applies the character budget to the untracked list too", () => {
+    const huge = Array.from({ length: 3000 }, (_, i) => "src/generated/f" + i + ".js").join("\n") + "\n";
+    const result = renderBaseFacts({ untrackedFiles: huge });
+    assert.ok(result.includes("New (untracked) files (truncated to 30000 characters):"));
+    assert.ok(result.includes("**Untracked list truncated.**"));
   });
 });
 
@@ -1251,16 +1347,16 @@ describe("renderBaseFacts untracked files", () => {
     assert.doesNotMatch(result, /New \(untracked\) files:/);
   });
 
-  it("works together with diffContent", () => {
+  it("works together with the rest of the base facts", () => {
     const result = renderBaseFacts({
       baseSha: "abc",
       baseLog: "log",
       statusOutput: " M src/foo.js\n?? newfile.ts",
-      diffContent: "diff --git a/src/foo.js b/src/foo.js\n+change",
       untrackedFiles: "newfile.ts",
     });
-    assert.match(result, /Diff content:/);
-    assert.match(result, /\+change/);
+    assert.match(result, /Base commit: `abc`/);
+    assert.match(result, /Actual change set/);
+    assert.match(result, /Fetching the diff is YOUR job/);
     assert.match(result, /New \(untracked\) files:/);
     assert.match(result, /`newfile\.ts`/);
     assert.match(result, /read_file_range/);
@@ -1539,7 +1635,6 @@ describe("renderContainerReviewInput", () => {
     baseSha: "0123456789abcdef",
     baseLog: "abc1234 first\ndef5678 second\n",
     statusOutput: " M src/foo.js\n",
-    diffContent: "diff --git a/src/foo.js b/src/foo.js\n@@ -1 +1 @@\n-old\n+new\n",
     untrackedFiles: "src/new.js\n",
   };
 
@@ -1554,16 +1649,18 @@ describe("renderContainerReviewInput", () => {
     assert.ok(out.includes("Do NOT rely on host cwd git state"));
   });
 
-  it("inlines the diff and the rest of the base facts", () => {
+  it("carries the base facts and the fetch instruction, and no diff body", () => {
     const out = renderContainerReviewInput(FACTS);
-    // The whole point of the block: the reviewer must not have to rebuild the
-    // change set by hand.
-    assert.ok(out.includes("diff --git a/src/foo.js b/src/foo.js"));
-    assert.ok(out.includes("+new"));
+    // The point of the block after #208: the reviewer is given the reference
+    // point it cannot derive, and told to fetch the diff against it.
     assert.ok(out.includes("- Base commit: `0123456789abcdef`"));
     assert.ok(out.includes("abc1234 first"));
     assert.ok(out.includes(" M src/foo.js"));
     assert.ok(out.includes("- `src/new.js`"));
+    assert.ok(out.includes("Fetching the diff is YOUR job"));
+    assert.ok(out.includes("`base` set to `0123456789abcdef`"));
+    assert.doesNotMatch(out, /diff --git/);
+    assert.ok(!out.includes("```diff"));
   });
 
   it("embeds renderBaseFacts verbatim, separated by a blank line", () => {
@@ -1572,15 +1669,28 @@ describe("renderContainerReviewInput", () => {
     assert.ok(out.endsWith("\n\n" + facts));
   });
 
-  it("stays well-formed when there is no diff at all", () => {
+  it("passes the truncation facts through to the base facts", () => {
+    const out = renderContainerReviewInput({
+      ...FACTS,
+      truncation: { status: { truncated: true, total: 137 } },
+    });
+    // FACTS.statusOutput is one line, so that is the numerator.
+    assert.ok(out.includes("**Change set truncated (showing 1 of 137 lines).**"));
+  });
+
+  it("stays well-formed when nothing could be read from the container", () => {
     const out = renderContainerReviewInput({ container: "c1" });
     assert.ok(out.startsWith("## Review target"));
     assert.ok(out.includes("container `c1`"));
     // Degraded, not malformed: every section is present and says what is
     // missing, and no fence is left open.
     assert.ok(out.includes("- Base commit: (unavailable)"));
-    assert.ok(out.includes("Diff content: (unavailable)"));
     assert.ok(out.includes("(empty change set)"));
+    // No base to name, so the instruction names the fallback instead of
+    // silently dropping the only sentence that says the fetch is the
+    // reviewer's job.
+    assert.ok(out.includes("Fetching the diff is YOUR job"));
+    assert.ok(out.includes("`worktree: true`"));
     assert.ok(!out.includes("```diff"));
     assert.equal((out.match(/```/g) || []).length % 2, 0);
     assert.ok(out.endsWith("must not be flagged as such."));
@@ -1589,6 +1699,7 @@ describe("renderContainerReviewInput", () => {
   it("does not throw when called with no arguments", () => {
     const out = renderContainerReviewInput();
     assert.ok(out.includes("## Review target"));
-    assert.ok(out.includes("Diff content: (unavailable)"));
+    assert.ok(out.includes("- Base commit: (unavailable)"));
+    assert.ok(out.includes("Fetching the diff is YOUR job"));
   });
 });

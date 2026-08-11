@@ -207,15 +207,16 @@ function buildReviewInput(cwd, base) {
  * `--base` decision for that command (kusabi #204).
  *
  * `task --phase review --container <cid>` dispatches the same reviewer the
- * chain does, and its agent definition promises the diff is already inlined in
- * its input -- but the task path built no review input at all, so the reviewer
- * rebuilt the change by hand (147 tool calls / 876s in one measured job, twice
- * running out of budget before it could review anything).  It now sends the
- * container-flavoured review input the chain sends, from the same renderer.
+ * chain does -- but the task path built no review input at all, so the
+ * reviewer rebuilt the change by hand (147 tool calls / 876s in one measured
+ * job, twice running out of budget before it could review anything).  It now
+ * sends the container-flavoured review input the chain sends, from the same
+ * renderer.  That input names the base and tells the reviewer to fetch the
+ * diff itself; it does not inline the diff body (kusabi #208).
  *
  * `--base` was accepted and silently dropped on this path.  It is now:
- *   - honoured on the container review, where the reviewer's diff is taken
- *     against that ref (committed and uncommitted work since it), and
+ *   - honoured on the container review, where it is the base commit the input
+ *     names as the ref to diff against, and
  *   - rejected loudly anywhere else on `task`, following the precedent
  *     `review --container` set in kusabi #153: a flag that cannot take effect
  *     must say so rather than pretend.
@@ -1628,7 +1629,7 @@ export async function runChainDriver({
   async function finishRound({ round, roundRecord, previousRecord, probeCtx }) {
     const {
       probesGreen, chainChangedPaths, chainNewlyChanged, chainStatusObserved,
-      chainStatusOutput, chainBaseLog, chainDeliverables, chainDiff, chainUntracked,
+      chainStatusOutput, chainBaseLog, chainDeliverables, chainUntracked, chainTruncation,
     } = probeCtx;
 
     // ---- phase 5: review (or skip when change set empty) ----
@@ -1641,7 +1642,7 @@ export async function runChainDriver({
       reviewJobStatus, reviewJobError,
     } = await runReviewPhase({
       container, brief, modelChain: effectiveReviewChain, chainId, cwd, previousRecord, baseSha: effectiveBaseSha,
-      chainStatusOutput, chainBaseLog, chainDiff, chainUntracked, roundRecord,
+      chainStatusOutput, chainBaseLog, chainUntracked, chainTruncation, roundRecord,
       chainChangedPaths, chainNewlyChanged, chainStatusObserved, chainDeliverables,
       flagsModel, _dispatchWithFallback: reviewDispatch,
     });
@@ -1890,8 +1891,8 @@ export async function runChainDriver({
           chainStatusOutput: reviewCtx.chainStatusOutput,
           chainBaseLog: reviewCtx.chainBaseLog,
           chainDeliverables: reviewCtx.chainDeliverables,
-          chainDiff: reviewCtx.chainDiff,
           chainUntracked: reviewCtx.chainUntracked,
+          chainTruncation: reviewCtx.chainTruncation,
           worktreeChanged: reviewCtx.worktreeChanged,
         };
         const result = await finishRound({

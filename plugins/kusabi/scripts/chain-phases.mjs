@@ -423,6 +423,7 @@ export async function runProbePhase({ baseSha, container, brief, callTool, workt
   let worktreeChanged = null;
   let chainStatusObserved = false;
   let chainStatusOutput = "";
+  let chainStatusTruncation = null;
 
   try {
     const p1Result = await runHeadCleanProbe({ baseSha, callTool, container, sourceLabel: "chain" });
@@ -448,6 +449,7 @@ export async function runProbePhase({ baseSha, container, brief, callTool, workt
     chainNewlyChanged = p3Result.newlyChangedPaths ?? chainChangedPaths;
     worktreeChanged = p3Result.worktreeChanged;
     chainStatusOutput = p3Result.statusOutput;
+    chainStatusTruncation = p3Result.statusTruncation ?? null;
     chainStatusObserved = true;
     probeResults.push(p3Result);
 
@@ -467,62 +469,113 @@ export async function runProbePhase({ baseSha, container, brief, callTool, workt
     probesGreen = false;
   }
 
-  // Base log + diff + untracked for review context (read-only; failures yield
+  // Base log + untracked for review context (read-only; failures yield
   // empty strings, never errors).
-  const diffCtx = await collectContainerDiffContext(callTool, container);
+  const baseCtx = await collectContainerBaseContext(callTool, container);
 
   return {
     probesGreen, probeResults, chainChangedPaths, chainNewlyChanged,
     chainStatusObserved, chainStatusOutput,
-    chainBaseLog: diffCtx.chainBaseLog, chainDeliverables,
-    chainDiff: diffCtx.chainDiff, chainUntracked: diffCtx.chainUntracked,
+    chainBaseLog: baseCtx.chainBaseLog, chainDeliverables,
+    chainUntracked: baseCtx.chainUntracked,
+    chainTruncation: { ...baseCtx.chainTruncation, status: chainStatusTruncation },
     worktreeChanged,
   };
 }
 
 /**
- * Collect the container-side context the review prompt renders: the base log,
- * the working diff, and untracked files.  Read-only sandbox_exec calls; every
- * failure yields an empty string rather than an error.
+ * Read one `sandbox_exec` result into its text plus what the server said about
+ * its own paging.
+ *
+ * sandbox_exec pages at `limit` (default 50) and reports the cut in
+ * `truncated` / `has_more`.  Call sites that read only `.output` cannot tell a
+ * complete capture from page one of many -- which is exactly how a 50-line
+ * slice of a diff reached the reviewer looking whole (kusabi #208).  A line
+ * count cannot substitute for the flags: "exactly 50 lines" is
+ * indistinguishable from a genuinely 50-line output.
+ *
+ * Only ONE count is taken from the response: `total_lines`, the denominator.
+ * `shown` is deliberately not read -- measured against the live server it
+ * equals `total_lines` even on a response that WAS cut (`seq 1 100` at
+ * limit=10 returns 10 lines and reports shown=101, total_lines=101), so
+ * rendering it produced "truncated (showing 101 of 101 lines)": a label that
+ * announces a cut and then prints numbers saying nothing was withheld.  The
+ * numerator is derived where the block is rendered, from the lines that block
+ * actually holds (`captureCutNote`, render.mjs).
+ *
+ * @param {object|null|undefined} result  A sandbox_exec result envelope.
+ * @returns {{ text: string, truncation: { truncated: boolean, total: number|null } }}
+ */
+export function readExecCapture(result) {
+  return {
+    text: result?.output ?? "",
+    truncation: {
+      // The OR is load-bearing, not redundant: summary truncation and paging
+      // are independent layers, and the server can report a cut capture with
+      // `truncated: false, has_more: true` (measured: `seq 1 60` at limit=25
+      // returns 25 lines with truncated=false, has_more=true).  Either flag
+      // means this text is not the whole output; do not simplify this to
+      // `truncated` alone.
+      truncated: result?.truncated === true || result?.has_more === true,
+      total: Number.isInteger(result?.total_lines) ? result.total_lines : null,
+    },
+  };
+}
+
+/**
+ * Collect the container-side context the review prompt renders: the base log
+ * and the untracked files, each with what sandbox_exec reported about its own
+ * paging.  Read-only sandbox_exec calls; every failure yields an empty string
+ * rather than an error.
+ *
+ * The working diff used to be captured here too and inlined into the review
+ * input.  It was one default-paged `sandbox_exec` call, so what the reviewer
+ * received was page one and nothing else -- a truncated, cruder copy of a
+ * diff the reviewer fetches itself with `diff_in_container` anyway.  The
+ * capture is gone rather than widened (kusabi #208); what the reviewer cannot
+ * work out for itself is the base, and that it still gets.
  *
  * @param {Function} callTool   The RPC callTool function (injectable).
  * @param {string}   container  Container ID.
- * @param {string|null} [base]  Ref to diff against (`git diff <base>`, which
- *        covers committed AND uncommitted work since that ref).  null -- the
- *        chain's default -- keeps the plain `git diff` (uncommitted vs HEAD).
- *        Callers MUST validate the ref first (assertContainerBaseRef); it is
- *        interpolated into a shell command here.
- * @returns {Promise<{ chainBaseLog: string, chainDiff: string, chainUntracked: string }>}
+ * @returns {Promise<{ chainBaseLog: string, chainUntracked: string,
+ *   chainTruncation: { baseLog: object|null, untracked: object|null } }>}
  */
-export async function collectContainerDiffContext(callTool, container, base = null) {
-  // Base log for review context (own try/catch so failure does not affect probesGreen)
+export async function collectContainerBaseContext(callTool, container) {
+  // Base log for review context (own try/catch so failure does not affect probesGreen).
+  // `git log --oneline -5` is five lines by construction: it is captured for
+  // truncation the same way as the lists, but it cannot page.
   let chainBaseLog = "";
+  let baseLogTruncation = null;
   try {
     const baseLogResult = await callTool("sandbox_exec", {
       container_id: container,
       commands: ["git log --oneline -5"],
     });
-    chainBaseLog = baseLogResult?.output ?? "";
+    const capture = readExecCapture(baseLogResult);
+    chainBaseLog = capture.text;
+    baseLogTruncation = capture.truncation;
   } catch { /* chainBaseLog stays "" */ }
 
-  // Diff content and untracked files for review context (own try/catch)
-  let chainDiff = "";
+  // Untracked files for review context (own try/catch).  This list has no
+  // bound -- a round that adds 60 files pages -- so its paging is recorded and
+  // rendered as a truncation label.
   let chainUntracked = "";
+  let untrackedTruncation = null;
   try {
-    const diffResult = await callTool("sandbox_exec", {
-      container_id: container,
-      commands: [base ? `git diff '${base}'` : "git diff"],
-    });
-    chainDiff = diffResult?.output ?? "";
-
     const untrackedResult = await callTool("sandbox_exec", {
       container_id: container,
       commands: ["git ls-files --others --exclude-standard"],
     });
-    chainUntracked = untrackedResult?.output ?? "";
-  } catch { /* chainDiff and chainUntracked stay "" */ }
+    const capture = readExecCapture(untrackedResult);
+    chainUntracked = capture.text;
+    untrackedTruncation = capture.truncation;
+  } catch { /* chainUntracked stays "" */ }
 
-  return { chainBaseLog, chainDiff, chainUntracked };
+  return {
+    chainBaseLog,
+    chainUntracked,
+    chainTruncation: { baseLog: baseLogTruncation, untracked: untrackedTruncation },
+  };
 }
 
 // A base ref is interpolated into a single-quoted shell word inside the
@@ -555,10 +608,14 @@ export function assertContainerBaseRef(base) {
  * that path reads the container's git state before the job is dispatched.
  *
  * `base`:
- *   - null (the chain's default) -- base commit is HEAD and the diff is the
- *     plain `git diff`, exactly what the chain's review renders.
- *   - a ref -- base commit is that ref resolved to a sha, and the diff is
- *     `git diff <ref>`, which covers committed AND uncommitted work since it.
+ *   - null (the chain's default) -- base commit is HEAD, exactly what the
+ *     chain's review renders.
+ *   - a ref -- base commit is that ref resolved to a sha.
+ *
+ * Either way the base commit is the ref the rendered input names as the one
+ * to diff against; the diff body itself is no longer captured or inlined
+ * (kusabi #208), so `base` reaches the reviewer as an instruction rather than
+ * as a truncated `git diff` capture.
  *
  * An unusable `--base` throws: the caller asked for a specific comparison and
  * silently reviewing a different one (or nothing) is the failure mode this
@@ -568,7 +625,7 @@ export function assertContainerBaseRef(base) {
  * @param {object}   opts
  * @param {string}   opts.container
  * @param {Function} opts.callTool        RPC callTool (injectable).
- * @param {string|null} [opts.base=null]  Ref to diff against.
+ * @param {string|null} [opts.base=null]  Ref the review is measured against.
  * @returns {Promise<string>} The rendered review input.
  * @throws {Error} when `base` is malformed or does not resolve in the container.
  */
@@ -603,23 +660,26 @@ export async function collectContainerReviewInput({ container, callTool, base = 
   }
 
   let statusOutput = "";
+  let statusTruncation = null;
   try {
     const statusResult = await callTool("sandbox_exec", {
       container_id: container,
       commands: ["git status --porcelain"],
     });
-    statusOutput = statusResult?.output ?? "";
+    const capture = readExecCapture(statusResult);
+    statusOutput = capture.text;
+    statusTruncation = capture.truncation;
   } catch { /* statusOutput stays "" -> "(empty change set)" */ }
 
-  const diffCtx = await collectContainerDiffContext(callTool, container, base);
+  const baseCtx = await collectContainerBaseContext(callTool, container);
 
   return renderContainerReviewInput({
     container,
     baseSha,
-    baseLog: diffCtx.chainBaseLog,
+    baseLog: baseCtx.chainBaseLog,
     statusOutput,
-    diffContent: diffCtx.chainDiff,
-    untrackedFiles: diffCtx.chainUntracked,
+    untrackedFiles: baseCtx.chainUntracked,
+    truncation: { ...baseCtx.chainTruncation, status: statusTruncation },
   });
 }
 
@@ -629,7 +689,7 @@ export async function collectContainerReviewInput({ container, callTool, base = 
  * Used by chain-resume (kusabi #153①) when a cancelled chain resumes at the
  * review phase of an interrupted round: the probes already ran and their
  * results are on the persisted round record; only the context the review
- * prompt renders (status, base log, diff, untracked) is re-collected from
+ * prompt renders (status, base log, untracked) is re-collected from
  * the container.
  *
  * `worktreeBaseline` should be null here: the interrupted round's changes ARE
@@ -656,6 +716,7 @@ export async function collectReviewContext({ container, brief, callTool, worktre
   let chainNewlyChanged = [];
   let worktreeChanged = false;
   let chainStatusOutput = "";
+  let chainStatusTruncation = null;
   let chainStatusObserved = false;
   try {
     const p3Result = await runDeliverablesProbe({
@@ -671,21 +732,22 @@ export async function collectReviewContext({ container, brief, callTool, worktre
     chainNewlyChanged = p3Result.newlyChangedPaths ?? chainChangedPaths;
     worktreeChanged = p3Result.worktreeChanged;
     chainStatusOutput = p3Result.statusOutput;
+    chainStatusTruncation = p3Result.statusTruncation ?? null;
     chainStatusObserved = true;
   } catch {
     // Degraded: fields keep their "unknown" defaults.
   }
-  const diffCtx = await collectContainerDiffContext(callTool, container);
+  const baseCtx = await collectContainerBaseContext(callTool, container);
 
   return {
     chainChangedPaths,
     chainNewlyChanged,
     chainStatusObserved,
     chainStatusOutput,
-    chainBaseLog: diffCtx.chainBaseLog,
+    chainBaseLog: baseCtx.chainBaseLog,
     chainDeliverables,
-    chainDiff: diffCtx.chainDiff,
-    chainUntracked: diffCtx.chainUntracked,
+    chainUntracked: baseCtx.chainUntracked,
+    chainTruncation: { ...baseCtx.chainTruncation, status: chainStatusTruncation },
     worktreeChanged,
   };
 }
@@ -805,7 +867,7 @@ export function shouldSkipReview({ chainStatusObserved, chainChangedPaths, chain
  */
 export async function runReviewPhase({
   container, brief, modelChain, chainId, cwd, previousRecord, baseSha,
-  chainStatusOutput, chainBaseLog, chainDiff, chainUntracked, roundRecord,
+  chainStatusOutput, chainBaseLog, chainUntracked, chainTruncation, roundRecord,
   chainChangedPaths, chainNewlyChanged, chainStatusObserved, chainDeliverables, flagsModel,
   _dispatchWithFallback: _dispatch = dispatchWithFallback,
 } = {}) {
@@ -832,18 +894,20 @@ export async function runReviewPhase({
     // The review input (the review-target block naming this container and the
     // read-side tools -- `read_file_range`, `search_in_container`,
     // `diff_in_container`, the verify gates -- followed by the base facts and
-    // the inlined diff) is rendered by renderContainerReviewInput in
-    // render.mjs.  It used to be built inline here; `task --phase review
-    // --container` sent no review input at all, so the extraction gives both
-    // routes the same block from one place (kusabi #204).  What this phase
-    // sends is unchanged, byte for byte.
+    // the instruction to fetch the diff against the base) is rendered by
+    // renderContainerReviewInput in render.mjs.  It used to be built inline
+    // here; `task --phase review --container` sent no review input at all, so
+    // the extraction gives both routes the same block from one place
+    // (kusabi #204).  The diff body it used to carry is gone: it was one
+    // default-paged capture, so it was page one of the diff and nothing else
+    // (kusabi #208).
     const reviewInput = renderContainerReviewInput({
       container,
       baseSha,
       baseLog: chainBaseLog,
       statusOutput: chainStatusOutput,
-      diffContent: chainDiff,
       untrackedFiles: chainUntracked,
+      truncation: chainTruncation,
     });
     const priorFindings = previousRecord?.findingsText || "(none -- first review round)";
 
@@ -1634,15 +1698,21 @@ export async function runVerifyProbe({ callTool, container, baseline }) {
 /**
  * P3: Check that changed files touch declared deliverables.
  *
- * Returns the probe result with `changedPaths` and `statusOutput` attached
- * for the chain call site.
+ * Returns the probe result with `changedPaths`, `statusOutput` and
+ * `statusTruncation` (what sandbox_exec reported about the status capture's
+ * own paging) attached for the chain call site.
  */
 export async function runDeliverablesProbe({ deliverables, headingPresent, callTool, container, baseline }) {
   const statusResult = await callTool("sandbox_exec", {
     container_id: container,
     commands: ["git status --porcelain"],
   });
-  const statusOutput = statusResult?.output ?? "";
+  // The status capture is paged like any other sandbox_exec call, and a change
+  // set can exceed a page.  What the server says about the cut is carried out
+  // with the text so the review input can label a partial list as partial
+  // (kusabi #208) instead of presenting page one as the whole change set.
+  const statusCapture = readExecCapture(statusResult);
+  const statusOutput = statusCapture.text;
   const changedPaths = parseChangedPaths(statusOutput);
 
   // When a baseline is provided, restrict the probe to paths newly changed
@@ -1674,6 +1744,7 @@ export async function runDeliverablesProbe({ deliverables, headingPresent, callT
   probeResult.changedPaths = changedPaths;
   probeResult.newlyChangedPaths = newlyChangedPaths;
   probeResult.statusOutput = statusOutput;
+  probeResult.statusTruncation = statusCapture.truncation;
   probeResult.worktreeChanged = worktreeChanged;
   return probeResult;
 }

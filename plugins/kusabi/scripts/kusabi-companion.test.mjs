@@ -4689,17 +4689,19 @@ describe("install-agents skills distribution", () => {
 });
 
 // ---------------------------------------------------------------------------
-// buildTaskReviewInput — `task --phase review --container` gets the diff (#204)
+// buildTaskReviewInput — `task --phase review --container` gets an input (#204)
 // ---------------------------------------------------------------------------
 // The task path built no review input at all: the reviewer was told the diff
 // was inlined, found none, and rebuilt the change by hand.  This is the seam
 // cmdTask calls, so it is where the behaviour is pinned — including the two
 // dispatches that must be untouched (another phase, and review without a
 // container) and the --base decision.
+//
+// The input no longer inlines the diff body (kusabi #208): what --base selects
+// is the base commit the input names as the ref to fetch against, so that is
+// what these assert instead of a captured `git diff <ref>`.
 
 describe("buildTaskReviewInput", () => {
-  const DIFF = "diff --git a/src/foo.js b/src/foo.js\n@@ -1 +1 @@\n-old\n+new\n";
-
   function containerTool(overrides = {}) {
     const commands = [];
     const callTool = async (tool, params) => {
@@ -4709,16 +4711,14 @@ describe("buildTaskReviewInput", () => {
       if (cmd === "git rev-parse HEAD") return { output: "deadbeefcafe\n" };
       if (cmd === "git status --porcelain") return { output: " M src/foo.js\n" };
       if (cmd === "git log --oneline -5") return { output: "deadbee latest\n" };
-      if (cmd === "git diff") return { output: DIFF };
       if (cmd.startsWith("git rev-parse --verify")) return { output: "c355fa61a7fee5402ed7ba999bd2fe2eeb46a842\n" };
-      if (cmd.startsWith("git diff '")) return { output: DIFF };
       return { output: "" };
     };
     return { commands, callTool };
   }
 
   it("builds the container review input for --phase review --container", async () => {
-    const { callTool } = containerTool();
+    const { commands, callTool } = containerTool();
     const input = await buildTaskReviewInput({
       phase: "review",
       flags: { container: "cid123" },
@@ -4728,10 +4728,16 @@ describe("buildTaskReviewInput", () => {
     assert.ok(input.includes("## Review target"));
     assert.ok(input.includes("container `cid123`"));
     assert.ok(input.includes("`diff_in_container`"));
-    // Content, not length: the diff must actually be there.
-    assert.ok(input.includes("diff --git a/src/foo.js b/src/foo.js"));
-    assert.ok(input.includes("+new"));
     assert.ok(input.includes("### Base change-set context (machine-recorded)"));
+    // Content, not length: the base and the fetch instruction must be there,
+    // and the diff body must not.
+    assert.ok(input.includes("- Base commit: `deadbeefcafe`"));
+    assert.ok(input.includes("Fetching the diff is YOUR job"));
+    assert.ok(!input.includes("diff --git"));
+    assert.ok(
+      !commands.some((c) => c.startsWith("git diff")),
+      `no git diff may be captured, got: ${JSON.stringify(commands)}`,
+    );
   });
 
   it("reflects --base in the input it builds", async () => {
@@ -4741,9 +4747,10 @@ describe("buildTaskReviewInput", () => {
       flags: { container: "cid123", base: "c355fa6" },
       callTool,
     });
-    assert.ok(commands.includes("git diff 'c355fa6'"), `expected a based diff, got: ${JSON.stringify(commands)}`);
+    assert.ok(commands.some((c) => c.startsWith("git rev-parse --verify --quiet 'c355fa6^{commit}'")));
     assert.ok(input.includes("- Base commit: `c355fa61a7fee5402ed7ba999bd2fe2eeb46a842`"));
-    assert.ok(input.includes("diff --git a/src/foo.js b/src/foo.js"));
+    assert.ok(input.includes("`base` set to `c355fa61a7fee5402ed7ba999bd2fe2eeb46a842`"));
+    assert.ok(!commands.some((c) => c.startsWith("git diff")));
   });
 
   it("rejects --base loudly when it cannot take effect (implement phase)", async () => {
