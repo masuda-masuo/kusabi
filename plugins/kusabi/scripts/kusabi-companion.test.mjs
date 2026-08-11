@@ -22,6 +22,8 @@ import {
   resolveResumeReviewContext,
   resolveResumeReworkContext,
   buildTaskReviewInput,
+  resolveOrchestratorRecord,
+  ORCH_SESSION_ENV,
 } from "./kusabi-companion.mjs";
 import { dispatchWithFallback } from "./prompt-execution.mjs";
 import { claudeDispatch } from "./claude-dispatch.mjs";
@@ -363,6 +365,121 @@ describe("orchestrator recording", () => {
       session: "abc123",
       date: "2026-01-01",
     });
+  });
+});
+
+// orchestrator session from the environment (kusabi #227)
+// ---------------------------------------------------------------------------
+// The session recorded on job/chain records must come from
+// CLAUDE_CODE_SESSION_ID when the companion runs inside an orchestrator
+// session: metrics-report joins chain.orch_session as a PREFIX of transcript
+// session ids, and a hand-typed label can never join.  The signature line
+// keeps supplying model/date, and supplies session only as the fallback.
+
+describe("resolveOrchestratorRecord (kusabi #227)", () => {
+  const SIGNED = "Orchestrator: claude-fable-5 | session cc-20260811-215 | 2026-08-12\n\nDo the work.";
+  const UNSIGNED = "Just a normal brief with no orchestrator line.\n\nDo the work.";
+  const ENV_UUID = "edafbf9f-03ae-4bce-ba2e-8d2d07af5f58";
+
+  it("env session beats the hand-typed signature session; model/date still come from the line", () => {
+    const record = resolveOrchestratorRecord(SIGNED, { [ORCH_SESSION_ENV]: ENV_UUID });
+    assert.deepEqual(record, {
+      model: "claude-fable-5",
+      session: ENV_UUID,
+      date: "2026-08-12",
+      sessionSource: "env",
+    });
+  });
+
+  it("without the env var the signature session is recorded, exactly as before", () => {
+    const record = resolveOrchestratorRecord(SIGNED, {});
+    assert.deepEqual(record, {
+      model: "claude-fable-5",
+      session: "cc-20260811-215",
+      date: "2026-08-12",
+    });
+    // The provenance marker must not appear on this path: its absence is what
+    // every record written before #227 means.
+    assert.deepEqual(record, parseOrchestratorSignature(SIGNED));
+    assert.ok(!("sessionSource" in record));
+  });
+
+  it("an empty or whitespace-only env var is treated as absent", () => {
+    for (const value of ["", "   ", "\n"]) {
+      assert.deepEqual(resolveOrchestratorRecord(SIGNED, { [ORCH_SESSION_ENV]: value }),
+        parseOrchestratorSignature(SIGNED));
+    }
+  });
+
+  it("no signature and no env var still records nothing (null), as today", () => {
+    assert.equal(resolveOrchestratorRecord(UNSIGNED, {}), null);
+    assert.equal(resolveOrchestratorRecord(UNSIGNED, { [ORCH_SESSION_ENV]: "  " }), null);
+    assert.equal(resolveOrchestratorRecord("", {}), null);
+    assert.equal(resolveOrchestratorRecord(null, {}), null);
+  });
+
+  it("env var with no signature line at all persists a record carrying the env session", () => {
+    const record = resolveOrchestratorRecord(UNSIGNED, { [ORCH_SESSION_ENV]: ENV_UUID });
+    assert.deepEqual(record, {
+      model: null,
+      session: ENV_UUID,
+      date: null,
+      sessionSource: "env",
+    });
+  });
+
+  it("a signature line without a session field takes the env session", () => {
+    const brief = "Orchestrator: claude-fable-5\n\nDo the work.";
+    const record = resolveOrchestratorRecord(brief, { [ORCH_SESSION_ENV]: ENV_UUID });
+    assert.equal(record.model, "claude-fable-5");
+    assert.equal(record.session, ENV_UUID);
+    assert.equal(record.sessionSource, "env");
+  });
+
+  it("the env var is trimmed before it is recorded", () => {
+    const record = resolveOrchestratorRecord(SIGNED, { [ORCH_SESSION_ENV]: `  ${ENV_UUID}\n` });
+    assert.equal(record.session, ENV_UUID);
+  });
+
+  it("provenance is machine-readable: sessionSource === 'env' vs absent for the signature", () => {
+    const fromEnv = resolveOrchestratorRecord(SIGNED, { [ORCH_SESSION_ENV]: ENV_UUID });
+    const fromSignature = resolveOrchestratorRecord(SIGNED, {});
+    assert.equal(fromEnv.sessionSource, "env");
+    assert.equal(fromSignature.sessionSource, undefined);
+  });
+
+  it("keeps the reader contract: model/session/date are the same fields chain-ingest reads", () => {
+    // chain-ingest.mjs stores orchestrator.model / .session / .date when each
+    // is a string; nothing there (or in metrics-report.mjs) had to change.
+    const record = resolveOrchestratorRecord(SIGNED, { [ORCH_SESSION_ENV]: ENV_UUID });
+    assert.equal(typeof record.model, "string");
+    assert.equal(typeof record.session, "string");
+    assert.equal(typeof record.date, "string");
+  });
+
+  it("reads process.env when no env object is passed", () => {
+    const saved = process.env[ORCH_SESSION_ENV];
+    try {
+      process.env[ORCH_SESSION_ENV] = ENV_UUID;
+      assert.equal(resolveOrchestratorRecord(SIGNED).session, ENV_UUID);
+      delete process.env[ORCH_SESSION_ENV];
+      assert.equal(resolveOrchestratorRecord(SIGNED).session, "cc-20260811-215");
+    } finally {
+      if (saved === undefined) delete process.env[ORCH_SESSION_ENV];
+      else process.env[ORCH_SESSION_ENV] = saved;
+    }
+  });
+
+  it("both dispatch sites resolve through it, not through the bare parser (source guard)", () => {
+    // cmdTask / cmdChain are not exported; this pins the wiring.
+    const source = fs.readFileSync(path.join(import.meta.dirname, "kusabi-companion.mjs"), "utf8");
+    const cmdTaskSource = source.slice(source.indexOf("async function cmdTask("), source.indexOf("async function cmdReview("));
+    const cmdChainSource = source.slice(source.indexOf("async function cmdChain("));
+    assert.ok(cmdTaskSource.includes("const orchestrator = resolveOrchestratorRecord(text);"));
+    assert.ok(cmdChainSource.includes("const orchestrator = resolveOrchestratorRecord(text);"));
+    // No dispatch site may bypass the resolution by parsing the brief itself.
+    assert.ok(!cmdTaskSource.includes("parseOrchestratorSignature("));
+    assert.ok(!cmdChainSource.includes("parseOrchestratorSignature("));
   });
 });
 
