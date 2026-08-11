@@ -193,40 +193,82 @@ export function firstRoute(chain) {
 }
 
 // ---------------------------------------------------------------------------
-// per-entry backend prefix (kusabi #192)
+// per-entry backend prefix (kusabi #192; third backend kusabi #199)
 // ---------------------------------------------------------------------------
 // Config chain entries may carry an explicit backend prefix: an entry of the
 // form `claude/<model>` selects the claude backend with model `<model>` (a
-// bare alias like `opus` or a full model id); any entry WITHOUT the prefix is
+// bare alias like `opus` or a full model id), and `agy/<model>` selects the
+// agy (Antigravity CLI) backend the same way; any entry WITHOUT a prefix is
 // an opencode `provider/model[:variant]` route, byte-identical to before the
-// prefix existed.  `claude` is not an opencode provider name, so the prefix
-// is unambiguous.  The `:variant` suffix stays rejected on the claude
-// backend exactly as today (see claude-dispatch.mjs validateClaudeModel).
+// prefix existed.  Neither `claude` nor `agy` is an opencode provider name,
+// so the prefixes are unambiguous.  The `:variant` suffix stays rejected on
+// both prefixed backends (see claude-dispatch.mjs validateClaudeModel /
+// agy-dispatch.mjs validateAgyModel).
 
 export const CLAUDE_ENTRY_PREFIX = "claude/";
+export const AGY_ENTRY_PREFIX = "agy/";
 
 /**
- * The backend-naming prefixes, as a TABLE: a third backend is one row here,
- * never a new branch in the resolution.  opencode has no row on purpose —
- * it is the unprefixed default (an entry with no row's prefix is an
- * opencode `provider/model[:variant]` route), which is what keeps every
- * pre-prefix config byte-identical.
+ * The backend-naming prefixes, as a TABLE: a further backend is one row
+ * here, never a new branch in the resolution — which is exactly how the agy
+ * backend (kusabi #199) was added.  opencode has no row on purpose — it is
+ * the unprefixed default (an entry with no row's prefix is an opencode
+ * `provider/model[:variant]` route), which is what keeps every pre-prefix
+ * config byte-identical.
  *
- * @type {ReadonlyArray<{ prefix: string, backend: "claude" }>}
+ * @type {ReadonlyArray<{ prefix: string, backend: "claude"|"agy" }>}
  */
 export const BACKEND_ENTRY_PREFIXES = [
   { prefix: CLAUDE_ENTRY_PREFIX, backend: "claude" },
+  { prefix: AGY_ENTRY_PREFIX, backend: "agy" },
 ];
+
+/**
+ * Which backends can continue a previous session, as a TABLE.
+ *
+ * opencode and claude both resume (`opencode -s <ses_*>` /
+ * `claude -p --resume <uuid>`).  The agy backend is fresh-dispatch only in
+ * v1 (kusabi #199): the Antigravity CLI records a `conversation_id` that
+ * kusabi stores as the job's `sessionID`, but nothing consumes it yet.
+ *
+ * The seams that carry a session across rounds consult this rather than
+ * naming a backend, so a backend that cannot resume never has a session
+ * manufactured for it — and an operator who ASKS for one (`--session` /
+ * `--resume-last`) is told no, loudly, instead of having the request
+ * silently dropped.
+ *
+ * @type {Readonly<Record<string, boolean>>}
+ */
+export const BACKEND_RESUME_SUPPORT = {
+  opencode: true,
+  claude: true,
+  agy: false,
+};
+
+/**
+ * True when `backend` can continue a previous session.  An unknown backend
+ * is treated as resuming (the pre-#199 default), so this can never silently
+ * disable resume for a backend added later without a table row.
+ *
+ * @param {string|null|undefined} backend
+ * @returns {boolean}
+ */
+export function backendSupportsResume(backend) {
+  const known = BACKEND_RESUME_SUPPORT[backend ?? "opencode"];
+  return known === undefined ? true : known;
+}
 
 /**
  * Split one route entry into its backend and its backend-specific model
  * spelling.  `claude/opus` → `{ route: "opus", backend: "claude" }`;
- * `opencode/x:max` (and any other unprefixed entry) → itself with backend
- * "opencode".  A bare `claude/` (empty model) is a config error.
+ * `agy/gemini-3.6-flash-high` → `{ route: "gemini-3.6-flash-high",
+ * backend: "agy" }`; `opencode/x:max` (and any other unprefixed entry) →
+ * itself with backend "opencode".  A bare prefix (`claude/`, `agy/` — an
+ * empty model) is a config error.
  *
  * @param {string} route
- * @returns {{ route: string, backend: "opencode"|"claude" }}
- * @throws {Error} On a `claude/` entry with an empty model.
+ * @returns {{ route: string, backend: "opencode"|"claude"|"agy" }}
+ * @throws {Error} On a prefixed entry with an empty model.
  */
 export function splitRouteBackend(route) {
   if (typeof route === "string") {
@@ -262,13 +304,13 @@ export function splitRouteBackend(route) {
  * that NAMES a backend may move it.
  *
  * The grammar is the config's own (`splitRouteBackend`), including its
- * deliberate asymmetry: a leading `claude/` is a BACKEND, while the first
- * segment of any other slashed identifier is an opencode providerID.  That
- * is why the no-slash case is answered before the split — a bare alias must
- * not read as an opencode route.
+ * deliberate asymmetry: a leading `claude/` or `agy/` is a BACKEND, while
+ * the first segment of any other slashed identifier is an opencode
+ * providerID.  That is why the no-slash case is answered before the split —
+ * a bare alias must not read as an opencode route.
  *
  * @param {string|null|undefined} value — the `--model` flag value.
- * @returns {{ backend: "claude"|"opencode"|null, model: string }|null}
+ * @returns {{ backend: "claude"|"agy"|"opencode"|null, model: string }|null}
  *          null when no `--model` was given.
  * @throws {Error} On a prefix with an empty model (`--model claude/`).
  */
@@ -302,16 +344,22 @@ export function chainNamesBackend(chain, backend) {
  * Determine the single backend of a (tiered) chain array from its entries.
  *
  * kusabi #192 invariant: one phase's chain array is single-backend.  An
- * array mixing `claude/` entries with opencode entries is a config error and
- * throws — the per-phase backend would be ambiguous.  The check runs at
- * command start (resolveDispatchBackend), before createChainDir and before
- * any job is dispatched.  Per-route mixed ladders within one phase are out of
- * scope by design.
+ * array mixing entries of two backends (`claude/` with opencode, `agy/`
+ * with `claude/`, …) is a config error and throws — the per-phase backend
+ * would be ambiguous.  The check runs at command start
+ * (resolveDispatchBackend), before createChainDir and before any job is
+ * dispatched.  Per-route mixed ladders within one phase are out of scope by
+ * design.
+ *
+ * The message names the TWO backends actually found rather than a hardcoded
+ * pair, so a third backend (kusabi #199) reports itself instead of being
+ * described as something it is not.
  *
  * @param {(string|string[])[]} chain
- * @returns {"opencode"|"claude"} The chain's single backend ("opencode" for
- *          an empty/unknown chain, which callers never reach post-validation).
- * @throws {Error} When the array mixes claude/ and opencode entries.
+ * @returns {"opencode"|"claude"|"agy"} The chain's single backend
+ *          ("opencode" for an empty/unknown chain, which callers never reach
+ *          post-validation).
+ * @throws {Error} When the array mixes two backends' entries.
  */
 export function resolveChainBackend(chain) {
   let backend = null;
@@ -323,7 +371,7 @@ export function resolveChainBackend(chain) {
         backend = b;
       } else if (backend !== b) {
         throw new Error(
-          `kusabi config: chain mixes backends — one chain array contains both claude/ and opencode entries ` +
+          `kusabi config: chain mixes backends — one chain array contains both ${backend} and ${b} entries ` +
           `(${JSON.stringify(chain)}); each phase's chain must be single-backend (per-phase mixing is ` +
           `across phases, never within one array)`
         );
@@ -334,19 +382,28 @@ export function resolveChainBackend(chain) {
 }
 
 /**
- * Strip the `claude/` prefix from every route of a (tiered) chain, preserving
- * the tier shape.  Used once the claude backend is decided: the downstream
- * claude dispatch expects bare aliases / full model ids, never the prefix.
+ * Strip the backend prefix (`claude/`, `agy/`) from every route of a
+ * (tiered) chain, preserving the tier shape.  Used once the backend is
+ * decided: the downstream dispatch expects that backend's own model
+ * spelling, never the prefix.  Unprefixed (opencode) entries pass through
+ * byte-identical.
  *
  * @param {(string|string[])[]} chain
  * @returns {(string|string[])[]}
  */
-export function stripClaudePrefixChain(chain) {
+export function stripBackendPrefixChain(chain) {
   return chain.map((tier) => {
     if (Array.isArray(tier)) return tier.map((r) => splitRouteBackend(r).route);
     return splitRouteBackend(tier).route;
   });
 }
+
+/**
+ * Pre-#199 name for `stripBackendPrefixChain`, kept as an alias because it
+ * never was claude-specific (it strips whatever prefix `splitRouteBackend`
+ * recognises) and existing callers/tests import it under this name.
+ */
+export const stripClaudePrefixChain = stripBackendPrefixChain;
 
 export function resolveModel({ flag, phase, config }) {
   // Determine the full ordered chain (may be tiered: string|string[])

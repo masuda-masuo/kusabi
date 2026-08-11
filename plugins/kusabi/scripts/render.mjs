@@ -48,18 +48,33 @@ export function renderHeader(job) {
     }
   }
 
-  // Backend-aware header/session lines (kusabi #184 Job B): a missing
-  // `backend` field predates the backend split and means opencode, so the
-  // opencode output stays byte-identical.  A claude job shows the claude
-  // continuation shape (`claude -p --resume <id>`); the session id is the
-  // one recorded on the job (a UUID for claude, ses_* for opencode).
+  // Backend-aware header/session lines (kusabi #184 Job B, third backend
+  // kusabi #199): a missing `backend` field predates the backend split and
+  // means opencode, so the opencode output stays byte-identical.  A claude
+  // job shows the claude continuation shape (`claude -p --resume <id>`); the
+  // session id is the one recorded on the job (a UUID for claude and agy,
+  // ses_* for opencode).
+  //
+  // The agy line names its id WITHOUT a continuation command on purpose: agy
+  // is fresh-dispatch only in v1, so printing a resume incantation would
+  // advertise something the backend cannot do.  The conversation id is still
+  // shown — it is how an operator finds the run in the agy UI.
   const isClaude = job.backend === "claude";
+  const isAgy = job.backend === "agy";
+  const backendLabel = isClaude ? "claude" : (isAgy ? "agy" : "opencode");
+
+  let sessionLine;
+  if (isAgy) {
+    sessionLine = `session: ${job.sessionID} (agy conversation id; resume is not supported on this backend)`;
+  } else if (isClaude) {
+    sessionLine = `session: ${job.sessionID} (continue in claude: \`claude -p --resume ${job.sessionID}\`)`;
+  } else {
+    sessionLine = `session: ${job.sessionID} (continue in opencode: \`opencode -s ${job.sessionID}\`)`;
+  }
 
   return [
-    `${isClaude ? "claude" : "opencode"} ${job.kind} ${job.id} — ${job.status} (${durationS(job)}s)`,
-    isClaude
-      ? `session: ${job.sessionID} (continue in claude: \`claude -p --resume ${job.sessionID}\`)`
-      : `session: ${job.sessionID} (continue in opencode: \`opencode -s ${job.sessionID}\`)`,
+    `${backendLabel} ${job.kind} ${job.id} — ${job.status} (${durationS(job)}s)`,
+    sessionLine,
     ...(job.phase ? [`phase: ${job.phase}`] : []),
     ...(routeLine.length ? routeLine : []),
     ...usageLine,
