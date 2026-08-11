@@ -836,14 +836,17 @@ function cmdStatus(cwd, { text }) {
     if (!job) return `no such job: ${jobId}`;
     // Check chain ownership for this job
     const s = job.stats ?? {};
-    // A stats object marked `instrumented: false` (the claude v1 backend)
-    // carries STRUCTURAL counters, never measured ones — presenting them
-    // as `events: 0, steps: 0, …` would report structural zeros as
-    // measured (kusabi #215).  The marker is the signal; `backend` is
-    // never consulted.  Records without the marker (opencode and legacy)
-    // render the counters as before.
+    // A stats object marked `instrumented: false` carries STRUCTURAL
+    // counters, never measured ones — presenting them as `events: 0,
+    // steps: 0, …` would report structural zeros as measured (kusabi
+    // #215).  The marker is the signal; `backend` is never consulted.
+    // Since kusabi #215 Job B the claude backend streams real events and
+    // marks every new dispatch `instrumented: true`; this marker now
+    // identifies only legacy/pre-#215 records already on disk.  Records
+    // without the marker (opencode and instrumented claude) render the
+    // counters as before.
     const statsLines = s.instrumented === false
-      ? ["stats: not instrumented (no event stream in v1)"]
+      ? ["stats: not instrumented (legacy record, no event stream)"]
       : [
           `events: ${s.events ?? 0}, steps: ${s.steps ?? 0}, last tool: ${s.lastTool ?? "-"}`,
           `permissions: ${s.permissionsAllowed ?? 0} allowed, ${s.permissionsRejected ?? 0} rejected`,

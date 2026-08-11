@@ -28,6 +28,9 @@ import {
   mapClaudeUsage,
   classifyClaudeTerminalFailure,
   renderClaudeQuotaError,
+  parseClaudeStreamLine,
+  initClaudeStreamAccumulator,
+  applyClaudeStreamEvent,
   allowedToolsForAgent,
   disallowedToolsForAgent,
   applyToolDenies,
@@ -41,7 +44,7 @@ import { dispatchWithFallback } from "./prompt-execution.mjs";
 import { runImplementPhase } from "./chain-phases.mjs";
 import { WRITE_TOOL_NAMES, implementDenyTools, firstRoute } from "./cli.mjs";
 import { stateDirFor, readJson } from "./state-paths.mjs";
-import { loadJob, jobDir } from "./job-store.mjs";
+import { loadJob, jobDir, listJobs } from "./job-store.mjs";
 
 // =========================================================================
 // pure helpers
@@ -179,7 +182,8 @@ describe("buildClaudeArgs", () => {
       "-p",
       "--strict-mcp-config",
       "--setting-sources", "",
-      "--output-format", "json",
+      "--output-format", "stream-json",
+      "--verbose",
       "--model", "opus",
       "--allowedTools", "a,b",
       "--disallowedTools", "mcp__sunaba__publish,Bash",
@@ -353,6 +357,105 @@ describe("mapClaudeUsage", () => {
 });
 
 // =========================================================================
+// NDJSON stream parsing — pure (kusabi #215 Job B)
+// =========================================================================
+
+describe("parseClaudeStreamLine", () => {
+  it("parses a valid JSON object line", () => {
+    const evt = parseClaudeStreamLine('{"type":"system","subtype":"init"}');
+    assert.deepEqual(evt, { type: "system", subtype: "init" });
+  });
+
+  it("returns null for a blank line", () => {
+    assert.equal(parseClaudeStreamLine(""), null);
+    assert.equal(parseClaudeStreamLine("   "), null);
+  });
+
+  it("returns null for non-JSON prose (the observed leading warning line)", () => {
+    assert.equal(
+      parseClaudeStreamLine("Warning: no stdin data received in 3s, proceeding without it."),
+      null,
+    );
+  });
+
+  it("returns null for JSON that is not an object (array, number, string)", () => {
+    assert.equal(parseClaudeStreamLine("[1,2,3]"), null);
+    assert.equal(parseClaudeStreamLine("42"), null);
+    assert.equal(parseClaudeStreamLine('"just a string"'), null);
+    assert.equal(parseClaudeStreamLine("null"), null);
+  });
+});
+
+describe("applyClaudeStreamEvent", () => {
+  it("counts every recognized event as one of 'events', regardless of type", () => {
+    const acc = initClaudeStreamAccumulator();
+    applyClaudeStreamEvent(acc, { type: "system", subtype: "init", session_id: "s1" }, "t1");
+    applyClaudeStreamEvent(acc, { type: "user", message: { content: [] } }, "t2");
+    assert.equal(acc.events, 2);
+    assert.equal(acc.lastActivity, "t2");
+  });
+
+  it("captures the session id from system/init only", () => {
+    const acc = initClaudeStreamAccumulator();
+    applyClaudeStreamEvent(acc, { type: "system", subtype: "thinking_tokens", estimated_tokens: 10 }, "t1");
+    assert.equal(acc.sessionIdFromInit, null);
+    applyClaudeStreamEvent(acc, { type: "system", subtype: "init", session_id: "claude-init-1" }, "t2");
+    assert.equal(acc.sessionIdFromInit, "claude-init-1");
+  });
+
+  it("keeps the most recent rate_limit_event, stamped with when it was observed", () => {
+    const acc = initClaudeStreamAccumulator();
+    applyClaudeStreamEvent(acc, { type: "rate_limit_event", rate_limit_info: { resetsAt: 1 } }, "t1");
+    applyClaudeStreamEvent(acc, { type: "rate_limit_event", rate_limit_info: { resetsAt: 2 } }, "t2");
+    assert.deepEqual(acc.rateLimit, { info: { resetsAt: 2 }, observedAt: "t2" });
+  });
+
+  it("counts tool_use blocks as steps and tracks the most recent tool name", () => {
+    const acc = initClaudeStreamAccumulator();
+    applyClaudeStreamEvent(acc, {
+      type: "assistant",
+      message: {
+        model: "claude-sonnet-4-5",
+        content: [
+          { type: "text", text: "thinking" },
+          { type: "tool_use", id: "1", name: "mcp__sunaba__read_file_range" },
+        ],
+      },
+    }, "t1");
+    applyClaudeStreamEvent(acc, {
+      type: "assistant",
+      message: { model: "claude-sonnet-4-5", content: [{ type: "tool_use", id: "2", name: "mcp__sunaba__edit_file" }] },
+    }, "t2");
+    assert.equal(acc.steps, 2);
+    assert.equal(acc.lastTool, "mcp__sunaba__edit_file");
+    // Same model on both messages — deduped, not doubled.
+    assert.deepEqual(acc.models, ["claude-sonnet-4-5"]);
+  });
+
+  it("dedupes models across multiple assistant messages", () => {
+    const acc = initClaudeStreamAccumulator();
+    applyClaudeStreamEvent(acc, { type: "assistant", message: { model: "opus", content: [] } }, "t1");
+    applyClaudeStreamEvent(acc, { type: "assistant", message: { model: "sonnet", content: [] } }, "t2");
+    applyClaudeStreamEvent(acc, { type: "assistant", message: { model: "opus", content: [] } }, "t3");
+    assert.deepEqual(acc.models, ["opus", "sonnet"]);
+  });
+
+  it("keeps the LAST result event when a stream carries more than one", () => {
+    const acc = initClaudeStreamAccumulator();
+    applyClaudeStreamEvent(acc, { type: "result", result: "first" }, "t1");
+    applyClaudeStreamEvent(acc, { type: "result", result: "second" }, "t2");
+    assert.equal(acc.resultEvent.result, "second");
+  });
+
+  it("ignores user events beyond counting them (no stat they contribute today)", () => {
+    const acc = initClaudeStreamAccumulator();
+    applyClaudeStreamEvent(acc, { type: "user", message: { content: [{ type: "tool_result", content: "ok" }] } }, "t1");
+    assert.equal(acc.events, 1);
+    assert.equal(acc.steps, 0);
+  });
+});
+
+// =========================================================================
 // classifyClaudeTerminalFailure — quota exhaustion classification (kusabi
 // #215): the real 2026-08-11 session-limit payload and its neighbours.
 // =========================================================================
@@ -477,6 +580,38 @@ describe("classifyClaudeTerminalFailure", () => {
       result: "rate limit reached",
     });
     assert.equal(f.reset, "2026-08-12T00:00:00Z");
+  });
+
+  // kusabi #215 Job B item 4: the rate_limit_event stream feed is a
+  // FALLBACK reset source, consulted only when the payload itself names
+  // none — text and structured fields always win when present.
+  it("falls back to the streamed rate_limit_info.resetsAt when the payload names no reset", () => {
+    const f = classifyClaudeTerminalFailure(
+      { type: "result", is_error: true, api_error_status: 429, result: "You've hit your session limit." },
+      { rateLimit: { info: { resetsAt: 1786424400 }, observedAt: "2026-08-11T05:00:00.000Z" } },
+    );
+    assert.equal(f.reset, new Date(1786424400 * 1000).toISOString());
+  });
+
+  it("prefers the payload's own reset text over the streamed rate_limit_info", () => {
+    const f = classifyClaudeTerminalFailure(
+      REAL_SESSION_LIMIT_PAYLOAD,
+      { rateLimit: { info: { resetsAt: 1786424400 }, observedAt: "2026-08-11T05:00:00.000Z" } },
+    );
+    assert.equal(f.reset, "1:20am (Asia/Tokyo)");
+  });
+
+  it("ignores a malformed rate_limit_info (no resetsAt) and stays null", () => {
+    const f = classifyClaudeTerminalFailure(
+      { type: "result", is_error: true, api_error_status: 429, result: "You've hit your session limit." },
+      { rateLimit: { info: { status: "allowed" }, observedAt: "2026-08-11T05:00:00.000Z" } },
+    );
+    assert.equal(f.reset, null);
+  });
+
+  it("works with no rateLimit argument at all (backward compatible, PR #218 call shape)", () => {
+    const f = classifyClaudeTerminalFailure(REAL_SESSION_LIMIT_PAYLOAD);
+    assert.equal(f.reset, "1:20am (Asia/Tokyo)");
   });
 
   it("returns null for a non-object payload", () => {
@@ -730,8 +865,109 @@ if (mode === "quota-session") {
   }));
   process.exit(0);
 }
-if (mode === "slow" || mode === "slow-with-child") {
-  if (mode === "slow-with-child") {
+if (mode === "stream-full") {
+  // The full realistic captured sequence (kusabi #215 Job B acceptance
+  // criterion 2): a leading non-JSON warning line (observed on the real
+  // CLI), system/init, a live rate_limit_event, an assistant message with
+  // TWO tool_use blocks, a user tool_result, and the terminal result event.
+  console.log("Warning: no stdin data received in 3s, proceeding without it.");
+  console.log(JSON.stringify({ type: "system", subtype: "init", session_id: "claude-stream-full-1", model: "claude-sonnet-4-5", tools: [], mcp_servers: [] }));
+  console.log(JSON.stringify({ type: "rate_limit_event", rate_limit_info: { status: "allowed", resetsAt: 1786424400, rateLimitType: "five_hour", overageStatus: "rejected", isUsingOverage: false } }));
+  console.log(JSON.stringify({
+    type: "assistant",
+    session_id: "claude-stream-full-1",
+    message: {
+      model: "claude-sonnet-4-5",
+      content: [
+        { type: "text", text: "Looking at the file." },
+        { type: "tool_use", id: "tool-1", name: "mcp__sunaba__read_file_range", input: {} },
+        { type: "tool_use", id: "tool-2", name: "mcp__sunaba__edit_file", input: {} },
+      ],
+    },
+  }));
+  console.log(JSON.stringify({
+    type: "user",
+    session_id: "claude-stream-full-1",
+    message: { content: [{ type: "tool_result", tool_use_id: "tool-2", content: "ok" }] },
+  }));
+  console.log(JSON.stringify({
+    type: "result",
+    is_error: false,
+    result: "implemented via the stream",
+    session_id: "claude-stream-full-1",
+    usage: { input_tokens: 1200, output_tokens: 600, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 },
+    total_cost_usd: 0.01,
+    duration_ms: 4000,
+    num_turns: 2,
+  }));
+  process.exit(0);
+}
+// The stall*/slow* never-terminating modes are handled in ONE block in
+// the tail below — they must never fall through to the result-writing
+// tail's else, or a stall fake would hand the dispatch a terminal
+// "result" event it could complete on.
+if (mode === "quota-ratelimit-fallback") {
+  // A rate_limit_event precedes a session-limit terminal payload that
+  // carries NO reset in its own text or fields — the classification's
+  // reset must fall back to the streamed rate_limit_info.resetsAt (kusabi
+  // #215 Job B acceptance criterion 5).
+  console.log(JSON.stringify({ type: "rate_limit_event", rate_limit_info: { status: "allowed", resetsAt: 1786424400, rateLimitType: "five_hour", overageStatus: "rejected", isUsingOverage: false } }));
+  console.log(JSON.stringify({
+    type: "result",
+    is_error: true,
+    api_error_status: 429,
+    terminal_reason: "api_error",
+    result: "You've hit your session limit.",
+    session_id: null,
+    usage: {},
+    total_cost_usd: 1.0,
+    duration_ms: 9000,
+    num_turns: 3,
+  }));
+  process.exit(0);
+}
+if (mode === "stream-split-multibyte") {
+  // The terminal result line's multibyte text is flushed in two writes
+  // SPLIT MID-CHARACTER (between a UTF-8 lead byte and its continuation).
+  // Per-chunk toString() decodes the halves separately into U+FFFD and
+  // corrupts the JSON line; stream-level decoding must reassemble it
+  // (kusabi #215 Job B review finding, claude-dispatch.mjs stdout handler).
+  const line = JSON.stringify({
+    type: "result", is_error: false,
+    result: "リセットは 1:20am (Asia/Tokyo) です",
+    session_id: "claude-split-1", usage: {}, total_cost_usd: 0,
+    duration_ms: 10, num_turns: 1,
+  }) + "\\n";
+  const buf = Buffer.from(line, "utf8");
+  const split = buf.findIndex((b) => b >= 0x80) + 1; // inside a multibyte sequence
+  process.stdout.write(buf.subarray(0, split));
+  await new Promise((resolve) => setTimeout(resolve, 120));
+  process.stdout.write(buf.subarray(split));
+  process.exit(0);
+}
+if (mode === "trickle") {
+  // One event, a real delay, then the terminal result — proves the job
+  // record moves on disk WHILE the child is still running, not only once
+  // it exits (kusabi #215 Job B: "reasonable cadence" requirement).
+  console.log(JSON.stringify({ type: "system", subtype: "init", session_id: "claude-trickle-1" }));
+  await new Promise((resolve) => setTimeout(resolve, 400));
+  console.log(JSON.stringify({
+    type: "result",
+    is_error: false,
+    result: "done after a delay",
+    session_id: "claude-trickle-1",
+    usage: {},
+    total_cost_usd: 0,
+    duration_ms: 400,
+    num_turns: 1,
+  }));
+  process.exit(0);
+}
+if (mode === "stall" || mode === "stall-with-child" || mode === "stall-garbage" || mode === "slow" || mode === "slow-with-child") {
+  // Never-terminating modes: the silence watchdog (stall*) or the
+  // dispatch timeout (slow*) must kill the group.  None of them writes a
+  // terminal "result" event, so the dispatch can never complete on them.
+  if (mode === "stall-with-child" || mode === "slow-with-child") {
     // Grandchild that inherits our stdout/stderr pipes: it must die with
     // the process-group kill, or the dispatch's 'close' never fires and
     // the job hangs forever after the timeout.
@@ -739,7 +975,25 @@ if (mode === "slow" || mode === "slow-with-child") {
     const sleeper = spawn("sleep", ["300"], { stdio: "inherit" });
     fs.appendFileSync(process.env.FAKE_CLAUDE_PIDS, String(sleeper.pid) + "\\n");
   }
-  setInterval(() => {}, 1000); // never writes, never exits — the dispatch timeout must kill us
+  if (mode === "stall-garbage") {
+    // One parsed event, then unparseable prose lines keep arriving every
+    // 300ms — stream noise, NOT parsed events — so the silence clock
+    // must NOT reset on them and the watchdog must still fire (kusabi
+    // #215 Job B item 3: the clock measures parsed stream events; the
+    // real CLI's leading warning line is not one).
+    console.log(JSON.stringify({ type: "system", subtype: "init", session_id: "claude-stall-garbage-1" }));
+    setInterval(() => {
+      console.log("still here, still not JSON");
+    }, 300);
+  } else if (mode === "stall" || mode === "stall-with-child") {
+    // One event (proves the silence clock resets on real activity, not
+    // just spawn), then permanent silence — the watchdog, not timeoutS,
+    // must end this job (kusabi #215 Job B acceptance criterion 4).
+    console.log(JSON.stringify({ type: "system", subtype: "init", session_id: "claude-stall-1" }));
+    setInterval(() => {}, 1000); // no further output — the watchdog must kill us
+  } else {
+    setInterval(() => {}, 1000); // never writes, never exits — the dispatch timeout must kill us
+  }
 } else {
   const argv = process.argv.slice(2);
   const resumeAt = argv.indexOf("--resume");
@@ -931,27 +1185,29 @@ describe("claudeDispatch (fake claude binary)", () => {
     assert.equal(args[2], "--setting-sources");
     assert.equal(args[3], "");
     assert.equal(args[4], "--output-format");
-    assert.equal(args[5], "json");
-    assert.equal(args[6], "--model");
-    assert.equal(args[7], "opus");
-    assert.equal(args[8], "--allowedTools");
-    assert.equal(args[9], ALLOWED_TOOLS.implement);
-    assert.equal(args[10], "--disallowedTools");
-    assert.equal(args[11], disallowedToolsForAgent("kusabi-implement"));
-    assert.ok(args[11].split(",").includes("mcp__sunaba__publish"));
-    assert.ok(args[11].split(",").includes("mcp__sunaba__sandbox_issue_write"));
-    assert.ok(args[11].split(",").includes("Bash"));
-    assert.equal(args[12], "--mcp-config");
+    assert.equal(args[5], "stream-json");
+    // stream-json requires --verbose or the real CLI refuses to start.
+    assert.equal(args[6], "--verbose");
+    assert.equal(args[7], "--model");
+    assert.equal(args[8], "opus");
+    assert.equal(args[9], "--allowedTools");
+    assert.equal(args[10], ALLOWED_TOOLS.implement);
+    assert.equal(args[11], "--disallowedTools");
+    assert.equal(args[12], disallowedToolsForAgent("kusabi-implement"));
+    assert.ok(args[12].split(",").includes("mcp__sunaba__publish"));
+    assert.ok(args[12].split(",").includes("mcp__sunaba__sandbox_issue_write"));
+    assert.ok(args[12].split(",").includes("Bash"));
+    assert.equal(args[13], "--mcp-config");
 
     // The generated MCP config contains ONLY the sunaba entry.
-    const mcpConfigPath = args[13];
+    const mcpConfigPath = args[14];
     assert.equal(mcpConfigPath, path.join(ctx.stateDir, "claude-mcp.json"));
     const mcpConfig = readJson(mcpConfigPath);
     assert.deepEqual(mcpConfig, { mcpServers: { sunaba: SUNABA_MCP } });
     assert.equal(mcpConfig.mcpServers.other, undefined);
 
-    assert.equal(args[14], "--append-system-prompt");
-    const systemPrompt = args[15];
+    assert.equal(args[15], "--append-system-prompt");
+    const systemPrompt = args[16];
     // Frontmatter stripped: the body, not the YAML header.
     assert.match(systemPrompt, /^You are the "implement" phase worker/);
     assert.ok(!systemPrompt.startsWith("---"));
@@ -969,7 +1225,7 @@ describe("claudeDispatch (fake claude binary)", () => {
       round: 2,
     }));
     const args = JSON.parse(fs.readFileSync(ctx.argsLog, "utf8").trim());
-    assert.equal(args[7], "sonnet");
+    assert.equal(args[8], "sonnet");
   });
 
   it("explicitModel wins over the chain", async () => {
@@ -978,8 +1234,8 @@ describe("claudeDispatch (fake claude binary)", () => {
       explicitModel: "claude-opus-4-1",
     }));
     const args = JSON.parse(fs.readFileSync(ctx.argsLog, "utf8").trim());
-    assert.equal(args[7], "claude-opus-4-1");
-    assert.equal(args[6], "--model");
+    assert.equal(args[8], "claude-opus-4-1");
+    assert.equal(args[7], "--model");
   });
 
   it("review agent: review allowlist + review system prompt", async () => {
@@ -989,9 +1245,9 @@ describe("claudeDispatch (fake claude binary)", () => {
       phase: "review",
     }));
     const args = JSON.parse(fs.readFileSync(ctx.argsLog, "utf8").trim());
-    assert.equal(args[9], ALLOWED_TOOLS.review);
-    assert.equal(args[11], disallowedToolsForAgent("kusabi-review"));
-    assert.match(args[15], /^You are the "review" phase worker/);
+    assert.equal(args[10], ALLOWED_TOOLS.review);
+    assert.equal(args[12], disallowedToolsForAgent("kusabi-review"));
+    assert.match(args[16], /^You are the "review" phase worker/);
   });
 
   it("investigate agent: issue write is exempt from --disallowedTools but stays out of the review allowlist", async () => {
@@ -999,7 +1255,7 @@ describe("claudeDispatch (fake claude binary)", () => {
       agent: "kusabi-investigate",
     }));
     const args = JSON.parse(fs.readFileSync(ctx.argsLog, "utf8").trim());
-    const denied = args[11].split(",");
+    const denied = args[12].split(",");
     assert.ok(!denied.includes("mcp__sunaba__sandbox_issue_write"), "investigate deliverable must stay allowed");
     assert.ok(denied.includes("mcp__sunaba__publish"));
     assert.ok(denied.includes("mcp__sunaba__sandbox_pr_review_write"));
@@ -1010,7 +1266,7 @@ describe("claudeDispatch (fake claude binary)", () => {
       tools: { sunaba_edit_file: false, bash: false },
     }));
     const args = JSON.parse(fs.readFileSync(ctx.argsLog, "utf8").trim());
-    const csv = args[9];
+    const csv = args[10];
     assert.ok(!csv.split(",").includes("mcp__sunaba__edit_file"));
     assert.ok(csv.split(",").includes("mcp__sunaba__write_file"));
   });
@@ -1024,7 +1280,7 @@ describe("claudeDispatch (fake claude binary)", () => {
       tools: translateDenyTools(Object.fromEntries(WRITE_TOOL_NAMES.map((t) => [t, false]))),
     }));
     const args = JSON.parse(fs.readFileSync(ctx.argsLog, "utf8").trim());
-    const csv = args[9].split(",");
+    const csv = args[10].split(",");
     for (const tool of ["mcp__sunaba__sandbox_exec", "mcp__sunaba__write_file", "mcp__sunaba__edit_file", "mcp__sunaba__transform_file"]) {
       assert.ok(!csv.includes(tool), `${tool} must be denied by --read-only`);
     }
@@ -1050,7 +1306,7 @@ describe("claudeDispatch (fake claude binary)", () => {
     assert.equal(args[1], "--strict-mcp-config");
     assert.equal(args[2], "--setting-sources");
     assert.equal(args[3], "");
-    assert.equal(args[9], ALLOWED_TOOLS.implement);
+    assert.equal(args[10], ALLOWED_TOOLS.implement);
     // The prompt still travels on stdin (I5), never on argv.
     assert.ok(!args.includes("Do the thing."));
     assert.equal(fs.readFileSync(ctx.stdinLog, "utf8"), "Do the thing.");
@@ -1184,12 +1440,16 @@ describe("claudeDispatch (fake claude binary)", () => {
   });
 
   it("fails the dispatch on garbage stdout, preserving the output snippet", async () => {
+    // The garbage line still fails the run — it just fails a different way
+    // now: the line itself is skipped as unparseable NDJSON (kusabi #215
+    // Job B item 3: never fatal on its own), but a run that never produces
+    // a terminal `result` event is still a failed dispatch.
     ctx.restore();
     ctx = fakeClaudeContext("garbage");
     const { job } = await claudeDispatch(ctx.dispatchOptions());
 
     assert.equal(job.status, "error");
-    assert.match(job.error, /unparseable output/);
+    assert.match(job.error, /no terminal result event/);
     assert.match(job.error, /this is not json at all/);
     assert.equal(job.retry, null);
     assert.equal(job.fallbacks, null);
@@ -1240,22 +1500,44 @@ describe("claudeDispatch (fake claude binary)", () => {
     assert.deepEqual(persisted.failure, job.failure);
   });
 
-  it("marks claude stats as not instrumented — structural counters, distinguishable from measured zeros", async () => {
+  it("marks claude stats as instrumented and measured from the stream (kusabi #215 Job B)", async () => {
+    // The base fake ("ok" mode) writes exactly ONE stream-json line — the
+    // terminal `result` event, no system/assistant events ahead of it — so
+    // `events` is 1, and there is no tool_use block to count as a step.
     const { job } = await claudeDispatch(ctx.dispatchOptions());
 
-    // `instrumented: false` is the marker; a reader never guesses from
-    // `backend`.  Counters are null / empty (not absent) so readers that
-    // render them with `?? 0` keep working.
-    assert.equal(job.stats.instrumented, false);
-    assert.equal(job.stats.events, null);
-    assert.equal(job.stats.steps, null);
+    assert.equal(job.stats.instrumented, true);
+    assert.equal(job.stats.events, 1);
+    assert.equal(job.stats.steps, 0);
     assert.equal(job.stats.lastTool, null);
-    assert.equal(job.stats.permissionsAllowed, null);
-    assert.equal(job.stats.permissionsRejected, null);
-    assert.equal(job.stats.lastActivity, null);
+    assert.equal(job.stats.permissionsAllowed, 0);
+    assert.equal(job.stats.permissionsRejected, 0);
+    assert.equal(typeof job.stats.lastActivity, "string");
+    assert.ok(!Number.isNaN(Date.parse(job.stats.lastActivity)));
     assert.deepEqual(job.stats.models, []);
+  });
+
+  it("legacy instrumented:false records still render via the 'not instrumented' reader path", () => {
+    // This dispatch never writes instrumented:false anymore (kusabi #215 Job
+    // B) — the marker now identifies only pre-#215 records already on disk.
+    // The reader contract (kusabi-companion.mjs) is exercised directly here,
+    // since claudeDispatch itself has no code path left that produces one.
+    const legacy = {
+      stats: {
+        instrumented: false,
+        events: null,
+        steps: null,
+        lastTool: null,
+        permissionsAllowed: null,
+        permissionsRejected: null,
+        lastActivity: null,
+        models: [],
+      },
+      startedAt: "2026-08-01T00:00:00.000Z",
+    };
+    assert.equal(legacy.stats.instrumented, false);
     // The idle-reap fallback (serve-lifecycle) reads lastActivity ?? startedAt.
-    assert.equal(job.stats.lastActivity ?? job.startedAt, job.startedAt);
+    assert.equal(legacy.stats.lastActivity ?? legacy.startedAt, legacy.startedAt);
   });
 
   it("times out: kills the child AND its process group, reports the opencode timeout status", async () => {
@@ -1274,6 +1556,123 @@ describe("claudeDispatch (fake claude binary)", () => {
     for (const pid of pids) {
       assert.equal(isAlive(pid), false, `pid ${pid} must be dead after the timeout group kill`);
     }
+  });
+
+  it("stream-json: the full realistic sequence yields real measured stats (kusabi #215 Job B, acceptance criteria 2 and 3)", async () => {
+    ctx.restore();
+    ctx = fakeClaudeContext("stream-full");
+    const { job, resultText } = await claudeDispatch(ctx.dispatchOptions());
+
+    // The leading non-JSON warning line never fails the run.
+    assert.equal(job.status, "completed");
+    assert.equal(resultText, "implemented via the stream");
+    assert.equal(job.sessionID, "claude-stream-full-1");
+
+    assert.equal(job.stats.instrumented, true);
+    assert.ok(job.stats.events > 0, "parsed event lines must be counted");
+    // Two tool_use blocks inside the one assistant message.
+    assert.equal(job.stats.steps, 2);
+    assert.equal(job.stats.lastTool, "mcp__sunaba__edit_file");
+    assert.equal(typeof job.stats.lastActivity, "string");
+    assert.ok(!Number.isNaN(Date.parse(job.stats.lastActivity)));
+    assert.deepEqual(job.stats.models, ["claude-sonnet-4-5"]);
+
+    // Usage and session id still come from the terminal result event
+    // exactly as today — the stream is a new SOURCE of that event, not a
+    // new mapping.
+    assert.equal(job.usage.input, 1200);
+    assert.equal(job.usage.output, 600);
+
+    // The live quota feed (kusabi #215 Job B item 4): the most recent
+    // rate_limit_event is persisted machine-readably on the job record.
+    assert.ok(job.rateLimit);
+    assert.equal(job.rateLimit.info.resetsAt, 1786424400);
+    assert.equal(typeof job.rateLimit.observedAt, "string");
+  });
+
+  it("stream-json: a multibyte character split across two chunks decodes intact (chunk-boundary review finding)", async () => {
+    // The fake flushes the result line in two writes split between a UTF-8
+    // lead byte and its continuation byte; per-chunk toString() would decode
+    // U+FFFD into the JSON line and lose the terminal result event entirely.
+    ctx.restore();
+    ctx = fakeClaudeContext("stream-split-multibyte");
+    const { job, resultText } = await claudeDispatch(ctx.dispatchOptions());
+
+    assert.equal(job.status, "completed");
+    assert.equal(resultText, "リセットは 1:20am (Asia/Tokyo) です");
+    assert.ok(!resultText.includes("�"), "no replacement characters may appear");
+    assert.equal(job.sessionID, "claude-split-1");
+  });
+
+  it("quota reset falls back to the streamed rate_limit_info.resetsAt when the payload names none (kusabi #215 Job B item 4)", async () => {
+    ctx.restore();
+    ctx = fakeClaudeContext("quota-ratelimit-fallback");
+    const { job } = await claudeDispatch(ctx.dispatchOptions());
+
+    assert.equal(job.status, "provider-error");
+    assert.equal(job.failure.kind, "quota-exhaustion");
+    assert.equal(job.failure.quota, "session");
+    // The terminal payload's own text/fields name no reset; it is filled
+    // from the rate_limit_event's resetsAt (epoch seconds) instead.
+    assert.equal(job.failure.reset, new Date(1786424400 * 1000).toISOString());
+  });
+
+  it("watchdog: silence kills the process group and the job finishes stalled (kusabi #215 Job B item 3)", async () => {
+    ctx.restore();
+    ctx = fakeClaudeContext("stall-with-child");
+    const { job } = await claudeDispatch(ctx.dispatchOptions({ watchdogS: 1 }));
+
+    assert.equal(job.status, "stalled");
+    // Mirrors the opencode watchdog's own wording exactly.
+    assert.equal(job.error, "watchdog: no events for 1s (process killed)");
+    // The system/init session id survives even though there was no
+    // terminal result event (kusabi #215 Job B item 5).
+    assert.equal(job.sessionID, "claude-stall-1");
+    assert.ok(job.stats.events >= 1, "the init event must still be reflected in stats");
+
+    // The fake claude AND the grandchild it spawned were actually killed —
+    // no orphaned work survives a stall, exactly like a timeout.
+    const pids = spawnedPids(ctx.pidsLog);
+    assert.ok(pids.length >= 2, "the fake claude and its grandchild must have been spawned");
+    for (const pid of pids) {
+      assert.equal(isAlive(pid), false, `pid ${pid} must be dead after the watchdog group kill`);
+    }
+  });
+
+  it("watchdog: unparseable prose lines are stream noise, not events — they never hold the watchdog off (kusabi #215 Job B item 3)", async () => {
+    ctx.restore();
+    ctx = fakeClaudeContext("stall-garbage");
+    const { job } = await claudeDispatch(ctx.dispatchOptions({ watchdogS: 1 }));
+
+    // Garbage lines arrived every 300ms for the whole run, yet the clock
+    // measures PARSED stream events only: after the single init event the
+    // stream was event-silent, so the watchdog fired on schedule.
+    assert.equal(job.status, "stalled");
+    assert.equal(job.error, "watchdog: no events for 1s (process killed)");
+    assert.equal(job.sessionID, "claude-stall-garbage-1");
+    // The garbage itself was counted for debugging, never fatal.
+    assert.equal(job.stats.events, 1);
+    // The fake is dead — no orphaned process keeps printing.
+    const pids = spawnedPids(ctx.pidsLog);
+    for (const pid of pids) {
+      assert.equal(isAlive(pid), false, `pid ${pid} must be dead after the watchdog group kill`);
+    }
+  });
+
+  it("saves job stats to disk at a bounded cadence while the child is still running (kusabi #215 Job B)", async () => {
+    ctx.restore();
+    ctx = fakeClaudeContext("trickle");
+    const promise = claudeDispatch(ctx.dispatchOptions());
+    await new Promise((resolve) => setTimeout(resolve, 150));
+
+    const [midflight] = listJobs(ctx.stateDir);
+    assert.ok(midflight, "the job record must already exist on disk");
+    assert.equal(midflight.status, "running");
+    assert.equal(midflight.stats.instrumented, true);
+    assert.ok(midflight.stats.events >= 1, "the init event must already be reflected on disk");
+
+    const { job } = await promise;
+    assert.equal(job.status, "completed");
   });
 
   it("fails loudly when the MCP source config lacks mcpServers.sunaba", async () => {
@@ -1344,7 +1743,7 @@ describe("CLI --read-only wiring (subprocess)", () => {
       );
       assert.equal(result.status, 0, `expected success, got: ${result.stdout} ${result.stderr}`);
       const args = JSON.parse(fs.readFileSync(argsLog, "utf8").trim());
-      const csv = args[9].split(",");
+      const csv = args[10].split(",");
       for (const tool of ["mcp__sunaba__sandbox_exec", "mcp__sunaba__write_file", "mcp__sunaba__edit_file", "mcp__sunaba__transform_file"]) {
         assert.ok(!csv.includes(tool), `${tool} must be denied by --read-only, got csv: ${csv.join(",")}`);
       }
