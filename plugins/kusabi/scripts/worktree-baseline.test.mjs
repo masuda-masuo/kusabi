@@ -394,8 +394,15 @@ describe("captureWorktreeState (throwaway git repo)", () => {
     const tool1 = makeFakeTool(tmpDir);
     const baseline = await captureWorktreeState(tool1, "fake-cid");
 
-    // Modify a file
-    fs.writeFileSync(path.join(tmpDir, "existing.js"), "// modified content");
+    // Modify a file.  The replacement must differ in SIZE, not just bytes:
+    // a same-size write can land inside the fixture commit's mtime at coarse
+    // filesystem timestamp granularity, and then git's stat cache skips
+    // re-hashing the entry during `git add -A` (the temp-index copy's fresh
+    // mtime also defeats the racy-clean re-check) — the modification goes
+    // undetected and this test flakes (observed on CI, run 31464361388,
+    // 2026-08-11; passed on rerun).  A size change forces the re-hash under
+    // any timestamp granularity.
+    fs.writeFileSync(path.join(tmpDir, "existing.js"), "// modified content, longer than before");
     const tool2 = makeFakeTool(tmpDir);
     const current = await captureWorktreeState(tool2, "fake-cid");
 
