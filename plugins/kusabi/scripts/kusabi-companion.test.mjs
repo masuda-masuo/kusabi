@@ -947,6 +947,7 @@ describe("runChainDriver resume", () => {
   function makeFakeDispatch({
     reviewResult = JSON.stringify({ verdict: "approve", findings: [], summary: "ok" }),
     implementStatus = "completed",
+    implementFailure = null,
   } = {}) {
     const dispatch = async (opts) => {
       if (opts.kind === "review") {
@@ -967,7 +968,17 @@ describe("runChainDriver resume", () => {
             modelEntry: "fake/model", modelVariant: null, fallbacks: null,
             sessionID: "sess-imp-" + (opts.round ?? 1),
             usage: { available: true, input: 1, output: 1, reasoning: 0, cacheRead: 0, cacheWrite: 0, cost: 0.01 },
-            error: implementStatus === "provider-error" ? "All routes exhausted: fake/model — retry at attempt 3" : null,
+            error: implementStatus === "provider-error"
+              ? (implementFailure
+                  // The classified error the claude dispatch actually writes
+                  // (renderClaudeQuotaError); the chain surface must show it.
+                  ? "claude dispatch failed: You've hit your session limit · resets 1:20am (Asia/Tokyo) — " +
+                    "session limit exhausted (resets 1:20am (Asia/Tokyo)): the whole claude backend is " +
+                    "blocked, including your own Claude Code session (same account window). Switch the " +
+                    "phase to the opencode backend (--model <provider>/<model>); do not retry claude."
+                  : "All routes exhausted: fake/model — retry at attempt 3")
+              : null,
+            failure: implementFailure,
           },
           resultText: "implemented",
         };
@@ -1200,6 +1211,57 @@ describe("runChainDriver resume", () => {
     const control = readChainControl(chainDir);
     assert.equal(control.status, "failed");
     assert.equal(control.round, 3);
+  });
+
+  it("dies a quota-classified implement failure with the classification, not the generic retry advice (kusabi #215)", async () => {
+    // The implement dispatch returns the REAL 2026-08-11 session-limit
+    // classification (status provider-error + structured `failure`), as the
+    // claude backend now produces.  The failed-round surface — what the
+    // operator sees when the round dies — must show the classification
+    // instead of the generic error text, and must NOT contradict it with
+    // "Retry when provider is available".
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-quota-chain-"));
+    const chainDir = path.join(tmp, "chains", "chain-test");
+    fs.mkdirSync(chainDir, { recursive: true });
+    writeChainControl(chainDir, {
+      chainId: "chain-test", container: "cid-1", pid: process.pid,
+      status: "running", round: 0, startedAt: new Date().toISOString(),
+    });
+
+    const dispatch = makeFakeDispatch({
+      implementStatus: "provider-error",
+      implementFailure: {
+        kind: "quota-exhaustion",
+        quota: "session",
+        backendBlocked: true,
+        reset: "1:20am (Asia/Tokyo)",
+      },
+    });
+
+    const text = await runChainDriver({
+      cwd: tmp, stateDir: tmp, chainDir, chainId: "chain-test", container: "cid-1",
+      model: "fake/model", modelChain: [["fake/model"], ["fake/pro"]], maxRounds: 4,
+      brief: BRIEF, orchestrator: null, baseSha: "abc123", worktreeBaseline: null,
+      callTool: fakeResumeCallTool(),
+      dispatchWithFallback: dispatch,
+      keepServe: true,
+      signalReceived: () => false,
+      resume: null,
+    });
+
+    // The chain stops at implement provider exhaustion and the surface
+    // carries the classified message.
+    assert.match(text, /implement provider exhausted/);
+    assert.match(text, /whole claude backend is blocked/);
+    assert.match(text, /Switch the phase to the opencode backend/);
+    assert.match(text, /do not retry claude/);
+    assert.ok(!text.includes("Retry when provider is available"),
+      "the generic capacity footer must not contradict a session-limit classification");
+
+    const control = readChainControl(chainDir);
+    assert.equal(control.status, "failed");
+
+    fs.rmSync(tmp, { recursive: true, force: true });
   });
 
   it("persists the interrupted round when stopped after probes (stop-accept path)", async () => {

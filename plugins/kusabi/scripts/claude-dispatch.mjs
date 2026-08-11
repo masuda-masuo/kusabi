@@ -671,6 +671,131 @@ export function mapClaudeUsage(result) {
 }
 
 // =========================================================================
+// terminal failure classification — quota exhaustion (kusabi #215)
+// =========================================================================
+//
+// An `is_error: true` result collapses today into a generic `error` job.
+// Quota exhaustion needs its own machine-readable classification: a
+// *session* limit (HTTP 429 + "session limit" text, real 2026-08-11
+// incident job-msnf4qph5ccd) means the WHOLE claude backend is blocked for
+// the account window — including the operator's own Claude Code session —
+// so retrying, or walking other claude models, is actively wrong; the
+// actionable response is switching the phase to the opencode backend
+// (a `--model <provider>/<model>` identifier carries its backend, kusabi
+// #210).  Other 429 kinds (per-model / per-request rate limits) do not
+// imply that.
+//
+// The classification is STRUCTURED on the job record (`job.failure`) so a
+// reader never has to grep prose.  `subtype` is deliberately NOT consulted:
+// a terminal payload can carry `subtype: "success"` next to
+// `is_error: true` — it must never influence success/failure.
+const SESSION_LIMIT_RE = /\bsession[\s_-]?limit\b/i;
+// Every alternative is a qualified multi-word phrase on purpose: a bare word
+// ("quota", "resets") matches unrelated failure prose — "disk quota exceeded",
+// "git reset failed" — and a false positive here does not merely mislabel, it
+// flips the job to provider-error and hard-stops the chain.  When in doubt,
+// leave the word out: an unclassified quota failure degrades to the generic
+// error path, which is survivable.
+const QUOTA_TEXT_RE = /\b(session[\s_-]?limit|rate[\s_-]?limit|spend[\s_-]?limit|daily[\s_-]?limit|monthly[\s_-]?limit|limit[\s_-]?(reached|exceeded)|too[\s_-]?many[\s_-]?requests)\b/i;
+// The kind said back to the operator must come from the text, never from
+// precedence: only an explicit rate-limit phrase may be called "rate".
+const RATE_LIMIT_RE = /\b(rate[\s_-]?limit|too[\s_-]?many[\s_-]?requests)\b/i;
+
+/**
+ * Classify a terminal (`is_error: true`) claude result payload.
+ *
+ * Conservative by design: only HTTP 429 (`api_error_status`) or an
+ * unambiguous quota phrase in `terminal_reason` / `result` classifies;
+ * anything else returns `null` and the job fails exactly as a generic
+ * error today.
+ *
+ * @param {object|null} parsed — output of `parseClaudeResult`.
+ * @returns {null | {
+ *   kind: "quota-exhaustion",
+ *   quota: "session" | "rate" | "unknown",
+ *   backendBlocked: boolean,
+ *   reset: string | null,
+ * }} `null` when the payload carries no quota marker.
+ */
+export function classifyClaudeTerminalFailure(parsed) {
+  if (!parsed || typeof parsed !== "object") return null;
+  const is429 = parsed.api_error_status === 429;
+  const reason = typeof parsed.terminal_reason === "string" ? parsed.terminal_reason : "";
+  const result = typeof parsed.result === "string" ? parsed.result : "";
+  const text = `${reason} ${result}`;
+  if (!is429 && !QUOTA_TEXT_RE.test(text)) return null;
+
+  const quota = SESSION_LIMIT_RE.test(text)
+    ? "session"
+    : RATE_LIMIT_RE.test(text)
+      ? "rate"
+      : "unknown";
+  return {
+    kind: "quota-exhaustion",
+    quota,
+    // A session limit blocks the whole claude backend (the operator's own
+    // Claude Code session shares the same account window); per-model /
+    // per-request rate limits do not.
+    backendBlocked: quota === "session",
+    reset: extractClaudeQuotaReset(parsed),
+  };
+}
+
+/**
+ * The reset time from the payload: a `resetAt` / `reset` field when the CLI
+ * carries one, else the "resets <when>" phrase inside the result text
+ * (e.g. "You've hit your session limit · resets 1:20am (Asia/Tokyo)").
+ *
+ * @param {object|null} parsed
+ * @returns {string|null}
+ */
+function extractClaudeQuotaReset(parsed) {
+  for (const key of ["resetAt", "reset"]) {
+    if (typeof parsed?.[key] === "string" && parsed[key].trim()) return parsed[key].trim();
+  }
+  const result = typeof parsed?.result === "string" ? parsed.result : "";
+  const m = result.match(/resets?\s+(?:at\s+)?(.+?)(?:[.;!]|$)/i);
+  return m ? m[1].trim() : null;
+}
+
+/**
+ * The operator-facing error text for a classified quota failure.  Says which
+ * quota, carries the reset time when the payload had one, and — for the
+ * session limit — that the WHOLE claude backend is blocked (including the
+ * operator's own Claude Code session) and what to do instead of retrying.
+ * The raw CLI result text stays at the front, so no information is lost.
+ *
+ * @param {{quota: string, reset: string|null}} failure — classification.
+ * @param {string} detail — the raw terminal result text.
+ * @returns {string}
+ */
+export function renderClaudeQuotaError(failure, detail) {
+  const resetPart = failure.reset ? ` (resets ${failure.reset})` : "";
+  if (failure.quota === "session") {
+    return (
+      `claude dispatch failed: ${detail} — session limit exhausted${resetPart}: ` +
+      "the whole claude backend is blocked, including your own Claude Code " +
+      "session (same account window). Switch the phase to the opencode " +
+      "backend (--model <provider>/<model>); do not retry claude."
+    );
+  }
+  // "rate" comes from an explicit rate-limit phrase; "unknown" is a bare 429
+  // whose kind the classifier could not determine — never assert a kind the
+  // classification itself does not claim.  No wording may promise a retry:
+  // the chain driver hard-stops on this status, so the honest guidance is
+  // re-running after the reset window or switching backend.
+  const kindPart = failure.quota === "rate"
+    ? "claude rate limit active"
+    : "claude quota limit hit (kind unknown)";
+  return (
+    `claude dispatch failed: ${detail} — ${kindPart}${resetPart}: ` +
+    "this dispatch is not retried automatically — re-run after the reset " +
+    "window, or switch the phase to the opencode backend " +
+    "(--model <provider>/<model>); walking other claude models will not help."
+  );
+}
+
+// =========================================================================
 // spawn — one child per dispatch, bounded by timeoutS
 // =========================================================================
 
@@ -1114,8 +1239,30 @@ export async function claudeDispatch(opts) {
     modelVariant: null,
     startedAt: new Date().toISOString(),
     finishedAt: null,
-    stats: { events: 0, steps: 0, lastTool: null, permissionsAllowed: 0, permissionsRejected: 0, lastActivity: null, models: [] },
+    // v1 has no event stream (`--output-format json`): every counter here
+    // is STRUCTURAL, never measured.  `instrumented: false` marks the whole
+    // object as not-measured so a reader can tell it apart from the opencode
+    // path's measured zeros WITHOUT guessing from `backend` (kusabi #215).
+    // Counters stay present (null / empty, not absent) so readers that
+    // render them with `?? 0` / `?? "-"` keep working unchanged; the
+    // serve-lifecycle idle-reap fallback (`stats.lastActivity ??
+    // startedAt`) still lands on startedAt.
+    stats: {
+      instrumented: false,
+      events: null,
+      steps: null,
+      lastTool: null,
+      permissionsAllowed: null,
+      permissionsRejected: null,
+      lastActivity: null,
+      models: [],
+    },
     error: null,
+    // Terminal-failure classification (kusabi #215): null for generic
+    // failures; { kind: "quota-exhaustion", quota, backendBlocked, reset }
+    // when the terminal payload was classified.  Machine-readable — never
+    // derived by grepping `error` prose.
+    failure: null,
     retry: null,
     fallbacks: null,
   };
@@ -1168,11 +1315,25 @@ export async function claudeDispatch(opts) {
     }
     if (parsed !== null) {
       if (parsed.is_error === true) {
-        job.status = "error";
+        // `subtype` is NEVER consulted here: a terminal payload can carry
+        // `subtype: "success"` next to `is_error: true` (real 2026-08-11
+        // session-limit payload) — the failure signal is is_error alone.
+        const failure = classifyClaudeTerminalFailure(parsed);
         const detail = typeof parsed.result === "string" && parsed.result.trim()
           ? parsed.result.trim()
           : "claude reported is_error: true";
-        job.error = `claude dispatch failed: ${detail}`;
+        job.failure = failure;
+        if (failure) {
+          // Quota exhaustion gets the provider-error status so the chain's
+          // provider-exhaustion stop renders the classification instead of
+          // the generic error text (kusabi #215); the error text carries
+          // the operator-facing advice (which quota, reset, what to do).
+          job.status = "provider-error";
+          job.error = renderClaudeQuotaError(failure, detail);
+        } else {
+          job.status = "error";
+          job.error = `claude dispatch failed: ${detail}`;
+        }
       } else {
         job.status = "completed";
         job.sessionID = parsed.session_id ?? null;
