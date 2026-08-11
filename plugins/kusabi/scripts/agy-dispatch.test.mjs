@@ -28,6 +28,9 @@ import {
   agyJsonSchemaFor,
   buildAgyPrompt,
   buildAgyArgs,
+  AGY_MAX_ARG_STRLEN,
+  AGY_MAX_ARG_BYTES,
+  checkAgyArgvSize,
   parseAgyResult,
   agyPayload,
   describeAgyResult,
@@ -46,7 +49,7 @@ import {
   backendPinsModel,
   assertSessionBackendCompatible,
 } from "./kusabi-companion.mjs";
-import { claudeDispatch } from "./claude-dispatch.mjs";
+import { claudeDispatch, readAgentSystemPrompt } from "./claude-dispatch.mjs";
 import { dispatchWithFallback } from "./prompt-execution.mjs";
 import { runImplementPhase } from "./chain-phases.mjs";
 import { backendSupportsResume, splitRouteBackend, stripBackendPrefixChain } from "./cli.mjs";
@@ -1425,6 +1428,251 @@ describe("CLI agy wiring (subprocess)", () => {
       assert.match(result.stdout, /--backend opencode\|claude\|agy/);
     } finally {
       fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+});
+
+// =========================================================================
+// argv size guard — the E2BIG residual left open by kusabi #221
+// =========================================================================
+//
+// agy has no stdin prompt transport, so a brief past MAX_ARG_STRLEN used to
+// die as a raw E2BIG with nothing naming the cause.  These tests pin the
+// refusal: which element, how big, what the limit is, and what to do next.
+
+describe("checkAgyArgvSize — the per-argument byte rule", () => {
+  it("derives its limit from MAX_ARG_STRLEN with a margin, and stays under it", () => {
+    // PAGE_SIZE (4096) * 32, measured on this project's hosts.
+    assert.equal(AGY_MAX_ARG_STRLEN, 131072);
+    assert.equal(AGY_MAX_ARG_BYTES, 131072 - 1024);
+    // The margin must be real: the kernel counts the NUL terminator, so a
+    // guard set AT MAX_ARG_STRLEN would still hand one size to the kernel.
+    assert.ok(AGY_MAX_ARG_BYTES < AGY_MAX_ARG_STRLEN);
+  });
+
+  it("passes an ordinary dispatch argv untouched", () => {
+    const args = buildAgyArgs({
+      model: "gemini-3.6-flash-high",
+      promptText: "Do the thing.",
+      jsonSchema: null,
+    });
+    const result = checkAgyArgvSize(args);
+    assert.equal(result.ok, true);
+    assert.deepEqual(result.oversized, []);
+    assert.equal(result.limit, AGY_MAX_ARG_BYTES);
+  });
+
+  it("is a PER-ELEMENT rule, not a total — two legal big args still pass", () => {
+    // 260096 bytes of argv in total, and correct to allow: the cap this
+    // guards is per string.  (ARG_MAX, the total bound, is 2097152.)
+    const big = "x".repeat(AGY_MAX_ARG_BYTES);
+    assert.equal(checkAgyArgvSize(["-p", big, "--json-schema", big]).ok, true);
+  });
+
+  it("passes at exactly the limit and refuses at limit+1", () => {
+    assert.equal(checkAgyArgvSize(["-p", "x".repeat(AGY_MAX_ARG_BYTES)]).ok, true);
+    const over = checkAgyArgvSize(["-p", "x".repeat(AGY_MAX_ARG_BYTES + 1)]);
+    assert.equal(over.ok, false);
+    assert.equal(over.oversized[0].bytes, AGY_MAX_ARG_BYTES + 1);
+  });
+
+  it("names the prompt element, its size, the limit and the way out", () => {
+    const result = checkAgyArgvSize(["-p", "x".repeat(200)], 100);
+    assert.equal(result.ok, false);
+    assert.deepEqual(result.oversized, [
+      { index: 1, element: "prompt", flag: "-p", bytes: 200 },
+    ]);
+    assert.match(result.message, /the prompt \(-p\) is 200 bytes/);
+    assert.match(result.message, /100-byte per-argument limit/);
+    assert.match(result.message, /MAX_ARG_STRLEN is 131072/);
+    assert.match(result.message, /shrink the brief/);
+    assert.match(result.message, /--model claude/);
+    assert.match(result.message, /opencode model/);
+  });
+
+  it("names the SCHEMA when the schema is oversized and the prompt is small (criterion 2)", () => {
+    // Exactly the composition agyDispatch performs — buildAgyArgs, then the
+    // guard over its output — with the sizes reversed from the usual case.
+    // A small prompt does not make an oversized schema safe: they are
+    // SEPARATE argv strings, each measured against the same cap.  (The real
+    // review schema is ~2KB, so an end-to-end oversized-schema dispatch
+    // would require editing a repo artifact; this exercises the same code
+    // path the dispatch runs.)
+    const args = buildAgyArgs({
+      model: "gemini-3.6-flash-high",
+      promptText: "tiny",
+      jsonSchema: JSON.stringify({ type: "object", title: "y".repeat(500) }),
+    });
+    const result = checkAgyArgvSize(args, 100);
+    assert.equal(result.ok, false);
+    assert.equal(result.oversized.length, 1);
+    assert.equal(result.oversized[0].element, "schema");
+    assert.equal(result.oversized[0].flag, "--json-schema");
+    assert.match(result.message, /the schema \(--json-schema\) is \d+ bytes/);
+    // Only the schema is NAMED as oversized (the standing advice text
+    // mentions the prompt, which is why this checks the named form).
+    assert.doesNotMatch(result.message, /the prompt \(-p\) is/);
+  });
+
+  it("reports EVERY oversized element, not just the first", () => {
+    const args = buildAgyArgs({
+      model: "gemini-3.6-flash-high",
+      promptText: "x".repeat(200),
+      jsonSchema: "y".repeat(300),
+    });
+    const result = checkAgyArgvSize(args, 100);
+    assert.deepEqual(result.oversized.map((o) => o.element), ["prompt", "schema"]);
+    assert.match(
+      result.message,
+      /the prompt \(-p\) is 200 bytes, and the schema \(--json-schema\) is 300 bytes/,
+    );
+  });
+
+  it("measures BYTES, not string length (criterion 4)", () => {
+    const jp = "実装".repeat(30); // 60 characters, 180 UTF-8 bytes
+    assert.equal(jp.length, 60);
+    assert.ok(jp.length < 100, "the .length reading must be UNDER the limit");
+    const result = checkAgyArgvSize(["-p", jp], 100);
+    assert.equal(result.ok, false);
+    assert.equal(result.oversized[0].bytes, 180);
+  });
+
+  it("falls back to a positional name for an element with no known flag", () => {
+    const result = checkAgyArgvSize(["x".repeat(200)], 100);
+    assert.equal(result.oversized[0].element, "argv[0]");
+    assert.equal(result.oversized[0].flag, null);
+  });
+});
+
+describe("agyDispatch — an oversized argv is refused before the spawn", () => {
+  let ctx;
+
+  beforeEach(() => { ctx = fakeAgyContext(); });
+  afterEach(() => { ctx.restore(); });
+
+  it("refuses, never spawns, and finalises the record with why (criterion 1)", async () => {
+    const oversized = "x".repeat(AGY_MAX_ARG_BYTES + 1);
+    const { job, resultText, stateDir } = await agyDispatch(
+      ctx.dispatchOptions({ promptText: oversized }),
+    );
+
+    // NOTHING was started: the fake binary logged no argv and no pid.
+    assert.deepEqual(loggedArgs(ctx.argsLog), []);
+    assert.equal(fs.readFileSync(ctx.pidsLog, "utf8"), "");
+    assert.equal(job.process, null);
+
+    // A caller error, not a provider outage — the same brief would fail
+    // identically on the next agy dispatch, so a retry walk must not be
+    // invited by a provider-error classification.
+    assert.equal(job.status, "error");
+    assert.equal(job.failure, null);
+    assert.notEqual(job.status, "provider-error");
+    assert.ok(job.finishedAt, "a refused dispatch is finished, not left running");
+
+    assert.match(job.error, /the prompt \(-p\) is 130049 bytes/);
+    assert.match(job.error, /130048-byte per-argument limit/);
+    assert.match(job.error, /MAX_ARG_STRLEN is 131072/);
+    assert.match(job.error, /shrink the brief/);
+    assert.match(job.error, /--model claude/);
+    assert.match(job.error, /opencode model/);
+    assert.equal(resultText, "");
+
+    // Persisted the same way every other failure on this backend is.
+    assert.equal(loadJob(stateDir, job.id).status, "error");
+
+    const jdir = jobDir(stateDir, job.id);
+    // prompt.md is written even though nothing ran: the operator of a
+    // refused dispatch is the one who most needs to see what was too big.
+    assert.equal(fs.readFileSync(path.join(jdir, "prompt.md"), "utf8"), oversized);
+    assert.ok(!fs.existsSync(path.join(jdir, "result.md")));
+
+    const events = fs.readFileSync(path.join(jdir, "events.ndjson"), "utf8")
+      .trim().split("\n").map(JSON.parse);
+    assert.equal(events.length, 1);
+    assert.equal(events[0].type, "companion.agy.argv-too-large");
+    assert.equal(events[0].backend, "agy");
+    assert.equal(events[0].model, "gemini-3.6-flash-high");
+    assert.equal(events[0].limit, AGY_MAX_ARG_BYTES);
+    // The MEASURED sizes, so the refusal can be checked rather than trusted.
+    assert.deepEqual(events[0].oversized, [
+      { index: 1, element: "prompt", flag: "-p", bytes: AGY_MAX_ARG_BYTES + 1 },
+    ]);
+    // No dispatch event: nothing was dispatched.
+    assert.deepEqual(events.filter((e) => e.type === "companion.agy.dispatch"), []);
+    assert.deepEqual(events.filter((e) => e.type === "companion.agy.finished"), []);
+  });
+
+  it("a prompt exactly AT the limit dispatches exactly as today (criterion 3)", async () => {
+    // Also a live check that the margin is not over-tight: this 130048-byte
+    // argument really does survive a real spawn on a real kernel.
+    const atLimit = "x".repeat(AGY_MAX_ARG_BYTES);
+    const { job, resultText, stateDir } = await agyDispatch(
+      ctx.dispatchOptions({ promptText: atLimit }),
+    );
+
+    assert.equal(job.status, "completed");
+    assert.equal(resultText, "implemented the thing per the brief");
+    const calls = loggedArgs(ctx.argsLog);
+    assert.equal(calls.length, 1);
+    assert.deepEqual(calls[0], [
+      "-p", atLimit,
+      "--output-format", "json",
+      "--model", "gemini-3.6-flash-high",
+    ]);
+
+    const events = fs.readFileSync(path.join(jobDir(stateDir, job.id), "events.ndjson"), "utf8")
+      .trim().split("\n").map(JSON.parse);
+    assert.equal(events[0].type, "companion.agy.dispatch");
+    assert.equal(events.at(-1).type, "companion.agy.finished");
+    assert.deepEqual(events.filter((e) => e.type === "companion.agy.argv-too-large"), []);
+  });
+
+  it("refuses a brief that is under the limit by .length but over it in bytes (criterion 4)", async () => {
+    const jp = "実装してください。".repeat(6000); // 54000 chars, 162000 bytes
+    assert.ok(jp.length < AGY_MAX_ARG_BYTES, "the .length reading must be UNDER the limit");
+
+    const { job } = await agyDispatch(ctx.dispatchOptions({ promptText: jp }));
+
+    assert.deepEqual(loggedArgs(ctx.argsLog), []);
+    assert.equal(job.status, "error");
+    assert.match(job.error, /the prompt \(-p\) is 162000 bytes/);
+  });
+
+  it("counts the ROLE BLOCK too — the composed prompt is what rides argv", async () => {
+    // buildAgyPrompt prepends the agent's role body; the guard runs on the
+    // composed prompt, not the caller's, so a brief that only goes over
+    // AFTER composition is still refused.
+    const roleBody = readAgentSystemPrompt("kusabi-review");
+    assert.ok(roleBody && roleBody.length > 0, "the review role body must be non-empty");
+    const justUnder = "x".repeat(AGY_MAX_ARG_BYTES - 100);
+    const composed = buildAgyPrompt({ systemPrompt: roleBody, promptText: justUnder });
+    assert.ok(Buffer.byteLength(composed, "utf8") > AGY_MAX_ARG_BYTES);
+
+    const { job } = await agyDispatch(
+      ctx.dispatchOptions({ promptText: justUnder, agent: "kusabi-review", phase: "review" }),
+    );
+    assert.deepEqual(loggedArgs(ctx.argsLog), []);
+    assert.equal(job.status, "error");
+    assert.match(job.error, /the prompt \(-p\) is \d+ bytes/);
+  });
+});
+
+describe("the argv size guard is agy-only (criterion 5)", () => {
+  it("no other dispatch path imports it or re-implements the rule", () => {
+    // claude passes its prompt over stdin and opencode goes over HTTP, so
+    // neither can hit MAX_ARG_STRLEN — and neither may grow a size check
+    // that would refuse work those transports handle fine.
+    for (const file of [
+      "claude-dispatch.mjs",
+      "prompt-execution.mjs",
+      "chain-phases.mjs",
+      "kusabi-companion.mjs",
+    ]) {
+      const source = fs.readFileSync(new URL(`./${file}`, import.meta.url), "utf8");
+      assert.doesNotMatch(
+        source, /checkAgyArgvSize|AGY_MAX_ARG|MAX_ARG_STRLEN|E2BIG/,
+        `${file} must not carry the agy argv size check`,
+      );
     }
   });
 });

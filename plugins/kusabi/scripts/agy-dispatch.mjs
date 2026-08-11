@@ -70,6 +70,13 @@
 //     `instrumented: false` (the same marker pre-#215 claude records carry,
 //     which every reader already handles) and `watchdogS` is not applicable
 //     — `timeoutS`, an absolute wall-clock bound, is the only bound.
+//   - A BRIEF HAS A HARD CEILING HERE that the other backends do not have.
+//     The prompt rides argv, and Linux caps a single argv string at
+//     MAX_ARG_STRLEN (131072 bytes); past it the spawn fails with E2BIG.
+//     `checkAgyArgvSize` refuses such a dispatch before the spawn with an
+//     error that names the oversized element and the way out, rather than
+//     letting a raw errno surface as a generic dispatch failure.  It is a
+//     caller error (`status: "error"`), not a provider outage.
 //   - Per-job tool permissions cannot be expressed: agy takes no allow/deny
 //     flags.  A deny map that reaches this dispatch (the chain phases pass
 //     implementDenyTools / reviewDenyTools unconditionally) is recorded on
@@ -314,6 +321,103 @@ export function buildAgyArgs({ model, promptText, jsonSchema }) {
     args.push("--json-schema", jsonSchema);
   }
   return args;
+}
+
+// =========================================================================
+// argv size guard — pure
+// =========================================================================
+
+// Linux caps EACH SINGLE argv/env string at MAX_ARG_STRLEN = PAGE_SIZE * 32.
+// With the 4096-byte pages this project runs on that is 131072 bytes
+// (measured, not assumed).  This is NOT ARG_MAX (2097152 on the same host):
+// ARG_MAX bounds the argv+env TOTAL, and a single oversized brief hits the
+// per-string cap first by an order of magnitude.
+//
+// It matters HERE and nowhere else.  agy has no stdin prompt transport (field
+// verification, kusabi #199): the composed prompt rides `-p <promptText>` and
+// the schema rides `--json-schema <json>`, so both are single argv strings
+// subject to this cap.  The claude backend feeds its prompt over stdin and
+// opencode goes over HTTP — neither can reach this failure, and neither gets
+// a size check.
+export const AGY_MAX_ARG_STRLEN = 131072;
+
+// The size one agy argv element may reach before this backend refuses.
+//
+// MAX_ARG_STRLEN less a 1024-byte margin, for two reasons worth stating:
+//   - The kernel measures the string WITH its NUL terminator (`copy_strings`
+//     compares `strnlen_user`'s count, which includes it), so 131072 content
+//     bytes is already E2BIG *at* the documented limit — the usable maximum
+//     is 131071, and a guard set exactly at 131072 would still let one size
+//     through to the kernel.
+//   - Refusing a kilobyte early buys a legible, actionable error instead of a
+//     raw errno surfacing as a generic dispatch failure.  Nothing about a
+//     brief's usefulness turns on its last kilobyte.
+export const AGY_MAX_ARG_BYTES = AGY_MAX_ARG_STRLEN - 1024;
+
+// Human names for the argv elements a size refusal can name.  Keyed by the
+// flag that PRECEDES the value, because that is what identifies it — the
+// values themselves are just strings.
+const AGY_ARG_ELEMENT_NAMES = {
+  "-p": "prompt",
+  "--json-schema": "schema",
+  "--model": "model",
+  "--output-format": "output-format",
+};
+
+/**
+ * Check every element of an agy argv against the per-string kernel cap.
+ *
+ * Checked ELEMENT BY ELEMENT, not as a total: the cap is per string, and the
+ * schema is a separate oversized-capable string from the prompt.  Checking
+ * only the prompt would miss criterion-2's failure entirely.
+ *
+ * Measured in BYTES (`Buffer.byteLength`), never `.length`: the kernel counts
+ * bytes, and a Japanese brief is ~3 bytes per character, so a `.length` check
+ * would pass a prompt three times over the real limit.
+ *
+ * Pure and exported so the size rule is testable without spawning anything.
+ *
+ * @param {string[]} args — the argv from buildAgyArgs.
+ * @param {number} [limit] — byte ceiling per element; defaults to
+ *        AGY_MAX_ARG_BYTES (overridable so tests need not build 128KiB
+ *        strings to exercise the rule).
+ * @returns {{ok: true, limit: number, oversized: []}
+ *          |{ok: false, limit: number,
+ *             oversized: {index: number, element: string, flag: string|null, bytes: number}[],
+ *             message: string}}
+ */
+export function checkAgyArgvSize(args, limit = AGY_MAX_ARG_BYTES) {
+  const list = Array.isArray(args) ? args : [];
+  const oversized = [];
+  for (let i = 0; i < list.length; i += 1) {
+    const value = typeof list[i] === "string" ? list[i] : String(list[i] ?? "");
+    const bytes = Buffer.byteLength(value, "utf8");
+    if (bytes <= limit) continue;
+    const flag = i > 0 && Object.hasOwn(AGY_ARG_ELEMENT_NAMES, list[i - 1]) ? list[i - 1] : null;
+    oversized.push({
+      index: i,
+      element: flag ? AGY_ARG_ELEMENT_NAMES[flag] : `argv[${i}]`,
+      flag,
+      bytes,
+    });
+  }
+  if (oversized.length === 0) return { ok: true, limit, oversized: [] };
+
+  const named = oversized
+    .map((o) => `the ${o.element}${o.flag ? ` (${o.flag})` : ""} is ${o.bytes} bytes`)
+    .join(", and ");
+  return {
+    ok: false,
+    limit,
+    oversized,
+    message:
+      `agy dispatch refused before spawn: ${named}, over the ${limit}-byte per-argument ` +
+      `limit (Linux MAX_ARG_STRLEN is ${AGY_MAX_ARG_STRLEN} bytes for a single argv string; ` +
+      "kusabi refuses just under it so this says what happened instead of E2BIG). " +
+      "The agy CLI has no stdin transport — the prompt and the JSON schema both ride argv — " +
+      "so this job cannot be dispatched on agy as written: shrink the brief, or run it on a " +
+      "backend that passes the prompt over stdin (--model claude/… or an opencode model).",
+  };
 }
 
 // =========================================================================
@@ -687,7 +791,39 @@ export async function agyDispatch(opts) {
     fallbacks: null,
   };
   saveJob(stateDir, job);
+  // prompt.md is written BEFORE the size guard runs, on purpose: the operator
+  // of a refused dispatch is the one who most needs to see what was too big.
   fs.writeFileSync(path.join(jobDir(stateDir, job.id), "prompt.md"), promptText, "utf8");
+
+  // ---- argv size guard (kusabi #221 residual) ----
+  // The last thing before the spawn.  An oversized argument would fail with a
+  // raw E2BIG that says nothing about which string was too long or what to do
+  // about it; this refuses first and says both.
+  //
+  // `status: "error"`, NOT `provider-error`: nothing upstream is blocked and
+  // no capacity is exhausted.  This is a CALLER error — the same brief would
+  // fail identically on the next agy dispatch, so marking it a provider
+  // outage would send a retry walk at a wall.  The record is finalised here
+  // and NO process is started: `job.process` stays null because there is no
+  // child to point `cancel` at.
+  const argvSize = checkAgyArgvSize(args);
+  if (!argvSize.ok) {
+    job.status = "error";
+    job.error = argvSize.message;
+    job.finishedAt = new Date().toISOString();
+    appendEvent(stateDir, job.id, {
+      type: "companion.agy.argv-too-large",
+      backend: AGY_BACKEND,
+      model: modelEntry,
+      limit: argvSize.limit,
+      // The measured sizes, element by element — what the guard actually saw,
+      // so the refusal can be checked rather than taken on faith.
+      oversized: argvSize.oversized,
+    });
+    saveJob(stateDir, job);
+    return { job, resultText: "", stateDir };
+  }
+
   appendEvent(stateDir, job.id, {
     type: "companion.agy.dispatch",
     backend: AGY_BACKEND,
