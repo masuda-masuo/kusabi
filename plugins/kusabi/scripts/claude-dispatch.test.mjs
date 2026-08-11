@@ -46,6 +46,13 @@ import {
   claudeSessionGuardObservation,
   renderClaudeSessionGuardRefusal,
   usageProbeTimeoutMs,
+  CLAUDE_WRITE_WATCHDOG_DEFAULT_WARN_S,
+  resolveClaudeWriteWatchdog,
+  writeWatchdogAppliesToPhase,
+  isClaudeWriteToolName,
+  eventHasClaudeWriteTool,
+  renderClaudeWriteWatchdogError,
+  runClaudeProcess,
 } from "./claude-dispatch.mjs";
 import { agyDispatch } from "./agy-dispatch.mjs";
 import { resolveBackend, resolveDispatchBackend } from "./kusabi-companion.mjs";
@@ -1013,10 +1020,35 @@ if (mode === "stream-full") {
   }));
   process.exit(0);
 }
-// The stall*/slow* never-terminating modes are handled in ONE block in
-// the tail below — they must never fall through to the result-writing
-// tail's else, or a stall fake would hand the dispatch a terminal
-// "result" event it could complete on.
+if (mode === "writes" || mode === "no-write-then-finish") {
+  // Two streams that keep the SILENCE watchdog fed the whole way (a parsed
+  // event every 200ms) and differ only in WHICH tool they call: "writes"
+  // calls a file-mutating one, "no-write-then-finish" only reads.  Telling
+  // those two apart is the write watchdog's entire job (kusabi #215 item 3).
+  // Both end with a real terminal result, so the run's own outcome is
+  // observable next to whatever the watchdog did.
+  const tool = mode === "writes" ? "mcp__sunaba__edit_file" : "mcp__sunaba__read_file_range";
+  const ticks = Number(process.env.FAKE_CLAUDE_TICKS || "12");
+  console.log(JSON.stringify({ type: "system", subtype: "init", session_id: "claude-cadence-1" }));
+  for (let i = 0; i < ticks; i += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    console.log(JSON.stringify({
+      type: "assistant",
+      session_id: "claude-cadence-1",
+      message: { model: "claude-sonnet-4-5", content: [{ type: "tool_use", id: "tool-" + i, name: tool, input: {} }] },
+    }));
+  }
+  console.log(JSON.stringify({
+    type: "result", is_error: false, result: "ran to completion",
+    session_id: "claude-cadence-1", usage: {}, total_cost_usd: 0,
+    duration_ms: 200 * ticks, num_turns: ticks,
+  }));
+  process.exit(0);
+}
+// The stall*/slow*/no-write never-terminating modes are handled in ONE
+// block in the tail below — they must never fall through to the
+// result-writing tail's else, or a stall fake would hand the dispatch a
+// terminal "result" event it could complete on.
 if (mode === "quota-ratelimit-fallback") {
   // A rate_limit_event precedes a session-limit terminal payload that
   // carries NO reset in its own text or fields — the classification's
@@ -1074,7 +1106,7 @@ if (mode === "trickle") {
   }));
   process.exit(0);
 }
-if (mode === "stall" || mode === "stall-with-child" || mode === "stall-garbage" || mode === "slow" || mode === "slow-with-child") {
+if (mode === "stall" || mode === "stall-with-child" || mode === "stall-garbage" || mode === "slow" || mode === "slow-with-child" || mode === "no-write") {
   // Never-terminating modes: the silence watchdog (stall*) or the
   // dispatch timeout (slow*) must kill the group.  None of them writes a
   // terminal "result" event, so the dispatch can never complete on them.
@@ -1102,6 +1134,20 @@ if (mode === "stall" || mode === "stall-with-child" || mode === "stall-garbage" 
     // must end this job (kusabi #215 Job B acceptance criterion 4).
     console.log(JSON.stringify({ type: "system", subtype: "init", session_id: "claude-stall-1" }));
     setInterval(() => {}, 1000); // no further output — the watchdog must kill us
+  } else if (mode === "no-write") {
+    // The recorded incident in miniature (kusabi #215 item 3): busy forever,
+    // producing nothing.  A READ tool call every 200ms holds the silence
+    // watchdog off indefinitely — only the write watchdog can end this run.
+    console.log(JSON.stringify({ type: "system", subtype: "init", session_id: "claude-no-write-1" }));
+    let n = 0;
+    setInterval(() => {
+      n += 1;
+      console.log(JSON.stringify({
+        type: "assistant",
+        session_id: "claude-no-write-1",
+        message: { model: "claude-sonnet-4-5", content: [{ type: "tool_use", id: "read-" + n, name: "mcp__sunaba__read_file_range", input: {} }] },
+      }));
+    }, 200);
   } else {
     setInterval(() => {}, 1000); // never writes, never exits — the dispatch timeout must kill us
   }
@@ -1139,7 +1185,15 @@ const SUNABA_MCP = {
   env: { SUNABA_URL: "http://127.0.0.1:8750/mcp" },
 };
 
-function fakeClaudeContext(mode = "ok") {
+/**
+ * @param {string} mode — FAKE_CLAUDE_MODE for the fake binary.
+ * @param {{config?: object|null}} [opts] — when `config` is given it is
+ *        written to <stateRoot>/config.json, which is where the claude
+ *        backend's config-driven features (the session guard, the write
+ *        watchdog) read from.  Default null: NO config file at all, which is
+ *        the pre-existing behaviour every earlier test relies on.
+ */
+function fakeClaudeContext(mode = "ok", { config = null } = {}) {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-claude-test-"));
   const binPath = path.join(tmp, "fake-claude.mjs");
   const argsLog = path.join(tmp, "args.ndjson");
@@ -1154,6 +1208,10 @@ function fakeClaudeContext(mode = "ok") {
   const stateRoot = path.join(tmp, "state");
   const cwd = path.join(tmp, "cwd");
   fs.mkdirSync(cwd, { recursive: true });
+  if (config !== null) {
+    fs.mkdirSync(stateRoot, { recursive: true });
+    fs.writeFileSync(path.join(stateRoot, "config.json"), JSON.stringify(config, null, 2), "utf8");
+  }
 
   const mcpSource = path.join(tmp, "claude.json");
   fs.writeFileSync(mcpSource, JSON.stringify({ mcpServers: { sunaba: SUNABA_MCP, other: { command: "echo" } } }), "utf8");
@@ -1219,6 +1277,14 @@ function readJobEvents(stateDir, jobId) {
 
 function watchdogEvents(stateDir, jobId) {
   return readJobEvents(stateDir, jobId).filter((e) => String(e.type).startsWith("companion.watchdog."));
+}
+
+// The write watchdog's own trail (kusabi #215 item 3).  Its prefix is
+// deliberately distinct from the silence pair's, so `watchdogEvents` above
+// keeps meaning exactly what it always meant and neither can be mistaken
+// for the other.
+function writeWatchdogEvents(stateDir, jobId) {
+  return readJobEvents(stateDir, jobId).filter((e) => String(e.type).startsWith("companion.write-watchdog."));
 }
 
 function spawnedPids(pidsLog) {
@@ -3392,5 +3458,401 @@ describe("probeClaudeSessionUsage — direct", () => {
     assert.equal(probe.reason, "spawn-failed");
     assert.equal(probe.percent, null);
     assert.match(probe.detail, /could not start/);
+  });
+});
+
+// =========================================================================
+// write-tool watchdog (kusabi #215 item 3)
+// =========================================================================
+//
+// The incident this exists for: an implement-phase claude job that ran 256s,
+// cost $2.39 and produced ZERO edits — chatty, busy, and holding the silence
+// watchdog off the whole time by reading files.
+
+describe("resolveClaudeWriteWatchdog", () => {
+  it("no config, and a config without the key, leave the feature entirely OFF", () => {
+    for (const absent of [null, undefined, "nope", [1, 2]]) {
+      const w = resolveClaudeWriteWatchdog(absent);
+      assert.deepEqual(w, { enabled: false, warnS: null, killS: null, reason: "no-config" });
+    }
+    for (const config of [{}, { models: { chain: [["opus"]] } }, { claude: {} }, { claude: "yes" }, { claude: null }]) {
+      const w = resolveClaudeWriteWatchdog(config);
+      assert.equal(w.enabled, false, `expected ${JSON.stringify(config)} to leave the watchdog off`);
+      assert.equal(w.reason, "absent");
+      assert.equal(w.warnS, null);
+      assert.equal(w.killS, null);
+    }
+  });
+
+  it("false disables explicitly; true is warn-only at the default warn bound", () => {
+    assert.deepEqual(
+      resolveClaudeWriteWatchdog({ claude: { writeWatchdog: false } }),
+      { enabled: false, warnS: null, killS: null, reason: "disabled" },
+    );
+    assert.deepEqual(
+      resolveClaudeWriteWatchdog({ claude: { writeWatchdog: true } }),
+      { enabled: true, warnS: CLAUDE_WRITE_WATCHDOG_DEFAULT_WARN_S, killS: null, reason: "default" },
+    );
+    assert.equal(CLAUDE_WRITE_WATCHDOG_DEFAULT_WARN_S, 300);
+  });
+
+  it("0 (and any negative number) at the section level is OFF — the session guard's convention", () => {
+    // An operator who disables the sibling session guard with 0 and mirrors
+    // the shape here must not silently arm a watchdog (cross-review [low],
+    // chain-msojs3cvdf4a).
+    for (const raw of [0, -1, -300, "0", "-1", "-300"]) {
+      assert.deepEqual(
+        resolveClaudeWriteWatchdog({ claude: { writeWatchdog: raw } }),
+        { enabled: false, warnS: null, killS: null, reason: "disabled" },
+        `expected writeWatchdog: ${raw} to disable the feature`,
+      );
+    }
+  });
+
+  it("warnS alone is warn-only; a LATER killS warns then kills", () => {
+    assert.deepEqual(
+      resolveClaudeWriteWatchdog({ claude: { writeWatchdog: { warnS: 120 } } }),
+      { enabled: true, warnS: 120, killS: null, reason: "configured" },
+    );
+    assert.deepEqual(
+      resolveClaudeWriteWatchdog({ claude: { writeWatchdog: { warnS: 300, killS: 900 } } }),
+      { enabled: true, warnS: 300, killS: 900, reason: "configured" },
+    );
+    // A JSON config may carry the numbers as strings; they still read.
+    assert.deepEqual(
+      resolveClaudeWriteWatchdog({ claude: { writeWatchdog: { warnS: "120", killS: "240" } } }),
+      { enabled: true, warnS: 120, killS: 240, reason: "configured" },
+    );
+    // killS with no warnS: the warn bound defaults (an ABSENT warnS is not a
+    // malformed one), and the configured kill is honored on top of it.
+    assert.deepEqual(
+      resolveClaudeWriteWatchdog({ claude: { writeWatchdog: { killS: 900 } } }),
+      { enabled: true, warnS: CLAUDE_WRITE_WATCHDOG_DEFAULT_WARN_S, killS: 900, reason: "configured" },
+    );
+  });
+
+  it("killS absent or 0 is warn-only — killing is opt-in ON TOP of warning", () => {
+    for (const raw of [{ warnS: 60 }, { warnS: 60, killS: 0 }, { warnS: 60, killS: null }]) {
+      const w = resolveClaudeWriteWatchdog({ claude: { writeWatchdog: raw } });
+      assert.equal(w.enabled, true, `expected ${JSON.stringify(raw)} to stay armed`);
+      assert.equal(w.warnS, 60);
+      assert.equal(w.killS, null, `expected ${JSON.stringify(raw)} to be warn-only`);
+    }
+  });
+
+  it("killS <= warnS is DROPPED to warn-only, never normalized upward", () => {
+    // Normalizing would kill a job on a bound the operator never wrote; the
+    // watchdog's contract is warn-BEFORE-kill, so a kill that cannot come
+    // after the warning is removed instead of moved.
+    for (const killS of [60, 30, 1]) {
+      const w = resolveClaudeWriteWatchdog({ claude: { writeWatchdog: { warnS: 60, killS } } });
+      assert.deepEqual(w, { enabled: true, warnS: 60, killS: null, reason: "kill-not-after-warn" });
+    }
+  });
+
+  it("a malformed value NEVER yields a killing configuration", () => {
+    // A malformed threshold must not silently arm a destructive action —
+    // this deliberately differs from the session guard's "malformed →
+    // default ON": refusing a dispatch is conservative, killing is not.
+    const malformed = ["soon", -5, true, {}, [], NaN, "", 0];
+    for (const warnS of malformed) {
+      const w = resolveClaudeWriteWatchdog({ claude: { writeWatchdog: { warnS, killS: 900 } } });
+      assert.equal(w.enabled, true, `warnS ${JSON.stringify(warnS)} must keep the warning`);
+      assert.equal(w.warnS, CLAUDE_WRITE_WATCHDOG_DEFAULT_WARN_S);
+      assert.equal(w.killS, null, `warnS ${JSON.stringify(warnS)} must never leave a kill armed`);
+      assert.equal(w.reason, "malformed-setting");
+    }
+    for (const killS of ["soon", -5, true, {}, [], NaN, ""]) {
+      const w = resolveClaudeWriteWatchdog({ claude: { writeWatchdog: { warnS: 120, killS } } });
+      assert.equal(w.enabled, true, `killS ${JSON.stringify(killS)} must keep the warning`);
+      assert.equal(w.warnS, 120, "a readable warnS survives an unreadable killS");
+      assert.equal(w.killS, null, `killS ${JSON.stringify(killS)} must never arm a kill`);
+      assert.equal(w.reason, "malformed-setting");
+    }
+    // The whole section in a shape this does not understand: the operator
+    // asked for the feature, so honor the ask at its safest setting.
+    for (const raw of ["yes", 900, [300, 900]]) {
+      const w = resolveClaudeWriteWatchdog({ claude: { writeWatchdog: raw } });
+      assert.deepEqual(w, {
+        enabled: true, warnS: CLAUDE_WRITE_WATCHDOG_DEFAULT_WARN_S, killS: null, reason: "malformed-setting",
+      });
+    }
+  });
+});
+
+describe("writeWatchdogAppliesToPhase", () => {
+  it("is armed for implement only — every read-shaped phase is exempt", () => {
+    assert.equal(writeWatchdogAppliesToPhase("implement"), true);
+    for (const phase of ["review", "investigate", "draft", "respond", "salvage", "gofer", "strategize"]) {
+      assert.equal(writeWatchdogAppliesToPhase(phase), false, `${phase} must never trip the write watchdog`);
+    }
+  });
+
+  it("no phase at all is off, never on", () => {
+    for (const phase of [null, undefined, "", 0, {}]) {
+      assert.equal(writeWatchdogAppliesToPhase(phase), false);
+    }
+  });
+
+  it("chain rework rounds dispatch under the phase name 'implement'", () => {
+    // The gate is only correct if rework rounds carry the phase it names.
+    // runImplementPhase (chain-phases.mjs) dispatches EVERY implement round —
+    // round 1 and every rework round — with phase: "implement"; the
+    // `models.phases.rework` config key selects a MODEL, it is not a
+    // dispatch phase name.  Asserted at the source, so a future rename
+    // cannot silently disarm the watchdog for rework rounds.
+    const source = fs.readFileSync(new URL("./chain-phases.mjs", import.meta.url), "utf8");
+    const dispatchPhases = [...source.matchAll(/phase: "([a-z]+)"/g)].map((m) => m[1]);
+    assert.ok(dispatchPhases.includes("implement"), "chain-phases must dispatch an implement phase");
+    assert.ok(!dispatchPhases.includes("rework"), "no dispatch uses a distinct 'rework' phase name");
+  });
+});
+
+describe("isClaudeWriteToolName / eventHasClaudeWriteTool", () => {
+  it("counts the sunaba mutators and the native editing tools", () => {
+    for (const name of [
+      "mcp__sunaba__write_file", "mcp__sunaba__edit_file", "mcp__sunaba__transform_file",
+      "mcp__sunaba__undo_file_edit", "mcp__sunaba__checkpoint_restore",
+      "Write", "Edit", "MultiEdit", "NotebookEdit",
+    ]) {
+      assert.equal(isClaudeWriteToolName(name), true, `${name} must count as a write`);
+    }
+    // The prefix is stripped, so a differently-named MCP server still counts.
+    assert.equal(isClaudeWriteToolName("mcp__other__edit_file"), true);
+    assert.equal(isClaudeWriteToolName("edit_file"), true);
+  });
+
+  it("does NOT count reads, searches, execs, or a plain checkpoint", () => {
+    for (const name of [
+      "mcp__sunaba__read_file_range", "mcp__sunaba__search_in_container", "mcp__sunaba__list_files",
+      "mcp__sunaba__sandbox_exec", "mcp__sunaba__verify_in_container", "mcp__sunaba__diff_in_container",
+      "mcp__sunaba__issue_view", "mcp__sunaba__checkpoint", "Read", "Grep", "Bash", "Skill",
+      "", null, undefined, 42, {},
+    ]) {
+      assert.equal(isClaudeWriteToolName(name), false, `${JSON.stringify(name)} must not count as a write`);
+    }
+  });
+
+  it("reads the same tool_use path applyClaudeStreamEvent folds", () => {
+    const assistant = (names) => ({
+      type: "assistant",
+      message: { model: "claude-sonnet-4-5", content: names.map((name, i) => ({ type: "tool_use", id: `t${i}`, name })) },
+    });
+    assert.equal(eventHasClaudeWriteTool(assistant(["mcp__sunaba__edit_file"])), true);
+    // One write among many reads still counts.
+    assert.equal(eventHasClaudeWriteTool(assistant([
+      "mcp__sunaba__read_file_range", "mcp__sunaba__search_in_container", "mcp__sunaba__write_file",
+    ])), true);
+    assert.equal(eventHasClaudeWriteTool(assistant(["mcp__sunaba__read_file_range"])), false);
+    // Non-assistant events, and junk, are never writes and never throw.
+    for (const evt of [
+      { type: "system", subtype: "init" },
+      { type: "result", is_error: false },
+      { type: "assistant" },
+      { type: "assistant", message: { content: "not an array" } },
+      { type: "assistant", message: { content: [null, "text", { type: "text", text: "edit_file" }] } },
+      null, undefined, "assistant", 7,
+    ]) {
+      assert.equal(eventHasClaudeWriteTool(evt), false);
+    }
+  });
+});
+
+describe("renderClaudeWriteWatchdogError", () => {
+  it("is distinct from the silence watchdog's wording", () => {
+    assert.equal(
+      renderClaudeWriteWatchdogError(900),
+      "write-watchdog: no write-tool call for 900s on an implement phase (process killed)",
+    );
+    assert.notEqual(renderClaudeWriteWatchdogError(900), "watchdog: no events for 900s (process killed)");
+  });
+});
+
+describe("runClaudeProcess — write watchdog", () => {
+  it("a child that exits before the 250ms poll still gets its warning", async () => {
+    // The polled interval can be beaten to the finish line — a descheduled
+    // parent can receive the child's whole output together with its exit,
+    // and the close callback clears the interval before the timers phase
+    // runs.  The warning is an audit fact about the run, not a property of
+    // scheduler luck, so a short-lived child that never wrote anything must
+    // still produce EXACTLY one warning (whichever path observed it).
+    // A child that lives ~120ms against a 10ms warn bound: a margin no
+    // scheduling outcome closes, and well inside the 250ms poll, so this
+    // normally exercises the close-time reading rather than the interval.
+    const seen = [];
+    const result = await runClaudeProcess({
+      bin: process.execPath,
+      args: ["-e", "setTimeout(() => {}, 120)"],
+      timeoutS: 20,
+      watchdogS: 0,
+      promptText: "",
+      writeWatchdog: { warnS: 0.01, killS: null },
+      onWriteWatchdog: (e) => seen.push(e),
+    });
+    assert.equal(result.spawnError, null, "the child must have started for this to say anything");
+    assert.equal(result.writeStalled, false, "warn-only must never kill");
+    assert.deepEqual(seen.map((e) => e.kind), ["warned"]);
+  });
+
+  it("no writeWatchdog option means no clock, no warning, no kill", async () => {
+    const seen = [];
+    const result = await runClaudeProcess({
+      bin: process.execPath,
+      args: ["-e", "setTimeout(() => {}, 120)"],
+      timeoutS: 20,
+      watchdogS: 0,
+      promptText: "",
+      onWriteWatchdog: (e) => seen.push(e),
+    });
+    assert.deepEqual(seen, []);
+    assert.equal(result.writeStalled, false);
+  });
+});
+
+describe("claudeDispatch — write-tool watchdog (kusabi #215 item 3)", () => {
+  let ctx;
+
+  afterEach(() => {
+    if (ctx) {
+      ctx.restore();
+      fs.rmSync(ctx.tmp, { recursive: true, force: true });
+    }
+    ctx = null;
+  });
+
+  // Every config below disables the SESSION guard explicitly: it reads the
+  // same config.json, and a config file WITHOUT `sessionGuardPercent` turns
+  // it on at the default threshold — which would spawn a /usage probe these
+  // tests are not about (and would sit out the probe timeout on the
+  // never-terminating fakes).
+  const withWatchdog = (writeWatchdog) => ({ claude: { sessionGuardPercent: false, writeWatchdog } });
+
+  it("criterion 3: warn then kill on an implement phase whose stream never writes", async () => {
+    ctx = fakeClaudeContext("no-write", { config: withWatchdog({ warnS: 1, killS: 2 }) });
+    const { job } = await claudeDispatch(ctx.dispatchOptions({ phase: "implement", timeoutS: 30, watchdogS: 900 }));
+
+    assert.equal(job.status, "stalled");
+    assert.equal(job.error, "write-watchdog: no write-tool call for 2s on an implement phase (process killed)");
+
+    const events = writeWatchdogEvents(ctx.stateDir, job.id);
+    assert.deepEqual(events.map((e) => e.type), [
+      "companion.write-watchdog.warned",
+      "companion.write-watchdog.fired",
+      "companion.write-watchdog.kill",
+    ]);
+    assert.ok(events[0].idleS >= 1, `warned event must carry the measured idle seconds, got ${events[0].idleS}`);
+    assert.equal(events[0].warnS, 1);
+    assert.equal(events[0].killS, 2);
+    assert.equal(events[0].phase, "implement");
+    assert.ok(events[1].idleS >= 2, `fired event must carry the measured idle seconds, got ${events[1].idleS}`);
+
+    // The SILENCE watchdog must not claim this stall: its clock was being
+    // reset by the read events the whole time.
+    assert.deepEqual(watchdogEvents(ctx.stateDir, job.id), []);
+
+    // Recorded on the job, and on disk.
+    assert.equal(job.writeWatchdog.warned, true);
+    assert.equal(job.writeWatchdog.killed, true);
+    assert.equal(job.writeWatchdog.warnS, 1);
+    assert.equal(job.writeWatchdog.killS, 2);
+    assert.equal(loadJob(ctx.stateDir, job.id).status, "stalled");
+
+    // The whole process group is dead, exactly as the silence watchdog leaves it.
+    for (const pid of spawnedPids(ctx.pidsLog)) {
+      assert.equal(isAlive(pid), false, `pid ${pid} must be dead after the write-watchdog group kill`);
+    }
+  });
+
+  it("criterion 4: a write-tool call resets the clock — a writing worker never warns", async () => {
+    // Writes every 200ms for ~2.4s under warnS: 1 / killS: 2 — bounds this
+    // run would trip many times over if the clock did not reset.
+    ctx = fakeClaudeContext("writes", { config: withWatchdog({ warnS: 1, killS: 2 }) });
+    const { job } = await claudeDispatch(ctx.dispatchOptions({ phase: "implement", timeoutS: 30, watchdogS: 900 }));
+
+    assert.equal(job.status, "completed");
+    assert.deepEqual(writeWatchdogEvents(ctx.stateDir, job.id), []);
+    assert.equal(job.writeWatchdog.warned, false);
+    assert.equal(job.writeWatchdog.killed, false);
+    assert.equal(job.stats.lastTool, "mcp__sunaba__edit_file");
+  });
+
+  it("criterion 5: the same config on a review-phase job never arms the watchdog", async () => {
+    // Identical stream and identical config as the warn-only case below —
+    // ONLY the phase differs, so the phase gate is what is under test.
+    ctx = fakeClaudeContext("no-write-then-finish", { config: withWatchdog({ warnS: 1, killS: 2 }) });
+    const { job } = await claudeDispatch(ctx.dispatchOptions({ phase: "review", timeoutS: 30, watchdogS: 900 }));
+
+    assert.equal(job.status, "completed");
+    assert.deepEqual(writeWatchdogEvents(ctx.stateDir, job.id), []);
+    assert.equal(job.writeWatchdog, undefined, "an unarmed dispatch records no watchdog field at all");
+    assert.ok(!("writeWatchdog" in loadJob(ctx.stateDir, job.id)));
+  });
+
+  it("criterion 6: warn-only mode warns once and never kills", async () => {
+    ctx = fakeClaudeContext("no-write-then-finish", { config: withWatchdog({ warnS: 1 }) });
+    const { job } = await claudeDispatch(ctx.dispatchOptions({ phase: "implement", timeoutS: 30, watchdogS: 900 }));
+
+    // The run's own outcome, untouched by the warning.
+    assert.equal(job.status, "completed");
+    assert.equal(job.error, null);
+    assert.equal(job.sessionID, "claude-cadence-1");
+
+    const events = writeWatchdogEvents(ctx.stateDir, job.id);
+    assert.deepEqual(events.map((e) => e.type), ["companion.write-watchdog.warned"], "warn-only warns EXACTLY once");
+    assert.equal(events[0].killS, null);
+    assert.equal(job.writeWatchdog.warned, true);
+    assert.equal(job.writeWatchdog.killed, false);
+    assert.ok(job.writeWatchdog.warnedAt, "the warning is timestamped on the record");
+    assert.ok(job.writeWatchdog.idleS >= 1);
+    for (const pid of spawnedPids(ctx.pidsLog)) {
+      // The fake exits on its own; nothing here killed it.
+      assert.equal(isAlive(pid), false);
+    }
+  });
+
+  it("criterion 1: a config WITHOUT the key leaves the dispatch and the record as they were", async () => {
+    ctx = fakeClaudeContext("stream-full", { config: { claude: { sessionGuardPercent: false } } });
+    const { job } = await claudeDispatch(ctx.dispatchOptions({ phase: "implement" }));
+
+    assert.equal(job.status, "completed");
+    assert.equal(job.writeWatchdog, undefined);
+    assert.ok(!("writeWatchdog" in loadJob(ctx.stateDir, job.id)), "no new key on the on-disk record");
+    assert.deepEqual(writeWatchdogEvents(ctx.stateDir, job.id), []);
+  });
+
+  it("criterion 1: no config file at all leaves the dispatch and the record as they were", async () => {
+    ctx = fakeClaudeContext("stream-full");
+    const { job } = await claudeDispatch(ctx.dispatchOptions({ phase: "implement" }));
+
+    assert.equal(job.status, "completed");
+    assert.equal(job.writeWatchdog, undefined);
+    assert.ok(!("writeWatchdog" in loadJob(ctx.stateDir, job.id)));
+    assert.deepEqual(writeWatchdogEvents(ctx.stateDir, job.id), []);
+  });
+
+  it("an explicitly disabled watchdog is off even on an implement phase", async () => {
+    ctx = fakeClaudeContext("no-write-then-finish", { config: withWatchdog(false) });
+    const { job } = await claudeDispatch(ctx.dispatchOptions({ phase: "implement", timeoutS: 30, watchdogS: 900 }));
+
+    assert.equal(job.status, "completed");
+    assert.equal(job.writeWatchdog, undefined);
+    assert.deepEqual(writeWatchdogEvents(ctx.stateDir, job.id), []);
+  });
+
+  it("criterion 7: an ARMED write watchdog leaves the silence watchdog's own stall untouched", async () => {
+    // A silent job with the write watchdog armed at bounds it cannot reach:
+    // the silence watchdog must still fire first, with ITS status, ITS
+    // wording and ITS events, and the write watchdog must add nothing.
+    ctx = fakeClaudeContext("stall", { config: withWatchdog({ warnS: 60, killS: 120 }) });
+    const { job } = await claudeDispatch(ctx.dispatchOptions({ phase: "implement", timeoutS: 30, watchdogS: 1 }));
+
+    assert.equal(job.status, "stalled");
+    assert.equal(job.error, "watchdog: no events for 1s (process killed)");
+    assert.deepEqual(watchdogEvents(ctx.stateDir, job.id).map((e) => e.type), [
+      "companion.watchdog.fired",
+      "companion.watchdog.kill",
+    ]);
+    assert.deepEqual(writeWatchdogEvents(ctx.stateDir, job.id), []);
+    assert.equal(job.writeWatchdog.killed, false);
   });
 });
