@@ -8,7 +8,7 @@
 // this function instead of dispatchWithFallback when `--backend claude` is
 // given; the chain phases stay backend-blind.
 //
-// v1 limits (deliberate, see docs/DESIGN.md §3.5.11):
+// v1 limits (deliberate, see docs/design/phase-chain.md §3.5.11):
 //   - ONE model per phase: `explicitModel` when given, else the first route
 //     of the tiered chain.  No tier ladder, no capacity fallback, no retry
 //     walk — a failed dispatch returns a failed job and the chain's existing

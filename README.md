@@ -51,7 +51,7 @@ kusabi ships 7 agent definitions (`plugins/kusabi/opencode-agents/`) that are au
 | `kusabi-salvage` | salvage — recover stalled / dead jobs | read-only + structured report |
 | `kusabi-gofer` | gofer — evidence-gathering errands | sandbox_exec + read/verify tools **allow**; host write/shiori/sunaba mutation **deny** |
 
-Run `/kusabi:setup` or `kusabi-companion.mjs install-agents` to copy them to `OPENCODE_AGENT_DIR`. Legacy `oc-*` names are automatically cleaned up. The same command also copies kusabi's opencode skills (`plugins/kusabi/opencode-skills/`) to `OPENCODE_SKILL_DIR`, copy-and-overwrite only — the destination is never pruned. Both defaults follow opencode's own config dir (`$XDG_CONFIG_HOME/opencode`, else `~/.config/opencode`), which is where opencode actually scans. Note that `OPENCODE_SKILL_DIR` / `OPENCODE_AGENT_DIR` are placement overrides that opencode itself does not read (see `docs/DESIGN.md` §3.8).
+Run `/kusabi:setup` or `kusabi-companion.mjs install-agents` to copy them to `OPENCODE_AGENT_DIR`. Legacy `oc-*` names are automatically cleaned up. The same command also copies kusabi's opencode skills (`plugins/kusabi/opencode-skills/`) to `OPENCODE_SKILL_DIR`, copy-and-overwrite only — the destination is never pruned. Both defaults follow opencode's own config dir (`$XDG_CONFIG_HOME/opencode`, else `~/.config/opencode`), which is where opencode actually scans. Note that `OPENCODE_SKILL_DIR` / `OPENCODE_AGENT_DIR` are placement overrides that opencode itself does not read (see `docs/design/phase-chain.md` §3.8).
 
 ## Commands
 
@@ -93,7 +93,7 @@ The `kusabi:opencode-worker` subagent forwards delegation requests to `task` so 
 | `metrics` | Refresh the kusabi metrics store and report from it (ingest, then report); use for "show me the metrics" / "how is token efficiency" / an explicit `/metrics` request, passing window arguments through. |
 | `update` | Reflect a merged kusabi change into the running local installation (pull, stop serve, redistribute agents, relink the plugin cache); load after merging any kusabi PR. |
 
-The `delegate` skill intentionally points at `--help` and `docs/DESIGN.md` for the CLI
+The `delegate` skill intentionally points at `--help` and `docs/design/phase-chain.md` for the CLI
 surface and the chain semantics instead of restating them, so that improving kusabi does
 not silently make the skill wrong.
 
@@ -182,7 +182,7 @@ hardcoded `--allowedTools` allowlists (implement, review; see
 host `~/.claude.json` (`mcpServers.sunaba`) into a generated
 `--mcp-config` file containing only that entry — override the source file
 with `KUSABI_CLAUDE_MCP_SOURCE`; a missing entry is a clear error. See
-`docs/DESIGN.md` §3.5.11 for the v1 limits and failure semantics.
+`docs/design/phase-chain.md` §3.5.11 for the v1 limits and failure semantics.
 
 ### Resolution precedence (highest to lowest)
 
@@ -199,7 +199,7 @@ The full resolved chain is stored on every job record (`job.modelChain`) for use
 
 The round number is only the budget counter — it does **not** index into the
 model chain. Model tier and session lifecycle are separate levers, decided by
-`deriveReworkStrategy` (`docs/DESIGN.md` §3.5.5).
+`deriveReworkStrategy` (`docs/design/phase-chain.md` §3.5.5).
 
 `models.chain` is a list of **tiers**. Each tier holds interchangeable routes of
 the same quality, tried in order when one is unavailable — that is capacity

@@ -28,7 +28,7 @@ names, probes and dispositions change faster than any skill can track. Read the
 authoritative source instead, once per session before the first dispatch:
 
 - `node <plugin>/scripts/kusabi-companion.mjs --help` — subcommands, flags, phase list
-- `docs/DESIGN.md` §3.5 — chain rounds, deterministic probes, the disposition table
+- `docs/design/phase-chain.md` §3.5 — chain rounds, deterministic probes, the disposition table
 
 What does *not* change with the CLI:
 
@@ -123,11 +123,12 @@ Worker reports are claims, not evidence. They have been false before.
   reprieve from deciding. Never conclude on a followup while a critical or high finding is
   open, and treat a wrong premise as a brief to rewrite, not a finding to defer.
 - **Close the loop on the review record.** A chain that reaches a terminal disposition
-  prints the path of its generated `review-record.md` (see DESIGN.md). After inspection,
-  fill its two fill-at-inspection sections — per-finding adjudication with reasons, and
-  any reusable precedent — and post it to the archive repository. Posting is
-  orchestrator-exclusive, by the same exit principle as publish; an unposted record is
-  write-only state the next brief cannot learn from.
+  prints the path of its generated `review-record.md` (see
+  `docs/design/phase-chain.md`). After inspection, fill its two fill-at-inspection
+  sections — per-finding adjudication with reasons, and any reusable precedent — and
+  post it to the archive repository. Posting is orchestrator-exclusive, by the same
+  exit principle as publish; an unposted record is write-only state the next brief
+  cannot learn from.
 
 ## Publish
 

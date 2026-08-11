@@ -92,9 +92,9 @@ CREATE TABLE IF NOT EXISTS chain (
   brief_smoke_count INTEGER
 );
 -- orch_model / orch_date are stratification keys, not incidental metadata
--- (see DESIGN.md 3.5.8 — orchestrator model is perfectly confounded with
--- date in the recorded history so far).  Indexed so the follow-up PR can
--- group/filter by either without a full scan.
+-- (see docs/design/phase-chain.md 3.5.8 — orchestrator model is perfectly
+-- confounded with date in the recorded history so far).  Indexed so the
+-- follow-up PR can group/filter by either without a full scan.
 CREATE INDEX IF NOT EXISTS idx_chain_orch_model ON chain(orch_model);
 CREATE INDEX IF NOT EXISTS idx_chain_orch_date ON chain(orch_date);
 

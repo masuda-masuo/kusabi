@@ -10,8 +10,8 @@ refreshes the store before reporting, so the numbers are current at the moment y
 even on a machine that has no daily ingest timer, or whose timer has not fired yet.
 
 **The specification is deliberately not restated here**: the report's design is owned by
-`docs/DESIGN.md` §3.5.9 and the flag surface by `kusabi-companion.mjs --help`. Read
-those, not this file, for what the report contains and which arguments exist.
+`docs/design/phase-chain.md` §3.5.9 and the flag surface by `kusabi-companion.mjs --help`.
+Read those, not this file, for what the report contains and which arguments exist.
 
 ## Procedure
 

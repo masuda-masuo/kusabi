@@ -79,7 +79,8 @@ export function deriveReworkStrategy({ reworkCount, strategized, verdict, probes
     reason = `${reworkCount + 1}th rework: escalate tier, new session, keep artifacts`;
   }
 
-  // Strategized always forces a fresh session (anchoring break per §3.4).
+  // Strategized always forces a fresh session (anchoring break per
+  // docs/design/phase-chain.md §3.4).
   if (strategized && !newSession) {
     newSession = true;
     reason += " + new session (strategized)";

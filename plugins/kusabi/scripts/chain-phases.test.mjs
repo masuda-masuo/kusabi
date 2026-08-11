@@ -2441,7 +2441,8 @@ describe("parseReviewResult — JSONL review stream (kusabi #202)", () => {
     assert.equal(result.reviewPartial, true);
     assert.equal(result.reviewFindingCount, 2);
     // Partial is NOT unparseable: we read the output fine, so the review is
-    // parseable and the §3.5 retry (gated on "unparseable") cannot fire.
+    // parseable and the docs/design/phase-chain.md §3.5 retry (gated on
+    // "unparseable") cannot fire.
     assert.equal(result.reviewParseable, true);
     assert.notEqual(result.chainVerdict, "unparseable");
     // The findings it did carry are rendered like any other findings.
