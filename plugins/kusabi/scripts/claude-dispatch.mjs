@@ -886,12 +886,17 @@ export function classifyClaudeTerminalFailure(parsed, { rateLimit } = {}) {
   };
 }
 
+// Upper bound for a value claiming to be epoch SECONDS: past this it is a
+// millisecond epoch (1e12 s already lands in year 33658) or garbage.
+const MAX_PLAUSIBLE_RESET_EPOCH_S = 1e12;
+
 /**
  * The reset time from a streamed `rate_limit_event` (kusabi #215 Job B item
  * 4) — the fallback used ONLY when the terminal payload itself names no
  * reset.  `resetsAt` is epoch seconds on the live quota feed; rendered as
  * an ISO timestamp so it prints the same way a structured payload
- * `resetAt` would.
+ * `resetAt` would.  Values that cannot be a sane epoch-seconds timestamp
+ * are rejected outright (see below) rather than rendered.
  *
  * @param {{info: object, observedAt: string}|null|undefined} rateLimit
  * @returns {string|null}
@@ -899,6 +904,12 @@ export function classifyClaudeTerminalFailure(parsed, { rateLimit } = {}) {
 function extractResetFromRateLimitInfo(rateLimit) {
   const resetsAt = rateLimit?.info?.resetsAt;
   if (typeof resetsAt !== "number" || !Number.isFinite(resetsAt)) return null;
+  // Plausibility bounds (cross-review of PR #219).  Any finite number used
+  // to pass: `0` rendered "1970-01-01T00:00:00.000Z" and a MILLISECOND-epoch
+  // value (the same field, wrong unit) rendered year 58579 — both presented
+  // to the operator as this quota's reset time.  A reset time we cannot
+  // believe is worse than none at all: the operator schedules around it.
+  if (resetsAt <= 0 || resetsAt > MAX_PLAUSIBLE_RESET_EPOCH_S) return null;
   return new Date(resetsAt * 1000).toISOString();
 }
 
@@ -928,10 +939,23 @@ function extractClaudeQuotaReset(parsed) {
  *
  * @param {{quota: string, reset: string|null}} failure — classification.
  * @param {string} detail — the raw terminal result text.
+ * @param {object} [opts]
+ * @param {boolean} [opts.resetFromRateFeed] — the reset came from the live
+ *        rate feed fallback, not from the payload itself (cross-review of
+ *        PR #219).  The two are not equally trustworthy: the payload states
+ *        the reset for THIS failure, while the feed's `resetsAt` is the last
+ *        window boundary the stream happened to mention, which may belong to
+ *        a different limit than the one that just fired.  Rendering both as
+ *        a bare "resets X" presents a guess as the provider's own claim, so
+ *        the fallback is marked as what it is.
  * @returns {string}
  */
-export function renderClaudeQuotaError(failure, detail) {
-  const resetPart = failure.reset ? ` (resets ${failure.reset})` : "";
+export function renderClaudeQuotaError(failure, detail, { resetFromRateFeed = false } = {}) {
+  const resetPart = failure.reset
+    ? (resetFromRateFeed
+        ? ` (resets ~${failure.reset}, from live rate feed)`
+        : ` (resets ${failure.reset})`)
+    : "";
   if (failure.quota === "session") {
     return (
       `claude dispatch failed: ${detail} — session limit exhausted${resetPart}: ` +
@@ -1238,10 +1262,16 @@ export async function stopRecordedProcess(recorded, { waitMs, pollMs = KILL_CONF
  *        AS IT ARRIVES — this is what lets the caller fold stats and reset
  *        the silence clock while the child is still running, not only after
  *        it exits.
+ * @param {(event: {kind: "fired"|"kill", silenceS?: number}) => void} [opts.onWatchdog]
+ *        — called when the silence watchdog fires (`kind: "fired"`, with the
+ *        measured silence in seconds) and again once the group kill has been
+ *        issued (`kind: "kill"`), in that order.  The caller turns these into
+ *        the job's watchdog audit events; only the watchdog path calls it (a
+ *        timeout kill is a different failure and reports itself elsewhere).
  * @returns {Promise<{ code: number|null, stdout: string, stderr: string,
  *                     timedOut: boolean, stalled: boolean, spawnError: Error|null }>}
  */
-export function runClaudeProcess({ bin, args, cwd, timeoutS, watchdogS, promptText, onStart, onLine }) {
+export function runClaudeProcess({ bin, args, cwd, timeoutS, watchdogS, promptText, onStart, onLine, onWatchdog }) {
   return new Promise((resolve) => {
     const child = spawn(bin, args, {
       cwd,
@@ -1317,13 +1347,27 @@ export function runClaudeProcess({ bin, args, cwd, timeoutS, watchdogS, promptTe
     // deadline timer, since the bound restarts on every stream event.
     // 250ms resolution keeps a small test watchdogS tight without adding
     // meaningful overhead against the real multi-minute defaults.
+    // Reports each watchdog step to the caller so the stall lands in the
+    // job's audit trail AT THE MOMENT it is detected, not after the process
+    // has closed and the record is being finalized.  Wrapped: appending to
+    // an audit trail must never take down the kill that is the watchdog's
+    // actual job — note the "fired" notification runs BEFORE killProcessGroup.
+    const notifyWatchdog = (event) => {
+      if (typeof onWatchdog !== "function") return;
+      try { onWatchdog(event); } catch { /* best-effort audit trail */ }
+    };
     const watchdogTimer = watchdogS && watchdogS > 0
       ? setInterval(() => {
           if (timedOut || stalled) return;
-          if (Date.now() - lastEventAt > watchdogS * 1000) {
+          const silenceMs = Date.now() - lastEventAt;
+          if (silenceMs > watchdogS * 1000) {
             stalled = true;
             clearInterval(watchdogTimer);
+            // Measured silence, rounded to seconds — the same quantity the
+            // opencode watchdog reports, not the configured bound.
+            notifyWatchdog({ kind: "fired", silenceS: Math.round(silenceMs / 1000) });
             killProcessGroup(child);
+            notifyWatchdog({ kind: "kill" });
           }
         }, 250)
       : null;
@@ -1546,6 +1590,21 @@ export async function claudeDispatch(opts) {
       saveJob(stateDir, job);
     },
     onLine,
+    // The SAME event types the opencode watchdog writes
+    // (prompt-execution.mjs), so stall auditing over events.ndjson is
+    // backend-agnostic and finally counts claude stalls too — until now the
+    // claude watchdog mirrored opencode's status and wording but left no
+    // trace in the trail at all.  There is deliberately no
+    // `companion.watchdog.declined-kill` counterpart: that event exists on
+    // opencode because a shared serve's pid may not be ours to signal, while
+    // this child is ours alone, so the kill always runs.
+    onWatchdog: ({ kind, silenceS }) => {
+      if (kind === "fired") {
+        appendEvent(stateDir, job.id, { type: "companion.watchdog.fired", silenceS });
+      } else {
+        appendEvent(stateDir, job.id, { type: "companion.watchdog.kill" });
+      }
+    },
   });
 
   job.finishedAt = new Date().toISOString();
@@ -1568,7 +1627,11 @@ export async function claudeDispatch(opts) {
     // Same failure status/text the opencode path uses for timeouts.
     job.status = "timeout";
     job.error = `timed out after ${opts.timeoutS}s`;
-  } else if (code !== 0) {
+  } else if (code !== 0 && streamAcc.resultEvent?.is_error !== true) {
+    // Nonzero exit with nothing to classify: no terminal payload at all, or
+    // one that does not itself claim failure.  Generic error, exactly as
+    // before.  (A terminal payload that DOES claim failure skips this branch
+    // — see the comment on the classification branch below.)
     job.status = "error";
     const detail = (stderr || stdout || "(no output)").trim();
     job.error = `claude exited with code ${code}: ${detail}`;
@@ -1583,6 +1646,16 @@ export async function claudeDispatch(opts) {
   } else {
     parsed = streamAcc.resultEvent;
     if (parsed.is_error === true) {
+      // Reached on exit 0 AND on a nonzero exit (cross-review of PR #219).
+      // The exit code decides nothing this payload does not already say: a
+      // terminal event with `is_error: true` names the failure, and whether
+      // it is quota exhaustion. Gating the classification on `code === 0`
+      // made the provider-exhaustion stop and its operator advice hostage to
+      // an exit code the real CLI is not documented to set either way — the
+      // one captured session-limit run exited 0, and a future build exiting 1
+      // on the same payload would have silently downgraded it to a generic
+      // error. The exit code is still recorded (companion.claude.finished).
+      //
       // `subtype` is NEVER consulted here: a terminal payload can carry
       // `subtype: "success"` next to `is_error: true` (real 2026-08-11
       // session-limit payload) — the failure signal is is_error alone.
@@ -1597,10 +1670,23 @@ export async function claudeDispatch(opts) {
         // the generic error text (kusabi #215); the error text carries
         // the operator-facing advice (which quota, reset, what to do).
         job.status = "provider-error";
-        job.error = renderClaudeQuotaError(failure, detail);
+        job.error = renderClaudeQuotaError(failure, detail, {
+          // Provenance of the reset the classifier settled on: the payload
+          // names one, or it fell back to the live rate feed. Asked the same
+          // way the classifier asks it, so the two can never disagree.
+          resetFromRateFeed: failure.reset !== null && extractClaudeQuotaReset(parsed) === null,
+        });
       } else {
         job.status = "error";
-        job.error = `claude dispatch failed: ${detail}`;
+        // Nonzero exit with stderr/stdout text: keep the CLI's own
+        // diagnostic on the record — a terse is_error payload says what
+        // happened, not why.  The quota arm never appends it: the
+        // classification names the failure and stderr would be noise.
+        // Exit-0 rendering is unchanged (this suffix is exit-gated).
+        const exitDiagnostic = (stderr || stdout || "").trim();
+        job.error = code !== 0 && exitDiagnostic
+          ? `claude dispatch failed: ${detail} (exited with code ${code}: ${exitDiagnostic})`
+          : `claude dispatch failed: ${detail}`;
       }
     } else {
       job.status = "completed";

@@ -658,6 +658,88 @@ describe("renderClaudeQuotaError", () => {
   });
 });
 
+// =========================================================================
+// Reset plausibility + provenance (cross-review of PR #219).  The rate feed
+// is the only reset source we do not control the shape of, and its value is
+// shown to an operator who schedules around it.
+// =========================================================================
+
+describe("classifyClaudeTerminalFailure — rate-feed reset plausibility bounds", () => {
+  // A session-limit payload naming no reset of its own, so the classifier
+  // always reaches the rate-feed fallback.
+  const NO_RESET_PAYLOAD = {
+    type: "result", is_error: true, api_error_status: 429,
+    result: "You've hit your session limit.",
+  };
+  const feed = (resetsAt) => ({
+    rateLimit: { info: { resetsAt }, observedAt: "2026-08-11T05:00:00.000Z" },
+  });
+  const resetFor = (resetsAt) => classifyClaudeTerminalFailure(NO_RESET_PAYLOAD, feed(resetsAt)).reset;
+
+  it("rejects resetsAt: 0 instead of telling the operator the quota reset in 1970", () => {
+    assert.equal(new Date(0).toISOString(), "1970-01-01T00:00:00.000Z"); // what it used to render
+    assert.equal(resetFor(0), null);
+  });
+
+  it("rejects a negative resetsAt", () => {
+    assert.equal(resetFor(-1), null);
+    assert.equal(resetFor(-1786424400), null);
+  });
+
+  it("rejects a millisecond-epoch resetsAt (same field, wrong unit)", () => {
+    // 1765430400000 as SECONDS lands five figures into the future; rendering
+    // that as this quota's reset time is worse than admitting we have none.
+    assert.ok(new Date(1765430400000 * 1000).getUTCFullYear() > 9999);
+    assert.equal(resetFor(1765430400000), null);
+  });
+
+  it("still accepts a sane epoch-seconds value, unchanged", () => {
+    assert.equal(resetFor(1786424400), new Date(1786424400 * 1000).toISOString());
+  });
+
+  it("a rejected feed value leaves reset null — it never falls through to a wrong one", () => {
+    const f = classifyClaudeTerminalFailure(NO_RESET_PAYLOAD, feed(0));
+    assert.equal(f.kind, "quota-exhaustion");
+    assert.equal(f.quota, "session");
+    assert.equal(f.backendBlocked, true);
+    assert.equal(f.reset, null);
+  });
+});
+
+describe("renderClaudeQuotaError — reset provenance", () => {
+  const ISO = new Date(1786424400 * 1000).toISOString();
+
+  it("marks a rate-feed reset as coming from the feed, not from the payload", () => {
+    const text = renderClaudeQuotaError(
+      { quota: "session", reset: ISO },
+      "You've hit your session limit.",
+      { resetFromRateFeed: true },
+    );
+    assert.ok(text.includes(`(resets ~${ISO}, from live rate feed)`));
+    // The rest of the session advice is untouched.
+    assert.match(text, /whole claude backend is blocked/);
+    assert.match(text, /do not retry claude/);
+  });
+
+  it("renders a payload-named reset exactly as before — no marker, no approximation", () => {
+    const failure = { quota: "session", reset: "1:20am (Asia/Tokyo)" };
+    const detail = "You've hit your session limit · resets 1:20am (Asia/Tokyo)";
+    const text = renderClaudeQuotaError(failure, detail, { resetFromRateFeed: false });
+    assert.match(text, /\(resets 1:20am \(Asia\/Tokyo\)\)/);
+    assert.ok(!text.includes("rate feed"));
+    assert.ok(!text.includes("~"));
+    // ...and the two-argument call (no provenance given) renders identically:
+    // absent information must never be reported as a feed fallback.
+    assert.equal(text, renderClaudeQuotaError(failure, detail));
+  });
+
+  it("says nothing about a reset, or its provenance, when there is none", () => {
+    const text = renderClaudeQuotaError({ quota: "rate", reset: null }, "Rate limit reached", { resetFromRateFeed: true });
+    assert.ok(!text.includes("resets"));
+    assert.ok(!text.includes("rate feed"));
+  });
+});
+
 describe("allowedToolsForAgent", () => {
   it("maps the implement agent to the implement allowlist (mirrors kusabi-implement.md)", () => {
     const csv = allowedToolsForAgent("kusabi-implement");
@@ -842,7 +924,7 @@ if (mode === "garbage") {
   process.stdout.write("this is not json at all\\n");
   process.exit(0);
 }
-if (mode === "is-error") {
+if (mode === "is-error" || mode === "is-error-exit1") {
   // "subtype: success" next to "is_error: true" is the real 2026-08-11
   // session-limit shape: subtype must NEVER influence success/failure.
   process.stdout.write(JSON.stringify({
@@ -850,9 +932,13 @@ if (mode === "is-error") {
     subtype: "success",
     session_id: "sess-err", usage: {}, total_cost_usd: 0, duration_ms: 5, num_turns: 1,
   }));
-  process.exit(0);
+  // "is-error-exit1" adds the stderr diagnostic a real nonzero exit carries
+  // (auth/model-permission errors) and exits nonzero — one shared payload
+  // literal, so the only variable under test is exit code + stderr.
+  process.stderr.write("claude: authentication failed\\n");
+  process.exit(mode === "is-error-exit1" ? 1 : 0);
 }
-if (mode === "quota-session") {
+if (mode === "quota-session" || mode === "quota-session-exit1") {
   // The REAL incident terminal payload (job-msnf4qph5ccd, 2026-08-11): an
   // implement phase that ran 256s, cost $2.39, made zero edits, and died
   // on the account's session limit.
@@ -863,7 +949,23 @@ if (mode === "quota-session") {
     session_id: null, usage: {}, total_cost_usd: 2.391763,
     duration_ms: 256000, num_turns: 8,
   }));
-  process.exit(0);
+  // The captured real run exited 0.  "quota-session-exit1" emits the very
+  // same payload and exits NONZERO instead — one shared literal, so the two
+  // modes can never drift apart and the only variable under test is the exit
+  // code (cross-review of PR #219).
+  process.exit(mode === "quota-session-exit1" ? 1 : 0);
+}
+if (mode === "ok-exit1") {
+  // A terminal result that does NOT claim failure, then a nonzero exit:
+  // there is nothing for the classifier to read, so this must stay the
+  // generic exit-code error it has always been.
+  process.stdout.write(JSON.stringify({
+    type: "result", is_error: false, result: "looked fine, then the CLI fell over",
+    session_id: "claude-ok-exit1", usage: {}, total_cost_usd: 0,
+    duration_ms: 5, num_turns: 1,
+  }));
+  process.stderr.write("claude: crashed while shutting down\\n");
+  process.exit(1);
 }
 if (mode === "stream-full") {
   // The full realistic captured sequence (kusabi #215 Job B acceptance
@@ -1097,6 +1199,17 @@ function fakeClaudeContext(mode = "ok") {
       }
     },
   };
+}
+
+function readJobEvents(stateDir, jobId) {
+  const file = path.join(jobDir(stateDir, jobId), "events.ndjson");
+  if (!fs.existsSync(file)) return [];
+  return fs.readFileSync(file, "utf8").trim().split("\n").filter(Boolean)
+    .map((line) => JSON.parse(line));
+}
+
+function watchdogEvents(stateDir, jobId) {
+  return readJobEvents(stateDir, jobId).filter((e) => String(e.type).startsWith("companion.watchdog."));
 }
 
 function spawnedPids(pidsLog) {
@@ -1657,6 +1770,132 @@ describe("claudeDispatch (fake claude binary)", () => {
     for (const pid of pids) {
       assert.equal(isAlive(pid), false, `pid ${pid} must be dead after the watchdog group kill`);
     }
+  });
+
+  // -----------------------------------------------------------------------
+  // Cross-review of PR #219: the exit code must not gate the classification,
+  // and the claude watchdog must leave the same audit trail opencode does.
+  // -----------------------------------------------------------------------
+
+  it("classifies the session-limit payload identically when the CLI exits NONZERO", async () => {
+    ctx.restore();
+    ctx = fakeClaudeContext("quota-session-exit1");
+    const { job } = await claudeDispatch(ctx.dispatchOptions());
+
+    // The same outcome the exit-0 case produces: the payload says what
+    // failed, the exit code adds nothing it does not already state.
+    assert.equal(job.status, "provider-error");
+    assert.deepEqual(job.failure, {
+      kind: "quota-exhaustion",
+      quota: "session",
+      backendBlocked: true,
+      reset: "1:20am (Asia/Tokyo)",
+    });
+    assert.match(job.error, /session limit exhausted \(resets 1:20am \(Asia\/Tokyo\)\)/);
+    assert.match(job.error, /whole claude backend is blocked/);
+    assert.match(job.error, /Switch the phase to the opencode backend/);
+    assert.match(job.error, /do not retry claude/);
+    assert.match(job.error, /You've hit your session limit/);
+    // The generic exit-code branch must not have swallowed the classification.
+    assert.ok(!job.error.includes("claude exited with code"));
+
+    const persisted = loadJob(ctx.stateDir, job.id);
+    assert.equal(persisted.status, "provider-error");
+    assert.deepEqual(persisted.failure, job.failure);
+
+    // Nothing is lost: the nonzero exit is still on the audit trail.
+    const finished = readJobEvents(ctx.stateDir, job.id).find((e) => e.type === "companion.claude.finished");
+    assert.equal(finished.exitCode, 1);
+    assert.equal(finished.status, "provider-error");
+  });
+
+  it("is_error + exit 1: keeps the payload detail AND the stderr diagnostic with the exit code", async () => {
+    // Non-quota is_error payload + nonzero exit: the payload says what
+    // failed, stderr says why (auth/model-permission errors a terse
+    // payload never carries).  The generic exit-diagnostic must not be
+    // lost to the classification branch.
+    ctx.restore();
+    ctx = fakeClaudeContext("is-error-exit1");
+    const { job } = await claudeDispatch(ctx.dispatchOptions());
+
+    assert.equal(job.status, "error");
+    assert.equal(job.failure, null);
+    assert.equal(
+      job.error,
+      "claude dispatch failed: boom: tool call failed (exited with code 1: claude: authentication failed)",
+    );
+  });
+
+  it("nonzero exit with no terminal payload keeps the generic exit-code error, unclassified", async () => {
+    ctx.restore();
+    ctx = fakeClaudeContext("exit");
+    const { job } = await claudeDispatch(ctx.dispatchOptions());
+
+    assert.equal(job.status, "error");
+    assert.equal(job.error, "claude exited with code 3: claude: permission denied for model opus");
+    assert.equal(job.failure, null);
+  });
+
+  it("nonzero exit after a SUCCESSFUL terminal result stays the generic exit-code error", async () => {
+    // Only a payload that itself claims failure (`is_error: true`) is worth
+    // classifying; a clean result plus a nonzero exit is still a crash.
+    ctx.restore();
+    ctx = fakeClaudeContext("ok-exit1");
+    const { job } = await claudeDispatch(ctx.dispatchOptions());
+
+    assert.equal(job.status, "error");
+    assert.match(job.error, /claude exited with code 1: claude: crashed while shutting down/);
+    assert.equal(job.failure, null);
+  });
+
+  it("the rendered quota error marks a rate-feed reset as coming from the feed", async () => {
+    ctx.restore();
+    ctx = fakeClaudeContext("quota-ratelimit-fallback");
+    const { job } = await claudeDispatch(ctx.dispatchOptions());
+
+    const iso = new Date(1786424400 * 1000).toISOString();
+    // The machine-readable value stays a clean ISO timestamp; only the
+    // operator-facing text says where it came from.
+    assert.equal(job.failure.reset, iso);
+    assert.ok(job.error.includes(`(resets ~${iso}, from live rate feed)`));
+  });
+
+  it("watchdog: appends the same fired/kill events the opencode watchdog writes", async () => {
+    ctx.restore();
+    ctx = fakeClaudeContext("stall-with-child");
+    const { job } = await claudeDispatch(ctx.dispatchOptions({ watchdogS: 1 }));
+
+    assert.equal(job.status, "stalled");
+    const events = watchdogEvents(ctx.stateDir, job.id);
+    // Same event types as prompt-execution.mjs, in the order they happened,
+    // so backend-agnostic stall auditing finally counts claude stalls.
+    assert.deepEqual(events.map((e) => e.type), [
+      "companion.watchdog.fired",
+      "companion.watchdog.kill",
+    ]);
+    assert.equal(typeof events[0].silenceS, "number");
+    assert.ok(events[0].silenceS >= 1, "the measured silence must be reported");
+    // No declined-kill counterpart on this backend: the process is ours
+    // alone, so the kill always ran.
+    assert.ok(!events.some((e) => e.type === "companion.watchdog.declined-kill"));
+  });
+
+  it("watchdog: a job that never stalls appends no watchdog events", async () => {
+    const { job } = await claudeDispatch(ctx.dispatchOptions());
+
+    assert.equal(job.status, "completed");
+    assert.deepEqual(watchdogEvents(ctx.stateDir, job.id), []);
+  });
+
+  it("watchdog: a TIMEOUT kill is not recorded as a stall", async () => {
+    // The timeout kills the group too, but it is a different failure — the
+    // trail must not claim the silence watchdog fired.
+    ctx.restore();
+    ctx = fakeClaudeContext("slow-with-child");
+    const { job } = await claudeDispatch(ctx.dispatchOptions({ timeoutS: 1, watchdogS: 900 }));
+
+    assert.equal(job.status, "timeout");
+    assert.deepEqual(watchdogEvents(ctx.stateDir, job.id), []);
   });
 
   it("saves job stats to disk at a bounded cadence while the child is still running (kusabi #215 Job B)", async () => {
