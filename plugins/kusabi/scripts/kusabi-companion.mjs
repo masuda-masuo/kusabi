@@ -7,7 +7,7 @@
 // session never sees intermediate narration, tool logs, or raw events.
 
 
-import { parseArgs, parseModel, resolveModel, firstRoute, reviewDenyTools, WRITE_TOOL_NAMES, validateChainEntries, splitRouteBackend, resolveChainBackend, stripClaudePrefixChain } from "./cli.mjs";
+import { parseArgs, parseModel, resolveModel, reviewDenyTools, WRITE_TOOL_NAMES, validateChainEntries, splitRouteBackend, resolveChainBackend, stripClaudePrefixChain, resolveModelBackend, chainNamesBackend } from "./cli.mjs";
 import { renderReview, renderChainShow, renderJobLine, renderHeader, extractJson, renderFollowupDraft } from "./render.mjs";
 import { hasSectionHeading, parseDeliverables, parseSmoke, parseOrchestratorSignature, briefRequestsPublish } from "./brief-parsing.mjs";
 import { deriveDisposition } from "./disposition.mjs";
@@ -352,34 +352,47 @@ export function resolveBackend(flags) {
 }
 
 /**
- * Resolve `{ dispatch, backend, model, chain }` for ONE phase of a
- * job-creating command.  The backend decides BOTH the dispatch function
- * (claudeDispatch vs dispatchWithFallback — the single decision point; the
- * chain phases stay backend-blind) and the model resolution syntax (claude
- * models are bare aliases / full ids, opencode models are provider/model).
+ * Resolve `{ dispatch, backend, model, explicitModel, chain }` for ONE phase
+ * of a job-creating command.  The backend decides BOTH the dispatch function
+ * (claudeDispatch vs dispatchWithFallback — the chain phases stay
+ * backend-blind) and the model resolution syntax (claude models are bare
+ * aliases / full ids, opencode models are provider/model).
  *
- * Backend selection (kusabi #192): the `--backend` flag, when given, forces
- * EVERY phase onto that backend and wins over the config (current behaviour,
- * including clampModelDispatch on claude).  With NO `--backend` flag, the
- * per-entry prefixes decide: a chain whose entries carry `claude/` selects
- * the claude backend for this phase; otherwise opencode.  `chain` resolves
- * the implement route-chain and the review route-chain independently, each
- * from `models.phases.<phase>` with fallback to `models.chain`, then the
- * built-in default — same precedence as resolveModel / resolveClaudeModel.
- * The built-in default chain remains opencode.
+ * ---------------------------------------------------------------------
+ * Resolution order (kusabi #210).  ONE decision picks the backend, and the
+ * model is validated against THAT backend.  The defect class removed here
+ * is a backend chosen by one input and a model validated against another:
+ *
+ *   0. a `--model` that NAMES a backend (`claude/opus`,
+ *      `opencode-go/deepseek-v4-pro:max`) decides it — for the phases the
+ *      flag pins, which is every phase it applies to and no wider;
+ *   1. otherwise `--backend`, which forces EVERY phase onto that backend;
+ *   2. otherwise the phase's chain entries (`models.phases.<phase>` →
+ *      `models.chain` → the built-in default), via resolveChainBackend.
+ *
+ * A bare `--model <alias>` (no `/`) names no backend and therefore moves
+ * nothing: the phase keeps its configured backend, exactly as before step 0
+ * existed.  `--backend X` together with a `--model` naming backend Y is a
+ * contradiction and throws, naming both — one is never silently dropped.
+ *
+ * Config file semantics are untouched: step 0 accepts the identifier syntax
+ * the CONFIG already defines (splitRouteBackend), so the string that routes
+ * a phase in `models.phases.<phase>` routes it on the CLI too.
+ * ---------------------------------------------------------------------
  *
  * Invariant (kusabi #192): one phase's chain array is single-backend — an
  * array mixing `claude/` and opencode entries fails LOUDLY here, at command
  * start, before createChainDir / before any job is dispatched.  The check is
- * skipped only when the chain is never consulted (explicit `--backend claude`
- * plus `--model` pins every phase — kusabi #186's carve-out).
+ * skipped only when the chain is never consulted (the backend is already
+ * decided AND `--model` pins every phase — kusabi #186's carve-out).
  *
  * @param {object} opts
  * @param {object} opts.flags
  * @param {string} [opts.phase]
  * @param {object|null} opts.config
  * @returns {{ dispatch: Function, backend: "opencode"|"claude",
- *             model: object|string|undefined, chain: (string|string[])[] }}
+ *             model: object|string|undefined, explicitModel: string|null,
+ *             chain: (string|string[])[] }}
  */
 export function resolveDispatchBackend({ flags, phase, config }) {
   // Unknown-backend errors are about the flag, not the phase's config key:
@@ -395,91 +408,156 @@ export function resolveDispatchBackend({ flags, phase, config }) {
     // fix — the same fail-loud principle as the mixed-backend / :variant
     // rejections.  Appended only when the phase actually has its own config
     // key (an error from models.chain must not be misattributed to a phase
-    // that has no key), and only once.
+    // that has no key), and only once.  Errors about the FLAGS carry
+    // `flagError` and are never re-attributed to a config key: blaming
+    // models.phases.<phase> for a value the operator typed on the command
+    // line is the confusion kusabi #210 removes.
     const key = phase && config?.models?.phases?.[phase] ? `models.phases.${phase}` : null;
-    if (key && err instanceof Error && !err.message.includes(key)) {
+    if (key && err instanceof Error && !err.flagError && !err.message.includes(key)) {
       throw new Error(`${err.message} (${key})`);
     }
     throw err;
   }
 }
 
+/**
+ * Build an error about the FLAGS rather than about a config key, tagged so
+ * the wrapper above never appends "(models.phases.<phase>)" to it.
+ *
+ * @param {string} message
+ * @returns {Error}
+ */
+function flagError(message) {
+  const err = new Error(message);
+  err.flagError = true;
+  return err;
+}
+
 function resolveDispatchBackendForPhase({ flags, phase, config, backendFlag }) {
-  if (backendFlag === "claude") {
-    const resolved = resolveClaudeModel({ flag: flags.model, phase, config });
-    // Entries written for the per-phase syntax may carry the claude/ prefix;
-    // the flag already forced this backend, so the prefix is redundant but
-    // must not leak into models — strip it before validating/deriving.
-    const chain = stripClaudePrefixChain(resolved.chain);
-    const model = resolved.model == null ? undefined : splitRouteBackend(String(resolved.model)).route;
-    // The chain is validated iff it can be consulted by a dispatch (kusabi
-    // #186).  With an explicit --model, clampModelDispatch pins EVERY phase
-    // (chain start and chain-resume alike) to that model, so the config
-    // chain is never read and an opencode-shaped models.chain must not block
-    // startup.  Without --model, a rework/strategize/resume round derives
-    // its model from the chain, so a bad models.chain must fail LOUDLY here
-    // — before createChainDir / before any job is dispatched — never
-    // mid-flight after round 1 (kusabi #184 finding 1).  The single-backend
-    // invariant (kusabi #192) is checked on the RAW chain: an opencode entry
-    // with no :variant would otherwise pass validateClaudeChain and silently
-    // run as a claude model.
-    if (!flags.model) {
-      resolveChainBackend(resolved.chain);
-      validateClaudeChain(chain);
-    }
-    // A :variant suffix cannot be expressed on the claude backend — reject
-    // it up front (clear error, nonzero exit) instead of silently ignoring
-    // it at dispatch time.
-    if (model != null) validateClaudeModel(model);
-    return { dispatch: claudeDispatch, backend: "claude", model, chain };
+  // ---- step 0: the identifier ----
+  // `--model` is resolved into { backend, model } BEFORE anything else is
+  // consulted, with the config's own prefix grammar.
+  const modelSpec = resolveModelBackend(flags.model);
+  const namedBackend = modelSpec?.backend ?? null;
+  const flagBackend = flags.backend ? backendFlag : null;
+  if (flagBackend && namedBackend && namedBackend !== flagBackend) {
+    throw flagError(
+      `--backend ${flagBackend} conflicts with --model ${flags.model}, which names the ${namedBackend} backend — ` +
+      `a --model that names a backend decides it for the phases it pins; drop --backend ${flagBackend}, ` +
+      `or pass a --model that names ${flagBackend}`
+    );
   }
 
-  // No --backend flag (or an explicit opencode flag): the entries decide.
-  // The chain is resolved FIRST (independent of the flag) because the
-  // backend decision — and therefore the --model syntax — depends on it: a
-  // claude-native chain takes a bare alias / full id for --model, an
-  // opencode chain takes provider/model.  The single-backend invariant runs
-  // on every chain a dispatch reads, so a mixed array fails at command start
-  // regardless of which phase resolved it.
-  const chainSource = resolveModel({ flag: undefined, phase, config });
-  const chainBackend = resolveChainBackend(chainSource.chain);
-  // Explicit `--backend opencode` forces EVERY phase onto opencode (kusabi
-  // #192 flag precedence: the flag wins over the config).  A phase whose
-  // chain is claude-native therefore CONTRADICTS the flag: throw at command
-  // start, naming the flag, the phase and the offending config key \u2014 never
-  // silently switch backends, never dispatch claude/... routes as opencode
-  // (the pre-fix code treated "no --backend flag" and "explicit --backend
-  // opencode" identically and let the entries decide).  No flag: the
-  // entries-decide behaviour below is unchanged.
-  if (flags.backend === "opencode" && chainBackend === "claude") {
+  // ---- THE single decision point ----
+  // Everything below — the dispatch function, the model spelling, and the
+  // backend that model is validated against — derives from this one value.
+  // The chain is consulted ONLY when neither the identifier nor the flag
+  // decided (`??` short-circuits), which is what keeps kusabi #186's
+  // carve-out intact: with the backend already decided and `--model` given,
+  // an opencode-shaped models.chain must not block startup.
+  const backend = namedBackend
+    ?? flagBackend
+    ?? resolveChainBackend(resolveModel({ flag: undefined, phase, config }).chain);
+
+  return backend === "claude"
+    ? resolveClaudePhaseDispatch({ flags, phase, config, modelSpec })
+    : resolveOpencodePhaseDispatch({ phase, config, modelSpec, namedBackend, flagBackend });
+}
+
+/**
+ * The claude branch of the decision.  Reached identically whether the
+ * identifier named claude, `--backend claude` forced it, or the phase's
+ * chain entries are claude-native — the branch does not care which, which
+ * is the point: one decision, one model syntax, one validation.
+ */
+function resolveClaudePhaseDispatch({ flags, phase, config, modelSpec }) {
+  // The chain this phase reads: models.phases.<phase> → models.chain → the
+  // claude-native default.  Entries written for the per-phase syntax may
+  // carry the claude/ prefix; the backend is already decided, so the prefix
+  // is redundant but must not leak into models — strip it before
+  // validating / deriving.
+  const resolved = resolveClaudeModel({ flag: undefined, phase, config });
+  const chain = stripClaudePrefixChain(resolved.chain);
+
+  if (!modelSpec) {
+    // No --model: the model comes from the chain, so the WHOLE chain can be
+    // consulted by a dispatch (a rework/strategize/resume round derives its
+    // model from it) and must be valid here — before createChainDir /
+    // before any job is dispatched — never mid-flight after round 1 (kusabi
+    // #184 finding 1).  The single-backend invariant (kusabi #192) is
+    // checked on the RAW chain: an opencode entry with no :variant would
+    // otherwise pass validateClaudeChain and silently run as a claude model.
+    resolveChainBackend(resolved.chain);
+    validateClaudeChain(chain);
+    const model = resolved.model == null ? undefined : splitRouteBackend(String(resolved.model)).route;
+    if (model != null) validateClaudeModel(model);
+    return { dispatch: claudeDispatch, backend: "claude", model, explicitModel: null, chain };
+  }
+
+  // With an explicit --model, clampModelDispatch pins EVERY phase (chain
+  // start and chain-resume alike) to that model, so the config chain is
+  // never consulted for a model and must not block startup (kusabi #186).
+  // A :variant suffix cannot be expressed on the claude backend — reject it
+  // up front (clear error, nonzero exit) instead of silently ignoring it at
+  // dispatch time, and attribute the rejection to the identifier's own
+  // backend rather than to a config key three levels away (kusabi #210).
+  const model = modelSpec.model;
+  try {
+    validateClaudeModel(model);
+  } catch (err) {
+    throw flagError(
+      `--model "${flags.model}" ${modelSpec.backend ? "names" : "resolves on"} the claude backend: ${err.message}`
+    );
+  }
+  return { dispatch: claudeDispatch, backend: "claude", model, explicitModel: model, chain };
+}
+
+/**
+ * The opencode branch of the decision: `--model` is provider/model syntax
+ * (parseModel), chain entries pass through byte-identical.
+ */
+function resolveOpencodePhaseDispatch({ phase, config, modelSpec, namedBackend, flagBackend }) {
+  // The phase's CONFIGURED chain, independent of --model: the single-backend
+  // invariant (kusabi #192) runs on it on every opencode resolution, as it
+  // always has, and the conflict below is stated over it.
+  const configuredChain = resolveModel({ flag: undefined, phase, config }).chain;
+  const configuredBackend = resolveChainBackend(configuredChain);
+  // kusabi #192: an explicit `--backend opencode` forces EVERY phase onto
+  // opencode, so a claude-native phase chain CONTRADICTS it — throw at
+  // command start, naming the flag, the phase and the offending config key;
+  // never silently switch backends, never dispatch claude/... routes as
+  // opencode.  It fires only when there is no backend-naming `--model` to
+  // settle the question: when the identifier names a backend the operator
+  // has stated their intent unambiguously (and a disagreeing --backend
+  // already threw above), so firing anyway would reproduce the incident
+  // kusabi #210 was filed for.
+  if (flagBackend === "opencode" && namedBackend === null && configuredBackend === "claude") {
     const chainKey = (phase && config?.models?.phases?.[phase])
       ? `models.phases.${phase}`
       : (config?.models?.chain ? "models.chain" : "the built-in default chain");
     throw new Error(
       `--backend opencode conflicts with the claude-native chain of the ${phase ?? "task"} phase ` +
-      `(${chainKey}: ${JSON.stringify(chainSource.chain)}) \u2014 an explicit --backend forces every phase ` +
+      `(${chainKey}: ${JSON.stringify(configuredChain)}) — an explicit --backend forces every phase ` +
       `onto that backend; remove --backend opencode or point ${chainKey} at opencode entries`
     );
   }
-  if (chainBackend === "claude") {
-    // The phase's chain is claude-native — claude backend with claude model
-    // syntax: `--model` (if given) is a bare alias / full id (a `:variant` or
-    // an opencode-shaped --model is rejected, exactly as on the flag path);
-    // otherwise the model is the chain's first route.
-    const chain = stripClaudePrefixChain(chainSource.chain);
-    const model = flags.model
-      ? splitRouteBackend(String(flags.model)).route
-      : (firstRoute(chain) ?? undefined);
-    if (model != null) validateClaudeModel(model);
-    // With --model the chain is never consulted for a model (same principle
-    // as the flag path above); without it the whole chain must be claude-valid.
-    if (!flags.model) validateClaudeChain(chain);
-    return { dispatch: claudeDispatch, backend: "claude", model, chain };
-  }
 
-  // opencode: --model is provider/model syntax (parseModel), chain verbatim.
-  const resolved = resolveModel({ flag: flags.model, phase, config });
-  return { dispatch: dispatchWithFallback, backend: "opencode", model: resolved.model, chain: resolved.chain };
+  const resolved = resolveModel({ flag: modelSpec?.model, phase, config });
+  let chain = resolved.chain;
+  if (namedBackend === "opencode" && chainNamesBackend(chain, "claude")) {
+    // Only reachable when the identifier chose opencode over a claude-native
+    // chain: those entries are claude models and must never be walked as
+    // opencode routes by the fallback ladder.  `--model` pins this phase
+    // anyway, so its ladder is exactly the pinned route.
+    chain = [modelSpec.model];
+  }
+  return {
+    dispatch: dispatchWithFallback,
+    backend: "opencode",
+    model: resolved.model,
+    explicitModel: modelSpec ? modelSpec.model : null,
+    chain,
+  };
 }
 
 /**
@@ -551,7 +629,12 @@ async function cmdTask(cwd, { flags, text }) {
   // Backend resolved ONCE at command start: it picks the dispatch function
   // AND the model syntax (claude: bare alias / full id; opencode:
   // provider/model).
-  const { dispatch, backend, chain: modelChain } = resolveDispatchBackend({ flags, phase, config });
+  // `explicitModel` is the --model value in the SPELLING of the backend the
+  // same resolution chose (kusabi #210): `claude/opus` reaches a claude
+  // dispatch as `opus`, an opencode route reaches the ladder verbatim.  The
+  // raw flag string must never be handed to a dispatch — a claude CLI given
+  // `--model claude/opus` would take the prefix for part of the model id.
+  const { dispatch, backend, chain: modelChain, explicitModel } = resolveDispatchBackend({ flags, phase, config });
 
   let session = flags.session;
   if (!session && flags.resumeLast) {
@@ -621,7 +704,7 @@ async function cmdTask(cwd, { flags, text }) {
     watchdogS: Number(flags.watchdog ?? DEFAULT_WATCHDOG_S),
     tiers: modelChain,
     round: 1,
-    explicitModel: flags.model || null,
+    explicitModel,
   });
 
   // Store the resolved model chain, orchestrator, and backend on the job
@@ -1445,7 +1528,12 @@ async function cmdChain(cwd, { flags, text }) {
         ? clampModelDispatch(reworkDispatch.dispatch, reworkDispatch.model)
         : reworkDispatch.dispatch,
       initialSession: flags.session,
-      flagsModel: flags.model,
+      // The --model value in the SPELLING of the backend the resolution
+      // chose, never the raw flag string (kusabi #210): a backend-naming
+      // --model pins every phase onto ITS backend, so all three phase
+      // resolutions carry the same spelling, and a claude dispatch must
+      // receive `opus`, not `claude/opus`.
+      flagsModel: implementDispatch.explicitModel,
       signalReceived: () => signalReceived,
       keepServe: !!flags.keepServe,
       resume: null,
@@ -2720,8 +2808,9 @@ function usage() {
     "",
     "Flags:",
     "  --read-only, --resume-last, --wait, --background",
-    "  --base <ref> (review: branch diff base; task: diff base for --phase review --container, rejected elsewhere), --model <provider/model>, --agent <id>, --phase <name> (draft|investigate|implement|review|respond|salvage|gofer)",
-    "  --backend opencode|claude (task/chain: dispatch backend; default opencode. With claude, --model takes a bare alias (opus|sonnet|haiku) or a full model id \u2014 :variant suffixes are rejected. Without --backend, config chain entries may carry a claude/ prefix for per-phase backend mixing \u2014 models.phases.<phase> (or models.chain) entries select the claude backend per phase; one phase's chain must be single-backend)",
+    "  --base <ref> (review: branch diff base; task: diff base for --phase review --container, rejected elsewhere), --agent <id>, --phase <name> (draft|investigate|implement|review|respond|salvage|gofer)",
+    "  --model <identifier> (task/chain: the identifier CARRIES its backend and decides it for the phases it pins — claude/<model> (bare alias opus|sonnet|haiku or a full model id; a :variant suffix is rejected) runs those phases on claude, provider/model[:variant] runs them on opencode, and a bare alias with no / names no backend, so the phase keeps its configured backend. The model is always validated against the backend the same identifier chose)",
+    "  --backend opencode|claude (task/chain: force EVERY phase onto that backend; default opencode. Redundant when --model names a backend — a --backend that disagrees with such a --model is a contradiction and is rejected, naming both. With neither, the config chain entries decide: models.phases.<phase> (or models.chain) entries may carry a claude/ prefix for per-phase backend mixing; one phase's chain must be single-backend)",
     "  --session <id>, --timeout <s>, --watchdog <s>, --deny <tools>",
     "  --brief-file <path> (task / chain: read the brief from a file; exclusive with inline text)",
     "  --container <cid> (chain/task: container to run deterministic probes in; NOT supported by review)",
