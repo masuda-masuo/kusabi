@@ -7,7 +7,7 @@
 // session never sees intermediate narration, tool logs, or raw events.
 
 
-import { parseArgs, parseModel, resolveModel, reviewDenyTools, WRITE_TOOL_NAMES, validateChainEntries, splitRouteBackend, resolveChainBackend, stripClaudePrefixChain, resolveModelBackend, chainNamesBackend } from "./cli.mjs";
+import { parseArgs, parseModel, resolveModel, reviewDenyTools, WRITE_TOOL_NAMES, validateChainEntries, splitRouteBackend, resolveChainBackend, stripBackendPrefixChain, resolveModelBackend, chainNamesBackend, backendSupportsResume } from "./cli.mjs";
 import { renderReview, renderChainShow, renderJobLine, renderHeader, extractJson, renderFollowupDraft } from "./render.mjs";
 import { hasSectionHeading, parseDeliverables, parseSmoke, parseOrchestratorSignature, briefRequestsPublish } from "./brief-parsing.mjs";
 import { deriveDisposition } from "./disposition.mjs";
@@ -38,6 +38,7 @@ import { jobDir, saveJob, loadJob, listJobs, latestJob } from "./job-store.mjs";
 import { opencodeBin, serverHealthy, ensureServer, reapIdleServes, reapOrphanedServes, runningRecordIsStale, isOurServe, api } from "./serve-lifecycle.mjs";
 import { runPrompt, dispatchWithFallback, resetFailedRoutes } from "./prompt-execution.mjs";
 import { claudeDispatch, resolveClaudeModel, validateClaudeModel, validateClaudeChain, translateDenyTools, clampModelDispatch, stopRecordedProcess, CLAUDE_BACKEND } from "./claude-dispatch.mjs";
+import { agyDispatch, resolveAgyModel, validateAgyModel, validateAgyChain, AGY_BACKEND } from "./agy-dispatch.mjs";
 import { openMetricsDb, openMetricsDbReadOnly } from "./metrics-db.mjs";
 import { ingestTranscriptDirectory } from "./transcript-ingest.mjs";
 import { ingestChainDirectory, ingestJobDirectory } from "./chain-ingest.mjs";
@@ -331,7 +332,7 @@ export function readBriefFile(flags, text) {
 // dispatch backend selection (kusabi #184)
 // ---------------------------------------------------------------------------
 
-export const BACKENDS = ["opencode", "claude"];
+export const BACKENDS = ["opencode", "claude", "agy"];
 
 /**
  * Resolve the dispatch backend from the `--backend` flag.  Resolved ONCE at
@@ -340,23 +341,126 @@ export const BACKENDS = ["opencode", "claude"];
  * without the field are treated as `"opencode"` by readers.
  *
  * @param {object} flags — parsed flags (may carry `backend`).
- * @returns {"opencode"|"claude"}
+ * @returns {"opencode"|"claude"|"agy"}
  * @throws {Error} For any unknown backend value.
  */
 export function resolveBackend(flags) {
   const backend = flags.backend || "opencode";
   if (!BACKENDS.includes(backend)) {
-    throw new Error(`unknown backend: ${backend}. Use --backend opencode|claude`);
+    throw new Error(`unknown backend: ${backend}. Use --backend ${BACKENDS.join("|")}`);
   }
   return backend;
 }
 
 /**
+ * The canonical dispatch function of a backend — the one a phase gets when
+ * nothing more specific was injected.
+ *
+ * A TABLE, not a chain of `=== "claude"` comparisons: adding the agy backend
+ * (kusabi #199) is one row, and every seam that needs "the dispatch of THIS
+ * backend" reads the same row.  opencode is the fallback because a record
+ * without a `backend` field predates the split and IS opencode (the reader
+ * contract every other surface applies).
+ *
+ * @param {string|null|undefined} backend
+ * @returns {Function}
+ */
+export function backendDispatch(backend) {
+  if (backend === CLAUDE_BACKEND) return claudeDispatch;
+  if (backend === AGY_BACKEND) return agyDispatch;
+  return dispatchWithFallback;
+}
+
+/**
+ * True when the backend pins ONE model per phase instead of walking a tier
+ * ladder — the v1 shape of both non-opencode backends.
+ *
+ * Two things follow from it, and both read this rather than naming a
+ * backend: the chain commands wrap such a dispatch in `clampModelDispatch`
+ * so later rounds reuse the command-start model, and `effectiveTierCount`
+ * reports a ladder of at most one tier so printed/recorded numbers describe
+ * the ladder that is actually climbed.
+ *
+ * @param {string|null|undefined} backend
+ * @returns {boolean}
+ */
+export function backendPinsModel(backend) {
+  return backend === CLAUDE_BACKEND || backend === AGY_BACKEND;
+}
+
+/**
+ * The dispatch a phase runs on, clamped to its command-start model when the
+ * backend pins one.  The two facts above, applied together — every chain
+ * seam that used to spell out `backend === "claude" ? clampModelDispatch(…)`
+ * calls this instead.
+ *
+ * @param {string} backend
+ * @param {Function} dispatch — the backend's dispatch (canonical or injected).
+ * @param {string|object|null} model
+ * @returns {Function}
+ */
+export function phaseDispatchFor(backend, dispatch, model) {
+  return backendPinsModel(backend) ? clampModelDispatch(dispatch, model ?? null) : dispatch;
+}
+
+/**
+ * Reject an explicitly named session that belongs to a DIFFERENT backend
+ * than the one it would run on — the SYMMETRIC cross-backend guard
+ * (kusabi #199).
+ *
+ * Session ids are backend-specific, and the failure mode is quiet: a CLI
+ * handed a session id it does not know does not error, it starts a
+ * fresh-looking run the operator believes continues their work.  Two
+ * independent signals decide, in this order:
+ *
+ *   1. SHAPE — `ses_*` is unmistakably an opencode id, and needs no record
+ *      to prove it.  This is the guard `claudeDispatch` has carried since
+ *      kusabi #184; stating it here makes it symmetric across every
+ *      non-opencode backend rather than claude's alone.
+ *   2. PROVENANCE — a claude session id and an agy conversation id are BOTH
+ *      bare UUIDs, so shape can never separate them.  The job store can: the
+ *      record that reported this session names the backend that made it.
+ *
+ * A session with no owning record and no telling shape is left alone: the
+ * operator may legitimately be resuming something kusabi never dispatched.
+ *
+ * @param {object} opts
+ * @param {string} opts.session
+ * @param {string} opts.backend — the backend this dispatch would run on.
+ * @param {object|null|undefined} [opts.owner] — the job record that reported
+ *        this session, if any.
+ * @throws {Error} Naming BOTH backends.
+ */
+export function assertSessionBackendCompatible({ session, backend, owner }) {
+  const shapeBackend = session.startsWith("ses_") ? "opencode" : null;
+  if (shapeBackend && shapeBackend !== backend) {
+    // Deliberately the SAME wording claudeDispatch's own ses_* guard uses
+    // (kusabi #184), generalised over the target backend: this check runs
+    // earlier than that one, so an operator who has seen the message once
+    // must not meet a second, differently-phrased version of it.
+    throw new Error(
+      `opencode session ${session} cannot be resumed on the ${backend} backend — ` +
+      `ses_* session ids belong to opencode; run the command without --backend ${backend} ` +
+      `(or pass a ${backend} session id)`
+    );
+  }
+  // Records without a `backend` field predate the split and are opencode.
+  const ownerBackend = owner ? (owner.backend ?? "opencode") : null;
+  if (!ownerBackend || ownerBackend === backend) return;
+  throw new Error(
+    `session ${session} belongs to the ${ownerBackend} backend and cannot be resumed on the ${backend} backend — ` +
+    `session ids are backend-specific, and the ${backend} CLI would silently start a fresh run instead of ` +
+    `continuing it. Run this on the ${ownerBackend} backend, or drop the session to start fresh.`
+  );
+}
+
+/**
  * Resolve `{ dispatch, backend, model, explicitModel, chain }` for ONE phase
  * of a job-creating command.  The backend decides BOTH the dispatch function
- * (claudeDispatch vs dispatchWithFallback — the chain phases stay
- * backend-blind) and the model resolution syntax (claude models are bare
- * aliases / full ids, opencode models are provider/model).
+ * (claudeDispatch / agyDispatch / dispatchWithFallback — the chain phases
+ * stay backend-blind) and the model resolution syntax (claude models are
+ * bare aliases / full ids, agy models are plain ids, opencode models are
+ * provider/model).
  *
  * ---------------------------------------------------------------------
  * Resolution order (kusabi #210).  ONE decision picks the backend, and the
@@ -364,8 +468,9 @@ export function resolveBackend(flags) {
  * is a backend chosen by one input and a model validated against another:
  *
  *   0. a `--model` that NAMES a backend (`claude/opus`,
- *      `opencode-go/deepseek-v4-pro:max`) decides it — for the phases the
- *      flag pins, which is every phase it applies to and no wider;
+ *      `agy/gemini-3.6-flash-high`, `opencode-go/deepseek-v4-pro:max`)
+ *      decides it — for the phases the flag pins, which is every phase it
+ *      applies to and no wider;
  *   1. otherwise `--backend`, which forces EVERY phase onto that backend;
  *   2. otherwise the phase's chain entries (`models.phases.<phase>` →
  *      `models.chain` → the built-in default), via resolveChainBackend.
@@ -381,8 +486,8 @@ export function resolveBackend(flags) {
  * ---------------------------------------------------------------------
  *
  * Invariant (kusabi #192): one phase's chain array is single-backend — an
- * array mixing `claude/` and opencode entries fails LOUDLY here, at command
- * start, before createChainDir / before any job is dispatched.  The check is
+ * array mixing two backends' entries fails LOUDLY here, at command start,
+ * before createChainDir / before any job is dispatched.  The check is
  * skipped only when the chain is never consulted (the backend is already
  * decided AND `--model` pins every phase — kusabi #186's carve-out).
  *
@@ -390,7 +495,7 @@ export function resolveBackend(flags) {
  * @param {object} opts.flags
  * @param {string} [opts.phase]
  * @param {object|null} opts.config
- * @returns {{ dispatch: Function, backend: "opencode"|"claude",
+ * @returns {{ dispatch: Function, backend: "opencode"|"claude"|"agy",
  *             model: object|string|undefined, explicitModel: string|null,
  *             chain: (string|string[])[] }}
  */
@@ -459,9 +564,9 @@ function resolveDispatchBackendForPhase({ flags, phase, config, backendFlag }) {
     ?? flagBackend
     ?? resolveChainBackend(resolveModel({ flag: undefined, phase, config }).chain);
 
-  return backend === "claude"
-    ? resolveClaudePhaseDispatch({ flags, phase, config, modelSpec })
-    : resolveOpencodePhaseDispatch({ phase, config, modelSpec, namedBackend, flagBackend });
+  if (backend === "claude") return resolveClaudePhaseDispatch({ flags, phase, config, modelSpec });
+  if (backend === "agy") return resolveAgyPhaseDispatch({ flags, phase, config, modelSpec });
+  return resolveOpencodePhaseDispatch({ phase, config, modelSpec, namedBackend, flagBackend });
 }
 
 /**
@@ -477,7 +582,7 @@ function resolveClaudePhaseDispatch({ flags, phase, config, modelSpec }) {
   // is redundant but must not leak into models — strip it before
   // validating / deriving.
   const resolved = resolveClaudeModel({ flag: undefined, phase, config });
-  const chain = stripClaudePrefixChain(resolved.chain);
+  const chain = stripBackendPrefixChain(resolved.chain);
 
   if (!modelSpec) {
     // No --model: the model comes from the chain, so the WHOLE chain can be
@@ -513,6 +618,52 @@ function resolveClaudePhaseDispatch({ flags, phase, config, modelSpec }) {
 }
 
 /**
+ * The agy branch of the decision (kusabi #199) — the exact mirror of the
+ * claude branch, one backend over: reached identically whether the
+ * identifier named agy, `--backend agy` forced it, or the phase's chain
+ * entries carry the `agy/` prefix, and the branch does not care which.
+ *
+ * The only differences from the claude branch are which validator runs and
+ * which dispatch comes out, because that is the only thing that actually
+ * differs: the precedence, the prefix stripping, the single-backend check,
+ * the #186 carve-out and the identifier-owns-its-rejection rule (#210) are
+ * all the same rules, applied to a third backend rather than restated for
+ * it.
+ */
+function resolveAgyPhaseDispatch({ flags, phase, config, modelSpec }) {
+  const resolved = resolveAgyModel({ flag: undefined, phase, config });
+  const chain = stripBackendPrefixChain(resolved.chain);
+
+  if (!modelSpec) {
+    // No --model: the model comes from the chain, so the WHOLE chain can be
+    // consulted by a dispatch and must be valid HERE — before createChainDir
+    // / before any job is dispatched, never mid-flight after round 1.  The
+    // single-backend invariant is checked on the RAW chain: an opencode
+    // entry with no :variant would otherwise pass validateAgyChain and
+    // silently run as an agy model id.
+    resolveChainBackend(resolved.chain);
+    validateAgyChain(chain);
+    const model = resolved.model == null ? undefined : splitRouteBackend(String(resolved.model)).route;
+    if (model != null) validateAgyModel(model);
+    return { dispatch: agyDispatch, backend: "agy", model, explicitModel: null, chain };
+  }
+
+  // With an explicit --model the config chain is never consulted for a model
+  // and must not block startup (kusabi #186).  A :variant suffix cannot be
+  // expressed on the agy backend — reject it up front, attributed to the
+  // identifier's own backend rather than to a config key three levels away.
+  const model = modelSpec.model;
+  try {
+    validateAgyModel(model);
+  } catch (err) {
+    throw flagError(
+      `--model "${flags.model}" ${modelSpec.backend ? "names" : "resolves on"} the agy backend: ${err.message}`
+    );
+  }
+  return { dispatch: agyDispatch, backend: "agy", model, explicitModel: model, chain };
+}
+
+/**
  * The opencode branch of the decision: `--model` is provider/model syntax
  * (parseModel), chain entries pass through byte-identical.
  */
@@ -523,20 +674,22 @@ function resolveOpencodePhaseDispatch({ phase, config, modelSpec, namedBackend, 
   const configuredChain = resolveModel({ flag: undefined, phase, config }).chain;
   const configuredBackend = resolveChainBackend(configuredChain);
   // kusabi #192: an explicit `--backend opencode` forces EVERY phase onto
-  // opencode, so a claude-native phase chain CONTRADICTS it — throw at
-  // command start, naming the flag, the phase and the offending config key;
-  // never silently switch backends, never dispatch claude/... routes as
-  // opencode.  It fires only when there is no backend-naming `--model` to
-  // settle the question: when the identifier names a backend the operator
-  // has stated their intent unambiguously (and a disagreeing --backend
-  // already threw above), so firing anyway would reproduce the incident
-  // kusabi #210 was filed for.
-  if (flagBackend === "opencode" && namedBackend === null && configuredBackend === "claude") {
+  // opencode, so a phase chain native to ANOTHER backend CONTRADICTS it —
+  // throw at command start, naming the flag, the phase and the offending
+  // config key; never silently switch backends, never dispatch claude/… or
+  // agy/… routes as opencode.  Stated over `!== "opencode"` rather than over
+  // one backend's name, so a third backend (kusabi #199) is covered by the
+  // rule instead of slipping past it.  It fires only when there is no
+  // backend-naming `--model` to settle the question: when the identifier
+  // names a backend the operator has stated their intent unambiguously (and
+  // a disagreeing --backend already threw above), so firing anyway would
+  // reproduce the incident kusabi #210 was filed for.
+  if (flagBackend === "opencode" && namedBackend === null && configuredBackend !== "opencode") {
     const chainKey = (phase && config?.models?.phases?.[phase])
       ? `models.phases.${phase}`
       : (config?.models?.chain ? "models.chain" : "the built-in default chain");
     throw new Error(
-      `--backend opencode conflicts with the claude-native chain of the ${phase ?? "task"} phase ` +
+      `--backend opencode conflicts with the ${configuredBackend}-native chain of the ${phase ?? "task"} phase ` +
       `(${chainKey}: ${JSON.stringify(configuredChain)}) — an explicit --backend forces every phase ` +
       `onto that backend; remove --backend opencode or point ${chainKey} at opencode entries`
     );
@@ -544,11 +697,13 @@ function resolveOpencodePhaseDispatch({ phase, config, modelSpec, namedBackend, 
 
   const resolved = resolveModel({ flag: modelSpec?.model, phase, config });
   let chain = resolved.chain;
-  if (namedBackend === "opencode" && chainNamesBackend(chain, "claude")) {
-    // Only reachable when the identifier chose opencode over a claude-native
-    // chain: those entries are claude models and must never be walked as
-    // opencode routes by the fallback ladder.  `--model` pins this phase
-    // anyway, so its ladder is exactly the pinned route.
+  if (namedBackend === "opencode"
+    && (chainNamesBackend(chain, "claude") || chainNamesBackend(chain, "agy"))) {
+    // Only reachable when the identifier chose opencode over a chain native
+    // to another backend: those entries are that backend's model ids and
+    // must never be walked as opencode routes by the fallback ladder.
+    // `--model` pins this phase anyway, so its ladder is exactly the pinned
+    // route.
     chain = [modelSpec.model];
   }
   return {
@@ -562,20 +717,23 @@ function resolveOpencodePhaseDispatch({ phase, config, modelSpec, namedBackend, 
 
 /**
  * Resolve the session for `--resume-last`: the sessionID of the most recent
- * task job of the SAME backend as the current dispatch.  Both backends share
- * ONE job store, and a session id is backend-specific \u2014 a claude UUID cannot
- * be resumed on opencode, and an opencode `ses_*` id is rejected by the
- * claude backend's cross-backend guard.  Without this filter,
- * `--resume-last` on a claude dispatch could silently pick an opencode
- * session (and vice versa).  Records without a `backend` field predate the
- * backend split and count as "opencode".  This is SELECTION only \u2014 whether a
- * given session may be resumed on the chosen backend is decided inside the
- * dispatch (claudeDispatch's ses_* guard).
+ * task job of the SAME backend as the current dispatch.  Every backend
+ * shares ONE job store, and a session id is backend-specific — a claude
+ * UUID cannot be resumed on opencode, and an opencode `ses_*` id is
+ * rejected by both other backends' cross-backend guards.  Without this
+ * filter, `--resume-last` on a claude dispatch could silently pick an
+ * opencode session (and vice versa).  Records without a `backend` field
+ * predate the backend split and count as "opencode".  This is SELECTION
+ * only — whether a given session may be resumed on the chosen backend is
+ * decided inside the dispatch (claudeDispatch's ses_* guard,
+ * agyDispatch's assertNoAgySession); whether the backend resumes AT ALL is
+ * decided by the caller (`backendSupportsResume`) before it gets here, so
+ * this is never reached for a fresh-dispatch-only backend.
  *
  * @param {string} stateDir
  * @param {object} opts
  * @param {string|null|undefined} [opts.phase]
- * @param {"opencode"|"claude"} opts.backend
+ * @param {"opencode"|"claude"|"agy"} opts.backend
  * @returns {string|null} The session id, or null when no same-backend job.
  */
 export function resolveResumeLastSession(stateDir, { phase, backend }) {
@@ -636,10 +794,35 @@ async function cmdTask(cwd, { flags, text }) {
   // `--model claude/opus` would take the prefix for part of the model id.
   const { dispatch, backend, chain: modelChain, explicitModel } = resolveDispatchBackend({ flags, phase, config });
 
+  // An explicitly named `--session` is checked against the backend it would
+  // run on BEFORE anything else, so the error the operator gets names both
+  // backends rather than the weaker "this backend does not resume".
+  if (flags.session) {
+    assertSessionBackendCompatible({
+      session: flags.session,
+      backend,
+      owner: latestJob(stateDir, (j) => j.sessionID === flags.session),
+    });
+  }
+
+  // A backend that cannot continue a session must SAY so when one is asked
+  // for (kusabi #199): the agy backend is fresh-dispatch only in v1, and
+  // quietly starting a blank run for an operator who typed `--session` /
+  // `--resume-last` would hand them a job that looks like a continuation and
+  // is not.  Rejected here, at command start, before any job record exists.
+  if ((flags.session || flags.resumeLast) && !backendSupportsResume(backend)) {
+    const asked = flags.session ? `--session ${flags.session}` : "--resume-last";
+    throw new Error(
+      `${asked} is not supported on the ${backend} backend — it is fresh-dispatch only (kusabi #199): ` +
+      "it records the CLI's conversation id on the job record but cannot continue one. " +
+      `Drop ${flags.session ? "--session" : "--resume-last"}, or run the phase on the opencode or claude backend.`
+    );
+  }
+
   let session = flags.session;
   if (!session && flags.resumeLast) {
     // --resume-last selects the previous job of the SAME backend as this
-    // dispatch: both backends share one job store, and a session id is
+    // dispatch: every backend shares one job store, and a session id is
     // backend-specific (a claude UUID cannot be resumed on opencode; an
     // opencode ses_* id is rejected by the claude backend's guard).  Records
     // without the backend field predate the backend split -> opencode.
@@ -668,6 +851,23 @@ async function cmdTask(cwd, { flags, text }) {
   // Phase-level deny maps (implementDenyTools / reviewDenyTools) are passed
   // inside the chain phases and are intentionally NOT translated.
   if (tools && backend === "claude") tools = translateDenyTools(tools);
+  // The agy CLI takes no allow/deny flags at all (kusabi #199), so there is
+  // nothing to translate the map INTO: a restriction the operator typed
+  // cannot be applied.  Reject it rather than run unrestricted while the
+  // command line says otherwise — the same "never silently no-op a deny"
+  // rule as the claude translation above, with the only honest answer this
+  // backend can give.  Phase-level maps from the chain are a different case
+  // (nobody typed them, and refusing them would break every chain that
+  // routes a phase here): agyDispatch records those on the job as
+  // `toolDeniesUnenforced` so the record cannot be mistaken for one where
+  // they applied.
+  if (tools && backend === AGY_BACKEND) {
+    throw new Error(
+      `${flags.readOnly ? "--read-only" : "--deny"} is not supported on the agy backend — ` +
+      "the agy CLI has no per-job tool permission flags, so the restriction cannot be applied. " +
+      "Run the task on the opencode or claude backend, which enforce it."
+    );
+  }
   // ---- record baseSha before dispatching the job if --container (for probe comparison) ----
   let taskBaseSha = null;
   if (flags.container) {
@@ -929,21 +1129,30 @@ function cmdResult(cwd, { text }) {
 async function stopRunningJob(stateDir, job) {
   // Records written before the backend split carry no `backend` field and
   // are opencode by definition (same rule every other reader uses).
-  if ((job.backend ?? "opencode") === CLAUDE_BACKEND) {
-    return stopClaudeJob(job);
+  const backend = job.backend ?? "opencode";
+  // Both spawned-CLI backends (claude, agy) are stopped the same way and for
+  // the same reason: their job records have no session to abort, so the
+  // recorded process is the only lever.  Keyed on the recorded-process shape
+  // rather than on one backend's name — routing an agy job to the opencode
+  // path would try to abort a session that does not exist and then report
+  // success, which is precisely the false confirmation kusabi #209 exists to
+  // prevent.
+  if (backend === CLAUDE_BACKEND || backend === AGY_BACKEND) {
+    return stopSpawnedCliJob(job, backend);
   }
   return stopOpencodeJob(stateDir, job);
 }
 
-// claude backend: there is no session to abort — the record's sessionID is
-// null by construction until the CLI returns one — so the recorded process
-// is the only lever, and it is verified before it is signalled.
-async function stopClaudeJob(job) {
+// claude / agy backends: there is no session to abort — the record's
+// sessionID is null by construction until the CLI returns one — so the
+// recorded process is the only lever, and it is verified before it is
+// signalled.
+async function stopSpawnedCliJob(job, backend) {
   const stop = await stopRecordedProcess(job.process);
   const tail = "The record is left `running`; nothing here proves the job stopped.";
   switch (stop.outcome) {
     case "stopped":
-      return { note: `Stopped process group ${stop.pid} (SIGKILL): the claude process and its children are gone.`, failure: null };
+      return { note: `Stopped process group ${stop.pid} (SIGKILL): the ${backend} process and its children are gone.`, failure: null };
     case "already-gone":
       return { note: `Nothing to signal — ${stop.reason}. The record is finalised.`, failure: null };
     case "identity-mismatch":
@@ -1374,16 +1583,18 @@ async function cmdSalvage(cwd, { flags, text }) {
 // chain
 // ---------------------------------------------------------------------------
 
-// Ladder accounting is backend-aware (kusabi #192 follow-up): a claude-native
-// chain never walks its tiers — claudeDispatch pins every phase to the
-// command-start model — so everywhere a tier count feeds ACCOUNTING (the
-// chain-start banner, the recordReworkEscalation clamp) a claude chain has an
-// effective tier count of min(1, length).  Dispatch behaviour is untouched;
-// this only makes printed/recorded numbers match the ladder the backend
-// actually climbs.  opencode chains keep their full length.
+// Ladder accounting is backend-aware (kusabi #192 follow-up): a chain on a
+// model-pinning backend never walks its tiers — that backend's dispatch pins
+// every phase to the command-start model — so everywhere a tier count feeds
+// ACCOUNTING (the chain-start banner, the recordReworkEscalation clamp) such
+// a chain has an effective tier count of min(1, length).  Dispatch behaviour
+// is untouched; this only makes printed/recorded numbers match the ladder the
+// backend actually climbs.  opencode chains keep their full length.  Keyed on
+// `backendPinsModel`, so the agy backend (kusabi #199 — also one model per
+// phase) reports its real ladder without a second branch here.
 export function effectiveTierCount(chain, backend) {
   if (!chain) return 0;
-  if (backend === "claude") return Math.min(1, chain.length);
+  if (backendPinsModel(backend)) return Math.min(1, chain.length);
   return chain.length;
 }
 
@@ -1527,20 +1738,18 @@ async function cmdChain(cwd, { flags, text }) {
       reworkModel: reworkDispatch.model,
       reworkModelChain: reworkDispatch.chain,
       reworkBackend: reworkDispatch.backend,
-      // claude: clamp later phases (rework implement, review, strategist)
-      // to the phase's command-start model — the claude backend has no tier
-      // ladder, so the model never changes mid-chain (kusabi #184 finding 1).
-      // Each phase clamps to ITS OWN resolved model, so implement and review
-      // can run on different backends with different models (kusabi #192).
-      dispatchWithFallback: implementDispatch.backend === "claude"
-        ? clampModelDispatch(implementDispatch.dispatch, implementDispatch.model)
-        : implementDispatch.dispatch,
-      reviewDispatchWithFallback: reviewDispatch.backend === "claude"
-        ? clampModelDispatch(reviewDispatch.dispatch, reviewDispatch.model)
-        : reviewDispatch.dispatch,
-      reworkDispatchWithFallback: reworkDispatch.backend === "claude"
-        ? clampModelDispatch(reworkDispatch.dispatch, reworkDispatch.model)
-        : reworkDispatch.dispatch,
+      // A model-pinning backend (claude, agy) clamps later phases (rework
+      // implement, review, strategist) to the phase's command-start model —
+      // neither has a tier ladder, so the model never changes mid-chain
+      // (kusabi #184 finding 1).  Each phase clamps to ITS OWN resolved
+      // model, so implement and review can run on different backends with
+      // different models (kusabi #192).
+      dispatchWithFallback: phaseDispatchFor(
+        implementDispatch.backend, implementDispatch.dispatch, implementDispatch.model),
+      reviewDispatchWithFallback: phaseDispatchFor(
+        reviewDispatch.backend, reviewDispatch.dispatch, reviewDispatch.model),
+      reworkDispatchWithFallback: phaseDispatchFor(
+        reworkDispatch.backend, reworkDispatch.dispatch, reworkDispatch.model),
       initialSession: flags.session,
       // The --model value in the SPELLING of the backend the resolution
       // chose, never the raw flag string (kusabi #210): a backend-naming
@@ -1575,21 +1784,22 @@ async function cmdChain(cwd, { flags, text }) {
  * cmdChainResume used to pass an undefined review seam for an opencode
  * review, and the driver fell back to the claude implement dispatch.  The
  * fallback for a differing backend is the CANONICAL dispatch of the review
- * backend (claudeDispatch for claude, dispatchWithFallback for opencode).
+ * backend (`backendDispatch`), so a review routed to any backend — including
+ * the agy one (kusabi #199) — reaches that backend's own dispatch.
  *
  * @param {object} opts
  * @param {Function|null|undefined} [opts.injectedReviewDispatch] — explicit
  *        review seam (always given by cmdChain; cmdChainResume passes one
  *        too, so this fallback mainly serves legacy single-dispatch callers).
  * @param {Function} [opts.injectedDispatch] — the implement dispatch.
- * @param {"opencode"|"claude"} opts.backend — implement backend.
- * @param {"opencode"|"claude"} opts.reviewBackend — review backend.
+ * @param {"opencode"|"claude"|"agy"} opts.backend — implement backend.
+ * @param {"opencode"|"claude"|"agy"} opts.reviewBackend — review backend.
  * @returns {Function} The dispatch the review phase will use.
  */
 export function resolveReviewDispatch({ injectedReviewDispatch, injectedDispatch, backend, reviewBackend }) {
   if (injectedReviewDispatch) return injectedReviewDispatch;
   if (reviewBackend === backend) return injectedDispatch ?? dispatchWithFallback;
-  return reviewBackend === "claude" ? claudeDispatch : dispatchWithFallback;
+  return backendDispatch(reviewBackend);
 }
 
 /**
@@ -1668,12 +1878,18 @@ export function resolveResumeReworkContext(chainJson) {
 
 export function resolveResumeDispatches({ resumeBackend, resumeReviewBackend, model, reviewModel }) {
   return {
-    dispatchWithFallback: resumeBackend === "claude"
-      ? clampModelDispatch(claudeDispatch, model ?? null)
+    // The implement seam keeps its pre-#192 shape: `undefined` for opencode
+    // so the driver uses its own real dispatchWithFallback, and the
+    // backend's own dispatch — clamped to the recorded model — for a
+    // model-pinning backend (claude, agy).
+    dispatchWithFallback: backendPinsModel(resumeBackend)
+      ? phaseDispatchFor(resumeBackend, backendDispatch(resumeBackend), model)
       : undefined,
-    reviewDispatchWithFallback: resumeReviewBackend === "claude"
-      ? clampModelDispatch(claudeDispatch, reviewModel ?? null)
-      : dispatchWithFallback,
+    // The review seam is ALWAYS explicit (see the doc above): an undefined
+    // seam would let the driver fall back to the implement dispatch, which
+    // on a mixed chain belongs to the other backend.
+    reviewDispatchWithFallback: phaseDispatchFor(
+      resumeReviewBackend, backendDispatch(resumeReviewBackend), reviewModel),
   };
 }
 
@@ -2513,9 +2729,8 @@ async function cmdChainResume(cwd, { flags, text }) {
       reviewBackend: resumeReviewBackend,
       dispatchWithFallback: resumeDispatches.dispatchWithFallback,
       reviewDispatchWithFallback: resumeDispatches.reviewDispatchWithFallback,
-      reworkDispatchWithFallback: reworkBackendForResume === "claude"
-        ? clampModelDispatch(claudeDispatch, resumeReworkModel ?? null)
-        : dispatchWithFallback,
+      reworkDispatchWithFallback: phaseDispatchFor(
+        reworkBackendForResume, backendDispatch(reworkBackendForResume), resumeReworkModel),
       initialSession: position.session,
       flagsModel: null,
       signalReceived: () => signalReceived,
@@ -2829,7 +3044,7 @@ function usage() {
     "  --read-only, --resume-last, --wait, --background",
     "  --base <ref> (review: branch diff base; task: diff base for --phase review --container, rejected elsewhere), --agent <id>, --phase <name> (draft|investigate|implement|review|respond|salvage|gofer)",
     "  --model <identifier> (task/chain: the identifier CARRIES its backend and decides it for the phases it pins — claude/<model> (bare alias opus|sonnet|haiku or a full model id; a :variant suffix is rejected) runs those phases on claude, provider/model[:variant] runs them on opencode, and a bare alias with no / names no backend, so the phase keeps its configured backend. The model is always validated against the backend the same identifier chose)",
-    "  --backend opencode|claude (task/chain: force EVERY phase onto that backend; default opencode. Redundant when --model names a backend — a --backend that disagrees with such a --model is a contradiction and is rejected, naming both. With neither, the config chain entries decide: models.phases.<phase> (or models.chain) entries may carry a claude/ prefix for per-phase backend mixing; one phase's chain must be single-backend)",
+    "  --backend opencode|claude|agy (task/chain: force EVERY phase onto that backend; default opencode. Redundant when --model names a backend — a --backend that disagrees with such a --model is a contradiction and is rejected, naming both. With neither, the config chain entries decide: models.phases.<phase> (or models.chain) entries may carry a claude/ or agy/ prefix for per-phase backend mixing; one phase's chain must be single-backend. agy is fresh-dispatch only: --session/--resume-last and --read-only/--deny are rejected on it)",
     "  --session <id>, --timeout <s>, --watchdog <s>, --deny <tools>",
     "  --brief-file <path> (task / chain: read the brief from a file; exclusive with inline text)",
     "  --container <cid> (chain/task: container to run deterministic probes in; NOT supported by review)",

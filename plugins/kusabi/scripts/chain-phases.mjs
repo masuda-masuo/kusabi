@@ -17,6 +17,7 @@ import { fileURLToPath } from "node:url";
 import {
   implementDenyTools,
   reviewDenyTools,
+  backendSupportsResume,
 } from "./cli.mjs";
 import {
   renderContainerReviewInput,
@@ -356,13 +357,20 @@ export async function runImplementPhase({
   backend = "opencode",
   _dispatchWithFallback: _dispatch = dispatchWithFallback,
 }) {
-  let resolvedSession = session;
-  if (!resolvedSession && !isFirstRound && previousRecord?.sessionID) {
-    // Session lineage guard (kusabi #192 invariant 5): a rework implement
-    // round may only continue a session created by the implement backend; a
-    // session attributable to a record of the OTHER backend is dropped and
-    // the round starts fresh.  Records without a `backend` field predate the
-    // backend split and count as "opencode" (readers' convention).
+  // Session lineage guard, part 1 (kusabi #199): a backend that cannot
+  // continue a session never has one carried into it — not from the caller
+  // (chain-resume's `initialSession`) and not from the previous round.  The
+  // agy backend records its `conversation_id` on the round record but has no
+  // resume in v1; handing it one would turn a working chain into a
+  // config-error throw at round 2.  Backends that DO resume are unaffected,
+  // so this is byte-identical for opencode and claude.
+  let resolvedSession = backendSupportsResume(backend) ? session : undefined;
+  if (!resolvedSession && !isFirstRound && previousRecord?.sessionID && backendSupportsResume(backend)) {
+    // Session lineage guard, part 2 (kusabi #192 invariant 5): a rework
+    // implement round may only continue a session created by the implement
+    // backend; a session attributable to a record of the OTHER backend is
+    // dropped and the round starts fresh.  Records without a `backend` field
+    // predate the backend split and count as "opencode" (readers' convention).
     if (!useNewSession && (previousRecord.backend ?? "opencode") === backend) {
       resolvedSession = previousRecord.sessionID;
     }

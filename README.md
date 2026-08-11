@@ -1,19 +1,20 @@
 # kusabi
 
-Use kusabi from inside Claude Code to delegate tasks or run adversarial code reviews to a worker backend — [opencode](https://opencode.ai) by default, or the Claude Code CLI in headless mode (`--backend claude`) — without flooding Claude's context with the worker's intermediate output.
+Use kusabi from inside Claude Code to delegate tasks or run adversarial code reviews to a worker backend — [opencode](https://opencode.ai) by default, the Claude Code CLI in headless mode (`--backend claude`), or the Antigravity CLI (`--backend agy`) — without flooding Claude's context with the worker's intermediate output.
 
 ## How it works
 
 ```
 Claude Code ——/kusabi:* slash command——> kusabi-companion.mjs —┬—HTTP——> opencode serve (127.0.0.1, on-demand)
-                                                               └—spawn——> claude -p (headless, no server)
+                                                               ├—spawn——> claude -p (headless, no server)
+                                                               └—spawn——> agy -p    (headless, no server)
                                                                │
                                                                ├─ SSE /event: progress tracking + automatic permission replies
                                                                ├─ state dir: full event log, job records, stored results
                                                                └─ stdout: rendered final result ONLY
 ```
 
-With `--backend claude` there is no serve process — the companion spawns `claude -p` per job and the same state-dir/stdout contract applies (see [Backends](#backends) for flags and v1 limits).
+With `--backend claude` or `--backend agy` there is no serve process — the companion spawns the CLI per job and the same state-dir/stdout contract applies (see [Backends](#backends) for flags and v1 limits).
 
 The companion script is a context firewall: the worker's narration, tool logs, and raw events are persisted under `~/.kusabi/<dir-hash>/` and never reach Claude. Claude only sees the rendered final result (or a compact status summary).
 
@@ -25,7 +26,7 @@ Key mechanics:
 
 ## Requirements
 
-- [opencode CLI](https://opencode.ai) installed and authenticated (`opencode auth login`) — or the Claude Code CLI (`claude`) for `--backend claude` (binary via `CLAUDE_BIN`, default `claude`)
+- [opencode CLI](https://opencode.ai) installed and authenticated (`opencode auth login`) — or the Claude Code CLI (`claude`) for `--backend claude` (binary via `CLAUDE_BIN`, default `claude`), or the Antigravity CLI (`agy`) for `--backend agy` (binary via `AGY_BIN`, default `agy`)
 - Node.js 18.18 or later
 
 ## Install
@@ -97,7 +98,7 @@ The `delegate` skill intentionally points at `--help` and `docs/design/phase-cha
 surface and the chain semantics instead of restating them, so that improving kusabi does
 not silently make the skill wrong.
 
-Every result includes the backend's session ID — an opencode `ses_*` id, or the Claude Code CLI's UUID with `--backend claude`; continue an opencode session in the opencode TUI with `opencode -s <session-id>`.
+Every result includes the backend's session ID — an opencode `ses_*` id, the Claude Code CLI's UUID with `--backend claude`, or the Antigravity CLI's conversation UUID with `--backend agy`; continue an opencode session in the opencode TUI with `opencode -s <session-id>`. Session ids are backend-specific: passing one to a different backend is rejected, naming both.
 
 ## Model configuration
 
@@ -152,7 +153,7 @@ A trailing colon (`p/a:`) or missing `/` are fatal parse errors.
 
 ### Backends
 
-`chain` and `task` accept `--backend opencode|claude` (default `opencode`).
+`chain` and `task` accept `--backend opencode|claude|agy` (default `opencode`).
 The backend is resolved once at command start and recorded as `backend` on
 every job record and chain round record; records written before the backend
 split (or without the field) are treated as `opencode` by readers.
@@ -175,6 +176,25 @@ split (or without the field) are treated as `opencode` by readers.
   (`opus`, `sonnet`, `haiku`) or a full model id (e.g.
   `claude-sonnet-4-5`). The binary is resolved through `CLAUDE_BIN`
   (default `claude`).
+- **agy** — dispatch through the Antigravity CLI in headless mode
+  (`agy -p <prompt> --output-format json --model <id>`; a single JSON object
+  on stdout). It buys a separate quota pool (Gemini, metered apart from both
+  other backends) and a third model family for cross-family review; any
+  phase may route to it. v1 limits: one model per phase (no tier ladder, no
+  capacity fallback), `:variant` suffixes rejected, and **fresh dispatch
+  only** — the CLI's `conversation_id` is recorded as the job's session id
+  but `--session` / `--resume-last` are rejected, as are `--read-only` /
+  `--deny` (the CLI has no per-job permission flags, so the restriction
+  cannot be applied and must not look applied). Success is decided by
+  PAYLOAD, not by the CLI's `status` field: a run with any failed tool call
+  reports `status: "ERROR"` even when the answer was delivered in full, so a
+  non-empty response is a completed job and `status` is recorded as advisory
+  metadata. Model syntax is a plain model id (e.g.
+  `gemini-3.6-flash-high`) — the agy CLI itself validates which ids exist,
+  so kusabi checks only the shape. The binary is resolved through `AGY_BIN`
+  (default `agy`), and the sunaba MCP server is assumed to be configured
+  globally in `~/.gemini/antigravity-cli/mcp_config.json` (kusabi never
+  touches that file).
 
 The claude backend mirrors the opencode agents' permission tables with two
 hardcoded `--allowedTools` allowlists (implement, review; see
@@ -185,6 +205,13 @@ host `~/.claude.json` (`mcpServers.sunaba`) into a generated
 `--mcp-config` file containing only that entry — override the source file
 with `KUSABI_CLAUDE_MCP_SOURCE`; a missing entry is a clear error. See
 `docs/design/phase-chain.md` §3.5.11 for the v1 limits and failure semantics.
+
+The agy backend has no permission flags to mirror: it carries the agent body
+inside the prompt (the CLI has no `--append-system-prompt`) and reaches
+sunaba through the operator's global Antigravity MCP config. A review phase
+routed to agy additionally passes `--json-schema` built from the existing
+`schemas/review-output.schema.json`, so the verdict shape is enforced at the
+CLI rather than hoped for. See `docs/design/phase-chain.md` §3.5.14.
 
 ### Resolution precedence (highest to lowest)
 
