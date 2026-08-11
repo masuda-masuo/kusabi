@@ -1544,3 +1544,275 @@ describe("resolveDispatchBackend (per-phase mixing, kusabi #192)", () => {
     assert.deepEqual(rev.chain, ["sonnet"]);
   });
 });
+
+// =========================================================================
+// --model carries its backend (kusabi #210)
+// -------------------------------------------------------------------------
+// The identifier is the single source of routing truth: a `--model` that
+// NAMES a backend decides the backend for the phases it pins, and the model
+// is then validated against THAT backend.  A bare alias names no backend and
+// moves nothing.  `--backend` keeps its all-phases meaning; disagreeing with
+// a backend-naming `--model` is a contradiction, never a silent win.
+// =========================================================================
+
+describe("resolveDispatchBackend (--model carries its backend, kusabi #210)", () => {
+  const CLAUDE_PINNED = { models: { phases: { implement: ["claude/opus"] } } };
+  const OPENCODE_PINNED = { models: { phases: { implement: ["opencode-go/deepseek-v4-flash:max"] } } };
+
+  it("THE INCIDENT: --model opencode-go/... runs a claude-pinned phase on opencode, no config edit", () => {
+    const r = resolveDispatchBackend({
+      flags: { model: "opencode-go/deepseek-v4-pro:max" },
+      phase: "implement",
+      config: CLAUDE_PINNED,
+    });
+    assert.equal(r.backend, "opencode");
+    assert.equal(r.dispatch, dispatchWithFallback);
+    assert.deepEqual(r.model, { providerID: "opencode-go", modelID: "deepseek-v4-pro", variant: "max" });
+    assert.equal(r.explicitModel, "opencode-go/deepseek-v4-pro:max");
+  });
+
+  it("--model claude/opus selects claude from an opencode phase, prefix stripped", () => {
+    const r = resolveDispatchBackend({
+      flags: { model: "claude/opus" },
+      phase: "implement",
+      config: OPENCODE_PINNED,
+    });
+    assert.equal(r.backend, "claude");
+    assert.equal(r.dispatch, claudeDispatch);
+    assert.equal(r.model, "opus");
+    // The dispatch must receive the claude spelling, never the prefixed
+    // flag string — a claude CLI given `claude/opus` would take the prefix
+    // for part of the model id.
+    assert.equal(r.explicitModel, "opus");
+  });
+
+  it("--model claude/<full model id> selects claude too", () => {
+    const r = resolveDispatchBackend({
+      flags: { model: "claude/claude-sonnet-4-5" },
+      phase: "review",
+      config: { models: { chain: ["opencode/deepseek-v4-flash-free:max"] } },
+    });
+    assert.equal(r.backend, "claude");
+    assert.equal(r.model, "claude-sonnet-4-5");
+  });
+
+  it("a bare --model on a claude-pinned phase is unchanged: claude, the phase's chain", () => {
+    const r = resolveDispatchBackend({
+      flags: { model: "haiku" },
+      phase: "implement",
+      config: CLAUDE_PINNED,
+    });
+    assert.equal(r.backend, "claude");
+    assert.equal(r.model, "haiku");
+    assert.deepEqual(r.chain, ["opus"]);
+    assert.equal(r.explicitModel, "haiku");
+  });
+
+  it("a bare --model on an opencode phase is unchanged: still rejected by parseModel, still naming the key", () => {
+    assert.throws(
+      () => resolveDispatchBackend({
+        flags: { model: "opus" },
+        phase: "implement",
+        config: OPENCODE_PINNED,
+      }),
+      /--model expects provider\/model, got: opus.*models\.phases\.implement/s,
+    );
+  });
+
+  it("--backend claude with a --model naming opencode throws, naming BOTH", () => {
+    assert.throws(
+      () => resolveDispatchBackend({
+        flags: { backend: "claude", model: "opencode-go/x:max" },
+        phase: "implement",
+        config: CLAUDE_PINNED,
+      }),
+      (err) => {
+        assert.match(err.message, /--backend claude/);
+        assert.match(err.message, /--model opencode-go\/x:max/);
+        assert.match(err.message, /names the opencode backend/);
+        return true;
+      },
+    );
+  });
+
+  it("--backend opencode with a --model naming claude throws, naming BOTH", () => {
+    assert.throws(
+      () => resolveDispatchBackend({
+        flags: { backend: "opencode", model: "claude/opus" },
+        phase: "implement",
+        config: CLAUDE_PINNED,
+      }),
+      (err) => {
+        assert.match(err.message, /--backend opencode/);
+        assert.match(err.message, /--model claude\/opus/);
+        assert.match(err.message, /names the claude backend/);
+        // Not the #192 chain conflict — the two FLAGS are what disagree.
+        assert.doesNotMatch(err.message, /claude-native chain/);
+        return true;
+      },
+    );
+  });
+
+  it("--backend and a --model naming the SAME backend are consistent and proceed", () => {
+    const claude = resolveDispatchBackend({
+      flags: { backend: "claude", model: "claude/opus" },
+      phase: "implement",
+      config: OPENCODE_PINNED,
+    });
+    assert.equal(claude.backend, "claude");
+    assert.equal(claude.model, "opus");
+    const opencode = resolveDispatchBackend({
+      flags: { backend: "opencode", model: "opencode-go/deepseek-v4-pro:max" },
+      phase: "implement",
+      config: CLAUDE_PINNED,
+    });
+    assert.equal(opencode.backend, "opencode");
+    assert.deepEqual(opencode.model, { providerID: "opencode-go", modelID: "deepseek-v4-pro", variant: "max" });
+  });
+
+  it("the #192 conflict still fires when there is no --model to settle it", () => {
+    assert.throws(
+      () => resolveDispatchBackend({
+        flags: { backend: "opencode" },
+        phase: "implement",
+        config: CLAUDE_PINNED,
+      }),
+      /--backend opencode conflicts with the claude-native chain/,
+    );
+    // A BARE --model names no backend, so it settles nothing: still fires.
+    assert.throws(
+      () => resolveDispatchBackend({
+        flags: { backend: "opencode", model: "opus" },
+        phase: "implement",
+        config: CLAUDE_PINNED,
+      }),
+      /--backend opencode conflicts with the claude-native chain/,
+    );
+  });
+
+  it("a backend-naming --model settles the #192 conflict instead of firing it", () => {
+    const r = resolveDispatchBackend({
+      flags: { backend: "opencode", model: "opencode-go/deepseek-v4-pro:max" },
+      phase: "implement",
+      config: CLAUDE_PINNED,
+    });
+    assert.equal(r.backend, "opencode");
+    assert.deepEqual(r.model, { providerID: "opencode-go", modelID: "deepseek-v4-pro", variant: "max" });
+  });
+
+  it(":variant on a claude-named model is rejected BY THE IDENTIFIER's backend, not by a config key", () => {
+    assert.throws(
+      () => resolveDispatchBackend({
+        flags: { model: "claude/opus:max" },
+        phase: "implement",
+        config: CLAUDE_PINNED,
+      }),
+      (err) => {
+        assert.match(err.message, /--model "claude\/opus:max" names the claude backend/);
+        assert.match(err.message, /:variant suffix in model "opus:max"/);
+        // The rejection is the identifier's, so it must NOT be blamed on a
+        // config key three levels away.
+        assert.doesNotMatch(err.message, /models\.phases\.implement/);
+        return true;
+      },
+    );
+  });
+
+  it("a claude-native ladder is never handed to an opencode dispatch as fallback routes", () => {
+    const r = resolveDispatchBackend({
+      flags: { model: "opencode-go/deepseek-v4-pro:max" },
+      phase: "implement",
+      config: { models: { chain: ["claude/sonnet", "claude/opus"] } },
+    });
+    assert.equal(r.backend, "opencode");
+    // The configured ladder belongs to the other backend; --model pins this
+    // phase, so the ladder is exactly the pinned route.
+    assert.deepEqual(r.chain, ["opencode-go/deepseek-v4-pro:max"]);
+  });
+
+  it("--model pins every phase it applies to — and no wider", () => {
+    const config = {
+      models: {
+        phases: {
+          implement: ["claude/opus"],
+          rework: ["opencode-go/deepseek-v4-flash:max"],
+          review: ["opencode/deepseek-v4-flash-free:max"],
+        },
+      },
+    };
+    // With the flag, all three phases of the command run on the named
+    // backend with the named model (this is what `--model` has always done
+    // to the model; it now does the same to the backend).
+    for (const phase of ["implement", "rework", "review"]) {
+      const r = resolveDispatchBackend({ flags: { model: "claude/opus" }, phase, config });
+      assert.equal(r.backend, "claude", phase);
+      assert.equal(r.model, "opus", phase);
+      assert.equal(r.explicitModel, "opus", phase);
+    }
+    // Without it, nothing is pinned: each phase keeps its configured backend.
+    const impl = resolveDispatchBackend({ flags: {}, phase: "implement", config });
+    const rework = resolveDispatchBackend({ flags: {}, phase: "rework", config });
+    const review = resolveDispatchBackend({ flags: {}, phase: "review", config });
+    assert.equal(impl.backend, "claude");
+    assert.equal(impl.explicitModel, null);
+    assert.equal(rework.backend, "opencode");
+    assert.equal(review.backend, "opencode");
+    assert.equal(review.explicitModel, null);
+  });
+});
+
+// =========================================================================
+// CLI --model backend routing (subprocess) — kusabi #210
+// -------------------------------------------------------------------------
+// The resolution decides the backend; this proves the decision reaches the
+// spawned process: a `--model claude/opus` with NO --backend (and no config,
+// so the default chain is opencode) must spawn the claude CLI, and it must
+// receive the claude spelling `opus` — never the prefixed flag string.
+// =========================================================================
+
+describe("CLI --model backend routing (subprocess, kusabi #210)", () => {
+  const COMPANION_SCRIPT = path.join(import.meta.dirname, "kusabi-companion.mjs");
+
+  function setupFakeClaude(tmp) {
+    const binPath = path.join(tmp, "fake-claude.mjs");
+    fs.writeFileSync(binPath, FAKE_CLAUDE_SOURCE, "utf8");
+    fs.chmodSync(binPath, 0o755);
+    const argsLog = path.join(tmp, "args.ndjson");
+    const pidsLog = path.join(tmp, "pids");
+    const stdinLog = path.join(tmp, "stdin.txt");
+    for (const f of [argsLog, pidsLog, stdinLog]) fs.writeFileSync(f, "", "utf8");
+    const mcpSource = path.join(tmp, "claude.json");
+    fs.writeFileSync(mcpSource, JSON.stringify({ mcpServers: { sunaba: SUNABA_MCP } }), "utf8");
+
+    const env = { ...process.env };
+    delete env.KUSABI_WORKER_CONTEXT;
+    env.CLAUDE_BIN = binPath;
+    env.KUSABI_CLAUDE_MCP_SOURCE = mcpSource;
+    env.KUSABI_STATE_DIR = path.join(tmp, "state");
+    env.FAKE_CLAUDE_MODE = "ok";
+    env.FAKE_CLAUDE_ARGS_LOG = argsLog;
+    env.FAKE_CLAUDE_PIDS = pidsLog;
+    env.FAKE_CLAUDE_STDIN_LOG = stdinLog;
+    return { env, argsLog };
+  }
+
+  it("task --model claude/opus (no --backend, opencode default chain) spawns claude with model opus", () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-model-backend-"));
+    try {
+      const { env, argsLog } = setupFakeClaude(tmp);
+      const result = spawnSync(
+        process.execPath,
+        [COMPANION_SCRIPT, "task", "--model", "claude/opus", "do the thing"],
+        { encoding: "utf8", cwd: tmp, env, timeout: 20_000 },
+      );
+      assert.equal(result.status, 0, `expected success, got: ${result.stdout} ${result.stderr}`);
+      const args = JSON.parse(fs.readFileSync(argsLog, "utf8").trim());
+      const modelIdx = args.indexOf("--model");
+      assert.ok(modelIdx > 0, `the claude CLI must receive --model, got: ${args.join(" ")}`);
+      assert.equal(args[modelIdx + 1], "opus");
+      assert.notEqual(args[modelIdx + 1], "claude/opus");
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+});

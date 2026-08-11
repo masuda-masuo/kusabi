@@ -206,6 +206,19 @@ export function firstRoute(chain) {
 export const CLAUDE_ENTRY_PREFIX = "claude/";
 
 /**
+ * The backend-naming prefixes, as a TABLE: a third backend is one row here,
+ * never a new branch in the resolution.  opencode has no row on purpose —
+ * it is the unprefixed default (an entry with no row's prefix is an
+ * opencode `provider/model[:variant]` route), which is what keeps every
+ * pre-prefix config byte-identical.
+ *
+ * @type {ReadonlyArray<{ prefix: string, backend: "claude" }>}
+ */
+export const BACKEND_ENTRY_PREFIXES = [
+  { prefix: CLAUDE_ENTRY_PREFIX, backend: "claude" },
+];
+
+/**
  * Split one route entry into its backend and its backend-specific model
  * spelling.  `claude/opus` → `{ route: "opus", backend: "claude" }`;
  * `opencode/x:max` (and any other unprefixed entry) → itself with backend
@@ -216,16 +229,73 @@ export const CLAUDE_ENTRY_PREFIX = "claude/";
  * @throws {Error} On a `claude/` entry with an empty model.
  */
 export function splitRouteBackend(route) {
-  if (typeof route === "string" && route.startsWith(CLAUDE_ENTRY_PREFIX)) {
-    const model = route.slice(CLAUDE_ENTRY_PREFIX.length);
-    if (!model) {
-      throw new Error(
-        `kusabi config: chain entry "claude/" has an empty model — use claude/<model> (bare alias or full model id)`
-      );
+  if (typeof route === "string") {
+    for (const { prefix, backend } of BACKEND_ENTRY_PREFIXES) {
+      if (!route.startsWith(prefix)) continue;
+      const model = route.slice(prefix.length);
+      if (!model) {
+        throw new Error(
+          `kusabi config: chain entry "${prefix}" has an empty model — use ${prefix}<model> (bare alias or full model id)`
+        );
+      }
+      return { route: model, backend };
     }
-    return { route: model, backend: "claude" };
   }
   return { route, backend: "opencode" };
+}
+
+/**
+ * Resolve a `--model` flag value into the backend it NAMES and the model
+ * spelling that backend takes (kusabi #210).
+ *
+ * This is step 0 of the per-phase resolution: the identifier decides the
+ * backend, and the model is then validated against the backend that SAME
+ * identifier chose — never against a backend decided by a config key three
+ * levels away.  Three forms:
+ *
+ *   `claude/opus`              → { backend: "claude",   model: "opus" }
+ *   `opencode-go/ds-pro:max`   → { backend: "opencode", model: "opencode-go/ds-pro:max" }
+ *   `opus`                     → { backend: null,       model: "opus" }
+ *
+ * The third form names NO backend: a bare `--model <alias>` keeps the
+ * phase's configured backend, exactly as before this existed.  Only a form
+ * that NAMES a backend may move it.
+ *
+ * The grammar is the config's own (`splitRouteBackend`), including its
+ * deliberate asymmetry: a leading `claude/` is a BACKEND, while the first
+ * segment of any other slashed identifier is an opencode providerID.  That
+ * is why the no-slash case is answered before the split — a bare alias must
+ * not read as an opencode route.
+ *
+ * @param {string|null|undefined} value — the `--model` flag value.
+ * @returns {{ backend: "claude"|"opencode"|null, model: string }|null}
+ *          null when no `--model` was given.
+ * @throws {Error} On a prefix with an empty model (`--model claude/`).
+ */
+export function resolveModelBackend(value) {
+  if (value === undefined || value === null || value === "") return null;
+  const raw = String(value);
+  if (!raw.includes("/")) return { backend: null, model: raw };
+  const { route, backend } = splitRouteBackend(raw);
+  return { backend, model: route };
+}
+
+/**
+ * True when ANY route of a (tiered) chain names `backend` through its
+ * prefix.  A probe, not the invariant check: unlike `resolveChainBackend`
+ * it never throws on a mixed array.
+ *
+ * @param {(string|string[])[]} chain
+ * @param {"opencode"|"claude"} backend
+ * @returns {boolean}
+ */
+export function chainNamesBackend(chain, backend) {
+  for (const tier of Array.isArray(chain) ? chain : []) {
+    for (const route of Array.isArray(tier) ? tier : [tier]) {
+      if (splitRouteBackend(route).backend === backend) return true;
+    }
+  }
+  return false;
 }
 
 /**

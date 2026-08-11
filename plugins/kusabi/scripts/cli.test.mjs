@@ -685,3 +685,62 @@ describe("stripClaudePrefixChain", () => {
     assert.deepEqual(stripClaudePrefixChain(["opencode/x:max", "claude/opus"]), ["opencode/x:max", "opus"]);
   });
 });
+
+// =========================================================================
+// resolveModelBackend — a --model identifier carries its backend (kusabi #210)
+// =========================================================================
+
+import { resolveModelBackend, chainNamesBackend } from "./cli.mjs";
+
+describe("resolveModelBackend", () => {
+  it("a claude/ identifier names the claude backend and strips the prefix", () => {
+    assert.deepEqual(resolveModelBackend("claude/opus"), { backend: "claude", model: "opus" });
+    assert.deepEqual(
+      resolveModelBackend("claude/claude-sonnet-4-5"),
+      { backend: "claude", model: "claude-sonnet-4-5" },
+    );
+  });
+
+  it("a provider/model identifier names the opencode backend and keeps the route verbatim", () => {
+    assert.deepEqual(
+      resolveModelBackend("opencode-go/deepseek-v4-pro:max"),
+      { backend: "opencode", model: "opencode-go/deepseek-v4-pro:max" },
+    );
+  });
+
+  it("a bare alias (no /) names NO backend — the phase keeps its configured one", () => {
+    assert.deepEqual(resolveModelBackend("opus"), { backend: null, model: "opus" });
+    assert.deepEqual(resolveModelBackend("claude-sonnet-4-5"), { backend: null, model: "claude-sonnet-4-5" });
+  });
+
+  it("no --model is null (not a backend decision)", () => {
+    assert.equal(resolveModelBackend(undefined), null);
+    assert.equal(resolveModelBackend(null), null);
+    assert.equal(resolveModelBackend(""), null);
+  });
+
+  it("the :variant suffix is carried through untouched — validation belongs to the backend", () => {
+    assert.deepEqual(resolveModelBackend("claude/opus:max"), { backend: "claude", model: "opus:max" });
+  });
+
+  it("a prefix with an empty model is an error", () => {
+    assert.throws(() => resolveModelBackend("claude/"), /empty model/);
+  });
+});
+
+describe("chainNamesBackend", () => {
+  it("finds a claude/ entry in a flat or tiered chain", () => {
+    assert.equal(chainNamesBackend(["claude/opus"], "claude"), true);
+    assert.equal(chainNamesBackend([["opencode/x:max"], ["claude/opus"]], "claude"), true);
+  });
+
+  it("is false when no entry names the backend", () => {
+    assert.equal(chainNamesBackend(["opencode/x:max"], "claude"), false);
+    assert.equal(chainNamesBackend([], "claude"), false);
+  });
+
+  it("is a probe, not the invariant check: a mixed chain does not throw", () => {
+    assert.equal(chainNamesBackend(["claude/opus", "opencode/x:max"], "claude"), true);
+    assert.equal(chainNamesBackend(["claude/opus", "opencode/x:max"], "opencode"), true);
+  });
+});

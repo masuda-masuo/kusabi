@@ -2582,6 +2582,51 @@ describe("chain per-phase config validation (kusabi #192)", () => {
       fs.rmSync(tmp, { recursive: true, force: true });
     }
   });
+
+  // ---- --model carries its backend (kusabi #210) ----
+
+  it("a backend-naming --model resolves a claude-pinned phase onto ITS backend at command start, with no config edit", () => {
+    const { tmp, stateDir } = makeState({
+      models: { phases: { implement: ["claude/opus"] } },
+    });
+    try {
+      // The incident: the operator hands over an identifier the config
+      // format itself defines, naming a reachable opencode model, for a
+      // phase pinned to claude/opus.  chain with no container must now fail
+      // on the container requirement — NOT on the :variant rejection and NOT
+      // on the --backend conflict: resolution accepted the identifier.
+      const result = runCompanion(
+        ["chain", "--model", "opencode-go/deepseek-v4-pro:max", "brief text"],
+        tmp, stateDir,
+      );
+      assert.notEqual(result.status, 0);
+      assert.doesNotMatch(result.stdout, /:variant/);
+      assert.doesNotMatch(result.stdout, /conflicts with the claude-native chain/);
+      assert.match(result.stdout, /chain requires --container/);
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("--backend disagreeing with a backend-naming --model fails at command start, naming both", () => {
+    const { tmp, stateDir } = makeState({
+      models: { phases: { implement: ["claude/opus"] } },
+    });
+    try {
+      const result = runCompanion(
+        ["chain", "--backend", "opencode", "--model", "claude/opus", "--container", "abc123", "brief text"],
+        tmp, stateDir,
+      );
+      assert.notEqual(result.status, 0, `expected failure, got: ${result.stdout}`);
+      assert.match(result.stdout, /--backend opencode/);
+      assert.match(result.stdout, /--model claude\/opus/);
+      // Failed at command start: no chain directory was created.
+      const hash = crypto.createHash("sha256").update(tmp).digest("hex").slice(0, 12);
+      assert.equal(fs.existsSync(path.join(stateDir, hash, "chains")), false);
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
 });
 
 // =========================================================================
