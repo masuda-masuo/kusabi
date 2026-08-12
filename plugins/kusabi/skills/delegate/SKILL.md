@@ -101,6 +101,12 @@ end up re-running a doomed cheap round three times.
   need to, say so explicitly". A real deviation then came back documented in source
   comments and could be adjudicated; a bare prohibition is either silently worked
   around or produces a distorted implementation.
+- **A "stop and report" condition is not a stop.** A brief that said "if you hit the
+  aggregate byte cap, stop and report rather than raising it yourself" was ignored at
+  exactly that condition, and the chain still ended in `accept` with the full suite red.
+  Write the condition anyway — it makes the deviation adjudicable — but treat it as
+  instrumentation, not a halt: at inspection, check whether the condition was hit rather
+  than assuming the worker stopped there.
 - **When the task wires new code into existing code, add a `## Suggested design`
   block** — explicitly a starting point, not frozen criteria. At minimum: which layer
   owns the loop/retry, where the state lives, and which single function makes the
