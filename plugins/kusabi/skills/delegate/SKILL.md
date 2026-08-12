@@ -66,6 +66,10 @@ end up re-running a doomed cheap round three times.
 - **Sign it.** A line among the first 5 — `Orchestrator: <model-id> | session <id> | <date>`
   — is parsed by the companion and recorded on the job/chain record. Without it, discard
   and rework rates cannot be attributed back to who wrote the brief.
+- **A skeleton that has held up**: `Deliverables / Smoke / Purpose / Workplace /
+  Read first (in the container) / Spec (numbered subsections, concrete file names) /
+  Acceptance criteria / Frozen tests / Non-goals / Constraints`. The order matters less
+  than the fact that the two machine-read sections come first.
 - **`## Deliverables` is machine-read, not decoration.** The deliverables probe parses it
   and an empty change set becomes a discard. List the files that must change, and state
   that producing notes or summary files is not the task — cheap workers otherwise treat
@@ -83,6 +87,24 @@ end up re-running a doomed cheap round three times.
   bullet entries require a backtick-quoted command with an optional `exit <N>`
   annotation. The heading may carry a trailing annotation — e.g. `## Smoke (run in
   container)` — and is still recognised.
+- **Keep the smoke cheap, deterministic and one command per line — never comprehensive.**
+  Across nine chains sharing one author, one day and one template, briefs carrying
+  `## Smoke` averaged 1.25 rounds against 2.40 without it; the winning smoke was a single
+  `node --check <file>` while the losing brief spent 900 characters on prose criteria.
+  Acceptance criteria are read and judged by the reviewer — smoke is the only section the
+  worker can run to close its own loop. (n=9, and a task that admits a one-line smoke may
+  simply be an easier task: direction, not causation.)
+- **Never put a bare `lint` / `type` command in `## Smoke` without measuring the baseline
+  first.** Two delegations failed both their smoke and their verify probe on pre-existing
+  lint debt in the target files; both workers were innocent, and the cost was paid twice —
+  once sending good work back, once re-measuring the baseline at inspection. Name the
+  target files and measure first (`git show HEAD:<f> | ruff check --stdin-filename <f> -`).
+  If you have not measured, do not write it — tests and imports usually suffice.
+- **A single failing smoke line is your line until you reproduce it by hand.** The probe
+  shell has no `\xNN` escape — that is a bash extension, and POSIX `printf` takes octal
+  only — so `printf '\xef\xbb\xbf' > f` writes those characters literally and fails a
+  correct implementation. This is the inverse error to a worker's false green, and it is
+  more expensive: it rejects work that was right.
 - **Inline the whole spec. Never open with "read issue #N first."** The brief is the
   contract; a pointer is not.
 - **Freeze outcomes, not architecture.** Acceptance criteria must describe observable
