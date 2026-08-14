@@ -1226,26 +1226,31 @@ describe("freshness label", () => {
   });
 });
 
-describe("Cursor sampling coverage", () => {
+// The section this replaces printed `sampled / total_output_tokens` as a
+// "coverage" percentage with a `!` outlier flag.  kusabi #253 retired the
+// ratio (the denominator is window occupancy, not a cumulative counter), so
+// these tests assert the two values are reported side by side and that no
+// ratio or flag comes back.
+describe("Cursor sampled output and window output occupancy", () => {
   it("omits the section (and the JSON key) when the counter table is empty", () => {
     const db = buildFixture();
     const report = computeReport(db, { dbPath: ":memory:" });
-    assert.equal(report.cursorSamplingCoverage, undefined);
+    assert.equal(report.cursorSampledOutput, undefined);
     const text = renderReportText(report);
-    assert.doesNotMatch(text, /Cursor sampling coverage/);
+    assert.doesNotMatch(text, /Cursor sampled output/);
     const parsed = JSON.parse(renderReportJson(report));
-    assert.equal("cursorSamplingCoverage" in parsed, false);
+    assert.equal("cursorSampledOutput" in parsed, false);
   });
 
   it("omits the section on a store whose counter table does not exist", () => {
     const db = buildFixture();
     db.exec("DROP TABLE cursor_session_counter");
     const report = computeReport(db, { dbPath: ":memory:" });
-    assert.equal(report.cursorSamplingCoverage, undefined);
-    assert.doesNotMatch(renderReportText(report), /Cursor sampling coverage/);
+    assert.equal(report.cursorSampledOutput, undefined);
+    assert.doesNotMatch(renderReportText(report), /Cursor sampled output/);
   });
 
-  it("shows sampled/reported/coverage for an undercounting sampler (50/80 = 62.5%)", () => {
+  it("reports sampled output and window occupancy as plain values, with no ratio and no flag", () => {
     const db = openMetricsDb(":memory:");
     const sessionId = "d73008ab-1111-2222-3333-444444444444";
     upsertSession(db, {
@@ -1278,24 +1283,39 @@ describe("Cursor sampling coverage", () => {
     });
 
     const report = computeReport(db, { dbPath: ":memory:" });
-    assert.ok(report.cursorSamplingCoverage);
-    assert.equal(report.cursorSamplingCoverage.sampledOutput, 50);
-    assert.equal(report.cursorSamplingCoverage.reportedOutput, 80);
-    assert.equal(report.cursorSamplingCoverage.coveragePct, 62.5);
-    assert.equal(report.cursorSamplingCoverage.anomaly, false);
-    assert.equal(report.cursorSamplingCoverage.sessions.length, 1);
-    assert.equal(report.cursorSamplingCoverage.sessions[0].sessionIdShort, "d73008ab...");
+    assert.ok(report.cursorSampledOutput);
+    assert.equal(report.cursorSampledOutput.sampledOutput, 50);
+    assert.equal(report.cursorSampledOutput.windowOutput, 80);
+    // The retired ratio and flag must not come back in any shape.
+    assert.equal("coveragePct" in report.cursorSampledOutput, false);
+    assert.equal("anomaly" in report.cursorSampledOutput, false);
+    assert.equal(report.cursorSampledOutput.sessions.length, 1);
+    assert.equal(report.cursorSampledOutput.sessions[0].sessionIdShort, "d73008ab...");
+    assert.equal(report.cursorSampledOutput.sessions[0].sampledOutput, 50);
+    assert.equal(report.cursorSampledOutput.sessions[0].windowOutput, 80);
+    assert.equal("coveragePct" in report.cursorSampledOutput.sessions[0], false);
+    assert.equal("anomaly" in report.cursorSampledOutput.sessions[0], false);
 
     const text = renderReportText(report);
-    assert.match(text, /Cursor sampling coverage:/);
-    assert.match(text, /sampled output 50  reported cumulative 80  coverage 62\.5%/);
-    assert.match(text, /d73008ab\.\.\.  sampled 50  reported 80  62\.5%/);
-    assert.doesNotMatch(text, /!/);
+    assert.match(text, /Cursor sampled output and window output occupancy:/);
+    assert.match(text, /sampled output 50 {2}latest window output occupancy 80/);
+    assert.match(text, /d73008ab\.\.\. {2}sampled 50 {2}window occupancy 80/);
+    const cursorSection = text.slice(text.indexOf("Cursor sampled output"));
+    assert.doesNotMatch(cursorSection, /%/);
+    assert.doesNotMatch(cursorSection, /!/);
+    assert.doesNotMatch(cursorSection, /coverage/i);
+    assert.doesNotMatch(cursorSection, /reported cumulative/i);
+    // The non-cumulative caveat is the whole reason both numbers are shown.
+    assert.match(cursorSection, /NOT a cumulative session total/);
+    assert.match(cursorSection, /compaction/);
   });
 
-  it("marks a row with ! when reported cumulative is smaller than sampled", () => {
+  it("prints both numbers unflagged when window occupancy is below the sampled sum", () => {
+    // Not an anomaly any more: occupancy drops on compaction while the
+    // sampled sum only grows, so sampled > occupancy is the expected shape
+    // of a long session, not a defect to flag.
     const db = openMetricsDb(":memory:");
-    const sessionId = "sess-anomaly-1";
+    const sessionId = "sess-below-1";
     upsertSession(db, {
       sessionId,
       firstTs: "2026-08-14T10:00:00.000Z",
@@ -1317,11 +1337,35 @@ describe("Cursor sampling coverage", () => {
     });
 
     const report = computeReport(db, { dbPath: ":memory:" });
-    assert.equal(report.cursorSamplingCoverage.anomaly, true);
-    assert.equal(report.cursorSamplingCoverage.sessions[0].anomaly, true);
+    assert.equal(report.cursorSampledOutput.sampledOutput, 90);
+    assert.equal(report.cursorSampledOutput.windowOutput, 80);
     const text = renderReportText(report);
-    assert.match(text, /coverage 112\.5% !/);
-    assert.match(text, /sess-ano\.\.\.  sampled 90  reported 80  112\.5% !/);
+    const cursorSection = text.slice(text.indexOf("Cursor sampled output"));
+    assert.match(cursorSection, /sess-bel\.\.\. {2}sampled 90 {2}window occupancy 80/);
+    assert.doesNotMatch(cursorSection, /!/);
+    assert.doesNotMatch(cursorSection, /%/);
+  });
+
+  it("renders n/a for a session whose window occupancy reading is absent", () => {
+    const db = openMetricsDb(":memory:");
+    const sessionId = "sess-null-window";
+    upsertTurn(db, {
+      requestId: `cursor:${sessionId}#1`,
+      sessionId,
+      ts: "2026-08-14T10:00:00.000Z",
+      tsMs: Date.parse("2026-08-14T10:00:00.000Z"),
+      output: 25,
+      isSidechain: 0,
+      isSynthetic: 0,
+    });
+    upsertCursorSessionCounter(db, {
+      sessionId,
+      totalOutputTokens: null,
+      ts: "2026-08-14T10:00:00.000Z",
+    });
+    const report = computeReport(db, { dbPath: ":memory:" });
+    assert.equal(report.cursorSampledOutput.sessions[0].windowOutput, null);
+    assert.match(renderReportText(report), /sess-nul\.\.\. {2}sampled 25 {2}window occupancy n\/a/);
   });
 
   it("does not count non-cursor turns in sampled output", () => {
@@ -1351,7 +1395,59 @@ describe("Cursor sampling coverage", () => {
       ts: "2026-08-14T10:00:00.000Z",
     });
     const report = computeReport(db, { dbPath: ":memory:" });
-    assert.equal(report.cursorSamplingCoverage.sampledOutput, 10);
-    assert.equal(report.cursorSamplingCoverage.reportedOutput, 40);
+    assert.equal(report.cursorSampledOutput.sampledOutput, 10);
+    assert.equal(report.cursorSampledOutput.windowOutput, 40);
+  });
+});
+
+describe("Brief-metrics strata — orch_model key normalisation (kusabi #252)", () => {
+  function chainSignedAs(db, chainId, orchModel) {
+    upsertChain(db, {
+      chainId,
+      orchModel,
+      orchSession: null,
+      orchDate: "2026-08-14",
+      briefHasSmoke: 1,
+      briefChars: 400,
+      briefHasDeliverables: 1,
+    });
+    upsertRound(db, {
+      chainId,
+      round: 1,
+      startedAt: "2026-08-14T10:00:00.000Z",
+      startedMs: Date.parse("2026-08-14T10:00:00.000Z"),
+      disposition: "accept",
+    });
+  }
+
+  it("merges display-name and model-id signatures of one orchestrator into a single stratum", () => {
+    const db = openMetricsDb(":memory:");
+    chainSignedAs(db, "chain-grok-a", "cursor-grok-4.6");
+    chainSignedAs(db, "chain-grok-b", "cursor-grok-4.6");
+    chainSignedAs(db, "chain-grok-c", "Cursor Grok 4.6");
+    chainSignedAs(db, "chain-fable", "claude-fable-5");
+
+    const report = computeReport(db, { dbPath: ":memory:" });
+    assert.deepEqual(
+      report.briefOutcome.map((b) => b.orchModel).sort(),
+      ["claude-fable-5", "cursor-grok-4.6"],
+    );
+    const grok = report.briefOutcome.find((b) => b.orchModel === "cursor-grok-4.6");
+    assert.equal(grok.chainCount, 3);
+    const fable = report.briefOutcome.find((b) => b.orchModel === "claude-fable-5");
+    assert.equal(fable.chainCount, 1);
+
+    // Stored values stay verbatim -- only the stratification key is folded.
+    assert.deepEqual(
+      db.prepare("SELECT orch_model FROM chain ORDER BY chain_id").all().map((r) => r.orch_model),
+      ["claude-fable-5", "cursor-grok-4.6", "cursor-grok-4.6", "Cursor Grok 4.6"],
+    );
+  });
+
+  it("keeps a chain with no orch_model in the (unknown) bucket", () => {
+    const db = openMetricsDb(":memory:");
+    chainSignedAs(db, "chain-null-model", null);
+    const report = computeReport(db, { dbPath: ":memory:" });
+    assert.deepEqual(report.briefOutcome.map((b) => b.orchModel), ["(unknown)"]);
   });
 });

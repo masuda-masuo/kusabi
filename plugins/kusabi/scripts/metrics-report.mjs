@@ -86,12 +86,9 @@ function fmtPct(pct) {
   return `${Math.round(pct)}%`;
 }
 
-/** Coverage ratio already scaled to 0-100; keep one decimal when needed (62.5%). */
-function fmtCoveragePct(pct) {
-  if (pct === null || pct === undefined) return "n/a";
-  const rounded1 = Math.round(pct * 10) / 10;
-  return Number.isInteger(rounded1) ? `${rounded1}%` : `${rounded1.toFixed(1)}%`;
-}
+// (fmtCoveragePct lived here until kusabi #253 retired the Cursor coverage
+// ratio — the only caller.  Nothing else in this file prints a one-decimal
+// percentage.)
 
 function fmtTs(v) {
   return v === null || v === undefined ? NONE : v;
@@ -518,8 +515,27 @@ function emptyBucketRow() {
   return { "rounds=1": 0, "rounds=2": 0, "rounds=3": 0, "rounds=4+": 0 };
 }
 
+/**
+ * Stratification key for one chain's `orch_model` (kusabi #252).
+ *
+ * The stored value is whatever the orchestrator signed itself as, and the
+ * same orchestrator signs two ways: `cursor-grok-4.6` from the model id and
+ * `Cursor Grok 4.6` from the display name.  Grouping verbatim split one
+ * orchestrator into two strata of 3 and 1 chains, which is a worse lie than
+ * the normalisation costs: lowercase, whitespace runs to `-`.
+ *
+ * Key only — the stored value stays verbatim, and every other section that
+ * prints `orch_model` per chain keeps printing it verbatim (same principle
+ * as Hazard B in cursor-usage-ingest.mjs).  A null/undefined model keeps its
+ * long-standing `(unknown)` bucket rather than being normalised into one.
+ */
+function orchModelStratumKey(orchModel) {
+  if (orchModel === null || orchModel === undefined) return "(unknown)";
+  return String(orchModel).trim().toLowerCase().replace(/\s+/g, "-");
+}
+
 function computeBriefOutcome(inWindowChains, roundsByChain) {
-  const byModel = groupBy(inWindowChains, (c) => c.orch_model ?? "(unknown)");
+  const byModel = groupBy(inWindowChains, (c) => orchModelStratumKey(c.orch_model));
   const blocks = [];
   for (const [model, chains] of byModel) {
     let chainsWithNoRounds = 0;
@@ -723,17 +739,29 @@ function computeBackendSplit(inWindowChains, inWindowJobs, roundsByChain) {
 }
 
 // ---------------------------------------------------------------------------
-// Cursor sampling coverage — display only, never rewrites turn.output
+// Cursor sampled output vs window output occupancy — display only, never
+// rewrites turn.output
+//
+// This used to divide the sampled sum by
+// cursor_session_counter.total_output_tokens and print the quotient as
+// "coverage" against a "reported cumulative".  That premise was wrong
+// (kusabi #253): the field is the output currently OCCUPYING the context
+// window, and it DECREASES when compaction evicts earlier output (measured
+// 45,976 → 36,842 inside one session), so the quotient was a ratio of
+// nothing and read as 222% even on correctly collapsed data.  The sink
+// payload carries no honest cumulative denominator, so the two numbers are
+// printed side by side and never divided.
 // ---------------------------------------------------------------------------
 
 /**
- * Whole-store (not window-scoped): sampled output is the sum of turn.output
- * for request_id LIKE 'cursor:%'; reported is the sum of
- * cursor_session_counter.total_output_tokens.  Coverage is sampled/reported.
- * Returns null when the table is missing or empty so Claude-only stores keep
- * their previous JSON/text shape (aside from the freshness label).
+ * Whole-store (not window-scoped): `sampledOutput` sums turn.output over
+ * request_id LIKE 'cursor:%'; `windowOutput` sums the latest-ts
+ * `context_window.total_output_tokens` reading per session (window
+ * occupancy — non-cumulative, may decrease).  Returns null when the table is
+ * missing or empty so Claude-only stores keep their previous JSON/text shape
+ * (aside from the freshness label).
  */
-function computeCursorSamplingCoverage(db) {
+function computeCursorSampledOutput(db) {
   if (!tableExists(db, "cursor_session_counter")) return null;
   const counters = db.prepare(
     "SELECT session_id, total_output_tokens, ts FROM cursor_session_counter",
@@ -753,32 +781,27 @@ function computeCursorSamplingCoverage(db) {
     sampledBySession.set(t.session_id, (sampledBySession.get(t.session_id) ?? 0) + out);
   }
 
-  let reportedTotal = 0;
+  let windowTotal = 0;
   const sessions = [];
   for (const c of counters) {
     const sampled = sampledBySession.get(c.session_id) ?? 0;
-    const reported = typeof c.total_output_tokens === "number" ? c.total_output_tokens : null;
-    if (typeof reported === "number") reportedTotal += reported;
-    const coveragePct = (reported === null || reported === 0)
-      ? null
-      : (sampled / reported) * 100;
+    const windowOutput = typeof c.total_output_tokens === "number" ? c.total_output_tokens : null;
+    if (typeof windowOutput === "number") windowTotal += windowOutput;
     sessions.push({
       sessionId: c.session_id,
       sessionIdShort: `${(c.session_id || "").slice(0, 8)}...`,
       sampledOutput: sampled,
-      reportedOutput: reported,
-      coveragePct,
-      anomaly: reported !== null && reported < sampled,
+      windowOutput,
+      windowOutputTs: c.ts ?? null,
     });
   }
   sessions.sort((a, b) => String(a.sessionId).localeCompare(String(b.sessionId)));
 
-  const coveragePct = reportedTotal === 0 ? null : (sampledTotal / reportedTotal) * 100;
   return {
     sampledOutput: sampledTotal,
-    reportedOutput: reportedTotal,
-    coveragePct,
-    anomaly: reportedTotal < sampledTotal,
+    // A sum of per-session occupancy snapshots taken at different instants:
+    // a rough scale indicator, not a total anything was measured at.
+    windowOutput: windowTotal,
     sessions,
   };
 }
@@ -886,7 +909,7 @@ export function computeReport(db, opts = {}) {
   const briefOutcome = computeBriefOutcome(inWindowChains, roundsByChain);
   const delegatedJobs = computeDelegatedJobs(inWindowJobs);
   const byBackend = computeBackendSplit(inWindowChains, inWindowJobs, roundsByChain);
-  const cursorSamplingCoverage = computeCursorSamplingCoverage(db);
+  const cursorSampledOutput = computeCursorSampledOutput(db);
 
   const status = (inWindowTurns.length === 0 && inWindowChains.length === 0 && inWindowJobs.length === 0)
     ? "empty_window"
@@ -913,7 +936,7 @@ export function computeReport(db, opts = {}) {
     briefOutcome,
     delegatedJobs,
     byBackend,
-    ...(cursorSamplingCoverage ? { cursorSamplingCoverage } : {}),
+    ...(cursorSampledOutput ? { cursorSampledOutput } : {}),
   };
 }
 
@@ -1127,21 +1150,26 @@ function renderDelegatedJobs(section) {
 }
 
 /**
- * Render Cursor sampler vs CLI-reported cumulative output.  Returns [] when
- * the store has no cursor_session_counter rows, so Claude-only text stays
- * byte-identical aside from the freshness label.
+ * Render the Cursor sampled-output sum beside the latest window-occupancy
+ * reading.  Returns [] when the store has no cursor_session_counter rows, so
+ * Claude-only text stays byte-identical aside from the freshness label.
+ *
+ * The two numbers are printed side by side and never divided — see
+ * `computeCursorSampledOutput` (kusabi #253).  Do not reintroduce a ratio or
+ * an outlier flag here: there is no denominator in the payload that would
+ * make either one mean something.
  */
-function renderCursorSamplingCoverage(section) {
+function renderCursorSampledOutput(section) {
   if (!section) return [];
-  const totalFlag = section.anomaly ? " !" : "";
   const lines = [
-    "Cursor sampling coverage:",
-    `  sampled output ${fmtInt(section.sampledOutput)}  reported cumulative ${fmtInt(section.reportedOutput)}  coverage ${fmtCoveragePct(section.coveragePct)}${totalFlag}`,
+    "Cursor sampled output and window output occupancy:",
+    `  sampled output ${fmtInt(section.sampledOutput)}  latest window output occupancy ${fmtInt(section.windowOutput)}`,
+    "  Sampled output is the sum of the statusline samples ingested as turns, and undercounts (calls between two refreshes are never seen).",
+    "  Window output occupancy is what Cursor last reported the context window holding, NOT a cumulative session total: it drops when compaction evicts earlier output, so the two are shown side by side and are not a ratio.",
   ];
   for (const s of section.sessions) {
-    const flag = s.anomaly ? " !" : "";
     lines.push(
-      `  ${s.sessionIdShort}  sampled ${fmtInt(s.sampledOutput)}  reported ${fmtInt(s.reportedOutput)}  ${fmtCoveragePct(s.coveragePct)}${flag}`,
+      `  ${s.sessionIdShort}  sampled ${fmtInt(s.sampledOutput)}  window occupancy ${fmtInt(s.windowOutput)}`,
     );
   }
   return lines;
@@ -1214,10 +1242,10 @@ export function renderReportText(report) {
   lines.push(...renderBriefOutcome(report.briefOutcome));
   lines.push("");
   lines.push(...renderDelegatedJobs(report.delegatedJobs));
-  const coverageLines = renderCursorSamplingCoverage(report.cursorSamplingCoverage);
-  if (coverageLines.length > 0) {
+  const cursorLines = renderCursorSampledOutput(report.cursorSampledOutput);
+  if (cursorLines.length > 0) {
     lines.push("");
-    lines.push(...coverageLines);
+    lines.push(...cursorLines);
   }
   const backendSplitLines = renderBackendSplit(report.byBackend);
   if (backendSplitLines.length > 0) {
