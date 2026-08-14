@@ -1,0 +1,21 @@
+{
+  "name": "kusabi",
+  "owner": {
+    "name": "masuda-masuo"
+  },
+  "metadata": {
+    "description": "kusabi plugin: delegation and adversarial code review over a local opencode server.",
+    "version": "0.1.0"
+  },
+  "plugins": [
+    {
+      "name": "kusabi",
+      "description": "Use opencode from an orchestrator harness to review code or delegate tasks, without flooding the orchestrator's context.",
+      "version": "0.1.0",
+      "author": {
+        "name": "masuda-masuo"
+      },
+      "source": "./plugins/kusabi"
+    }
+  ]
+}
