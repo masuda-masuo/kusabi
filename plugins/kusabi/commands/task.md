@@ -2,7 +2,7 @@
 description: Delegate a task to opencode through the local opencode server
 argument-hint: '[--wait|--background] [--model provider/model] [--agent name] [--phase name] [--read-only] [--deny tool1,tool2] [--auto] [--resume-last|--session <id>] <task description>'
 disable-model-invocation: true
-allowed-tools: Read, Bash(node:*), Bash(git:*), AskUserQuestion
+allowed-tools: Read, Bash(node:*), Bash(kusabi-companion:*), Bash(git:*), AskUserQuestion
 ---
 
 Delegate a task to opencode through the companion runtime.
@@ -28,14 +28,15 @@ Argument handling:
 
 Foreground flow:
 ```bash
-node "${CLAUDE_PLUGIN_ROOT}/scripts/kusabi-companion.mjs" task "$ARGUMENTS"
+kusabi-companion task "$ARGUMENTS"
 ```
+If the shim is not installed (command not found), `node "${CLAUDE_PLUGIN_ROOT}/scripts/kusabi-companion.mjs" task ...` is equivalent.
 - Return the command stdout verbatim, exactly as-is. No commentary before or after.
 
 Background flow:
 ```typescript
 Bash({
-  command: `node "${CLAUDE_PLUGIN_ROOT}/scripts/kusabi-companion.mjs" task "$ARGUMENTS"`,
+  command: `kusabi-companion task "$ARGUMENTS"`,
   description: "opencode task",
   run_in_background: true
 })

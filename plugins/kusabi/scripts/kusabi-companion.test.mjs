@@ -5192,3 +5192,205 @@ describe("buildTaskReviewInput", () => {
     assert.ok(cmdTaskSource.includes("${taskReviewInput}"));
   });
 });
+
+
+// install-cli: PATH-independent companion shim
+// ---------------------------------------------------------------------------
+// Path resolution lives in the CLI itself (import.meta.url). Commands invoke
+// `kusabi-companion <sub>` once the shim is on PATH. Tests inject
+// KUSABI_BIN_DIR / HOME so they never touch the real ~/.local/bin.
+
+describe("install-cli shim", () => {
+  const COMPANION_SCRIPT = path.join(import.meta.dirname, "kusabi-companion.mjs");
+  let tmpHome;
+  let binDir;
+
+  beforeEach(() => {
+    tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-install-cli-home-"));
+    binDir = path.join(tmpHome, "bin");
+  });
+
+  afterEach(() => {
+    fs.rmSync(tmpHome, { recursive: true, force: true });
+  });
+
+  function run(args, extraEnv = {}) {
+    const env = {
+      ...process.env,
+      HOME: tmpHome,
+      KUSABI_BIN_DIR: binDir,
+      OPENCODE_BIN: "/nonexistent-opencode-bin",
+      ...extraEnv,
+    };
+    if (Object.prototype.hasOwnProperty.call(extraEnv, "KUSABI_BIN_DIR") && extraEnv.KUSABI_BIN_DIR === undefined) {
+      delete env.KUSABI_BIN_DIR;
+    }
+    return spawnSync(process.execPath, [COMPANION_SCRIPT, ...args], {
+      encoding: "utf8",
+      env,
+      timeout: 10_000,
+    });
+  }
+
+  function expectedShim(target = COMPANION_SCRIPT) {
+    return `#!/bin/sh\nexec node ${JSON.stringify(target)} "$@"\n`;
+  }
+
+  it("--help lists install-cli", () => {
+    const result = run(["--help"]);
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stdout, /^ {2}install-cli  /m);
+  });
+
+  it("creates a 0755 shim under KUSABI_BIN_DIR (created)", () => {
+    const result = run(["install-cli"]);
+    assert.equal(result.status, 0, result.stderr + result.stdout);
+    const shim = path.join(binDir, "kusabi-companion");
+    assert.match(result.stdout, /^created: /m);
+    assert.ok(result.stdout.includes(shim), result.stdout);
+    assert.equal(fs.readFileSync(shim, "utf8"), expectedShim());
+    assert.equal(fs.statSync(shim).mode & 0o777, 0o755);
+    const execLine = fs.readFileSync(shim, "utf8").split("\n").find((l) => l.startsWith("exec node "));
+    assert.equal(execLine, `exec node ${JSON.stringify(COMPANION_SCRIPT)} "$@"`);
+    assert.ok(path.isAbsolute(JSON.parse(execLine.match(/^exec node (.+) "\$@"$/)[1])));
+  });
+
+  it("is a no-op when the shim already matches (current)", () => {
+    const first = run(["install-cli"]);
+    assert.match(first.stdout, /^created: /m);
+    const shim = path.join(binDir, "kusabi-companion");
+    const before = fs.readFileSync(shim, "utf8");
+    const mtime = fs.statSync(shim).mtimeMs;
+    const second = run(["install-cli"]);
+    assert.equal(second.status, 0, second.stderr + second.stdout);
+    assert.match(second.stdout, /^current: /m);
+    assert.equal(fs.readFileSync(shim, "utf8"), before);
+    assert.equal(fs.statSync(shim).mtimeMs, mtime);
+  });
+
+  it("overwrites a shim that points elsewhere (updated)", () => {
+    fs.mkdirSync(binDir, { recursive: true });
+    const shim = path.join(binDir, "kusabi-companion");
+    const other = "/tmp/other-kusabi-companion.mjs";
+    fs.writeFileSync(shim, expectedShim(other), { mode: 0o755 });
+    const result = run(["install-cli"]);
+    assert.equal(result.status, 0, result.stderr + result.stdout);
+    assert.match(result.stdout, /^updated: /m);
+    assert.equal(fs.readFileSync(shim, "utf8"), expectedShim());
+    assert.ok(!fs.readFileSync(shim, "utf8").includes(other));
+  });
+
+  it("creates the destination directory when it does not exist", () => {
+    const nested = path.join(tmpHome, "nested", "bin");
+    const result = run(["install-cli"], { KUSABI_BIN_DIR: nested });
+    assert.equal(result.status, 0, result.stdout);
+    assert.match(result.stdout, /^created: /m);
+    assert.ok(fs.existsSync(path.join(nested, "kusabi-companion")));
+  });
+
+  it("defaults to ~/.local/bin when KUSABI_BIN_DIR is unset", () => {
+    const result = run(["install-cli"], { KUSABI_BIN_DIR: undefined });
+    assert.equal(result.status, 0, result.stdout);
+    const shim = path.join(tmpHome, ".local", "bin", "kusabi-companion");
+    assert.match(result.stdout, /^created: /m);
+    assert.ok(result.stdout.includes(shim), result.stdout);
+    assert.equal(fs.readFileSync(shim, "utf8"), expectedShim());
+  });
+
+  it("warns when the destination is not on PATH", () => {
+    const result = run(["install-cli"], { PATH: "/usr/bin" });
+    assert.equal(result.status, 0, result.stdout);
+    assert.match(result.stdout, /warning: .* is not on PATH/);
+    assert.ok(result.stdout.includes(binDir), result.stdout);
+  });
+
+  it("does not warn when the destination is on PATH", () => {
+    const result = run(["install-cli"], { PATH: `${binDir}${path.delimiter}/usr/bin` });
+    assert.equal(result.status, 0, result.stdout);
+    assert.doesNotMatch(result.stdout, /warning: .* is not on PATH/);
+  });
+
+  it("shim --help matches node companion --help and forwards exit codes", () => {
+    const installed = run(["install-cli"], { PATH: `${binDir}${path.delimiter}${process.env.PATH}` });
+    assert.equal(installed.status, 0, installed.stdout);
+    const shim = path.join(binDir, "kusabi-companion");
+    const viaShim = spawnSync(shim, ["--help"], { encoding: "utf8", timeout: 10_000 });
+    const viaNode = spawnSync(process.execPath, [COMPANION_SCRIPT, "--help"], { encoding: "utf8", timeout: 10_000 });
+    assert.equal(viaShim.status, 0);
+    assert.equal(viaShim.stdout, viaNode.stdout);
+    const shimUnknown = spawnSync(shim, ["not-a-subcommand"], { encoding: "utf8", timeout: 10_000 });
+    const nodeUnknown = spawnSync(process.execPath, [COMPANION_SCRIPT, "not-a-subcommand"], { encoding: "utf8", timeout: 10_000 });
+    assert.equal(shimUnknown.status, nodeUnknown.status);
+    assert.equal(shimUnknown.stdout, nodeUnknown.stdout);
+    assert.notEqual(shimUnknown.status, 0);
+  });
+});
+
+describe("setup companion-shim diagnosis", () => {
+  const COMPANION_SCRIPT = path.join(import.meta.dirname, "kusabi-companion.mjs");
+  let tmpHome;
+  let binDir;
+
+  beforeEach(() => {
+    tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-setup-shim-home-"));
+    binDir = path.join(tmpHome, "bin");
+  });
+
+  afterEach(() => {
+    fs.rmSync(tmpHome, { recursive: true, force: true });
+  });
+
+  function run(args, extraEnv = {}) {
+    return spawnSync(process.execPath, [COMPANION_SCRIPT, ...args], {
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        HOME: tmpHome,
+        KUSABI_BIN_DIR: binDir,
+        OPENCODE_BIN: "/nonexistent-opencode-bin",
+        ...extraEnv,
+      },
+      timeout: 10_000,
+    });
+  }
+
+  it("reports missing and still exits 0, prompting install-cli", () => {
+    const result = run(["setup"]);
+    assert.equal(result.status, 0, result.stderr + result.stdout);
+    assert.match(result.stdout, /companion shim: missing/);
+    assert.match(result.stdout, /kusabi-companion install-cli/);
+    assert.match(result.stdout, /opencode CLI not found/);
+  });
+
+  it("reports ok after install-cli", () => {
+    const installed = run(["install-cli"]);
+    assert.equal(installed.status, 0, installed.stdout);
+    const result = run(["setup"]);
+    assert.equal(result.status, 0, result.stderr + result.stdout);
+    assert.match(result.stdout, /companion shim: ok \(/);
+    assert.doesNotMatch(result.stdout, /companion shim: missing/);
+    assert.doesNotMatch(result.stdout, /companion shim: stale/);
+  });
+
+  it("reports stale when the shim points at another path, without failing", () => {
+    fs.mkdirSync(binDir, { recursive: true });
+    const other = "/tmp/other-kusabi-companion.mjs";
+    fs.writeFileSync(
+      path.join(binDir, "kusabi-companion"),
+      `#!/bin/sh\nexec node ${JSON.stringify(other)} "$@"\n`,
+      { mode: 0o755 },
+    );
+    const result = run(["setup"]);
+    assert.equal(result.status, 0, result.stderr + result.stdout);
+    assert.match(result.stdout, /companion shim: stale/);
+    assert.ok(result.stdout.includes(other), result.stdout);
+    assert.match(result.stdout, /kusabi-companion install-cli/);
+  });
+
+  it("cmdSetup appends the shim diagnosis (source guard)", () => {
+    const source = fs.readFileSync(COMPANION_SCRIPT, "utf8");
+    const cmdSetupSource = source.slice(source.indexOf("async function cmdSetup("), source.indexOf("async function cmdTask("));
+    assert.ok(cmdSetupSource.includes("formatShimSetupLine"));
+    assert.ok(cmdSetupSource.includes("shimLine"));
+  });
+});
