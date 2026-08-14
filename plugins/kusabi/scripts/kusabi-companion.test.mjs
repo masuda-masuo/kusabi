@@ -5634,3 +5634,34 @@ describe("flushAndExit (kusabi #243)", () => {
     assert.equal([...cli.matchAll(/process\.exit\(/g)].length, 0);
   });
 });
+
+// Failure next-action names the companion CLI, not a slash command (kusabi #246)
+// ---------------------------------------------------------------------------
+// Cursor CLI has no `/kusabi:status`, and companion stdout is transferred
+// verbatim by whatever orchestrator ran it — so the line a failed task/review
+// renders must name the executable surface. cmdTask / cmdReview are not
+// exported; the rendered literal is pinned in their source.
+
+describe("failed task/review next-action (kusabi #246)", () => {
+  const COMPANION_SCRIPT = path.join(import.meta.dirname, "kusabi-companion.mjs");
+
+  function commandSource(startMarker, endMarker) {
+    const source = fs.readFileSync(COMPANION_SCRIPT, "utf8");
+    const start = source.indexOf(startMarker);
+    const end = source.indexOf(endMarker);
+    assert.ok(start >= 0 && end > start, `could not slice ${startMarker}`);
+    return source.slice(start, end);
+  }
+
+  it("cmdTask points at kusabi-companion status, never a slash command", () => {
+    const cmdTaskSource = commandSource("async function cmdTask(", "async function cmdReview(");
+    assert.ok(cmdTaskSource.includes("Run kusabi-companion status ${job.id} for details."));
+    assert.ok(!cmdTaskSource.includes("/kusabi:"), "no slash command in cmdTask output");
+  });
+
+  it("cmdReview points at kusabi-companion status, never a slash command", () => {
+    const cmdReviewSource = commandSource("async function cmdReview(", "function cmdStatus(");
+    assert.ok(cmdReviewSource.includes("Run kusabi-companion status ${job.id} for details."));
+    assert.ok(!cmdReviewSource.includes("/kusabi:"), "no slash command in cmdReview output");
+  });
+});

@@ -5,18 +5,18 @@ Use kusabi from inside Claude Code to delegate tasks or run adversarial code rev
 ## How it works
 
 ```
-Claude Code ——/kusabi:* slash command——> kusabi-companion.mjs —┬—HTTP——> opencode serve (127.0.0.1, on-demand)
-                                                               ├—spawn——> claude -p (headless, no server)
-                                                               └—spawn——> agy -p    (headless, no server)
-                                                               │
-                                                               ├─ SSE /event: progress tracking + automatic permission replies
-                                                               ├─ state dir: full event log, job records, stored results
-                                                               └─ stdout: rendered final result ONLY
+orchestrator ——> kusabi-companion <subcommand> —┬—HTTP——> opencode serve (127.0.0.1, on-demand)
+                                                ├—spawn——> claude -p (headless, no server)
+                                                └—spawn——> agy -p    (headless, no server)
+                                                │
+                                                ├─ SSE /event: progress tracking + automatic permission replies
+                                                ├─ state dir: full event log, job records, stored results
+                                                └─ stdout: rendered final result ONLY
 ```
 
 With `--backend claude` or `--backend agy` there is no serve process — the companion spawns the CLI per job and the same state-dir/stdout contract applies (see [Backends](#backends) for flags and v1 limits).
 
-The companion script is a context firewall: the worker's narration, tool logs, and raw events are persisted under `~/.kusabi/<dir-hash>/` and never reach Claude. Claude only sees the rendered final result (or a compact status summary).
+The companion script is a context firewall: the worker's narration, tool logs, and raw events are persisted under `~/.kusabi/<dir-hash>/` and never reach the orchestrator. The orchestrator only sees the rendered final result (or a compact status summary).
 
 Key mechanics:
 
@@ -53,7 +53,7 @@ copy with no relink step. Run
 `cursor-agent plugin marketplace add` accepts github.com URLs only, and its
 indexing of private repositories is unverified.
 
-Then run `/kusabi:setup` to verify the CLI and server come up.
+Then run `kusabi-companion setup` to verify the CLI and server come up.
 
 ## Phase agents
 
@@ -69,7 +69,7 @@ kusabi ships 7 agent definitions (`plugins/kusabi/opencode-agents/`) that are au
 | `kusabi-salvage` | salvage — recover stalled / dead jobs | read-only + structured report |
 | `kusabi-gofer` | gofer — evidence-gathering errands | sandbox_exec + read/verify tools **allow**; host write/shiori/sunaba mutation **deny** |
 
-Run `/kusabi:setup` or `kusabi-companion.mjs install-agents` to copy them to `OPENCODE_AGENT_DIR`. Legacy `oc-*` names are automatically cleaned up. The same command also copies kusabi's opencode skills (`plugins/kusabi/opencode-skills/`) to `OPENCODE_SKILL_DIR`, copy-and-overwrite only — the destination is never pruned. Both defaults follow opencode's own config dir (`$XDG_CONFIG_HOME/opencode`, else `~/.config/opencode`), which is where opencode actually scans. Note that `OPENCODE_SKILL_DIR` / `OPENCODE_AGENT_DIR` are placement overrides that opencode itself does not read (see `docs/design/phase-chain.md` §3.8).
+Run `kusabi-companion setup` or `kusabi-companion install-agents` to copy them to `OPENCODE_AGENT_DIR`. Legacy `oc-*` names are automatically cleaned up. The same command also copies kusabi's opencode skills (`plugins/kusabi/opencode-skills/`) to `OPENCODE_SKILL_DIR`, copy-and-overwrite only — the destination is never pruned. Both defaults follow opencode's own config dir (`$XDG_CONFIG_HOME/opencode`, else `~/.config/opencode`), which is where opencode actually scans. Note that `OPENCODE_SKILL_DIR` / `OPENCODE_AGENT_DIR` are placement overrides that opencode itself does not read (see `docs/design/phase-chain.md` §3.8).
 
 ## Commands
 
@@ -100,7 +100,7 @@ Everything else is a companion subcommand, invoked directly as
 | `install-agents` | Copy phase agent definitions to `OPENCODE_AGENT_DIR` and opencode skills to `OPENCODE_SKILL_DIR` |
 | `salvage <job-id>` | Recover a dead/stalled job: reads its prompt + events, launches a salvage agent to produce a structured report |
 
-The `kusabi:opencode-worker` subagent forwards delegation requests to `task` so the main Claude thread never carries the work.
+The `kusabi:opencode-worker` subagent forwards delegation requests to `task` so the main orchestrator thread never carries the work.
 
 ## Skills
 
@@ -164,7 +164,7 @@ reasoning effort set to `max`. The variant is passed as the top-level
 **Caveat:** opencode silently ignores a variant the model does not define — no
 error is returned. To detect this, inspect the `modelVariant` field stored on
 each chain round record or the `variant` field in `job.modelChain` entries via
-`/kusabi:status <job-id>` or `/kusabi:result <job-id>`.
+`kusabi-companion status <job-id>` or `kusabi-companion result <job-id>`.
 
 A trailing colon (`p/a:`) or missing `/` are fatal parse errors.
 

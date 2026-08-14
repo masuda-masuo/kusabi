@@ -1162,7 +1162,7 @@ async function cmdTask(cwd, { flags, text }) {
 
   let taskOutput;
   if (job.status !== "completed") {
-    taskOutput = `${renderHeader(job)}${job.error ?? ""}\nCheck /kusabi:status ${job.id} for details.`;
+    taskOutput = `${renderHeader(job)}${job.error ?? ""}\nRun kusabi-companion status ${job.id} for details.`;
   } else {
     taskOutput = `${renderHeader(job)}${resultText || "(empty result)"}`;
   }
@@ -1218,7 +1218,7 @@ async function cmdReview(cwd, { flags, text }) {
     watchdogS: Number(flags.watchdog ?? DEFAULT_WATCHDOG_S),
   });
   if (job.status !== "completed") {
-    return `${renderHeader(job)}${job.error ?? ""}\nCheck /kusabi:status ${job.id} for details.`;
+    return `${renderHeader(job)}${job.error ?? ""}\nRun kusabi-companion status ${job.id} for details.`;
   }
   // Strip trailing VERDICT token line before JSON parsing so the token
   // does not make extractJson fail on well-formed JSON.

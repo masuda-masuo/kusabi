@@ -46,4 +46,4 @@ Bash({
 })
 ```
 - Do not poll or wait for completion in this turn.
-- After launching, tell the user: "opencode review started in the background. Check `/kusabi:status` for progress."
+- After launching, tell the user: "opencode review started in the background. Check progress with `kusabi-companion status`."
