@@ -46,6 +46,11 @@ describe("parseArgs", () => {
     assert.equal(result.text, "");
   });
 
+  it("parses --cursor-usage-dir as a value flag", () => {
+    const result = parseArgs(["--cursor-usage-dir", "/tmp/cu"]);
+    assert.equal(result.flags["cursor-usage-dir"], "/tmp/cu");
+  });
+
   it("treats -h as a boolean flag", () => {
     const result = parseArgs(["-h"]);
     assert.equal(result.flags.h, true);

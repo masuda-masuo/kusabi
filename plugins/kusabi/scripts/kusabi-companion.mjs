@@ -42,6 +42,7 @@ import { claudeDispatch, resolveClaudeModel, validateClaudeModel, validateClaude
 import { agyDispatch, resolveAgyModel, validateAgyModel, validateAgyChain, AGY_BACKEND } from "./agy-dispatch.mjs";
 import { openMetricsDb, openMetricsDbReadOnly } from "./metrics-db.mjs";
 import { ingestTranscriptDirectory } from "./transcript-ingest.mjs";
+import { ingestCursorUsageDirectory } from "./cursor-usage-ingest.mjs";
 import { ingestChainDirectory, ingestJobDirectory } from "./chain-ingest.mjs";
 import { computeReport, renderReportText, renderReportJson, missingStoreReport, renderMissingText } from "./metrics-report.mjs";
 
@@ -3091,9 +3092,10 @@ function cmdChainStats(cwd, { flags }) {
 // ---------------------------------------------------------------------------
 
 /**
- * Ingest Claude Code transcripts, kusabi chain records, and delegated-job
- * records (#154) into a durable SQLite metrics store.  This is the ingest + store step only (issues #83 /
- * #81) -- no reporting/rendering here; that is a follow-up PR.
+ * Ingest Claude Code transcripts, Cursor usage jsonl (#237), kusabi chain
+ * records, and delegated-job records (#154) into a durable SQLite metrics
+ * store.  This is the ingest + store step only (issues #83 / #81) -- no
+ * reporting/rendering here; that is a follow-up PR.
  *
  * `--dry-run` parses everything but writes to a throwaway in-memory
  * database instead of the real one, so the target db path (and any file at
@@ -3102,6 +3104,7 @@ function cmdChainStats(cwd, { flags }) {
 function cmdMetricsIngest(cwd, { flags }) {
   const home = os.homedir();
   const transcriptDir = flags["transcript-dir"] || path.join(home, ".claude", "projects");
+  const cursorDir = flags["cursor-usage-dir"] || cursorUsageDir();
   const metricsStateRoot = flags["state-root"] || stateRoot();
   const dryRun = !!flags.dryRun;
   const dbPath = dryRun ? ":memory:" : (flags.db || path.join(metricsStateRoot, "metrics.db"));
@@ -3109,11 +3112,13 @@ function cmdMetricsIngest(cwd, { flags }) {
   const db = openMetricsDb(dbPath);
 
   let transcriptSummary;
+  let cursorSummary;
   let chainSummary;
   let jobSummary;
   db.exec("BEGIN");
   try {
     transcriptSummary = ingestTranscriptDirectory(db, transcriptDir);
+    cursorSummary = ingestCursorUsageDirectory(db, cursorDir);
     chainSummary = ingestChainDirectory(db, metricsStateRoot);
     jobSummary = ingestJobDirectory(db, metricsStateRoot);
     db.exec("COMMIT");
@@ -3128,6 +3133,9 @@ function cmdMetricsIngest(cwd, { flags }) {
   lines.push("");
   lines.push("Transcripts:");
   lines.push(`  transcript dir:            ${transcriptDir}`);
+  if (!fs.existsSync(transcriptDir)) {
+    lines.push(`warning: transcript dir not found: ${transcriptDir}`);
+  }
   lines.push(`  files scanned:             ${transcriptSummary.filesScanned}`);
   lines.push(`  files skipped (unchanged): ${transcriptSummary.filesSkippedUnchanged}`);
   lines.push(`  sessions:                  ${transcriptSummary.sessions}`);
@@ -3146,6 +3154,18 @@ function cmdMetricsIngest(cwd, { flags }) {
   lines.push(`  I/O failures (whole file unreadable): ${transcriptSummary.ioFailures}`);
   lines.push(`  parse failures (malformed JSON):       ${transcriptSummary.parseFailures}`);
   lines.push(`  records skipped (no requestId):        ${transcriptSummary.noRequestIdRecords} (overlaps with <synthetic> above, not additional data loss)`);
+  lines.push("");
+  lines.push("Cursor usage:");
+  lines.push(`  cursor-usage dir:          ${cursorDir}`);
+  if (!fs.existsSync(cursorDir)) {
+    lines.push(`warning: cursor-usage dir not found: ${cursorDir}`);
+  }
+  lines.push(`  files scanned:             ${cursorSummary.filesScanned}`);
+  lines.push(`  files skipped (unchanged): ${cursorSummary.filesSkippedUnchanged}`);
+  lines.push(`  sessions:                  ${cursorSummary.sessions}`);
+  lines.push(`  turns:                     ${cursorSummary.turns}`);
+  lines.push(`  I/O failures (whole file unreadable): ${cursorSummary.ioFailures}`);
+  lines.push(`  parse failures (malformed JSON):       ${cursorSummary.parseFailures}`);
   lines.push("");
   lines.push("Chains:");
   lines.push(`  state root:                ${metricsStateRoot}`);
@@ -3263,6 +3283,7 @@ function usage() {
     "  --until <ISO> (chain-stats: end of time range, exclusive)",
     "  --compare <ISO> (chain-stats: show before/after comparison at cutoff)",
     "  --transcript-dir <path> (metrics-ingest: default ~/.claude/projects)",
+    "  --cursor-usage-dir <path> (metrics-ingest: default ~/.kusabi/cursor-usage)",
     "  --state-root <path> (metrics-ingest: default the kusabi state root, ~/.kusabi)",
     "  --db <path> (metrics-ingest: default <state-root>/metrics.db)",
     "  --dry-run (metrics-ingest: parse and report counts, write nothing)",
