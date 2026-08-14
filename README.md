@@ -31,10 +31,27 @@ Key mechanics:
 
 ## Install
 
+### Claude Code
+
 ```bash
 /plugin marketplace add masuda-masuo/kusabi
 /plugin install kusabi@kusabi
 ```
+
+### Cursor CLI
+
+```bash
+cursor-agent --plugin-dir /path/to/kusabi/plugins/kusabi
+```
+
+Cursor loads the plugin from a working-copy checkout as-is: it reads both
+`.cursor-plugin/` and `.claude-plugin/` manifests (skills verified on
+cursor-agent 2026.08.11), and a `--plugin-dir` plugin follows the working
+copy with no relink step. Run
+`node plugins/kusabi/scripts/kusabi-companion.mjs install-cli` once so the
+`kusabi-companion` shim the command definitions invoke is on PATH.
+`cursor-agent plugin marketplace add` accepts github.com URLs only, and its
+indexing of private repositories is unverified.
 
 Then run `/kusabi:setup` to verify the CLI and server come up.
 
