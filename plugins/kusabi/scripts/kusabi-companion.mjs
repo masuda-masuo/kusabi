@@ -234,6 +234,7 @@ function resolveCursorSessionForRecord(env, opts) {
 
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
+const COMPANION_SCRIPT = fileURLToPath(import.meta.url);
 const PLUGIN_ROOT = path.resolve(HERE, "..");
 const DEFAULT_TASK_TIMEOUT_S = 3600;
 const DEFAULT_REVIEW_TIMEOUT_S = 1800;
@@ -855,12 +856,106 @@ export function resolveResumeLastSession(stateDir, { phase, backend }) {
 // subcommands
 // ---------------------------------------------------------------------------
 
+const SHIM_NAME = "kusabi-companion";
+
+function companionBinDir() {
+  return process.env.KUSABI_BIN_DIR || path.join(os.homedir(), ".local", "bin");
+}
+
+function companionShimPath(binDir = companionBinDir()) {
+  return path.join(binDir, SHIM_NAME);
+}
+
+function renderCompanionShim(targetPath = COMPANION_SCRIPT) {
+  return `#!/bin/sh\nexec node ${JSON.stringify(targetPath)} "$@"\n`;
+}
+
+function parseShimExecTarget(content) {
+  const m = String(content).match(/^\s*exec\s+node\s+"([^"]+)"\s+"\$@"\s*$/m);
+  return m ? m[1] : null;
+}
+
+function diagnoseCompanionShim({ binDir, selfPath } = {}) {
+  const dir = binDir ?? companionBinDir();
+  const shim = companionShimPath(dir);
+  const expected = selfPath ?? COMPANION_SCRIPT;
+  if (!fs.existsSync(shim)) {
+    return { state: "missing", shim, expected, target: null };
+  }
+  let content = "";
+  try {
+    content = fs.readFileSync(shim, "utf8");
+  } catch {
+    return { state: "stale", shim, expected, target: null };
+  }
+  const target = parseShimExecTarget(content);
+  if (target === expected) {
+    return { state: "ok", shim, expected, target };
+  }
+  return { state: "stale", shim, expected, target };
+}
+
+function formatShimSetupLine(diag = diagnoseCompanionShim()) {
+  if (diag.state === "ok") {
+    return `companion shim: ok (${diag.shim})`;
+  }
+  if (diag.state === "stale") {
+    const pointed = diag.target ? `points at ${diag.target}` : "does not point at this CLI";
+    return `companion shim: stale (${pointed}); run \`kusabi-companion install-cli\``;
+  }
+  return `companion shim: missing; run \`kusabi-companion install-cli\``;
+}
+
+function pathHasDir(dir) {
+  const resolved = path.resolve(dir);
+  return (process.env.PATH || "")
+    .split(path.delimiter)
+    .filter(Boolean)
+    .some((entry) => {
+      try {
+        return path.resolve(entry) === resolved;
+      } catch {
+        return false;
+      }
+    });
+}
+
+function cmdInstallCli() {
+  const binDir = companionBinDir();
+  const shim = companionShimPath(binDir);
+  const expected = renderCompanionShim();
+  fs.mkdirSync(binDir, { recursive: true });
+
+  let status;
+  if (fs.existsSync(shim)) {
+    const current = fs.readFileSync(shim, "utf8");
+    if (current === expected) {
+      status = "current";
+    } else {
+      fs.writeFileSync(shim, expected, { encoding: "utf8" });
+      fs.chmodSync(shim, 0o755);
+      status = "updated";
+    }
+  } else {
+    fs.writeFileSync(shim, expected, { encoding: "utf8", mode: 0o755 });
+    fs.chmodSync(shim, 0o755);
+    status = "created";
+  }
+
+  const lines = [`${status}: ${shim}`];
+  if (!pathHasDir(binDir)) {
+    lines.push(`warning: ${binDir} is not on PATH; add it so \`${SHIM_NAME}\` can be found`);
+  }
+  return lines.join("\n");
+}
+
 async function cmdSetup(cwd) {
+  const shimLine = formatShimSetupLine();
   let version;
   try {
     version = execFileSync(opencodeBin(), ["--version"], { encoding: "utf8" }).trim();
   } catch {
-    return `opencode CLI not found. Install it first: https://opencode.ai (or set OPENCODE_BIN).`;
+    return `opencode CLI not found. Install it first: https://opencode.ai (or set OPENCODE_BIN).\n${shimLine}`;
   }
   const server = await ensureServer(cwd);
   return [
@@ -868,6 +963,7 @@ async function cmdSetup(cwd) {
     `server: http://127.0.0.1:${server.port} (pid ${server.pid}, password-protected)`,
     `state dir: ${server.stateDir}`,
     cmdInstallAgents(),
+    shimLine,
   ].join("\n");
 }
 
@@ -3147,6 +3243,7 @@ function usage() {
     "  cancel     Cancel a running job",
     "  serve-stop Stop the background opencode server and remove its state file",
     "  install-agents  Copy phase agent definitions to OPENCODE_AGENT_DIR and skills to OPENCODE_SKILL_DIR",
+    "  install-cli  Write a kusabi-companion shim to $KUSABI_BIN_DIR (default ~/.local/bin)",
     "  salvage    Salvage a dead job (inspect progress and produce structured report)",
     "  help       Show this help message",
     "",
@@ -3278,6 +3375,8 @@ async function main() {
       return cmdChainCancel(cwd, parsed);
     case "install-agents":
       return cmdInstallAgents();
+    case "install-cli":
+      return cmdInstallCli();
     case "salvage":
       return cmdSalvage(cwd, parsed);
     case "chain":
@@ -3298,7 +3397,7 @@ async function main() {
     case "metricsReport":
       return cmdMetricsReport(cwd, parsed);
     default:
-      throw new Error(`unknown subcommand: ${subcommand ?? "(none)"}. Use setup|task|review|chain|chain-resume|chain-show|chain-stats|metrics-ingest|metrics-report|chain-cancel|status|result|cancel|serve-stop|install-agents|salvage`);
+      throw new Error(`unknown subcommand: ${subcommand ?? "(none)"}. Use setup|task|review|chain|chain-resume|chain-show|chain-stats|metrics-ingest|metrics-report|chain-cancel|status|result|cancel|serve-stop|install-agents|install-cli|salvage`);
   }
 }
 

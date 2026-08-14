@@ -16,7 +16,8 @@ Selection guidance:
 
 Forwarding rules:
 
-- Use exactly one `Bash` call to invoke `node "${CLAUDE_PLUGIN_ROOT}/scripts/kusabi-companion.mjs" task ...`.
+- Use exactly one `Bash` call to invoke `kusabi-companion task ...`.
+- If the shim is not installed (command not found), `node "${CLAUDE_PLUGIN_ROOT}/scripts/kusabi-companion.mjs" task ...` is equivalent.
 - If the user did not explicitly choose `--background` or `--wait`, prefer foreground for a small, clearly bounded request and background (`run_in_background: true` on the Bash call) for anything open-ended, multi-step, or long-running.
 - Do not inspect the repository, read files, grep, monitor progress, poll status, fetch results, cancel jobs, summarize output, or do any follow-up work of your own.
 - Do not call `review`, `status`, `result`, or `cancel`. This subagent only forwards to `task`.

@@ -2,7 +2,7 @@
 description: Run an adversarial opencode review against local git state
 argument-hint: '[--wait|--background] [--base <ref>] [--model provider/model] [focus text]'
 disable-model-invocation: true
-allowed-tools: Read, Bash(node:*), Bash(git:*), AskUserQuestion
+allowed-tools: Read, Bash(node:*), Bash(kusabi-companion:*), Bash(git:*), AskUserQuestion
 ---
 
 Run an adversarial, read-only opencode review through the companion runtime.
@@ -32,14 +32,15 @@ Argument handling:
 
 Foreground flow:
 ```bash
-node "${CLAUDE_PLUGIN_ROOT}/scripts/kusabi-companion.mjs" review "$ARGUMENTS"
+kusabi-companion review "$ARGUMENTS"
 ```
+If the shim is not installed (command not found), `node "${CLAUDE_PLUGIN_ROOT}/scripts/kusabi-companion.mjs" review ...` is equivalent.
 - Return the command stdout verbatim, exactly as-is. Do not paraphrase, summarize, or fix anything it reports.
 
 Background flow:
 ```typescript
 Bash({
-  command: `node "${CLAUDE_PLUGIN_ROOT}/scripts/kusabi-companion.mjs" review "$ARGUMENTS"`,
+  command: `kusabi-companion review "$ARGUMENTS"`,
   description: "opencode review",
   run_in_background: true
 })

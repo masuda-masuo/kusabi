@@ -2,15 +2,17 @@
 description: Check that opencode is installed and the local server can start
 argument-hint: ''
 disable-model-invocation: true
-allowed-tools: Bash(node:*)
+allowed-tools: Bash(node:*), Bash(kusabi-companion:*)
 ---
 
 Check the opencode companion setup.
 
 Run:
 ```bash
-node "${CLAUDE_PLUGIN_ROOT}/scripts/kusabi-companion.mjs" setup
+kusabi-companion setup
 ```
+
+If the shim is not installed (command not found), `node "${CLAUDE_PLUGIN_ROOT}/scripts/kusabi-companion.mjs" setup` is equivalent.
 
 Return the command stdout verbatim, exactly as-is.
 
