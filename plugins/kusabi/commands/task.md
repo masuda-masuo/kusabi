@@ -24,7 +24,7 @@ Argument handling:
 - The companion automatically prepends worker guardrails (`prompts/task-guardrails.md`: scope adherence, verification honesty, no credential hunting, no VCS exit, fixed report format) to every task prompt. The task text does not need to restate them — it should carry only task-specific content: precise scope, relevant premise/context, and acceptance criteria.
 - `--auto` auto-approves opencode permission requests (dangerous); pass it through only when the user asked for it.
 - `--deny name1,name2` disables the named opencode tools for this task via the session tools config. MCP tools do not go through opencode's permission asks, so this is the only effective way to block them (e.g. `--deny sunaba_publish` to keep the network exit with the orchestrator).
-- `--phase draft|investigate|implement|review|respond` selects a phase agent (maps to a preconfigured opencode agent with a phase-specific deny profile). Mutually exclusive with `--agent`. Cross-phase session reuse via `--resume-last`/`--session` is rejected. Run `/kusabi:setup` once so the phase agents are installed.
+- `--phase draft|investigate|implement|review|respond` selects a phase agent (maps to a preconfigured opencode agent with a phase-specific deny profile). Mutually exclusive with `--agent`. Cross-phase session reuse via `--resume-last`/`--session` is rejected. Run `kusabi-companion install-agents` (or `kusabi-companion setup`, which runs it) once so the phase agents are installed.
 
 Foreground flow:
 ```bash
@@ -42,4 +42,4 @@ Bash({
 })
 ```
 - Do not poll or wait for completion in this turn.
-- After launching, tell the user: "opencode task started in the background. Check `/kusabi:status` for progress."
+- After launching, tell the user: "opencode task started in the background. Check progress with `kusabi-companion status`."

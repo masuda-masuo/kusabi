@@ -1,6 +1,6 @@
 ---
 name: kusabi-result-handling
-description: Internal discipline for handling kusabi worker (companion) output on the Claude Code side
+description: Internal discipline for handling kusabi worker (companion) output
 user-invocable: false
 ---
 
@@ -19,13 +19,13 @@ user-invocable: false
 ## Post-processing of review results prohibited
 
 - After presenting review findings, **stop there**. Which findings to fix is determined by the user (or the orchestrator's explicit judgment), not before. Automatic application is prohibited
-- Even when a decision to fix is made, the default path is re-delegation to a worker (respond/implement phase). Direct fixing by Claude is the exception, and the reason must be stated
+- Even when a decision to fix is made, the default path is re-delegation to a worker (respond/implement phase). Direct fixing by the orchestrator is the exception, and the reason must be stated
 
 ## Prohibition of substituting for failure
 
-- If the worker's job failed or was incomplete, do not substitute it with implementation on the Claude side. Report it as a failure and stop
-- The same applies to salvage results: the job is to report the analysis result, not to have Claude implement the continuation
-- If the companion returns a setup/authentication error, guide the user to run `/kusabi:setup`. Do not improvise another authentication path
+- If the worker's job failed or was incomplete, do not substitute it with implementation on the orchestrator's side. Report it as a failure and stop
+- The same applies to salvage results: the job is to report the analysis result, not to have the orchestrator implement the continuation
+- If the companion returns a setup/authentication error, guide the user to run `kusabi-companion setup`. Do not improvise another authentication path
 
 ## Verification against reports (interface with the reviewer specification)
 
