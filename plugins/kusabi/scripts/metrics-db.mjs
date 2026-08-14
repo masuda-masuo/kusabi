@@ -182,8 +182,11 @@ CREATE INDEX IF NOT EXISTS idx_job_started_ms ON job(started_ms);
 -- Cursor statusline sink's context_window.total_output_tokens, stored
 -- separately because the session table is shared with Claude transcript rows
 -- and must not grow Cursor-only columns.  Value is the latest-ts non-null
--- reading (the CLI's reported cumulative output).  Not used to rewrite
--- turn.output — coverage is a report-only display.
+-- reading.  That field is the output currently OCCUPYING the context window,
+-- not a cumulative session counter: it decreases when compaction evicts
+-- earlier output (kusabi #253 — measured 45,976 → 36,842 inside one
+-- session).  Not used to rewrite turn.output, and never a ratio denominator
+-- — the report prints it beside the sampled sum.
 CREATE TABLE IF NOT EXISTS cursor_session_counter (
   session_id TEXT PRIMARY KEY,
   total_output_tokens INTEGER,
@@ -605,7 +608,9 @@ function tsMsOf(ts) {
 }
 
 /**
- * Store the CLI-reported cumulative output for a Cursor session.  The
+ * Store the CLI-reported window output occupancy for a Cursor session (the
+ * latest `context_window.total_output_tokens`, which is not cumulative and
+ * may decrease -- see the table comment above).  The
  * incoming row wins only when it is at least as new as the stored one
  * (equal ts replaces, for idempotent re-ingest of the same snapshot).
  * Monotonicity of the token value is not assumed — newest ts is the rule.
@@ -635,6 +640,34 @@ export function upsertCursorSessionCounter(db, row) {
     totalOutputTokens: row.totalOutputTokens ?? null,
     ts: row.ts ?? null,
   });
+}
+
+/**
+ * Delete every cursor-sourced turn row of one session.
+ *
+ * Needed because `INSERT OR REPLACE` can only overwrite request_ids the new
+ * parse still produces.  When cursor-usage-ingest re-reads a file with a
+ * changed turn-emission rule (kusabi #252 collapses runs of repeated
+ * `current_usage` snapshots into one turn), the pre-change rows sit at line
+ * numbers the new parse no longer emits, and a finished session's jsonl
+ * never changes again -- so without an explicit delete they would live in
+ * the store forever.  The caller deletes, then re-inserts the whole file's
+ * turns, which is what makes a re-ingest converge instead of accumulating.
+ *
+ * Matches on the `session_id` column plus a `'cursor:%'` request_id prefix
+ * rather than a LIKE over the session id itself, so a session id containing
+ * `%` or `_` cannot widen the delete.  Claude transcript turns of the same
+ * session id (there are none in practice) are untouched by the prefix.
+ *
+ * @param {import("node:sqlite").DatabaseSync} db
+ * @param {string} sessionId
+ * @returns {number} rows deleted
+ */
+export function deleteCursorTurnsForSession(db, sessionId) {
+  const result = db.prepare(
+    "DELETE FROM turn WHERE session_id = $sessionId AND request_id LIKE 'cursor:%'",
+  ).run({ sessionId });
+  return Number(result.changes ?? 0);
 }
 
 export function countRows(db, table) {

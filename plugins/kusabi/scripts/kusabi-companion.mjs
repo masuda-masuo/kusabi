@@ -3164,6 +3164,8 @@ function cmdMetricsIngest(cwd, { flags }) {
   lines.push(`  files skipped (unchanged): ${cursorSummary.filesSkippedUnchanged}`);
   lines.push(`  sessions:                  ${cursorSummary.sessions}`);
   lines.push(`  turns:                     ${cursorSummary.turns}`);
+  lines.push(`  usage lines collapsed as repeated snapshots: ${cursorSummary.collapsedRepeats}`);
+  lines.push(`  stale turn rows deleted before re-insert:    ${cursorSummary.staleTurnsRemoved}`);
   lines.push(`  I/O failures (whole file unreadable): ${cursorSummary.ioFailures}`);
   lines.push(`  parse failures (malformed JSON):       ${cursorSummary.parseFailures}`);
   lines.push("");
