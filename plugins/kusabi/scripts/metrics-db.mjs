@@ -178,6 +178,17 @@ CREATE TABLE IF NOT EXISTS job (
   usage_cost REAL
 );
 CREATE INDEX IF NOT EXISTS idx_job_started_ms ON job(started_ms);
+
+-- Cursor statusline sink's context_window.total_output_tokens, stored
+-- separately because the session table is shared with Claude transcript rows
+-- and must not grow Cursor-only columns.  Value is the latest-ts non-null
+-- reading (the CLI's reported cumulative output).  Not used to rewrite
+-- turn.output — coverage is a report-only display.
+CREATE TABLE IF NOT EXISTS cursor_session_counter (
+  session_id TEXT PRIMARY KEY,
+  total_output_tokens INTEGER,
+  ts TEXT
+);
 `;
 
 /**
@@ -568,6 +579,61 @@ export function upsertJob(db, row) {
     usageCacheRead: row.usageCacheRead ?? null,
     usageCacheWrite: row.usageCacheWrite ?? null,
     usageCost: row.usageCost === undefined ? null : row.usageCost,
+  });
+}
+
+// ---------------------------------------------------------------------------
+// cursor_session_counter — latest-ts CLI cumulative output (display only)
+// ---------------------------------------------------------------------------
+
+/**
+ * @param {import("node:sqlite").DatabaseSync} db
+ * @param {string} sessionId
+ * @returns {{ session_id: string, total_output_tokens: number|null, ts: string|null } | undefined}
+ */
+export function getCursorSessionCounter(db, sessionId) {
+  return db.prepare(`
+    SELECT session_id, total_output_tokens, ts
+    FROM cursor_session_counter WHERE session_id = $sessionId
+  `).get({ sessionId });
+}
+
+function tsMsOf(ts) {
+  if (typeof ts !== "string" || !ts) return null;
+  const ms = Date.parse(ts);
+  return Number.isNaN(ms) ? null : ms;
+}
+
+/**
+ * Store the CLI-reported cumulative output for a Cursor session.  The
+ * incoming row wins only when it is at least as new as the stored one
+ * (equal ts replaces, for idempotent re-ingest of the same snapshot).
+ * Monotonicity of the token value is not assumed — newest ts is the rule.
+ * An incoming row with no parseable ts never overwrites a stored row that
+ * has one.
+ *
+ * @param {import("node:sqlite").DatabaseSync} db
+ * @param {{ sessionId: string, totalOutputTokens: number|null, ts: string|null }} row
+ */
+export function upsertCursorSessionCounter(db, row) {
+  const existing = getCursorSessionCounter(db, row.sessionId);
+  if (existing) {
+    const existingMs = tsMsOf(existing.ts);
+    const incomingMs = tsMsOf(row.ts);
+    if (existingMs !== null && incomingMs !== null && existingMs > incomingMs) {
+      return;
+    }
+    if (existingMs !== null && incomingMs === null) {
+      return;
+    }
+  }
+  db.prepare(`
+    INSERT OR REPLACE INTO cursor_session_counter (session_id, total_output_tokens, ts)
+    VALUES ($sessionId, $totalOutputTokens, $ts)
+  `).run({
+    sessionId: row.sessionId,
+    totalOutputTokens: row.totalOutputTokens ?? null,
+    ts: row.ts ?? null,
   });
 }
 

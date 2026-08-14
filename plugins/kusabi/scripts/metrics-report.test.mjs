@@ -17,6 +17,7 @@ import {
   upsertChain,
   upsertRound,
   upsertJob,
+  upsertCursorSessionCounter,
 } from "./metrics-db.mjs";
 
 import {
@@ -1213,5 +1214,144 @@ describe("per-phase backend attribution (kusabi #195)", () => {
     assert.deepEqual(report.byBackend.chains.map((c) => c.backend).sort(), ["mixed", "opencode"]);
     assert.doesNotThrow(() => renderReportText(report));
     assert.doesNotThrow(() => renderReportJson(report));
+  });
+});
+
+describe("freshness label", () => {
+  it("renders 'newest ingested turn' (MAX(turn.ts) includes cursor samples)", () => {
+    const db = openMetricsDb(":memory:");
+    const text = renderReportText(computeReport(db, { dbPath: ":memory:" }));
+    assert.match(text, /newest ingested turn:/);
+    assert.doesNotMatch(text, /newest transcript turn:/);
+  });
+});
+
+describe("Cursor sampling coverage", () => {
+  it("omits the section (and the JSON key) when the counter table is empty", () => {
+    const db = buildFixture();
+    const report = computeReport(db, { dbPath: ":memory:" });
+    assert.equal(report.cursorSamplingCoverage, undefined);
+    const text = renderReportText(report);
+    assert.doesNotMatch(text, /Cursor sampling coverage/);
+    const parsed = JSON.parse(renderReportJson(report));
+    assert.equal("cursorSamplingCoverage" in parsed, false);
+  });
+
+  it("omits the section on a store whose counter table does not exist", () => {
+    const db = buildFixture();
+    db.exec("DROP TABLE cursor_session_counter");
+    const report = computeReport(db, { dbPath: ":memory:" });
+    assert.equal(report.cursorSamplingCoverage, undefined);
+    assert.doesNotMatch(renderReportText(report), /Cursor sampling coverage/);
+  });
+
+  it("shows sampled/reported/coverage for an undercounting sampler (50/80 = 62.5%)", () => {
+    const db = openMetricsDb(":memory:");
+    const sessionId = "d73008ab-1111-2222-3333-444444444444";
+    upsertSession(db, {
+      sessionId,
+      firstTs: "2026-08-14T10:00:10.000Z",
+      firstTsMs: Date.parse("2026-08-14T10:00:10.000Z"),
+    });
+    upsertTurn(db, {
+      requestId: `cursor:${sessionId}#1`,
+      sessionId,
+      ts: "2026-08-14T10:00:10.000Z",
+      tsMs: Date.parse("2026-08-14T10:00:10.000Z"),
+      output: 20,
+      isSidechain: 0,
+      isSynthetic: 0,
+    });
+    upsertTurn(db, {
+      requestId: `cursor:${sessionId}#2`,
+      sessionId,
+      ts: "2026-08-14T10:00:20.000Z",
+      tsMs: Date.parse("2026-08-14T10:00:20.000Z"),
+      output: 30,
+      isSidechain: 0,
+      isSynthetic: 0,
+    });
+    upsertCursorSessionCounter(db, {
+      sessionId,
+      totalOutputTokens: 80,
+      ts: "2026-08-14T10:00:20.000Z",
+    });
+
+    const report = computeReport(db, { dbPath: ":memory:" });
+    assert.ok(report.cursorSamplingCoverage);
+    assert.equal(report.cursorSamplingCoverage.sampledOutput, 50);
+    assert.equal(report.cursorSamplingCoverage.reportedOutput, 80);
+    assert.equal(report.cursorSamplingCoverage.coveragePct, 62.5);
+    assert.equal(report.cursorSamplingCoverage.anomaly, false);
+    assert.equal(report.cursorSamplingCoverage.sessions.length, 1);
+    assert.equal(report.cursorSamplingCoverage.sessions[0].sessionIdShort, "d73008ab...");
+
+    const text = renderReportText(report);
+    assert.match(text, /Cursor sampling coverage:/);
+    assert.match(text, /sampled output 50  reported cumulative 80  coverage 62\.5%/);
+    assert.match(text, /d73008ab\.\.\.  sampled 50  reported 80  62\.5%/);
+    assert.doesNotMatch(text, /!/);
+  });
+
+  it("marks a row with ! when reported cumulative is smaller than sampled", () => {
+    const db = openMetricsDb(":memory:");
+    const sessionId = "sess-anomaly-1";
+    upsertSession(db, {
+      sessionId,
+      firstTs: "2026-08-14T10:00:00.000Z",
+      firstTsMs: Date.parse("2026-08-14T10:00:00.000Z"),
+    });
+    upsertTurn(db, {
+      requestId: `cursor:${sessionId}#1`,
+      sessionId,
+      ts: "2026-08-14T10:00:00.000Z",
+      tsMs: Date.parse("2026-08-14T10:00:00.000Z"),
+      output: 90,
+      isSidechain: 0,
+      isSynthetic: 0,
+    });
+    upsertCursorSessionCounter(db, {
+      sessionId,
+      totalOutputTokens: 80,
+      ts: "2026-08-14T10:00:00.000Z",
+    });
+
+    const report = computeReport(db, { dbPath: ":memory:" });
+    assert.equal(report.cursorSamplingCoverage.anomaly, true);
+    assert.equal(report.cursorSamplingCoverage.sessions[0].anomaly, true);
+    const text = renderReportText(report);
+    assert.match(text, /coverage 112\.5% !/);
+    assert.match(text, /sess-ano\.\.\.  sampled 90  reported 80  112\.5% !/);
+  });
+
+  it("does not count non-cursor turns in sampled output", () => {
+    const db = openMetricsDb(":memory:");
+    const sessionId = "cursor-sess";
+    upsertTurn(db, {
+      requestId: "claude-req-1",
+      sessionId: "claude-sess",
+      ts: "2026-08-14T10:00:00.000Z",
+      tsMs: Date.parse("2026-08-14T10:00:00.000Z"),
+      output: 1000,
+      isSidechain: 0,
+      isSynthetic: 0,
+    });
+    upsertTurn(db, {
+      requestId: `cursor:${sessionId}#1`,
+      sessionId,
+      ts: "2026-08-14T10:00:00.000Z",
+      tsMs: Date.parse("2026-08-14T10:00:00.000Z"),
+      output: 10,
+      isSidechain: 0,
+      isSynthetic: 0,
+    });
+    upsertCursorSessionCounter(db, {
+      sessionId,
+      totalOutputTokens: 40,
+      ts: "2026-08-14T10:00:00.000Z",
+    });
+    const report = computeReport(db, { dbPath: ":memory:" });
+    assert.equal(report.cursorSamplingCoverage.sampledOutput, 10);
+    assert.equal(report.cursorSamplingCoverage.reportedOutput, 40);
   });
 });

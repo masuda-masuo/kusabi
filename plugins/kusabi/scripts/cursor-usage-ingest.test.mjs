@@ -14,7 +14,7 @@ import {
   ingestCursorUsageDirectory,
   projectSlugFromCwd,
 } from "./cursor-usage-ingest.mjs";
-import { openMetricsDb, countRows } from "./metrics-db.mjs";
+import { openMetricsDb, countRows, getCursorSessionCounter } from "./metrics-db.mjs";
 
 const SESSION_ID = "d73008ab-1111-2222-3333-444444444444";
 const CWD = "/home/user/proj";
@@ -26,6 +26,7 @@ function usageRecord({
   modelId = "default",
   currentUsage,
   contextWindow,
+  totalOutputTokens,
 } = {}) {
   const rec = {
     ts,
@@ -36,7 +37,9 @@ function usageRecord({
   if (contextWindow === undefined) {
     rec.context_window = {
       total_input_tokens: currentUsage ? 100 : null,
-      total_output_tokens: currentUsage ? 10 : null,
+      total_output_tokens: totalOutputTokens !== undefined
+        ? totalOutputTokens
+        : (currentUsage ? 10 : null),
       context_window_size: 256000,
       current_usage: currentUsage ?? null,
     };
@@ -330,6 +333,119 @@ describe("ingestCursorUsageDirectory", () => {
     const result = ingestCursorUsageDirectory(db, dir);
     assert.equal(result.filesScanned, 0);
     assert.equal(result.turns, 0);
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+});
+
+function buildUndercountLines() {
+  return [
+    JSON.stringify(usageRecord({
+      ts: "2026-08-14T10:00:10.000Z",
+      currentUsage: tokens({ input: 100, output: 20, cacheRead: 0, cacheWrite: 0 }),
+      totalOutputTokens: 30,
+    })),
+    JSON.stringify(usageRecord({
+      ts: "2026-08-14T10:00:20.000Z",
+      currentUsage: tokens({ input: 200, output: 30, cacheRead: 0, cacheWrite: 0 }),
+      totalOutputTokens: 80,
+    })),
+  ].join("\n") + "\n";
+}
+
+describe("parseCursorUsageContent — cursor_session_counter tracking", () => {
+  it("keeps the latest-ts numeric total_output_tokens per session", () => {
+    const result = parseCursorUsageContent(buildUndercountLines());
+    assert.equal(result.counters.length, 1);
+    assert.equal(result.counters[0].sessionId, SESSION_ID);
+    assert.equal(result.counters[0].totalOutputTokens, 80);
+    assert.equal(result.counters[0].ts, "2026-08-14T10:00:20.000Z");
+    assert.equal(result.turns.reduce((s, t) => s + t.output, 0), 50);
+  });
+
+  it("ignores non-numeric total_output_tokens and still emits the turn", () => {
+    const rec = usageRecord({
+      ts: "2026-08-14T10:00:10.000Z",
+      currentUsage: tokens({ input: 1, output: 2, cacheRead: 0, cacheWrite: 0 }),
+    });
+    rec.context_window.total_output_tokens = "80";
+    const result = parseCursorUsageContent(JSON.stringify(rec));
+    assert.equal(result.turns.length, 1);
+    assert.equal(result.counters.length, 0);
+  });
+
+  it("tracks a numeric total on a null-usage row (no turn)", () => {
+    const rec = usageRecord({
+      ts: "2026-08-14T10:00:00.000Z",
+      currentUsage: null,
+      totalOutputTokens: 12,
+    });
+    const result = parseCursorUsageContent(JSON.stringify(rec));
+    assert.equal(result.turns.length, 0);
+    assert.equal(result.counters.length, 1);
+    assert.equal(result.counters[0].totalOutputTokens, 12);
+  });
+
+  it("prefers a later ts even when the token value is smaller (no monotonicity)", () => {
+    const content = [
+      JSON.stringify(usageRecord({
+        ts: "2026-08-14T10:00:10.000Z",
+        currentUsage: tokens({ input: 1, output: 1, cacheRead: 0, cacheWrite: 0 }),
+        totalOutputTokens: 80,
+      })),
+      JSON.stringify(usageRecord({
+        ts: "2026-08-14T10:00:20.000Z",
+        currentUsage: tokens({ input: 1, output: 1, cacheRead: 0, cacheWrite: 0 }),
+        totalOutputTokens: 40,
+      })),
+    ].join("\n");
+    const result = parseCursorUsageContent(content);
+    assert.equal(result.counters[0].totalOutputTokens, 40);
+    assert.equal(result.counters[0].ts, "2026-08-14T10:00:20.000Z");
+  });
+});
+
+describe("ingestCursorUsageDirectory — cursor_session_counter", () => {
+  it("upserts the latest-ts counter and stays idempotent after skip-cache is cleared", () => {
+    const dir = makeTempUsageDir();
+    fs.writeFileSync(path.join(dir, `${SESSION_ID}.jsonl`), buildUndercountLines(), "utf8");
+    const db = openMetricsDb(":memory:");
+    ingestCursorUsageDirectory(db, dir);
+    assert.equal(countRows(db, "cursor_session_counter"), 1);
+    assert.equal(getCursorSessionCounter(db, SESSION_ID).total_output_tokens, 80);
+    assert.equal(getCursorSessionCounter(db, SESSION_ID).ts, "2026-08-14T10:00:20.000Z");
+    const turnSum = db.prepare("SELECT SUM(output) AS s FROM turn").get().s;
+    assert.equal(turnSum, 50);
+
+    const skipped = ingestCursorUsageDirectory(db, dir);
+    assert.equal(skipped.filesSkippedUnchanged, 1);
+    assert.equal(getCursorSessionCounter(db, SESSION_ID).total_output_tokens, 80);
+
+    db.exec("DELETE FROM source_file");
+    ingestCursorUsageDirectory(db, dir);
+    assert.equal(countRows(db, "cursor_session_counter"), 1);
+    assert.equal(getCursorSessionCounter(db, SESSION_ID).total_output_tokens, 80);
+    assert.equal(countRows(db, "turn"), 2);
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("across files, keeps the newest-ts reading even if that file is seen second", () => {
+    const dir = makeTempUsageDir();
+    const older = JSON.stringify(usageRecord({
+      ts: "2026-08-14T10:00:10.000Z",
+      currentUsage: tokens({ input: 1, output: 1, cacheRead: 0, cacheWrite: 0 }),
+      totalOutputTokens: 999,
+    })) + "\n";
+    const newer = JSON.stringify(usageRecord({
+      ts: "2026-08-14T10:00:20.000Z",
+      currentUsage: tokens({ input: 1, output: 1, cacheRead: 0, cacheWrite: 0 }),
+      totalOutputTokens: 80,
+    })) + "\n";
+    fs.writeFileSync(path.join(dir, "a.jsonl"), newer, "utf8");
+    fs.writeFileSync(path.join(dir, "b.jsonl"), older, "utf8");
+    const db = openMetricsDb(":memory:");
+    ingestCursorUsageDirectory(db, dir);
+    assert.equal(getCursorSessionCounter(db, SESSION_ID).total_output_tokens, 80);
+    assert.equal(getCursorSessionCounter(db, SESSION_ID).ts, "2026-08-14T10:00:20.000Z");
     fs.rmSync(dir, { recursive: true, force: true });
   });
 });
