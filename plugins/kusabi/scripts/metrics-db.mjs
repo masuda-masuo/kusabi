@@ -1,11 +1,11 @@
 // metrics-db.mjs — schema definition, DB open/migrate, and row upsert helpers.
 //
 // Owns all SQL for the metrics store.  Nothing else in this feature opens a
-// database handle or writes SQL: transcript-ingest.mjs and chain-ingest.mjs
-// receive an already-open `db` and only ever call the upsert* functions
-// exported here.  That split is what makes the ingest modules testable
-// against an in-memory database (openMetricsDb(":memory:")) with no real
-// files or state directory involved.
+// database handle or writes SQL: transcript-ingest.mjs, cursor-usage-ingest.mjs
+// and chain-ingest.mjs receive an already-open `db` and only ever call the
+// upsert* functions exported here.  That split is what makes the ingest
+// modules testable against an in-memory database (openMetricsDb(":memory:"))
+// with no real files or state directory involved.
 //
 // Correctness (idempotency) comes from the PRIMARY KEY + `INSERT OR REPLACE`
 // on every table below, not from the `source_file` skip-cache.  Re-running

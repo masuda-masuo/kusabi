@@ -840,14 +840,17 @@ describe("metrics-ingest / metrics-report — delegated jobs (#154)", () => {
   let tmpDir;
   let stateRoot;
   let transcriptDir;
+  let cursorUsageDir;
   let dbPath;
 
   beforeEach(() => {
     tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-test-metrics-jobs-"));
     stateRoot = path.join(tmpDir, "state");
     transcriptDir = path.join(tmpDir, "transcripts");
+    cursorUsageDir = path.join(tmpDir, "cursor-usage");
     dbPath = path.join(tmpDir, "metrics.db");
     fs.mkdirSync(transcriptDir, { recursive: true });
+    fs.mkdirSync(cursorUsageDir, { recursive: true });
 
     const jobsDir = path.join(stateRoot, "ws-hash-1", "jobs");
     const completeDir = path.join(jobsDir, "job-complete01");
@@ -897,6 +900,7 @@ describe("metrics-ingest / metrics-report — delegated jobs (#154)", () => {
       "metrics-ingest",
       "--state-root", stateRoot,
       "--transcript-dir", transcriptDir,
+      "--cursor-usage-dir", cursorUsageDir,
       "--db", dbPath,
     ]);
     assert.equal(ingest.status, 0, `ingest failed: ${ingest.stdout} ${ingest.stderr}`);
@@ -924,11 +928,11 @@ describe("metrics-ingest / metrics-report — delegated jobs (#154)", () => {
 
   it("re-running metrics-ingest skips both jobs as unchanged (idempotent and cheap)", () => {
     const first = runCompanion([
-      "metrics-ingest", "--state-root", stateRoot, "--transcript-dir", transcriptDir, "--db", dbPath,
+      "metrics-ingest", "--state-root", stateRoot, "--transcript-dir", transcriptDir, "--cursor-usage-dir", cursorUsageDir, "--db", dbPath,
     ]);
     assert.equal(first.status, 0);
     const second = runCompanion([
-      "metrics-ingest", "--state-root", stateRoot, "--transcript-dir", transcriptDir, "--db", dbPath,
+      "metrics-ingest", "--state-root", stateRoot, "--transcript-dir", transcriptDir, "--cursor-usage-dir", cursorUsageDir, "--db", dbPath,
     ]);
     assert.equal(second.status, 0);
     assert.match(second.stdout, /jobs skipped \(unchanged\):\s+2/);
@@ -939,12 +943,132 @@ describe("metrics-ingest / metrics-report — delegated jobs (#154)", () => {
     const emptyRoot = path.join(tmpDir, "empty-state");
     fs.mkdirSync(emptyRoot, { recursive: true });
     const result = runCompanion([
-      "metrics-ingest", "--state-root", emptyRoot, "--transcript-dir", transcriptDir, "--dry-run",
+      "metrics-ingest", "--state-root", emptyRoot, "--transcript-dir", transcriptDir, "--cursor-usage-dir", cursorUsageDir, "--dry-run",
     ]);
     assert.equal(result.status, 0, `dry-run failed: ${result.stdout} ${result.stderr}`);
     assert.match(result.stdout, /Jobs \(delegated single-shot task\/review jobs\):/);
     assert.match(result.stdout, /jobs scanned:\s+0/);
     assert.match(result.stdout, /jobs ingested:\s+0/);
+  });
+});
+
+// metrics-ingest — cursor-usage jsonl + missing-dir warnings (#237)
+// ---------------------------------------------------------------------------
+
+describe("metrics-ingest — cursor-usage and missing-dir warnings (#237)", () => {
+  const COMPANION_SCRIPT = path.join(import.meta.dirname, "kusabi-companion.mjs");
+  let tmpDir;
+
+  beforeEach(() => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-test-metrics-cursor-"));
+  });
+
+  afterEach(() => {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  function runCompanion(args) {
+    return spawnSync(process.execPath, [COMPANION_SCRIPT, ...args], {
+      encoding: "utf8",
+      timeout: 30_000,
+    });
+  }
+
+  it("--help lists --cursor-usage-dir", () => {
+    const result = runCompanion(["--help"]);
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stdout, /--cursor-usage-dir <path> \(metrics-ingest: default ~\/\.kusabi\/cursor-usage\)/);
+  });
+
+  it("warns when transcript-dir and cursor-usage-dir do not exist, and reports cursor files/sessions/turns", () => {
+    const missingTranscript = path.join(tmpDir, "no-claude");
+    const cursorDir = path.join(tmpDir, "cu237");
+    const emptyState = path.join(tmpDir, "state");
+    const dbPath = path.join(tmpDir, "m237.db");
+    fs.mkdirSync(cursorDir, { recursive: true });
+    fs.mkdirSync(emptyState, { recursive: true });
+
+    const sessionId = "d73008ab-1111-2222-3333-444444444444";
+    const rec = (ts, usage) => JSON.stringify({
+      ts,
+      session_id: sessionId,
+      model: { id: "default", display_name: "Auto" },
+      cwd: "/workspace",
+      context_window: usage === null
+        ? { current_usage: null }
+        : { current_usage: {
+          input_tokens: usage.input,
+          output_tokens: usage.output,
+          cache_read_input_tokens: usage.cacheRead,
+          cache_creation_input_tokens: usage.cacheWrite,
+        } },
+    });
+    fs.writeFileSync(path.join(cursorDir, `${sessionId}.jsonl`), [
+      rec("2026-08-14T10:00:00.000Z", null),
+      rec("2026-08-14T10:00:05.000Z", null),
+      rec("2026-08-14T10:00:10.000Z", { input: 10, output: 2, cacheRead: 3, cacheWrite: 4 }),
+      rec("2026-08-14T10:00:20.000Z", { input: 11, output: 5, cacheRead: 6, cacheWrite: 7 }),
+    ].join("\n") + "\n", "utf8");
+
+    const ingest = runCompanion([
+      "metrics-ingest",
+      "--state-root", emptyState,
+      "--transcript-dir", missingTranscript,
+      "--cursor-usage-dir", cursorDir,
+      "--db", dbPath,
+    ]);
+    assert.equal(ingest.status, 0, `ingest failed: ${ingest.stdout} ${ingest.stderr}`);
+    assert.match(ingest.stdout, new RegExp(`warning: transcript dir not found: ${missingTranscript.replace(/\\/g, "\\\\")}`));
+    assert.doesNotMatch(ingest.stdout, /warning: cursor-usage dir not found/);
+    assert.match(ingest.stdout, /Cursor usage:/);
+    assert.match(ingest.stdout, /files scanned:\s+1/);
+    assert.match(ingest.stdout, /sessions:\s+1/);
+    assert.match(ingest.stdout, /turns:\s+2/);
+
+    const second = runCompanion([
+      "metrics-ingest",
+      "--state-root", emptyState,
+      "--transcript-dir", missingTranscript,
+      "--cursor-usage-dir", cursorDir,
+      "--db", dbPath,
+    ]);
+    assert.equal(second.status, 0, second.stderr);
+    assert.match(second.stdout, /files skipped \(unchanged\):\s+1/);
+    assert.match(second.stdout, /turns:\s+0/);
+  });
+
+  it("warns when cursor-usage-dir is missing and does not warn when the dir exists but is empty", () => {
+    const transcriptDir = path.join(tmpDir, "transcripts");
+    const missingCursor = path.join(tmpDir, "no-cursor");
+    const emptyCursor = path.join(tmpDir, "empty-cursor");
+    const emptyState = path.join(tmpDir, "state");
+    fs.mkdirSync(transcriptDir, { recursive: true });
+    fs.mkdirSync(emptyCursor, { recursive: true });
+    fs.mkdirSync(emptyState, { recursive: true });
+
+    const missing = runCompanion([
+      "metrics-ingest",
+      "--state-root", emptyState,
+      "--transcript-dir", transcriptDir,
+      "--cursor-usage-dir", missingCursor,
+      "--dry-run",
+    ]);
+    assert.equal(missing.status, 0, missing.stderr);
+    assert.match(missing.stdout, new RegExp(`warning: cursor-usage dir not found: ${missingCursor.replace(/\\/g, "\\\\")}`));
+    assert.doesNotMatch(missing.stdout, /warning: transcript dir not found/);
+
+    const empty = runCompanion([
+      "metrics-ingest",
+      "--state-root", emptyState,
+      "--transcript-dir", transcriptDir,
+      "--cursor-usage-dir", emptyCursor,
+      "--dry-run",
+    ]);
+    assert.equal(empty.status, 0, empty.stderr);
+    assert.doesNotMatch(empty.stdout, /warning: transcript dir not found/);
+    assert.doesNotMatch(empty.stdout, /warning: cursor-usage dir not found/);
+    assert.match(empty.stdout, /Cursor usage:/);
+    assert.match(empty.stdout, /files scanned:\s+0/);
   });
 });
 
