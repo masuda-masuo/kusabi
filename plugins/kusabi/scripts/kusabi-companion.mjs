@@ -10,6 +10,7 @@
 import { parseArgs, parseModel, resolveModel, reviewDenyTools, WRITE_TOOL_NAMES, validateChainEntries, splitRouteBackend, resolveChainBackend, stripBackendPrefixChain, resolveModelBackend, chainNamesBackend, backendSupportsResume } from "./cli.mjs";
 import { renderReview, renderChainShow, renderJobLine, renderHeader, extractJson, renderFollowupDraft } from "./render.mjs";
 import { hasSectionHeading, parseDeliverables, parseSmoke, parseOrchestratorSignature, briefRequestsPublish } from "./brief-parsing.mjs";
+import { cursorUsageDir, resolveLatestCursorSession } from "./cursor-statusline-sink.mjs";
 import { deriveDisposition } from "./disposition.mjs";
 import { parseReviewJsonl } from "./review-jsonl.mjs";
 import fs from "node:fs";
@@ -136,13 +137,17 @@ export const ORCH_SESSION_ENV = "CLAUDE_CODE_SESSION_ID";
 /**
  * The orchestrator record to persist on a job / chain: the signature line
  * parsed out of the brief, with `session` taken from the environment
- * whenever the environment has one (kusabi #227).
+ * whenever the environment has one (kusabi #227), then from a Cursor
+ * statusline usage file whose last line matches the current cwd (kusabi
+ * #237), and only then from the hand-typed signature session.
  *
  * Why the env wins: metrics-report joins `chain.orch_session` as a PREFIX of
  * transcript session ids (kusabi #135).  A hand-typed label ("wsl-claude",
  * "cc-20260811-215", "(current)") can never join, which is what left 27 of
- * 122 chains orphaned.  The signature line stays the source of model/date,
- * and the fallback for session when the variable is absent.
+ * 122 chains orphaned.  Cursor CLI does not set CLAUDE_CODE_SESSION_ID; the
+ * statusline sink writes `$HOME/.kusabi/cursor-usage/<session_id>.jsonl`
+ * instead, and that is the next-best join key.  The signature line stays the
+ * source of model/date, and the last fallback for session.
  *
  * Resolution happens HERE, at record-write time, not inside
  * parseOrchestratorSignature — that stays a pure text parser.  Same shape as
@@ -151,33 +156,82 @@ export const ORCH_SESSION_ENV = "CLAUDE_CODE_SESSION_ID";
  * `date` exactly as before.
  *
  * `sessionSource: "env"` marks a session that came from the environment, so
- * a reader can tell the two provenances apart.  It is written ONLY on that
- * branch: its absence means signature (or no session at all), which is
- * exactly what every record written before this change means.  That keeps
- * the no-env path byte-identical to today, including for the chains already
- * ingested.
+ * a reader can tell the provenances apart.  `sessionSource: "cursor-statusline"`
+ * marks the Cursor usage-dir branch.  Neither marker is written on the
+ * signature path: its absence means signature (or no session at all), which
+ * is exactly what every record written before #227 means.  Env set, or env
+ * unset with no eligible cursor session, stays byte-identical to today.
+ *
+ * Cursor lookup is cwd-exact and freshness-bounded (see
+ * CURSOR_SESSION_MAX_AGE_MS).  dir / cwd / now / home / maxAgeMs are
+ * injectable so tests never touch the real HOME; when a fake `env` object is
+ * passed without KUSABI_CURSOR_USAGE_DIR and without opts.dir/home, the
+ * cursor branch is skipped (existing two-arg tests stay hermetic).
  *
  * @param {string|null|undefined} briefText
  * @param {Record<string, string|undefined>} [env]  Defaults to process.env.
+ * @param {{dir?: string, cwd?: string, now?: number|Date|string,
+ *          home?: string, maxAgeMs?: number}} [opts]
  * @returns {{model: string|null, session: string|null, date: string|null,
- *            sessionSource?: "env"} | null}
+ *            sessionSource?: "env"|"cursor-statusline"} | null}
  */
-export function resolveOrchestratorRecord(briefText, env = process.env) {
+export function resolveOrchestratorRecord(briefText, env = process.env, opts = {}) {
   const signature = parseOrchestratorSignature(briefText);
   const raw = env ? env[ORCH_SESSION_ENV] : undefined;
   const envSession = typeof raw === "string" ? raw.trim() : "";
-  // No usable env session: today's behaviour, byte for byte — the signature
-  // record, or null when the brief carries no signature line at all.
-  if (envSession === "") return signature;
-  // Env wins over the hand-typed field.  With no signature line there is
-  // still an identity worth persisting: session only, model/date null.
-  return {
-    model: signature?.model ?? null,
-    session: envSession,
-    date: signature?.date ?? null,
-    sessionSource: "env",
-  };
+  if (envSession !== "") {
+    return {
+      model: signature?.model ?? null,
+      session: envSession,
+      date: signature?.date ?? null,
+      sessionSource: "env",
+    };
+  }
+
+  const cursorSession = resolveCursorSessionForRecord(env, opts);
+  if (cursorSession) {
+    return {
+      model: signature?.model ?? null,
+      session: cursorSession,
+      date: signature?.date ?? null,
+      sessionSource: "cursor-statusline",
+    };
+  }
+
+  // No usable env session and no eligible cursor session: today's behaviour,
+  // byte for byte — the signature record, or null when the brief carries no
+  // signature line at all.
+  return signature;
 }
+
+function resolveCursorUsageDirForRecord(env, opts) {
+  if (typeof opts.dir === "string" && opts.dir.length > 0) return opts.dir;
+  if (env && typeof env.KUSABI_CURSOR_USAGE_DIR === "string" && env.KUSABI_CURSOR_USAGE_DIR.trim()) {
+    return env.KUSABI_CURSOR_USAGE_DIR.trim();
+  }
+  if (typeof opts.home === "string" && opts.home.length > 0) {
+    return cursorUsageDir(env, opts.home);
+  }
+  if (env === process.env) return cursorUsageDir(env);
+  return null;
+}
+
+function resolveCursorSessionForRecord(env, opts) {
+  const dir = resolveCursorUsageDirForRecord(env, opts);
+  if (!dir) return null;
+  const cwd = typeof opts.cwd === "string" && opts.cwd.length > 0 ? opts.cwd : process.cwd();
+  try {
+    return resolveLatestCursorSession({
+      dir,
+      cwd,
+      now: opts.now,
+      maxAgeMs: opts.maxAgeMs,
+    });
+  } catch {
+    return null;
+  }
+}
+
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const PLUGIN_ROOT = path.resolve(HERE, "..");

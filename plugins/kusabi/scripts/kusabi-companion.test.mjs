@@ -459,7 +459,13 @@ describe("resolveOrchestratorRecord (kusabi #227)", () => {
 
   it("reads process.env when no env object is passed", () => {
     const saved = process.env[ORCH_SESSION_ENV];
+    // With the env var deleted, the 1-arg call falls through to the cursor
+    // usage dir — on a dev host that dir can hold a REAL session whose cwd
+    // matches this repo (container-green, host-red).  Pin it to a
+    // nonexistent dir so the signature assertion stays hermetic.
+    const savedDir = process.env.KUSABI_CURSOR_USAGE_DIR;
     try {
+      process.env.KUSABI_CURSOR_USAGE_DIR = path.join(import.meta.dirname, "no-such-cursor-usage-dir");
       process.env[ORCH_SESSION_ENV] = ENV_UUID;
       assert.equal(resolveOrchestratorRecord(SIGNED).session, ENV_UUID);
       delete process.env[ORCH_SESSION_ENV];
@@ -467,6 +473,8 @@ describe("resolveOrchestratorRecord (kusabi #227)", () => {
     } finally {
       if (saved === undefined) delete process.env[ORCH_SESSION_ENV];
       else process.env[ORCH_SESSION_ENV] = saved;
+      if (savedDir === undefined) delete process.env.KUSABI_CURSOR_USAGE_DIR;
+      else process.env.KUSABI_CURSOR_USAGE_DIR = savedDir;
     }
   });
 
@@ -480,6 +488,154 @@ describe("resolveOrchestratorRecord (kusabi #227)", () => {
     // No dispatch site may bypass the resolution by parsing the brief itself.
     assert.ok(!cmdTaskSource.includes("parseOrchestratorSignature("));
     assert.ok(!cmdChainSource.includes("parseOrchestratorSignature("));
+  });
+});
+
+describe("resolveOrchestratorRecord cursor-statusline fallback (kusabi #237)", () => {
+  const SIGNED = "Orchestrator: claude-fable-5 | session cc-20260811-215 | 2026-08-12\n\nDo the work.";
+  const UNSIGNED = "Just a normal brief with no orchestrator line.\n\nDo the work.";
+  const ENV_UUID = "edafbf9f-03ae-4bce-ba2e-8d2d07af5f58";
+  const CURSOR_UUID = "d73008ab-aaaa-bbbb-cccc-ddddeeeeffff";
+  const CWD = "/home/masuda/dev/projects/claude";
+  const NOW = Date.parse("2026-08-14T12:00:00.000Z");
+
+  let tmpDir;
+
+  beforeEach(() => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-orch-cursor-"));
+  });
+
+  afterEach(() => {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  function writeUsage(id, rec) {
+    fs.writeFileSync(path.join(tmpDir, `${id}.jsonl`), `${JSON.stringify(rec)}\n`);
+  }
+
+  function freshCursor(overrides = {}) {
+    writeUsage(CURSOR_UUID, {
+      ts: "2026-08-14T11:50:00.000Z",
+      session_id: CURSOR_UUID,
+      cwd: CWD,
+      model: { id: "default", display_name: "Auto" },
+      context_window: null,
+      ...overrides,
+    });
+  }
+
+  const cursorOpts = () => ({ dir: tmpDir, cwd: CWD, now: NOW });
+
+  it("env still wins even when a matching cursor session exists (byte-identical to #227)", () => {
+    freshCursor();
+    const record = resolveOrchestratorRecord(
+      SIGNED,
+      { [ORCH_SESSION_ENV]: ENV_UUID, KUSABI_CURSOR_USAGE_DIR: tmpDir },
+      cursorOpts(),
+    );
+    assert.deepEqual(record, {
+      model: "claude-fable-5",
+      session: ENV_UUID,
+      date: "2026-08-12",
+      sessionSource: "env",
+    });
+  });
+
+  it("without env and without cursor state the signature record is unchanged", () => {
+    const record = resolveOrchestratorRecord(SIGNED, {});
+    assert.deepEqual(record, parseOrchestratorSignature(SIGNED));
+    assert.ok(!("sessionSource" in record));
+  });
+
+  it("without env and without cursor state an unsigned brief is still null", () => {
+    assert.equal(resolveOrchestratorRecord(UNSIGNED, {}), null);
+  });
+
+  it("no env + cwd-matching fresh session records sessionSource cursor-statusline", () => {
+    freshCursor();
+    const record = resolveOrchestratorRecord(SIGNED, {}, cursorOpts());
+    assert.deepEqual(record, {
+      model: "claude-fable-5",
+      session: CURSOR_UUID,
+      date: "2026-08-12",
+      sessionSource: "cursor-statusline",
+    });
+  });
+
+  it("unsigned brief still persists a cursor session with null model/date", () => {
+    freshCursor();
+    const record = resolveOrchestratorRecord(UNSIGNED, {}, cursorOpts());
+    assert.deepEqual(record, {
+      model: null,
+      session: CURSOR_UUID,
+      date: null,
+      sessionSource: "cursor-statusline",
+    });
+  });
+
+  it("does not fire when the only sessions have a different cwd", () => {
+    freshCursor({ cwd: "/some/other/project" });
+    const record = resolveOrchestratorRecord(SIGNED, {}, cursorOpts());
+    assert.deepEqual(record, parseOrchestratorSignature(SIGNED));
+    assert.ok(!("sessionSource" in record));
+  });
+
+  it("does not fire when the matching session's last-line ts is older than 24h", () => {
+    freshCursor({ ts: "2026-08-13T11:00:00.000Z" });
+    const record = resolveOrchestratorRecord(SIGNED, {}, cursorOpts());
+    assert.deepEqual(record, parseOrchestratorSignature(SIGNED));
+  });
+
+  it("picks the newest of several cwd-matching sessions", () => {
+    writeUsage("older", {
+      ts: "2026-08-14T10:00:00.000Z",
+      session_id: "older",
+      cwd: CWD,
+    });
+    writeUsage("newer", {
+      ts: "2026-08-14T11:40:00.000Z",
+      session_id: "newer",
+      cwd: CWD,
+    });
+    writeUsage("neighbour", {
+      ts: "2026-08-14T11:59:00.000Z",
+      session_id: "neighbour",
+      cwd: "/elsewhere",
+    });
+    const record = resolveOrchestratorRecord(SIGNED, {}, cursorOpts());
+    assert.equal(record.session, "newer");
+    assert.equal(record.sessionSource, "cursor-statusline");
+  });
+
+  it("resolves the usage dir from KUSABI_CURSOR_USAGE_DIR on the injected env", () => {
+    freshCursor();
+    const record = resolveOrchestratorRecord(
+      SIGNED,
+      { KUSABI_CURSOR_USAGE_DIR: tmpDir },
+      { cwd: CWD, now: NOW },
+    );
+    assert.equal(record.session, CURSOR_UUID);
+    assert.equal(record.sessionSource, "cursor-statusline");
+  });
+
+  it("a whitespace-only env var falls through to the cursor branch", () => {
+    freshCursor();
+    const record = resolveOrchestratorRecord(
+      SIGNED,
+      { [ORCH_SESSION_ENV]: "  ", KUSABI_CURSOR_USAGE_DIR: tmpDir },
+      { cwd: CWD, now: NOW },
+    );
+    assert.equal(record.sessionSource, "cursor-statusline");
+    assert.equal(record.session, CURSOR_UUID);
+  });
+
+  it("missing usage dir is treated as no cursor state, not an exception", () => {
+    const record = resolveOrchestratorRecord(
+      SIGNED,
+      {},
+      { dir: path.join(tmpDir, "absent"), cwd: CWD, now: NOW },
+    );
+    assert.deepEqual(record, parseOrchestratorSignature(SIGNED));
   });
 });
 
