@@ -1,0 +1,16 @@
+---
+description: Implementation is delegated to a kusabi worker; the orchestrator briefs, inspects and publishes instead of writing code.
+alwaysApply: true
+---
+
+Implementation is delegated to a kusabi worker. Do not start writing the code
+yourself, and do not spawn a same-family subagent to write it for you.
+
+- Read the kusabi `delegate` skill before the first dispatch. It defines the
+  brief, the container workspace, and the publish rules.
+- Your work is briefing, inspection, publishing and merge decisions. The
+  worker's context is the cheap one; yours is not.
+- Read a worker's report through the `kusabi-result-handling` skill before
+  acting on it.
+- `kusabi-companion --help` is the authoritative CLI surface. Consult it
+  rather than a remembered flag list.

@@ -921,7 +921,114 @@ function pathHasDir(dir) {
     });
 }
 
-function cmdInstallCli() {
+// Cursor discovers user-level skills at <cursorDir>/skills/<name>/SKILL.md and
+// alwaysApply rules at <cursorDir>/rules/*.mdc (kusabi #247).  `--plugin-dir`
+// covers a working copy under development; a default `cursor-agent` launch and
+// the IDE chat see neither, so install-cli symlinks the two orchestrator-facing
+// skills into the user directory.  Symlinks, not copies: a plugin update then
+// reaches Cursor without a reinstall.
+const CURSOR_SKILL_NAMES = ["delegate", "kusabi-result-handling"];
+const CURSOR_RULE_FILE = "kusabi-delegate.mdc";
+
+/** The plugin root (`plugins/kusabi`), resolved from this script, never cwd. */
+function pluginRootDir() {
+  return path.dirname(path.dirname(COMPANION_SCRIPT));
+}
+
+function cursorUserDir() {
+  return process.env.KUSABI_CURSOR_DIR || path.join(os.homedir(), ".cursor");
+}
+
+/**
+ * Make `linkPath` a symlink to `target`, without ever clobbering user content.
+ *
+ * A real file or directory at linkPath is left alone and reported as
+ * `conflict` — staying stale is strictly better than deleting something the
+ * user put there.  Existing symlinks are compared by RESOLVED target, so a
+ * relative and an absolute spelling of the same destination count as
+ * `current`.
+ *
+ * @param {string} target
+ * @param {string} linkPath
+ * @returns {{state: "created"|"current"|"updated"|"conflict"|"error", target: string, linkPath: string, previous: string|null, error?: string}}
+ */
+function ensureSymlink(target, linkPath) {
+  let stat = null;
+  try {
+    stat = fs.lstatSync(linkPath);
+  } catch { /* missing */ }
+
+  if (stat && !stat.isSymbolicLink()) {
+    return { state: "conflict", target, linkPath, previous: null };
+  }
+
+  let previous = null;
+  if (stat) {
+    try {
+      const raw = fs.readlinkSync(linkPath);
+      previous = path.resolve(path.dirname(linkPath), raw);
+    } catch { /* unreadable link: treat as pointing nowhere and replace */ }
+    if (previous === path.resolve(target)) {
+      return { state: "current", target, linkPath, previous };
+    }
+  }
+
+  try {
+    fs.mkdirSync(path.dirname(linkPath), { recursive: true });
+    if (stat) fs.rmSync(linkPath, { force: true });
+    fs.symlinkSync(target, linkPath);
+  } catch (err) {
+    return { state: "error", target, linkPath, previous, error: err.message };
+  }
+  return { state: stat ? "updated" : "created", target, linkPath, previous };
+}
+
+function formatSymlinkLine(res) {
+  switch (res.state) {
+    case "conflict":
+      return `conflict: ${res.linkPath} exists and is not a symlink; left untouched (expected a link to ${res.target})`;
+    case "error":
+      return `error: ${res.linkPath}: ${res.error}`;
+    case "updated":
+      return `updated: ${res.linkPath} -> ${res.target} (was ${res.previous ?? "an unreadable link"})`;
+    default:
+      return `${res.state}: ${res.linkPath} -> ${res.target}`;
+  }
+}
+
+/**
+ * Wire Cursor's user-level discovery paths to the plugin's own skills.
+ *
+ * A machine with no `~/.cursor` simply has no Cursor: that is information,
+ * not a warning, and nothing is created there.  An explicit
+ * KUSABI_CURSOR_DIR is a request, so that directory IS created.  Per-artifact
+ * failures are reported and the rest continues — install-cli's primary job
+ * (the shim) has already succeeded by the time this runs.
+ *
+ * @param {{ rule?: boolean }} [opts]
+ * @returns {string[]} One line per artifact (or one skip line).
+ */
+function wireCursorSkills({ rule = false } = {}) {
+  const explicit = Boolean(process.env.KUSABI_CURSOR_DIR);
+  const cursorDir = cursorUserDir();
+  if (!explicit && !fs.existsSync(cursorDir)) {
+    return [`cursor skills: skipped (${cursorDir} not found — no Cursor user directory on this machine)`];
+  }
+  const pluginDir = pluginRootDir();
+  const lines = CURSOR_SKILL_NAMES.map((name) => formatSymlinkLine(ensureSymlink(
+    path.join(pluginDir, "skills", name),
+    path.join(cursorDir, "skills", name),
+  )));
+  if (rule) {
+    lines.push(formatSymlinkLine(ensureSymlink(
+      path.join(pluginDir, "rules", CURSOR_RULE_FILE),
+      path.join(cursorDir, "rules", CURSOR_RULE_FILE),
+    )));
+  }
+  return lines;
+}
+
+function cmdInstallCli({ flags } = {}) {
   const binDir = companionBinDir();
   const shim = companionShimPath(binDir);
   const expected = renderCompanionShim();
@@ -947,6 +1054,7 @@ function cmdInstallCli() {
   if (!pathHasDir(binDir)) {
     lines.push(`warning: ${binDir} is not on PATH; add it so \`${SHIM_NAME}\` can be found`);
   }
+  lines.push(...wireCursorSkills({ rule: Boolean(flags?.cursorRule) }));
   return lines.join("\n");
 }
 
@@ -3265,7 +3373,7 @@ function usage() {
     "  cancel     Cancel a running job",
     "  serve-stop Stop the background opencode server and remove its state file",
     "  install-agents  Copy phase agent definitions to OPENCODE_AGENT_DIR and skills to OPENCODE_SKILL_DIR",
-    "  install-cli  Write a kusabi-companion shim to $KUSABI_BIN_DIR (default ~/.local/bin)",
+    "  install-cli  Write a kusabi-companion shim to $KUSABI_BIN_DIR (default ~/.local/bin), and symlink the delegate / kusabi-result-handling skills into $KUSABI_CURSOR_DIR/skills (default ~/.cursor/skills) when that directory exists",
     "  salvage    Salvage a dead job (inspect progress and produce structured report)",
     "  help       Show this help message",
     "",
@@ -3279,6 +3387,7 @@ function usage() {
     "  --container <cid> (chain/task: container to run deterministic probes in; NOT supported by review)",
     "  --keep-serve (chain / chain-resume: keep the serve alive after the chain finishes)",
     "  --force (serve-stop: force kill the serve even when jobs are running)",
+    "  --cursor-rule (install-cli: also symlink the alwaysApply kusabi-delegate rule into <cursor dir>/rules; opt-in, since it taxes every conversation on the machine)",
     "  --prior <text> (review: prior findings for anti-ratchet)",
     "  --max-rounds <N> (chain: max rounds, default 4)",
     "  --since <ISO> (chain-stats: start of time range, inclusive)",
@@ -3377,6 +3486,12 @@ async function main() {
     throw new Error(`--backend is only supported by task and chain (got subcommand ${subcommand ?? "(none)"})`);
   }
 
+  // --cursor-rule is an install-cli placement decision; anywhere else it would
+  // be silently ignored, so reject it the same way --backend is.
+  if (parsed.flags.cursorRule && subcommand !== "install-cli") {
+    throw new Error(`--cursor-rule is only supported by install-cli (got subcommand ${subcommand ?? "(none)"})`);
+  }
+
   switch (subcommand) {
     case "setup":
       return cmdSetup(cwd);
@@ -3398,7 +3513,7 @@ async function main() {
     case "install-agents":
       return cmdInstallAgents();
     case "install-cli":
-      return cmdInstallCli();
+      return cmdInstallCli(parsed);
     case "salvage":
       return cmdSalvage(cwd, parsed);
     case "chain":

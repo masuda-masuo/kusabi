@@ -5450,6 +5450,212 @@ describe("install-cli shim", () => {
   });
 });
 
+// install-cli: Cursor user-level skill discovery (kusabi #247)
+// ---------------------------------------------------------------------------
+// Cursor finds user skills at <cursorDir>/skills/<name>/SKILL.md and rules at
+// <cursorDir>/rules/*.mdc -- neither comes from the plugin manifest, so a
+// default `cursor-agent` launch sees nothing without this wiring. Tests point
+// HOME and KUSABI_CURSOR_DIR at tmp dirs; the real ~/.cursor is never touched.
+
+describe("install-cli cursor skill wiring", () => {
+  const COMPANION_SCRIPT = path.join(import.meta.dirname, "kusabi-companion.mjs");
+  const PLUGIN_DIR = path.dirname(import.meta.dirname);
+  const SKILLS = ["delegate", "kusabi-result-handling"];
+  let tmpHome;
+  let binDir;
+  let cursorDir;
+
+  beforeEach(() => {
+    tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-install-cursor-home-"));
+    binDir = path.join(tmpHome, "bin");
+    cursorDir = path.join(tmpHome, "cursor");
+  });
+
+  afterEach(() => {
+    fs.rmSync(tmpHome, { recursive: true, force: true });
+  });
+
+  function run(args = [], extraEnv = {}) {
+    const env = {
+      ...process.env,
+      HOME: tmpHome,
+      KUSABI_BIN_DIR: binDir,
+      KUSABI_CURSOR_DIR: cursorDir,
+      OPENCODE_BIN: "/nonexistent-opencode-bin",
+      ...extraEnv,
+    };
+    for (const key of Object.keys(extraEnv)) {
+      if (extraEnv[key] === undefined) delete env[key];
+    }
+    return spawnSync(process.execPath, [COMPANION_SCRIPT, "install-cli", ...args], {
+      encoding: "utf8",
+      env,
+      timeout: 10_000,
+    });
+  }
+
+  // Paths land in the output verbatim; escape them before building a matcher.
+  const rx = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const skillSrc = (name) => path.join(PLUGIN_DIR, "skills", name);
+  const skillLink = (name) => path.join(cursorDir, "skills", name);
+
+  it("creates both skill symlinks and reports one line per artifact", () => {
+    const result = run();
+    assert.equal(result.status, 0, result.stderr + result.stdout);
+    for (const name of SKILLS) {
+      const link = skillLink(name);
+      assert.ok(fs.lstatSync(link).isSymbolicLink(), `${link} is not a symlink`);
+      assert.equal(fs.realpathSync(link), fs.realpathSync(skillSrc(name)));
+      assert.ok(fs.existsSync(path.join(link, "SKILL.md")), `${link}/SKILL.md not reachable`);
+      assert.match(result.stdout, new RegExp(`^created: ${rx(link)} -> ${rx(skillSrc(name))}$`, "m"));
+    }
+  });
+
+  it("reports current and changes nothing on a re-run (idempotent)", () => {
+    assert.equal(run().status, 0);
+    const before = SKILLS.map((name) => fs.readlinkSync(skillLink(name)));
+    const second = run();
+    assert.equal(second.status, 0, second.stderr + second.stdout);
+    SKILLS.forEach((name, i) => {
+      assert.match(second.stdout, new RegExp(`^current: ${rx(skillLink(name))} -> `, "m"));
+      assert.equal(fs.readlinkSync(skillLink(name)), before[i]);
+    });
+    assert.doesNotMatch(second.stdout, /^(created|updated|conflict|error):/m);
+  });
+
+  it("wires ~/.cursor when it exists and KUSABI_CURSOR_DIR is unset", () => {
+    const homeCursor = path.join(tmpHome, ".cursor");
+    fs.mkdirSync(homeCursor, { recursive: true });
+    const result = run([], { KUSABI_CURSOR_DIR: undefined });
+    assert.equal(result.status, 0, result.stderr + result.stdout);
+    for (const name of SKILLS) {
+      const link = path.join(homeCursor, "skills", name);
+      assert.equal(fs.realpathSync(link), fs.realpathSync(skillSrc(name)));
+      assert.match(result.stdout, new RegExp(`^created: ${rx(link)} -> `, "m"));
+    }
+  });
+
+  it("skips with one informational line when there is no cursor directory", () => {
+    const result = run([], { KUSABI_CURSOR_DIR: undefined });
+    assert.equal(result.status, 0, result.stderr + result.stdout);
+    const skips = result.stdout.split("\n").filter((l) => l.startsWith("cursor skills: skipped"));
+    assert.equal(skips.length, 1, result.stdout);
+    assert.ok(skips[0].includes(path.join(tmpHome, ".cursor")), skips[0]);
+    assert.ok(!fs.existsSync(path.join(tmpHome, ".cursor")), "skip must not create ~/.cursor");
+    // A machine without Cursor is information, not a warning or an error.
+    // (The one warning that may appear is the pre-existing PATH one.)
+    assert.doesNotMatch(result.stdout, /^(error|conflict):/m);
+    assert.doesNotMatch(result.stdout, /^warning:.*\.cursor/m);
+  });
+
+  it("wires KUSABI_CURSOR_DIR (creating it) and leaves HOME untouched", () => {
+    const result = run();
+    assert.equal(result.status, 0, result.stderr + result.stdout);
+    assert.ok(fs.lstatSync(skillLink("delegate")).isSymbolicLink());
+    assert.ok(!fs.existsSync(path.join(tmpHome, ".cursor")), "HOME must not be touched");
+  });
+
+  it("leaves a real directory at the target untouched and reports conflict", () => {
+    const link = skillLink("delegate");
+    fs.mkdirSync(link, { recursive: true });
+    fs.writeFileSync(path.join(link, "SKILL.md"), "mine\n");
+    const result = run();
+    assert.equal(result.status, 0, result.stderr + result.stdout);
+    assert.match(result.stdout, new RegExp(`^conflict: ${rx(link)} `, "m"));
+    assert.ok(!fs.lstatSync(link).isSymbolicLink());
+    assert.equal(fs.readFileSync(path.join(link, "SKILL.md"), "utf8"), "mine\n");
+    // The conflict does not stop the other artifact.
+    assert.match(result.stdout, new RegExp(`^created: ${rx(skillLink("kusabi-result-handling"))} -> `, "m"));
+  });
+
+  it("replaces a symlink pointing elsewhere and names the old target (updated)", () => {
+    const other = path.join(tmpHome, "elsewhere");
+    fs.mkdirSync(other, { recursive: true });
+    fs.mkdirSync(path.join(cursorDir, "skills"), { recursive: true });
+    const link = skillLink("delegate");
+    fs.symlinkSync(other, link);
+    const result = run();
+    assert.equal(result.status, 0, result.stderr + result.stdout);
+    assert.match(
+      result.stdout,
+      new RegExp(`^updated: ${rx(link)} -> ${rx(skillSrc("delegate"))} \\(was ${rx(other)}\\)$`, "m"),
+    );
+    assert.equal(fs.realpathSync(link), fs.realpathSync(skillSrc("delegate")));
+  });
+
+  it("treats a relative symlink to the same target as current", () => {
+    const skillsDir = path.join(cursorDir, "skills");
+    fs.mkdirSync(skillsDir, { recursive: true });
+    const link = skillLink("delegate");
+    fs.symlinkSync(path.relative(skillsDir, skillSrc("delegate")), link);
+    const result = run();
+    assert.equal(result.status, 0, result.stderr + result.stdout);
+    assert.match(result.stdout, new RegExp(`^current: ${rx(link)} -> `, "m"));
+  });
+
+  it("reports a per-artifact error, continues, and still exits 0", () => {
+    // A regular file where skills/ should be: every symlink under it fails.
+    fs.mkdirSync(cursorDir, { recursive: true });
+    fs.writeFileSync(path.join(cursorDir, "skills"), "not a directory\n");
+    const result = run();
+    assert.equal(result.status, 0, result.stderr + result.stdout);
+    const errors = result.stdout.split("\n").filter((l) => l.startsWith("error: "));
+    assert.equal(errors.length, SKILLS.length, result.stdout);
+    assert.match(result.stdout, /^created: .*kusabi-companion$/m);
+  });
+
+  it("installs the alwaysApply rule only with --cursor-rule", () => {
+    const link = path.join(cursorDir, "rules", "kusabi-delegate.mdc");
+    const plain = run();
+    assert.equal(plain.status, 0, plain.stderr + plain.stdout);
+    assert.ok(!fs.existsSync(path.join(cursorDir, "rules")), "no rules dir without the flag");
+    assert.doesNotMatch(plain.stdout, /kusabi-delegate\.mdc/);
+
+    const withRule = run(["--cursor-rule"]);
+    assert.equal(withRule.status, 0, withRule.stderr + withRule.stdout);
+    assert.match(withRule.stdout, new RegExp(`^created: ${rx(link)} -> `, "m"));
+    assert.equal(
+      fs.realpathSync(link),
+      fs.realpathSync(path.join(PLUGIN_DIR, "rules", "kusabi-delegate.mdc")),
+    );
+  });
+
+  it("rejects --cursor-rule on other subcommands", () => {
+    const result = spawnSync(process.execPath, [COMPANION_SCRIPT, "status", "--cursor-rule"], {
+      encoding: "utf8",
+      env: { ...process.env, HOME: tmpHome, OPENCODE_BIN: "/nonexistent-opencode-bin" },
+      timeout: 10_000,
+    });
+    assert.notEqual(result.status, 0);
+    assert.match(result.stdout + result.stderr, /--cursor-rule is only supported by install-cli/);
+  });
+
+  it("the plugin rule is frontmatter + body with alwaysApply and no absolute paths", () => {
+    const raw = fs.readFileSync(path.join(PLUGIN_DIR, "rules", "kusabi-delegate.mdc"), "utf8");
+    const m = raw.match(/^---\n([\s\S]*?)\n---\n([\s\S]*)$/);
+    assert.ok(m, "rule does not parse as frontmatter + body");
+    const [, front, body] = m;
+    assert.match(front, /^description: \S/m);
+    assert.match(front, /^alwaysApply: true$/m);
+    const bodyLines = body.trim().split("\n");
+    assert.ok(bodyLines.length > 0 && body.trim().length > 0, "rule body is empty");
+    assert.ok(bodyLines.length <= 15, `rule body is ${bodyLines.length} lines, want <= 15`);
+    // Machine-independence: no absolute path and no environment-overlay refs.
+    assert.doesNotMatch(raw, /(^|\s)~?\/[A-Za-z0-9_.-]/m, "rule contains an absolute filesystem path");
+    assert.doesNotMatch(raw, /MEMORY\.md|kairanban/);
+  });
+
+  it("--help documents --cursor-rule and the extended install-cli behaviour", () => {
+    const result = spawnSync(process.execPath, [COMPANION_SCRIPT, "--help"], {
+      encoding: "utf8",
+      timeout: 10_000,
+    });
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stdout, /^ {2}--cursor-rule /m);
+    assert.match(result.stdout, /^ {2}install-cli .*\.cursor\/skills/m);
+  });
+});
+
 describe("setup companion-shim diagnosis", () => {
   const COMPANION_SCRIPT = path.join(import.meta.dirname, "kusabi-companion.mjs");
   let tmpHome;

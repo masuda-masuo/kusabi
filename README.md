@@ -40,6 +40,34 @@ Key mechanics:
 
 ### Cursor CLI
 
+Two separate paths — day-to-day use, and tracking a working copy while
+developing the plugin itself.
+
+**Daily use.** Run `install-cli` once:
+
+```bash
+node plugins/kusabi/scripts/kusabi-companion.mjs install-cli
+```
+
+It writes the `kusabi-companion` shim the command definitions invoke to
+`$KUSABI_BIN_DIR` (default `~/.local/bin`) and, when `~/.cursor` exists,
+symlinks the `delegate` and `kusabi-result-handling` skills into
+`~/.cursor/skills/` — Cursor's own user-level discovery path, so a default
+`cursor-agent` launch and the IDE chat see them without `--plugin-dir`.
+Symlinks, so plugin updates reach Cursor with no reinstall. A machine with no
+`~/.cursor` is reported as skipped and nothing is created; `KUSABI_CURSOR_DIR`
+overrides the destination. Anything real (not a symlink) already sitting at a
+target path is reported as a conflict and left untouched.
+
+Add `--cursor-rule` to also install an `alwaysApply` rule into
+`~/.cursor/rules/` that tells the orchestrator to delegate rather than
+implement. It is opt-in: an `alwaysApply` rule taxes every conversation on the
+machine, and some machines already carry a local orchestrator rule.
+
+Then run `kusabi-companion setup` to verify the CLI and server come up.
+
+**Development-time tracking** of a working copy:
+
 ```bash
 cursor-agent --plugin-dir /path/to/kusabi/plugins/kusabi
 ```
@@ -47,13 +75,8 @@ cursor-agent --plugin-dir /path/to/kusabi/plugins/kusabi
 Cursor loads the plugin from a working-copy checkout as-is: it reads both
 `.cursor-plugin/` and `.claude-plugin/` manifests (skills verified on
 cursor-agent 2026.08.11), and a `--plugin-dir` plugin follows the working
-copy with no relink step. Run
-`node plugins/kusabi/scripts/kusabi-companion.mjs install-cli` once so the
-`kusabi-companion` shim the command definitions invoke is on PATH.
-`cursor-agent plugin marketplace add` accepts github.com URLs only, and its
-indexing of private repositories is unverified.
-
-Then run `kusabi-companion setup` to verify the CLI and server come up.
+copy with no relink step. `cursor-agent plugin marketplace add` accepts
+github.com URLs only, and its indexing of private repositories is unverified.
 
 ## Phase agents
 
