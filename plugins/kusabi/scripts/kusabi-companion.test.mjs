@@ -5518,3 +5518,119 @@ describe("setup companion-shim diagnosis", () => {
     assert.ok(cmdSetupSource.includes("shimLine"));
   });
 });
+
+// flushAndExit — piped stdout must survive process.exit (kusabi #243).
+// Truncation only reproduces when the consumer is slower than the writer:
+// a delayed pipe (`pause` then `resume` after 1s), not a file redirect.
+// ---------------------------------------------------------------------------
+
+describe("flushAndExit (kusabi #243)", () => {
+  const COMPANION_SCRIPT = path.join(import.meta.dirname, "kusabi-companion.mjs");
+  const LARGE = 150_000;
+
+  function spawnFlushChild({ bytes, exitCode, leftoverTimer = false }) {
+    const lines = [`import { flushAndExit } from ${JSON.stringify(COMPANION_SCRIPT)};`];
+    if (leftoverTimer) lines.push("setInterval(() => {}, 60_000);");
+    if (bytes > 0) lines.push(`process.stdout.write("x".repeat(${bytes}));`);
+    lines.push(`flushAndExit(${exitCode});`);
+    return spawn(process.execPath, ["--input-type=module", "-e", lines.join("\n")], {
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+  }
+
+  function collectDelayedPipe(child, { delayMs = 1000, timeoutMs = 15_000 } = {}) {
+    return new Promise((resolve, reject) => {
+      const chunks = [];
+      let stderr = "";
+      let code = null;
+      let signal = null;
+      let stdoutEnded = false;
+      let closed = false;
+      let reading = false;
+
+      const tryResolve = () => {
+        if (!closed || !stdoutEnded) return;
+        clearTimeout(timer);
+        resolve({ code, signal, stdout: Buffer.concat(chunks), stderr });
+      };
+
+      const beginRead = () => {
+        if (reading) return;
+        reading = true;
+        clearTimeout(startRead);
+        child.stdout.on("data", (c) => { chunks.push(c); });
+        child.stdout.on("end", () => { stdoutEnded = true; tryResolve(); });
+        child.stdout.resume();
+      };
+
+      child.stderr.on("data", (c) => { stderr += c; });
+      child.stdout.pause();
+      const startRead = setTimeout(beginRead, delayMs);
+
+      const timer = setTimeout(() => {
+        child.kill("SIGKILL");
+        reject(new Error(`timed out after ${timeoutMs}ms; got ${Buffer.concat(chunks).length} bytes; stderr=${stderr}`));
+      }, timeoutMs);
+
+      child.on("error", (err) => {
+        clearTimeout(timer);
+        clearTimeout(startRead);
+        reject(err);
+      });
+      child.on("close", (c, s) => {
+        code = c;
+        signal = s;
+        closed = true;
+        beginRead();
+        tryResolve();
+      });
+    });
+  }
+
+  it("delivers 150KiB through a delayed pipe and exits 0", async () => {
+    const child = spawnFlushChild({ bytes: LARGE, exitCode: 0 });
+    const result = await collectDelayedPipe(child);
+    assert.equal(result.code, 0, result.stderr);
+    assert.equal(result.stdout.length, LARGE);
+    assert.equal(result.stdout.toString("utf8"), "x".repeat(LARGE));
+  });
+
+  it("preserves a non-zero exit code after draining a large pipe", async () => {
+    const child = spawnFlushChild({ bytes: LARGE, exitCode: 7 });
+    const result = await collectDelayedPipe(child);
+    assert.equal(result.code, 7, result.stderr);
+    assert.equal(result.stdout.length, LARGE);
+  });
+
+  it("exits even when a leftover timer handle remains", async () => {
+    const child = spawnFlushChild({ bytes: 0, exitCode: 0, leftoverTimer: true });
+    const result = await collectDelayedPipe(child, { delayMs: 0, timeoutMs: 5_000 });
+    assert.equal(result.code, 0, result.stderr);
+  });
+
+  it("companion --help still exits 0", () => {
+    const result = spawnSync(process.execPath, [COMPANION_SCRIPT, "--help"], {
+      encoding: "utf8",
+      timeout: 10_000,
+    });
+    assert.equal(result.status, 0, result.stderr + result.stdout);
+    assert.match(result.stdout, /Usage: kusabi-companion/);
+  });
+
+  it("companion unknown subcommand still exits 1", () => {
+    const result = spawnSync(process.execPath, [COMPANION_SCRIPT, "definitely-not-a-subcommand"], {
+      encoding: "utf8",
+      timeout: 10_000,
+    });
+    assert.equal(result.status, 1, result.stderr + result.stdout);
+    assert.match(result.stdout, /kusabi-companion error: unknown subcommand/);
+  });
+
+  it("CLI entry drains via flushAndExit rather than a bare process.exit", () => {
+    const source = fs.readFileSync(COMPANION_SCRIPT, "utf8");
+    const cli = source.slice(source.indexOf("if (process.argv[1] === fileURLToPath"));
+    assert.match(cli, /flushAndExit\(exitCode\)/);
+    assert.match(cli, /flushAndExit\(1\)/);
+    assert.equal([...cli.matchAll(/process\.exit\(/g)].length, 0);
+  });
+});
