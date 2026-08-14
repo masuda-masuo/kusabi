@@ -17,7 +17,7 @@ signal to stop and delegate.
 
 | Who | Role |
 |---|---|
-| Orchestrator (Claude Code) | brief authoring, container preparation, inspection (diff + full gate + real behaviour), publish, merge decision |
+| Orchestrator | brief authoring, container preparation, inspection (diff + full gate + real behaviour), publish, merge decision |
 | kusabi worker | implementation, investigation, first-pass review |
 | Human | direction, final acceptance |
 
@@ -27,7 +27,8 @@ signal to stop and delegate.
 names, probes and dispositions change faster than any skill can track. Read the
 authoritative source instead, once per session before the first dispatch:
 
-- `node <plugin>/scripts/kusabi-companion.mjs --help` — subcommands, flags, phase list
+- `kusabi-companion --help` — subcommands, flags, phase list. If the PATH shim is
+  missing, `node <plugin>/scripts/kusabi-companion.mjs --help` is equivalent.
 - `docs/design/phase-chain.md` §3.5 — chain rounds, deterministic probes, the disposition table
 
 What does *not* change with the CLI:
@@ -152,6 +153,17 @@ Worker reports are claims, not evidence. They have been false before.
 
 - **Start with `chain-show`**, not raw `rounds/*.json` or `events.ndjson`. Re-reading raw
   chain state into the orchestrator's context is the single largest avoidable cost here.
+- **An escalate ending with that round's probes/smoke all green is a dead review seat
+  only when the seat itself failed to finish — the round record shows findings but no
+  verdict line, or the output is unreadable.** The deterministic checks passed on the
+  work that exists, so the implementation is intact; buy a replacement review and do not
+  send the worker that wrote the code a rework for that escalate reason. When the
+  escalate instead came from a review that completed — the same file area flagged for
+  two consecutive rounds, the work discarded, unverified items still open, or the round
+  limit reached — its findings stand: use the four routes below, or the stall lever
+  (stronger model / strategize) for a repeated area, rather than a replacement review.
+  If the probes were not all green this bullet does not apply, and the four routes below
+  decide the round as usual.
 - **The dispute over a green gate is scope, not repetition.** Re-running the same command
   in the same container proves nothing you did not already know. Ask what the worker's
   verify did *not* cover — a "full suite" has turned out to be twenty-odd single-file runs
