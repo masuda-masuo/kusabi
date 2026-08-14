@@ -19,8 +19,9 @@
 // whatever Cursor last reported when the statusline refreshed.  Multiple API
 // calls between refreshes are dropped, so ingested input/output/cache totals
 // can undercount.  Do not treat turn sums as a complete token ledger, and do
-// not "correct" them against context_window.total_output_tokens here (that
-// reconciliation is a follow-up).
+// not "correct" them against context_window.total_output_tokens (the reported
+// cumulative is stored on cursor_session_counter and shown as coverage in
+// metrics-report; turn rows stay as sampled).
 //
 // Hazard B — `model.id` is "default" when Cursor Auto is routing, and the
 // real downstream model is unknown.  We store `record.model.id` verbatim
@@ -48,6 +49,7 @@ import {
   upsertTurn,
   upsertSourceFile,
   isSourceFileUnchanged,
+  upsertCursorSessionCounter,
 } from "./metrics-db.mjs";
 
 /**
@@ -107,6 +109,28 @@ function currentUsageOf(rec) {
   return usage;
 }
 
+/** Numeric `context_window.total_output_tokens` only; anything else is absent. */
+function numericTotalOutputTokens(rec) {
+  const cw = rec.context_window;
+  if (cw == null || typeof cw !== "object") return null;
+  const v = cw.total_output_tokens;
+  return typeof v === "number" && Number.isFinite(v) ? v : null;
+}
+
+/**
+ * Keep the latest-ts reading.  Equal ts prefers `incoming` so a later line
+ * in the same file (same timestamp) wins.  Token monotonicity is not assumed.
+ */
+function mergeCounter(existing, incoming) {
+  if (!existing) return { ...incoming };
+  const existingMs = existing.tsMs;
+  const incomingMs = incoming.tsMs;
+  if (existingMs == null) return { ...incoming };
+  if (incomingMs == null) return existing;
+  if (incomingMs >= existingMs) return { ...incoming };
+  return existing;
+}
+
 /**
  * Parse the full text of one Cursor usage `*.jsonl` file into turn rows plus
  * per-session metadata for THIS FILE ONLY.
@@ -114,7 +138,9 @@ function currentUsageOf(rec) {
  * Pure — no filesystem access.  A turn is emitted only for a line whose
  * `context_window.current_usage` is a non-null object.  Every record with a
  * usable `session_id` and timestamp still contributes to that session's
- * first/last range, including the pre-first-API null-usage rows.
+ * first/last range, including the pre-first-API null-usage rows.  A numeric
+ * `context_window.total_output_tokens` on any line (usage or null-period) is
+ * tracked per session as the latest-ts reading.
  *
  * `request_id` is `cursor:<session_id>#<lineNo>` where `lineNo` is the
  * 1-based physical line number in the file (empty lines still occupy a
@@ -125,6 +151,7 @@ function currentUsageOf(rec) {
  * @returns {{
  *   turns: Array<object>,
  *   sessions: Array<object>,
+ *   counters: Array<{ sessionId: string, totalOutputTokens: number, ts: string|null, tsMs: number|null }>,
  *   recordCount: number,
  *   usageRecordCount: number,
  *   nullUsageCount: number,
@@ -134,6 +161,7 @@ function currentUsageOf(rec) {
 export function parseCursorUsageContent(content) {
   const turns = [];
   const sessionAgg = new Map();
+  const counterAgg = new Map();
 
   let recordCount = 0;
   let usageRecordCount = 0;
@@ -178,6 +206,15 @@ export function parseCursorUsageContent(content) {
       sessionAgg.set(sessionId, mergeSessionMeta(sessionAgg.get(sessionId) ?? null, incoming));
     }
 
+    const totalOutputTokens = numericTotalOutputTokens(rec);
+    if (sessionId && totalOutputTokens !== null) {
+      counterAgg.set(sessionId, mergeCounter(counterAgg.get(sessionId) ?? null, {
+        totalOutputTokens,
+        ts,
+        tsMs,
+      }));
+    }
+
     const usage = currentUsageOf(rec);
     if (!usage) {
       nullUsageCount += 1;
@@ -213,6 +250,7 @@ export function parseCursorUsageContent(content) {
   return {
     turns,
     sessions: [...sessionAgg.entries()].map(([sessionId, meta]) => ({ sessionId, ...meta })),
+    counters: [...counterAgg.entries()].map(([sessionId, meta]) => ({ sessionId, ...meta })),
     recordCount,
     usageRecordCount,
     nullUsageCount,
@@ -247,7 +285,8 @@ function walkJsonlFiles(dir) {
 /**
  * Walk `cursorUsageDir` (default `~/.kusabi/cursor-usage`) for `*.jsonl`
  * files, parse each with `parseCursorUsageContent`, and upsert session/turn
- * rows into `db`.  Unchanged files (same size + mtime as a prior ingest) are
+ * rows into `db`, plus the latest-ts `cursor_session_counter` reading per
+ * session.  Unchanged files (same size + mtime as a prior ingest) are
  * skipped as a speed optimisation only — this never affects correctness,
  * since every row write below goes through a PRIMARY KEY `INSERT OR REPLACE`.
  *
@@ -280,6 +319,7 @@ export function ingestCursorUsageDirectory(db, cursorUsageDir) {
 
   const seenRequestIds = new Set();
   const sessionAgg = new Map();
+  const counterAgg = new Map();
 
   for (const filePath of files) {
     summary.filesScanned += 1;
@@ -342,6 +382,14 @@ export function ingestCursorUsageDirectory(db, cursorUsageDir) {
       sessionAgg.set(sess.sessionId, mergeSessionMeta(sessionAgg.get(sess.sessionId) ?? null, incoming));
     }
 
+    for (const counter of parsed.counters) {
+      counterAgg.set(counter.sessionId, mergeCounter(counterAgg.get(counter.sessionId) ?? null, {
+        totalOutputTokens: counter.totalOutputTokens,
+        ts: counter.ts,
+        tsMs: counter.tsMs,
+      }));
+    }
+
     upsertSourceFile(db, {
       path: filePath,
       size: stat.size,
@@ -373,6 +421,14 @@ export function ingestCursorUsageDirectory(db, cursorUsageDir) {
       lastTsMs: merged.lastTsMs,
       cwd: merged.cwd,
       gitBranch: merged.gitBranch,
+    });
+  }
+
+  for (const [sessionId, counter] of counterAgg) {
+    upsertCursorSessionCounter(db, {
+      sessionId,
+      totalOutputTokens: counter.totalOutputTokens,
+      ts: counter.ts,
     });
   }
 

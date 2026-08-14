@@ -1,5 +1,5 @@
 // metrics-report.mjs — query/report surface over the metrics store built by
-// metrics-db.mjs / transcript-ingest.mjs / chain-ingest.mjs.
+// metrics-db.mjs / transcript-ingest.mjs / cursor-usage-ingest.mjs / chain-ingest.mjs.
 //
 // Pure reader. Every function here takes an already-open database handle
 // (opened by the caller with `openMetricsDbReadOnly` from metrics-db.mjs —
@@ -84,6 +84,13 @@ function fmtCost(n) {
 function fmtPct(pct) {
   if (pct === null || pct === undefined) return "n/a";
   return `${Math.round(pct)}%`;
+}
+
+/** Coverage ratio already scaled to 0-100; keep one decimal when needed (62.5%). */
+function fmtCoveragePct(pct) {
+  if (pct === null || pct === undefined) return "n/a";
+  const rounded1 = Math.round(pct * 10) / 10;
+  return Number.isInteger(rounded1) ? `${rounded1}%` : `${rounded1.toFixed(1)}%`;
 }
 
 function fmtTs(v) {
@@ -189,6 +196,8 @@ function isStoreEmpty(db) {
 
 function computeFreshness(db, dbPath) {
   const lastIngestRun = db.prepare("SELECT MAX(ingested_at) AS m FROM source_file").get().m ?? null;
+  // MAX(turn.ts) covers every ingested turn row, including cursor-usage
+  // samples — the label is "newest ingested turn", not "transcript".
   const newestTranscriptTurn = db.prepare("SELECT MAX(ts) AS m FROM turn").get().m ?? null;
   const newestChainRound = db.prepare("SELECT MAX(started_at) AS m FROM round").get().m ?? null;
   const newestChainDate = db.prepare("SELECT MAX(orch_date) AS m FROM chain").get().m ?? null;
@@ -714,6 +723,67 @@ function computeBackendSplit(inWindowChains, inWindowJobs, roundsByChain) {
 }
 
 // ---------------------------------------------------------------------------
+// Cursor sampling coverage — display only, never rewrites turn.output
+// ---------------------------------------------------------------------------
+
+/**
+ * Whole-store (not window-scoped): sampled output is the sum of turn.output
+ * for request_id LIKE 'cursor:%'; reported is the sum of
+ * cursor_session_counter.total_output_tokens.  Coverage is sampled/reported.
+ * Returns null when the table is missing or empty so Claude-only stores keep
+ * their previous JSON/text shape (aside from the freshness label).
+ */
+function computeCursorSamplingCoverage(db) {
+  if (!tableExists(db, "cursor_session_counter")) return null;
+  const counters = db.prepare(
+    "SELECT session_id, total_output_tokens, ts FROM cursor_session_counter",
+  ).all();
+  if (counters.length === 0) return null;
+
+  const turnRows = db.prepare(
+    "SELECT session_id, output FROM turn WHERE request_id LIKE 'cursor:%'",
+  ).all();
+
+  const sampledBySession = new Map();
+  let sampledTotal = 0;
+  for (const t of turnRows) {
+    const out = typeof t.output === "number" ? t.output : 0;
+    sampledTotal += out;
+    if (!t.session_id) continue;
+    sampledBySession.set(t.session_id, (sampledBySession.get(t.session_id) ?? 0) + out);
+  }
+
+  let reportedTotal = 0;
+  const sessions = [];
+  for (const c of counters) {
+    const sampled = sampledBySession.get(c.session_id) ?? 0;
+    const reported = typeof c.total_output_tokens === "number" ? c.total_output_tokens : null;
+    if (typeof reported === "number") reportedTotal += reported;
+    const coveragePct = (reported === null || reported === 0)
+      ? null
+      : (sampled / reported) * 100;
+    sessions.push({
+      sessionId: c.session_id,
+      sessionIdShort: `${(c.session_id || "").slice(0, 8)}...`,
+      sampledOutput: sampled,
+      reportedOutput: reported,
+      coveragePct,
+      anomaly: reported !== null && reported < sampled,
+    });
+  }
+  sessions.sort((a, b) => String(a.sessionId).localeCompare(String(b.sessionId)));
+
+  const coveragePct = reportedTotal === 0 ? null : (sampledTotal / reportedTotal) * 100;
+  return {
+    sampledOutput: sampledTotal,
+    reportedOutput: reportedTotal,
+    coveragePct,
+    anomaly: reportedTotal < sampledTotal,
+    sessions,
+  };
+}
+
+// ---------------------------------------------------------------------------
 // top-level report
 // ---------------------------------------------------------------------------
 
@@ -816,6 +886,7 @@ export function computeReport(db, opts = {}) {
   const briefOutcome = computeBriefOutcome(inWindowChains, roundsByChain);
   const delegatedJobs = computeDelegatedJobs(inWindowJobs);
   const byBackend = computeBackendSplit(inWindowChains, inWindowJobs, roundsByChain);
+  const cursorSamplingCoverage = computeCursorSamplingCoverage(db);
 
   const status = (inWindowTurns.length === 0 && inWindowChains.length === 0 && inWindowJobs.length === 0)
     ? "empty_window"
@@ -842,6 +913,7 @@ export function computeReport(db, opts = {}) {
     briefOutcome,
     delegatedJobs,
     byBackend,
+    ...(cursorSamplingCoverage ? { cursorSamplingCoverage } : {}),
   };
 }
 
@@ -853,7 +925,7 @@ function renderFreshness(f) {
   return [
     `Metrics store: ${f.dbPath ?? "(unknown)"} (opened read-only)`,
     `  last ingest run:        ${fmtTs(f.lastIngestRun)}`,
-    `  newest transcript turn: ${fmtTs(f.newestTranscriptTurn)}`,
+    `  newest ingested turn:   ${fmtTs(f.newestTranscriptTurn)}`,
     `  newest chain round:     ${fmtTs(f.newestChainRound)}`,
     `  newest chain date:      ${fmtTs(f.newestChainDate)}`,
     `  newest job start:       ${fmtTs(f.newestJobStart)}`,
@@ -1055,6 +1127,27 @@ function renderDelegatedJobs(section) {
 }
 
 /**
+ * Render Cursor sampler vs CLI-reported cumulative output.  Returns [] when
+ * the store has no cursor_session_counter rows, so Claude-only text stays
+ * byte-identical aside from the freshness label.
+ */
+function renderCursorSamplingCoverage(section) {
+  if (!section) return [];
+  const totalFlag = section.anomaly ? " !" : "";
+  const lines = [
+    "Cursor sampling coverage:",
+    `  sampled output ${fmtInt(section.sampledOutput)}  reported cumulative ${fmtInt(section.reportedOutput)}  coverage ${fmtCoveragePct(section.coveragePct)}${totalFlag}`,
+  ];
+  for (const s of section.sessions) {
+    const flag = s.anomaly ? " !" : "";
+    lines.push(
+      `  ${s.sessionIdShort}  sampled ${fmtInt(s.sampledOutput)}  reported ${fmtInt(s.reportedOutput)}  ${fmtCoveragePct(s.coveragePct)}${flag}`,
+    );
+  }
+  return lines;
+}
+
+/**
  * Render the by-backend split (kusabi #184).  Returns [] — no section at
  * all — when the window contains at most one distinct backend, so a
  * single-backend history renders byte-identically to before the split.
@@ -1121,6 +1214,11 @@ export function renderReportText(report) {
   lines.push(...renderBriefOutcome(report.briefOutcome));
   lines.push("");
   lines.push(...renderDelegatedJobs(report.delegatedJobs));
+  const coverageLines = renderCursorSamplingCoverage(report.cursorSamplingCoverage);
+  if (coverageLines.length > 0) {
+    lines.push("");
+    lines.push(...coverageLines);
+  }
   const backendSplitLines = renderBackendSplit(report.byBackend);
   if (backendSplitLines.length > 0) {
     lines.push("");

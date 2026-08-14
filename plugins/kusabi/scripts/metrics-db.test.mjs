@@ -24,12 +24,14 @@ import {
   upsertFinding,
   upsertJob,
   countRows,
+  upsertCursorSessionCounter,
+  getCursorSessionCounter,
 } from "./metrics-db.mjs";
 
 describe("openMetricsDb", () => {
   it("creates all tables on an in-memory database", () => {
     const db = openMetricsDb(":memory:");
-    for (const table of ["source_file", "session", "turn", "chain", "round", "finding", "job"]) {
+    for (const table of ["source_file", "session", "turn", "chain", "round", "finding", "job", "cursor_session_counter"]) {
       assert.equal(countRows(db, table), 0, `expected empty ${table}`);
     }
   });
@@ -612,5 +614,52 @@ describe("round.review_backend migration (kusabi #195)", () => {
     const rows = db.prepare("SELECT chain_id, backend, review_backend FROM round ORDER BY chain_id").all();
     assert.deepEqual(rows.map((r) => r.review_backend), ["opencode", null, null]);
     assert.deepEqual(rows.map((r) => r.backend), ["claude", "claude", null]);
+  });
+});
+
+describe("upsertCursorSessionCounter / getCursorSessionCounter", () => {
+  it("stores a row and returns it; unknown sessionId is undefined", () => {
+    const db = openMetricsDb(":memory:");
+    assert.equal(getCursorSessionCounter(db, "nope"), undefined);
+    upsertCursorSessionCounter(db, {
+      sessionId: "sess-c",
+      totalOutputTokens: 80,
+      ts: "2026-08-14T10:00:20.000Z",
+    });
+    assert.equal(countRows(db, "cursor_session_counter"), 1);
+    const row = getCursorSessionCounter(db, "sess-c");
+    assert.equal(row.total_output_tokens, 80);
+    assert.equal(row.ts, "2026-08-14T10:00:20.000Z");
+  });
+
+  it("re-upserting the same session_id at the same ts replaces, does not duplicate", () => {
+    const db = openMetricsDb(":memory:");
+    upsertCursorSessionCounter(db, { sessionId: "sess-c", totalOutputTokens: 30, ts: "2026-08-14T10:00:10.000Z" });
+    upsertCursorSessionCounter(db, { sessionId: "sess-c", totalOutputTokens: 30, ts: "2026-08-14T10:00:10.000Z" });
+    assert.equal(countRows(db, "cursor_session_counter"), 1);
+    assert.equal(getCursorSessionCounter(db, "sess-c").total_output_tokens, 30);
+  });
+
+  it("keeps the newest-ts value; an older incoming row is ignored (monotonicity of tokens is not assumed)", () => {
+    const db = openMetricsDb(":memory:");
+    upsertCursorSessionCounter(db, { sessionId: "sess-c", totalOutputTokens: 80, ts: "2026-08-14T10:00:20.000Z" });
+    upsertCursorSessionCounter(db, { sessionId: "sess-c", totalOutputTokens: 999, ts: "2026-08-14T10:00:10.000Z" });
+    const row = getCursorSessionCounter(db, "sess-c");
+    assert.equal(row.total_output_tokens, 80);
+    assert.equal(row.ts, "2026-08-14T10:00:20.000Z");
+
+    upsertCursorSessionCounter(db, { sessionId: "sess-c", totalOutputTokens: 40, ts: "2026-08-14T10:00:30.000Z" });
+    const later = getCursorSessionCounter(db, "sess-c");
+    assert.equal(later.total_output_tokens, 40);
+    assert.equal(later.ts, "2026-08-14T10:00:30.000Z");
+  });
+
+  it("does not let a ts-less incoming row overwrite a stored row that has a ts", () => {
+    const db = openMetricsDb(":memory:");
+    upsertCursorSessionCounter(db, { sessionId: "sess-c", totalOutputTokens: 80, ts: "2026-08-14T10:00:20.000Z" });
+    upsertCursorSessionCounter(db, { sessionId: "sess-c", totalOutputTokens: 1, ts: null });
+    const row = getCursorSessionCounter(db, "sess-c");
+    assert.equal(row.total_output_tokens, 80);
+    assert.equal(row.ts, "2026-08-14T10:00:20.000Z");
   });
 });
