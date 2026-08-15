@@ -113,7 +113,7 @@ Everything else is a companion subcommand, invoked directly as
 | Subcommand | What it does |
 | --- | --- |
 | `chain [--brief-file <path>]` | **Auto chain** — run implement → review → rework until acceptance or escalate. Requires `--container <cid>`. Optional: `--model <provider/model>`, `--brief-file <path>`, `--max-rounds <N>` (default 4), `--session`, `--keep-serve`. When `--model` is omitted the model is resolved from the config file or built-in default chain. |
-| `chain-resume <chainId>` | Resume a cancelled chain from its last recorded phase boundary (reads `chain.json` / `control.json`; same chain lifecycle as `chain`; only flag: `--keep-serve`) |
+| `chain-resume <chainId>` | Resume a cancelled chain from its last recorded phase boundary, or buy a replacement review seat for a chain that escalated on a dead review seat over green probes (reads `chain.json` / `control.json`; same chain lifecycle as `chain`; only flag: `--keep-serve`) |
 | `chain-show` | Compact plain-text digest of a chain (read-only, no LLM) |
 | `chain-stats` | Aggregate every chain record and print a summary (read-only, no LLM) |
 | `chain-cancel <chainId>` | Request a running chain to stop (file-based, works across processes) |

@@ -617,6 +617,66 @@ describe("round.review_backend migration (kusabi #195)", () => {
   });
 });
 
+// round.review_seat_failures column (kusabi #248 follow-up)
+// ---------------------------------------------------------------------------
+
+describe("round.review_seat_failures migration (kusabi #248 follow-up)", () => {
+  it("adds review_seat_failures to a post-#195 / pre-#248 database, preserving old rows as NULL", () => {
+    const dbPath = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-migrate-test-")), "metrics.db");
+
+    // A database written between #195 and #248: `round` already has
+    // `review_backend`, but no `review_seat_failures` at all.
+    const legacyDb = new DatabaseSync(dbPath);
+    legacyDb.exec(`
+      CREATE TABLE round (
+        chain_id TEXT,
+        round INTEGER,
+        started_at TEXT,
+        started_ms INTEGER,
+        backend TEXT,
+        review_backend TEXT,
+        model_entry TEXT,
+        tier_before INTEGER,
+        tier_after INTEGER,
+        verdict TEXT,
+        probes_green INTEGER,
+        worktree_changed INTEGER,
+        disposition TEXT,
+        rework_count INTEGER,
+        findings_text TEXT,
+        implement_in INTEGER,
+        implement_out INTEGER,
+        implement_cost REAL,
+        review_in INTEGER,
+        review_out INTEGER,
+        review_cost REAL,
+        PRIMARY KEY (chain_id, round)
+      )
+    `);
+    legacyDb.prepare("INSERT INTO round (chain_id, round, disposition) VALUES (?, ?, ?)")
+      .run("chain-legacy", 1, "accept");
+    if (typeof legacyDb.close === "function") legacyDb.close();
+
+    // Re-opening through openMetricsDb migrates in place; the old row keeps
+    // NULL, which readers treat as 0 (the backend TEXT precedent) -- never a
+    // fabricated measurement.
+    const db = openMetricsDb(dbPath);
+    const legacyRound = db.prepare("SELECT * FROM round WHERE chain_id = ?").get("chain-legacy");
+    assert.equal(legacyRound.review_seat_failures, null);
+    assert.equal(legacyRound.disposition, "accept"); // other columns untouched
+
+    // New rows written after migration store the failed-seat count verbatim.
+    upsertRound(db, {
+      chainId: "chain-new", round: 1, disposition: "accept", reviewSeatFailures: 2,
+    });
+    const newRound = db.prepare("SELECT review_seat_failures FROM round WHERE chain_id = ? AND round = 1")
+      .get("chain-new");
+    assert.equal(newRound.review_seat_failures, 2);
+
+    fs.rmSync(path.dirname(dbPath), { recursive: true, force: true });
+  });
+});
+
 describe("upsertCursorSessionCounter / getCursorSessionCounter", () => {
   it("stores a row and returns it; unknown sessionId is undefined", () => {
     const db = openMetricsDb(":memory:");

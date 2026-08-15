@@ -117,6 +117,11 @@ CREATE TABLE IF NOT EXISTS round (
   worktree_changed INTEGER,
   disposition TEXT,
   rework_count INTEGER,
+  -- review_seat_failures: how many review seats died on this round and were
+  -- archived by chain-resume's replacement seat (kusabi #248).  NULL when
+  -- the record predates the field; readers treat NULL as 0 (the backend TEXT
+  -- precedent: absent, never measured zero).
+  review_seat_failures INTEGER,
   findings_text TEXT,
   implement_in INTEGER,
   implement_out INTEGER,
@@ -246,6 +251,11 @@ export function openMetricsDb(dbPath) {
   // predate `reviewBackend`, so their review backend is genuinely unknown
   // and is never backfilled from the round's implement backend.
   ensureColumn(db, "round", "review_backend", "TEXT");
+  // Migration for databases created before `round.review_seat_failures`
+  // existed (kusabi #248 follow-up -- the seat-failure episode must be
+  // queryable).  Old rows keep NULL, which readers treat as 0 (the `backend`
+  // TEXT precedent: an absent field is never coerced to a measured zero).
+  ensureColumn(db, "round", "review_seat_failures", "INTEGER");
   return db;
 }
 
@@ -459,11 +469,11 @@ export function upsertRound(db, row) {
   db.prepare(`
     INSERT OR REPLACE INTO round
       (chain_id, round, started_at, started_ms, backend, review_backend, model_entry, tier_before, tier_after,
-       verdict, probes_green, worktree_changed, disposition, rework_count, findings_text,
+       verdict, probes_green, worktree_changed, disposition, rework_count, review_seat_failures, findings_text,
        implement_in, implement_out, implement_cost, review_in, review_out, review_cost)
     VALUES
       ($chainId, $round, $startedAt, $startedMs, $backend, $reviewBackend, $modelEntry, $tierBefore, $tierAfter,
-       $verdict, $probesGreen, $worktreeChanged, $disposition, $reworkCount, $findingsText,
+       $verdict, $probesGreen, $worktreeChanged, $disposition, $reworkCount, $reviewSeatFailures, $findingsText,
        $implementIn, $implementOut, $implementCost, $reviewIn, $reviewOut, $reviewCost)
   `).run({
     chainId: row.chainId,
@@ -492,6 +502,9 @@ export function upsertRound(db, row) {
     worktreeChanged: row.worktreeChanged ?? null,
     disposition: row.disposition ?? null,
     reworkCount: row.reworkCount ?? null,
+    // Failed-seat count (kusabi #248 follow-up): NULL when the record has no
+    // reviewSeatFailures array; readers treat NULL as 0.
+    reviewSeatFailures: row.reviewSeatFailures ?? null,
     findingsText: row.findingsText ?? null,
     implementIn: row.implementIn ?? null,
     implementOut: row.implementOut ?? null,
@@ -527,6 +540,32 @@ export function upsertFinding(db, row) {
     // would; `source` is the only column that tells the two apart.
     source: row.source ?? null,
   });
+}
+
+/**
+ * Delete every finding row of one round.
+ *
+ * Needed because `INSERT OR REPLACE` can only overwrite idx values the new
+ * parse still produces.  When a round is re-ingested after a review seat
+ * replacement (kusabi #248 follow-up), the record's findings are the
+ * REPLACEMENT review's -- the pre-replacement rows sit at idx values the new
+ * parse may no longer emit, and they would live in the store forever.  The
+ * caller deletes this round's rows, then re-inserts the current record's --
+ * the same delete-then-insert contract `deleteCursorTurnsForSession` uses --
+ * which is what makes a re-ingest converge instead of accumulating.  Matches
+ * on the round primary key (chain_id, round), the same granularity as the
+ * round-row upsert; other rounds and other chains are untouched.
+ *
+ * @param {import("node:sqlite").DatabaseSync} db
+ * @param {string} chainId
+ * @param {number} round
+ * @returns {number} rows deleted
+ */
+export function deleteFindingsForRound(db, chainId, round) {
+  const result = db.prepare(
+    "DELETE FROM finding WHERE chain_id = $chainId AND round = $round",
+  ).run({ chainId, round });
+  return Number(result.changes ?? 0);
 }
 
 // ---------------------------------------------------------------------------
