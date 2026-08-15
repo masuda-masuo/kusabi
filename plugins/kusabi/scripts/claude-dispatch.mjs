@@ -609,12 +609,32 @@ export function applySunabaProfile(sunabaEntry, profile) {
  * return its path.  The generated file is what `--mcp-config` points at, so
  * the claude session never sees the host config's other servers.
  *
- * @param {string} stateDir
+ * The file is per-dispatch, NOT per-cwd (kusabi #276): the caller passes the
+ * owning job's directory, so each dispatch's config lives at a path only it
+ * ever writes.  Two dispatches in the same cwd whose spawn windows overlap
+ * (a chain and a stand-alone task, or two tasks) therefore each hand their
+ * `claude` process the config their own pre-flight wrote — one dispatch's
+ * `?profile=` can never overwrite another's before the child has read it.
+ *
+ * Cleanup rule — explicit lifetime (kusabi #276): the config's lifetime is
+ * its job's.  It is written in pre-flight, before the job record exists (a
+ * missing or malformed `mcpServers.sunaba` entry must stay a loud throw,
+ * not a job that reaches `running`), but it lives inside the job's own
+ * directory from the moment of writing.  Nothing removes it, because
+ * nothing in kusabi removes job artifacts at all — a job directory is a
+ * permanent record.  That is the whole cleanup rule: no two dispatches
+ * share a path and no code deletes another job's directory, so a config
+ * belonging to a dispatch that has not yet spawned can never be removed by
+ * anyone.  A dispatch that throws between this write and the job record
+ * leaves a directory holding only this file; `listJobs` drops it, since it
+ * keeps only directories from which a job record actually loads.
+ *
+ * @param {string} dir - the owning job's directory (jobDir(stateDir, jobId)).
  * @param {object} sunabaEntry
  * @returns {string} Path of the generated config file.
  */
-export function writeClaudeMcpConfig(stateDir, sunabaEntry) {
-  const file = path.join(stateDir, "claude-mcp.json");
+export function writeClaudeMcpConfig(dir, sunabaEntry) {
+  const file = path.join(dir, "claude-mcp.json");
   writeJson(file, { mcpServers: { sunaba: sunabaEntry } });
   return file;
 }
@@ -2603,16 +2623,27 @@ export async function claudeDispatch(opts) {
   // The agent decides the sunaba tool profile: the generated config's URL
   // carries `?profile=<name>` so the session only ever loads that profile's
   // tool definitions (kusabi #274).  Agents with no profile (investigate,
-  // anything unknown) keep the full list.
+  // anything unknown) keep the full list.  Extraction and validation stay
+  // AHEAD of every other pre-flight step: a missing or malformed
+  // `mcpServers.sunaba` entry must fail the dispatch loudly before anything
+  // is written or spawned (kusabi #276).
   const sunabaEntry = applySunabaProfile(
     extractSunabaMcp(claudeMcpSourcePath()),
     sunabaProfileForAgent(opts.agent),
   );
-  const mcpConfigPath = writeClaudeMcpConfig(stateDir, sunabaEntry);
   const systemPrompt = readAgentSystemPrompt(opts.agent);
   const allowedTools = applyToolDenies(allowedToolsForAgent(opts.agent), opts.tools);
   const disallowedTools = disallowedToolsForAgent(opts.agent);
   const bin = claudeBin();
+  // The job id is minted here, in pre-flight, so the generated MCP config
+  // can be named after its job (kusabi #276): the file lives in the job's
+  // OWN directory, so two dispatches in the same cwd whose spawn windows
+  // overlap each hand their claude process a config file only they write —
+  // one dispatch's profile can never overwrite another's.  The write is
+  // deliberately the LAST pre-flight step, after every throw-capable check
+  // above has passed, so a loud failure never leaves a stray config behind.
+  const jobId = newJobId();
+  const mcpConfigPath = writeClaudeMcpConfig(jobDir(stateDir, jobId), sunabaEntry);
   const args = buildClaudeArgs({
     model: modelEntry,
     allowedTools,
@@ -2628,8 +2659,11 @@ export async function claudeDispatch(opts) {
   });
 
   // ---- job record (opencode-path shape + backend) ----
+  // `id` was already minted in pre-flight (the generated MCP config is named
+  // after the job, kusabi #276); the record is created here, as always, only
+  // after every loud pre-flight check has passed.
   const job = {
-    id: newJobId(),
+    id: jobId,
     kind: opts.kind || "task",
     title: opts.title || "",
     status: "running",
