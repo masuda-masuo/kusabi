@@ -1324,7 +1324,7 @@ describe("chain publish-demand warning", () => {
 describe("runChainDriver resume", () => {
   const BRIEF = "Implement X.\n\n## Deliverables\n- src/foo.js\n";
 
-  function fakeResumeCallTool({ statusOutput = " M src/foo.js\n" } = {}) {
+  function fakeResumeCallTool({ statusOutput = " M src/foo.js\n", headSha = "abc123" } = {}) {
     return async (toolName, params) => {
       if (toolName === "verify_in_container") {
         return { gate_passed: true };
@@ -1335,7 +1335,7 @@ describe("runChainDriver resume", () => {
       if (cmd.startsWith("cd /workspace &&") && cmd.includes("TMPIDX=")) {
         return { output: "ERROR_NO_INDEX\n" };
       }
-      if (cmd === "git rev-parse HEAD") return { output: "abc123\n" };
+      if (cmd === "git rev-parse HEAD") return { output: headSha + "\n" };
       if (cmd === "git status --porcelain") return { output: statusOutput };
       if (cmd === "git log --oneline -5") return { output: "abc123 latest change\n" };
       if (cmd === "git diff") return { output: "diff --git a/src/foo.js b/src/foo.js\n" };
@@ -2004,6 +2004,288 @@ describe("runChainDriver resume", () => {
     assert.equal(round1.verdictSource, "probe");
     assert.equal(round1.disposition.disposition, "escalate");
     assert.equal(round1.disposition.reason, "reviewer discarded the work");
+  });
+
+  // =======================================================================
+  // Lazy re-validation of RECORDED probe truth (kusabi #262)
+  // -----------------------------------------------------------------------
+  // A review-resume (interrupted round #153, or replacement review seat
+  // #248) derives its disposition from probe truth measured BEFORE the
+  // stop/escalate.  Between then and now the container worktree can have
+  // moved.  An accept CONSUMES that recorded truth, so it must re-measure on
+  // the current worktree before finalising; a rework must not, because the
+  // next round it buys re-measures everything anyway.
+  //
+  // The probe count is read off verify_in_container: a review-resume runs no
+  // probes of its own, and P2 issues exactly one call per probe phase on
+  // these fixtures (green gate → no tolerated re-run; red gate with
+  // `tests.full` → tests ran and failed, also no re-run).  So the call count
+  // IS the number of probe phases that ran.
+  // =======================================================================
+
+  // Round 1 implemented, probes P1-P4 green, then the review SEAT died
+  // mid-stream and the chain escalated on it (#248).  Recorded probe details
+  // are tagged so a fresh run is distinguishable from the recorded one.
+  function seatDeadRound() {
+    return {
+      round: 1,
+      reworkScope: "full",
+      implementJobId: "job-imp-1",
+      reviewJobId: "job-rev-1",
+      sessionID: "sess-1",
+      tierBefore: 0,
+      tierAfter: 0,
+      reworkCount: 0,
+      probesGreen: true,
+      probeResults: [
+        { probe: "P1: HEAD clean", passed: true, detail: "recorded before the escalate" },
+        { probe: "P2: verify gate", passed: true, detail: "recorded before the escalate" },
+        { probe: "P3: deliverables", passed: true, detail: "recorded before the escalate" },
+        { probe: "P4: smoke", passed: true, detail: "recorded before the escalate" },
+      ],
+      worktreeChanged: true,
+      verdict: "partial",
+      reviewParseable: true,
+      reviewPartial: true,
+      reviewFindingCount: 3,
+      disposition: {
+        disposition: "escalate",
+        reason: "partial review: stream ended before the verdict line",
+      },
+    };
+  }
+
+  // fakeResumeCallTool plus a verify_in_container counter, and a settable
+  // verify result so a test can degrade the worktree after the escalate.
+  // headSha drives what `git rev-parse HEAD` reports, so a test can move
+  // the fake worktree's HEAD; every sandbox_exec command is recorded in
+  // execCalls so a test can assert what did (and did not) run.
+  function probeCountingCallTool({ verifyResult = { gate_passed: true }, statusOutput, headSha } = {}) {
+    const base = fakeResumeCallTool({ statusOutput, headSha });
+    const verifyCalls = [];
+    const execCalls = [];
+    const fn = async (toolName, params) => {
+      if (toolName === "verify_in_container") {
+        verifyCalls.push(params);
+        return verifyResult;
+      }
+      if (toolName === "sandbox_exec") {
+        execCalls.push(params.commands[0]);
+      }
+      return base(toolName, params);
+    };
+    fn.verifyCalls = verifyCalls;
+    fn.execCalls = execCalls;
+    return fn;
+  }
+
+  it("re-runs the probes once before an accept from a resumed review and finalises it when they come back green (kusabi #262)", async () => {
+    const { chainDir } = makeChainState({
+      records: [seatDeadRound()],
+      controlOverrides: { status: "completed", round: 1, finishedAt: "2026-08-01T01:00:00.000Z" },
+    });
+    // The worktree still matches the recorded state: the fresh probes pass.
+    const callTool = probeCountingCallTool();
+    const dispatch = makeFakeDispatch(); // the replacement review approves
+
+    const text = await resumeChain({ chainDir, dispatch, callTool });
+
+    assert.match(text, /accepted at round 1/);
+    assert.equal(callTool.verifyCalls.length, 1, "the accept must re-measure the probes exactly once");
+
+    const round1 = readJson(path.join(chainDir, "round-1.json"));
+    assert.equal(round1.verdict, "approve");
+    assert.equal(round1.disposition.disposition, "accept");
+    assert.equal(round1.probesGreen, true);
+
+    // The record SHOWS the re-validation: the recorded truth is preserved
+    // beside the fresh results that replaced it.
+    assert.ok(round1.probesRevalidated, "the record must show that recorded-green was re-validated");
+    assert.equal(round1.probesRevalidated.probesGreen, true);
+    assert.match(round1.probesRevalidated.reason, /kusabi #262/);
+    assert.deepEqual(
+      round1.probesRevalidated.probeResults.map((p) => p.detail),
+      ["recorded before the escalate", "recorded before the escalate", "recorded before the escalate", "recorded before the escalate"],
+    );
+    // ...and the live probe fields are the FRESH run, not the recorded one.
+    assert.deepEqual(
+      round1.probeResults.map((p) => p.probe),
+      ["P1: HEAD clean", "P2: verify gate", "P3: deliverables", "P4: smoke"],
+    );
+    assert.ok(round1.probeResults.every((p) => p.passed));
+    assert.ok(
+      round1.probeResults.every((p) => p.detail !== "recorded before the escalate"),
+      "the live probe results must be the re-measured ones",
+    );
+  });
+
+  it("does not finalise an accept from a resumed review when the re-run comes back red; the red-probe disposition decides (kusabi #262)", async () => {
+    const { chainDir } = makeChainState({
+      records: [seatDeadRound()],
+      controlOverrides: { status: "completed", round: 1, finishedAt: "2026-08-01T01:00:00.000Z" },
+    });
+    // The worktree was degraded after the escalate: the verify gate now runs
+    // the tests and they fail (tests.full present => tests ran, one call).
+    const callTool = probeCountingCallTool({
+      verifyResult: {
+        gate_passed: false,
+        lint: [],
+        types: [],
+        tests: { full: { status: "fail", passed: 0, total: 1 } },
+      },
+    });
+    // The replacement review still approves.  The next round's implement hits
+    // provider exhaustion so the chain stops where the test can read it.
+    const dispatch = makeFakeDispatch({ implementStatus: "provider-error" });
+
+    const text = await resumeChain({ chainDir, dispatch, callTool });
+
+    assert.doesNotMatch(text, /accepted at round/);
+    assert.match(text, /implement provider exhausted/);
+    // Once and only once: the re-derived rework does not re-trigger the
+    // re-run, and round 2's implement dies before its own probes.
+    assert.equal(callTool.verifyCalls.length, 1);
+
+    const round1 = readJson(path.join(chainDir, "round-1.json"));
+    // The review approved, but the accept never finalised: approve + red
+    // probes is exactly what a normal round would derive.
+    assert.equal(round1.verdict, "approve");
+    assert.equal(round1.disposition.disposition, "rework");
+    assert.equal(round1.disposition.reason, "deterministic probes failed");
+    // Both truths are visible on the record: recorded green AND fresh red.
+    assert.equal(round1.probesRevalidated.probesGreen, true);
+    assert.equal(round1.probesRevalidated.recordedDisposition.disposition, "accept");
+    assert.equal(round1.probesGreen, false);
+    const freshP2 = round1.probeResults.find((p) => p.probe === "P2: verify gate");
+    assert.equal(freshP2.passed, false);
+  });
+
+  it("re-validation P1 compares and never resets: a moved HEAD is red, no git reset, accept does not finalise, recorded truth preserved (kusabi #262 follow-up)", async () => {
+    const { chainDir } = makeChainState({
+      records: [seatDeadRound()],
+      controlOverrides: { status: "completed", round: 1, finishedAt: "2026-08-01T01:00:00.000Z" },
+    });
+    // The worktree HEAD moved after the escalate (operator hand-edit,
+    // another job, a partial restore): rev-parse now reports a different
+    // SHA than the recorded baseSha.  Everything else still measures green.
+    const callTool = probeCountingCallTool({ headSha: "def456" });
+    const dispatch = makeFakeDispatch({ implementStatus: "provider-error" });
+
+    const text = await resumeChain({ chainDir, dispatch, callTool });
+
+    assert.doesNotMatch(text, /accepted at round/);
+    assert.match(text, /implement provider exhausted/);
+
+    // The probe phase issued NO reset: a measurement must not mutate the
+    // state it measures.  The fake container's HEAD is whatever the
+    // operator left it at — the re-validation never touched it.
+    assert.ok(
+      !callTool.execCalls.some((cmd) => cmd.startsWith("git reset")),
+      "the re-validation must never issue a git reset",
+    );
+    // Once and only once: the re-derived rework does not re-trigger the
+    // re-run, and round 2's implement dies before its own probes.
+    assert.equal(callTool.verifyCalls.length, 1);
+
+    const round1 = readJson(path.join(chainDir, "round-1.json"));
+    const freshP1 = round1.probeResults.find((p) => p.probe === "P1: HEAD clean");
+    assert.equal(freshP1.passed, false);
+    assert.match(freshP1.detail, /HEAD def456 != base abc123/);
+    assert.doesNotMatch(freshP1.detail, /reset/);
+    // The review approved, but the accept never finalised: approve + red
+    // probes is exactly what a normal round would derive — the same red
+    // disposition as the verify-gate failure test above.
+    assert.equal(round1.verdict, "approve");
+    assert.equal(round1.disposition.disposition, "rework");
+    assert.equal(round1.disposition.reason, "deterministic probes failed");
+    // Both truths are visible on the record: recorded green AND fresh red.
+    assert.equal(round1.probesRevalidated.probesGreen, true);
+    assert.equal(round1.probesRevalidated.recordedDisposition.disposition, "accept");
+    assert.equal(round1.probesGreen, false);
+    // The re-run could not measure worktreeChanged (no baseline on this
+    // path), so the recorded true stays true — it does not degrade to null.
+    assert.equal(round1.worktreeChanged, true);
+    assert.equal(round1.probesRevalidated.worktreeChanged, true);
+  });
+
+  it("re-runs no probes when a resumed review reworks — the next round re-measures anyway (kusabi #262)", async () => {
+    const partial = {
+      round: 3,
+      resumeMethod: { type: "continue_session" },
+      startedAt: "2026-08-01T00:00:00.000Z",
+      verdict: null,
+      probesGreen: true,
+      modelEntry: "fake/model",
+      modelVariant: null,
+      fallbacks: null,
+      implementJobId: "job-imp-3",
+      sessionID: "sess-3",
+      implementUsage: null,
+      tierBefore: 0,
+      reworkStrategyReason: null,
+      reworkCount: 0,
+      probeResults: [{ probe: "P1: HEAD clean", passed: true, detail: "recorded before the stop" }],
+      worktreeChanged: true,
+      interrupted: true,
+      interruptedAfter: "probes",
+    };
+    const { chainDir } = makeChainState({ records: [partial] });
+    const callTool = probeCountingCallTool();
+    // The resumed review finds a high-severity problem => rework; the next
+    // round's implement hits provider exhaustion so the chain stops there.
+    const dispatch = makeFakeDispatch({
+      reviewResult: JSON.stringify({
+        verdict: "needs-attention",
+        findings: [{ severity: "high", file: "src/foo.js", description: "fix the parser" }],
+      }),
+      implementStatus: "provider-error",
+    });
+
+    const text = await resumeChain({ chainDir, dispatch, callTool });
+
+    assert.match(text, /implement provider exhausted/);
+    assert.equal(callTool.verifyCalls.length, 0, "a rework disposition must buy no probe re-run");
+
+    const round3 = readJson(path.join(chainDir, "round-3.json"));
+    assert.equal(round3.disposition.disposition, "rework");
+    assert.equal(round3.probesRevalidated, undefined);
+    // The recorded probe truth is left exactly as the stop wrote it.
+    assert.equal(round3.probesGreen, true);
+    assert.deepEqual(round3.probeResults, [
+      { probe: "P1: HEAD clean", passed: true, detail: "recorded before the stop" },
+    ]);
+  });
+
+  it("leaves a NON-resumed round untouched: probes run once, in-round, and nothing is re-validated (kusabi #262)", async () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-chain-norevalidate-"));
+    const chainDir = path.join(tmp, "chains", "chain-test");
+    fs.mkdirSync(chainDir, { recursive: true });
+    writeChainControl(chainDir, {
+      chainId: "chain-test", container: "cid-1", pid: process.pid,
+      status: "running", round: 0, startedAt: new Date().toISOString(),
+    });
+    const callTool = probeCountingCallTool();
+
+    const text = await runChainDriver({
+      cwd: tmp, stateDir: tmp, chainDir, chainId: "chain-test", container: "cid-1",
+      model: "fake/model", modelChain: [["fake/model"]], maxRounds: 1,
+      brief: BRIEF, orchestrator: null, baseSha: "abc123", worktreeBaseline: null,
+      callTool,
+      dispatchWithFallback: makeFakeDispatch(),
+      keepServe: true,
+      signalReceived: () => false,
+      resume: null,
+    });
+
+    assert.match(text, /accepted at round 1/);
+    // The round's own P2 and nothing else: an accept whose probe truth was
+    // measured in-round never re-measures.
+    assert.equal(callTool.verifyCalls.length, 1);
+    const round1 = readJson(path.join(chainDir, "round-1.json"));
+    assert.equal(round1.disposition.disposition, "accept");
+    assert.equal(round1.probesRevalidated, undefined);
+
+    fs.rmSync(tmp, { recursive: true, force: true });
   });
 });
 
