@@ -4,6 +4,7 @@ description: Phase chain "review" worker. Streams an adversarial review of a PR 
 mode: primary
 permission:
   "*": deny
+  kaiba*: allow
   sunaba_sandbox_attach: allow
   sunaba_read_file_range: allow
   sunaba_search_in_container: allow

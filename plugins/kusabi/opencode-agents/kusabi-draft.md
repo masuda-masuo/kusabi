@@ -4,6 +4,7 @@ description: Phase chain "draft" worker. Duplicate check + new issue creation.
 mode: primary
 permission:
   "*": deny
+  kaiba*: allow
   sunaba_sandbox_attach: allow
   sunaba_read_file_range: allow
   sunaba_search_in_container: allow
