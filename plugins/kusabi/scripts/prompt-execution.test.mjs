@@ -1,12 +1,17 @@
 import { describe, it, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import {
   accumulateUsage,
   decidePermission,
   dispatchWithFallback,
   failedRoutes,
+  providerStatusFromError,
   resetFailedRoutes,
 } from "./prompt-execution.mjs";
+import { stateDirFor } from "./state-paths.mjs";
 
 // decidePermission — always returns "once"
 // ---------------------------------------------------------------------------
@@ -744,5 +749,455 @@ describe("classifyJobOutcome", () => {
       timeoutS: 300,
     });
     assert.equal(result.status, "completed");
+  });
+});
+// =========================================================================
+// providerStatusFromError — session.error provider classification (kusabi #233)
+// =========================================================================
+// The incident payload (2026-08-13): a session.error whose error object is
+// APIError-shaped with a structured `data.statusCode` — HTTP 401,
+// isRetryable: false, and NO retry events before it.  These unit tests pin
+// which payloads count as provider-scoped evidence (walk the tier) and
+// which keep today's `error` outcome (fail closed).
+
+const INCIDENT_401 = {
+  name: "APIError",
+  data: {
+    message: "Upstream request failed: [invalid_bearer_credential] Missing or invalid bearer credential",
+    statusCode: 401,
+    isRetryable: false,
+  },
+};
+
+describe("providerStatusFromError", () => {
+  it("recognises the incident 401 APIError payload", () => {
+    assert.deepEqual(providerStatusFromError(INCIDENT_401), {
+      statusCode: 401,
+      message: "Upstream request failed: [invalid_bearer_credential] Missing or invalid bearer credential",
+    });
+  });
+
+  it("recognises 403, 429 and every 5xx statusCode", () => {
+    for (const code of [403, 429, 500, 502, 503, 599]) {
+      const result = providerStatusFromError({
+        name: "APIError",
+        data: { statusCode: code, message: "upstream refused" },
+      });
+      assert.equal(result.statusCode, code);
+      assert.equal(result.message, "upstream refused");
+    }
+  });
+
+  it("rejects statusCodes outside the provider-failure ranges", () => {
+    for (const code of [0, 300, 400, 404, 418, 600, -1]) {
+      assert.equal(providerStatusFromError({ name: "APIError", data: { statusCode: code } }), null);
+    }
+  });
+
+  it("rejects a non-APIError name even with a provider statusCode", () => {
+    assert.equal(providerStatusFromError({ name: "SomeOtherError", data: { statusCode: 401 } }), null);
+    assert.equal(providerStatusFromError({ data: { statusCode: 401 } }), null);
+    assert.equal(providerStatusFromError({ name: null, data: { statusCode: 401 } }), null);
+  });
+
+  it("rejects missing, null or malformed data", () => {
+    assert.equal(providerStatusFromError({ name: "APIError" }), null);
+    assert.equal(providerStatusFromError({ name: "APIError", data: null }), null);
+    assert.equal(providerStatusFromError({ name: "APIError", data: "401" }), null);
+    assert.equal(providerStatusFromError({ name: "APIError", data: [] }), null);
+  });
+
+  it("rejects a non-numeric statusCode", () => {
+    assert.equal(providerStatusFromError({ name: "APIError", data: { statusCode: "401" } }), null);
+    assert.equal(providerStatusFromError({ name: "APIError", data: { statusCode: null } }), null);
+  });
+
+  it("rejects null, undefined and primitive payloads", () => {
+    assert.equal(providerStatusFromError(null), null);
+    assert.equal(providerStatusFromError(undefined), null);
+    assert.equal(providerStatusFromError("APIError"), null);
+    assert.equal(providerStatusFromError(401), null);
+  });
+
+  it("tolerates a missing or non-string data.message", () => {
+    assert.equal(providerStatusFromError({ name: "APIError", data: { statusCode: 429 } }).message, "");
+    assert.equal(providerStatusFromError({ name: "APIError", data: { statusCode: 429, message: 42 } }).message, "");
+  });
+
+  it("tolerates extra payload fields (isRetryable, retryAfter, ...)", () => {
+    const result = providerStatusFromError({
+      name: "APIError",
+      data: { message: "Upstream request failed", statusCode: 401, isRetryable: false, retryAfter: 5 },
+    });
+    assert.equal(result.statusCode, 401);
+  });
+});
+
+// =========================================================================
+// dispatchWithFallback — session.error-shaped provider failure advances the
+// walk within the dispatch only (kusabi #233)
+// =========================================================================
+// The fake runner below returns exactly what runPrompt now produces for the
+// incident stream: a provider-error job whose `retry` record carries the
+// structured HTTP status (reason "http-401"), attempt 0, and terminal false.
+
+describe("dispatchWithFallback — non-retryable provider failure (session.error shape)", () => {
+  beforeEach(() => {
+    resetFailedRoutes();
+  });
+
+  afterEach(() => {
+    resetFailedRoutes();
+  });
+
+  it("advances to the next route of the same tier, records the fallback and the reason", async () => {
+    let callCount = 0;
+    const fakeRunner = async () => {
+      callCount++;
+      if (callCount === 1) {
+        return fakeResult("provider-error", {
+          retry: {
+            reason: "http-401",
+            message: "Upstream request failed: [invalid_bearer_credential] Missing or invalid bearer credential",
+            attempt: 0,
+            count: 0,
+            terminal: false,
+          },
+        });
+      }
+      return fakeResult("completed", { resultText: "done via route two" });
+    };
+
+    const { job, resultText } = await dispatchWithFallback({
+      _runPrompt: fakeRunner,
+      tiers: [["route/free", "route/go"]],
+      round: 1,
+      kind: "task",
+      promptText: "test",
+    });
+
+    assert.equal(job.status, "completed");
+    assert.equal(resultText, "done via route two");
+    assert.equal(job.modelEntry, "route/go");
+    // Each route attempted exactly once — no same-route retry.
+    assert.equal(callCount, 2);
+    // No route poisoning: the 401 route is not remembered across dispatches.
+    assert.equal(failedRoutes.size, 0);
+    assert.ok(Array.isArray(job.fallbacks));
+    assert.equal(job.fallbacks.length, 1);
+    assert.deepEqual(job.fallbacks[0], {
+      from: "route/free",
+      to: "route/go",
+      reason: "http-401",
+      attempt: 0,
+      message: "Upstream request failed: [invalid_bearer_credential] Missing or invalid bearer credential",
+    });
+  });
+
+  it("a plain error (no structured status) keeps today's behavior: no walk", async () => {
+    let callCount = 0;
+    const fakeRunner = async () => {
+      callCount++;
+      return fakeResult("error", { error: '{"message":"something broke"}' });
+    };
+
+    const { job } = await dispatchWithFallback({
+      _runPrompt: fakeRunner,
+      tiers: [["route/free", "route/go"]],
+      round: 1,
+      kind: "task",
+      promptText: "test",
+    });
+
+    assert.equal(job.status, "error");
+    assert.equal(callCount, 1, "the second route must not be tried");
+    assert.equal(job.fallbacks, null);
+  });
+});
+
+// =========================================================================
+// end-to-end: non-retryable provider failure walks the tier (kusabi #233)
+// =========================================================================
+// runPrompt is driven through dispatchWithFallback against a spawned fake
+// `opencode serve` (same pattern as serve-lifecycle.test.mjs): OPENCODE_BIN
+// points at a script that speaks just enough of the HTTP + SSE protocol.
+// The first session it creates receives the scripted session.error (no
+// retry events — the incident's exact shape); later sessions idle out with
+// a final assistant message so the walk's second route completes.  The
+// fake serve logs every session creation and prompt_async call so the
+// attempt count per route is asserted from the wire, not from the code.
+
+function fakeServeSource({ firstError }) {
+  return `#!/usr/bin/env node
+import http from "node:http";
+import fs from "node:fs";
+
+const argv = process.argv.slice(2);
+const port = Number(argv[argv.indexOf("--port") + 1]);
+const sessions = [];
+let nextSession = 0;
+const log = process.env.KUSABI_TEST_LOG;
+
+const FIRST_ERROR = ${JSON.stringify(firstError)};
+
+function sse(res, event) {
+  res.write("data: " + JSON.stringify(event) + "\\n\\n");
+}
+
+const server = http.createServer((req, res) => {
+  res.on("error", () => {});
+  const url = new URL(req.url, "http://127.0.0.1:" + port);
+  const chunks = [];
+  req.on("data", (c) => chunks.push(c));
+  req.on("end", () => {
+    if (req.method === "GET" && url.pathname === "/session") {
+      // Health probe (ensureServer / serverHealthy).
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end("[]");
+      return;
+    }
+    if (req.method === "POST" && url.pathname === "/session") {
+      const id = "ses-" + (++nextSession);
+      sessions.push({ id, outcome: nextSession === 1 ? "error" : "idle", emitted: false });
+      if (log) fs.appendFileSync(log, "create " + id + "\\n");
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ id }));
+      return;
+    }
+    const segs = url.pathname.split("/");
+    const sessionId = segs[2];
+    if (req.method === "POST" && segs[3] === "prompt_async") {
+      if (log) fs.appendFileSync(log, "prompt " + sessionId + "\\n");
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end("{}");
+      return;
+    }
+    if (req.method === "POST" && segs[3] === "abort") {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end("{}");
+      return;
+    }
+    if (req.method === "GET" && segs[3] === "message") {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify([
+        { info: { role: "assistant" }, parts: [{ type: "text", text: "survived via route two" }] },
+      ]));
+      return;
+    }
+    if (req.method === "GET" && url.pathname === "/event") {
+      res.writeHead(200, { "content-type": "text/event-stream" });
+      const session = sessions[sessions.length - 1];
+      if (session && !session.emitted) {
+        session.emitted = true;
+        const props = { sessionID: session.id };
+        if (session.outcome === "error") {
+          sse(res, { type: "session.error", properties: { ...props, error: FIRST_ERROR } });
+        } else {
+          sse(res, { type: "session.idle", properties: props });
+        }
+        res.end();
+        return;
+      }
+      // Already emitted (or nothing yet): hold the connection open instead
+      // of ending it, so a reconnect can never spin on re-emitted events.
+      return;
+    }
+    res.writeHead(404, { "content-type": "application/json" });
+    res.end("{}");
+  });
+});
+server.listen(port, "127.0.0.1");
+setInterval(() => {}, 1000);
+`;
+}
+
+function incidentServeContext({ firstError }) {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-233-test-"));
+  const binPath = path.join(tmp, "fake-serve.mjs");
+  fs.writeFileSync(binPath, fakeServeSource({ firstError }), "utf8");
+  fs.chmodSync(binPath, 0o755);
+  const stateRoot = path.join(tmp, "state");
+  const cwd = path.join(tmp, "cwd");
+  fs.mkdirSync(cwd, { recursive: true });
+  const testLog = path.join(tmp, "requests.log");
+  fs.writeFileSync(testLog, "", "utf8");
+  const saved = {
+    OPENCODE_BIN: process.env.OPENCODE_BIN,
+    KUSABI_STATE_DIR: process.env.KUSABI_STATE_DIR,
+    KUSABI_SERVE_READY_TIMEOUT_MS: process.env.KUSABI_SERVE_READY_TIMEOUT_MS,
+    KUSABI_TEST_LOG: process.env.KUSABI_TEST_LOG,
+  };
+  // Set env first: stateDirFor hashes cwd under KUSABI_STATE_DIR, so it
+  // must see the temp root or the returned paths point at the real root.
+  process.env.OPENCODE_BIN = binPath;
+  process.env.KUSABI_STATE_DIR = stateRoot;
+  process.env.KUSABI_SERVE_READY_TIMEOUT_MS = "8000";
+  process.env.KUSABI_TEST_LOG = testLog;
+  const stateDir = stateDirFor(cwd);
+  return {
+    tmp,
+    cwd,
+    stateDir,
+    testLog,
+    restore() {
+      for (const [key, value] of Object.entries(saved)) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+    },
+    killAll() {
+      try {
+        const rec = JSON.parse(fs.readFileSync(path.join(stateDir, "server.json"), "utf8"));
+        try { process.kill(rec.pid, "SIGKILL"); } catch { /* already gone */ }
+      } catch { /* no record written */ }
+    },
+    rm() {
+      try { fs.rmSync(tmp, { recursive: true, force: true }); } catch { /* best-effort */ }
+    },
+  };
+}
+
+function loadJobRecords(stateDir) {
+  return fs
+    .readdirSync(path.join(stateDir, "jobs"))
+    .map((id) => JSON.parse(fs.readFileSync(path.join(stateDir, "jobs", id, "job.json"), "utf8")));
+}
+
+function requestLogLines(testLog) {
+  return fs.readFileSync(testLog, "utf8").trim().split("\n");
+}
+
+function dispatchIncidentOpts(cwd, title) {
+  return {
+    cwd,
+    tiers: [["opencode/deepseek-v4-flash-free:max", "opencode-go/deepseek-v4-flash:max"]],
+    round: 1,
+    kind: "task",
+    title,
+    promptText: "review this",
+    timeoutS: 30,
+    watchdogS: 0,
+  };
+}
+
+describe("dispatchWithFallback — end-to-end against a fake serve (kusabi #233)", () => {
+  beforeEach(() => {
+    resetFailedRoutes();
+  });
+
+  afterEach(() => {
+    resetFailedRoutes();
+  });
+
+  it("the incident stream (401 APIError session.error, no retry events) advances to the tier's second route", async () => {
+    const ctx = incidentServeContext({ firstError: INCIDENT_401 });
+    try {
+      const { job, resultText } = await dispatchWithFallback(dispatchIncidentOpts(ctx.cwd, "incident reproduction"));
+
+      // The walk advanced to the surviving route in the same tier instead
+      // of finishing `error` on the first one.
+      assert.equal(job.status, "completed");
+      assert.equal(job.modelEntry, "opencode-go/deepseek-v4-flash:max");
+      assert.equal(resultText, "survived via route two");
+
+      // The job record carries the fallback trail and the reason.
+      assert.ok(Array.isArray(job.fallbacks));
+      assert.equal(job.fallbacks.length, 1);
+      assert.equal(job.fallbacks[0].from, "opencode/deepseek-v4-flash-free:max");
+      assert.equal(job.fallbacks[0].to, "opencode-go/deepseek-v4-flash:max");
+      assert.equal(job.fallbacks[0].reason, "http-401");
+      assert.equal(job.fallbacks[0].attempt, 0);
+      assert.match(job.fallbacks[0].message, /invalid_bearer_credential/);
+
+      // No same-route retry: each route exactly once, two distinct sessions.
+      assert.deepEqual(requestLogLines(ctx.testLog), [
+        "create ses-1", "prompt ses-1",
+        "create ses-2", "prompt ses-2",
+      ]);
+
+      // No route poisoning: nothing crossed into failedRoutes.
+      assert.equal(failedRoutes.size, 0);
+
+      // The failed route's own record: provider-error, retry carries the
+      // structured status, terminal false.
+      const records = loadJobRecords(ctx.stateDir);
+      assert.equal(records.length, 2);
+      const failedRec = records.find((r) => r.status === "provider-error");
+      const okRec = records.find((r) => r.status === "completed");
+      assert.ok(failedRec, "the first route's record must be provider-error");
+      assert.ok(okRec, "the second route's record must be completed");
+      assert.equal(failedRec.retry.reason, "http-401");
+      assert.equal(failedRec.retry.attempt, 0);
+      assert.equal(failedRec.retry.terminal, false);
+
+      // The audit trail shows the provider-error and fallback events with
+      // the reason on the failed route's stream.
+      const events = fs.readFileSync(path.join(ctx.stateDir, "jobs", failedRec.id, "events.ndjson"), "utf8")
+        .trim().split("\n").map(JSON.parse);
+      const types = events.map((e) => e.type);
+      assert.ok(types.includes("session.error"));
+      assert.ok(types.includes("companion.provider-error"));
+      const fbEvent = events.find((e) => e.type === "companion.fallback");
+      assert.equal(fbEvent.from, "opencode/deepseek-v4-flash-free:max");
+      assert.equal(fbEvent.to, "opencode-go/deepseek-v4-flash:max");
+      assert.equal(fbEvent.reason, "http-401");
+    } finally {
+      ctx.killAll();
+      ctx.restore();
+      ctx.rm();
+    }
+  });
+
+  it("403 / 429 / 5xx structured payloads advance the walk the same way", async () => {
+    for (const code of [403, 429, 500, 503]) {
+      const ctx = incidentServeContext({
+        firstError: { name: "APIError", data: { statusCode: code, message: `upstream refused ${code}` } },
+      });
+      try {
+        const { job } = await dispatchWithFallback(dispatchIncidentOpts(ctx.cwd, `code ${code}`));
+
+        assert.equal(job.status, "completed", `code ${code} must walk to the second route`);
+        assert.equal(job.modelEntry, "opencode-go/deepseek-v4-flash:max");
+        assert.equal(job.fallbacks.length, 1);
+        assert.equal(job.fallbacks[0].reason, `http-${code}`);
+        assert.deepEqual(requestLogLines(ctx.testLog), [
+          "create ses-1", "prompt ses-1",
+          "create ses-2", "prompt ses-2",
+        ]);
+        assert.equal(failedRoutes.size, 0);
+      } finally {
+        ctx.killAll();
+        ctx.restore();
+        ctx.rm();
+      }
+    }
+  });
+
+  it("a session.error WITHOUT a structured status keeps today's error outcome and stops the walk", async () => {
+    const ctx = incidentServeContext({ firstError: { message: "something broke" } });
+    try {
+      const { job } = await dispatchWithFallback(dispatchIncidentOpts(ctx.cwd, "plain error"));
+
+      // Unchanged behavior: status `error`, no fallback trail, no walk.
+      assert.equal(job.status, "error");
+      assert.equal(job.fallbacks, null);
+      assert.deepEqual(requestLogLines(ctx.testLog), [
+        "create ses-1", "prompt ses-1",
+      ]);
+      assert.equal(failedRoutes.size, 0);
+
+      const records = loadJobRecords(ctx.stateDir);
+      assert.equal(records.length, 1);
+      const events = fs.readFileSync(path.join(ctx.stateDir, "jobs", records[0].id, "events.ndjson"), "utf8")
+        .trim().split("\n").map(JSON.parse);
+      const types = events.map((e) => e.type);
+      assert.ok(types.includes("session.error"));
+      assert.ok(!types.includes("companion.provider-error"));
+      assert.ok(!types.includes("companion.fallback"));
+    } finally {
+      ctx.killAll();
+      ctx.restore();
+      ctx.rm();
+    }
   });
 });

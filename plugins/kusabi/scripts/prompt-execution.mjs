@@ -129,6 +129,42 @@ export function classifyJobOutcome({
   return { status: "completed", error: null };
 }
 
+/**
+ * Extract a structured provider status from a session.error payload, or null.
+ *
+ * Remote provider failures reach us as `session.error` events whose error
+ * object is APIError-shaped: `{ name: "APIError", data: { statusCode, ... } }`.
+ * A numeric `data.statusCode` in the provider-failure ranges (401, 403, 429,
+ * 5xx) is provider-scoped evidence: the ROUTE could not do the work, which
+ * says nothing about the next route in the same tier (different credentials,
+ * different provider), so the caller may classify the job `provider-error`
+ * and let dispatchWithFallback advance the walk.
+ *
+ * Everything else returns null — local caller errors, non-APIError shapes,
+ * unparseable payloads, statuses outside the ranges — and the job keeps
+ * today's `error` classification.  Absence of evidence is not provider
+ * evidence; this deliberately fails closed toward current behavior.
+ *
+ * @param {unknown} error  — the session.error payload (`properties.error`).
+ * @returns {{ statusCode: number, message: string }|null}
+ */
+export function providerStatusFromError(error) {
+  if (!error || typeof error !== "object") return null;
+  if (error.name !== "APIError") return null;
+  const data = error.data;
+  if (!data || typeof data !== "object") return null;
+  const { statusCode } = data;
+  if (typeof statusCode !== "number") return null;
+  const isProviderStatus =
+    statusCode === 401 || statusCode === 403 || statusCode === 429 ||
+    (statusCode >= 500 && statusCode <= 599);
+  if (!isProviderStatus) return null;
+  return {
+    statusCode,
+    message: typeof data.message === "string" ? data.message : "",
+  };
+}
+
 // =========================================================================
 // failed-route memo — process-scoped, survives rounds of one chain run
 // =========================================================================
@@ -634,7 +670,33 @@ export async function runPrompt({ cwd, kind, title, promptText, agent, model, se
           } else if (type === "session.idle") {
             sawIdle = true;
           } else if (type === "session.error") {
-            sessionError = JSON.stringify(event?.properties?.error ?? event?.properties ?? {}).slice(0, 500);
+            const rawError = event?.properties?.error ?? event?.properties ?? null;
+            const providerStatus = providerStatusFromError(rawError);
+            if (providerStatus) {
+              // A remote provider failure with a structured status is
+              // route-scoped: this route cannot do the work, which says
+              // nothing about the next route in the same tier.  Classify
+              // provider-error so dispatchWithFallback advances the walk —
+              // without a same-route retry (the provider's isRetryable
+              // verdict is respected) and without poisoning the route for
+              // later dispatches (terminal: false).
+              providerError = {
+                reason: `http-${providerStatus.statusCode}`,
+                message: providerStatus.message,
+                attempt: 0,
+                count: 0,
+                terminal: false,
+              };
+              appendEvent(stateDir, job.id, {
+                type: "companion.provider-error",
+                reason: providerError.reason,
+                attempt: 0,
+                message: providerStatus.message,
+                terminal: false,
+              });
+            } else {
+              sessionError = JSON.stringify(rawError ?? {}).slice(0, 500);
+            }
           }
           saveJob(stateDir, job);
           if (sawIdle || sessionError || providerError) break;

@@ -150,7 +150,9 @@ tiers, with the `:max` reasoning variant pinned on every route:
     tier 1: opencode-go/deepseek-v4-pro:max
 
 Tier 0's two routes are interchangeable — the same quality, tried in order
-when one is unavailable. That is capacity fallback, not a quality step: with
+when one is unavailable; a non-retryable provider failure (for example an
+HTTP 401 with a structured provider status) also advances the walk to the
+next route in the same tier. That is capacity fallback, not a quality step: with
 the default ladder, rounds 1 and 2 both run on tier 0 and the second tier is
 first reached at round 3 (see "Chain round escalation"). The first route of
 the current tier is used unless overridden.
