@@ -396,6 +396,25 @@ describe("parseChainRecord — retried review rounds (reviewFirstUsage)", () => 
   });
 });
 
+describe("parseChainRecord \u2014 archived review seats (kusabi #248 follow-up)", () => {
+  it("round rows carry the archived seat count; an absent field stores NULL, an empty array stores 0", () => {
+    const parsed = parseChainRecord({
+      chainId: "chain-seats",
+      records: [
+        { round: 1, reviewSeatFailures: [{ seat: 1 }, { seat: 2 }] },
+        { round: 2 },
+        { round: 3, reviewSeatFailures: [] },
+      ],
+    });
+    assert.equal(parsed.roundRows[0].reviewSeatFailures, 2);
+    // Pre-#248 records have no field at all: NULL, never 0 (readers apply
+    // the NULL-means-0 contract at read time -- the backend TEXT precedent).
+    assert.equal(parsed.roundRows[1].reviewSeatFailures, null);
+    // An empty array is a real measurement: zero archived seats.
+    assert.equal(parsed.roundRows[2].reviewSeatFailures, 0);
+  });
+});
+
 // ---------------------------------------------------------------------------
 // ingestChainDirectory — filesystem + database integration
 // ---------------------------------------------------------------------------
@@ -493,6 +512,84 @@ describe("ingestChainDirectory", () => {
     const result = ingestChainDirectory(db, path.join(os.tmpdir(), "does-not-exist-" + Date.now()));
     assert.equal(result.workspacesScanned, 0);
     assert.equal(result.chainsIngested, 0);
+  });
+
+  // kusabi #248 follow-up: a chain re-ingested after a review seat
+  // replacement.  The same chain id and round number come back with the
+  // REPLACEMENT review's findings (F2) plus the archived seat -- the finding
+  // rows must be exactly F2 (no stale pre-replacement rows), the round row
+  // must not be duplicated, and the failed-seat count must be queryable.
+  it("re-ingesting a replaced round replaces its finding rows, records the failed-seat count, and never duplicates the round", () => {
+    const stateRoot = makeTempStateRoot();
+    const chainId = "chain-reingest-seat";
+    // First ingest: the PRE-replacement record -- findings F1 (3 findings),
+    // no reviewSeatFailures yet (the seat is still alive on the record).
+    const pre = {
+      chainId,
+      modelChain: [["fake/model"]],
+      maxRounds: 4,
+      brief: MODERN_BRIEF,
+      baseSha: "abc123",
+      records: [
+        {
+          round: 1,
+          startedAt: "2026-08-01T10:00:00.000Z",
+          disposition: { disposition: "escalate" },
+          findings: [
+            { severity: "medium", title: "pre-finding-1", file: "src/a.mjs" },
+            { severity: "high", title: "pre-finding-2", file: "src/b.mjs" },
+            { severity: "low", title: "pre-finding-3", file: "src/c.mjs" },
+          ],
+        },
+      ],
+    };
+    writeChainDir(stateRoot, "ws1", chainId, pre);
+
+    const db = openMetricsDb(":memory:");
+    const first = ingestChainDirectory(db, stateRoot);
+    assert.equal(first.chainsIngested, 1);
+    assert.equal(first.findingsIngested, 3);
+    assert.equal(countRows(db, "round"), 1);
+    assert.equal(countRows(db, "finding"), 3);
+    const preRound = db.prepare("SELECT review_seat_failures FROM round").get();
+    assert.equal(preRound.review_seat_failures, null); // absent field, not 0
+
+    // The seat died; chain-resume bought a replacement seat for the SAME
+    // round.  The replacement review overrode the record's findings (F2 --
+    // two findings, one fewer than F1, so stale idx rows would survive
+    // without the delete) and the archived seat is recorded on the record.
+    const post = {
+      ...pre,
+      records: [
+        {
+          ...pre.records[0],
+          reviewSeatFailures: [{ seat: 1, reviewJobId: "job-rev-1", verdict: "partial" }],
+          findings: [
+            { severity: "low", title: "post-finding-1", file: "src/a.mjs" },
+            { severity: "low", title: "post-finding-2", file: "src/d.mjs" },
+          ],
+        },
+      ],
+    };
+    writeChainDir(stateRoot, "ws1", chainId, post);
+
+    const second = ingestChainDirectory(db, stateRoot);
+    assert.equal(second.filesSkippedUnchanged, 0, "the rewritten chain.json must force a re-read");
+    assert.equal(second.findingsIngested, 2);
+
+    // Finding rows are EXACTLY F2 -- no stale pre-replacement rows survive.
+    assert.equal(countRows(db, "finding"), 2);
+    const titles = db.prepare("SELECT title FROM finding ORDER BY idx").all().map((r) => r.title);
+    assert.deepEqual(titles, ["post-finding-1", "post-finding-2"]);
+
+    // The round is not duplicated, and the failed-seat count is queryable.
+    assert.equal(countRows(db, "round"), 1);
+    const roundRow = db.prepare("SELECT chain_id, round, review_seat_failures FROM round").get();
+    assert.equal(roundRow.chain_id, chainId);
+    assert.equal(roundRow.round, 1);
+    assert.equal(roundRow.review_seat_failures, 1);
+
+    fs.rmSync(stateRoot, { recursive: true, force: true });
   });
 });
 

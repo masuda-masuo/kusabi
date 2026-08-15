@@ -778,10 +778,29 @@ export function renderChainShow(chain, rounds, unreadable = [], control = null) 
       }
     }
 
+    // Review seats that died mid-stream and were replaced by chain-resume
+    // (kusabi #248).  Rendered BEFORE the verdict, in the order they were
+    // bought, so the round reads chronologically: each failed seat with the
+    // escalate it caused, then the verdict the replacement seat produced.
+    // Without this the round would show only the replacement's verdict and
+    // read as a clean single review.
+    const seatFailures = Array.isArray(round.reviewSeatFailures) ? round.reviewSeatFailures : [];
+    for (const seat of seatFailures) {
+      if (!seat || typeof seat !== "object") continue;
+      const seatNo = seat.seat ?? "?";
+      const seatDisp = seat.disposition?.disposition
+        ? `, disposition: ${seat.disposition.disposition}`
+        : "";
+      lines.push(`  review seat ${seatNo}: FAILED (verdict: ${seat.verdict ?? "?"}${seatDisp}) — replaced by chain-resume`);
+    }
+
     // Verdict
     if (round.verdict) {
       const parseableNote = round.reviewParseable === false ? " (unparseable)" : "";
-      lines.push(`  verdict: ${round.verdict}${parseableNote}`);
+      // Name the seat the verdict came from, so a replacement verdict is
+      // never mistaken for the round's first and only review.
+      const seatNote = seatFailures.length > 0 ? ` (replacement seat ${seatFailures.length + 1})` : "";
+      lines.push(`  verdict: ${round.verdict}${parseableNote}${seatNote}`);
     }
 
     // Disposition + reason
@@ -1159,6 +1178,13 @@ export function renderReviewRecord(record) {
     const changed = (round.worktreeChanged === undefined || round.worktreeChanged === null)
       ? "unknown" : round.worktreeChanged ? "yes" : "no";
     lines.push(`Round ${roundNo} — model: ${model}, verdict: ${verdict} (${verdictSource}), disposition: ${roundDisposition}, changed: ${changed}`);
+    // Replacement review seats (kusabi #248): the verdict above came from the
+    // LAST seat this round bought.  A seat that died mid-stream is named here
+    // so the postable record cannot read as a single clean review.
+    for (const seat of (Array.isArray(round.reviewSeatFailures) ? round.reviewSeatFailures : [])) {
+      if (!seat || typeof seat !== "object") continue;
+      lines.push(`  review seat ${seat.seat ?? "?"}: FAILED (verdict: ${seat.verdict ?? "?"}) — replaced by chain-resume`);
+    }
     const probes = Array.isArray(round.probeResults) ? round.probeResults : [];
     for (const probe of probes) {
       lines.push("  " + reviewRecordProbeLine(probe));

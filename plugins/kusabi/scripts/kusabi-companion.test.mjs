@@ -1895,6 +1895,116 @@ describe("runChainDriver resume", () => {
 
     fs.rmSync(tmp, { recursive: true, force: true });
   });
+
+  // ---- replacement review seat: loud refusal on an empty change set
+  // (kusabi #248 follow-up) ----
+  // A seat-replacement resume whose container no longer holds the round's
+  // changes (fresh clone, reset worktree) must refuse loudly instead of
+  // flowing into the empty-change-set review skip and dead-ending in a
+  // silent discard-escalate.  Fixture mirrors chain-phases.test.mjs's
+  // deadSeatRound: round 1 implement complete, probes P1-P4 green, the
+  // review seat died mid-stream (`partial`), the chain escalated on that
+  // seat failure and finished normally (control status "completed").
+  it("refuses a seat-replacement resume whose change set is empty, before any dispatch, leaving the record untouched", async () => {
+    const seatDeadRecord = {
+      round: 1,
+      reworkScope: "full",
+      implementJobId: "job-imp-1",
+      reviewJobId: "job-rev-1",
+      sessionID: "sess-1",
+      tierBefore: 0,
+      tierAfter: 0,
+      reworkCount: 0,
+      probesGreen: true,
+      probeResults: [
+        { probe: "P1: HEAD clean", passed: true, detail: "HEAD matches base abc123" },
+        { probe: "P2: verify gate", passed: true, detail: "{}" },
+        { probe: "P3: deliverables", passed: true, detail: "touches declared deliverables" },
+        { probe: "P4: smoke", passed: true, detail: "all smoke entries exited 0" },
+      ],
+      worktreeChanged: true,
+      verdict: "partial",
+      reviewParseable: true,
+      reviewPartial: true,
+      reviewFindingCount: 3,
+      disposition: {
+        disposition: "escalate",
+        reason: "partial review: stream ended before the verdict line",
+      },
+    };
+    const { chainDir } = makeChainState({
+      records: [seatDeadRecord],
+      controlOverrides: { status: "completed", round: 1, finishedAt: "2026-08-01T01:00:00.000Z" },
+    });
+    const dispatch = makeFakeDispatch();
+    // An empty worktree: `git status --porcelain` reports nothing, so the
+    // collected change set is empty and the review machinery would skip.
+    let refusal = null;
+    try {
+      await resumeChain({ chainDir, dispatch, statusOutput: "" });
+    } catch (err) {
+      refusal = err;
+    }
+    assert.ok(refusal, "seat-replacement resume with an empty change set must refuse");
+    // The named refusal: the container no longer holds the round's changes,
+    // a replacement review has nothing to review, re-run the chain instead.
+    assert.match(refusal.message, /cannot resume chain chain-test with a replacement review seat/);
+    assert.match(refusal.message, /no longer holds round 1's changes/);
+    assert.match(refusal.message, /nothing to review/);
+    assert.match(refusal.message, /Re-run the chain instead/);
+    // No review dispatch happens -- no job at all was dispatched.
+    assert.equal(dispatch.calls.length, 0, "no dispatch may happen on the refusal path");
+
+    // The chain record does not claim a review happened: nothing was
+    // persisted (no round-N.json appears) and chain.json still carries the
+    // seat-failure escalate -- not a discard-escalate.
+    assert.equal(fs.existsSync(path.join(chainDir, "round-1.json")), false, "no round record may be written on the refusal path");
+    const chainJson = readJson(path.join(chainDir, "chain.json"));
+    assert.equal(chainJson.records.length, 1);
+    assert.equal(chainJson.records[0].disposition.disposition, "escalate");
+    assert.equal(chainJson.records[0].disposition.reason, "partial review: stream ended before the verdict line");
+    assert.equal(chainJson.records[0].reviewSeatFailures, undefined, "the seat is not archived on the refusal path");
+    assert.equal(chainJson.records[0].verdict, "partial");
+  });
+
+  // The refusal is seat-replacement-only (kusabi #248 follow-up): an
+  // INTERRUPTED round (#153) legitimately reviews whatever the worktree
+  // holds -- an empty change set there keeps the pre-existing behaviour
+  // (probe-sourced discard -> escalate), never the refusal.
+  it("does NOT refuse an interrupted round (#153) with an empty change set -- pre-existing discard-escalate stands", async () => {
+    const partial = {
+      round: 1,
+      resumeMethod: { type: "continue_session" },
+      startedAt: "2026-08-01T00:00:00.000Z",
+      verdict: null,
+      probesGreen: true,
+      modelEntry: "fake/model",
+      modelVariant: null,
+      fallbacks: null,
+      implementJobId: "job-imp-1",
+      sessionID: "sess-1",
+      implementUsage: { available: true, input: 1, output: 1, reasoning: 0, cacheRead: 0, cacheWrite: 0, cost: 0.01 },
+      tierBefore: 0,
+      reworkStrategyReason: null,
+      reworkCount: 0,
+      probeResults: [{ probe: "P1: HEAD clean", passed: true, detail: "ok" }],
+      worktreeChanged: true,
+      interrupted: true,
+      interruptedAfter: "probes",
+    };
+    const { chainDir } = makeChainState({ records: [partial] });
+    const dispatch = makeFakeDispatch();
+
+    const text = await resumeChain({ chainDir, dispatch, statusOutput: "" });
+
+    assert.match(text, /escalated at round 1: reviewer discarded the work/);
+    assert.equal(dispatch.calls.length, 0); // skip path: no review job dispatched
+    const round1 = readJson(path.join(chainDir, "round-1.json"));
+    assert.equal(round1.verdict, "discard");
+    assert.equal(round1.verdictSource, "probe");
+    assert.equal(round1.disposition.disposition, "escalate");
+    assert.equal(round1.disposition.reason, "reviewer discarded the work");
+  });
 });
 
 // =========================================================================

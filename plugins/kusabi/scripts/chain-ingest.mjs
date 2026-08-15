@@ -48,6 +48,7 @@ import {
   upsertSourceFile,
   isSourceFileUnchanged,
   getSourceFile,
+  deleteFindingsForRound,
 } from "./metrics-db.mjs";
 
 function toBoolInt(v) {
@@ -57,18 +58,22 @@ function toBoolInt(v) {
 }
 
 /**
- * Sum one usage field across the final and first review attempts.  Each side
- * contributes only when its usage object is usable (available === true,
- * checked by the caller) and the field is a number \u2014 the same guard style as
- * the pre-retry columns.  When neither side contributes the result is null
- * (the old single-attempt value), so a round without a retry is
- * byte-for-byte identical to before.
+ * Sum one usage field across every review attempt a round made: the final
+ * attempt, the unparseable-retry's first attempt, and any review SEAT that
+ * died and was replaced by chain-resume (kusabi #248).  Each side contributes
+ * only when its usage object is usable (available === true, checked by the
+ * caller) and the field is a number -- the same guard style as the pre-retry
+ * columns.  When nothing contributes the result is null (the old
+ * single-attempt value), so a round with a single review is byte-for-byte
+ * identical to before.
  */
-function usageFieldSum(usage, firstUsage, field) {
-  const value = usage && typeof usage[field] === "number" ? usage[field] : null;
-  const firstValue = firstUsage && typeof firstUsage[field] === "number" ? firstUsage[field] : null;
-  if (value === null && firstValue === null) return null;
-  return (value === null ? 0 : value) + (firstValue === null ? 0 : firstValue);
+function usageFieldSum(field, usages) {
+  let total = null;
+  for (const usage of usages) {
+    if (!usage || typeof usage[field] !== "number") continue;
+    total = (total === null ? 0 : total) + usage[field];
+  }
+  return total;
 }
 
 /**
@@ -213,7 +218,16 @@ export function parseChainRecord(chainJson, ctx = {}) {
     // columns as the final attempt's, so the round row reports the round's
     // total review spend without any schema change.
     const reviewFirstUsage = (rec.reviewFirstUsage && rec.reviewFirstUsage.available === true) ? rec.reviewFirstUsage : null;
-
+    // Review seats that died and were replaced by chain-resume (kusabi #248).
+    // A dead seat still burned tokens, and archiving moved its spend off the
+    // live fields above; folding it into the same columns keeps the round's
+    // review spend honest without adding a column.  The ROUND is not
+    // duplicated: a replacement seat continues the same record, so this loop
+    // still emits exactly one round row for it.
+    const reviewSeatUsages = (Array.isArray(rec.reviewSeatFailures) ? rec.reviewSeatFailures : [])
+      .flatMap(function (s) { return [s?.reviewUsage, s?.reviewFirstUsage]; })
+      .filter(function (u) { return u && u.available === true; });
+    const reviewUsages = [reviewUsage, reviewFirstUsage, ...reviewSeatUsages];
     let startedMs = null;
     if (typeof rec.startedAt === "string") {
       const parsed = Date.parse(rec.startedAt);
@@ -250,13 +264,18 @@ export function parseChainRecord(chainJson, ctx = {}) {
         ? rec.disposition.disposition
         : null,
       reworkCount: typeof rec.reworkCount === "number" ? rec.reworkCount : null,
+      // How many review seats died on this round and were archived by
+      // chain-resume's replacement seat (kusabi #248 follow-up).  NULL when
+      // the record predates the field; readers treat NULL as 0 (the backend
+      // TEXT precedent in this store: absent, never measured zero).
+      reviewSeatFailures: Array.isArray(rec.reviewSeatFailures) ? rec.reviewSeatFailures.length : null,
       findingsText: typeof rec.findingsText === "string" ? rec.findingsText : null,
       implementIn: implementUsage && typeof implementUsage.input === "number" ? implementUsage.input : null,
       implementOut: implementUsage && typeof implementUsage.output === "number" ? implementUsage.output : null,
       implementCost: implementUsage && typeof implementUsage.cost === "number" ? implementUsage.cost : null,
-      reviewIn: usageFieldSum(reviewUsage, reviewFirstUsage, "input"),
-      reviewOut: usageFieldSum(reviewUsage, reviewFirstUsage, "output"),
-      reviewCost: usageFieldSum(reviewUsage, reviewFirstUsage, "cost"),
+      reviewIn: usageFieldSum("input", reviewUsages),
+      reviewOut: usageFieldSum("output", reviewUsages),
+      reviewCost: usageFieldSum("cost", reviewUsages),
     });
 
     // Generational gap (hazard 3): prefer full `findings` objects
@@ -412,7 +431,19 @@ export function ingestChainDirectory(db, stateRoot) {
       summary.findingsIngested += parsed.findingRows.length;
 
       upsertChain(db, parsed.chainRow);
-      for (const r of parsed.roundRows) upsertRound(db, r);
+      for (const r of parsed.roundRows) {
+        upsertRound(db, r);
+        // Re-ingest honesty (kusabi #248 follow-up): a round's finding rows
+        // must reflect ONLY the current record's findings.  `upsertFinding`'s
+        // (chain_id, round, idx) primary key replaces same-idx rows but
+        // leaves rows at idx values the new parse no longer emits -- after a
+        // seat replacement the round's findings can shrink (the replacement
+        // review overrode the record's findings), and the pre-replacement
+        // rows would survive forever.  Delete this round's rows per
+        // (chain_id, round) -- the same granularity as the round-row upsert
+        // -- before the finding upserts below.
+        deleteFindingsForRound(db, r.chainId, r.round);
+      }
       for (const f of parsed.findingRows) upsertFinding(db, f);
       upsertSourceFile(db, {
         path: chainJsonPath,

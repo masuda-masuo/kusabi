@@ -38,6 +38,8 @@ import {
   assertContainerBaseRef,
   collectReviewContext,
   resolveChainResume,
+  classifyReviewSeatReplacement,
+  archiveFailedReviewSeat,
 } from "./chain-phases.mjs";
 import {
   createFakeCallTool,
@@ -4550,6 +4552,421 @@ describe("resolveChainResume", () => {
     const result = resolveChainResume({ control, chainJson });
     assert.equal(result.ok, false);
     assert.match(result.error, /no brief/);
+  });
+
+  // =======================================================================
+  // Replacement review seat (kusabi #248)
+  //
+  // Fixtures reproduce chain-mssxxuu3cc16: round 1 implement complete, probes
+  // all green, the review seat died mid-stream (`partial`), the chain
+  // escalated on that seat failure and finalised as status "completed".  The
+  // implementation was intact; only the seat was consumed.
+  // =======================================================================
+
+  // The chain finished NORMALLY on the escalate, so control status is
+  // "completed" with a dead pid -- not "cancelled".
+  const seatControl = {
+    chainId: "chain-test", container: "cid-1", pid: 0,
+    status: "completed", round: 1, finishedAt: "2026-08-01T01:00:00.000Z",
+  };
+
+  const greenProbes = () => ([
+    { probe: "P1: HEAD clean", passed: true, detail: "HEAD matches base abc123" },
+    { probe: "P2: verify gate", passed: true, detail: JSON.stringify({ gate_passed: true }) },
+    { probe: "P3: deliverables", passed: true, detail: "touches declared deliverables" },
+    { probe: "P4: smoke", passed: true, detail: "all smoke entries exited 0" },
+  ]);
+
+  function deadSeatRound(overrides = {}) {
+    return {
+      round: 1,
+      reworkScope: "full",
+      implementJobId: "job-imp-1",
+      reviewJobId: "job-rev-1",
+      sessionID: "sess-1",
+      tierBefore: 0,
+      tierAfter: 0,
+      reworkCount: 0,
+      probesGreen: true,
+      probeResults: greenProbes(),
+      worktreeChanged: true,
+      verdict: "partial",
+      reviewParseable: true,
+      reviewPartial: true,
+      reviewFindingCount: 3,
+      disposition: {
+        disposition: "escalate",
+        reason: "partial review: stream ended before the verdict line",
+      },
+      ...overrides,
+    };
+  }
+
+  it("allows a review-position resume for an escalate caused by a dead review seat", () => {
+    const record = deadSeatRound();
+    const result = resolveChainResume({
+      control: seatControl,
+      chainJson: baseChainJson({ records: [record], maxRounds: 4 }),
+    });
+    assert.equal(result.ok, true, result.error);
+    assert.equal(result.position.reviewSeatReplacement, true);
+    // The resumed record is the SAME object -- the round is continued in
+    // place, never duplicated.
+    assert.equal(result.position.roundRecord, record);
+    assert.equal(result.position.records.length, 1);
+    assert.equal(result.position.reworkCount, 0);
+    assert.equal(result.position.currentTierIndex, 0);
+    assert.equal(result.position.session, "sess-1");
+  });
+
+  // The invariant: for every allowed resume under this feature the NEXT
+  // dispatched phase is review, at the SAME round -- never implement.
+  it("resolves the allowed case to the same round's review phase, never implement", () => {
+    const result = resolveChainResume({
+      control: seatControl,
+      chainJson: baseChainJson({ records: [deadSeatRound({ round: 3 })], maxRounds: 4 }),
+    });
+    assert.equal(result.ok, true, result.error);
+    assert.equal(result.position.phase, "review");
+    assert.notEqual(result.position.phase, "implement");
+    assert.equal(result.position.round, 3);
+  });
+
+  it("allows the unparseable seat failure on the same terms as partial", () => {
+    const result = resolveChainResume({
+      control: seatControl,
+      chainJson: baseChainJson({
+        records: [deadSeatRound({
+          verdict: "unparseable",
+          reviewParseable: false,
+          verdictSource: "recovered-from-token",
+          reviewPartial: undefined,
+          reviewFindingCount: undefined,
+          disposition: { disposition: "escalate", reason: "unexpected verdict: unparseable" },
+        })],
+      }),
+    });
+    assert.equal(result.ok, true, result.error);
+    assert.equal(result.position.phase, "review");
+  });
+
+  it("refuses a needs-attention escalate -- a completed review judging the work", () => {
+    const result = resolveChainResume({
+      control: seatControl,
+      chainJson: baseChainJson({
+        records: [deadSeatRound({
+          verdict: "needs-attention",
+          reviewPartial: undefined,
+          reviewFindingCount: undefined,
+          disposition: {
+            disposition: "escalate",
+            reason: "same file area flagged for two consecutive rounds",
+          },
+        })],
+      }),
+    });
+    assert.equal(result.ok, false);
+    assert.match(result.error, /already finished/);
+    // Today's refusal, verbatim -- no field-naming detail appended.
+    assert.doesNotMatch(result.error, /—/);
+  });
+
+  it("refuses a discard-based escalate", () => {
+    const result = resolveChainResume({
+      control: seatControl,
+      chainJson: baseChainJson({
+        records: [deadSeatRound({
+          verdict: "discard",
+          reviewPartial: undefined,
+          reviewFindingCount: undefined,
+          disposition: { disposition: "escalate", reason: "reviewer discarded the work" },
+        })],
+      }),
+    });
+    assert.equal(result.ok, false);
+    assert.match(result.error, /already finished/);
+    assert.doesNotMatch(result.error, /—/);
+  });
+
+  it("refuses a max-rounds escalate even when the verdict is a seat failure", () => {
+    // Budget exhausted: deriveDisposition's max-rounds terminal fires before
+    // the partial branch, so the recorded reason is the max-rounds one.  The
+    // seat did fail, but the escalate did not come FROM the seat failure.
+    const result = resolveChainResume({
+      control: { ...seatControl, round: 2 },
+      chainJson: baseChainJson({
+        records: [
+          deadSeatRound({
+            round: 1,
+            verdict: "needs-attention",
+            reviewPartial: undefined,
+            disposition: { disposition: "rework", reason: "needs-attention" },
+          }),
+          deadSeatRound({
+            round: 2,
+            disposition: {
+              disposition: "escalate",
+              reason: "max rounds (2) reached without acceptance",
+            },
+          }),
+        ],
+        maxRounds: 2,
+      }),
+    });
+    assert.equal(result.ok, false);
+    assert.match(result.error, /already finished/);
+    assert.doesNotMatch(result.error, /—/);
+  });
+
+  it("refuses an accepted chain", () => {
+    const result = resolveChainResume({
+      control: seatControl,
+      chainJson: baseChainJson({
+        records: [deadSeatRound({
+          verdict: "approve",
+          reviewPartial: undefined,
+          reviewFindingCount: undefined,
+          disposition: { disposition: "accept" },
+        })],
+      }),
+    });
+    assert.equal(result.ok, false);
+    assert.match(result.error, /already finished/);
+    assert.doesNotMatch(result.error, /—/);
+  });
+
+  it("refuses a seat-shaped escalate whose probe results are missing, naming the field", () => {
+    const record = deadSeatRound();
+    delete record.probeResults;
+    const result = resolveChainResume({
+      control: seatControl,
+      chainJson: baseChainJson({ records: [record] }),
+    });
+    assert.equal(result.ok, false);
+    assert.match(result.error, /already finished/);
+    assert.match(result.error, /probeResults/);
+    assert.match(result.error, /P1–P4 cannot be confirmed green/);
+  });
+
+  it("refuses a seat-shaped escalate whose probe results do not cover P1–P4", () => {
+    const result = resolveChainResume({
+      control: seatControl,
+      chainJson: baseChainJson({
+        records: [deadSeatRound({ probeResults: greenProbes().slice(0, 2) })],
+      }),
+    });
+    assert.equal(result.ok, false);
+    assert.match(result.error, /does not cover P3, P4/);
+  });
+
+  it("refuses a seat-shaped escalate whose probes were red", () => {
+    const probes = greenProbes();
+    probes[1] = { probe: "P2: verify gate", passed: false, detail: "{}" };
+    const result = resolveChainResume({
+      control: seatControl,
+      chainJson: baseChainJson({
+        records: [deadSeatRound({ probeResults: probes, probesGreen: false })],
+      }),
+    });
+    assert.equal(result.ok, false);
+    assert.match(result.error, /not all green \(P2: verify gate\)/);
+  });
+
+  it("refuses when probesGreen disagrees with the probe entries", () => {
+    const result = resolveChainResume({
+      control: seatControl,
+      chainJson: baseChainJson({ records: [deadSeatRound({ probesGreen: undefined })] }),
+    });
+    assert.equal(result.ok, false);
+    assert.match(result.error, /probesGreen/);
+  });
+
+  it("refuses a seat-shaped escalate with no recorded disposition reason, naming the field", () => {
+    const result = resolveChainResume({
+      control: seatControl,
+      chainJson: baseChainJson({
+        records: [deadSeatRound({ disposition: { disposition: "escalate" } })],
+      }),
+    });
+    assert.equal(result.ok, false);
+    assert.match(result.error, /disposition\.reason/);
+  });
+
+  it("refuses a seat-failure escalate with no implement job, naming the field", () => {
+    const record = deadSeatRound();
+    delete record.implementJobId;
+    const result = resolveChainResume({
+      control: seatControl,
+      chainJson: baseChainJson({ records: [record] }),
+    });
+    assert.equal(result.ok, false);
+    assert.match(result.error, /implementJobId/);
+  });
+
+  it("refuses an escalate whose record carries no verdict at all, naming the field", () => {
+    const record = deadSeatRound();
+    delete record.verdict;
+    const result = resolveChainResume({
+      control: seatControl,
+      chainJson: baseChainJson({ records: [record] }),
+    });
+    assert.equal(result.ok, false);
+    assert.match(result.error, /`verdict`/);
+  });
+
+  it("refuses a seat verdict paired with the other seat state's reason (inconsistent)", () => {
+    const result = resolveChainResume({
+      control: seatControl,
+      chainJson: baseChainJson({
+        records: [deadSeatRound({
+          disposition: { disposition: "escalate", reason: "unexpected verdict: unparseable" },
+        })],
+      }),
+    });
+    assert.equal(result.ok, false);
+    assert.match(result.error, /inconsistent/);
+  });
+
+  it("still refuses a live chain that would otherwise be seat-eligible", () => {
+    const result = resolveChainResume({
+      control: { ...seatControl, pid: process.pid, status: "running" },
+      chainJson: baseChainJson({ records: [deadSeatRound()] }),
+    });
+    assert.equal(result.ok, false);
+    assert.match(result.error, /still running/);
+  });
+
+  it("refuses a seat-eligible chain whose chain.json has no brief", () => {
+    // The general preconditions still apply: eligibility widens WHICH chains
+    // reach the position decision, not what the driver needs to run.
+    const result = resolveChainResume({
+      control: seatControl,
+      chainJson: baseChainJson({ brief: "", records: [deadSeatRound()] }),
+    });
+    assert.equal(result.ok, false);
+    assert.match(result.error, /no brief/);
+  });
+
+  it("allows a second replacement seat after an earlier one already failed", () => {
+    // Each resume is an explicit operator action; a round that burned two
+    // seats carries the first in reviewSeatFailures and stays eligible.
+    const record = deadSeatRound({
+      reviewSeatFailures: [{ seat: 1, verdict: "unparseable" }],
+    });
+    const result = resolveChainResume({
+      control: seatControl,
+      chainJson: baseChainJson({ records: [record] }),
+    });
+    assert.equal(result.ok, true, result.error);
+    assert.equal(result.position.phase, "review");
+  });
+});
+
+// =========================================================================
+// classifyReviewSeatReplacement / archiveFailedReviewSeat (kusabi #248)
+// =========================================================================
+
+describe("classifyReviewSeatReplacement", () => {
+  it("is not a seat failure when there are no records", () => {
+    const result = classifyReviewSeatReplacement({ records: [] });
+    assert.equal(result.eligible, false);
+    assert.equal(result.detail, null);
+  });
+
+  it("is not a seat failure for a non-terminal disposition", () => {
+    const result = classifyReviewSeatReplacement({
+      records: [{ round: 1, verdict: "needs-attention", disposition: { disposition: "rework" } }],
+    });
+    assert.equal(result.eligible, false);
+    assert.equal(result.detail, null);
+  });
+
+  it("names the round field when the record cannot say which round it is", () => {
+    const result = classifyReviewSeatReplacement({
+      records: [{
+        verdict: "partial",
+        disposition: { disposition: "escalate", reason: "partial review: stream ended before the verdict line" },
+      }],
+    });
+    assert.equal(result.eligible, false);
+    assert.match(result.detail, /`round`/);
+  });
+});
+
+describe("archiveFailedReviewSeat", () => {
+  function liveRecord() {
+    return {
+      round: 2,
+      implementJobId: "job-imp-2",
+      probesGreen: true,
+      verdict: "partial",
+      verdictSource: "recovered-from-token",
+      reviewParseable: false,
+      reviewPartial: true,
+      reviewFindingCount: 4,
+      reviewJobId: "job-rev-2",
+      reviewUsage: { available: true, input: 10, output: 5, cost: 0.5 },
+      reviewModelEntry: "fake/model",
+      reviewModelVariant: null,
+      reviewFallbacks: [],
+      reviewJobFailure: null,
+      reviewUnparseableRetried: true,
+      reviewFirstJobId: "job-rev-2a",
+      reviewFirstUsage: { available: true, input: 3, output: 1, cost: 0.1 },
+      reviewFirstFallbacks: [],
+      findingsText: "one finding",
+      findings: [{ severity: "high", title: "t", file: "a.mjs" }],
+      findingFiles: ["a.mjs"],
+      disposition: { disposition: "escalate", reason: "partial review: stream ended before the verdict line" },
+    };
+  }
+
+  it("moves every review field onto the archived seat and clears the live ones", () => {
+    const record = archiveFailedReviewSeat(liveRecord());
+    assert.equal(record.reviewSeatFailures.length, 1);
+    const seat = record.reviewSeatFailures[0];
+    assert.equal(seat.seat, 1);
+    assert.equal(seat.verdict, "partial");
+    assert.equal(seat.reviewJobId, "job-rev-2");
+    assert.equal(seat.disposition.disposition, "escalate");
+    assert.deepEqual(seat.findingFiles, ["a.mjs"]);
+    // Conditionally-written fields must NOT survive on the live record: a
+    // clean replacement verdict must not inherit "partial" or
+    // "recovered-from-token" from the seat that died.
+    for (const field of [
+      "verdict", "verdictSource", "reviewParseable", "reviewPartial", "reviewFindingCount",
+      "reviewJobId", "reviewUsage", "reviewModelEntry", "reviewModelVariant", "reviewFallbacks",
+      "reviewJobFailure", "reviewUnparseableRetried", "reviewFirstJobId", "reviewFirstUsage",
+      "reviewFirstFallbacks", "findingsText", "findings", "findingFiles", "disposition",
+    ]) {
+      assert.equal(Object.prototype.hasOwnProperty.call(record, field), false, `${field} survived archiving`);
+    }
+    // Non-review round state is untouched.
+    assert.equal(record.round, 2);
+    assert.equal(record.implementJobId, "job-imp-2");
+    assert.equal(record.probesGreen, true);
+  });
+
+  it("appends a second seat rather than replacing the first", () => {
+    const record = archiveFailedReviewSeat(liveRecord());
+    record.verdict = "unparseable";
+    record.reviewJobId = "job-rev-2b";
+    archiveFailedReviewSeat(record);
+    assert.equal(record.reviewSeatFailures.length, 2);
+    assert.deepEqual(record.reviewSeatFailures.map((s) => s.seat), [1, 2]);
+    assert.equal(record.reviewSeatFailures[0].verdict, "partial");
+    assert.equal(record.reviewSeatFailures[1].verdict, "unparseable");
+  });
+
+  it("keeps the dead seat's spend in the chain totals", () => {
+    const record = archiveFailedReviewSeat(liveRecord());
+    // The replacement seat writes its own usage onto the live field.
+    record.reviewUsage = { available: true, input: 100, output: 50, cost: 2 };
+    const totals = computeChainTotals([record]);
+    // 10 + 3 (dead seat + its retry) + 100 (replacement).
+    assert.equal(totals.input, 113);
+    assert.equal(totals.output, 56);
+    assert.ok(Math.abs(totals.cost - 2.6) < 1e-9, `cost was ${totals.cost}`);
   });
 });
 

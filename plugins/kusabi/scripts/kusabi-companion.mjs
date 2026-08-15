@@ -71,6 +71,8 @@ import {
   handleProviderExhaustion,
   recordReworkEscalation,
   resolveChainResume,
+  shouldSkipReview,
+  archiveFailedReviewSeat,
   collectReviewContext,
   collectContainerReviewInput,
 } from "./chain-phases.mjs";
@@ -2787,7 +2789,11 @@ export async function runChainDriver({
       const hasPreviousRound = round > 1 && records.length > 0;
       const previousRecord = hasPreviousRound ? records[records.length - 1] : null;
 
-      // ---- review-resume: continue the interrupted round from its review ----
+      // ---- review-resume: continue this round from its review phase ----
+      // Two ways in: the round was INTERRUPTED before review ran (#153①), or
+      // its review seat died and the chain escalated on it, so the resume
+      // buys a replacement seat for the same round (#248).  Both continue the
+      // persisted record in place and dispatch review, never implement.
       if (resume && resume.phase === "review" && round === resume.round) {
         const roundRecord = resume.roundRecord;
         roundRecord.resumed = true;
@@ -2799,6 +2805,40 @@ export async function runChainDriver({
           // use the full changed set instead.
           worktreeBaseline: null,
         });
+        // ---- replacement review seat (kusabi #248) ----
+        // This round already ran a review; the SEAT died mid-stream and the
+        // chain escalated on it.  Archive that seat before the replacement
+        // review writes over the record's review fields, so the record keeps
+        // saying a first seat failed instead of silently claiming the
+        // replacement's verdict was the only one.  The round record itself is
+        // continued in place (no second record, no second round row).
+        if (resume.reviewSeatReplacement) {
+          // ---- loud refusal on an empty change set (kusabi #248 follow-up) ----
+          // A replacement review reviews the CHANGES this round made.  When
+          // the collected change set is empty, the container no longer holds
+          // the round's changes (fresh clone, reset worktree): the review/skip
+          // machinery would skip the review and hand the user a silent
+          // discard-escalate.  Refuse loudly instead.  Nothing is persisted on
+          // this path, so the chain record stays exactly as the escalate left
+          // it -- it never claims a review happened -- and the user is told to
+          // re-run the chain.  Only the seat-replacement entry refuses: an
+          // interrupted round (#153) legitimately reviews whatever the
+          // worktree holds -- its escalate-on-empty is pre-existing behaviour.
+          if (shouldSkipReview({
+            chainStatusObserved: reviewCtx.chainStatusObserved,
+            chainChangedPaths: reviewCtx.chainChangedPaths,
+            chainNewlyChanged: reviewCtx.chainNewlyChanged,
+            chainDeliverables: reviewCtx.chainDeliverables,
+          })) {
+            throw new Error(
+              `cannot resume chain ${chainId} with a replacement review seat: the container no longer holds ` +
+              `round ${round}'s changes (the collected change set is empty -- fresh clone or reset worktree), ` +
+              `so a replacement review has nothing to review.  Re-run the chain instead; the chain record was ` +
+              `left untouched (no review was dispatched, nothing was escalated).`
+            );
+          }
+          archiveFailedReviewSeat(roundRecord);
+        }
         const probeCtx = {
           probesGreen: roundRecord.probesGreen ?? false,
           chainChangedPaths: reviewCtx.chainChangedPaths,
@@ -3527,7 +3567,7 @@ function usage() {
     "  task       Run an opencode task",
     "  review     Run an adversarial review of working-tree changes (host worktree only; --container is rejected \u2014 use task --phase review for container reviews)",
     "  chain      Run implement→review→rework chain until acceptance or escalate",
-    "  chain-resume  Resume a cancelled chain from its last recorded phase boundary (reads chain.json / control.json; same chain lifecycle as chain)",
+    "  chain-resume  Resume a cancelled chain from its last recorded phase boundary, or buy a replacement review seat for a chain that escalated on a dead review seat over green probes (reads chain.json / control.json; same chain lifecycle as chain)",
     "  chain-show Print a compact plain-text digest of a chain (read-only, no LLM)",
     "  chain-stats Aggregate every chain record and print a summary (read-only, no LLM)",
     "  metrics-ingest  Ingest transcripts + chain records + delegated-job records into a durable SQLite store (read-only source, no LLM)",

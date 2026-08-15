@@ -1054,12 +1054,74 @@ export async function runReviewPhase({
 }
 
 /**
+ * Every field on a round record that describes the ROUND'S REVIEW, and that a
+ * replacement review seat (kusabi #248) therefore rewrites.
+ *
+ * The list must stay complete, because several of these are written only
+ * CONDITIONALLY by runReviewPhase — `reviewPartial` only when the stream was
+ * partial, `verdictSource` only when the result was unparseable, the
+ * `reviewFirst*` trio only when the unparseable retry fired.  A field left
+ * behind would keep describing the DEAD seat next to the replacement's
+ * verdict: a clean `approve` still flagged partial, or sourced
+ * "recovered-from-token".  That is exactly the fail-open edge this feature
+ * must not add, so archiving CLEARS them rather than trusting the overwrite.
+ */
+const REVIEW_SEAT_RECORD_FIELDS = [
+  "verdict", "verdictSource", "reviewParseable",
+  "reviewPartial", "reviewFindingCount",
+  "reviewJobId", "reviewUsage", "reviewModelEntry", "reviewModelVariant",
+  "reviewFallbacks", "reviewJobFailure",
+  "reviewUnparseableRetried", "reviewFirstJobId", "reviewFirstUsage", "reviewFirstFallbacks",
+  "findingsText", "findings", "findingFiles",
+  "disposition",
+];
+
+/**
+ * Move a round record's FAILED review seat into `reviewSeatFailures` and clear
+ * the live review fields, so a replacement seat (kusabi #248) can write its
+ * own verdict without the dead seat's state surviving underneath it.
+ *
+ * The failed seat is preserved, never silently overwritten: the record keeps
+ * saying that a first review died and how (`verdict`, its escalate
+ * disposition, its job id and spend), and chain-show renders both it and the
+ * replacement verdict.  The round itself is NOT duplicated — the same record
+ * object is continued in place, so metrics ingest still sees one round row.
+ *
+ * Called by the driver's review-resume branch, once, immediately before the
+ * replacement review is dispatched.  Idempotent in shape (repeated seat
+ * failures append), so a chain that burns a second seat archives that one too.
+ *
+ * @param {object} roundRecord — the round record being resumed, mutated in place.
+ * @returns {object} the same record.
+ */
+export function archiveFailedReviewSeat(roundRecord) {
+  if (!roundRecord || typeof roundRecord !== "object") return roundRecord;
+  if (!Array.isArray(roundRecord.reviewSeatFailures)) roundRecord.reviewSeatFailures = [];
+
+  const seat = { seat: roundRecord.reviewSeatFailures.length + 1 };
+  for (const field of REVIEW_SEAT_RECORD_FIELDS) {
+    if (roundRecord[field] !== undefined) seat[field] = roundRecord[field];
+    delete roundRecord[field];
+  }
+  roundRecord.reviewSeatFailures.push(seat);
+  return roundRecord;
+}
+
+/**
  * Compute chain-wide usage totals from all round records.
+ *
+ * Archived review seats (kusabi #248) count too: a seat that died mid-stream
+ * still burned tokens, and its spend moved off the live `reviewUsage` field
+ * when the replacement seat was bought.  Dropping it here would make the
+ * chain's reported cost quietly cheaper than the run actually was.
  */
 export function computeChainTotals(records) {
   const chainTotals = { input: 0, output: 0, reasoning: 0, cacheRead: 0, cacheWrite: 0, cost: 0 };
   for (const rec of records) {
-    for (const usage of [rec.implementUsage, rec.reviewUsage, rec.reviewFirstUsage]) {
+    const seatUsages = Array.isArray(rec.reviewSeatFailures)
+      ? rec.reviewSeatFailures.flatMap(function (s) { return [s?.reviewUsage, s?.reviewFirstUsage]; })
+      : [];
+    for (const usage of [rec.implementUsage, rec.reviewUsage, rec.reviewFirstUsage, ...seatUsages]) {
       if (usage && usage.available) {
         chainTotals.input += usage.input || 0;
         chainTotals.output += usage.output || 0;
@@ -2027,6 +2089,155 @@ export function handleProviderExhaustion({
 // Chain resume (kusabi #153①) — resume-position resolution
 // =========================================================================
 
+// ---- replacement review seat (kusabi #248) ------------------------------
+//
+// A chain can terminate on `escalate` for two very different reasons: the
+// review JUDGED the work and found it wanting, or the review SEAT itself died
+// mid-stream and never produced a judgement.  Only the second is a spent seat
+// over an intact implementation, and only it may be re-bought by chain-resume.
+//
+// The two seat-failure states the review parser can produce (`partial`,
+// `unparseable`) each escalate through deriveDisposition with ONE reason
+// string; the map is keyed by verdict so a seat-failure verdict carrying the
+// other verdict's reason reads as inconsistent records, not as eligible.
+// `needs-attention` and `discard` are deliberately absent: those are completed
+// reviews judging the work, and they keep today's refusal.
+const REVIEW_SEAT_FAILURE_REASONS = {
+  partial: "partial review: stream ended before the verdict line",
+  unparseable: "unexpected verdict: unparseable",
+};
+
+// The deterministic probes a replacement seat requires green.  runProbePhase
+// always records all four (P1 HEAD clean / P2 verify gate / P3 deliverables /
+// P4 smoke) on a run that got far enough to be green; a shorter list means the
+// probe phase threw partway, so the record cannot testify that the work is
+// intact.
+const REVIEW_SEAT_PROBES = ["P1", "P2", "P3", "P4"];
+
+/** Not a seat failure at all — the caller keeps its existing refusal verbatim. */
+const NOT_A_SEAT_FAILURE = Object.freeze({ eligible: false, detail: null });
+
+/** Seat-failure SHAPE, but the records cannot decide it — name the field. */
+function seatRecordsUndecidable(detail) {
+  return { eligible: false, detail };
+}
+
+/** Append a fail-closed detail to a refusal, when there is one. */
+function withSeatDetail(error, detail) {
+  return detail ? `${error} — ${detail}` : error;
+}
+
+/**
+ * Decide whether a chain's FINAL round may buy a replacement review seat
+ * (kusabi #248).  Pure: reads only the persisted records, never an LLM and
+ * never the worktree.
+ *
+ * Eligible iff all four hold for the last round record:
+ *   1. probes P1–P4 all green,
+ *   2. the review verdict is `partial` or `unparseable` (a dead seat — NOT
+ *      `needs-attention`, which is a completed review judging the work),
+ *   3. the escalate came from that seat failure (not discard, not max-rounds,
+ *      not repeated-areas — each of those carries a different
+ *      `disposition.reason`),
+ *   4. the records needed to decide 1–3 are present and unambiguous.
+ *
+ * Fail closed (the resume guard's #192 history): a missing or ambiguous field
+ * refuses and NAMES the field.  The two negative results are distinct on
+ * purpose — `detail: null` means "this escalate was never a seat failure", so
+ * the caller's existing refusal stands verbatim; a non-null `detail` means
+ * "seat-failure shaped, but undecidable", and it is appended to that refusal.
+ *
+ * @param {object|null} chainJson — chain.json record.
+ * @returns {{ eligible: boolean, detail: string|null }}
+ */
+export function classifyReviewSeatReplacement(chainJson) {
+  const records = Array.isArray(chainJson?.records) ? chainJson.records : [];
+  const last = records.length > 0 ? records[records.length - 1] : null;
+  if (!last || typeof last !== "object") return NOT_A_SEAT_FAILURE;
+  if (last.disposition?.disposition !== "escalate") return NOT_A_SEAT_FAILURE;
+
+  // ---- condition 2: a dead SEAT, not a review judgement ----
+  const verdict = last.verdict;
+  if (typeof verdict !== "string" || verdict === "") {
+    return seatRecordsUndecidable(
+      "the final round record has no review `verdict` — a dead review seat cannot be told from a completed review"
+    );
+  }
+  const expectedReason = Object.prototype.hasOwnProperty.call(REVIEW_SEAT_FAILURE_REASONS, verdict)
+    ? REVIEW_SEAT_FAILURE_REASONS[verdict]
+    : null;
+  // approve / approve-partial / needs-attention / discard and anything else:
+  // a completed review, so this escalate is not a spent seat.
+  if (!expectedReason) return NOT_A_SEAT_FAILURE;
+
+  // The round number addresses the phase the driver re-dispatches; a record
+  // that cannot name its own round has no position to resume at.
+  if (!Number.isInteger(last.round) || last.round < 1) {
+    return seatRecordsUndecidable(
+      "the final round record has no usable `round` number — there is no position to resume at"
+    );
+  }
+  const where = `round ${last.round}`;
+
+  // ---- condition 3: the escalate came from THAT seat failure ----
+  const reason = last.disposition?.reason;
+  if (typeof reason !== "string" || reason === "") {
+    return seatRecordsUndecidable(
+      `${where} record has no \`disposition.reason\` — the escalate cause cannot be established`
+    );
+  }
+  if (reason !== expectedReason) {
+    // The OTHER seat-failure reason next to this verdict is contradictory
+    // records; anything else (max-rounds, discard, repeated areas) is simply
+    // a different escalate, which keeps the refusal verbatim.
+    return Object.values(REVIEW_SEAT_FAILURE_REASONS).includes(reason)
+      ? seatRecordsUndecidable(
+        `${where} record is inconsistent: verdict \`${verdict}\` with \`disposition.reason\` "${reason}"`
+      )
+      : NOT_A_SEAT_FAILURE;
+  }
+
+  // A replacement review judges an implementation; there must be one.
+  if (typeof last.implementJobId !== "string" || !last.implementJobId) {
+    return seatRecordsUndecidable(
+      `${where} record has no \`implementJobId\` — there is no implementation for a replacement review to judge`
+    );
+  }
+
+  // ---- condition 1: probes P1–P4 all green ----
+  const probeResults = last.probeResults;
+  if (!Array.isArray(probeResults) || probeResults.length === 0) {
+    return seatRecordsUndecidable(
+      `${where} record has no \`probeResults\` — P1–P4 cannot be confirmed green`
+    );
+  }
+  const probeLabels = probeResults.map(function (p) {
+    return typeof p?.probe === "string" ? p.probe.split(":")[0].trim() : "";
+  });
+  const missingProbes = REVIEW_SEAT_PROBES.filter(function (p) { return !probeLabels.includes(p); });
+  if (missingProbes.length > 0) {
+    return seatRecordsUndecidable(
+      `${where} \`probeResults\` does not cover ${missingProbes.join(", ")} — P1–P4 cannot be confirmed green`
+    );
+  }
+  const redProbes = probeResults.filter(function (p) { return p?.passed !== true; });
+  if (redProbes.length > 0) {
+    const names = redProbes.map(function (p) { return typeof p?.probe === "string" ? p.probe : "(unnamed)"; });
+    return seatRecordsUndecidable(
+      `${where} \`probeResults\` is not all green (${names.join(", ")}) — the work is not known intact`
+    );
+  }
+  // The summary flag must agree with the entries: `probesGreen` is what the
+  // disposition machinery read, so a disagreement is ambiguous records.
+  if (last.probesGreen !== true) {
+    return seatRecordsUndecidable(
+      `${where} record has \`probesGreen\`: ${JSON.stringify(last.probesGreen ?? null)} — a replacement review seat requires green P1–P4`
+    );
+  }
+
+  return { eligible: true, detail: null };
+}
+
 /**
  * Decide where a stopped chain resumes, from its persisted state alone.
  *
@@ -2037,7 +2248,9 @@ export function handleProviderExhaustion({
  * Preconditions (explicit errors for everything else):
  *   - The chain must be stopped: status "cancelled", or "running" with a dead
  *     pid (stale — abnormal stop).  A live process (running / stopping) and
- *     any finished status (completed / failed) are errors.
+ *     any finished status (completed / failed) are errors — with the single
+ *     replacement-review-seat exception below, which is decided BEFORE this
+ *     gate because such a chain finished normally (status "completed").
  *
  * Resume position, from the LAST round record in chain.json:
  *   - Last record has implement done but no review/disposition (an
@@ -2048,7 +2261,13 @@ export function handleProviderExhaustion({
  *     tier/reworkCount; strategize: with the fresh-session lever from the
  *     record's pendingReworkStrategy).
  *   - Terminal dispositions (accept / accept-with-followup / escalate) mean
- *     the chain already finished — error.
+ *     the chain already finished — error.  ONE exception (kusabi #248): an
+ *     `escalate` that classifyReviewSeatReplacement finds eligible — probes
+ *     P1–P4 green, verdict `partial`/`unparseable`, and that seat failure is
+ *     the recorded escalate cause — resumes at the SAME round's REVIEW phase
+ *     to buy a replacement seat.  Never implement: the implementation is
+ *     intact and only the seat was consumed, so no round-budget slot is spent
+ *     (the return sits before the budget-derived guard).
  *
  * Cross-round state (reworkCount, currentTierIndex, strategized, session,
  * baseSha) is derived from the record fields so the resumed run continues the
@@ -2071,6 +2290,9 @@ export function handleProviderExhaustion({
  *   - `round`        — round to continue at
  *   - `roundRecord`  — the persisted partial record (review-resume only)
  *   - `records`      — chain.json records array (continued in place)
+ *   - `reviewSeatReplacement` — true only for the kusabi #248 escalate
+ *     exception; tells the driver to archive the failed seat on the record
+ *     before dispatching the replacement review
  *   - `reworkCount`, `currentTierIndex`, `strategized`, `session`, `baseSha`
  */
 export function resolveChainResume({ control, chainJson }) {
@@ -2088,10 +2310,19 @@ export function resolveChainResume({ control, chainJson }) {
       error: `chain is still running (pid ${control.pid}) — stop it first (chain-cancel)`,
     };
   }
-  if (status !== "cancelled" && !stale) {
+
+  // Replacement review seat (kusabi #248), classified from the records alone
+  // and BEFORE the finished-status gate: a chain that escalated on a dead
+  // review seat finished NORMALLY (status "completed"), so the gate below
+  // would refuse it before the disposition branch ever ran.  `detail` is the
+  // fail-closed field name for a seat-shaped escalate whose records cannot
+  // decide it; it is null for every other chain, leaving the refusals verbatim.
+  const seat = classifyReviewSeatReplacement(chainJson);
+
+  if (status !== "cancelled" && !stale && !seat.eligible) {
     return {
       ok: false,
-      error: `chain already finished (status: ${status})`,
+      error: withSeatDetail(`chain already finished (status: ${status})`, seat.detail),
     };
   }
 
@@ -2119,10 +2350,39 @@ export function resolveChainResume({ control, chainJson }) {
 
   const lastDisposition = last.disposition?.disposition;
   if (lastDisposition) {
+    // ---- replacement review seat (kusabi #248) ----
+    // The ONE terminal disposition that is resumable: an escalate caused by a
+    // dead review seat over green probes.  The resume dispatches the SAME
+    // round's REVIEW phase in a fresh session (each phase is a new session;
+    // review seats are never reused) — never implement, which is why this
+    // returns a review position instead of falling through to the
+    // next-round/implement path.  It also returns BEFORE the budget-derived
+    // guard below: the round already spent its slot, and re-buying its review
+    // spends no new one.
+    if (lastDisposition === "escalate" && seat.eligible) {
+      return {
+        ok: true,
+        position: {
+          phase: "review",
+          round: last.round,
+          roundRecord: last,
+          records,
+          reviewSeatReplacement: true,
+          reworkCount: last.reworkCount ?? 0,
+          currentTierIndex: last.tierBefore ?? 0,
+          strategized,
+          session: last.sessionID ?? undefined,
+          baseSha,
+        },
+      };
+    }
     if (lastDisposition === "accept" || lastDisposition === "accept-with-followup" || lastDisposition === "escalate") {
       return {
         ok: false,
-        error: `chain already finished (last round ${last.round} disposition: ${lastDisposition})`,
+        error: withSeatDetail(
+          `chain already finished (last round ${last.round} disposition: ${lastDisposition})`,
+          seat.detail,
+        ),
       };
     }
     const nextRound = (last.round ?? records.length) + 1;
