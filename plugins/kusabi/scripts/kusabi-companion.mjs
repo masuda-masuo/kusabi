@@ -9,7 +9,7 @@
 
 import { parseArgs, parseModel, resolveModel, reviewDenyTools, WRITE_TOOL_NAMES, validateChainEntries, splitRouteBackend, resolveChainBackend, stripBackendPrefixChain, resolveModelBackend, chainNamesBackend, backendSupportsResume } from "./cli.mjs";
 import { renderReview, renderChainShow, renderJobLine, renderHeader, extractJson, renderFollowupDraft } from "./render.mjs";
-import { hasSectionHeading, parseDeliverables, parseSmoke, parseOrchestratorSignature, briefRequestsPublish } from "./brief-parsing.mjs";
+import { hasSectionHeading, parseDeliverables, parseSmoke, parseOrchestratorSignature, briefRequestsPublish, findSmokeViolations, SMOKE_VIOLATION_NO_ENTRIES } from "./brief-parsing.mjs";
 import { cursorUsageDir, resolveLatestCursorSession } from "./cursor-statusline-sink.mjs";
 import { deriveDisposition } from "./disposition.mjs";
 import { parseReviewJsonl } from "./review-jsonl.mjs";
@@ -127,6 +127,52 @@ export function publishWarningForBrief(brief) {
     "brief が publish を要求しているが、ワーカーは publish できない(オーケストレーター専権)。" +
     "受理後にオーケストレーターが publish を行う。"
   );
+}
+
+/**
+ * The chain-start refusal text for a brief whose `## Smoke` section the
+ * machine would read differently from what it says (kusabi #250), or null
+ * when the section is clean.
+ *
+ * Unlike the publish warning above this is a REFUSAL, not a note: a smoke
+ * command truncated at a nested backtick reaches the runner as an unclosed
+ * fragment, every round reports P4 red ("exit code could not be observed"),
+ * and no worker can fix it from inside the chain — kusabi #246 burned six
+ * rounds that way.  A `## Smoke` heading with no parseable entry is the same
+ * failure seen from the other side: the declared check silently never runs.
+ * Both are detectable at parse time with no I/O, so the cheap moment to stop
+ * is before any job exists.  The report quotes the brief's own line next to
+ * the command the machine read out of it, because the gap between those two
+ * IS the bug.
+ *
+ * @param {string|null|undefined} brief
+ * @returns {string|null}
+ */
+export function smokeViolationReport(brief) {
+  const violations = findSmokeViolations(brief);
+  if (violations.length === 0) return null;
+  const lines = [
+    `brief rejected before dispatch: the ## Smoke section has ${violations.length} ` +
+    `problem${violations.length === 1 ? "" : "s"} the runner cannot recover from (kusabi #250). ` +
+    "Nothing was started; fix the brief and re-run.",
+  ];
+  for (const v of violations) {
+    if (v.kind === SMOKE_VIOLATION_NO_ENTRIES) {
+      lines.push(
+        "  - `## Smoke` heading present but no smoke entry parsed: the declared smoke check would never run. " +
+        "Write each command as a bullet with a backtick-quoted command, or inside a fenced code block."
+      );
+      continue;
+    }
+    lines.push(`  - line ${v.lineNumber}: ${v.line}`);
+    lines.push(`    machine reads the command as: \`${v.command}\``);
+    lines.push(`    dropped by the first backtick pair: ${v.lost}`);
+    lines.push(
+      "    a backtick inside the command truncates it. Rewrite the command without nested " +
+      "backticks, or put it in a fenced code block (the whole line is the command there)."
+    );
+  }
+  return lines.join("\n");
 }
 
 // The environment variable Claude Code exports into every subprocess it
@@ -948,11 +994,22 @@ function cursorUserDir() {
  * relative and an absolute spelling of the same destination count as
  * `current`.
  *
+ * A missing SOURCE is reported as `missing` and nothing is created: a link
+ * to a path that does not exist resolves to nothing for Cursor while the
+ * install output claims `created`, so a broken plugin checkout would be
+ * reported as a success (kusabi #256).
+ *
  * @param {string} target
  * @param {string} linkPath
- * @returns {{state: "created"|"current"|"updated"|"conflict"|"error", target: string, linkPath: string, previous: string|null, error?: string}}
+ * @returns {{state: "created"|"current"|"updated"|"conflict"|"missing"|"error", target: string, linkPath: string, previous: string|null, error?: string}}
  */
-function ensureSymlink(target, linkPath) {
+export function ensureSymlink(target, linkPath) {
+  // Checked before linkPath is even inspected: with no source there is
+  // nothing worth linking to, whatever is (or is not) at linkPath.
+  if (!fs.existsSync(target)) {
+    return { state: "missing", target, linkPath, previous: null };
+  }
+
   let stat = null;
   try {
     stat = fs.lstatSync(linkPath);
@@ -975,18 +1032,36 @@ function ensureSymlink(target, linkPath) {
 
   try {
     fs.mkdirSync(path.dirname(linkPath), { recursive: true });
-    if (stat) fs.rmSync(linkPath, { force: true });
-    fs.symlinkSync(target, linkPath);
+    if (stat) {
+      // Atomic replace (kusabi #256): symlink under a temp name, then rename
+      // over the old link.  rm-then-create leaves the path absent in
+      // between, and a failure in that window leaves nothing at all where a
+      // stale-but-working link used to be.  renameSync over an existing
+      // entry is a single atomic step.
+      const staging = `${linkPath}.kusabi-tmp-${process.pid}`;
+      fs.rmSync(staging, { force: true });
+      try {
+        fs.symlinkSync(target, staging);
+        fs.renameSync(staging, linkPath);
+      } catch (err) {
+        fs.rmSync(staging, { force: true });
+        throw err;
+      }
+    } else {
+      fs.symlinkSync(target, linkPath);
+    }
   } catch (err) {
     return { state: "error", target, linkPath, previous, error: err.message };
   }
   return { state: stat ? "updated" : "created", target, linkPath, previous };
 }
 
-function formatSymlinkLine(res) {
+export function formatSymlinkLine(res) {
   switch (res.state) {
     case "conflict":
       return `conflict: ${res.linkPath} exists and is not a symlink; left untouched (expected a link to ${res.target})`;
+    case "missing":
+      return `error: ${res.linkPath}: symlink source does not exist: ${res.target} (nothing created)`;
     case "error":
       return `error: ${res.linkPath}: ${res.error}`;
     case "updated":
@@ -1006,26 +1081,38 @@ function formatSymlinkLine(res) {
  * (the shim) has already succeeded by the time this runs.
  *
  * @param {{ rule?: boolean }} [opts]
- * @returns {string[]} One line per artifact (or one skip line).
+ * @returns {{lines: string[], failed: boolean}} One line per artifact (or one
+ *   skip line); `failed` when an artifact's SOURCE was missing.
  */
 function wireCursorSkills({ rule = false } = {}) {
   const explicit = Boolean(process.env.KUSABI_CURSOR_DIR);
   const cursorDir = cursorUserDir();
   if (!explicit && !fs.existsSync(cursorDir)) {
-    return [`cursor skills: skipped (${cursorDir} not found — no Cursor user directory on this machine)`];
+    return {
+      lines: [`cursor skills: skipped (${cursorDir} not found — no Cursor user directory on this machine)`],
+      failed: false,
+    };
   }
   const pluginDir = pluginRootDir();
-  const lines = CURSOR_SKILL_NAMES.map((name) => formatSymlinkLine(ensureSymlink(
+  const results = CURSOR_SKILL_NAMES.map((name) => ensureSymlink(
     path.join(pluginDir, "skills", name),
     path.join(cursorDir, "skills", name),
-  )));
+  ));
   if (rule) {
-    lines.push(formatSymlinkLine(ensureSymlink(
+    results.push(ensureSymlink(
       path.join(pluginDir, "rules", CURSOR_RULE_FILE),
       path.join(cursorDir, "rules", CURSOR_RULE_FILE),
-    )));
+    ));
   }
-  return lines;
+  return {
+    lines: results.map(formatSymlinkLine),
+    // Only a missing SOURCE decides the exit code (kusabi #256): that says
+    // the plugin checkout itself is broken, so install-cli's promise is
+    // false everywhere, not just on this machine.  A per-artifact `error`
+    // (a filesystem refusal at the destination) stays non-fatal — the shim,
+    // install-cli's primary job, is already written by the time we get here.
+    failed: results.some((r) => r.state === "missing"),
+  };
 }
 
 function cmdInstallCli({ flags } = {}) {
@@ -1054,8 +1141,13 @@ function cmdInstallCli({ flags } = {}) {
   if (!pathHasDir(binDir)) {
     lines.push(`warning: ${binDir} is not on PATH; add it so \`${SHIM_NAME}\` can be found`);
   }
-  lines.push(...wireCursorSkills({ rule: Boolean(flags?.cursorRule) }));
-  return lines.join("\n");
+  const cursor = wireCursorSkills({ rule: Boolean(flags?.cursorRule) });
+  lines.push(...cursor.lines);
+  const text = lines.join("\n");
+  // A missing skill source means the installed wiring points at nothing;
+  // reporting it on stdout and still exiting 0 would let a broken checkout
+  // read as a successful install (kusabi #256).
+  return cursor.failed ? { text, exitCode: 1 } : text;
 }
 
 async function cmdSetup(cwd) {
@@ -1950,6 +2042,16 @@ async function cmdChain(cwd, { flags, text }) {
   if (publishWarning) {
     process.stdout.write(publishWarning + "\n");
   }
+
+  // ---- lossy-smoke refusal (kusabi #250) ----
+  // A smoke command the parser truncates (nested backtick), or a `## Smoke`
+  // heading it can read nothing out of, dooms every round of the chain and
+  // cannot be repaired by the worker.  Refuse here — the same stage as the
+  // :variant rejection below, and before createChainDir, so no chain state
+  // and no job exist when this fires.  A brief problem is reported whatever
+  // the model config says, hence the check sits ahead of backend resolution.
+  const smokeRejection = smokeViolationReport(text);
+  if (smokeRejection) throw new Error(smokeRejection);
 
   // ---- setup ----
   const stateDir = stateDirFor(cwd);
@@ -2899,6 +3001,17 @@ async function cmdChainResume(cwd, { flags, text }) {
   const chainJson = readJson(path.join(chainDir, "chain.json"));
   if (!chainJson) {
     throw new Error(`chain.json not found for ${chainId} — the chain never persisted state to resume from`);
+  }
+
+  // ---- lossy-smoke refusal (kusabi #250) ----
+  // chain-resume DOES re-read the brief: chain.json's `brief` is handed to
+  // runChainDriver below, so every remaining round would run the same
+  // misread smoke section.  Refuse before rearmChainControl, i.e. before any
+  // state is touched.  Chains predating the `brief` field resume with "",
+  // which has no Smoke section and never trips this.
+  const resumeSmokeRejection = smokeViolationReport(chainJson.brief ?? "");
+  if (resumeSmokeRejection) {
+    throw new Error(`cannot resume chain ${chainId}: ${resumeSmokeRejection}`);
   }
 
   // ---- resume-position decision, from the records alone ----

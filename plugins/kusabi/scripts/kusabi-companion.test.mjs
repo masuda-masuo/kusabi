@@ -24,6 +24,9 @@ import {
   buildTaskReviewInput,
   resolveOrchestratorRecord,
   ORCH_SESSION_ENV,
+  smokeViolationReport,
+  ensureSymlink,
+  formatSymlinkLine,
 } from "./kusabi-companion.mjs";
 import { dispatchWithFallback } from "./prompt-execution.mjs";
 import { claudeDispatch } from "./claude-dispatch.mjs";
@@ -5869,5 +5872,296 @@ describe("failed task/review next-action (kusabi #246)", () => {
     const cmdReviewSource = commandSource("async function cmdReview(", "function cmdStatus(");
     assert.ok(cmdReviewSource.includes("Run kusabi-companion status ${job.id} for details."));
     assert.ok(!cmdReviewSource.includes("/kusabi:"), "no slash command in cmdReview output");
+  });
+});
+
+// Lossy smoke briefs are refused before the chain starts (kusabi #250)
+// ---------------------------------------------------------------------------
+// A smoke command containing a backtick is truncated by parseSmoke into an
+// entry no shell can run; the chain then burns every round with P4 red and
+// the worker cannot fix it from the inside (kusabi #246, chain-mst2adbf5fd5).
+// The refusal happens at parse time, before any chain state exists.
+
+describe("smoke-brief refusal (kusabi #250)", () => {
+  const COMPANION_SCRIPT = path.join(import.meta.dirname, "kusabi-companion.mjs");
+  // Verbatim from the incident, and what parseSmoke reads out of it.
+  const NESTED = "- `! grep -F 'Check `/kusabi:status`' plugins/kusabi/commands/task.md …`";
+  const TRUNCATED = "! grep -F 'Check ";
+  const LOSSY_BRIEF = ["# Task", "", "## Smoke", "", NESTED, ""].join("\n");
+
+  describe("smokeViolationReport", () => {
+    it("names the source line and the command the machine read", () => {
+      const report = smokeViolationReport(LOSSY_BRIEF);
+      assert.ok(report, "a lossy brief must produce a report");
+      assert.ok(report.includes(NESTED), report);
+      assert.ok(report.includes("`" + TRUNCATED + "`"), report);
+    });
+
+    it("reports a `## Smoke` heading with no entries", () => {
+      const report = smokeViolationReport("## Smoke\n\nRun the usual checks.\n");
+      assert.ok(report);
+      assert.match(report, /no smoke entry parsed/);
+    });
+
+    it("returns null for a clean brief and for no brief at all", () => {
+      assert.equal(smokeViolationReport("## Smoke\n- `npm test`\n"), null);
+      assert.equal(smokeViolationReport(""), null);
+      assert.equal(smokeViolationReport(null), null);
+    });
+  });
+
+  describe("chain CLI", () => {
+    function runChain(briefText, tmp) {
+      const briefPath = path.join(tmp, "brief.md");
+      fs.writeFileSync(briefPath, briefText);
+      const env = { ...process.env };
+      delete env.KUSABI_WORKER_CONTEXT;
+      env.KUSABI_STATE_DIR = path.join(tmp, "state");
+      env.KUSABI_SUNABA_URL = "http://127.0.0.1:9/mcp";
+      return spawnSync(
+        process.execPath,
+        [COMPANION_SCRIPT, "chain", "--container", "cid-1", "--brief-file", briefPath],
+        { encoding: "utf8", cwd: tmp, env, timeout: 15_000 },
+      );
+    }
+
+    it("refuses the #250 nested-backtick brief, showing line and command", () => {
+      const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-smoke-chain-"));
+      try {
+        const result = runChain(LOSSY_BRIEF, tmp);
+        assert.notEqual(result.status, 0, result.stdout);
+        assert.ok(result.stdout.includes(NESTED), result.stdout);
+        assert.ok(result.stdout.includes("`" + TRUNCATED + "`"), result.stdout);
+        // Nothing may have been created: the refusal is upstream of any state.
+        assert.ok(!fs.existsSync(path.join(tmp, "state")), "no state dir may be created");
+      } finally {
+        fs.rmSync(tmp, { recursive: true, force: true });
+      }
+    });
+
+    it("refuses a `## Smoke` heading with no entries", () => {
+      const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-smoke-chain-"));
+      try {
+        const result = runChain("# Task\n\n## Smoke\n\nRun the usual checks.\n", tmp);
+        assert.notEqual(result.status, 0, result.stdout);
+        assert.match(result.stdout, /no smoke entry parsed/);
+        assert.ok(!fs.existsSync(path.join(tmp, "state")), "no state dir may be created");
+      } finally {
+        fs.rmSync(tmp, { recursive: true, force: true });
+      }
+    });
+
+    it("lets a clean smoke brief through the check (fails later, on dispatch)", () => {
+      const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-smoke-chain-"));
+      try {
+        const result = runChain("# Task\n\n## Smoke\n\n- `npm test`\n", tmp);
+        // The dispatch itself cannot succeed here (dead sunaba endpoint); what
+        // matters is that the failure is NOT the smoke refusal.
+        assert.doesNotMatch(result.stdout, /brief rejected before dispatch/);
+      } finally {
+        fs.rmSync(tmp, { recursive: true, force: true });
+      }
+    });
+  });
+
+  describe("chain-resume CLI", () => {
+    // chain-resume re-reads the brief from chain.json, so the same refusal
+    // applies there — and must land before the control record is re-armed.
+    function hashedWorkspaceDir(stateRootDir, cwd) {
+      const hash = crypto.createHash("sha256").update(cwd).digest("hex").slice(0, 12);
+      return path.join(stateRootDir, hash);
+    }
+
+    it("refuses to resume a chain whose saved brief is lossy", () => {
+      const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-smoke-resume-"));
+      try {
+        const stateRootDir = path.join(tmp, "state");
+        const stateDir = hashedWorkspaceDir(stateRootDir, tmp);
+        const chainDir = path.join(stateDir, "chains", "chain-lossy");
+        fs.mkdirSync(chainDir, { recursive: true });
+        writeJson(path.join(chainDir, "chain.json"), {
+          chainId: "chain-lossy",
+          container: "cid-1",
+          model: "fake/model",
+          modelChain: [["fake/model"]],
+          maxRounds: 4,
+          brief: LOSSY_BRIEF,
+          records: [{ round: 1, implementJobId: "job-1", interrupted: true }],
+        });
+        writeChainControl(chainDir, {
+          chainId: "chain-lossy", container: "cid-1", pid: 999999,
+          status: "running", round: 1, startedAt: new Date().toISOString(),
+        });
+
+        const env = { ...process.env };
+        delete env.KUSABI_WORKER_CONTEXT;
+        env.KUSABI_STATE_DIR = stateRootDir;
+        env.KUSABI_SUNABA_URL = "http://127.0.0.1:9/mcp";
+        const result = spawnSync(
+          process.execPath, [COMPANION_SCRIPT, "chain-resume", "chain-lossy"],
+          { encoding: "utf8", cwd: tmp, env, timeout: 15_000 },
+        );
+        assert.notEqual(result.status, 0, result.stdout);
+        assert.match(result.stdout, /cannot resume chain chain-lossy/);
+        assert.ok(result.stdout.includes("`" + TRUNCATED + "`"), result.stdout);
+        // Refused before rearmChainControl touched anything.
+        assert.equal(readChainControl(chainDir).status, "running");
+      } finally {
+        fs.rmSync(tmp, { recursive: true, force: true });
+      }
+    });
+  });
+});
+
+// ensureSymlink: no dangling links, atomic replacement (kusabi #256)
+// ---------------------------------------------------------------------------
+// A link to a source that does not exist resolves to nothing for Cursor while
+// the install output says `created` — a broken checkout reported as success.
+// And rm-then-symlink leaves the path absent in between, so a crash in that
+// window destroys a stale-but-working link.
+
+describe("ensureSymlink (kusabi #256)", () => {
+  const COMPANION_SCRIPT = path.join(import.meta.dirname, "kusabi-companion.mjs");
+  let tmp;
+
+  beforeEach(() => {
+    tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-symlink-"));
+  });
+
+  afterEach(() => {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  });
+
+  it("refuses a missing source: no link, distinct state, visible line", () => {
+    const source = path.join(tmp, "plugin", "skills", "delegate");
+    const link = path.join(tmp, "cursor", "skills", "delegate");
+    const res = ensureSymlink(source, link);
+    assert.equal(res.state, "missing");
+    assert.equal(res.target, source);
+    assert.equal(res.linkPath, link);
+    assert.ok(!fs.existsSync(link), "no dangling link may be created");
+    assert.ok(!fs.existsSync(path.dirname(link)), "not even the parent directory");
+    assert.match(formatSymlinkLine(res), /^error: /);
+    assert.ok(formatSymlinkLine(res).includes(source), formatSymlinkLine(res));
+  });
+
+  it("refuses a missing source even when a link is already there", () => {
+    const source = path.join(tmp, "gone");
+    const link = path.join(tmp, "link");
+    fs.mkdirSync(path.join(tmp, "elsewhere"));
+    fs.symlinkSync(path.join(tmp, "elsewhere"), link);
+    assert.equal(ensureSymlink(source, link).state, "missing");
+    // The existing link is left exactly as it was rather than destroyed.
+    assert.equal(fs.readlinkSync(link), path.join(tmp, "elsewhere"));
+  });
+
+  it("creates a link to an existing source", () => {
+    const source = path.join(tmp, "skills", "delegate");
+    fs.mkdirSync(source, { recursive: true });
+    const link = path.join(tmp, "cursor", "skills", "delegate");
+    assert.equal(ensureSymlink(source, link).state, "created");
+    assert.equal(fs.realpathSync(link), fs.realpathSync(source));
+  });
+
+  it("replaces a link pointing elsewhere and leaves no staging file behind", () => {
+    const source = path.join(tmp, "skills", "delegate");
+    const other = path.join(tmp, "elsewhere");
+    fs.mkdirSync(source, { recursive: true });
+    fs.mkdirSync(other, { recursive: true });
+    const linkDir = path.join(tmp, "cursor", "skills");
+    fs.mkdirSync(linkDir, { recursive: true });
+    const link = path.join(linkDir, "delegate");
+    fs.symlinkSync(other, link);
+
+    const res = ensureSymlink(source, link);
+    assert.equal(res.state, "updated");
+    assert.equal(res.previous, other);
+    assert.equal(fs.realpathSync(link), fs.realpathSync(source));
+    // The temp-name scheme must not leak: the directory holds the link alone.
+    assert.deepEqual(fs.readdirSync(linkDir), ["delegate"]);
+  });
+
+  it("still reports current / conflict as before", () => {
+    const source = path.join(tmp, "skills", "delegate");
+    fs.mkdirSync(source, { recursive: true });
+    const link = path.join(tmp, "link");
+    fs.symlinkSync(source, link);
+    assert.equal(ensureSymlink(source, link).state, "current");
+
+    const real = path.join(tmp, "real");
+    fs.mkdirSync(real);
+    assert.equal(ensureSymlink(source, real).state, "conflict");
+    assert.ok(fs.lstatSync(real).isDirectory());
+  });
+
+  it("never removes the link before its replacement exists", () => {
+    // Atomicity is a property of the replace path, not of an observable
+    // moment in a single-threaded test: pin it structurally.
+    const src = fs.readFileSync(COMPANION_SCRIPT, "utf8");
+    const start = src.indexOf("export function ensureSymlink(");
+    const end = src.indexOf("export function formatSymlinkLine(");
+    assert.ok(start >= 0 && end > start, "could not slice ensureSymlink");
+    const body = src.slice(start, end);
+    assert.match(body, /renameSync\(/, "the replace path must rename over the old link");
+    assert.doesNotMatch(body, /rmSync\(linkPath/, "the old link must never be removed first");
+  });
+});
+
+// install-cli surfaces a broken plugin checkout (kusabi #256)
+// ---------------------------------------------------------------------------
+// The skill sources are resolved from the companion script's own location, so
+// a fixture checkout is built around a copy of the script with no skills/ in
+// it. The copy must be real: Node resolves the ENTRY through realpath, so a
+// symlinked companion would report the true plugin root and test nothing.
+// The sibling modules can be symlinks for the same reason.
+
+describe("install-cli with a missing skill source (kusabi #256)", () => {
+  let tmp;
+
+  beforeEach(() => {
+    tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-broken-checkout-"));
+  });
+
+  afterEach(() => {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  });
+
+  function brokenCheckoutScript() {
+    const realScripts = import.meta.dirname;
+    const scripts = path.join(tmp, "plugins", "kusabi", "scripts");
+    fs.mkdirSync(scripts, { recursive: true });
+    for (const entry of fs.readdirSync(realScripts)) {
+      if (!entry.endsWith(".mjs")) continue;
+      const from = path.join(realScripts, entry);
+      const to = path.join(scripts, entry);
+      if (entry === "kusabi-companion.mjs") fs.copyFileSync(from, to);
+      else fs.symlinkSync(from, to);
+    }
+    return path.join(scripts, "kusabi-companion.mjs");
+  }
+
+  it("reports an error line per skill, creates no link, and exits non-zero", () => {
+    const script = brokenCheckoutScript();
+    const cursorDir = path.join(tmp, "cursor");
+    const result = spawnSync(process.execPath, [script, "install-cli"], {
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        HOME: tmp,
+        KUSABI_BIN_DIR: path.join(tmp, "bin"),
+        KUSABI_CURSOR_DIR: cursorDir,
+        OPENCODE_BIN: "/nonexistent-opencode-bin",
+      },
+      timeout: 15_000,
+    });
+    assert.notEqual(result.status, 0, result.stdout + result.stderr);
+    const errors = result.stdout.split("\n").filter((l) => l.startsWith("error: "));
+    assert.equal(errors.length, 2, result.stdout);
+    for (const line of errors) {
+      assert.match(line, /symlink source does not exist/);
+    }
+    assert.ok(!fs.existsSync(path.join(cursorDir, "skills")), "no dangling link may be created");
+    // The shim — install-cli's primary job — is still written and reported.
+    assert.match(result.stdout, /^created: .*kusabi-companion$/m);
   });
 });

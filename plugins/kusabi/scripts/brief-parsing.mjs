@@ -25,9 +25,14 @@
  * recognised, while `## Deliverables2` / `## Smoketest` are not.  Matching
  * is case-sensitive.
  *
+ * Every item also carries the source line it came from (`raw`, exactly as
+ * written, and 1-indexed `lineNumber`) so a caller can quote the brief back
+ * at its author.  Consumers that only want the content ignore these.
+ *
  * @param {string|null|undefined} briefText  The full brief text.
  * @param {string}                headingName  e.g. "Deliverables" or "Smoke".
- * @returns {{ items: Array<{content: string, source: "bullet"|"code-block"}>,
+ * @returns {{ items: Array<{content: string, source: "bullet"|"code-block",
+ *                           raw: string, lineNumber: number}>,
  *             headingFound: boolean }}
  */
 function parseSectionItems(briefText, headingName) {
@@ -78,7 +83,7 @@ function parseSectionItems(briefText, headingName) {
     // line would yield an empty token and be dropped silently.
     if (inCodeBlock) {
       if (trimmed !== "") {
-        items.push({ content: trimmed, source: "code-block" });
+        items.push({ content: trimmed, source: "code-block", raw: line, lineNumber: li + 1 });
       }
       continue;
     }
@@ -87,7 +92,7 @@ function parseSectionItems(briefText, headingName) {
     let bulletMatch = trimmed.match(/^[-*+]\s+(.*)/);
     if (bulletMatch) {
       const content = bulletMatch[1].trim();
-      if (content) items.push({ content, source: "bullet" });
+      if (content) items.push({ content, source: "bullet", raw: line, lineNumber: li + 1 });
       continue;
     }
 
@@ -95,7 +100,7 @@ function parseSectionItems(briefText, headingName) {
     bulletMatch = trimmed.match(/^\d+[.)]\s+(.*)/);
     if (bulletMatch) {
       const content = bulletMatch[1].trim();
-      if (content) items.push({ content, source: "bullet" });
+      if (content) items.push({ content, source: "bullet", raw: line, lineNumber: li + 1 });
       continue;
     }
 
@@ -244,6 +249,85 @@ export function parseSmoke(briefText) {
     }
   }
   return entries;
+}
+
+// ---------------------------------------------------------------------------
+// findSmokeViolations — smoke entries the machine would read differently from
+// what the brief says (kusabi #250)
+// ---------------------------------------------------------------------------
+
+/** A bullet whose command was truncated at a nested backtick. */
+export const SMOKE_VIOLATION_LOSSY = "lossy-command";
+/** A `## Smoke` heading from which parseSmoke extracts nothing. */
+export const SMOKE_VIOLATION_NO_ENTRIES = "no-entries";
+
+/**
+ * Find `## Smoke` entries whose written form and machine-read form disagree.
+ *
+ * parseSmoke takes the FIRST backtick pair of a bullet as the command, so a
+ * command that itself contains a backtick is silently cut at that backtick
+ * and handed on as a legal-looking entry (kusabi #246 ran six rounds on
+ * `` ! grep -F 'Check ` `` — an unclosed quote no worker could fix).  The
+ * loss is visible here, at parse time, with no I/O.  Two classes:
+ *
+ *  1. `lossy-command` — a bullet where, after removing the first backtick
+ *     pair, what is left still contains a backtick and is not merely an
+ *     `exit <N>` annotation.  Fenced code-block entries take the whole line
+ *     as the command and therefore cannot lose anything; they are never
+ *     flagged.
+ *  2. `no-entries` — a `## Smoke` heading (hasSectionHeading semantics) from
+ *     which parseSmoke extracts nothing at all, i.e. the declared smoke
+ *     check would silently not run.
+ *
+ * This is purely additive: parseSmoke's accepted grammar is untouched, and a
+ * brief with no violations parses exactly as before.
+ *
+ * @param {string|null|undefined} briefText
+ * @returns {Array<{kind: string, line: string|null, lineNumber: number|null,
+ *                  command: string|null, lost: string|null}>}
+ *   One entry per violation, in brief order; [] when clean.  Never throws.
+ */
+export function findSmokeViolations(briefText) {
+  const violations = [];
+  const { items, headingFound } = parseSectionItems(briefText, "Smoke");
+
+  for (const item of items) {
+    // Code-block entries take the whole line — nothing can be cut off.
+    if (item.source !== "code-block") {
+      const backtickMatch = item.content.match(/`([^`]+)`/);
+      // No backtick pair at all: parseSmoke skips the bullet outright, which
+      // is the documented way to write a non-command bullet.  Not a loss.
+      if (backtickMatch) {
+        const start = item.content.indexOf(backtickMatch[0]);
+        const lost = item.content.slice(0, start) +
+          item.content.slice(start + backtickMatch[0].length);
+        // A remainder holding a backtick is text the machine dropped; it is
+        // non-empty by construction.  The one benign remainder that can
+        // carry backticks is a quoted `exit <N>` annotation.
+        if (lost.includes("`") && !/^exit\s+\d+$/i.test(lost.replace(/`/g, "").trim())) {
+          violations.push({
+            kind: SMOKE_VIOLATION_LOSSY,
+            line: item.raw,
+            lineNumber: item.lineNumber,
+            command: backtickMatch[1],
+            lost: lost.trim(),
+          });
+        }
+      }
+    }
+  }
+
+  if (headingFound && parseSmoke(briefText).length === 0) {
+    violations.push({
+      kind: SMOKE_VIOLATION_NO_ENTRIES,
+      line: null,
+      lineNumber: null,
+      command: null,
+      lost: null,
+    });
+  }
+
+  return violations;
 }
 
 // ---------------------------------------------------------------------------
