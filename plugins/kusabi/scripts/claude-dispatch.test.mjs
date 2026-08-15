@@ -37,6 +37,8 @@ import {
   translateDenyTools,
   clampModelDispatch,
   extractSunabaMcp,
+  extractKaibaMcp,
+  applyWorkerKaibaIdentity,
   sunabaProfileForAgent,
   applySunabaProfile,
   claudeDispatch,
@@ -808,6 +810,14 @@ describe("allowedToolsForAgent", () => {
     assert.throws(() => allowedToolsForAgent("kusabi-draft"), /no permission allowlist/);
     assert.throws(() => allowedToolsForAgent("custom-agent"), /no permission allowlist/);
   });
+
+  it("grants both kaiba tools to all three supported agents (kusabi #279)", () => {
+    for (const agent of ["kusabi-implement", "kusabi-review", "kusabi-investigate"]) {
+      const csv = allowedToolsForAgent(agent);
+      assert.ok(csv.includes("mcp__kaiba__remember"), `${agent} must allow mcp__kaiba__remember`);
+      assert.ok(csv.includes("mcp__kaiba__recall"), `${agent} must allow mcp__kaiba__recall`);
+    }
+  });
 });
 
 describe("applyToolDenies", () => {
@@ -921,6 +931,189 @@ describe("extractSunabaMcp", () => {
 
   it("throws a clear error when the file is unreadable", () => {
     assert.throws(() => extractSunabaMcp("/nonexistent/never.json"), /cannot read MCP source config/);
+  });
+});
+
+describe("extractKaibaMcp", () => {
+  it("extracts the kaiba server entry", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-claude-mcp-"));
+    const file = path.join(dir, "claude.json");
+    const kaiba = { command: "/usr/local/bin/kaiba", env: { KAIBA_WORKSPACE: "dev", KAIBA_AGENT: "claude" } };
+    fs.writeFileSync(file, JSON.stringify({ mcpServers: { sunaba: { command: "npx" }, kaiba } }), "utf8");
+    assert.deepEqual(extractKaibaMcp(file), kaiba);
+  });
+
+  it("returns null when the entry is absent — kaiba is optional, this must NOT throw", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-claude-mcp-"));
+    const file = path.join(dir, "claude.json");
+    fs.writeFileSync(file, JSON.stringify({ mcpServers: { sunaba: { command: "npx" } } }), "utf8");
+    assert.equal(extractKaibaMcp(file), null);
+  });
+
+  it("throws the SAME read error as extractSunabaMcp — an unreadable config is a config error, not an absence", () => {
+    assert.throws(() => extractKaibaMcp("/nonexistent/never.json"), /cannot read MCP source config/);
+  });
+
+  it("throws the SAME parse error as extractSunabaMcp", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-claude-mcp-"));
+    const file = path.join(dir, "claude.json");
+    fs.writeFileSync(file, "{ not json", "utf8");
+    assert.throws(() => extractKaibaMcp(file), /is not valid JSON/);
+  });
+
+  it("rejects a string, a number, a boolean, an array and null \u2014 each is a config error, not an absence", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-claude-mcp-"));
+    const file = path.join(dir, "claude.json");
+    const junk = [
+      ["string", "kaiba"],
+      ["number", 7],
+      ["boolean", true],
+      ["array", ["kaiba"]],
+      ["null", null],
+    ];
+    for (const [label, value] of junk) {
+      fs.writeFileSync(file, JSON.stringify({ mcpServers: { sunaba: { command: "npx" }, kaiba: value } }), "utf8");
+      assert.throws(
+        () => extractKaibaMcp(file),
+        (err) => {
+          // A reader must be able to tell this apart from the missing-sunaba
+          // failure: the message names the kaiba key, says the entry is not
+          // a server entry, and tells the operator that removing the key
+          // restores the previous behaviour.
+          assert.match(err.message, /mcpServers\.kaiba/, "the error must name the key");
+          assert.match(err.message, /not a server entry/, "the error must say the entry is not a server entry");
+          assert.match(
+            err.message,
+            /remove the mcpServers\.kaiba key/,
+            "the error must tell the operator that removing the key restores the previous behaviour",
+          );
+          return true;
+        },
+        `${label} entry must throw`,
+      );
+    }
+  });
+
+  it("the error says what the entry was found to be", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-claude-mcp-"));
+    const file = path.join(dir, "claude.json");
+    const cases = [
+      ["string", "kaiba", /is a string, not a server entry/],
+      ["number", 7, /is a number, not a server entry/],
+      ["boolean", true, /is a boolean, not a server entry/],
+      ["array", ["kaiba"], /is an array, not a server entry/],
+      ["null", null, /is null, not a server entry/],
+    ];
+    for (const [label, value, re] of cases) {
+      fs.writeFileSync(file, JSON.stringify({ mcpServers: { sunaba: { command: "npx" }, kaiba: value } }), "utf8");
+      assert.throws(() => extractKaibaMcp(file), re, `${label}: the message must say what was found`);
+    }
+  });
+
+  it("rejects an object with no field that could start a server \u2014 {} and junk objects are malformed, not absent", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-claude-mcp-"));
+    const file = path.join(dir, "claude.json");
+    const junk = [{}, { foo: 1 }, { env: { KAIBA_AGENT: "claude" } }];
+    for (const value of junk) {
+      fs.writeFileSync(file, JSON.stringify({ mcpServers: { sunaba: { command: "npx" }, kaiba: value } }), "utf8");
+      assert.throws(() => extractKaibaMcp(file), /an object with none of the server-launching fields/);
+    }
+  });
+
+  it("rejects an object whose only launch-declaring field is type \u2014 type names the transport kind, it launches nothing", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-claude-mcp-"));
+    const file = path.join(dir, "claude.json");
+    const junk = [{ type: "stdio" }, { type: "http" }, { type: "sse" }];
+    for (const value of junk) {
+      fs.writeFileSync(file, JSON.stringify({ mcpServers: { sunaba: { command: "npx" }, kaiba: value } }), "utf8");
+      assert.throws(
+        () => extractKaibaMcp(file),
+        (err) => {
+          // Same message shape as the other rejections: the key is named,
+          // the entry is not a server entry, and what was wrong with it is
+          // spelled out (it has none of the server-launching fields).
+          assert.match(err.message, /mcpServers\.kaiba/, "the error must name the key");
+          assert.match(err.message, /not a server entry/, "the error must say the entry is not a server entry");
+          assert.match(
+            err.message,
+            /an object with none of the server-launching fields \(command, url\)/,
+            "the message must say what was wrong with the entry",
+          );
+          return true;
+        },
+        `${JSON.stringify(value)} entry must throw`,
+      );
+    }
+  });
+
+  it("accepts type beside a launcher \u2014 type with command or url is a normal entry", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-claude-mcp-"));
+    const file = path.join(dir, "claude.json");
+    const entries = [
+      { type: "stdio", command: "/usr/local/bin/kaiba" },
+      { type: "http", url: "http://localhost:8890/mcp" },
+      { type: "http", url: "http://localhost:8890/mcp", headers: { Authorization: "Bearer x" } },
+    ];
+    for (const entry of entries) {
+      fs.writeFileSync(file, JSON.stringify({ mcpServers: { sunaba: { command: "npx" }, kaiba: entry } }), "utf8");
+      assert.deepEqual(extractKaibaMcp(file), entry);
+    }
+  });
+
+  it("accepts any object that can launch a server \u2014 command or url \u2014 without judging its contents", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-claude-mcp-"));
+    const file = path.join(dir, "claude.json");
+    const entries = [
+      { command: "/usr/local/bin/kaiba" },
+      { command: "/usr/local/bin/kaiba", args: ["--stdio"], env: { KAIBA_WORKSPACE: "dev" } },
+      { url: "http://localhost:8890/sse" },
+      { type: "http", url: "http://localhost:8890/mcp" },
+      // Contents are NOT judged here: whether the command exists or the url
+      // answers belongs to claude at connect time (kusabi #279 follow-up).
+      { command: "/definitely/not/on/this/machine" },
+    ];
+    for (const entry of entries) {
+      fs.writeFileSync(file, JSON.stringify({ mcpServers: { sunaba: { command: "npx" }, kaiba: entry } }), "utf8");
+      assert.deepEqual(extractKaibaMcp(file), entry);
+    }
+  });
+});
+
+describe("applyWorkerKaibaIdentity", () => {
+  it("forces env.KAIBA_AGENT=worker no matter what the source entry said, preserving the rest", () => {
+    const entry = {
+      command: "/usr/local/bin/kaiba",
+      args: ["--stdio"],
+      env: { KAIBA_WORKSPACE: "dev", KAIBA_AGENT: "claude" },
+    };
+    assert.deepEqual(applyWorkerKaibaIdentity(entry), {
+      command: "/usr/local/bin/kaiba",
+      args: ["--stdio"],
+      env: { KAIBA_WORKSPACE: "dev", KAIBA_AGENT: "worker" },
+    });
+  });
+
+  it("adds the env block when the source entry has none", () => {
+    assert.deepEqual(
+      applyWorkerKaibaIdentity({ command: "/usr/local/bin/kaiba" }),
+      { command: "/usr/local/bin/kaiba", env: { KAIBA_AGENT: "worker" } },
+    );
+  });
+
+  it("never mutates the source entry — the rewrite comes back on a copy", () => {
+    const entry = { command: "/usr/local/bin/kaiba", env: { KAIBA_AGENT: "claude" } };
+    applyWorkerKaibaIdentity(entry);
+    assert.deepEqual(entry, { command: "/usr/local/bin/kaiba", env: { KAIBA_AGENT: "claude" } });
+  });
+
+  it("passes an absent entry through as absent", () => {
+    assert.equal(applyWorkerKaibaIdentity(null), null);
+    assert.equal(applyWorkerKaibaIdentity(undefined), undefined);
+  });
+
+  it("passes a non-object entry through unchanged", () => {
+    const entry = "kaiba";
+    assert.equal(applyWorkerKaibaIdentity(entry), entry);
   });
 });
 
@@ -1611,6 +1804,89 @@ describe("claudeDispatch (fake claude binary)", () => {
 
     // The prompt reached the child on stdin (I5), not argv.
     assert.equal(fs.readFileSync(ctx.stdinLog, "utf8"), "Do the thing.");
+  });
+
+  // ---- kaiba pass-through (kusabi #279) ----
+  // The default fixture has NO kaiba entry, and the invocation-shape test
+  // above already pins that the generated config stays exactly
+  // `{ mcpServers: { sunaba } }`.  These drive the kaiba-present and
+  // error cases end to end.
+
+  it("a source kaiba entry reaches the generated config, filed under worker — never the operator's identity", async () => {
+    // The host entry is the OPERATOR's own registration (KAIBA_AGENT=claude).
+    // A dispatched worker is not that session: conclusions it writes must
+    // not be attributed to it — authorship exists precisely to tell them
+    // apart — so the generated config always carries KAIBA_AGENT=worker.
+    const sourceKaiba = {
+      command: "/usr/local/bin/kaiba",
+      env: { KAIBA_WORKSPACE: "dev", KAIBA_AGENT: "claude" },
+    };
+    fs.writeFileSync(
+      ctx.mcpSource,
+      JSON.stringify({ mcpServers: { sunaba: SUNABA_MCP, kaiba: sourceKaiba, other: { command: "echo" } } }),
+      "utf8",
+    );
+    await claudeDispatch(ctx.dispatchOptions());
+
+    const args = JSON.parse(fs.readFileSync(ctx.argsLog, "utf8").trim());
+    const mcpConfig = readJson(args[args.indexOf("--mcp-config") + 1]);
+    assert.deepEqual(mcpConfig.mcpServers.sunaba, SUNABA_MCP);
+    assert.deepEqual(mcpConfig.mcpServers.kaiba, {
+      command: "/usr/local/bin/kaiba",
+      env: { KAIBA_WORKSPACE: "dev", KAIBA_AGENT: "worker" },
+    });
+    // The operator's registration on disk is untouched — the rewrite came
+    // back on a copy.
+    const source = JSON.parse(fs.readFileSync(ctx.mcpSource, "utf8"));
+    assert.deepEqual(source.mcpServers.kaiba, sourceKaiba);
+  });
+
+  it("without a kaiba entry the generated config is exactly today's — no kaiba, no error", async () => {
+    // The machine that has not adopted kaiba must keep dispatching
+    // unchanged (kusabi #279): this fixture's source config has no kaiba
+    // entry, so the generated config must deep-equal the pre-kaiba shape.
+    await claudeDispatch(ctx.dispatchOptions());
+    const args = JSON.parse(fs.readFileSync(ctx.argsLog, "utf8").trim());
+    const mcpConfig = readJson(args[args.indexOf("--mcp-config") + 1]);
+    assert.deepEqual(mcpConfig, { mcpServers: { sunaba: SUNABA_MCP } });
+    assert.equal(mcpConfig.mcpServers.kaiba, undefined);
+  });
+
+  it("a malformed source config still throws in pre-flight — an optional server never softens the loud failure", async () => {
+    fs.writeFileSync(ctx.mcpSource, "{ not json", "utf8");
+    await assert.rejects(() => claudeDispatch(ctx.dispatchOptions()), /is not valid JSON/);
+    // Nothing was spawned: no argv line was recorded.
+    assert.equal(fs.readFileSync(ctx.argsLog, "utf8").trim(), "");
+  });
+
+  it("a missing sunaba entry still throws in pre-flight even when kaiba is present", async () => {
+    fs.writeFileSync(
+      ctx.mcpSource,
+      JSON.stringify({ mcpServers: { kaiba: { command: "/usr/local/bin/kaiba" } } }),
+      "utf8",
+    );
+    await assert.rejects(() => claudeDispatch(ctx.dispatchOptions()), /no mcpServers\.sunaba entry/);
+    assert.equal(fs.readFileSync(ctx.argsLog, "utf8").trim(), "");
+  });
+
+  it("a malformed kaiba entry fails the dispatch in pre-flight \u2014 no job record, nothing spawned, and the error names the kaiba key", async () => {
+    // The entry is present but cannot be a server entry.  Unlike ABSENCE
+    // (silent, kusabi #279), this is an operator error: it must fail loudly
+    // BEFORE any job record exists — and the message must be distinguishable
+    // from the missing-sunaba failure by naming the kaiba key.
+    fs.writeFileSync(
+      ctx.mcpSource,
+      JSON.stringify({ mcpServers: { sunaba: SUNABA_MCP, kaiba: "kaiba" } }),
+      "utf8",
+    );
+    await assert.rejects(
+      () => claudeDispatch(ctx.dispatchOptions()),
+      /mcpServers\.kaiba .* not a server entry/,
+    );
+    // Nothing was spawned and no job record exists: the failure landed in
+    // pre-flight, before either could be created.
+    assert.equal(fs.readFileSync(ctx.argsLog, "utf8").trim(), "");
+    assert.deepEqual(listJobs(ctx.stateDir), []);
   });
 
   it("one model per phase: uses the chain's first route, never walks the ladder", async () => {
