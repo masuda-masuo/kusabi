@@ -42,13 +42,17 @@ import {
   BACKENDS,
   resolveBackend,
   resolveDispatchBackend,
-  resolveReviewDispatch,
-  resolveResumeDispatches,
-  effectiveTierCount,
   backendDispatch,
   backendPinsModel,
   assertSessionBackendCompatible,
 } from "./kusabi-companion.mjs";
+// The chain-side seams moved out of the companion with the driver
+// (kusabi #264 PR 2/2); no compatibility re-export was left behind.
+import {
+  resolveReviewDispatch,
+  resolveResumeDispatches,
+  effectiveTierCount,
+} from "./chain-driver.mjs";
 import { claudeDispatch, readAgentSystemPrompt } from "./claude-dispatch.mjs";
 import { dispatchWithFallback } from "./prompt-execution.mjs";
 import { runImplementPhase } from "./chain-phases.mjs";
