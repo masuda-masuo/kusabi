@@ -85,6 +85,25 @@
 // error text.  Off by default, warn-only unless a kill bound is configured,
 // never killing on a malformed config, and fail-open throughout (see
 // resolveClaudeWriteWatchdog).
+//
+// Repeat-tool watchdog (kusabi #234): both siblings measure TIME — the
+// silence watchdog the time since any parsed event, the write watchdog the
+// time since any file-mutating call — so a worker that calls the SAME tool
+// with the SAME arguments satisfies both clocks forever (chatty, writing,
+// and saying the same thing every time; the neighbour of the recorded #215
+// incident).  On an implement-phase dispatch, and only when
+// `claude.repeatWatchdog` is configured, a CHAIN counts consecutive
+// identical calls — keyed on `(tool name, deep-key-sorted
+// JSON.stringify(input))` at the same fold point the write watchdog already
+// observes, so it needs no new I/O.  At `threshold` it warns once
+// (`companion.repeat-watchdog.warned`, also recorded on the job), and at
+// `killThreshold` it kills the child's process group exactly as its siblings
+// do, finishing the job `status: "stalled"` with its own distinct error
+// text.  Untracked bookkeeping calls are transparent to the chain, denied
+// calls count, argument identity is always the FULL normalized string (only
+// the event preview is ever truncated), and an invalid config fails LOUDLY
+// at load — never off, never a killing configuration the operator did not
+// write (see resolveClaudeRepeatWatchdog).
 
 import path from "node:path";
 import fs from "node:fs";
@@ -1569,6 +1588,294 @@ export function renderClaudeWriteWatchdogError(killS) {
 }
 
 // =========================================================================
+// repeat-tool watchdog — pure helpers (kusabi #234)
+// =========================================================================
+//
+// The silence watchdog measures whether ANY parsed stream event arrives,
+// and the write watchdog measures how long a phase whose whole job is to
+// produce edits has gone without a file-mutating tool call.  Both are
+// TIME-based, so a worker that repeats the SAME tool call with the SAME
+// arguments holds both clocks off forever: every call is a parsed event
+// (silence clock reset) and, for a write tool, every call is a write (write
+// clock reset).  The recorded neighbour failure (kusabi #215 item 3) was
+// "chatty but never writing"; this one is "chatty, writing, and saying the
+// same thing every time".
+//
+// This watchdog counts, not times: a CHAIN keyed on `(tool name,
+// deep-key-sorted JSON.stringify(input))` folds at the same point the write
+// watchdog already observes (assistant event → message.content[] → tool_use
+// blocks), so it needs no new I/O.  At `threshold` consecutive identical
+// calls it warns once (`companion.repeat-watchdog.warned`, also recorded on
+// the job), and at `killThreshold` it kills the child's process group
+// exactly as its two siblings do.
+//
+// Adopted from deepseek-harness's repeat-tool-reminder (shiori-indexed):
+//   - argument normalization is deep key sort + JSON.stringify, so two
+//     inputs differing only in property ORDER count as identical;
+//   - calls of UNTRACKED bookkeeping tools are TRANSPARENT to the chain —
+//     they neither increment nor reset it, so `edit_file X → TodoWrite →
+//     edit_file X` still counts as two consecutive `edit_file X`.  The
+//     untracked list exists ONLY to keep bookkeeping tools from laundering
+//     a loop (or being laundered by one); a bookkeeping tool that is itself
+//     the repeated call is detected like any other;
+//   - DENIED calls count: kusabi is allowlist-based, so a model hammering a
+//     tool kusabi refuses is exactly the loop to break;
+//   - invalid threshold settings fail LOUDLY at load — never a silent
+//     fallback, never a killing configuration the operator did not write;
+//   - the identity comparison always uses the FULL normalized string; the
+//     truncated preview that goes into events is a record, never a
+//     comparison input.
+// Not adopted: dsh's advisory injection (kusabi observes the NDJSON from
+// outside `claude -p` and has no path to inject a nudge into the running
+// child — warn and kill are the only levers) and fuzzy/approximate argument
+// matching (a one-character variation escapes; that is accepted).
+//
+// The one deliberate difference from the two siblings: this watchdog is
+// count-based, not time-based — there is no clock to poll, the chain folds
+// synchronously at line delivery, and the kill lands the instant the
+// `killThreshold`-th identical call arrives.
+
+// How much of the normalized arguments the warned/fired events carry.  The
+// full normalized string can be huge (a repeated edit of a big file); the
+// preview is truncated to this many characters for the record.  Identity
+// comparison NEVER uses the preview (kusabi #234 invariant 5) — the chain
+// key always carries the complete string.
+export const CLAUDE_REPEAT_ARGS_PREVIEW_MAX = 200;
+
+// Bookkeeping tools that are TRANSPARENT to the chain: calling one neither
+// increments nor resets the consecutive-identical count.  `TodoWrite` is
+// Claude Code's native progress bookkeeping (the deepseek-harness precedent
+// is `todo_write`; both spellings are matched after the `mcp__<server>__`
+// prefix is stripped, so a differently-named MCP server still matches).
+// This list exists ONLY to keep bookkeeping tools from laundering a loop —
+// a tool on this list that is ITSELF the repeated call is detected like any
+// other, because transparency means "ignored", not "exempt".
+const CLAUDE_REPEAT_UNTRACKED_TOOL_NAMES = new Set(["TodoWrite", "todo_write"]);
+
+/**
+ * Is this `tool_use` name a bookkeeping tool the chain is transparent to?
+ * Same prefix-stripping and case-sensitivity discipline as
+ * isClaudeWriteToolName.
+ *
+ * @param {unknown} name
+ * @returns {boolean}
+ */
+export function isClaudeRepeatUntrackedToolName(name) {
+  if (typeof name !== "string" || !name) return false;
+  const bare = /^mcp__(.+?)__(.+)$/.exec(name)?.[2] ?? name;
+  return CLAUDE_REPEAT_UNTRACKED_TOOL_NAMES.has(bare);
+}
+
+/**
+ * Deep key-sorted JSON: object keys are sorted recursively (arrays keep
+ * their order — element order is part of the arguments), so two inputs
+ * differing only in property order normalize identically.
+ *
+ * @param {unknown} value
+ * @returns {unknown}
+ */
+function deepSortedJson(value) {
+  if (Array.isArray(value)) return value.map(deepSortedJson);
+  if (value !== null && typeof value === "object") {
+    const out = {};
+    for (const key of Object.keys(value).sort()) out[key] = deepSortedJson(value[key]);
+    return out;
+  }
+  return value;
+}
+
+/**
+ * Normalize a tool call's `input` into the identity string the chain
+ * compares.  Deep key sort + JSON.stringify (kusabi #234): property ORDER
+ * is not part of the arguments, so `{a:1,b:2}` and `{b:2,a:1}` must count
+ * as the same call.  An absent input normalizes to `{}` — the empty
+ * arguments, not a distinct identity.
+ *
+ * @param {unknown} input — the `tool_use` block's `input` (present in real
+ *        transcripts; transcript-ingest.mjs stringifies it the same way).
+ * @returns {string} — the full normalized string; ALWAYS complete, never
+ *          truncated.  Only the event preview (claudeRepeatArgsPreview) is
+ *          ever cut, and the comparison never reads it.
+ */
+export function normalizeClaudeRepeatArgs(input) {
+  if (input === undefined || input === null) return "{}";
+  return JSON.stringify(deepSortedJson(input));
+}
+
+/**
+ * The chain key for one tracked call: `(tool name, normalized input)`.
+ * The NUL separator is unambiguous — tool names never contain one.
+ *
+ * @param {string} name — the bare tool name as the stream reported it.
+ * @param {unknown} input — the `tool_use` block's `input`.
+ * @returns {string}
+ */
+export function claudeRepeatChainKey(name, input) {
+  return `${name}\u0000${normalizeClaudeRepeatArgs(input)}`;
+}
+
+/**
+ * The truncated args preview that goes into the warned/fired events: the
+ * first CLAUDE_REPEAT_ARGS_PREVIEW_MAX characters of the normalized string,
+ * with a trailing ellipsis when it was cut.  A record, never a comparison
+ * input (kusabi #234 invariant 5).
+ *
+ * @param {string} chainKey — output of claudeRepeatChainKey.
+ * @returns {string}
+ */
+export function claudeRepeatArgsPreview(chainKey) {
+  const normalized = chainKey.slice(chainKey.indexOf("\u0000") + 1);
+  return normalized.length > CLAUDE_REPEAT_ARGS_PREVIEW_MAX
+    ? `${normalized.slice(0, CLAUDE_REPEAT_ARGS_PREVIEW_MAX)}…`
+    : normalized;
+}
+
+/**
+ * Advance the consecutive-identical chain by one tracked call.  A call
+ * whose key equals the current chain's key increments the count; any other
+ * key starts a new chain at count 1.
+ *
+ * @param {{key: string, count: number}|null} chain — the current chain
+ *        state, or null before the first tracked call.
+ * @param {string} key — output of claudeRepeatChainKey for the call.
+ * @returns {{key: string, count: number}}
+ */
+export function claudeRepeatChainAdvance(chain, key) {
+  if (chain !== null && chain.key === key) return { key, count: chain.count + 1 };
+  return { key, count: 1 };
+}
+
+/**
+ * Fold one parsed stream event's tool_use blocks into the caller's chain,
+ * in stream order.  Reads the SAME `assistant` → `message.content[]` →
+ * `tool_use` path eventHasClaudeWriteTool and applyClaudeStreamEvent fold,
+ * so the three can never disagree about what a tool call is.  Untracked
+ * bookkeeping tools are skipped entirely (transparent — no callback).
+ *
+ * @param {object|null} evt — one parsed stream event.
+ * @param {(toolName: string, chainKey: string) => void} onCall — called for
+ *        every TRACKED tool_use block, in stream order, with the bare tool
+ *        name and its chain key.
+ */
+export function foldClaudeRepeatCalls(evt, onCall) {
+  if (!evt || typeof evt !== "object" || evt.type !== "assistant") return;
+  const message = evt.message;
+  if (!message || typeof message !== "object") return;
+  const content = Array.isArray(message.content) ? message.content : [];
+  for (const block of content) {
+    if (!block || typeof block !== "object" || block.type !== "tool_use") continue;
+    if (typeof block.name !== "string" || !block.name) continue;
+    if (isClaudeRepeatUntrackedToolName(block.name)) continue;
+    onCall(block.name, claudeRepeatChainKey(block.name, block.input));
+  }
+}
+
+/**
+ * The repeat watchdog's settings for this dispatch.
+ *
+ * Config shape (`~/.kusabi/config.json`, the same file the session guard
+ * and the write watchdog read):
+ *
+ *   { "claude": { "repeatWatchdog": { "threshold": 5, "killThreshold": 12 } } }
+ *
+ * Resolution table:
+ *
+ *   - no config file / not an object     → OFF, `no-config`
+ *   - `claude.repeatWatchdog` absent     → OFF, `absent` (byte-identical to
+ *                                          the pre-#234 dispatch)
+ *   - `{ threshold, killThreshold }` with
+ *     integers, threshold >= 2 and
+ *     killThreshold > threshold          → ON, `configured` (numeric strings
+ *                                          read, like the write watchdog's
+ *                                          quoted seconds)
+ *   - ANY other present value (missing /
+ *     non-integer / sub-2 / non-increasing
+ *     thresholds; `true`, `false`, `0`,
+ *     a bare string, an array)           → THROWS.  A config error must fail
+ *                                          the dispatch LOUDLY before any
+ *                                          job record exists — never a
+ *                                          silent fallback to off, and never
+ *                                          a killing configuration the
+ *                                          operator did not write.  This
+ *                                          deliberately differs from the
+ *                                          write watchdog's fail-open
+ *                                          resolution: that one is
+ *                                          time-based and can afford a
+ *                                          warn-only fallback, while a
+ *                                          count watchdog has no warn-only
+ *                                          shape — there is no safe reading
+ *                                          of a malformed threshold.
+ *
+ * @param {object|null|undefined} config — output of loadClaudeGuardConfig().
+ * @returns {{ enabled: boolean, threshold: number|null, killThreshold: number|null, reason: string }}
+ * @throws {Error} for a present-but-invalid `claude.repeatWatchdog` value.
+ */
+export function resolveClaudeRepeatWatchdog(config) {
+  const off = (reason) => ({ enabled: false, threshold: null, killThreshold: null, reason });
+  if (config === null || config === undefined || typeof config !== "object" || Array.isArray(config)) {
+    return off("no-config");
+  }
+  const claude = config.claude === null || typeof config.claude !== "object" || Array.isArray(config.claude)
+    ? undefined
+    : config.claude;
+  const raw = claude?.repeatWatchdog;
+  if (raw === undefined || raw === null) return off("absent");
+  if (typeof raw !== "object" || Array.isArray(raw)) {
+    throw new Error(
+      `claude.repeatWatchdog must be an object { threshold, killThreshold } — got ${describeConfigValue(raw)}`,
+    );
+  }
+  const threshold = repeatWatchdogCount(raw.threshold, "threshold");
+  const killThreshold = repeatWatchdogCount(raw.killThreshold, "killThreshold");
+  if (killThreshold <= threshold) {
+    throw new Error(
+      `claude.repeatWatchdog.killThreshold (${killThreshold}) must be strictly greater than threshold (${threshold})`,
+    );
+  }
+  return { enabled: true, threshold, killThreshold, reason: "configured" };
+}
+
+/** One threshold of the repeat watchdog: a finite integer >= 2. */
+function repeatWatchdogCount(raw, key) {
+  if (raw === undefined || raw === null) {
+    throw new Error(`claude.repeatWatchdog.${key} is required — got ${describeConfigValue(raw)}`);
+  }
+  const parsed = typeof raw === "number"
+    ? raw
+    : (typeof raw === "string" && raw.trim() !== "" ? Number(raw) : NaN);
+  if (!Number.isFinite(parsed) || !Number.isInteger(parsed) || parsed < 2) {
+    throw new Error(`claude.repeatWatchdog.${key} must be an integer >= 2 — got ${describeConfigValue(raw)}`);
+  }
+  return parsed;
+}
+
+/** A config value rendered for an error message. */
+function describeConfigValue(raw) {
+  if (typeof raw === "number" && Number.isNaN(raw)) return "NaN";
+  try {
+    return JSON.stringify(raw);
+  } catch {
+    return String(raw);
+  }
+}
+
+/**
+ * The job's `error` text when the repeat watchdog killed the run.  Distinct
+ * from BOTH siblings' wording on purpose: three failures with three
+ * different causes and fixes must never be mistakable for one another.  The
+ * measured count and the repeated tool are the diagnosis (the configured
+ * thresholds ride in the events, exactly as the siblings split measured vs.
+ * configured).
+ *
+ * @param {string} tool — the repeated tool's name as the stream reported it.
+ * @param {number} count — the consecutive-identical count at the kill.
+ * @returns {string}
+ */
+export function renderClaudeRepeatWatchdogError(tool, count) {
+  return `repeat-watchdog: ${tool} called ${count} consecutive times with identical arguments on an implement phase (process killed)`;
+}
+
+// =========================================================================
 // spawn — one child per dispatch, bounded by timeoutS
 // =========================================================================
 
@@ -1864,11 +2171,20 @@ export async function stopRecordedProcess(recorded, { waitMs, pollMs = KILL_CONF
  *        — called once with `kind: "warned"` when `warnS` passes with no
  *        write-tool call, and (kill mode only) with `fired` then `kill`
  *        around the group kill, mirroring onWatchdog's pair.
+ * @param {{threshold: number, killThreshold: number}|null} [opts.repeatWatchdog] — the
+ *        repeat-tool watchdog's resolved thresholds (kusabi #234), or null
+ *        (the default) to leave it entirely off.  Both thresholds are
+ *        required: a count watchdog has no warn-only shape.
+ * @param {(event: {kind: "warned"|"fired"|"kill", tool?: string, count?: number, argsPreview?: string}) => void} [opts.onRepeatWatchdog]
+ *        — called with `kind: "warned"` the first time `threshold`
+ *        consecutive identical calls arrive (with the repeated tool, the
+ *        count, and a truncated args preview), then — kill mode only — with
+ *        `fired` and `kill` around the group kill.
  * @returns {Promise<{ code: number|null, stdout: string, stderr: string,
  *                     timedOut: boolean, stalled: boolean, writeStalled: boolean,
- *                     spawnError: Error|null }>}
+ *                     repeatStalled: boolean, spawnError: Error|null }>}
  */
-export function runClaudeProcess({ bin, args, cwd, timeoutS, watchdogS, promptText, onStart, onLine, onWatchdog, writeWatchdog = null, onWriteWatchdog }) {
+export function runClaudeProcess({ bin, args, cwd, timeoutS, watchdogS, promptText, onStart, onLine, onWatchdog, writeWatchdog = null, onWriteWatchdog, repeatWatchdog = null, onRepeatWatchdog }) {
   return new Promise((resolve) => {
     const child = spawn(bin, args, {
       cwd,
@@ -1907,6 +2223,14 @@ export function runClaudeProcess({ bin, args, cwd, timeoutS, watchdogS, promptTe
     // this, not be held off by the absence of a first write to measure from.
     let lastWriteAt = Date.now();
     let writeWarned = false;
+    // The repeat-tool chain (kusabi #234).  Count-based, so there is no
+    // clock and no timer: the chain folds synchronously at line delivery
+    // and the kill lands the instant the killThreshold-th identical call
+    // arrives.  `repeatChain` remembers the last tracked call's key and how
+    // many times it has appeared in a row.
+    let repeatChain = null;
+    let repeatWarned = false;
+    let repeatStalled = false;
 
     // Delivers one complete NDJSON line to the caller and resets the
     // silence clock the watchdog measures against — the clock starts at
@@ -1926,6 +2250,41 @@ export function runClaudeProcess({ bin, args, cwd, timeoutS, watchdogS, promptTe
         try {
           if (eventHasClaudeWriteTool(parsedLine)) lastWriteAt = Date.now();
         } catch { /* fail open: no reset, never a broken stream */ }
+      }
+      // The repeat-tool chain folds at the SAME parsed-event point the
+      // write clock does (kusabi #234): every assistant event's tool_use
+      // blocks, in stream order.  Wrapped like the write fold — a detection
+      // bug must never break line delivery or the sibling watchdogs that
+      // share this path.
+      if (repeatWatchdog && parsedLine !== null) {
+        try {
+          foldClaudeRepeatCalls(parsedLine, (toolName, chainKey) => {
+            // Once ANY bound has killed the group the stream is winding
+            // down; no further chain work, and no event noise on a run
+            // another watchdog already diagnosed.
+            if (timedOut || stalled || writeStalled || repeatStalled) return;
+            repeatChain = claudeRepeatChainAdvance(repeatChain, chainKey);
+            if (!repeatWarned && repeatChain.count >= repeatWatchdog.threshold) {
+              // Exactly once per job, like the siblings' warnings: a
+              // repeating warning is noise the operator learns to ignore.
+              repeatWarned = true;
+              notifyRepeatWatchdog({
+                kind: "warned",
+                tool: toolName,
+                count: repeatChain.count,
+                argsPreview: claudeRepeatArgsPreview(chainKey),
+              });
+            }
+            if (repeatChain.count >= repeatWatchdog.killThreshold) {
+              repeatStalled = true;
+              // Measured count here; the configured thresholds ride in the
+              // events and the record (the same split the siblings make).
+              notifyRepeatWatchdog({ kind: "fired", tool: toolName, count: repeatChain.count });
+              killProcessGroup(child);
+              notifyRepeatWatchdog({ kind: "kill" });
+            }
+          });
+        } catch { /* fail open: no detection, never a broken stream */ }
       }
       if (typeof onLine === "function") {
         try { onLine(line); } catch { /* a stats-fold bug must not take down the dispatch */ }
@@ -1971,13 +2330,13 @@ export function runClaudeProcess({ bin, args, cwd, timeoutS, watchdogS, promptTe
     };
     const watchdogTimer = watchdogS && watchdogS > 0
       ? setInterval(() => {
-          // `writeStalled` joins the existing guards for one reason: once the
-          // WRITE watchdog has killed the group the stream stops, so silence
-          // would grow and this watchdog would report a stall it did not
-          // cause (and overwrite the distinct error text).  With the write
-          // watchdog off, writeStalled is false forever and this reads
-          // exactly as it did before (kusabi #215 item 3).
-          if (timedOut || stalled || writeStalled) return;
+          // `writeStalled` and `repeatStalled` join the existing guards for
+          // one reason: once a SIBLING watchdog has killed the group the
+          // stream stops, so silence would grow and this watchdog would
+          // report a stall it did not cause (and overwrite the distinct
+          // error text).  With both siblings off, this reads exactly as it
+          // did before (kusabi #215 item 3, #234).
+          if (timedOut || stalled || writeStalled || repeatStalled) return;
           const silenceMs = Date.now() - lastEventAt;
           if (silenceMs > watchdogS * 1000) {
             stalled = true;
@@ -2002,10 +2361,18 @@ export function runClaudeProcess({ bin, args, cwd, timeoutS, watchdogS, promptTe
       if (typeof onWriteWatchdog !== "function") return;
       try { onWriteWatchdog(event); } catch { /* best-effort audit trail */ }
     };
+    const notifyRepeatWatchdog = (event) => {
+      if (typeof onRepeatWatchdog !== "function") return;
+      try { onRepeatWatchdog(event); } catch { /* best-effort audit trail */ }
+    };
     const writeWatchdogTimer = writeWatchdog && writeWatchdog.warnS > 0
       ? setInterval(() => {
           try {
-            if (timedOut || stalled || writeStalled) return;
+            // `repeatStalled` joins the guards for the same reason
+            // `writeStalled` is there: once a sibling has killed the group,
+            // this watchdog must not report (or overwrite) a stall it did
+            // not cause (kusabi #234).
+            if (timedOut || stalled || writeStalled || repeatStalled) return;
             const idleMs = Date.now() - lastWriteAt;
             const idleS = Math.round(idleMs / 1000);
             if (!writeWarned && idleMs > writeWatchdog.warnS * 1000) {
@@ -2045,7 +2412,7 @@ export function runClaudeProcess({ bin, args, cwd, timeoutS, watchdogS, promptTe
       // Deliberately AFTER the final line is delivered (a write on the last
       // line still resets the clock) and never on a run some other bound
       // already killed: those carry their own diagnosis.
-      if (writeWatchdog && !writeWarned && !writeStalled && !stalled && !timedOut) {
+      if (writeWatchdog && !writeWarned && !writeStalled && !stalled && !repeatStalled && !timedOut) {
         try {
           const idleMs = Date.now() - lastWriteAt;
           if (idleMs > writeWatchdog.warnS * 1000) {
@@ -2054,7 +2421,7 @@ export function runClaudeProcess({ bin, args, cwd, timeoutS, watchdogS, promptTe
           }
         } catch { /* fail open */ }
       }
-      resolve({ code, stdout, stderr, timedOut, stalled, writeStalled, spawnError });
+      resolve({ code, stdout, stderr, timedOut, stalled, writeStalled, repeatStalled, spawnError });
     });
   });
 }
@@ -2131,6 +2498,33 @@ export async function claudeDispatch(opts) {
       "ses_* session ids belong to opencode; run the command without --backend claude " +
       "(or resume the claude session id on this backend)"
     );
+  }
+
+  // ---- repeat-tool watchdog config (kusabi #234) ----
+  // Resolved in PRE-FLIGHT, unlike its two siblings: an invalid
+  // `claude.repeatWatchdog` VALUE must fail the dispatch LOUDLY before any
+  // job record exists, before anything is written or spawned — a config
+  // error is a loud throw, not a stuck "running" record, and never a
+  // silently-disarmed watchdog.  Only the config FILE read fails open (the
+  // siblings' discipline: reading a settings file must never be the thing
+  // that fails a dispatch); an unreadable file is not an invalid VALUE, and
+  // every invalid value throws from resolveClaudeRepeatWatchdog below.
+  let repeatWatchdog;
+  let repeatWatchdogConfig;
+  try {
+    repeatWatchdogConfig = loadClaudeGuardConfig();
+  } catch (err) {
+    repeatWatchdogConfig = null;
+    repeatWatchdog = {
+      enabled: false,
+      threshold: null,
+      killThreshold: null,
+      reason: `config-unreadable: ${err.message}`,
+    };
+  }
+  if (repeatWatchdog === undefined) {
+    // May THROW — loudly, and that is the point (see resolveClaudeRepeatWatchdog).
+    repeatWatchdog = resolveClaudeRepeatWatchdog(repeatWatchdogConfig);
   }
 
   // v1 model selection: explicit model, else the chain's first route.
@@ -2333,6 +2727,31 @@ export async function claudeDispatch(opts) {
     saveJob(stateDir, job);
   }
 
+  // ---- repeat-tool watchdog (kusabi #234) ----
+  // Config was resolved (and validated) in pre-flight, above.  Here the
+  // watchdog is GATED exactly like its siblings: armed only when the config
+  // enabled it AND the phase is one whose deliverable is an edit — the same
+  // implement-only gate the write watchdog uses (every chain rework round
+  // dispatches under "implement").
+  if (repeatWatchdog.enabled && !writeWatchdogAppliesToPhase(opts.phase)) {
+    repeatWatchdog = { enabled: false, threshold: null, killThreshold: null, reason: "phase-not-gated" };
+  }
+  if (repeatWatchdog.enabled) {
+    // Recorded ONLY when armed: an unarmed dispatch must leave a job record
+    // byte-identical to the pre-#234 one (no new key at all).  `count` is
+    // the chain length at the last recorded event (the warn, or the kill).
+    job.repeatWatchdog = {
+      threshold: repeatWatchdog.threshold,
+      killThreshold: repeatWatchdog.killThreshold,
+      reason: repeatWatchdog.reason,
+      warned: false,
+      warnedAt: null,
+      tool: null,
+      count: 0,
+    };
+    saveJob(stateDir, job);
+  }
+
   // ---- run: parse the NDJSON stream as it arrives (kusabi #215 Job B) ----
   const streamAcc = initClaudeStreamAccumulator();
   let malformedLines = 0;
@@ -2368,7 +2787,7 @@ export async function claudeDispatch(opts) {
     }
   };
 
-  const { code, stdout, stderr, timedOut, stalled, writeStalled, spawnError } = await runClaudeProcess({
+  const { code, stdout, stderr, timedOut, stalled, writeStalled, repeatStalled, spawnError } = await runClaudeProcess({
     bin,
     args,
     cwd: opts.cwd,
@@ -2429,6 +2848,52 @@ export async function claudeDispatch(opts) {
         appendEvent(stateDir, job.id, { type: "companion.write-watchdog.kill" });
       }
     },
+    // Null unless the config armed it AND the phase is one that must edit
+    // (resolved in pre-flight, gated above).
+    repeatWatchdog: repeatWatchdog.enabled ? { threshold: repeatWatchdog.threshold, killThreshold: repeatWatchdog.killThreshold } : null,
+    // Naming parity with the two siblings (kusabi #234):
+    // `companion.repeat-watchdog.{warned,fired,kill}`, so stall auditing
+    // over events.ndjson needs no third vocabulary.  The warn is ALSO put
+    // on the job record — a warning nobody can see in `kusabi status` is a
+    // warning that changes nothing.
+    onRepeatWatchdog: ({ kind, tool, count, argsPreview }) => {
+      if (kind === "warned") {
+        // Trail first, record second (the write watchdog's discipline): a
+        // failing record save must not be able to swallow the audit event
+        // that is the warning's whole point.
+        appendEvent(stateDir, job.id, {
+          type: "companion.repeat-watchdog.warned",
+          tool,
+          count,
+          argsPreview,
+          threshold: repeatWatchdog.threshold,
+          killThreshold: repeatWatchdog.killThreshold,
+          phase: job.phase,
+        });
+        if (job.repeatWatchdog) {
+          job.repeatWatchdog.warned = true;
+          job.repeatWatchdog.warnedAt = new Date().toISOString();
+          job.repeatWatchdog.tool = tool;
+          job.repeatWatchdog.count = count;
+          saveJob(stateDir, job);
+        }
+      } else if (kind === "fired") {
+        appendEvent(stateDir, job.id, {
+          type: "companion.repeat-watchdog.fired",
+          tool,
+          count,
+          killThreshold: repeatWatchdog.killThreshold,
+        });
+        // The record's tool/count follow the chain to the kill, so the
+        // finalised record shows what actually repeated.
+        if (job.repeatWatchdog) {
+          job.repeatWatchdog.tool = tool;
+          job.repeatWatchdog.count = count;
+        }
+      } else {
+        appendEvent(stateDir, job.id, { type: "companion.repeat-watchdog.kill" });
+      }
+    },
   });
 
   job.finishedAt = new Date().toISOString();
@@ -2438,6 +2903,21 @@ export async function claudeDispatch(opts) {
   if (spawnError) {
     job.status = "error";
     job.error = `claude dispatch failed: could not start ${bin}: ${spawnError.message}`;
+  } else if (repeatStalled) {
+    // The repeat-tool watchdog killed the group (kusabi #234).  Same
+    // `stalled` STATUS as both siblings — a chain must treat all three the
+    // same way — but a DISTINCT error text, because this failure has its
+    // own cause and fix: the worker called one tool with one argument shape
+    // over and over, satisfying both time-based clocks the whole way.
+    // Checked before the write branch so the kill that actually happened is
+    // the one reported (the flags are mutually exclusive by construction:
+    // each watchdog sets only its own, and once any of them has killed the
+    // group the others' paths go quiet).
+    job.status = "stalled";
+    job.error = renderClaudeRepeatWatchdogError(
+      job.repeatWatchdog?.tool ?? "an unknown tool",
+      job.repeatWatchdog?.count ?? 0,
+    );
   } else if (writeStalled) {
     // The write-tool watchdog killed the group (kusabi #215 item 3).  Same
     // `stalled` STATUS as the silence watchdog — a chain must treat both the
