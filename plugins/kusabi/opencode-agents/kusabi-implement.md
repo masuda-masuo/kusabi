@@ -3,6 +3,7 @@ description: Phase chain "implement" worker. Implementation + verification based
 mode: primary
 permission:
   "*": deny
+  kaiba*: allow
   skill:
     "kusabi-*": allow
   sunaba_sandbox_attach: allow

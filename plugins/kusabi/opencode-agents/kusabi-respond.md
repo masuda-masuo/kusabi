@@ -3,6 +3,7 @@ description: Phase chain "respond" worker. Implements responses to review findin
 mode: primary
 permission:
   "*": deny
+  kaiba*: allow
   sunaba_sandbox_attach: allow
   sunaba_read_file_range: allow
   sunaba_search_in_container: allow
