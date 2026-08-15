@@ -1003,12 +1003,63 @@ function cursorUserDir() {
  * @param {string} linkPath
  * @returns {{state: "created"|"current"|"updated"|"conflict"|"missing"|"error", target: string, linkPath: string, previous: string|null, error?: string}}
  */
+/**
+ * Remove stale staging symlinks from a crashed previous run (kusabi #258).
+ *
+ * A crash between symlink and rename leaves `<name>.kusabi-tmp-<pid>` behind
+ * under whatever pid that run had.  Only entries whose owning pid is provably
+ * dead are removed (a `process.kill(pid, 0)` liveness probe): a concurrent
+ * install-cli run's in-flight staging has a live pid and is left alone, so
+ * overlapping runs stay last-writer-wins instead of one deleting the other's
+ * staging between its symlinkSync and renameSync.  Entries whose suffix is
+ * not a pid (someone else's file) are likewise left alone.  Best-effort by
+ * design: a sweep failure on one entry must not break the link operation
+ * itself — the error-state path in ensureSymlink still covers real failures
+ * of the operation.  ensureSymlink calls this once for every link that
+ * passes its missing-source check, whichever branch it then takes (create,
+ * replace, current, conflict), so residue from a crashed replace cannot
+ * survive just because a later run found the link already current.  Only
+ * entries prefixed with this link's own basename are touched, so a stale
+ * staging entry for an unrelated link in the same directory is left alone.
+ */
+function sweepStaleStaging(linkPath) {
+  const dir = path.dirname(linkPath);
+  const prefix = `${path.basename(linkPath)}.kusabi-tmp-`;
+  let entries;
+  try {
+    entries = fs.readdirSync(dir);
+  } catch {
+    return; // directory unreadable or gone: nothing to sweep, nothing to do
+  }
+  for (const entry of entries) {
+    if (!entry.startsWith(prefix)) continue;
+    const pid = Number(entry.slice(prefix.length));
+    if (!Number.isInteger(pid) || pid <= 0) continue; // not our pid scheme: leave alone
+    try {
+      process.kill(pid, 0);
+      continue; // the pid is alive: a concurrent run's in-flight staging, leave it
+    } catch (err) {
+      if (err.code === "EPERM") continue; // exists but owned by another user: leave it
+      // ESRCH: no such process — residue from a crashed run, sweep it.
+    }
+    try {
+      fs.rmSync(path.join(dir, entry), { force: true });
+    } catch { /* best-effort: keep replacing */ }
+  }
+}
+
 export function ensureSymlink(target, linkPath) {
   // Checked before linkPath is even inspected: with no source there is
   // nothing worth linking to, whatever is (or is not) at linkPath.
   if (!fs.existsSync(target)) {
     return { state: "missing", target, linkPath, previous: null };
   }
+
+  // Sweep residue from a crashed previous run (dead pids only, best-effort)
+  // on every branch past the missing-source check — create, replace, current,
+  // and conflict alike — so it cannot survive just because this run found the
+  // link already current (or found nothing at all) (kusabi #258).
+  sweepStaleStaging(linkPath);
 
   let stat = null;
   try {
@@ -1082,7 +1133,7 @@ export function formatSymlinkLine(res) {
  *
  * @param {{ rule?: boolean }} [opts]
  * @returns {{lines: string[], failed: boolean}} One line per artifact (or one
- *   skip line); `failed` when an artifact's SOURCE was missing.
+ *   skip line); `failed` when any artifact rendered an `error:` line.
  */
 function wireCursorSkills({ rule = false } = {}) {
   const explicit = Boolean(process.env.KUSABI_CURSOR_DIR);
@@ -1106,12 +1157,13 @@ function wireCursorSkills({ rule = false } = {}) {
   }
   return {
     lines: results.map(formatSymlinkLine),
-    // Only a missing SOURCE decides the exit code (kusabi #256): that says
-    // the plugin checkout itself is broken, so install-cli's promise is
-    // false everywhere, not just on this machine.  A per-artifact `error`
-    // (a filesystem refusal at the destination) stays non-fatal — the shim,
-    // install-cli's primary job, is already written by the time we get here.
-    failed: results.some((r) => r.state === "missing"),
+    // Any rendered `error:` line — a missing source (broken checkout) or a
+    // destination-side failure — decides the exit code (kusabi #256, #258):
+    // when install-cli's output reports an error, the caller must not read
+    // success from `$?`.  The shim itself, install-cli's primary job, is
+    // already written by the time we get here, but the wiring is still
+    // incomplete, so the exit code follows the output.
+    failed: results.some((r) => r.state === "missing" || r.state === "error"),
   };
 }
 
@@ -1144,9 +1196,9 @@ function cmdInstallCli({ flags } = {}) {
   const cursor = wireCursorSkills({ rule: Boolean(flags?.cursorRule) });
   lines.push(...cursor.lines);
   const text = lines.join("\n");
-  // A missing skill source means the installed wiring points at nothing;
-  // reporting it on stdout and still exiting 0 would let a broken checkout
-  // read as a successful install (kusabi #256).
+  // Any rendered `error:` line means the wiring is incomplete; reporting it
+  // on stdout and still exiting 0 would let a broken install read as a
+  // successful one (kusabi #256, #258).
   return cursor.failed ? { text, exitCode: 1 } : text;
 }
 

@@ -5596,12 +5596,14 @@ describe("install-cli cursor skill wiring", () => {
     assert.match(result.stdout, new RegExp(`^current: ${rx(link)} -> `, "m"));
   });
 
-  it("reports a per-artifact error, continues, and still exits 0", () => {
+  it("reports a per-artifact error, continues, and exits non-zero (kusabi #258)", () => {
     // A regular file where skills/ should be: every symlink under it fails.
     fs.mkdirSync(cursorDir, { recursive: true });
     fs.writeFileSync(path.join(cursorDir, "skills"), "not a directory\n");
     const result = run();
-    assert.equal(result.status, 0, result.stderr + result.stdout);
+    // Any rendered error line — destination-side failure here — must drive
+    // the exit code (kusabi #258), just like a missing source does.
+    assert.notEqual(result.status, 0, result.stdout + result.stderr);
     const errors = result.stdout.split("\n").filter((l) => l.startsWith("error: "));
     assert.equal(errors.length, SKILLS.length, result.stdout);
     assert.match(result.stdout, /^created: .*kusabi-companion$/m);
@@ -6081,6 +6083,137 @@ describe("ensureSymlink (kusabi #256)", () => {
     assert.deepEqual(fs.readdirSync(linkDir), ["delegate"]);
   });
 
+  it("sweeps a stale staging entry from a crashed run before replacing (kusabi #258)", () => {
+    const source = path.join(tmp, "skills", "delegate");
+    const other = path.join(tmp, "elsewhere");
+    fs.mkdirSync(source, { recursive: true });
+    fs.mkdirSync(other, { recursive: true });
+    const linkDir = path.join(tmp, "cursor", "skills");
+    fs.mkdirSync(linkDir, { recursive: true });
+    const link = path.join(linkDir, "delegate");
+    fs.symlinkSync(other, link);
+    // Residue from a crashed previous run: a staging symlink left under a
+    // pid that is provably dead — a short-lived child, already exited and
+    // reaped by spawnSync.  The replace must sweep it regardless of pid.
+    const deadPid = spawnSync(process.execPath, ["-e", ""]).pid;
+    const stale = path.join(linkDir, `delegate.kusabi-tmp-${deadPid}`);
+    fs.symlinkSync(other, stale);
+
+    const res = ensureSymlink(source, link);
+    assert.equal(res.state, "updated");
+    assert.equal(fs.realpathSync(link), fs.realpathSync(source));
+    assert.ok(!fs.existsSync(stale), "stale staging entry must be swept");
+    assert.deepEqual(fs.readdirSync(linkDir), ["delegate"]);
+  });
+
+  it("sweeps a stale staging entry when the link is already current (kusabi #258)", () => {
+    const source = path.join(tmp, "skills", "delegate");
+    fs.mkdirSync(source, { recursive: true });
+    const linkDir = path.join(tmp, "cursor", "skills");
+    fs.mkdirSync(linkDir, { recursive: true });
+    const link = path.join(linkDir, "delegate");
+    fs.symlinkSync(source, link);
+    // Residue from a crashed replace beside a link that already points at the
+    // right target: the current branch must still sweep it, or it would
+    // survive forever (no replace ever happens again to clean it up).
+    const deadPid = spawnSync(process.execPath, ["-e", ""]).pid;
+    const stale = path.join(linkDir, `delegate.kusabi-tmp-${deadPid}`);
+    fs.symlinkSync(source, stale);
+
+    const res = ensureSymlink(source, link);
+    assert.equal(res.state, "current");
+    assert.equal(fs.realpathSync(link), fs.realpathSync(source));
+    assert.ok(!fs.existsSync(stale), "stale staging entry must be swept on the current branch");
+    assert.deepEqual(fs.readdirSync(linkDir), ["delegate"]);
+  });
+
+  it("sweeps a stale staging entry when no link exists yet (kusabi #258)", () => {
+    const source = path.join(tmp, "skills", "delegate");
+    const other = path.join(tmp, "elsewhere");
+    fs.mkdirSync(source, { recursive: true });
+    fs.mkdirSync(other, { recursive: true });
+    const linkDir = path.join(tmp, "cursor", "skills");
+    fs.mkdirSync(linkDir, { recursive: true });
+    const link = path.join(linkDir, "delegate");
+    // No link at all — e.g. the old one was removed after the crash — so this
+    // run takes the create branch: it must still sweep the crashed run's
+    // residue rather than leave it next to the freshly created link.
+    const deadPid = spawnSync(process.execPath, ["-e", ""]).pid;
+    const stale = path.join(linkDir, `delegate.kusabi-tmp-${deadPid}`);
+    fs.symlinkSync(other, stale);
+
+    const res = ensureSymlink(source, link);
+    assert.equal(res.state, "created");
+    assert.equal(fs.realpathSync(link), fs.realpathSync(source));
+    assert.ok(!fs.existsSync(stale), "stale staging entry must be swept on the create branch");
+    assert.deepEqual(fs.readdirSync(linkDir), ["delegate"]);
+  });
+
+  it("leaves a stale staging entry for a different link name alone (kusabi #258)", () => {
+    const source = path.join(tmp, "skills", "delegate");
+    const other = path.join(tmp, "elsewhere");
+    fs.mkdirSync(source, { recursive: true });
+    fs.mkdirSync(other, { recursive: true });
+    const linkDir = path.join(tmp, "cursor", "skills");
+    fs.mkdirSync(linkDir, { recursive: true });
+    const link = path.join(linkDir, "delegate");
+    fs.symlinkSync(other, link);
+    // A stale entry belonging to a DIFFERENT link name in the same directory:
+    // the sweep is per-link-name, so this one must survive untouched — even
+    // with a provably dead pid of its own.
+    const deadPid = spawnSync(process.execPath, ["-e", ""]).pid;
+    const foreignStale = path.join(linkDir, `result-handling.kusabi-tmp-${deadPid}`);
+    fs.symlinkSync(other, foreignStale);
+
+    const res = ensureSymlink(source, link);
+    assert.equal(res.state, "updated");
+    assert.equal(fs.realpathSync(link), fs.realpathSync(source));
+    assert.ok(fs.existsSync(foreignStale), "another link's stale entry must survive");
+  });
+
+  it("leaves a live run's staging entry alone (kusabi #258)", () => {
+    const source = path.join(tmp, "skills", "delegate");
+    fs.mkdirSync(source, { recursive: true });
+    const linkDir = path.join(tmp, "cursor", "skills");
+    fs.mkdirSync(linkDir, { recursive: true });
+    const link = path.join(linkDir, "delegate");
+    fs.symlinkSync(source, link);
+    // A concurrent run's in-flight staging: its owning pid is alive, so the
+    // sweep's liveness probe must not mistake it for residue and delete it
+    // between that run's symlinkSync and renameSync (deleting it would make
+    // the other run's rename throw ENOENT).  The test's own pid is always
+    // alive while the test runs.  (Planted on the current branch: on the
+    // replace branch the name would collide with the staging entry
+    // ensureSymlink itself creates under process.pid.)
+    const liveStaging = path.join(linkDir, `delegate.kusabi-tmp-${process.pid}`);
+    fs.symlinkSync(source, liveStaging);
+
+    const res = ensureSymlink(source, link);
+    assert.equal(res.state, "current");
+    assert.equal(fs.realpathSync(link), fs.realpathSync(source));
+    assert.ok(fs.existsSync(liveStaging), "a live run's staging entry must survive the sweep");
+  });
+
+  it("leaves an entry whose suffix is not a pid alone (kusabi #258)", () => {
+    const source = path.join(tmp, "skills", "delegate");
+    const other = path.join(tmp, "elsewhere");
+    fs.mkdirSync(source, { recursive: true });
+    fs.mkdirSync(other, { recursive: true });
+    const linkDir = path.join(tmp, "cursor", "skills");
+    fs.mkdirSync(linkDir, { recursive: true });
+    const link = path.join(linkDir, "delegate");
+    fs.symlinkSync(other, link);
+    // Not our pid scheme (no trailing number): could be another tool's file,
+    // so the sweep must not guess — only provably-dead pids are swept.
+    const foreign = path.join(linkDir, "delegate.kusabi-tmp-manual");
+    fs.symlinkSync(other, foreign);
+
+    const res = ensureSymlink(source, link);
+    assert.equal(res.state, "updated");
+    assert.equal(fs.realpathSync(link), fs.realpathSync(source));
+    assert.ok(fs.existsSync(foreign), "non-pid-suffixed entry must be left alone");
+  });
+
   it("still reports current / conflict as before", () => {
     const source = path.join(tmp, "skills", "delegate");
     fs.mkdirSync(source, { recursive: true });
@@ -6161,6 +6294,37 @@ describe("install-cli with a missing skill source (kusabi #256)", () => {
       assert.match(line, /symlink source does not exist/);
     }
     assert.ok(!fs.existsSync(path.join(cursorDir, "skills")), "no dangling link may be created");
+    // The shim — install-cli's primary job — is still written and reported.
+    assert.match(result.stdout, /^created: .*kusabi-companion$/m);
+  });
+
+  it("exits non-zero when the destination refuses the links (kusabi #258)", () => {
+    // Full checkout (sources exist): the failure is destination-side.  A
+    // regular file where `skills/` must be a directory makes every
+    // mkdirSync/symlinkSync in the wiring throw, so each artifact reports
+    // `error` — and a rendered error line must drive the exit code just like
+    // a missing source does.
+    const script = path.join(import.meta.dirname, "kusabi-companion.mjs");
+    const cursorDir = path.join(tmp, "cursor");
+    fs.mkdirSync(cursorDir, { recursive: true });
+    fs.writeFileSync(path.join(cursorDir, "skills"), "a file, not a directory");
+    const result = spawnSync(process.execPath, [script, "install-cli"], {
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        HOME: tmp,
+        KUSABI_BIN_DIR: path.join(tmp, "bin"),
+        KUSABI_CURSOR_DIR: cursorDir,
+        OPENCODE_BIN: "/nonexistent-opencode-bin",
+      },
+      timeout: 15_000,
+    });
+    assert.notEqual(result.status, 0, result.stdout + result.stderr);
+    const errors = result.stdout.split("\n").filter((l) => l.startsWith("error: "));
+    assert.equal(errors.length, 2, result.stdout);
+    for (const line of errors) {
+      assert.ok(line.includes(cursorDir), line);
+    }
     // The shim — install-cli's primary job — is still written and reported.
     assert.match(result.stdout, /^created: .*kusabi-companion$/m);
   });
