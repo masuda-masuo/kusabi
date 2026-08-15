@@ -37,6 +37,8 @@ import {
   translateDenyTools,
   clampModelDispatch,
   extractSunabaMcp,
+  sunabaProfileForAgent,
+  applySunabaProfile,
   claudeDispatch,
   CLAUDE_SESSION_GUARD_DEFAULT_PERCENT,
   resolveClaudeSessionGuard,
@@ -922,6 +924,64 @@ describe("extractSunabaMcp", () => {
   });
 });
 
+describe("sunabaProfileForAgent", () => {
+  it("maps the implement agent — and a bare task — to the implement profile", () => {
+    assert.equal(sunabaProfileForAgent("kusabi-implement"), "implement");
+    assert.equal(sunabaProfileForAgent(undefined), "implement");
+    assert.equal(sunabaProfileForAgent(null), "implement");
+  });
+
+  it("maps review to the review profile", () => {
+    assert.equal(sunabaProfileForAgent("kusabi-review"), "review");
+  });
+
+  it("gives investigate NO profile — no single profile covers its allowlist", () => {
+    // Its allowlist is the review-shaped read tools PLUS sandbox_issue_write;
+    // the unfiltered list is the correct cover (kusabi #274 acceptance 4).
+    assert.equal(sunabaProfileForAgent("kusabi-investigate"), null);
+  });
+
+  it("gives unknown agents NO profile (the full list is the safe default)", () => {
+    assert.equal(sunabaProfileForAgent("kusabi-draft"), null);
+    assert.equal(sunabaProfileForAgent("custom-agent"), null);
+  });
+});
+
+describe("applySunabaProfile", () => {
+  it("appends profile= to a plain URL", () => {
+    const entry = { type: "http", url: "http://127.0.0.1:8750/mcp" };
+    assert.deepEqual(applySunabaProfile(entry, "implement"), {
+      type: "http",
+      url: "http://127.0.0.1:8750/mcp?profile=implement",
+    });
+    // The source entry is never mutated.
+    assert.equal(entry.url, "http://127.0.0.1:8750/mcp");
+  });
+
+  it("preserves existing query parameters", () => {
+    const out = applySunabaProfile({ url: "http://127.0.0.1:8750/mcp?token=abc" }, "review");
+    assert.equal(out.url, "http://127.0.0.1:8750/mcp?token=abc&profile=review");
+  });
+
+  it("leaves a pre-existing profile= untouched (an explicit source profile wins)", () => {
+    const entry = { url: "http://127.0.0.1:8750/mcp?profile=issue" };
+    const out = applySunabaProfile(entry, "implement");
+    assert.equal(out.url, "http://127.0.0.1:8750/mcp?profile=issue");
+    assert.equal(out, entry); // pass-through, not a copy
+  });
+
+  it("passes a stdio entry (no url) through unchanged — profiles are an HTTP query feature", () => {
+    const entry = { command: "npx", args: ["-y", "@sunaba/mcp-server"] };
+    assert.equal(applySunabaProfile(entry, "implement"), entry);
+  });
+
+  it("is a no-op when no profile was resolved", () => {
+    const entry = { url: "http://127.0.0.1:8750/mcp" };
+    assert.equal(applySunabaProfile(entry, null), entry);
+    assert.equal(applySunabaProfile(entry, undefined), entry);
+  });
+});
+
 // =========================================================================
 // integration — fake `claude` binary (CLAUDE_BIN), like serve-lifecycle
 // =========================================================================
@@ -1591,6 +1651,58 @@ describe("claudeDispatch (fake claude binary)", () => {
     assert.ok(!denied.includes("mcp__sunaba__sandbox_issue_write"), "investigate deliverable must stay allowed");
     assert.ok(denied.includes("mcp__sunaba__publish"));
     assert.ok(denied.includes("mcp__sunaba__sandbox_pr_review_write"));
+  });
+
+  // ---- sunaba tool profiles (kusabi #274) ----
+  //
+  // The default fixture's sunaba entry is stdio, and the invocation-shape
+  // test above already asserts it reaches claude-mcp.json byte-identical
+  // (stdio has no query string to carry a profile).  These point the source
+  // config at an HTTP entry instead and follow the profile end to end.
+
+  /** Rewrite the fixture's MCP source with an HTTP sunaba entry. */
+  function useHttpSunabaSource(url = "http://127.0.0.1:8750/mcp") {
+    fs.writeFileSync(
+      ctx.mcpSource,
+      JSON.stringify({ mcpServers: { sunaba: { type: "http", url }, other: { command: "echo" } } }),
+      "utf8",
+    );
+  }
+
+  /** The sunaba url in the generated claude-mcp.json of the last dispatch. */
+  function generatedSunabaUrl() {
+    const args = JSON.parse(fs.readFileSync(ctx.argsLog, "utf8").trim().split("\n").pop());
+    return readJson(args[args.indexOf("--mcp-config") + 1]).mcpServers.sunaba.url;
+  }
+
+  it("review agent: the generated MCP config's sunaba url carries profile=review", async () => {
+    useHttpSunabaSource();
+    await claudeDispatch(ctx.dispatchOptions({ kind: "review", agent: "kusabi-review", phase: "review" }));
+    assert.equal(generatedSunabaUrl(), "http://127.0.0.1:8750/mcp?profile=review");
+  });
+
+  it("implement agent: the generated MCP config's sunaba url carries profile=implement", async () => {
+    useHttpSunabaSource();
+    await claudeDispatch(ctx.dispatchOptions({ agent: "kusabi-implement" }));
+    assert.equal(generatedSunabaUrl(), "http://127.0.0.1:8750/mcp?profile=implement");
+  });
+
+  it("keeps the source url's other query parameters when appending the profile", async () => {
+    useHttpSunabaSource("http://127.0.0.1:8750/mcp?token=abc");
+    await claudeDispatch(ctx.dispatchOptions({ agent: "kusabi-implement" }));
+    assert.equal(generatedSunabaUrl(), "http://127.0.0.1:8750/mcp?token=abc&profile=implement");
+  });
+
+  it("investigate agent: no profile parameter — the full tool list is its cover", async () => {
+    useHttpSunabaSource();
+    await claudeDispatch(ctx.dispatchOptions({ agent: "kusabi-investigate" }));
+    assert.equal(generatedSunabaUrl(), "http://127.0.0.1:8750/mcp");
+  });
+
+  it("leaves a profile named in the source config untouched", async () => {
+    useHttpSunabaSource("http://127.0.0.1:8750/mcp?profile=issue");
+    await claudeDispatch(ctx.dispatchOptions({ agent: "kusabi-implement" }));
+    assert.equal(generatedSunabaUrl(), "http://127.0.0.1:8750/mcp?profile=issue");
   });
 
   it("applies tools deny maps to the allowlist (a deny is never silently ignored)", async () => {

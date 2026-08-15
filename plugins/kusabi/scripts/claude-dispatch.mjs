@@ -354,6 +354,35 @@ export function allowedToolsForAgent(agent) {
   );
 }
 
+/**
+ * Resolve the sunaba MCP `?profile=` for an agent name.
+ *
+ * sunaba serves a filtered `tools/list` when the MCP URL carries a known
+ * `profile` parameter (sunaba #782).  On the claude backend that filtering
+ * is the only thing that keeps unused tool definitions OUT of the session
+ * context: `--allowedTools` is a runtime guard, it does not remove tool
+ * definitions the way opencode's permission deny does (kusabi #274).  A
+ * null profile means the unfiltered list — always correct, merely larger,
+ * so it is the safe default for anything not mapped here.
+ *
+ * `kusabi-investigate` gets NO profile deliberately: its allowlist spans
+ * the review-shaped read tools PLUS `sandbox_issue_write`, which no single
+ * sunaba profile covers — the full list is the correct cover (kusabi #274
+ * acceptance 4).
+ *
+ * @param {string|null|undefined} agent
+ * @returns {string|null} Profile name, or null for the unfiltered list.
+ */
+export function sunabaProfileForAgent(agent) {
+  if (agent === "kusabi-implement" || agent === undefined || agent === null) {
+    return "implement"; // the bare-task default is the worker toolset
+  }
+  if (agent === "kusabi-review") {
+    return "review";
+  }
+  return null;
+}
+
 // The claude/sunaba equivalents of the opencode tool names in
 // WRITE_TOOL_NAMES (cli.mjs).  The user-facing deny map built by cmdTask
 // (--read-only, --deny) speaks the opencode vocabulary; on the claude
@@ -543,6 +572,36 @@ export function extractSunabaMcp(sourcePath) {
     );
   }
   return sunaba;
+}
+
+/**
+ * Return the sunaba MCP entry to write, with `profile=<name>` appended to
+ * its `url` so the server sends only that profile's tool definitions
+ * (sunaba #782).  The source entry is never mutated — a changed URL comes
+ * back on a copy.
+ *
+ * Pass-through, unchanged, when: no profile was resolved
+ * (`sunabaProfileForAgent` returned null); the entry has no `url` (stdio
+ * transport — profiles are an HTTP query feature); or the source URL
+ * already names a profile (an explicit profile in the host config wins).
+ * Any other existing query parameters survive.
+ *
+ * There is NO fallback: if the server rejects the profile (a server
+ * predating sunaba #782, or a name it does not know) the worker session
+ * fails loud at MCP connect and the job errors — deliberately the same
+ * fail-loud posture sunaba itself chose, so a filtered session is never
+ * silently downgraded to an unfiltered one (kusabi #274).
+ *
+ * @param {object} sunabaEntry
+ * @param {string|null|undefined} profile
+ * @returns {object} The entry to write.
+ */
+export function applySunabaProfile(sunabaEntry, profile) {
+  if (!profile || !sunabaEntry || typeof sunabaEntry.url !== "string") return sunabaEntry;
+  const url = new URL(sunabaEntry.url);
+  if (url.searchParams.has("profile")) return sunabaEntry;
+  url.searchParams.set("profile", profile);
+  return { ...sunabaEntry, url: url.toString() };
 }
 
 /**
@@ -2541,7 +2600,14 @@ export async function claudeDispatch(opts) {
 
   // ---- pre-flight (before the job record exists, so a config error is a
   // loud throw, not a stuck "running" record) ----
-  const sunabaEntry = extractSunabaMcp(claudeMcpSourcePath());
+  // The agent decides the sunaba tool profile: the generated config's URL
+  // carries `?profile=<name>` so the session only ever loads that profile's
+  // tool definitions (kusabi #274).  Agents with no profile (investigate,
+  // anything unknown) keep the full list.
+  const sunabaEntry = applySunabaProfile(
+    extractSunabaMcp(claudeMcpSourcePath()),
+    sunabaProfileForAgent(opts.agent),
+  );
   const mcpConfigPath = writeClaudeMcpConfig(stateDir, sunabaEntry);
   const systemPrompt = readAgentSystemPrompt(opts.agent);
   const allowedTools = applyToolDenies(allowedToolsForAgent(opts.agent), opts.tools);
