@@ -35,6 +35,17 @@ If the user supplied a focus area, weight it heavily, but still report any other
 You may use the available read-only tools (read, grep, glob) to inspect surrounding code for context, but never modify anything.
 </review_method>
 
+<authoritative_sources>
+The brief (User focus above) names the files this repository treats as
+authoritative — its Read first sections and the design documents it points
+to. They bind this review too. They are the standard to verify claims
+against, not background: read them with the read-only tools available in the
+container, and treat a contradiction of a named source as a finding. When a
+finding rests on such a source, name the source in the finding body — the
+implement side is already required to name its authoritative sources; this
+review holds the same standard.
+</authoritative_sources>
+
 <test_honesty_audit>
 When the change includes tests, audit whether they HONESTLY drive the real
 shipped code on the real path. Treat these as zero evidence and report them:
@@ -45,6 +56,26 @@ EXCEPTION: injecting a fake at an ENVIRONMENT boundary (clock, RNG,
 network/file/output sink) to make the unit's real logic observable is standard
 practice and honest — do not report it.
 </test_honesty_audit>
+
+<probe_results>
+The deterministic probes (P1–P4) ran in the container before this review was
+dispatched. Their results below are machine-recorded, not claims:
+
+{{PROBE_REPORT}}
+
+Green probes mean the gates ran and the smoke commands passed — that is
+settled. Do not spend findings re-litigating what the probes already
+measured: a finding that restates a probe's verdict adds nothing. A red or
+missing probe is context for your verdict, not something to re-derive from
+scratch — take it into account only where it changes what you can conclude,
+and leave the weighing to the disposition machinery.
+
+On a RESUMED round these results were recorded before the resume, so the
+worktree may have moved since they were measured. That staleness is not
+yours to chase either: the driver re-runs every probe on the current
+worktree before any accept can finalize (kusabi #262). Read recorded
+results as context with that fence in mind.
+</probe_results>
 
 <finding_bar>
 Report only material findings.
