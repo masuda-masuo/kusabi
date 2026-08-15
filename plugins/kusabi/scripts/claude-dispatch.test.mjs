@@ -52,6 +52,15 @@ import {
   isClaudeWriteToolName,
   eventHasClaudeWriteTool,
   renderClaudeWriteWatchdogError,
+  CLAUDE_REPEAT_ARGS_PREVIEW_MAX,
+  resolveClaudeRepeatWatchdog,
+  isClaudeRepeatUntrackedToolName,
+  normalizeClaudeRepeatArgs,
+  claudeRepeatChainKey,
+  claudeRepeatArgsPreview,
+  claudeRepeatChainAdvance,
+  foldClaudeRepeatCalls,
+  renderClaudeRepeatWatchdogError,
   runClaudeProcess,
 } from "./claude-dispatch.mjs";
 import { agyDispatch } from "./agy-dispatch.mjs";
@@ -1045,6 +1054,104 @@ if (mode === "writes" || mode === "no-write-then-finish") {
   }));
   process.exit(0);
 }
+if (mode === "repeat-identical" || mode === "repeat-untracked" || mode === "repeat-denied" || mode === "repeat-huge-args") {
+  // The repeat watchdog's never-terminating fixtures (kusabi #234): every
+  // tick is a parsed assistant event carrying a tool_use block WITH input,
+  // and the SAME call repeats forever — only the count-based watchdog can
+  // end these runs.  All four share this block and differ in WHICH tool
+  // repeats and with what input.
+  const init = {
+    "repeat-identical": { session: "claude-repeat-1" },
+    "repeat-untracked": { session: "claude-repeat-untracked-1" },
+    "repeat-denied": { session: "claude-repeat-denied-1" },
+    "repeat-huge-args": { session: "claude-repeat-huge-1" },
+  }[mode];
+  console.log(JSON.stringify({ type: "system", subtype: "init", session_id: init.session }));
+  let n = 0;
+  setInterval(() => {
+    n += 1;
+    let block;
+    if (mode === "repeat-identical") {
+      // Invariant 1: the SAME file-mutating call, same arguments, every
+      // tick.  Every tick is a parsed event (silence clock reset) and every
+      // tick is a file-mutating call (write clock reset) — the two
+      // time-based watchdogs are satisfied forever; only a count-based
+      // chain can end this run.
+      block = {
+        type: "tool_use",
+        id: "edit-" + n,
+        name: "mcp__sunaba__edit_file",
+        input: { file: "src/worker.js", file_contents: "export const x = 1;" },
+      };
+    } else if (mode === "repeat-untracked") {
+      // Invariant 2: a bookkeeping tool (TodoWrite) alternates with the
+      // repeated call.  Untracked calls are TRANSPARENT to the chain —
+      // neither increment nor reset — so the edit_file calls still count as
+      // consecutive across them (deepseek-harness's todo_write precedent).
+      block = n % 2 === 1
+        ? { type: "tool_use", id: "edit-" + n, name: "mcp__sunaba__edit_file", input: { file: "src/worker.js", file_contents: "export const x = 1;" } }
+        : { type: "tool_use", id: "todo-" + n, name: "TodoWrite", input: { todos: [{ content: "keep editing src/worker.js", status: "in_progress" }] } };
+    } else if (mode === "repeat-denied") {
+      // Invariant 3: the repeated call is DENIED by kusabi — Bash is on the
+      // belt-and-braces DISALLOWED_TOOLS list, so every one of these calls
+      // would be refused in a real session.  The refusal does not stop the
+      // model from repeating them, and the chain must count them.
+      block = { type: "tool_use", id: "bash-" + n, name: "Bash", input: { command: "ls" } };
+    } else {
+      // Invariant 5: the repeated input is ~460 chars — far past the
+      // 200-char preview cap — so the warned event's preview is visibly
+      // truncated while identity comparison still uses the FULL normalized
+      // string.
+      block = { type: "tool_use", id: "huge-" + n, name: "mcp__sunaba__edit_file", input: { file: "src/worker.js", file_contents: "// common leading comment that fills the preview window " + "x".repeat(400) + "a" } };
+    }
+    console.log(JSON.stringify({
+      type: "assistant",
+      session_id: init.session,
+      message: { model: "claude-sonnet-4-5", content: mode === "repeat-identical" ? [{ type: "text", text: "Working on it." }, block] : [block] },
+    }));
+  }, 50);
+  // Never-terminating, and must never fall through to the result-writing
+  // tail's else (which would exit(0) and let the dispatch COMPLETE on these
+  // modes): the count-based watchdog, or nothing, ends this run.
+  await new Promise(() => {});
+}
+if (mode === "repeat-then-change" || mode === "repeat-huge-differ") {
+  // The repeat watchdog's terminating fixtures (kusabi #234): the repeated
+  // call chain is crossed, then the worker changes what it does — the chain
+  // must reset on the different call and the run completes on its own.
+  const init = {
+    "repeat-then-change": { session: "claude-repeat-change-1" },
+    "repeat-huge-differ": { session: "claude-repeat-differ-1" },
+  }[mode];
+  console.log(JSON.stringify({ type: "system", subtype: "init", session_id: init.session }));
+  let contents;
+  if (mode === "repeat-then-change") {
+    // Three identical calls (warn at threshold 3), then three with
+    // DIFFERENT arguments.
+    contents = ["export const x = 1;", "export const x = 1;", "export const x = 1;", "export const x = 2;", "export const x = 2;", "export const x = 2;"];
+  } else {
+    // Three calls with input A, then three with input B whose first 200
+    // characters are IDENTICAL to A's — only the tail differs.  A
+    // comparison against the truncated preview would count B as a
+    // continuation of A's chain and reach killThreshold 5; the full-string
+    // comparison resets on B (invariant 5).
+    contents = ["a", "a", "a", "b", "b", "b"].map((s) => "// common leading comment that fills the preview window " + "x".repeat(400) + s);
+  }
+  for (let i = 0; i < contents.length; i += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    console.log(JSON.stringify({
+      type: "assistant",
+      session_id: init.session,
+      message: { model: "claude-sonnet-4-5", content: [{ type: "tool_use", id: "tool-" + i, name: "mcp__sunaba__edit_file", input: { file: "src/worker.js", file_contents: contents[i] } }] },
+    }));
+  }
+  console.log(JSON.stringify({
+    type: "result", is_error: false, result: "changed approach mid-run",
+    session_id: init.session, usage: {}, total_cost_usd: 0,
+    duration_ms: 300, num_turns: contents.length,
+  }));
+  process.exit(0);
+}
 // The stall*/slow*/no-write never-terminating modes are handled in ONE
 // block in the tail below — they must never fall through to the
 // result-writing tail's else, or a stall fake would hand the dispatch a
@@ -1285,6 +1392,43 @@ function watchdogEvents(stateDir, jobId) {
 // for the other.
 function writeWatchdogEvents(stateDir, jobId) {
   return readJobEvents(stateDir, jobId).filter((e) => String(e.type).startsWith("companion.write-watchdog."));
+}
+
+// The repeat watchdog's own trail (kusabi #234).  Its prefix is distinct
+// from both siblings', so the filters above keep meaning exactly what they
+// always meant.
+function repeatWatchdogEvents(stateDir, jobId) {
+  return readJobEvents(stateDir, jobId).filter((e) => String(e.type).startsWith("companion.repeat-watchdog."));
+}
+
+// The volatile fields that make two identical runs differ on the record:
+// ids, timestamps, the child's process identity, and the observation/duration
+// stamps derived from them.  Stripping them lets a test assert byte- and
+// event-equivalence between two runs of the SAME fixture (kusabi #234
+// invariant 4) — the comparison then covers everything the dispatch itself
+// controls.
+function stripVolatile(job) {
+  const copy = { ...job };
+  delete copy.id;
+  delete copy.startedAt;
+  delete copy.finishedAt;
+  delete copy.process;
+  // The record names its working directory, and two independent fixtures
+  // necessarily live in different temp trees — the comparison is about the
+  // dispatch's own output, not about where it happened.
+  delete copy.cwd;
+  if (copy.stats) {
+    copy.stats = { ...copy.stats };
+    delete copy.stats.lastActivity;
+  }
+  if (copy.rateLimit) {
+    copy.rateLimit = { ...copy.rateLimit, observedAt: null };
+  }
+  if (copy.usage) {
+    copy.usage = { ...copy.usage };
+    delete copy.usage.durationSeconds;
+  }
+  return copy;
 }
 
 function spawnedPids(pidsLog) {
@@ -3854,5 +3998,506 @@ describe("claudeDispatch — write-tool watchdog (kusabi #215 item 3)", () => {
     ]);
     assert.deepEqual(writeWatchdogEvents(ctx.stateDir, job.id), []);
     assert.equal(job.writeWatchdog.killed, false);
+  });
+});
+// =========================================================================
+// repeat-tool watchdog (kusabi #234)
+// =========================================================================
+//
+// The third sibling: the silence and write watchdogs both measure TIME, so
+// a worker that repeats the SAME tool call with the SAME arguments holds
+// both clocks off forever — chatty, writing, and saying the same thing
+// every time.  This one counts consecutive identical calls — chain key
+// `(tool name, deep-key-sorted JSON.stringify(input))` — at the same fold
+// point the write watchdog already observes, so the fixtures below carry
+// `input` on every tool_use block, exactly as real transcripts do
+// (invariant 6).
+
+describe("resolveClaudeRepeatWatchdog", () => {
+  it("no config, and a config without the key, leave the feature entirely OFF", () => {
+    for (const absent of [null, undefined, "nope", [1, 2]]) {
+      const w = resolveClaudeRepeatWatchdog(absent);
+      assert.deepEqual(w, { enabled: false, threshold: null, killThreshold: null, reason: "no-config" });
+    }
+    for (const config of [{}, { models: { chain: [["opus"]] } }, { claude: {} }, { claude: "yes" }, { claude: null }]) {
+      const w = resolveClaudeRepeatWatchdog(config);
+      assert.equal(w.enabled, false, `expected ${JSON.stringify(config)} to leave the watchdog off`);
+      assert.equal(w.reason, "absent");
+      assert.equal(w.threshold, null);
+      assert.equal(w.killThreshold, null);
+    }
+  });
+
+  it("valid thresholds arm the watchdog; numeric strings read", () => {
+    assert.deepEqual(
+      resolveClaudeRepeatWatchdog({ claude: { repeatWatchdog: { threshold: 5, killThreshold: 12 } } }),
+      { enabled: true, threshold: 5, killThreshold: 12, reason: "configured" },
+    );
+    // A JSON config may carry the numbers as strings; they still read.
+    assert.deepEqual(
+      resolveClaudeRepeatWatchdog({ claude: { repeatWatchdog: { threshold: "5", killThreshold: "12" } } }),
+      { enabled: true, threshold: 5, killThreshold: 12, reason: "configured" },
+    );
+    // The minimum viable configuration: warn on the 2nd identical call,
+    // kill on the 3rd.
+    assert.deepEqual(
+      resolveClaudeRepeatWatchdog({ claude: { repeatWatchdog: { threshold: 2, killThreshold: 3 } } }),
+      { enabled: true, threshold: 2, killThreshold: 3, reason: "configured" },
+    );
+  });
+
+  it("ANY present-but-invalid value THROWS — loudly, never a silent fallback (invariant 4)", () => {
+    // The write watchdog's fail-open resolution does NOT carry over: a
+    // count watchdog has no warn-only shape, so there is no safe reading of
+    // a malformed threshold — the dispatch must fail at load instead of
+    // running unguarded or killing on a bound the operator never wrote.
+    const invalid = [
+      { claude: { repeatWatchdog: false } },
+      { claude: { repeatWatchdog: true } },
+      { claude: { repeatWatchdog: 0 } },
+      { claude: { repeatWatchdog: "5" } },
+      { claude: { repeatWatchdog: [5, 12] } },
+      { claude: { repeatWatchdog: {} } },
+      { claude: { repeatWatchdog: { threshold: 5 } } },
+      { claude: { repeatWatchdog: { killThreshold: 12 } } },
+      { claude: { repeatWatchdog: { threshold: 1, killThreshold: 12 } } },
+      { claude: { repeatWatchdog: { threshold: 0, killThreshold: 3 } } },
+      { claude: { repeatWatchdog: { threshold: 2.5, killThreshold: 12 } } },
+      { claude: { repeatWatchdog: { threshold: "soon", killThreshold: 12 } } },
+      { claude: { repeatWatchdog: { threshold: 5, killThreshold: 5 } } },
+      { claude: { repeatWatchdog: { threshold: 5, killThreshold: 3 } } },
+      { claude: { repeatWatchdog: { threshold: 5, killThreshold: 2 } } },
+      { claude: { repeatWatchdog: { threshold: 5, killThreshold: "soon" } } },
+    ];
+    for (const config of invalid) {
+      assert.throws(
+        () => resolveClaudeRepeatWatchdog(config),
+        /repeatWatchdog/,
+        `expected ${JSON.stringify(config)} to fail loudly`,
+      );
+    }
+  });
+});
+
+describe("normalizeClaudeRepeatArgs / claudeRepeatChainKey", () => {
+  it("property order is not part of the identity (deep key sort)", () => {
+    assert.equal(normalizeClaudeRepeatArgs({ a: 1, b: 2 }), normalizeClaudeRepeatArgs({ b: 2, a: 1 }));
+    assert.equal(
+      normalizeClaudeRepeatArgs({ file: "a.js", options: { cache: true, mode: "fast" } }),
+      normalizeClaudeRepeatArgs({ options: { mode: "fast", cache: true }, file: "a.js" }),
+    );
+    // Nested arrays sort their elements' keys too.
+    assert.equal(
+      normalizeClaudeRepeatArgs({ list: [{ b: 1, a: 2 }] }),
+      normalizeClaudeRepeatArgs({ list: [{ a: 2, b: 1 }] }),
+    );
+  });
+
+  it("array element order IS part of the identity", () => {
+    assert.notEqual(normalizeClaudeRepeatArgs({ tags: ["a", "b"] }), normalizeClaudeRepeatArgs({ tags: ["b", "a"] }));
+    assert.equal(normalizeClaudeRepeatArgs({ tags: [1, 2] }), normalizeClaudeRepeatArgs({ tags: [1, 2] }));
+  });
+
+  it("an absent input normalizes to the empty arguments", () => {
+    assert.equal(normalizeClaudeRepeatArgs(undefined), "{}");
+    assert.equal(normalizeClaudeRepeatArgs(null), "{}");
+    assert.equal(normalizeClaudeRepeatArgs({}), "{}");
+  });
+
+  it("primitive inputs normalize to their JSON", () => {
+    assert.equal(normalizeClaudeRepeatArgs("ls"), "\"ls\"");
+    assert.equal(normalizeClaudeRepeatArgs(42), "42");
+    assert.equal(normalizeClaudeRepeatArgs(["a", "b"]), "[\"a\",\"b\"]");
+  });
+
+  it("the chain key embeds the tool name — same args, different tool, different identity", () => {
+    assert.notEqual(claudeRepeatChainKey("edit_file", { a: 1 }), claudeRepeatChainKey("write_file", { a: 1 }));
+    assert.equal(claudeRepeatChainKey("edit_file", { a: 1 }), claudeRepeatChainKey("edit_file", { a: 1 }));
+  });
+
+  it("identity is the FULL normalized string — a differing tail resets even past the preview cap (invariant 5)", () => {
+    const longA = { file: "src/worker.js", file_contents: "// common leading comment " + "x".repeat(400) + "a" };
+    const longB = { file: "src/worker.js", file_contents: "// common leading comment " + "x".repeat(400) + "b" };
+    assert.ok(longA.file_contents.length > CLAUDE_REPEAT_ARGS_PREVIEW_MAX, "the fixture must exceed the preview cap");
+    // Identical first CLAUDE_REPEAT_ARGS_PREVIEW_MAX characters...
+    assert.equal(
+      longA.file_contents.slice(0, CLAUDE_REPEAT_ARGS_PREVIEW_MAX),
+      longB.file_contents.slice(0, CLAUDE_REPEAT_ARGS_PREVIEW_MAX),
+    );
+    // ...but different identities: a preview-truncated comparison would
+    // have counted them as the same call.
+    assert.notEqual(normalizeClaudeRepeatArgs(longA), normalizeClaudeRepeatArgs(longB));
+  });
+});
+
+describe("claudeRepeatArgsPreview", () => {
+  it("truncates past the cap with an ellipsis — and the chain never reads it", () => {
+    const key = claudeRepeatChainKey("edit_file", { file_contents: "y".repeat(500) });
+    const preview = claudeRepeatArgsPreview(key);
+    assert.equal(preview.length, CLAUDE_REPEAT_ARGS_PREVIEW_MAX + 1);
+    assert.ok(preview.endsWith("…"), "the cut is marked, never silent");
+    // The chain compares the FULL key; the preview is a record only.
+    assert.deepEqual(claudeRepeatChainAdvance(null, key), { key, count: 1 });
+  });
+
+  it("short normalized args pass through untruncated", () => {
+    assert.equal(claudeRepeatArgsPreview(claudeRepeatChainKey("edit_file", { a: 1 })), "{\"a\":1}");
+  });
+});
+
+describe("claudeRepeatChainAdvance", () => {
+  it("increments on the same key, resets to 1 on any other", () => {
+    const k1 = claudeRepeatChainKey("edit_file", { a: 1 });
+    const k2 = claudeRepeatChainKey("edit_file", { a: 2 });
+    const c1 = claudeRepeatChainAdvance(null, k1);
+    assert.deepEqual(c1, { key: k1, count: 1 });
+    assert.deepEqual(claudeRepeatChainAdvance(c1, k1), { key: k1, count: 2 });
+    assert.deepEqual(claudeRepeatChainAdvance({ key: k1, count: 2 }, k2), { key: k2, count: 1 });
+  });
+});
+
+describe("isClaudeRepeatUntrackedToolName", () => {
+  it("names the bookkeeping tools only — transparency, never exemption", () => {
+    for (const name of ["TodoWrite", "todo_write", "mcp__x__TodoWrite", "mcp__other__todo_write"]) {
+      assert.equal(isClaudeRepeatUntrackedToolName(name), true, `${name} must be transparent to the chain`);
+    }
+    // Everything that does real work stays tracked — including tools that
+    // ARE on this list's own family in other shapes.
+    for (const name of [
+      "edit_file", "mcp__sunaba__edit_file", "write_file", "Bash", "Read", "Grep",
+      "mcp__sunaba__checkpoint", "mcp__sunaba__read_file_range",
+      "", null, undefined, 42, {},
+    ]) {
+      assert.equal(isClaudeRepeatUntrackedToolName(name), false, `${JSON.stringify(name)} must be tracked`);
+    }
+  });
+});
+
+describe("foldClaudeRepeatCalls", () => {
+  const assistant = (blocks) => ({ type: "assistant", message: { content: blocks } });
+  const tool = (name, input) => ({ type: "tool_use", id: "t", name, input });
+
+  it("folds every tracked tool_use block in stream order — the same path the write watchdog folds", () => {
+    const seen = [];
+    foldClaudeRepeatCalls(assistant([
+      tool("mcp__sunaba__read_file_range", { file: "a" }),
+      tool("mcp__sunaba__edit_file", { file: "a", file_contents: "x" }),
+      tool("mcp__sunaba__edit_file", { file: "a", file_contents: "x" }),
+    ]), (name, key) => seen.push([name, key]));
+    assert.equal(seen.length, 3);
+    assert.equal(seen[0][0], "mcp__sunaba__read_file_range");
+    assert.equal(seen[1][0], "mcp__sunaba__edit_file");
+    assert.equal(seen[1][1], seen[2][1], "identical inputs fold to identical chain keys");
+  });
+
+  it("untracked bookkeeping calls are TRANSPARENT — skipped, never a reset (invariant 2)", () => {
+    const seen = [];
+    foldClaudeRepeatCalls(assistant([
+      tool("mcp__sunaba__edit_file", { file: "a", file_contents: "x" }),
+      tool("TodoWrite", { todos: [] }),
+      tool("mcp__sunaba__edit_file", { file: "a", file_contents: "x" }),
+    ]), (name, key) => seen.push(key));
+    assert.equal(seen.length, 2, "the TodoWrite call folds nothing");
+    assert.equal(seen[0], seen[1], "the two edit_file calls are consecutive — TodoWrite neither incremented nor reset");
+  });
+
+  it("non-assistant events and junk fold nothing and never throw", () => {
+    let calls = 0;
+    for (const evt of [
+      { type: "system", subtype: "init" },
+      { type: "result", is_error: false },
+      { type: "assistant" },
+      { type: "assistant", message: { content: "not an array" } },
+      { type: "assistant", message: { content: [null, "text", { type: "text", text: "edit_file" }] } },
+      null, undefined, "assistant", 7,
+    ]) {
+      foldClaudeRepeatCalls(evt, () => { calls += 1; });
+    }
+    assert.equal(calls, 0);
+  });
+});
+
+describe("renderClaudeRepeatWatchdogError", () => {
+  it("is distinct from BOTH siblings' wording", () => {
+    const text = renderClaudeRepeatWatchdogError("mcp__sunaba__edit_file", 5);
+    assert.equal(
+      text,
+      "repeat-watchdog: mcp__sunaba__edit_file called 5 consecutive times with identical arguments on an implement phase (process killed)",
+    );
+    assert.notEqual(text, "watchdog: no events for 900s (process killed)");
+    assert.notEqual(text, "write-watchdog: no write-tool call for 900s on an implement phase (process killed)");
+  });
+});
+
+describe("runClaudeProcess — repeat watchdog", () => {
+  it("no repeatWatchdog option means no chain, no events, no kill", async () => {
+    const seen = [];
+    const result = await runClaudeProcess({
+      bin: process.execPath,
+      args: ["-e", "setTimeout(() => {}, 120)"],
+      timeoutS: 20,
+      watchdogS: 0,
+      promptText: "",
+      onRepeatWatchdog: (e) => seen.push(e),
+    });
+    assert.deepEqual(seen, []);
+    assert.equal(result.repeatStalled, false);
+  });
+
+  it("identical consecutive calls warn at threshold and kill at killThreshold", async () => {
+    const src = "const t={type:'assistant',message:{content:[{type:'tool_use',name:'mcp__sunaba__edit_file',input:{file:'a',file_contents:'x'}}]}};[1,2,3,4,5].forEach(()=>console.log(JSON.stringify(t)))";
+    const seen = [];
+    const result = await runClaudeProcess({
+      bin: process.execPath,
+      args: ["-e", src],
+      timeoutS: 20,
+      watchdogS: 0,
+      promptText: "",
+      repeatWatchdog: { threshold: 3, killThreshold: 5 },
+      onRepeatWatchdog: (e) => seen.push(e),
+    });
+    assert.equal(result.repeatStalled, true);
+    assert.deepEqual(seen.map((e) => e.kind), ["warned", "fired", "kill"]);
+    assert.equal(seen[0].tool, "mcp__sunaba__edit_file");
+    assert.equal(seen[0].count, 3);
+    assert.equal(seen[1].count, 5);
+  });
+
+  it("a different call resets the chain before the threshold is reached", async () => {
+    const a = "{type:'assistant',message:{content:[{type:'tool_use',name:'mcp__sunaba__edit_file',input:{file:'a',file_contents:'x'}}]}}";
+    const b = "{type:'assistant',message:{content:[{type:'tool_use',name:'mcp__sunaba__edit_file',input:{file:'a',file_contents:'y'}}]}}";
+    const src = `[${a},${a},${b},${b}].forEach((t)=>console.log(JSON.stringify(t)))`;
+    const seen = [];
+    const result = await runClaudeProcess({
+      bin: process.execPath,
+      args: ["-e", src],
+      timeoutS: 20,
+      watchdogS: 0,
+      promptText: "",
+      repeatWatchdog: { threshold: 3, killThreshold: 5 },
+      onRepeatWatchdog: (e) => seen.push(e),
+    });
+    assert.equal(result.repeatStalled, false);
+    assert.deepEqual(seen, [], "the reset kept every chain below the threshold");
+  });
+});
+
+describe("claudeDispatch — repeat-tool watchdog (kusabi #234)", () => {
+  let ctx;
+
+  afterEach(() => {
+    if (ctx) {
+      ctx.restore();
+      fs.rmSync(ctx.tmp, { recursive: true, force: true });
+    }
+    ctx = null;
+  });
+
+  // Same session-guard note as the write watchdog tests: every config below
+  // disables it explicitly — a config file WITHOUT `sessionGuardPercent`
+  // turns it on at the default threshold and would spawn a /usage probe
+  // these tests are not about.
+  const withRepeat = (threshold, killThreshold) => ({
+    claude: { sessionGuardPercent: false, repeatWatchdog: { threshold, killThreshold } },
+  });
+
+  it("invariant 1: identical consecutive calls are caught while BOTH time clocks are satisfied", async () => {
+    // The fixture calls mcp__sunaba__edit_file with the SAME input every
+    // tick.  Every tick is a parsed event (silence clock reset) and every
+    // tick is a file-mutating call (write clock reset) — a worker like this
+    // would satisfy both time-based watchdogs forever.  Only the count-based
+    // chain can end this run.
+    ctx = fakeClaudeContext("repeat-identical", { config: withRepeat(3, 5) });
+    const { job } = await claudeDispatch(ctx.dispatchOptions({ phase: "implement", timeoutS: 30, watchdogS: 900 }));
+
+    assert.equal(job.status, "stalled");
+    assert.equal(
+      job.error,
+      "repeat-watchdog: mcp__sunaba__edit_file called 5 consecutive times with identical arguments on an implement phase (process killed)",
+    );
+
+    const events = repeatWatchdogEvents(ctx.stateDir, job.id);
+    assert.deepEqual(events.map((e) => e.type), [
+      "companion.repeat-watchdog.warned",
+      "companion.repeat-watchdog.fired",
+      "companion.repeat-watchdog.kill",
+    ]);
+    assert.equal(events[0].tool, "mcp__sunaba__edit_file");
+    assert.equal(events[0].count, 3);
+    assert.equal(events[0].threshold, 3);
+    assert.equal(events[0].killThreshold, 5);
+    assert.equal(events[0].phase, "implement");
+    // Short normalized args pass through untruncated: the full normalized
+    // input, deep-key-sorted.
+    assert.equal(events[0].argsPreview, "{\"file\":\"src/worker.js\",\"file_contents\":\"export const x = 1;\"}");
+    assert.equal(events[1].tool, "mcp__sunaba__edit_file");
+    assert.equal(events[1].count, 5);
+
+    // Neither sibling claims this stall: the stream was busy the whole way.
+    assert.deepEqual(watchdogEvents(ctx.stateDir, job.id), []);
+    assert.deepEqual(writeWatchdogEvents(ctx.stateDir, job.id), []);
+
+    // Recorded on the job, and on disk.
+    assert.equal(job.repeatWatchdog.warned, true);
+    assert.ok(job.repeatWatchdog.warnedAt, "the warning is timestamped on the record");
+    assert.equal(job.repeatWatchdog.tool, "mcp__sunaba__edit_file");
+    assert.equal(job.repeatWatchdog.count, 5);
+    assert.equal(job.repeatWatchdog.threshold, 3);
+    assert.equal(job.repeatWatchdog.killThreshold, 5);
+    assert.equal(loadJob(ctx.stateDir, job.id).status, "stalled");
+
+    // The whole process group is dead, exactly as the siblings leave it.
+    for (const pid of spawnedPids(ctx.pidsLog)) {
+      assert.equal(isAlive(pid), false, `pid ${pid} must be dead after the repeat-watchdog group kill`);
+    }
+  });
+
+  it("invariant 2: untracked bookkeeping calls interleaved still count as consecutive", async () => {
+    // edit_file X → TodoWrite → edit_file X → ... — the TodoWrite calls are
+    // TRANSPARENT: neither increment nor reset, so the edit_file calls chain
+    // across them.
+    ctx = fakeClaudeContext("repeat-untracked", { config: withRepeat(3, 5) });
+    const { job } = await claudeDispatch(ctx.dispatchOptions({ phase: "implement", timeoutS: 30, watchdogS: 900 }));
+
+    assert.equal(job.status, "stalled");
+    assert.equal(
+      job.error,
+      "repeat-watchdog: mcp__sunaba__edit_file called 5 consecutive times with identical arguments on an implement phase (process killed)",
+    );
+    const events = repeatWatchdogEvents(ctx.stateDir, job.id);
+    assert.equal(events[0].count, 3, "warned at the 3rd edit_file across two TodoWrite interleavings");
+    assert.equal(events[1].count, 5, "killed at the 5th edit_file across four TodoWrite interleavings");
+    assert.equal(events[1].tool, "mcp__sunaba__edit_file");
+  });
+
+  it("invariant 3: DENIED calls count — a worker hammering a denied tool is the loop to break", async () => {
+    // Bash is on the belt-and-braces DISALLOWED_TOOLS list, so kusabi
+    // refuses every one of these calls in a real session; the refusal does
+    // not stop the model from repeating them, and the chain must count them.
+    ctx = fakeClaudeContext("repeat-denied", { config: withRepeat(3, 5) });
+    const { job } = await claudeDispatch(ctx.dispatchOptions({ phase: "implement", timeoutS: 30, watchdogS: 900 }));
+
+    assert.equal(job.status, "stalled");
+    assert.equal(
+      job.error,
+      "repeat-watchdog: Bash called 5 consecutive times with identical arguments on an implement phase (process killed)",
+    );
+    const events = repeatWatchdogEvents(ctx.stateDir, job.id);
+    assert.equal(events[1].tool, "Bash");
+    assert.equal(events[1].count, 5);
+  });
+
+  it("invariant 4: config absent leaves the dispatch and the record byte-equivalent to a no-watchdog run", async () => {
+    // Run A: NO repeatWatchdog key at all.  Run B: the key IS present but
+    // the phase gate refuses to arm it — the same "watchdog not armed"
+    // state, reached through the other door.  Same fixture, same phase; the
+    // two runs must produce identical records (modulo ids/timestamps) and
+    // identical event trails.
+    const ctxA = fakeClaudeContext("stream-full", { config: null });
+    const { job: jobA } = await claudeDispatch(ctxA.dispatchOptions({ phase: "review" }));
+    ctx = fakeClaudeContext("stream-full", { config: withRepeat(3, 5) });
+    const { job: jobB } = await claudeDispatch(ctx.dispatchOptions({ phase: "review" }));
+
+    assert.equal(jobA.repeatWatchdog, undefined, "no watchdog field on the unarmed dispatch");
+    assert.ok(!("repeatWatchdog" in loadJob(ctxA.stateDir, jobA.id)), "no new key on the on-disk record");
+    assert.deepEqual(repeatWatchdogEvents(ctxA.stateDir, jobA.id), []);
+
+    const stripEventBin = (events) => events.map((e) => (e.bin === undefined ? e : { ...e, bin: "FAKE" }));
+    assert.deepEqual(stripVolatile(jobA), stripVolatile(jobB), "absent-config record equals the gated-off run's record");
+    assert.deepEqual(
+      stripEventBin(readJobEvents(ctxA.stateDir, jobA.id)),
+      stripEventBin(readJobEvents(ctx.stateDir, jobB.id)),
+      "absent-config events equal the gated-off run's events",
+    );
+    fs.rmSync(ctxA.tmp, { recursive: true, force: true });
+  });
+
+  it("invariant 5: a truncated args preview never affects identity comparison", async () => {
+    // The repeated input is ~460 chars — far past the 200-char preview cap —
+    // so the warned event's preview is visibly truncated.  Identity is the
+    // FULL normalized string: the identical huge calls still chain, warn at
+    // 3 and kill at 5.
+    ctx = fakeClaudeContext("repeat-huge-args", { config: withRepeat(3, 5) });
+    const { job } = await claudeDispatch(ctx.dispatchOptions({ phase: "implement", timeoutS: 30, watchdogS: 900 }));
+
+    assert.equal(job.status, "stalled");
+    const events = repeatWatchdogEvents(ctx.stateDir, job.id);
+    assert.ok(events[0].argsPreview.endsWith("…"), "the preview is truncated, and the cut is marked");
+    assert.equal(events[0].argsPreview.length, CLAUDE_REPEAT_ARGS_PREVIEW_MAX + 1);
+    assert.equal(events[1].count, 5, "the full-string chain still counted every identical call");
+  });
+
+  it("invariant 5: two huge inputs sharing the preview window but differing in the tail are NOT consecutive", async () => {
+    // Three calls with input A, then three with input B whose first 200
+    // characters are IDENTICAL to A's — only the tail differs.  A comparison
+    // against the truncated preview would count B as a continuation of A and
+    // reach killThreshold 5; the full-string comparison resets on B and the
+    // run completes with a single warning.
+    ctx = fakeClaudeContext("repeat-huge-differ", { config: withRepeat(3, 5) });
+    const { job } = await claudeDispatch(ctx.dispatchOptions({ phase: "implement", timeoutS: 30, watchdogS: 900 }));
+
+    assert.equal(job.status, "completed");
+    assert.equal(job.error, null);
+    const events = repeatWatchdogEvents(ctx.stateDir, job.id);
+    assert.deepEqual(events.map((e) => e.type), ["companion.repeat-watchdog.warned"], "warned exactly once, never killed");
+    assert.equal(events[0].count, 3);
+    assert.equal(job.repeatWatchdog.warned, true);
+    assert.equal(job.repeatWatchdog.count, 3);
+  });
+
+  it("warns exactly once, then a different call resets the chain and the run completes", async () => {
+    // Three identical calls (warn at threshold 3), then three calls with
+    // DIFFERENT arguments: the chain resets on the first different call and
+    // never reaches killThreshold 9.  The warning stays EXACTLY once.
+    ctx = fakeClaudeContext("repeat-then-change", { config: withRepeat(3, 9) });
+    const { job } = await claudeDispatch(ctx.dispatchOptions({ phase: "implement", timeoutS: 30, watchdogS: 900 }));
+
+    assert.equal(job.status, "completed");
+    assert.equal(job.error, null);
+    const events = repeatWatchdogEvents(ctx.stateDir, job.id);
+    assert.deepEqual(events.map((e) => e.type), ["companion.repeat-watchdog.warned"]);
+    assert.equal(events[0].count, 3);
+    assert.equal(job.repeatWatchdog.warned, true);
+    assert.equal(job.repeatWatchdog.count, 3);
+  });
+
+  it("an invalid claude.repeatWatchdog fails the dispatch LOUDLY before any record exists (invariant 4)", async () => {
+    ctx = fakeClaudeContext("ok", { config: { claude: { sessionGuardPercent: false, repeatWatchdog: { threshold: 5 } } } });
+    await assert.rejects(claudeDispatch(ctx.dispatchOptions({ phase: "implement" })), /repeatWatchdog/);
+    assert.deepEqual(listJobs(ctx.stateDir), [], "a config error must not leave a job record behind");
+  });
+
+  it("the same config on a review-phase job never arms the watchdog", async () => {
+    ctx = fakeClaudeContext("repeat-then-change", { config: withRepeat(3, 5) });
+    const { job } = await claudeDispatch(ctx.dispatchOptions({ phase: "review", timeoutS: 30, watchdogS: 900 }));
+
+    assert.equal(job.status, "completed");
+    assert.deepEqual(repeatWatchdogEvents(ctx.stateDir, job.id), []);
+    assert.equal(job.repeatWatchdog, undefined, "an unarmed dispatch records no watchdog field at all");
+    assert.ok(!("repeatWatchdog" in loadJob(ctx.stateDir, job.id)));
+  });
+
+  it("an armed repeat watchdog leaves the siblings' own paths untouched", async () => {
+    // The write watchdog is armed at bounds this busy run cannot reach; the
+    // REPEAT watchdog owns the stall, and neither sibling adds a thing — no
+    // spurious write warning, no silence claim, no overwritten error text.
+    ctx = fakeClaudeContext("repeat-identical", {
+      config: {
+        claude: {
+          sessionGuardPercent: false,
+          writeWatchdog: { warnS: 60, killS: 120 },
+          repeatWatchdog: { threshold: 3, killThreshold: 5 },
+        },
+      },
+    });
+    const { job } = await claudeDispatch(ctx.dispatchOptions({ phase: "implement", timeoutS: 30, watchdogS: 900 }));
+
+    assert.equal(job.status, "stalled");
+    assert.match(job.error, /^repeat-watchdog:/);
+    assert.deepEqual(writeWatchdogEvents(ctx.stateDir, job.id), []);
+    assert.deepEqual(watchdogEvents(ctx.stateDir, job.id), []);
+    assert.equal(job.writeWatchdog.killed, false);
+    assert.equal(job.writeWatchdog.warned, false);
+    assert.equal(job.repeatWatchdog.warned, true);
   });
 });
