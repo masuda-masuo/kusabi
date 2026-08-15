@@ -24,6 +24,7 @@ import {
   runDeliverablesProbe,
   runProbePhase,
   runReviewPhase,
+  renderProbeReport,
   runStrategizePhase,
   parseReviewResult,
   normalizeFilePath,
@@ -5288,8 +5289,117 @@ describe("chain review prompt byte-identity", () => {
       .replaceAll("{{USER_FOCUS}}", "GOLDEN BRIEF TEXT")
       .replaceAll("{{OUTPUT_SCHEMA}}", JSON.stringify(schemaJson))
       .replaceAll("{{REVIEW_INPUT}}", GOLDEN_CHAIN_REVIEW_INPUT)
-      .replaceAll("{{PRIOR_FINDINGS}}", "(none -- first review round)");
+      .replaceAll("{{PRIOR_FINDINGS}}", "(none -- first review round)")
+      // kusabi #236: the golden round records no probes, so the slot renders
+      // the explicit absence marker \u2014 the same bytes the chain produces for
+      // a round without recorded probe results.
+      .replaceAll("{{PROBE_REPORT}}", "(no probe results recorded)");
     assert.equal(prompt, expected);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// runReviewPhase \u2014 {{PROBE_REPORT}} slot (kusabi #236)
+//
+// The round's deterministic probe results (P1\u2013P4) render into the review
+// prompt so the reviewer does not re-litigate what the probes already
+// measured.  Fixture-pinned both ways: a round with recorded probes carries
+// all four probe lines, a round without carries the explicit absence marker.
+// ---------------------------------------------------------------------------
+
+describe("runReviewPhase \u2014 {{PROBE_REPORT}} slot (kusabi #236)", () => {
+  const PLUGIN_DIR = path.resolve(import.meta.dirname, "..");
+
+  // The same four-probe fixture the seat-replacement tests use (kusabi #248).
+  const GREEN_PROBES = [
+    { probe: "P1: HEAD clean", passed: true, detail: "HEAD matches base abc123" },
+    { probe: "P2: verify gate", passed: true, detail: JSON.stringify({ gate_passed: true }) },
+    { probe: "P3: deliverables", passed: true, detail: "touches declared deliverables" },
+    { probe: "P4: smoke", passed: true, detail: "all smoke entries exited 0" },
+  ];
+
+  async function capturePrompt(roundRecord) {
+    let captured = null;
+    function stubbedDispatch(opts) {
+      captured = opts.promptText;
+      return {
+        job: { id: "job-probes", status: "completed", modelEntry: "m", modelVariant: null, fallbacks: null, usage: null, error: null },
+        resultText: JSON.stringify({ verdict: "approve", findings: [] }),
+      };
+    }
+    await runReviewPhase({
+      container: "cafe1234beef",
+      brief: "GOLDEN BRIEF TEXT",
+      modelChain: ["test-org/test-flash"],
+      chainId: "chain-probes",
+      cwd: process.cwd(),
+      previousRecord: null,
+      baseSha: "0123456789abcdef",
+      chainStatusOutput: " M src/foo.js\n",
+      chainBaseLog: "abc1234 first\n",
+      chainUntracked: "",
+      roundRecord,
+      chainChangedPaths: ["src/foo.js"],
+      chainStatusObserved: true,
+      chainDeliverables: ["src/foo.js"],
+      flagsModel: null,
+      _dispatchWithFallback: stubbedDispatch,
+    });
+    return captured;
+  }
+
+  it("carries all four probe lines when the round recorded probe results", async () => {
+    const prompt = await capturePrompt({ round: 1, probeResults: GREEN_PROBES });
+    const probeBlock = prompt.slice(prompt.indexOf("<probe_results>"), prompt.indexOf("</probe_results>"));
+    for (const line of [
+      "- P1: HEAD clean \u2014 passed \u2014 HEAD matches base abc123",
+      "- P2: verify gate \u2014 passed \u2014 {\"gate_passed\":true}",
+      "- P3: deliverables \u2014 passed \u2014 touches declared deliverables",
+      "- P4: smoke \u2014 passed \u2014 all smoke entries exited 0",
+    ]) {
+      assert.ok(probeBlock.includes(line), "missing probe line: " + line);
+    }
+  });
+
+  it("carries the explicit absence marker when no probes were recorded", async () => {
+    const prompt = await capturePrompt({ round: 2 });
+    assert.ok(prompt.includes("(no probe results recorded)"));
+  });
+
+  it("carries the explicit absence marker for an empty probe array", async () => {
+    const prompt = await capturePrompt({ round: 3, probeResults: [] });
+    assert.ok(prompt.includes("(no probe results recorded)"));
+  });
+
+  it("renders a red probe as failed context rather than hiding it", async () => {
+    const prompt = await capturePrompt({
+      round: 4,
+      probeResults: [
+        { probe: "P1: HEAD clean", passed: true, detail: "HEAD matches base abc123" },
+        { probe: "P2: verify gate", passed: false, detail: "lint: 2 violations" },
+        { probe: "P3: deliverables", passed: true, detail: "touches declared deliverables" },
+        { probe: "P4: smoke", passed: true, detail: "all smoke entries exited 0" },
+      ],
+    });
+    const probeBlock = prompt.slice(prompt.indexOf("<probe_results>"), prompt.indexOf("</probe_results>"));
+    assert.ok(probeBlock.includes("- P2: verify gate \u2014 failed \u2014 lint: 2 violations"));
+  });
+
+  it("renderProbeReport renders the explicit absence marker for a missing or empty set", () => {
+    assert.equal(renderProbeReport(undefined), "(no probe results recorded)");
+    assert.equal(renderProbeReport(null), "(no probe results recorded)");
+    assert.equal(renderProbeReport([]), "(no probe results recorded)");
+  });
+
+  it("template carries the probe interpretation text and the authoritative-source mandate", () => {
+    const template = fs.readFileSync(path.join(PLUGIN_DIR, "prompts", "adversarial-review.md"), "utf8");
+    assert.ok(template.includes("{{PROBE_REPORT}}"));
+    assert.ok(template.includes("Do not spend findings re-litigating what the probes already"));
+    assert.ok(template.includes("missing probe is context for your verdict"));
+    assert.ok(template.includes("<authoritative_sources>"));
+    assert.ok(template.includes("name the source in the finding body"));
+    // The discard/verdict contract (#235's metrics reading) must be unchanged.
+    assert.ok(template.includes("Use `discard` when the change premise itself is wrong"));
   });
 });
 

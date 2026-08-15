@@ -867,6 +867,32 @@ export function shouldSkipReview({ chainStatusObserved, chainChangedPaths, chain
 }
 
 /**
+ * Render the round's deterministic probe results (P1\u2013P4) into the review
+ * prompt (kusabi #236).
+ *
+ * One line per probe: name, pass state, one-line detail.  The detail is
+ * normalised to a single line (internal whitespace collapsed) so the block
+ * is always exactly one line per probe \u2014 never a wall of captured output
+ * that eats the reviewer's budget.  A missing or empty probe set must
+ * render an explicit absence marker \u2014 never an empty string, which would
+ * read as "all fine" and hand the reviewer false confidence.
+ *
+ * @param {Array<{probe: string, passed: boolean, detail: string}>|undefined} probeResults
+ * @returns {string}
+ */
+export function renderProbeReport(probeResults) {
+  if (!Array.isArray(probeResults) || probeResults.length === 0) {
+    return "(no probe results recorded)";
+  }
+  return probeResults.map(function (p) {
+    const name = p && typeof p.probe === "string" && p.probe ? p.probe : "(unnamed probe)";
+    const state = p && p.passed === true ? "passed" : "failed";
+    const detail = String((p && p.detail) || "").replace(/\s+/g, " ").trim();
+    return "- " + name + " \u2014 " + state + (detail ? " \u2014 " + detail : "");
+  }).join("\n");
+}
+
+/**
  * Run the review phase (or mark skip when the change set is empty).
  *
  * Single result conduit (kusabi #100): everything that belongs on the
@@ -930,7 +956,13 @@ export async function runReviewPhase({
       .replaceAll("{{USER_FOCUS}}", brief)
       .replaceAll("{{OUTPUT_SCHEMA}}", JSON.stringify(schemaJson))
       .replaceAll("{{REVIEW_INPUT}}", reviewInput)
-      .replaceAll("{{PRIOR_FINDINGS}}", priorFindings);
+      .replaceAll("{{PRIOR_FINDINGS}}", priorFindings)
+      // kusabi #236: the round's deterministic probe results (P1\u2013P4) reach
+      // the reviewer as {{PROBE_REPORT}}, so the reviewer does not spend
+      // findings re-litigating what the probes already measured.  A round
+      // with no recorded probes renders the explicit absence marker, never an
+      // empty string that reads as "all fine".
+      .replaceAll("{{PROBE_REPORT}}", renderProbeReport(roundRecord.probeResults));
 
     // The reviewer's route does not follow the round ladder: it stays on the
     // same route for every round, which is what the pre-fallback code did

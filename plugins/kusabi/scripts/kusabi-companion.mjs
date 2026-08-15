@@ -1069,7 +1069,11 @@ async function cmdReview(cwd, { flags, text }) {
     .replaceAll("{{USER_FOCUS}}", text || "(none — general adversarial review)")
     .replaceAll("{{OUTPUT_SCHEMA}}", JSON.stringify(schema))
     .replaceAll("{{REVIEW_INPUT}}", input)
-    .replaceAll("{{PRIOR_FINDINGS}}", flags.prior || "(none — first review round)");
+    .replaceAll("{{PRIOR_FINDINGS}}", flags.prior || "(none — first review round)")
+    // kusabi #236: the standalone review route never runs the chain probes,
+    // so {{PROBE_REPORT}} renders the explicit absence marker rather than
+    // leaking the raw placeholder into the prompt.
+    .replaceAll("{{PROBE_REPORT}}", "(no probe results recorded)");
   const { job, resultText } = await runPrompt({
     cwd,
     kind: "review",
