@@ -253,6 +253,15 @@ export function parseChainRecord(chainJson, ctx = {}) {
       tierBefore: typeof rec.tierBefore === "number" ? rec.tierBefore : null,
       tierAfter: typeof rec.tierAfter === "number" ? rec.tierAfter : null,
       verdict: typeof rec.verdict === "string" ? rec.verdict : null,
+      // Verdict issuer (kusabi #235): "probe" when the P3 empty-change-set
+      // path wrote the verdict without dispatching a review job,
+      // "recovered-from-token" when an unparseable review's verdict was
+      // recovered from the model token stream, absent for a normally parsed
+      // review verdict.  Copied verbatim when present -- an unknown future
+      // value passes through unmodified -- and NULL when the record does
+      // not say, never a default (the usage_available three-state
+      // discipline: absent is a fact, not "review").
+      verdictSource: typeof rec.verdictSource === "string" ? rec.verdictSource : null,
       probesGreen: toBoolInt(rec.probesGreen),
       // Three-valued (kusabi #165): 1 = worker changed the worktree,
       // 0 = measured no change, NULL = never measured (old record or a

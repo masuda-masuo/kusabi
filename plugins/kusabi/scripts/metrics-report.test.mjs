@@ -1451,3 +1451,325 @@ describe("Brief-metrics strata — orch_model key normalisation (kusabi #252)", 
     assert.deepEqual(report.briefOutcome.map((b) => b.orchModel), ["(unknown)"]);
   });
 });
+// ---------------------------------------------------------------------------
+// Round-level review sections (kusabi #235) — the escalate review axis, the
+// disposition x severity table, and the review-output pathology rate.
+// ---------------------------------------------------------------------------
+
+/**
+ * A store exercising all three round-level review sections.  One chain of 8
+ * escalated rounds carries the verdict spread; three single-round chains
+ * carry the other dispositions.  All rounds share one chain-date so the
+ * window key never interferes with the assertions:
+ *
+ *  - rv-esc rounds 1-2: discard, probes red, verdict_source "probe" (P3
+ *    empty-change-set discards — review never dispatched)
+ *  - rv-esc round 3:    discard, probes red, no verdict_source (unknown)
+ *  - rv-esc round 4:    unparseable, probes green, "recovered-from-token"
+ *  - rv-esc round 5:    partial, probes green, no verdict_source (unknown)
+ *  - rv-esc round 6:    needs-attention, probes red, "recovered-from-token",
+ *                       findings low x1 / medium x2
+ *  - rv-esc round 7:    needs-attention, probes green, no verdict_source
+ *  - rv-esc round 8:    mystery-verdict, probes NULL, no verdict_source
+ *  - rv-followup:       accept-with-followup / approve, findings low x2 /
+ *                       medium x1 / urgent x1
+ *  - rv-rework:         rework / needs-attention, "recovered-from-token",
+ *                       findings low x1 / high x1 / critical x1 / NULL severity x1
+ *  - rv-noverdict:      accept, verdict NULL — not review output
+ *  - rv-old (optional): escalate / unparseable / probes red, dated 2026-07-20
+ *                       — for window-scoping tests
+ *  - rv-esc round 9 (optional, withOtherSource): escalate /
+ *                       needs-attention / probes green, verdict_source
+ *                       "some-future-source" — an unrecognized non-NULL
+ *                       source: NOT review output, its own "other" bucket
+ */
+function buildRoundReviewFixture({ withOldChain = false, withOtherSource = false } = {}) {
+  const db = openMetricsDb(":memory:");
+  const chain = (id) => upsertChain(db, {
+    chainId: id,
+    orchModel: "claude-opus-5",
+    orchSession: null,
+    orchDate: "2026-07-26",
+    briefHasSmoke: 1,
+    briefChars: 300,
+    briefHasDeliverables: 1,
+  });
+  const round = (id, n, f, findings = []) => {
+    upsertRound(db, {
+      chainId: id,
+      round: n,
+      startedAt: "2026-07-26T09:00:00.000Z",
+      startedMs: Date.parse("2026-07-26T09:00:00.000Z"),
+      ...f,
+    });
+    findings.forEach((sev, idx) => db.prepare(
+      "INSERT INTO finding (chain_id, round, idx, severity, title, file) VALUES (?, ?, ?, ?, ?, ?)",
+    ).run(id, n, idx, sev, `finding ${idx}`, "src/a.mjs"));
+  };
+
+  chain("rv-esc");
+  round("rv-esc", 1, { disposition: "escalate", verdict: "discard", probesGreen: 0, verdictSource: "probe" });
+  round("rv-esc", 2, { disposition: "escalate", verdict: "discard", probesGreen: 0, verdictSource: "probe" });
+  round("rv-esc", 3, { disposition: "escalate", verdict: "discard", probesGreen: 0, verdictSource: null });
+  round("rv-esc", 4, { disposition: "escalate", verdict: "unparseable", probesGreen: 1, verdictSource: "recovered-from-token" });
+  round("rv-esc", 5, { disposition: "escalate", verdict: "partial", probesGreen: 1, verdictSource: null });
+  round("rv-esc", 6, { disposition: "escalate", verdict: "needs-attention", probesGreen: 0, verdictSource: "recovered-from-token" }, ["low", "medium", "medium"]);
+  round("rv-esc", 7, { disposition: "escalate", verdict: "needs-attention", probesGreen: 1, verdictSource: null });
+  round("rv-esc", 8, { disposition: "escalate", verdict: "mystery-verdict", probesGreen: null, verdictSource: null });
+
+  chain("rv-followup");
+  round("rv-followup", 1, { disposition: "accept-with-followup", verdict: "approve", probesGreen: 1, verdictSource: null }, ["low", "low", "medium", "urgent"]);
+
+  chain("rv-rework");
+  round("rv-rework", 1, { disposition: "rework", verdict: "needs-attention", probesGreen: 0, verdictSource: "recovered-from-token" }, ["low", "high", "critical", null]);
+
+  chain("rv-noverdict");
+  round("rv-noverdict", 1, { disposition: "accept", verdict: null, probesGreen: null, verdictSource: null });
+
+  if (withOldChain) {
+    chain("rv-old");
+    round("rv-old", 1, {
+      startedAt: "2026-07-20T09:00:00.000Z",
+      startedMs: Date.parse("2026-07-20T09:00:00.000Z"),
+      disposition: "escalate",
+      verdict: "unparseable",
+      probesGreen: 0,
+      verdictSource: null,
+    });
+  }
+
+  if (withOtherSource) {
+    // An unrecognized NON-NULL verdict_source — a future value that passes
+    // through ingest verbatim.  At the report surface it is NOT known to be
+    // review output: the axis must bucket it as "other" (raw value kept)
+    // and section C must exclude it from both sides, never silently count
+    // it as review-issued.
+    round("rv-esc", 9, { disposition: "escalate", verdict: "needs-attention", probesGreen: 1, verdictSource: "some-future-source" });
+  }
+
+  return db;
+}
+
+describe("escalate review axis (kusabi #235)", () => {
+  it("counts escalated rounds only, splitting per-verdict probes and source", () => {
+    const db = buildRoundReviewFixture();
+    const axis = computeReport(db, { dbPath: ":memory:" }).escalateReviewAxis;
+    assert.equal(axis.escalateRounds, 8);
+    // Probes all green: rounds 4, 5, 7 — round 8's NULL probes is NOT green.
+    assert.equal(axis.allGreenEscalate, 3);
+    assert.equal(axis.verdictSourceAvailable, true);
+    const byVerdict = Object.fromEntries(axis.byVerdict.map((r) => [r.verdict, r]));
+    assert.deepEqual(Object.keys(byVerdict).sort(), ["discard", "mystery-verdict", "needs-attention", "partial", "unparseable"]);
+    // discard: 3 rounds, 2 probe-issued + 1 unknown source, all red probes.
+    assert.deepEqual(byVerdict.discard.probesGreen, { green: 0, red: 3, unknown: 0 });
+    assert.deepEqual(byVerdict.discard.source, { review: 0, probe: 2, unknown: 1, other: 0 });
+    // recovered-from-token is review-issued — never folded into unknown.
+    assert.deepEqual(byVerdict.unparseable.source, { review: 1, probe: 0, unknown: 0, other: 0 });
+    assert.deepEqual(byVerdict["needs-attention"].source, { review: 1, probe: 0, unknown: 1, other: 0 });
+    // NULL probes is its own bucket, never red.
+    assert.deepEqual(byVerdict["mystery-verdict"].probesGreen, { green: 0, red: 0, unknown: 1 });
+    assert.deepEqual(byVerdict["mystery-verdict"].source, { review: 0, probe: 0, unknown: 1, other: 0 });
+  });
+
+  it("renders the axis with the ROUND-level label and the aligned columns", () => {
+    const db = buildRoundReviewFixture();
+    const text = renderReportText(computeReport(db, { dbPath: ":memory:" }));
+    assert.match(text, /Escalate review axis \(ROUND-level/);
+    assert.match(text, /escalated rounds: 8  \|  all-green escalate \(probes all green\): 3/);
+    assert.match(text, /verdict_source recorded: review-issued \/ probe-issued \/ unknown-source split/);
+  });
+});
+
+describe("disposition x severity (kusabi #235)", () => {
+  it("counts rounds and findings per disposition; known-severity zeros are real counts", () => {
+    const db = buildRoundReviewFixture();
+    const rows = computeReport(db, { dbPath: ":memory:" }).dispositionSeverity;
+    const byDisp = Object.fromEntries(rows.map((r) => [r.disposition, r]));
+    assert.deepEqual(Object.keys(byDisp).sort(), ["accept", "accept-with-followup", "escalate", "rework"]);
+    // A round with no findings still gets the zero columns — the complement
+    // (no high/critical on accept-with-followup) is the signal.
+    assert.deepEqual(byDisp.accept.severities, { low: 0, medium: 0, high: 0, critical: 0 });
+    assert.equal(byDisp.accept.findings, 0);
+    assert.deepEqual(byDisp["accept-with-followup"].severities, { low: 2, medium: 1, high: 0, critical: 0, urgent: 1 });
+    // NULL severity is its own "(no severity)" bucket, never folded away.
+    assert.deepEqual(byDisp.rework.severities, { low: 1, medium: 0, high: 1, critical: 1, "(no severity)": 1 });
+    assert.equal(byDisp.rework.findings, 4);
+    assert.equal(byDisp.escalate.rounds, 8);
+    assert.equal(byDisp.escalate.findings, 3); // only round 6 carries findings
+  });
+
+  it("renders the table with every severity column separated", () => {
+    const db = buildRoundReviewFixture();
+    const text = renderReportText(computeReport(db, { dbPath: ":memory:" }));
+    assert.match(text, /Disposition × severity \(ROUND-level/);
+    // Unknown severities sort between the knowns and the "(no severity)"
+    // bucket, and the 12-char column name must not abut its neighbours.
+    assert.match(text, /critical\s+urgent\s+\(no severity\)/);
+    // "(no severity)" is the last column — nothing may follow it on the line
+    // (literal space: \s would match the line's trailing newline).
+    assert.doesNotMatch(text, /\(no severity\) \S/);
+  });
+});
+
+describe("review-output pathology rate (kusabi #235)", () => {
+  it("counts unparseable/partial among review-issued-or-unknown-source verdict rounds only", () => {
+    const db = buildRoundReviewFixture();
+    const path = computeReport(db, { dbPath: ":memory:" }).reviewPathology;
+    assert.equal(path.pathologyCount, 2); // unparseable (r4) + partial (r5)
+    // Denominator: 6 escalate non-probe rounds + approve + needs-attention =
+    // 8.  The two probe-issued discards are excluded from BOTH sides; the
+    // NULL-verdict accept round is not review output at all.
+    assert.equal(path.denominator, 8);
+    assert.equal(path.pct, 25);
+    assert.equal(path.probeIssued, 2);
+    assert.equal(path.verdictSourceAvailable, true);
+  });
+
+  it("renders the ratio, the probe exclusion, and the caveat", () => {
+    const db = buildRoundReviewFixture();
+    const text = renderReportText(computeReport(db, { dbPath: ":memory:" }));
+    assert.match(text, /Review-output pathology rate \(ROUND-level/);
+    assert.match(text, /2 of 8 review-issued-or-unknown-source verdict rounds \(25%\)/);
+    assert.match(text, /probe-issued verdicts excluded: 2 \(discard written by the P3 empty-change-set path/);
+    assert.match(text, /probe-issued verdicts \(P3 empty-change-set discards, review never dispatched\) are excluded from both sides/);
+    assert.match(text, /no better\/worse-over-time claim/);
+  });
+
+  it("a store without the verdict_source column treats every source as unknown", () => {
+    const db = buildRoundReviewFixture();
+    db.exec("ALTER TABLE round DROP COLUMN verdict_source");
+    const report = computeReport(db, { dbPath: ":memory:" });
+    const path = report.reviewPathology;
+    assert.equal(path.verdictSourceAvailable, false);
+    assert.equal(path.probeIssued, 0); // indistinguishable — never guessed
+    assert.equal(path.denominator, 10); // all 11 rounds minus the NULL-verdict accept
+    assert.equal(path.pathologyCount, 2);
+    assert.equal(path.pct, 20);
+    // Same store, the axis: every source bucket is unknown, no crash.
+    const axis = report.escalateReviewAxis;
+    assert.equal(axis.verdictSourceAvailable, false);
+    assert.equal(axis.byVerdict.find((r) => r.verdict === "discard").source.unknown, 3);
+  });
+});
+
+describe("round-level section scoping (kusabi #235)", () => {
+  it("sections are window-scoped by CHAIN: an out-of-window chain contributes nothing", () => {
+    const db = buildRoundReviewFixture({ withOldChain: true });
+    // rv-old (2026-07-20) falls outside the window; everything else is in.
+    const report = computeReport(db, { since: "2026-07-25T00:00:00.000Z", dbPath: ":memory:" });
+    assert.equal(report.status, "ok");
+    assert.equal(report.escalateReviewAxis.escalateRounds, 8);
+    assert.equal(report.reviewPathology.denominator, 8);
+    assert.equal(report.reviewPathology.pathologyCount, 2);
+
+    // Unbounded: the old chain joins in.
+    const all = computeReport(db, { dbPath: ":memory:" });
+    assert.equal(all.escalateReviewAxis.escalateRounds, 9);
+    assert.equal(all.reviewPathology.denominator, 9);
+    assert.equal(all.reviewPathology.pathologyCount, 3);
+    assert.ok(Math.abs(all.reviewPathology.pct - (100 / 3)) < 0.001);
+  });
+
+  it("a window that excludes every chain yields empty sections, not errors", () => {
+    const db = buildRoundReviewFixture();
+    const report = computeReport(db, { since: "2099-01-01T00:00:00.000Z", dbPath: ":memory:" });
+    assert.equal(report.status, "empty_window");
+    assert.equal(report.escalateReviewAxis.escalateRounds, 0);
+    assert.deepEqual(report.escalateReviewAxis.byVerdict, []);
+    assert.deepEqual(report.dispositionSeverity, []);
+    assert.equal(report.reviewPathology.denominator, 0);
+    assert.equal(report.reviewPathology.pct, null);
+    const text = renderReportText(report);
+    assert.match(text, /\(no escalated rounds in window\)/);
+    assert.match(text, /\(no rounds in window\)/);
+    assert.match(text, /\(no review-issued or unknown-source verdict rounds in window\)/);
+  });
+
+  it("the sections render between the brief-outcome block and the delegated-jobs section", () => {
+    const db = buildRoundReviewFixture();
+    const text = renderReportText(computeReport(db, { dbPath: ":memory:" }));
+    const brief = text.indexOf("Brief metrics vs outcome");
+    const axis = text.indexOf("Escalate review axis");
+    const pathology = text.indexOf("Review-output pathology rate");
+    const jobs = text.indexOf("Delegated jobs");
+    assert.ok(brief !== -1 && axis !== -1 && pathology !== -1 && jobs !== -1);
+    assert.ok(brief < axis && axis < pathology && pathology < jobs);
+  });
+
+  it("the JSON document carries the three sections", () => {
+    const db = buildRoundReviewFixture();
+    const parsed = JSON.parse(renderReportJson(computeReport(db, { dbPath: ":memory:" })));
+    assert.equal(parsed.escalateReviewAxis.escalateRounds, 8);
+    assert.equal(parsed.reviewPathology.pct, 25);
+    assert.equal(parsed.dispositionSeverity.length, 4);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Unrecognized non-NULL verdict_source values (kusabi #235 follow-up) — the
+// ingest pass-through discipline ("an unknown future value survives
+// verbatim") must not be defeated at the report surface: such a round is
+// NOT known to be review output, so it gets its own "other" bucket in the
+// axis (raw value rendered) and is excluded from BOTH sides of the
+// pathology ratio (counted for disclosure), exactly like probe-issued.
+// ---------------------------------------------------------------------------
+
+describe("unrecognized verdict_source values (kusabi #235 follow-up)", () => {
+  it("the axis buckets an unrecognized source as 'other', never as review, keeping the raw value", () => {
+    const db = buildRoundReviewFixture({ withOtherSource: true });
+    const axis = computeReport(db, { dbPath: ":memory:" }).escalateReviewAxis;
+    assert.equal(axis.escalateRounds, 9);
+    assert.equal(axis.allGreenEscalate, 4); // rounds 4, 5, 7 + round 9 (probes green)
+    const na = axis.byVerdict.find((r) => r.verdict === "needs-attention");
+    // review: round 6 (recovered-from-token); unknown: round 7 (NULL
+    // source); other: round 9 ("some-future-source") — NOT folded into
+    // review, NOT folded into unknown.
+    assert.deepEqual(na.source, { review: 1, probe: 0, unknown: 1, other: 1 });
+    assert.deepEqual(na.otherValues, ["some-future-source"]);
+    // Rows that never see an unrecognized source keep an empty list.
+    assert.deepEqual(axis.byVerdict.find((r) => r.verdict === "discard").otherValues, []);
+  });
+
+  it("section C excludes unrecognized-source rounds from both sides and reports the count verbatim", () => {
+    const db = buildRoundReviewFixture({ withOtherSource: true });
+    const path = computeReport(db, { dbPath: ":memory:" }).reviewPathology;
+    // Round 9 is not review output: denominator unchanged from the base
+    // fixture (8), pathology count unchanged (2), pct unchanged (25) — but
+    // the exclusion is disclosed, never silent.
+    assert.equal(path.otherIssued, 1);
+    assert.deepEqual(path.otherValues, ["some-future-source"]);
+    assert.equal(path.denominator, 8);
+    assert.equal(path.pathologyCount, 2);
+    assert.equal(path.pct, 25);
+    assert.equal(path.probeIssued, 2);
+    assert.equal(path.verdictSourceAvailable, true);
+  });
+
+  it("renders the other-source footnote and the exclusion line; the base fixture shows neither", () => {
+    const db = buildRoundReviewFixture({ withOtherSource: true });
+    const text = renderReportText(computeReport(db, { dbPath: ":memory:" }));
+    assert.match(text, /needs-attention: other-source values verbatim: "some-future-source"/);
+    assert.match(text, /unrecognized verdict_source values excluded: 1 \("some-future-source" — not known to be review output\)/);
+    const baseText = renderReportText(computeReport(buildRoundReviewFixture(), { dbPath: ":memory:" }));
+    assert.doesNotMatch(baseText, /other-source values verbatim/);
+    assert.doesNotMatch(baseText, /unrecognized verdict_source values excluded/);
+  });
+
+  it("a legacy store (no column) never produces an 'other' bucket — every source reads unknown", () => {
+    const db = buildRoundReviewFixture({ withOtherSource: true });
+    db.exec("ALTER TABLE round DROP COLUMN verdict_source");
+    const report = computeReport(db, { dbPath: ":memory:" });
+    const na = report.escalateReviewAxis.byVerdict.find((r) => r.verdict === "needs-attention");
+    // 3 needs-attention rounds: round 6 (recovered-from-token) and round 9
+    // (some-future-source) are indistinguishable from round 7 (NULL) once
+    // the column is gone — all unknown, nothing "other".
+    assert.deepEqual(na.source, { review: 0, probe: 0, unknown: 3, other: 0 });
+    assert.deepEqual(na.otherValues, []);
+    const path = report.reviewPathology;
+    assert.equal(path.otherIssued, 0);
+    assert.deepEqual(path.otherValues, []);
+    assert.equal(path.denominator, 11); // 12 rounds - 1 NULL-verdict accept
+    assert.equal(path.pathologyCount, 2);
+    assert.equal(path.verdictSourceAvailable, false);
+  });
+});

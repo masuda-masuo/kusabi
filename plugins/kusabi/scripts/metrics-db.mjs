@@ -113,6 +113,13 @@ CREATE TABLE IF NOT EXISTS round (
   tier_before INTEGER,
   tier_after INTEGER,
   verdict TEXT,
+  -- verdict_source (kusabi #235): who issued the verdict -- "probe" (the P3
+  -- empty-change-set discard, review never dispatched) /
+  -- "recovered-from-token" (review output unparseable, verdict recovered
+  -- from the model token stream) / absent for a normally parsed review
+  -- verdict.  NULL = never recorded -- the usage_available three-state
+  -- discipline: absent is a fact, never backfilled with 0 or "review".
+  verdict_source TEXT,
   probes_green INTEGER,
   worktree_changed INTEGER,
   disposition TEXT,
@@ -256,6 +263,14 @@ export function openMetricsDb(dbPath) {
   // queryable).  Old rows keep NULL, which readers treat as 0 (the `backend`
   // TEXT precedent: an absent field is never coerced to a measured zero).
   ensureColumn(db, "round", "review_seat_failures", "INTEGER");
+  // Migration for databases created before `round.verdict_source` existed
+  // (kusabi #235 -- the review-side failure-rate issue: a probe-issued
+  // discard (P3 empty change set, review never dispatched) is not review
+  // output, and without this column verdict aggregation cannot tell it from
+  // a review-issued one).  Old rows keep NULL -- "not recorded" is a fact
+  // worth seeing (the usage_available discipline), never backfilled with 0
+  // or "review".
+  ensureColumn(db, "round", "verdict_source", "TEXT");
   return db;
 }
 
@@ -469,11 +484,11 @@ export function upsertRound(db, row) {
   db.prepare(`
     INSERT OR REPLACE INTO round
       (chain_id, round, started_at, started_ms, backend, review_backend, model_entry, tier_before, tier_after,
-       verdict, probes_green, worktree_changed, disposition, rework_count, review_seat_failures, findings_text,
+       verdict, verdict_source, probes_green, worktree_changed, disposition, rework_count, review_seat_failures, findings_text,
        implement_in, implement_out, implement_cost, review_in, review_out, review_cost)
     VALUES
       ($chainId, $round, $startedAt, $startedMs, $backend, $reviewBackend, $modelEntry, $tierBefore, $tierAfter,
-       $verdict, $probesGreen, $worktreeChanged, $disposition, $reworkCount, $reviewSeatFailures, $findingsText,
+       $verdict, $verdictSource, $probesGreen, $worktreeChanged, $disposition, $reworkCount, $reviewSeatFailures, $findingsText,
        $implementIn, $implementOut, $implementCost, $reviewIn, $reviewOut, $reviewCost)
   `).run({
     chainId: row.chainId,
@@ -494,6 +509,13 @@ export function upsertRound(db, row) {
     tierBefore: row.tierBefore ?? null,
     tierAfter: row.tierAfter ?? null,
     verdict: row.verdict ?? null,
+    // Verdict issuer (kusabi #235): "probe" when the P3 empty-change-set
+    // path wrote the verdict without dispatching a review, otherwise the
+    // review's source or absent.  Copied verbatim when present — an unknown
+    // future value passes through unmodified — and NULL when the record did
+    // not say; never backfilled with 0 or "review" (readers bucket NULL as
+    // "unknown", the usage_available three-state discipline).
+    verdictSource: row.verdictSource ?? null,
     probesGreen: row.probesGreen ?? null,
     // Three-valued (kusabi #165): 1 = changed, 0 = measured no change,
     // NULL = never measured (old record / pre-probe death).  Absent is a

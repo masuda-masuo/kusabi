@@ -962,6 +962,78 @@ describe("backend field (kusabi #184 Job C)", () => {
 });
 
 // ---------------------------------------------------------------------------
+// verdictSource field (kusabi #235) — carried verbatim into the round row; a
+// record without the field stores NULL, never a default.  "probe" (the P3
+// empty-change-set discard, review never dispatched) and
+// "recovered-from-token" (unparseable review output, verdict recovered from
+// the token stream) are different facts from "absent", and an unknown future
+// value must survive to the report, not be dropped by an enum.
+// ---------------------------------------------------------------------------
+
+describe("verdictSource field (kusabi #235)", () => {
+  it("carries verdictSource from the records into round rows; an absent field stores NULL", () => {
+    // A post-#235 record: the P3 empty-change-set path wrote
+    // verdictSource: "probe" (no review job ever dispatched).
+    const probeChain = structuredClone(chainModernFixture());
+    probeChain.records[0].verdictSource = "probe";
+    const parsed = parseChainRecord(probeChain, { workspaceSlug: "ws1" });
+    assert.equal(parsed.roundRows[0].verdictSource, "probe");
+
+    // Records that never wrote the field store NULL — never "review" (the
+    // three-state discipline: absent is a fact, not a default).
+    const legacy = parseChainRecord(chainOldFixture(), { workspaceSlug: "ws1" });
+    assert.ok(legacy.roundRows.length >= 1);
+    for (const r of legacy.roundRows) assert.equal(r.verdictSource, null);
+  });
+
+  it("an unknown future verdictSource value passes through unmodified", () => {
+    const parsed = parseChainRecord({
+      chainId: "chain-future-source",
+      records: [{ round: 1, verdictSource: "some-future-source" }],
+    });
+    assert.equal(parsed.roundRows[0].verdictSource, "some-future-source");
+  });
+
+  it("the chain walker stores verdict_source verbatim; re-ingest keeps an absent source NULL", () => {
+    const stateRoot = makeTempStateRoot();
+    const chainId = "chain-ms1g7lesd89b";
+    const withSource = structuredClone(chainModernFixture());
+    withSource.records[0].verdictSource = "probe";
+    writeChainDir(stateRoot, "ws1", chainId, withSource);
+
+    const db = openMetricsDb(":memory:");
+    const first = ingestChainDirectory(db, stateRoot);
+    assert.equal(first.chainsIngested, 1);
+    assert.equal(db.prepare("SELECT verdict_source FROM round ORDER BY round LIMIT 1").get().verdict_source, "probe");
+
+    // The same round re-ingested from a record that does not carry the
+    // field stores NULL — the row is replaced by the record, and an absent
+    // source is never backfilled (INSERT OR REPLACE rewrites every column).
+    const withoutSource = structuredClone(chainModernFixture());
+    writeChainDir(stateRoot, "ws1", chainId, withoutSource);
+    const second = ingestChainDirectory(db, stateRoot);
+    assert.equal(second.filesSkippedUnchanged, 0, "the rewritten chain.json must force a re-read");
+    assert.equal(db.prepare("SELECT verdict_source FROM round ORDER BY round LIMIT 1").get().verdict_source, null);
+
+    // Re-ingesting the same record (still without the field) keeps NULL.
+    // The rewrite is byte-identical, so bump mtime explicitly — the
+    // skip-unchanged bookkeeping compares size + mtimeMs (millisecond
+    // resolution) and two writes in the same millisecond would look
+    // unchanged.
+    writeChainDir(stateRoot, "ws1", chainId, withoutSource);
+    const chainJsonPath = path.join(stateRoot, "ws1", "chains", chainId, "chain.json");
+    const bumped = new Date(Date.now() + 5000);
+    fs.utimesSync(chainJsonPath, bumped, bumped);
+    const third = ingestChainDirectory(db, stateRoot);
+    assert.equal(third.filesSkippedUnchanged, 0, "the rewritten chain.json must force a re-read");
+    assert.equal(countRows(db, "round"), 2, "re-ingest must not duplicate rounds");
+    assert.equal(db.prepare("SELECT verdict_source FROM round ORDER BY round LIMIT 1").get().verdict_source, null);
+
+    fs.rmSync(stateRoot, { recursive: true, force: true });
+  });
+});
+
+// ---------------------------------------------------------------------------
 // per-phase backend attribution (kusabi #195) — kusabi #192 made backend a
 // per-phase property (implement vs review can differ within one round), so
 // the round row carries `reviewBackend` too and a chain whose known phase
