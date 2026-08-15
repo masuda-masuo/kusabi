@@ -409,3 +409,94 @@ describe("deriveReworkStrategy", () => {
     assert.match(result.reason, /escalate tier/);
   });
 });
+
+
+// deriveDisposition — the deterministic oracle marker (kusabi #197)
+// ---------------------------------------------------------------------------
+//
+// A P5 (frozen tests) or P6 (collected count) failure must reach a HUMAN.  It
+// must never buy a rework round: the correct resolution may be "this deletion
+// is legitimate, I approve it", which no worker can decide.  So the marker
+// takes precedence over every rework/strategize/accept row — and the table is
+// byte-for-byte unchanged when the marker is absent.
+
+describe("deriveDisposition — oracle violation routing (kusabi #197)", () => {
+  it("escalates an approve with green probes (the case the oracle exists to catch)", () => {
+    const result = deriveDisposition({
+      verdict: "approve", probesGreen: true, round: 1, maxRounds: 3,
+      repeatedAreas: false, oracleViolation: true,
+    });
+    assert.equal(result.disposition, "escalate");
+    assert.match(result.reason, /oracle violation/);
+    assert.match(result.reason, /never an automatic rework/);
+  });
+
+  it("never reworks and never strategizes, whatever the other evidence says", () => {
+    const cases = [
+      { verdict: "approve", probesGreen: false, repeatedAreas: false },
+      { verdict: "approve", probesGreen: false, repeatedAreas: true, strategizeEligible: true },
+      { verdict: "needs-attention", probesGreen: false, repeatedAreas: false },
+      { verdict: "needs-attention", probesGreen: true, repeatedAreas: true, strategizeEligible: true },
+      { verdict: "approve-partial", probesGreen: true, repeatedAreas: false },
+      { verdict: "partial", probesGreen: true, repeatedAreas: false },
+    ];
+    for (const evidence of cases) {
+      const result = deriveDisposition({ round: 1, maxRounds: 3, oracleViolation: true, ...evidence });
+      assert.equal(result.disposition, "escalate", JSON.stringify(evidence));
+    }
+  });
+
+  it("preempts the accept-with-followup economic cutoff", () => {
+    // Same evidence without the marker ships with a follow-up issue.  A round
+    // that edited a frozen test must not ship on "all findings are minor".
+    const withMarker = deriveDisposition({
+      verdict: "needs-attention", probesGreen: true, round: 1, maxRounds: 3,
+      repeatedAreas: false, findingSeverities: ["low", "medium"], oracleViolation: true,
+    });
+    const without = deriveDisposition({
+      verdict: "needs-attention", probesGreen: true, round: 1, maxRounds: 3,
+      repeatedAreas: false, findingSeverities: ["low", "medium"],
+    });
+    assert.equal(withMarker.disposition, "escalate");
+    assert.deepEqual(without, { disposition: "accept-with-followup", reason: "probes green; remaining findings all minor" });
+  });
+
+  it("names the violation in the reason when the marker is a string", () => {
+    // This is what puts the offending path in front of the human: the escalate
+    // outcome line renders `disposition.reason` verbatim.
+    const result = deriveDisposition({
+      verdict: "approve", probesGreen: false, round: 1, maxRounds: 3, repeatedAreas: false,
+      oracleViolation: "P5: frozen: frozen path(s) changed: [tests/a.test.mjs]; frozen: [tests/a.test.mjs]",
+    });
+    assert.equal(result.disposition, "escalate");
+    assert.match(result.reason, /tests\/a\.test\.mjs/);
+  });
+
+  it("does not preempt discard — that round keeps the reviewer's own reason", () => {
+    const result = deriveDisposition({
+      verdict: "discard", probesGreen: true, round: 1, maxRounds: 3,
+      repeatedAreas: false, oracleViolation: true,
+    });
+    // Both routes end in escalate, so there is no state where the chain can
+    // neither accept nor escalate (kusabi #173).
+    assert.deepEqual(result, { disposition: "escalate", reason: "reviewer discarded the work" });
+  });
+
+  it("leaves the table unchanged when the marker is absent, false, or an empty string", () => {
+    const rows = [
+      { input: { verdict: "approve", probesGreen: true }, expected: { disposition: "accept" } },
+      { input: { verdict: "approve", probesGreen: false }, expected: { disposition: "rework", reason: "deterministic probes failed" } },
+      { input: { verdict: "needs-attention", probesGreen: true }, expected: { disposition: "rework", reason: "needs-attention" } },
+      { input: { verdict: "discard", probesGreen: true }, expected: { disposition: "escalate", reason: "reviewer discarded the work" } },
+      { input: { verdict: "approve-partial", probesGreen: true }, expected: { disposition: "escalate", reason: "approve-partial: unverified items remain" } },
+    ];
+    for (const marker of [undefined, false, "", "   "]) {
+      for (const row of rows) {
+        const result = deriveDisposition({
+          round: 1, maxRounds: 3, repeatedAreas: false, oracleViolation: marker, ...row.input,
+        });
+        assert.deepEqual(result, row.expected, `${JSON.stringify(marker)} / ${JSON.stringify(row.input)}`);
+      }
+    }
+  });
+});
