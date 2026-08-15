@@ -90,7 +90,7 @@ kusabi ships 7 agent definitions (`plugins/kusabi/opencode-agents/`) that are au
 | `kusabi-review` | review — adversarial review | verify/lint/type_check **allow**, sandbox_exec/sandbox_write/issue_write/pr_review_write **deny** (deliverable is structured report, not issue comments) |
 | `kusabi-respond` | respond — address review findings | code write; issue_write **deny** |
 | `kusabi-salvage` | salvage — recover stalled / dead jobs | read-only + structured report |
-| `kusabi-gofer` | gofer — evidence-gathering errands | sandbox_exec + read/verify tools **allow**; host write/shiori/sunaba mutation **deny** |
+| `kusabi-gofer` | gofer — evidence-gathering errands | sandbox_exec + run_python + read/verify tools **allow**; host write/shiori/sunaba mutation **deny** |
 
 Run `kusabi-companion setup` or `kusabi-companion install-agents` to copy them to `OPENCODE_AGENT_DIR`. Legacy `oc-*` names are automatically cleaned up. The same command also copies kusabi's opencode skills (`plugins/kusabi/opencode-skills/`) to `OPENCODE_SKILL_DIR`, copy-and-overwrite only — the destination is never pruned. Both defaults follow opencode's own config dir (`$XDG_CONFIG_HOME/opencode`, else `~/.config/opencode`), which is where opencode actually scans. Note that `OPENCODE_SKILL_DIR` / `OPENCODE_AGENT_DIR` are placement overrides that opencode itself does not read (see `docs/design/phase-chain.md` §3.8).
 

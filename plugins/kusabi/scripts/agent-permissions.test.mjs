@@ -69,13 +69,15 @@ export function checkAgentPermissions(permission, roleName) {
     }
   }
 
-  // 6. sunaba_run_python: exclusive to implement/respond — both the negative
-  //    check (nobody else may have it) and the positive check (those two MUST
-  //    have it).
-  if ((roleName === "implement" || roleName === "respond") && permission["sunaba_run_python"] !== "allow") {
-    violations.push(`"sunaba_run_python" missing from "${roleName}" (implement/respond must have it)`);
-  } else if (permission["sunaba_run_python"] === "allow" && roleName !== "implement" && roleName !== "respond") {
-    violations.push(`"sunaba_run_python" granted to "${roleName}", but only implement/respond may have it`);
+  // 6. sunaba_run_python: exclusive to implement/respond/gofer — both the
+  //    negative check (nobody else may have it) and the positive check (those
+  //    three MUST have it).  Gofer's grant is for post-collection compression
+  //    of gathered evidence, not exploration (#216).
+  const runPythonRoles = ["implement", "respond", "gofer"];
+  if (runPythonRoles.includes(roleName) && permission["sunaba_run_python"] !== "allow") {
+    violations.push(`"sunaba_run_python" missing from "${roleName}" (implement/respond/gofer must have it)`);
+  } else if (permission["sunaba_run_python"] === "allow" && !runPythonRoles.includes(roleName)) {
+    violations.push(`"sunaba_run_python" granted to "${roleName}", but only implement/respond/gofer may have it`);
   }
 
   // 7. sunaba_sandbox_issue_write: exclusive to draft/investigate — both the
