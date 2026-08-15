@@ -1591,9 +1591,12 @@ describe("claudeDispatch (fake claude binary)", () => {
     assert.ok(args[12].split(",").includes("Bash"));
     assert.equal(args[13], "--mcp-config");
 
-    // The generated MCP config contains ONLY the sunaba entry.
+    // The generated MCP config contains ONLY the sunaba entry, at a path
+    // that names a REAL file at spawn time (kusabi #276): the config is
+    // per-dispatch — it lives in this job's own directory, so no other
+    // dispatch in the same cwd can overwrite it before this child reads it.
     const mcpConfigPath = args[14];
-    assert.equal(mcpConfigPath, path.join(ctx.stateDir, "claude-mcp.json"));
+    assert.ok(fs.existsSync(mcpConfigPath), "--mcp-config must name a file that exists at spawn time");
     const mcpConfig = readJson(mcpConfigPath);
     assert.deepEqual(mcpConfig, { mcpServers: { sunaba: SUNABA_MCP } });
     assert.equal(mcpConfig.mcpServers.other, undefined);
@@ -1656,7 +1659,7 @@ describe("claudeDispatch (fake claude binary)", () => {
   // ---- sunaba tool profiles (kusabi #274) ----
   //
   // The default fixture's sunaba entry is stdio, and the invocation-shape
-  // test above already asserts it reaches claude-mcp.json byte-identical
+  // test above already asserts it reaches the generated config byte-identical
   // (stdio has no query string to carry a profile).  These point the source
   // config at an HTTP entry instead and follow the profile end to end.
 
@@ -1669,7 +1672,11 @@ describe("claudeDispatch (fake claude binary)", () => {
     );
   }
 
-  /** The sunaba url in the generated claude-mcp.json of the last dispatch. */
+  /**
+   * The sunaba url in the generated MCP config of the last dispatch.  The
+   * config is a per-dispatch file (kusabi #276) that lives with its job, so
+   * it is still on disk after the dispatch completes.
+   */
   function generatedSunabaUrl() {
     const args = JSON.parse(fs.readFileSync(ctx.argsLog, "utf8").trim().split("\n").pop());
     return readJson(args[args.indexOf("--mcp-config") + 1]).mcpServers.sunaba.url;
@@ -1703,6 +1710,56 @@ describe("claudeDispatch (fake claude binary)", () => {
     useHttpSunabaSource("http://127.0.0.1:8750/mcp?profile=issue");
     await claudeDispatch(ctx.dispatchOptions({ agent: "kusabi-implement" }));
     assert.equal(generatedSunabaUrl(), "http://127.0.0.1:8750/mcp?profile=issue");
+  });
+
+  it("overlapping dispatches in the same cwd each read the config their own pre-flight wrote", async () => {
+    // The failure this guards (kusabi #276): the generated config used to be
+    // ONE file per cwd, so two dispatches whose spawn windows overlap — a
+    // chain and a stand-alone task, or two tasks — raced it.  Dispatch A
+    // wrote `profile=implement` and spawned; dispatch B overwrote the same
+    // file with `profile=review` before A's claude process had read
+    // `--mcp-config`, and A's worker ran with the review profile, its write
+    // tools simply absent.
+    //
+    // Interleave them the way the real world does: A's pre-flight writes its
+    // config and spawns, then B's pre-flight writes ITS config and spawns —
+    // both in the SAME cwd.  The assertion is on CONTENT, never on a
+    // filename shape: whatever path each dispatch handed to `--mcp-config`
+    // must still contain the profile that dispatch resolved.  With the old
+    // shared per-cwd file, A's path IS B's path, so the implement assertion
+    // below reads B's review config and fails.
+    useHttpSunabaSource();
+    const promiseA = claudeDispatch(ctx.dispatchOptions({ agent: "kusabi-implement" }));
+    const promiseB = claudeDispatch(ctx.dispatchOptions({
+      kind: "review",
+      agent: "kusabi-review",
+      phase: "review",
+      // The only argv difference between the two lines in the args log, so
+      // each dispatch's line — and therefore its `--mcp-config` path — can
+      // be identified after both have run.
+      explicitModel: "claude-opus-4-1",
+    }));
+    const [resultA, resultB] = await Promise.all([promiseA, promiseB]);
+    assert.equal(resultA.job.status, "completed");
+    assert.equal(resultB.job.status, "completed");
+
+    const lines = fs.readFileSync(ctx.argsLog, "utf8").trim().split("\n").map((l) => JSON.parse(l));
+    assert.equal(lines.length, 2, "one argv line per dispatch");
+    const argsFor = (model) => {
+      const line = lines.find((l) => l[l.indexOf("--model") + 1] === model);
+      assert.ok(line, `expected an argv line carrying --model ${model}`);
+      return line;
+    };
+    const mcpConfigPathFor = (argv) => argv[argv.indexOf("--mcp-config") + 1];
+    const aPath = mcpConfigPathFor(argsFor("opus"));
+    const bPath = mcpConfigPathFor(argsFor("claude-opus-4-1"));
+
+    // A's file still exists and still carries A's own entry — B's write
+    // must not have touched it, and A must not have read B's.
+    assert.ok(fs.existsSync(aPath), "A's --mcp-config path must still exist after B's dispatch");
+    assert.equal(readJson(aPath).mcpServers.sunaba.url, "http://127.0.0.1:8750/mcp?profile=implement");
+    assert.ok(fs.existsSync(bPath), "B's --mcp-config path must still exist");
+    assert.equal(readJson(bPath).mcpServers.sunaba.url, "http://127.0.0.1:8750/mcp?profile=review");
   });
 
   it("applies tools deny maps to the allowlist (a deny is never silently ignored)", async () => {
