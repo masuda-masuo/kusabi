@@ -677,6 +677,70 @@ describe("round.review_seat_failures migration (kusabi #248 follow-up)", () => {
   });
 });
 
+// round.verdict_source column (kusabi #235) — the source of a round's
+// review verdict ("probe" = P3 empty-change-set discard, review never
+// dispatched; "recovered-from-token" = unparseable review output, verdict
+// recovered from the token stream; NULL = the record never wrote the field).
+// ---------------------------------------------------------------------------
+
+describe("round.verdict_source migration (kusabi #235)", () => {
+  it("adds verdict_source to a post-#248 / pre-#235 database, preserving old rows as NULL", () => {
+    const dbPath = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-migrate-test-")), "metrics.db");
+
+    // A database written between #248 and #235: `round` already has
+    // `review_seat_failures`, but no `verdict_source` at all.
+    const legacyDb = new DatabaseSync(dbPath);
+    legacyDb.exec(`
+      CREATE TABLE round (
+        chain_id TEXT,
+        round INTEGER,
+        started_at TEXT,
+        started_ms INTEGER,
+        backend TEXT,
+        review_backend TEXT,
+        model_entry TEXT,
+        tier_before INTEGER,
+        tier_after INTEGER,
+        verdict TEXT,
+        probes_green INTEGER,
+        worktree_changed INTEGER,
+        disposition TEXT,
+        rework_count INTEGER,
+        findings_text TEXT,
+        implement_in INTEGER,
+        implement_out INTEGER,
+        implement_cost REAL,
+        review_in INTEGER,
+        review_out INTEGER,
+        review_cost REAL,
+        review_seat_failures INTEGER,
+        PRIMARY KEY (chain_id, round)
+      )
+    `);
+    legacyDb.prepare("INSERT INTO round (chain_id, round, verdict, disposition) VALUES (?, ?, ?, ?)")
+      .run("chain-legacy", 1, "approve", "accept");
+    if (typeof legacyDb.close === "function") legacyDb.close();
+
+    // Re-opening through openMetricsDb migrates in place; the old row keeps
+    // NULL — the report buckets NULL as "not recorded", it is never
+    // backfilled with a fabricated source.
+    const db = openMetricsDb(dbPath);
+    const legacyRound = db.prepare("SELECT * FROM round WHERE chain_id = ?").get("chain-legacy");
+    assert.equal(legacyRound.verdict_source, null);
+    assert.equal(legacyRound.verdict, "approve"); // other columns untouched
+    assert.equal(legacyRound.review_seat_failures, null); // and the pre-existing column survives
+
+    // New rows written after migration store the source verbatim; a row
+    // without a source stores NULL, never a default.
+    upsertRound(db, { chainId: "chain-new", round: 1, disposition: "escalate", verdict: "discard", verdictSource: "probe" });
+    upsertRound(db, { chainId: "chain-new2", round: 1, disposition: "escalate", verdict: "partial" });
+    const rows = db.prepare("SELECT chain_id, verdict_source FROM round ORDER BY chain_id").all();
+    assert.deepEqual(rows.map((r) => r.verdict_source), [null, "probe", null]);
+
+    fs.rmSync(path.dirname(dbPath), { recursive: true, force: true });
+  });
+});
+
 describe("upsertCursorSessionCounter / getCursorSessionCounter", () => {
   it("stores a row and returns it; unknown sessionId is undefined", () => {
     const db = openMetricsDb(":memory:");

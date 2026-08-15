@@ -248,13 +248,25 @@ function fetchRounds(db) {
   // deliberately NOT selected: mixedness is decided at ingest and stored in
   // `chain.backend`, and this read-only surface reads that verbatim — a
   // store written before #195 simply has no "mixed" labels yet (re-ingest
-  // is the fix, not re-derivation).
+  // is the fix, not re-derivation).  `verdict_source` (kusabi #235) is
+  // guarded the same way: a pre-#235 store renders every source as
+  // "unknown" rather than crashing on `no such column`.
   const hasWorktreeChanged = tableHasColumn(db, "round", "worktree_changed");
   const hasBackend = tableHasColumn(db, "round", "backend");
-  const cols = ["chain_id", "round", "started_at", "started_ms", "disposition"];
+  const hasVerdictSource = tableHasColumn(db, "round", "verdict_source");
+  // verdict / probes_green have been in the schema since the first metrics
+  // store, so they are always selected.
+  const cols = ["chain_id", "round", "started_at", "started_ms", "disposition", "verdict", "probes_green"];
   if (hasBackend) cols.push("backend");
   if (hasWorktreeChanged) cols.push("worktree_changed");
+  if (hasVerdictSource) cols.push("verdict_source");
   return db.prepare(`SELECT ${cols.join(", ")} FROM round`).all();
+}
+
+function fetchFindings(db) {
+  // severity only — the round-level disposition × severity table needs
+  // nothing else.  severity has been in the schema since the first store.
+  return db.prepare(`SELECT chain_id, round, severity FROM finding`).all();
 }
 
 /** Callers must check `tableExists(db, "job")` first (pre-#154 store files
@@ -593,6 +605,236 @@ function computeBriefOutcome(inWindowChains, roundsByChain) {
 }
 
 // ---------------------------------------------------------------------------
+// kusabi #235 — round-level review-side metrics.
+//
+// THREE sections, all ROUND-level.  They sit next to the #165 escalate split
+// (#165 classifies by the IMPLEMENT axis — did the worker produce a change
+// set — over the CHAIN's FINAL round; these classify by the REVIEW axis over
+// every round).  The unit difference is deliberate and labelled in the
+// output: a chain whose round-1 review failed and whose round-2 review
+// recovered is one "escalated chain" to #165 but two rounds here, and both
+// surfaces must not disagree about what "final" means — so `finalDisposition`
+// and the #165 split are untouched, and these sections never mention "final".
+//
+// Invariants from the issue:
+//   - unknown verdict values are reported verbatim, never dropped by an enum;
+//   - NULL probes_green is a distinct bucket from 0 (red);
+//   - NULL verdict_source is its own "unknown" bucket, never folded into
+//     review-issued or probe-issued;
+//   - an unrecognized NON-NULL verdict_source is its own "other" bucket
+//     (raw value kept and rendered verbatim) — the ingest pass-through
+//     discipline (chain-ingest.mjs) must not be defeated one layer up by
+//     silently counting it as review output;
+//   - distributions only — no better/worse-over-time claims.
+// ---------------------------------------------------------------------------
+
+/** Verdicts that mean the review could not produce a usable judgement.
+ * Corrected set from the issue's comment (kusabi #235): `discard` is a
+ * DESIGNED judgement (P3 empty change set — the probe writes it without
+ * dispatching a review; a review-issued discard means "the premise of the
+ * change is wrong", phase-chain.md L219) and `approve-partial` is a
+ * judgement (approve with a partial stream), so neither is pathology.  The
+ * two that are: `unparseable` (no JSON and no recoverable verdict token)
+ * and `partial` (the stream ended before the verdict record — the safety
+ * net that is not a goal, kusabi #202). */
+const REVIEW_PATHOLOGY_VERDICTS = new Set(["unparseable", "partial"]);
+
+/** Known severity vocabulary, in display order.  Unknown severities render
+ * verbatim after these; NULL severity renders as its own "(no severity)"
+ * bucket (the finding_files generation has no severity at all). */
+const SEVERITY_ORDER = ["low", "medium", "high", "critical"];
+
+/** Known verdict_source vocabulary (kusabi #235): "probe" = the P3
+ * empty-change-set discard written WITHOUT dispatching a review (not review
+ * output); "recovered-from-token" = the review ran but its output was
+ * unparseable and the verdict was recovered from the model token stream
+ * (review output).  The issue's comment lists the vocabulary as non-
+ * exhaustive ("probe" / "recovered-from-token" など), so ANY other non-NULL
+ * value is an unrecognized future source: it is NOT known to be review
+ * output and must not be folded into the review bucket at the report
+ * surface — it gets its own "other" bucket with the raw value rendered. */
+const REVIEW_SOURCE_VALUES = new Set(["probe", "recovered-from-token"]);
+
+/**
+ * Section A — escalate review-axis split (round-level).
+ *
+ * Every round whose disposition is "escalate", broken down by `verdict`
+ * (verbatim — an unknown value is its own row, never dropped), crossed with
+ * probes_green (green / red / unknown — NULL is a distinct bucket from 0)
+ * and with verdict_source (review / probe / unknown / other — NULL source
+ * is its own "unknown" bucket, never folded into either; an unrecognized
+ * non-NULL source is its own "other" bucket with the raw value(s) kept for
+ * the renderer, never counted as review output).  "All-green escalate" —
+ * escalate rounds whose probes were all green, i.e. the implement side was
+ * mechanically fine and the escalate is a review-side signal — is its own
+ * number on top.
+ *
+ * @param {object[]} inWindowRounds
+ * @param {boolean} verdictSourceAvailable  whether the store has the
+ *   round.verdict_source column (pre-#235 stores render every source as
+ *   "unknown").
+ */
+function computeEscalateReviewAxis(inWindowRounds, verdictSourceAvailable) {
+  const escalate = inWindowRounds.filter((r) => r.disposition === "escalate");
+  /** @type {Map<string, object>} */
+  const byVerdict = new Map();
+  let allGreenEscalate = 0;
+  for (const r of escalate) {
+    // A NULL verdict is its own verbatim-ish bucket, never dropped.
+    const verdict = r.verdict === null || r.verdict === undefined ? "(no verdict)" : String(r.verdict);
+    let row = byVerdict.get(verdict);
+    if (!row) {
+      row = {
+        verdict,
+        rounds: 0,
+        probesGreen: { green: 0, red: 0, unknown: 0 },
+        source: { review: 0, probe: 0, unknown: 0, other: 0 },
+        otherValues: [],
+      };
+      byVerdict.set(verdict, row);
+    }
+    row.rounds += 1;
+    if (r.probes_green === 1) {
+      row.probesGreen.green += 1;
+      allGreenEscalate += 1;
+    } else if (r.probes_green === 0) {
+      row.probesGreen.red += 1;
+    } else {
+      // NULL — never measured.  A distinct bucket from red (0).
+      row.probesGreen.unknown += 1;
+    }
+    if (r.verdict_source === "probe") {
+      row.source.probe += 1;
+    } else if (r.verdict_source === null || r.verdict_source === undefined) {
+      // Absent source: predates the field, or the record never said.  Its
+      // own bucket — never folded into review-issued.
+      row.source.unknown += 1;
+    } else if (REVIEW_SOURCE_VALUES.has(r.verdict_source)) {
+      // "recovered-from-token" — the review ran, its output was unparseable,
+      // and the verdict was recovered from the token stream.  Review output.
+      row.source.review += 1;
+    } else {
+      // Unrecognized non-NULL source: the ingest pass-through discipline
+      // says an unknown future value survives verbatim — it must NOT be
+      // silently counted as review output one layer up.  Its own "other"
+      // bucket, with the raw value(s) kept for the renderer.
+      row.source.other += 1;
+      if (!row.otherValues.includes(r.verdict_source)) row.otherValues.push(r.verdict_source);
+    }
+  }
+  const rows = [...byVerdict.values()].sort((a, b) => a.verdict.localeCompare(b.verdict));
+  return {
+    escalateRounds: escalate.length,
+    allGreenEscalate,
+    byVerdict: rows,
+    verdictSourceAvailable,
+  };
+}
+
+/**
+ * Section B — disposition × severity table (round-level).
+ *
+ * Per disposition (verbatim — an unknown disposition is its own row): the
+ * round count and the finding count of those rounds, with the severity
+ * breakdown.  The complementary distribution is the payload: if
+ * accept-with-followup rounds carry exclusively low/medium findings while
+ * rework carries the high/critical ones, the table shows it.  Known
+ * severities are always present (zero is a measurement, and the zeros ARE
+ * the signal); unknown severities render verbatim; NULL severity is its own
+ * "(no severity)" bucket (the finding_files generation).
+ *
+ * @param {object[]} inWindowRounds
+ * @param {Map<string, object[]>} findingsByRound  keyed by
+ *   `${chain_id}\u0000${round}` — only in-window rounds are looked up.
+ */
+function computeDispositionSeverity(inWindowRounds, findingsByRound) {
+  /** @type {Map<string, object>} */
+  const byDisposition = new Map();
+  for (const r of inWindowRounds) {
+    const disp = r.disposition === null || r.disposition === undefined ? "(no disposition)" : String(r.disposition);
+    let row = byDisposition.get(disp);
+    if (!row) {
+      row = { disposition: disp, rounds: 0, findings: 0, severities: {} };
+      byDisposition.set(disp, row);
+    }
+    row.rounds += 1;
+    const findings = findingsByRound.get(`${r.chain_id}\u0000${r.round}`) || [];
+    for (const f of findings) {
+      row.findings += 1;
+      const sev = f.severity === null || f.severity === undefined ? "(no severity)" : String(f.severity);
+      row.severities[sev] = (row.severities[sev] || 0) + 1;
+    }
+  }
+  const rows = [...byDisposition.values()];
+  for (const row of rows) {
+    // The four known severities always appear — a zero is a real count and
+    // the complement (e.g. no high/critical on accept-with-followup) is the
+    // point of the table.
+    for (const sev of SEVERITY_ORDER) {
+      if (row.severities[sev] === undefined) row.severities[sev] = 0;
+    }
+  }
+  rows.sort((a, b) => a.disposition.localeCompare(b.disposition));
+  return rows;
+}
+
+/**
+ * Section C — review-output pathology rate (round-level, one number).
+ *
+ * Numerator: rounds whose verdict is in REVIEW_PATHOLOGY_VERDICTS and was
+ * review-issued or unknown-source.  Denominator: rounds with a recorded
+ * verdict that is review-issued or unknown-source — probe-issued verdicts
+ * (the P3 empty-change-set discard, review never dispatched) are NOT review
+ * output and are excluded from BOTH sides; their count is reported beside
+ * the ratio so the exclusion is visible.  The same exclusion applies to an
+ * unrecognized NON-NULL verdict_source (not in {probe,
+ * recovered-from-token}): it is not known to be review output, so it must
+ * not silently inflate the denominator — it is excluded from both sides,
+ * counted (`otherIssued`) with the verbatim value(s) for disclosure.  A
+ * store without the verdict_source column cannot tell probe-issued from
+ * review-issued, so every verdict round is in the denominator and the ratio
+ * is stated with that caveat.
+ *
+ * @param {object[]} inWindowRounds
+ * @param {boolean} verdictSourceAvailable
+ */
+function computeReviewPathology(inWindowRounds, verdictSourceAvailable) {
+  let pathologyCount = 0;
+  let denominator = 0;
+  let probeIssued = 0;
+  let otherIssued = 0;
+  const otherValues = new Set();
+  for (const r of inWindowRounds) {
+    if (r.verdict === null || r.verdict === undefined) continue; // no verdict at all — not review output
+    if (r.verdict_source === "probe") {
+      probeIssued += 1;
+      continue; // probe-issued verdicts are not review output — not pathology, not denominator
+    }
+    if (r.verdict_source !== null && r.verdict_source !== undefined && !REVIEW_SOURCE_VALUES.has(r.verdict_source)) {
+      // Unrecognized non-NULL source — the same failure class the probe
+      // exclusion exists for (a non-review verdict counted as review-issued
+      // would corrupt the very scorecard this section exists to produce).
+      // Excluded from both sides; counted with the verbatim value so the
+      // exclusion is visible, never silent.
+      otherIssued += 1;
+      otherValues.add(r.verdict_source);
+      continue;
+    }
+    denominator += 1;
+    if (REVIEW_PATHOLOGY_VERDICTS.has(String(r.verdict))) pathologyCount += 1;
+  }
+  return {
+    pathologyCount,
+    denominator,
+    pct: denominator === 0 ? null : (pathologyCount / denominator) * 100,
+    verdictSourceAvailable,
+    probeIssued,
+    otherIssued,
+    otherValues: [...otherValues].sort(),
+  };
+}
+
+// ---------------------------------------------------------------------------
 // section 8 — delegated jobs (#154)
 //
 // Deliberately a SEPARATE section, not rows grafted onto `Orchestrator vs
@@ -810,6 +1052,30 @@ function computeCursorSampledOutput(db) {
 // top-level report
 // ---------------------------------------------------------------------------
 
+/** Empty section A shape (missing/empty stores) — escalateRounds zero, no
+ * verdict rows, no verdict_source column to split on. */
+function emptyEscalateReviewAxis() {
+  return {
+    escalateRounds: 0,
+    allGreenEscalate: 0,
+    byVerdict: [],
+    verdictSourceAvailable: false,
+  };
+}
+
+/** Empty section C shape (missing/empty stores) — no denominator to state. */
+function emptyReviewPathology() {
+  return {
+    pathologyCount: 0,
+    denominator: 0,
+    pct: null,
+    verdictSourceAvailable: false,
+    probeIssued: 0,
+    otherIssued: 0,
+    otherValues: [],
+  };
+}
+
 /**
  * Report for a missing database file — the caller must check
  * `fs.existsSync(dbPath)` BEFORE calling `openMetricsDbReadOnly` (a
@@ -837,6 +1103,9 @@ export function missingStoreReport(dbPath) {
     briefOutcome: [],
     delegatedJobs: emptyDelegatedJobs(),
     byBackend: { chains: [], jobs: [] },
+    escalateReviewAxis: emptyEscalateReviewAxis(),
+    dispositionSeverity: [],
+    reviewPathology: emptyReviewPathology(),
   };
 }
 
@@ -872,6 +1141,9 @@ export function computeReport(db, opts = {}) {
       briefOutcome: [],
       delegatedJobs: emptyDelegatedJobs(),
       byBackend: { chains: [], jobs: [] },
+      escalateReviewAxis: emptyEscalateReviewAxis(),
+      dispositionSeverity: [],
+      reviewPathology: emptyReviewPathology(),
     };
   }
 
@@ -879,6 +1151,7 @@ export function computeReport(db, opts = {}) {
   const allSessions = fetchSessions(db);
   const allChains = fetchChains(db);
   const allRounds = fetchRounds(db);
+  const allFindings = fetchFindings(db);
   // A store file written before #154 has no `job` table and cannot be
   // migrated by a read-only open — treated as zero jobs, not an error.
   const allJobs = tableExists(db, "job") ? fetchJobs(db) : [];
@@ -903,10 +1176,25 @@ export function computeReport(db, opts = {}) {
   const sessionAggMap = computeSessionAggregates(allSessions, inWindowTurns);
   const sessionsInWindowCount = [...sessionAggMap.values()].filter((a) => a.turnCount > 0).length;
 
+  // kusabi #235 — round-level sections are window-scoped by CHAIN (the same
+  // window key every other section uses): the rounds of in-window chains.
+  const inWindowChainIds = new Set(inWindowChains.map((c) => c.chain_id));
+  const inWindowRounds = allRounds.filter((r) => inWindowChainIds.has(r.chain_id));
+  const verdictSourceAvailable = tableHasColumn(db, "round", "verdict_source");
+  const findingsByRound = new Map();
+  for (const f of allFindings) {
+    const key = `${f.chain_id}\u0000${f.round}`;
+    if (!findingsByRound.has(key)) findingsByRound.set(key, []);
+    findingsByRound.get(key).push(f);
+  }
+
   const sessionCostByModel = computeSessionCostByModel(inWindowTurns);
   const sessionsInWindow = computeSessionsList(sessionAggMap);
   const chainJoin = computeChainJoin(inWindowChains, sessionAggMap, allSessions);
   const briefOutcome = computeBriefOutcome(inWindowChains, roundsByChain);
+  const escalateReviewAxis = computeEscalateReviewAxis(inWindowRounds, verdictSourceAvailable);
+  const dispositionSeverity = computeDispositionSeverity(inWindowRounds, findingsByRound);
+  const reviewPathology = computeReviewPathology(inWindowRounds, verdictSourceAvailable);
   const delegatedJobs = computeDelegatedJobs(inWindowJobs);
   const byBackend = computeBackendSplit(inWindowChains, inWindowJobs, roundsByChain);
   const cursorSampledOutput = computeCursorSampledOutput(db);
@@ -934,6 +1222,9 @@ export function computeReport(db, opts = {}) {
     sessionsInWindow,
     chainJoin,
     briefOutcome,
+    escalateReviewAxis,
+    dispositionSeverity,
+    reviewPathology,
     delegatedJobs,
     byBackend,
     ...(cursorSampledOutput ? { cursorSampledOutput } : {}),
@@ -1100,6 +1391,118 @@ function renderBriefOutcome(blocks) {
   return lines;
 }
 
+/**
+ * Render section A — escalate review axis (round-level).  The label states
+ * the unit explicitly: the #165 split above is chain-FINAL, these rows are
+ * per-round, and the two must not be confused (a round whose review failed
+ * and a chain that ended in escalate are different denominators).
+ */
+function renderEscalateReviewAxis(section) {
+  const lines = [
+    "Escalate review axis (ROUND-level — per-round verdicts of escalated rounds, NOT the #165 chain-final split above):",
+  ];
+  if (section.escalateRounds === 0) {
+    lines.push("  (no escalated rounds in window)");
+    return lines;
+  }
+  const sourceNote = section.verdictSourceAvailable
+    ? "verdict_source recorded: review-issued / probe-issued / unknown-source split"
+    : "store predates round.verdict_source: every source is unknown (records predate the field)";
+  lines.push(
+    `  escalated rounds: ${fmtCount(section.escalateRounds)}  |  all-green escalate (probes all green): ${fmtCount(section.allGreenEscalate)}  |  ${sourceNote}`,
+  );
+  // g/r/u = probes green/red/unknown (NULL probes is its own bucket, never
+  // folded into red); r/p/u/o = source review/probe/unknown/other (NULL
+  // source its own bucket, never folded into either side; "other" = an
+  // unrecognized non-NULL source, shown verbatim below, never review
+  // output).
+  lines.push(
+    `  ${"verdict".padEnd(18)}${"rounds".padStart(8)}  ${"probes g/r/u".padStart(13)}  ${"source r/p/u/o".padStart(16)}`,
+  );
+  lines.push("  r/p/u/o = review-issued / probe-issued / unknown-source (NULL) / other-source (unrecognized value, shown verbatim below)");
+  for (const row of section.byVerdict) {
+    const g = row.probesGreen;
+    const s = row.source;
+    lines.push(
+      `  ${row.verdict.padEnd(18)}${String(row.rounds).padStart(8)}`
+      + `  ${String(g.green).padStart(4)}/${String(g.red).padStart(2)}/${String(g.unknown).padStart(5)}`
+      + `  ${String(s.review).padStart(4)}/${String(s.probe).padStart(2)}/${String(s.unknown).padStart(5)}/${String(s.other).padStart(2)}`,
+    );
+  }
+  // Unrecognized non-NULL sources surface verbatim (the ingest pass-through
+  // discipline), never as a bare count that could be mistaken for review.
+  for (const row of section.byVerdict) {
+    if (row.otherValues.length > 0) {
+      lines.push(
+        `  ${row.verdict}: other-source values verbatim: ${row.otherValues.map((v) => `"${v}"`).join(", ")}`,
+      );
+    }
+  }
+  return lines;
+}
+
+/** Render section B — disposition × severity (round-level). */
+function renderDispositionSeverity(rows) {
+  const lines = [
+    "Disposition × severity (ROUND-level — rounds and their findings per disposition;",
+    "  severity zeros are real counts: the low/medium-only complement on accept-with-followup is the signal):",
+  ];
+  if (rows.length === 0) {
+    lines.push("  (no rounds in window)");
+    return lines;
+  }
+  // Column order: the four known severities, then any verbatim unknown
+  // values (sorted), then the "(no severity)" bucket last.  Every cell gets
+  // a leading space so a 12-char column name ("(no severity)") never
+  // abuts its neighbour.
+  const seen = new Set();
+  for (const row of rows) for (const sev of Object.keys(row.severities)) seen.add(sev);
+  const extra = [...seen]
+    .filter((s) => !SEVERITY_ORDER.includes(s))
+    .sort((a, b) => (a === "(no severity)" ? 1 : b === "(no severity)" ? -1 : a.localeCompare(b)));
+  const columns = [...SEVERITY_ORDER, ...extra];
+  const cell = (text) => ` ${String(text).padStart(12)}`;
+  const header = `  ${"disposition".padEnd(22)}${"rounds".padStart(8)}${"findings".padStart(10)}`
+    + columns.map((c) => cell(c)).join("");
+  lines.push(header);
+  for (const row of rows) {
+    lines.push(
+      `  ${row.disposition.padEnd(22)}${String(row.rounds).padStart(8)}${String(row.findings).padStart(10)}`
+      + columns.map((c) => cell(row.severities[c] ?? 0)).join(""),
+    );
+  }
+  return lines;
+}
+
+/** Render section C — review-output pathology rate (round-level, one number,
+ * denominator stated). */
+function renderReviewPathology(section) {
+  const caveat = section.verdictSourceAvailable
+    ? "probe-issued verdicts (P3 empty-change-set discards, review never dispatched) are excluded from both sides"
+    : "store predates round.verdict_source: probe-issued and review-issued verdicts are indistinguishable, so every verdict round is the denominator";
+  const lines = [
+    "Review-output pathology rate (ROUND-level — verdicts that are not usable judgements: unparseable, partial):",
+  ];
+  if (section.denominator === 0) {
+    lines.push("  (no review-issued or unknown-source verdict rounds in window)");
+    return lines;
+  }
+  const probeLine = section.probeIssued > 0
+    ? `probe-issued verdicts excluded: ${fmtCount(section.probeIssued)} (discard written by the P3 empty-change-set path — not review output)`
+    : `probe-issued verdicts excluded: ${fmtCount(section.probeIssued)}`;
+  const otherLine = section.otherIssued > 0
+    ? `unrecognized verdict_source values excluded: ${fmtCount(section.otherIssued)} (${section.otherValues.map((v) => `"${v}"`).join(", ")} — not known to be review output)`
+    : null;
+  lines.push(
+    `  ${fmtCount(section.pathologyCount)} of ${fmtCount(section.denominator)} review-issued-or-unknown-source verdict rounds (${fmtPct(section.pct)})`,
+  );
+  lines.push(`  ${probeLine}`);
+  if (otherLine) lines.push(`  ${otherLine}`);
+  lines.push(`  ${caveat}`);
+  lines.push("  Describes the distribution only — no better/worse-over-time claim.");
+  return lines;
+}
+
 function renderDelegatedJobRow(j) {
   let usageStr;
   if (j.usageState === "measured") {
@@ -1240,6 +1643,14 @@ export function renderReportText(report) {
   lines.push(...renderChainJoin(report.chainJoin, report.window.hasBound));
   lines.push("");
   lines.push(...renderBriefOutcome(report.briefOutcome));
+  // kusabi #235 — the three round-level review sections sit next to the
+  // #165 escalate split (above), with the unit labelled in every heading.
+  lines.push("");
+  lines.push(...renderEscalateReviewAxis(report.escalateReviewAxis));
+  lines.push("");
+  lines.push(...renderDispositionSeverity(report.dispositionSeverity));
+  lines.push("");
+  lines.push(...renderReviewPathology(report.reviewPathology));
   lines.push("");
   lines.push(...renderDelegatedJobs(report.delegatedJobs));
   const cursorLines = renderCursorSampledOutput(report.cursorSampledOutput);
