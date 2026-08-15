@@ -262,6 +262,11 @@ export function resolveClaudeModel({ flag, phase, config }) {
 //     (the `shiori*` glob is granted IN FULL as `mcp__shiori__*` — the
 //     round-2 3-tool expansion was a narrowing and is replaced by the glob,
 //     which is valid in claude permission rules, I4).
+//   - kaiba (all three agents, kusabi #279): the `kaiba` server's two tools
+//     (`remember`/`recall`) — the shared conclusion store.  Granted
+//     directly, they mirror no opencode table; the server only enters the
+//     generated config when the host config carries `mcpServers.kaiba`, so
+//     the entries are inert on a machine that has not configured it.
 // Passed to `claude -p` via --allowedTools.  NEVER
 // --dangerously-skip-permissions.
 const IMPLEMENT_ALLOWED_TOOLS = [
@@ -286,6 +291,12 @@ const IMPLEMENT_ALLOWED_TOOLS = [
   "mcp__sunaba__verify_in_container",
   "mcp__sunaba__lint_in_container",
   "mcp__sunaba__type_check_in_container",
+  // kaiba (kusabi #279): the shared conclusion store, reachable from every
+  // worker phase.  The two tool definitions ride in every turn's context
+  // regardless — --allowedTools is a runtime guard, not a context filter —
+  // and that cost (two definitions per turn) is accepted deliberately.
+  "mcp__kaiba__remember",
+  "mcp__kaiba__recall",
   "Skill", // mirrors `skill: kusabi-*: allow` in kusabi-implement.md
 ];
 
@@ -301,6 +312,10 @@ const REVIEW_ALLOWED_TOOLS = [
   "mcp__sunaba__lint_in_container",
   "mcp__sunaba__type_check_in_container",
   "mcp__sunaba__sandbox_exec",
+  // kaiba (kusabi #279): the shared conclusion store — the same two tools
+  // as implement; INVESTIGATE inherits them via the spread below.
+  "mcp__kaiba__remember",
+  "mcp__kaiba__recall",
 ];
 
 // kusabi-investigate.md grants issue write: the standalone investigate
@@ -526,12 +541,13 @@ export function readAgentSystemPrompt(agent) {
 }
 
 // =========================================================================
-// MCP config — sunaba entry extracted from the host claude config
+// MCP config — sunaba + kaiba entries extracted from the host claude config
 // =========================================================================
 
 /**
- * Path of the source claude config the sunaba MCP entry is extracted from.
- * Overridable via KUSABI_CLAUDE_MCP_SOURCE (tests point it at a fixture).
+ * Path of the source claude config the sunaba and kaiba MCP entries are
+ * extracted from.  Overridable via KUSABI_CLAUDE_MCP_SOURCE (tests point it
+ * at a fixture).
  *
  * @returns {string}
  */
@@ -540,14 +556,15 @@ export function claudeMcpSourcePath() {
 }
 
 /**
- * Extract the `mcpServers.sunaba` entry from a claude config file.
+ * Read and parse the source claude config.  Shared by the sunaba and kaiba
+ * extractors so both report the same unreadable/unparseable errors, naming
+ * the source path and the env override.
  *
  * @param {string} sourcePath
- * @returns {object} The sunaba server entry.
- * @throws {Error} When the file is unreadable/unparseable or the entry is
- *         missing — the error names the source path and the env override.
+ * @returns {object} The parsed config.
+ * @throws {Error} When the file is unreadable or not valid JSON.
  */
-export function extractSunabaMcp(sourcePath) {
+function readClaudeMcpSource(sourcePath) {
   let raw;
   try {
     raw = fs.readFileSync(sourcePath, "utf8");
@@ -563,7 +580,19 @@ export function extractSunabaMcp(sourcePath) {
   } catch (err) {
     throw new Error(`claude backend: MCP source config ${sourcePath} is not valid JSON: ${err.message}`);
   }
-  const sunaba = parsed?.mcpServers?.sunaba;
+  return parsed;
+}
+
+/**
+ * Extract the `mcpServers.sunaba` entry from a claude config file.
+ *
+ * @param {string} sourcePath
+ * @returns {object} The sunaba server entry.
+ * @throws {Error} When the file is unreadable/unparseable or the entry is
+ *         missing — the error names the source path and the env override.
+ */
+export function extractSunabaMcp(sourcePath) {
+  const sunaba = readClaudeMcpSource(sourcePath)?.mcpServers?.sunaba;
   if (!sunaba) {
     throw new Error(
       `claude backend: no mcpServers.sunaba entry in ${sourcePath} — ` +
@@ -572,6 +601,125 @@ export function extractSunabaMcp(sourcePath) {
     );
   }
   return sunaba;
+}
+
+/**
+ * Extract the `mcpServers.kaiba` entry from a claude config file, or null
+ * when the entry is absent.
+ *
+ * kaiba is an OPTIONAL aid (kusabi #279): a machine that has not configured
+ * it must keep dispatching exactly as it does today — no kaiba in the
+ * generated config and no error.  This is deliberately the opposite of
+ * extractSunabaMcp's throw-on-missing: without sunaba a worker cannot do
+ * its work at all; without kaiba it merely cannot reach the shared
+ * conclusion store.
+ *
+ * What is NOT an absence (all config errors, thrown the same way
+ * extractSunabaMcp's are): an unreadable or unparseable FILE (the same
+ * reader, the same messages) and — since the kusabi #279 follow-up — a
+ * present-but-malformed ENTRY.  A value that could not be a server entry
+ * (a string, a number, an array, an object with none of the
+ * server-launching fields) used to be written straight into the generated
+ * config, where it failed at MCP connect inside the claude session — an
+ * error that names neither kusabi nor this key.  Failing here instead, in
+ * pre-flight, is what makes the operator error actionable: the message
+ * names the key, says what was found, and tells the operator that removing
+ * the key restores the previous behaviour.
+ *
+ * @param {string} sourcePath
+ * @returns {object|null} The kaiba server entry, or null when absent.
+ * @throws {Error} When the file is unreadable/unparseable (same errors as
+ *         extractSunabaMcp) or the entry is present but cannot be a server
+ *         entry.
+ */
+export function extractKaibaMcp(sourcePath) {
+  const kaiba = readClaudeMcpSource(sourcePath)?.mcpServers?.kaiba;
+  if (kaiba === undefined) return null;
+  if (!isKaibaServerEntryShape(kaiba)) {
+    throw new Error(
+      `claude backend: mcpServers.kaiba in ${sourcePath} is ${describeKaibaEntry(kaiba)}, not a server entry — ` +
+      "a malformed kaiba entry is a config error, not an absence: remove the mcpServers.kaiba key " +
+      "from the config to restore the previous behaviour (set KUSABI_CLAUDE_MCP_SOURCE to override " +
+      "the source file)"
+    );
+  }
+  return kaiba;
+}
+
+/**
+ * The fields that declare HOW a server launches in the claude config
+ * formats kusabi writes: a stdio server starts from `command`, a remote
+ * server from `url`.  `type` declares the transport KIND, not a launcher —
+ * it only accompanies a launcher field, and an entry carrying it alone
+ * could not start a server ({"type": "stdio"} launches nothing).  Every
+ * other entry field (args, env, cwd, headers, type, ...) only accompanies
+ * one of these — an object with none of them could not start a server even
+ * if every field were well-formed, so it is malformed in the same sense as
+ * a string entry.  What the launcher fields CONTAIN is deliberately not
+ * checked (is the command on PATH, does the url answer): that is claude's
+ * call at connect time, and guessing at it here would duplicate a check
+ * kusabi cannot do correctly.
+ */
+const KAIBA_SERVER_LAUNCH_FIELDS = ["command", "url"];
+
+function isKaibaServerEntryShape(value) {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    !Array.isArray(value) &&
+    KAIBA_SERVER_LAUNCH_FIELDS.some((field) => field in value)
+  );
+}
+
+/**
+ * What a rejected kaiba entry turned out to be, for the error message: a
+ * string is "a string", a number "a number", an array "an array", null
+ * "null" — and an object that reached the rejection is always one with
+ * none of the server-launching fields.
+ *
+ * @param {*} value
+ * @returns {string}
+ */
+function describeKaibaEntry(value) {
+  if (value === null) return "null";
+  if (Array.isArray(value)) return "an array";
+  if (typeof value === "object") {
+    return `an object with none of the server-launching fields (${KAIBA_SERVER_LAUNCH_FIELDS.join(", ")})`;
+  }
+  return `a ${typeof value}`;
+}
+
+/**
+ * Force a kaiba MCP entry to file conclusions under the kusabi worker
+ * identity.
+ *
+ * The host entry is the OPERATOR's own registration — its own Claude Code
+ * session files conclusions under `KAIBA_AGENT=claude`.  A dispatched
+ * kusabi worker is not that session, and conclusions it writes must not be
+ * attributed to it: authorship exists precisely to tell those apart.  The
+ * entry a worker session receives therefore always carries
+ * `KAIBA_AGENT=worker` — the name the opencode workers already use — no
+ * matter what the source entry said.  Every other part of the entry
+ * (command, args, the remaining env such as KAIBA_WORKSPACE) passes
+ * through untouched.
+ *
+ * The source entry is never mutated — the changed env comes back on a copy
+ * (the same rule applySunabaProfile follows).  An absent entry stays
+ * absent, and a non-object entry passes through unchanged (as a pure
+ * function; the dispatch path never feeds it one — extractKaibaMcp rejects
+ * anything that could not be a server entry before this transform runs).
+ *
+ * @param {object|null|undefined} kaibaEntry
+ * @returns {object|null|undefined} The entry to write, or null/undefined
+ *         when there is none.
+ */
+export function applyWorkerKaibaIdentity(kaibaEntry) {
+  if (!kaibaEntry || typeof kaibaEntry !== "object" || Array.isArray(kaibaEntry)) return kaibaEntry;
+  const srcEnv =
+    kaibaEntry.env && typeof kaibaEntry.env === "object" && !Array.isArray(kaibaEntry.env)
+      ? kaibaEntry.env
+      : {};
+  return { ...kaibaEntry, env: { ...srcEnv, KAIBA_AGENT: "worker" } };
 }
 
 /**
@@ -605,9 +753,17 @@ export function applySunabaProfile(sunabaEntry, profile) {
 }
 
 /**
- * Write a generated MCP config containing ONLY the sunaba server entry and
- * return its path.  The generated file is what `--mcp-config` points at, so
- * the claude session never sees the host config's other servers.
+ * Write a generated MCP config containing ONLY the sunaba server entry —
+ * plus the kaiba entry when one was configured — and return its path.  The
+ * generated file is what `--mcp-config` points at, so the claude session
+ * never sees the host config's other servers.
+ *
+ * kaiba (kusabi #279) is the OPTIONAL half of the pair: a null/absent
+ * kaiba entry writes exactly the pre-kaiba config (`mcpServers` with the
+ * sunaba entry alone) — a machine that has not configured kaiba dispatches
+ * unchanged.  A present entry must already carry the worker identity
+ * (applyWorkerKaibaIdentity), because the generated config is what the
+ * worker session reads — this function writes what it is given.
  *
  * The file is per-dispatch, NOT per-cwd (kusabi #276): the caller passes the
  * owning job's directory, so each dispatch's config lives at a path only it
@@ -631,11 +787,15 @@ export function applySunabaProfile(sunabaEntry, profile) {
  *
  * @param {string} dir - the owning job's directory (jobDir(stateDir, jobId)).
  * @param {object} sunabaEntry
+ * @param {object|null} [kaibaEntry] - the worker-identity kaiba entry, or
+ *        null when the host config has no kaiba server.
  * @returns {string} Path of the generated config file.
  */
-export function writeClaudeMcpConfig(dir, sunabaEntry) {
+export function writeClaudeMcpConfig(dir, sunabaEntry, kaibaEntry = null) {
   const file = path.join(dir, "claude-mcp.json");
-  writeJson(file, { mcpServers: { sunaba: sunabaEntry } });
+  const mcpServers = { sunaba: sunabaEntry };
+  if (kaibaEntry) mcpServers.kaiba = kaibaEntry;
+  writeJson(file, { mcpServers });
   return file;
 }
 
@@ -2631,6 +2791,17 @@ export async function claudeDispatch(opts) {
     extractSunabaMcp(claudeMcpSourcePath()),
     sunabaProfileForAgent(opts.agent),
   );
+  // kaiba is OPTIONAL (kusabi #279) — deliberately the opposite of sunaba:
+  // a host config without an `mcpServers.kaiba` entry keeps dispatching
+  // exactly as it does today (no kaiba in the generated config, no error),
+  // while a present entry is rewritten so the worker files conclusions
+  // under `worker` — never the operator's own registration, whatever
+  // KAIBA_AGENT the host entry said.  The rewrite comes back on a copy; the
+  // source entry is never touched.  Absence is silent, but a present entry
+  // that could not be a server entry throws HERE, in pre-flight, before any
+  // job record exists — the same fail-loud posture as the sunaba entry
+  // (kusabi #279 follow-up).
+  const kaibaEntry = applyWorkerKaibaIdentity(extractKaibaMcp(claudeMcpSourcePath()));
   const systemPrompt = readAgentSystemPrompt(opts.agent);
   const allowedTools = applyToolDenies(allowedToolsForAgent(opts.agent), opts.tools);
   const disallowedTools = disallowedToolsForAgent(opts.agent);
@@ -2643,7 +2814,7 @@ export async function claudeDispatch(opts) {
   // deliberately the LAST pre-flight step, after every throw-capable check
   // above has passed, so a loud failure never leaves a stray config behind.
   const jobId = newJobId();
-  const mcpConfigPath = writeClaudeMcpConfig(jobDir(stateDir, jobId), sunabaEntry);
+  const mcpConfigPath = writeClaudeMcpConfig(jobDir(stateDir, jobId), sunabaEntry, kaibaEntry);
   const args = buildClaudeArgs({
     model: modelEntry,
     allowedTools,
