@@ -2078,6 +2078,83 @@ export function renderChainBanner({ chainId, tierCount, reworkTierCount, reworkK
     "\n";
 }
 
+// Re-validation probe phase (kusabi #262): a review-resumed round's accept
+// re-measures the RECORDED probe truth on the current worktree before
+// finalising.  This phase is deliberately NOT runProbePhase: that phase's P1
+// auto-resets a moved HEAD (`git reset --mixed <baseSha>`) — the right
+// fix-up for a round whose own implement moved the worktree, but a MUTATION
+// of the very state this re-run exists to measure (kusabi #262 follow-up).
+// A measurement must not change what it measures: the operator must find
+// the worktree exactly as it was, and the red P1 alone must carry the
+// verdict.  P2–P4 are the shared probes; the assembly mirrors
+// runProbePhase's so the two phases cannot drift.
+async function runRevalidationProbePhase({ baseSha, container, brief, callTool, verifyBaseline }) {
+  const probeResults = [];
+  let worktreeChanged = null;
+  try {
+    probeResults.push(await runHeadCompareProbe({ baseSha, callTool, container }));
+
+    // P2 keeps the chain-start verify baseline (kusabi #173): re-capturing
+    // it here would measure the round's own changes as the baseline.
+    probeResults.push(await runVerifyProbe({ callTool, container, baseline: verifyBaseline }));
+
+    const p3Result = await runDeliverablesProbe({
+      deliverables: parseDeliverables(brief),
+      headingPresent: hasSectionHeading(brief, "Deliverables"),
+      callTool,
+      container,
+      // null for the same reason the recorded run passes null: the resumed
+      // round's changes ARE the subject, and a baseline captured at resume
+      // time would measure them as "changed".  No baseline means P3 cannot
+      // measure worktreeChanged; the caller preserves the recorded value
+      // instead of overwriting it with null.
+      baseline: null,
+    });
+    worktreeChanged = p3Result.worktreeChanged;
+    probeResults.push(p3Result);
+
+    probeResults.push(await runSmokeProbe({
+      entries: parseSmoke(brief),
+      callTool,
+      container,
+      headingPresent: hasSectionHeading(brief, "Smoke"),
+    }));
+  } catch (probeErr) {
+    probeResults.push({ probe: "sunaba-rpc", passed: false, detail: String(probeErr) });
+  }
+  return {
+    probesGreen: probeResults.every(function (p) { return p.passed; }),
+    probeResults,
+    worktreeChanged,
+  };
+}
+
+// P1 in re-validation mode (kusabi #262 follow-up): COMPARE HEAD against the
+// recorded baseSha and report red on mismatch — never reset.  Detail strings
+// mirror the shared P1 (chain-phases runHeadCleanProbe) so the records read
+// alike; the mismatch wording names both SHAs so the operator sees exactly
+// what moved.
+async function runHeadCompareProbe({ baseSha, callTool, container }) {
+  let passed = false;
+  let detail = "";
+  if (baseSha) {
+    const gitRev = await callTool("sandbox_exec", {
+      container_id: container,
+      commands: ["git rev-parse HEAD"],
+    });
+    const headSha = (gitRev?.output ?? "").trim();
+    if (headSha !== baseSha) {
+      detail = "HEAD " + headSha + " != base " + baseSha + " (compare-only)";
+    } else {
+      passed = true;
+      detail = "HEAD matches base " + baseSha;
+    }
+  } else {
+    detail = "baseSha not recorded at chain start; cannot check HEAD";
+  }
+  return { probe: "P1: HEAD clean", passed, detail };
+}
+
 async function cmdChain(cwd, { flags, text }) {
   // ---- brief-file resolution ----
   text = readBriefFile(flags, text);
@@ -2543,9 +2620,14 @@ export async function runChainDriver({
   // place; returns { done: true, text } when the chain ended.
   async function finishRound({ round, roundRecord, previousRecord, probeCtx }) {
     const {
-      probesGreen, chainChangedPaths, chainNewlyChanged, chainStatusObserved,
+      chainChangedPaths, chainNewlyChanged, chainStatusObserved,
       chainStatusOutput, chainBaseLog, chainDeliverables, chainUntracked, chainTruncation,
     } = probeCtx;
+    // NOT const: an accept finalising on RECORDED probe truth re-measures it
+    // first (kusabi #262), and everything downstream of the disposition —
+    // the re-derivation itself, recordReworkEscalation's evidence — must see
+    // the fresh value, never the recorded one.
+    let probesGreen = probeCtx.probesGreen;
 
     // ---- phase 5: review (or skip when change set empty) ----
     // Single conduit (kusabi #100): runReviewPhase writes everything that
@@ -2600,15 +2682,75 @@ export async function runChainDriver({
     }).length;
     const budgetRound = budgetUsedBefore + (roundRecord.reworkScope !== "mechanical" ? 1 : 0);
 
-    const disposition = deriveDisposition({
-      verdict: chainVerdict || "needs-attention",
-      probesGreen,
-      round: budgetRound,
-      maxRounds,
-      repeatedAreas: chainRepeatedAreas,
-      findingSeverities,
-      strategizeEligible: !strategized,
-    });
+    // The derivation is a closure because it runs twice on the re-validation
+    // path below (kusabi #262): once on the truth this round arrived with,
+    // once on the truth re-measured for an accept.  Every input except
+    // probesGreen is identical between the two calls, so they cannot drift.
+    const deriveWith = function (green) {
+      return deriveDisposition({
+        verdict: chainVerdict || "needs-attention",
+        probesGreen: green,
+        round: budgetRound,
+        maxRounds,
+        repeatedAreas: chainRepeatedAreas,
+        findingSeverities,
+        strategizeEligible: !strategized,
+      });
+    };
+    let disposition = deriveWith(probesGreen);
+
+    // ---- lazy re-validation of RECORDED probe truth (kusabi #262) ----
+    // A review-resumed round (the #153 interrupted round, or the #248
+    // replacement review seat) carries probe truth measured BEFORE the
+    // stop/escalate.  The container worktree can have moved since then
+    // (operator hand-edits, another job, a partial restore), so an accept
+    // derived from that record would finalise on an estimate while the
+    // authoritative check is one probe run away.  Re-measure and re-derive.
+    //
+    // Only the accept family triggers it, deliberately: a rework buys a next
+    // round whose own probes re-measure everything anyway, so re-running here
+    // would pay for truth that round produces regardless.  Only an accept
+    // CONSUMES the recorded truth, so only an accept must re-measure it.
+    //
+    // At most once per round: `probesRevalidated` is the guard, so a
+    // re-derived rework/strategize cannot re-trigger it.  Non-resumed rounds
+    // never set `probesFromRecord` and are untouched — their probe truth was
+    // measured in-round, minutes ago, on this worktree.
+    if (
+      probeCtx.probesFromRecord
+      && !roundRecord.probesRevalidated
+      && (disposition.disposition === "accept" || disposition.disposition === "accept-with-followup")
+    ) {
+      const fresh = await runRevalidationProbePhase({
+        baseSha: effectiveBaseSha, container, brief, callTool,
+        verifyBaseline: effectiveVerifyBaseline,
+      });
+      // Preserve the recorded truth the way #248 preserves a dead seat: the
+      // record must keep saying "recorded green, then re-validated", never
+      // silently swap one measurement for the other.
+      roundRecord.probesRevalidated = {
+        reason: "accept finalisation after a review-resume (kusabi #262)",
+        at: new Date().toISOString(),
+        recordedDisposition: disposition,
+        probesGreen,
+        probeResults: roundRecord.probeResults ?? null,
+        worktreeChanged: roundRecord.worktreeChanged ?? null,
+      };
+      probesGreen = fresh.probesGreen;
+      roundRecord.probesGreen = fresh.probesGreen;
+      roundRecord.probeResults = fresh.probeResults;
+      // Overwrite a live record field only with an actually measured value.
+      // This run carries no worktree baseline (see runRevalidationProbePhase),
+      // so P3 cannot measure worktreeChanged — it is null.  A recorded true
+      // must stay true, not degrade to unknown (kusabi #262 follow-up).
+      if (fresh.worktreeChanged !== null && fresh.worktreeChanged !== undefined) {
+        roundRecord.worktreeChanged = fresh.worktreeChanged;
+      }
+      // Fresh green → the accept stands unchanged.  Fresh red → this is the
+      // disposition of a round with red probes, exactly as a normal round
+      // would derive it; the accept never finalises.
+      disposition = deriveWith(probesGreen);
+    }
     roundRecord.disposition = disposition;
 
     // ---- phase 7: record keeping + persistence ----
@@ -2841,6 +2983,12 @@ export async function runChainDriver({
         }
         const probeCtx = {
           probesGreen: roundRecord.probesGreen ?? false,
+          // The probe truth here is RECORDED — measured before the stop or
+          // the seat escalate, on a worktree that may have moved since.  It
+          // is good enough to buy a rework (whose own round re-measures), but
+          // an accept must re-measure before finalising on it (kusabi #262);
+          // this flag is what tells finishRound the truth is second-hand.
+          probesFromRecord: true,
           chainChangedPaths: reviewCtx.chainChangedPaths,
           chainNewlyChanged: reviewCtx.chainNewlyChanged,
           chainStatusObserved: reviewCtx.chainStatusObserved,
