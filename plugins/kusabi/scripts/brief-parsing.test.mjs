@@ -7,6 +7,9 @@ import {
   hasSectionHeading,
   parseChangedPaths,
   briefRequestsPublish,
+  findSmokeViolations,
+  SMOKE_VIOLATION_LOSSY,
+  SMOKE_VIOLATION_NO_ENTRIES,
 } from "./brief-parsing.mjs";
 
 // parseOrchestratorSignature
@@ -579,3 +582,141 @@ describe("briefRequestsPublish", () => {
   });
 });
 
+// findSmokeViolations — parse-time detection of misread smoke entries (#250)
+// ---------------------------------------------------------------------------
+// parseSmoke takes the FIRST backtick pair of a bullet as the command, so a
+// command containing a backtick is truncated into a legal-looking entry the
+// runner can never execute (kusabi #246 spent six rounds on one, P4 red every
+// round).  The loss is detectable with no I/O, before anything is dispatched.
+// The check is additive: parseSmoke's grammar is asserted unchanged alongside.
+
+describe("findSmokeViolations", () => {
+  // Verbatim from kusabi #246, chain-mst2adbf5fd5.
+  const NESTED = "- `! grep -F 'Check `/kusabi:status`' plugins/kusabi/commands/task.md …`";
+  // What parseSmoke actually reads out of it: everything up to the backtick
+  // inside the command, leaving an unclosed single quote.
+  const TRUNCATED = "! grep -F 'Check ";
+
+  it("flags the #250 nested-backtick line and reports the command as read", () => {
+    const brief = ["## Smoke", "", NESTED, ""].join("\n");
+    const violations = findSmokeViolations(brief);
+    assert.equal(violations.length, 1);
+    assert.equal(violations[0].kind, SMOKE_VIOLATION_LOSSY);
+    assert.equal(violations[0].line, NESTED);
+    assert.equal(violations[0].lineNumber, 3);
+    assert.equal(violations[0].command, TRUNCATED);
+    assert.ok(violations[0].lost.includes("/kusabi:status"), violations[0].lost);
+  });
+
+  it("the flagged line really is what parseSmoke hands on (the bug itself)", () => {
+    const brief = ["## Smoke", NESTED].join("\n");
+    assert.deepEqual(parseSmoke(brief), [{ command: TRUNCATED, expectedExit: 0 }]);
+  });
+
+  it("returns [] for a brief exercising every smoke form that parses today", () => {
+    const brief = [
+      "## Smoke",
+      "",
+      "- `node --check plugins/kusabi/scripts/brief-parsing.mjs`",
+      "* `npm run lint` exit 0",
+      "+ `grep -q needle file.txt`",
+      "1. `node --test brief-parsing.test.mjs`",
+      "2) `test -f dist/out.js` exit 1",
+      "  - `echo indented`",
+      "",
+      "```",
+      "node --test kusabi-companion.test.mjs",
+      "sh -c 'echo `date`'",
+      "```",
+      "",
+      "## Acceptance",
+      "- `not a smoke command`",
+      "",
+    ].join("\n");
+    assert.deepEqual(findSmokeViolations(brief), []);
+    // ... and the same brief still parses into exactly the entries it did
+    // before the check existed.
+    assert.deepEqual(parseSmoke(brief), [
+      { command: "node --check plugins/kusabi/scripts/brief-parsing.mjs", expectedExit: 0 },
+      { command: "npm run lint", expectedExit: 0 },
+      { command: "grep -q needle file.txt", expectedExit: 0 },
+      { command: "node --test brief-parsing.test.mjs", expectedExit: 0 },
+      { command: "test -f dist/out.js", expectedExit: 1 },
+      { command: "echo indented", expectedExit: 0 },
+      { command: "node --test kusabi-companion.test.mjs", expectedExit: 0 },
+      { command: "sh -c 'echo `date`'", expectedExit: 0 },
+    ]);
+  });
+
+  it("never flags a fenced code-block entry: the whole line is the command", () => {
+    const brief = [
+      "## Smoke",
+      "```",
+      "sh -c 'echo `date`' && grep -F 'Check `x`' file.md",
+      "```",
+    ].join("\n");
+    assert.deepEqual(findSmokeViolations(brief), []);
+    assert.deepEqual(parseSmoke(brief), [
+      { command: "sh -c 'echo `date`' && grep -F 'Check `x`' file.md", expectedExit: 0 },
+    ]);
+  });
+
+  it("flags a `## Smoke` heading that yields no entries", () => {
+    const brief = ["## Smoke", "", "Run the usual checks in the container.", ""].join("\n");
+    const violations = findSmokeViolations(brief);
+    assert.equal(violations.length, 1);
+    assert.equal(violations[0].kind, SMOKE_VIOLATION_NO_ENTRIES);
+    assert.equal(violations[0].line, null);
+    assert.equal(violations[0].command, null);
+    assert.deepEqual(parseSmoke(brief), []);
+  });
+
+  it("flags an annotated heading with no entries the same way (kusabi #167)", () => {
+    const violations = findSmokeViolations("## Smoke (run in container)\n\njust prose\n");
+    assert.equal(violations.length, 1);
+    assert.equal(violations[0].kind, SMOKE_VIOLATION_NO_ENTRIES);
+  });
+
+  it("does not flag an absent Smoke section, or a look-alike heading", () => {
+    assert.deepEqual(findSmokeViolations("## Deliverables\n- `a.mjs`\n"), []);
+    assert.deepEqual(findSmokeViolations("## Smoketest\n\nprose only\n"), []);
+    assert.deepEqual(findSmokeViolations(""), []);
+  });
+
+  it("does not flag an exit annotation, backticked or not", () => {
+    assert.deepEqual(findSmokeViolations("## Smoke\n- `npm test` exit 3\n"), []);
+    assert.deepEqual(findSmokeViolations("## Smoke\n- `npm test` `exit 3`\n"), []);
+  });
+
+  it("does not flag a backtick-less bullet next to a real command", () => {
+    const brief = ["## Smoke", "- `npm test`", "- run these in the container", ""].join("\n");
+    assert.deepEqual(findSmokeViolations(brief), []);
+  });
+
+  it("flags trailing prose in backticks: the machine read only the first span", () => {
+    const brief = "## Smoke\n- `npm test` then `npm run lint`\n";
+    const violations = findSmokeViolations(brief);
+    assert.equal(violations.length, 1);
+    assert.equal(violations[0].command, "npm test");
+    assert.equal(violations[0].lost, "then `npm run lint`");
+  });
+
+  it("reports one violation per lossy line, in brief order", () => {
+    const brief = [
+      "## Smoke",
+      "- `a && grep 'x`y' f`",
+      "- `plain command`",
+      "1. `b && grep 'p`q' g`",
+    ].join("\n");
+    const violations = findSmokeViolations(brief);
+    assert.equal(violations.length, 2);
+    assert.deepEqual(violations.map((v) => v.lineNumber), [2, 4]);
+    assert.deepEqual(violations.map((v) => v.command), ["a && grep 'x", "b && grep 'p"]);
+  });
+
+  it("never throws on non-string input", () => {
+    assert.deepEqual(findSmokeViolations(null), []);
+    assert.deepEqual(findSmokeViolations(undefined), []);
+    assert.deepEqual(findSmokeViolations(42), []);
+  });
+});
