@@ -2838,6 +2838,24 @@ describe("install-agents skills distribution", () => {
     assert.equal(entries[0][1], "deny");
     assert.deepEqual(permission.skill, { "kusabi-*": "allow" });
   });
+
+  it("kusabi-gofer still denies all first, allows run_python, and keeps the exit boundary closed (#216)", () => {
+    const file = path.resolve(import.meta.dirname, "..", "opencode-agents", "kusabi-gofer.md");
+    const permission = parsePermissionBlock(fs.readFileSync(file, "utf8"));
+    const entries = Object.entries(permission);
+    assert.equal(entries[0][0], "*");
+    assert.equal(entries[0][1], "deny");
+    assert.equal(permission.sunaba_run_python, "allow");
+    // The exit-point boundary is out of scope for #216: no write, publish or
+    // issue/PR tools may ever be granted here.
+    for (const key of Object.keys(permission)) {
+      assert.doesNotMatch(
+        key,
+        /publish|issue_write|pr_review_write|write_file|edit_file|transform_file|checkpoint_restore|sandbox_initialize/,
+        `gofer must not be granted a write/exit tool: ${key}`,
+      );
+    }
+  });
 });
 
 // ---------------------------------------------------------------------------
