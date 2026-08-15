@@ -104,9 +104,38 @@ export function deriveReworkStrategy({ reworkCount, strategized, verdict, probes
  *   escalate; combined internally with `round < maxRounds` (see strategizeAllowed) because a
  *   strategist job produced on the final round has no next round left to consume its output, so
  *   the final round never strategizes even when strategizeEligible is true.
+ * @param {boolean|string} [opts.oracleViolation] — the deterministic oracle marker (kusabi #197):
+ *   a P5 (frozen tests) or P6 (collected count) probe failed this round.  Truthy routes the round
+ *   to `escalate`; a string additionally NAMES the violation in the reason, which is what puts it
+ *   in front of the human on the escalate line.
  * @returns {{ disposition: "accept"|"accept-with-followup"|"strategize"|"rework"|"escalate", reason?: string }}
  */
-export function deriveDisposition({ verdict, probesGreen, round, maxRounds, repeatedAreas, findingSeverities, strategizeEligible }) {
+export function deriveDisposition({ verdict, probesGreen, round, maxRounds, repeatedAreas, findingSeverities, strategizeEligible, oracleViolation }) {
+  // ---- deterministic oracle violation (kusabi #197) ----
+  // A frozen-test edit or a drop in the collected test count must reach a
+  // HUMAN, never a rework round: the correct resolution may be "this deletion
+  // is legitimate, I approve it", and no worker can decide that.  So this
+  // takes precedence over every rework/strategize/accept row below —
+  // including accept-with-followup, and including an `approve` verdict with
+  // green probes, which is exactly the case the pair exists to catch.
+  //
+  // `discard` is the one row it does not preempt: that round is already
+  // heading out of the chain on the reviewer's own judgement, and its reason
+  // is the more informative one to show.  Both end in `escalate` either way,
+  // so there is no state where the chain can neither accept nor escalate
+  // (kusabi #173: a deterministic check must never dead-end a chain).
+  const oracleViolated =
+    oracleViolation === true ||
+    (typeof oracleViolation === "string" && oracleViolation.trim() !== "");
+  if (oracleViolated && verdict !== "discard") {
+    const named = typeof oracleViolation === "string" ? " — " + oracleViolation.trim() : "";
+    return {
+      disposition: "escalate",
+      reason: "deterministic oracle violation (P5 frozen tests / P6 collected count); " +
+        "a human must adjudicate, never an automatic rework" + named,
+    };
+  }
+
   // strategize only pays off if there is a next round to spend its output on —
   // on the final round the strategist job would be produced and then discarded
   // (the chain loop's post-strategize `continue` just exits the loop). Gate

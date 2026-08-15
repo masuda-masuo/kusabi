@@ -21,6 +21,11 @@ import {
   runVerifyProbe,
   captureVerifyBaseline,
   countVerifyViolations,
+  countVerifyCollected,
+  buildVerifyBaseline,
+  runFrozenProbe,
+  runCollectedProbe,
+  summariseOracleViolations,
   runDeliverablesProbe,
   runProbePhase,
   runReviewPhase,
@@ -5650,5 +5655,433 @@ describe("base ref reaches the reviewer as an instruction, not a capture", () =>
     const { commands, callTool } = recorder();
     await collectContainerBaseContext(callTool, "cid123");
     assert.deepEqual(commands, ["git log --oneline -5", "git ls-files --others --exclude-standard"]);
+  });
+});
+
+
+// P5 / P6 — the deterministic oracle probes (kusabi #197)
+// ---------------------------------------------------------------------------
+
+describe("runFrozenProbe (P5)", () => {
+  it("passes trivially when no `## Frozen Tests` section is declared", () => {
+    const result = runFrozenProbe({ frozen: [], headingPresent: false, changedPaths: ["src/a.js"] });
+    assert.equal(result.probe, "P5: frozen");
+    assert.equal(result.passed, true);
+    assert.equal(result.detail, "no Frozen Tests declared; check skipped");
+    assert.equal(result.oracleViolation, undefined);
+  });
+
+  it("fails when the heading is present but no entries parsed", () => {
+    // Same author-facing rule as P3/P4: fix the brief syntax rather than
+    // believe the check ran.
+    const result = runFrozenProbe({ frozen: [], headingPresent: true, changedPaths: [] });
+    assert.equal(result.passed, false);
+    assert.match(result.detail, /heading present but no entries parsed/);
+    // No oracle marker: nothing was violated — the declaration is unreadable,
+    // which the normal disposition table already routes (as it does a
+    // zero-entry P3/P4).
+    assert.equal(result.oracleViolation, undefined);
+  });
+
+  it("passes when the change set misses every frozen path", () => {
+    const result = runFrozenProbe({
+      frozen: ["tests/frozen.test.mjs"],
+      headingPresent: true,
+      changedPaths: ["src/a.js", "tests/scaffold.test.mjs"],
+    });
+    assert.equal(result.passed, true);
+    assert.match(result.detail, /no frozen path changed/);
+  });
+
+  it("fails and names every intersecting path when the change set touches one", () => {
+    const result = runFrozenProbe({
+      frozen: ["tests/frozen.test.mjs", "tests/other.test.mjs"],
+      headingPresent: true,
+      changedPaths: ["src/a.js", "tests/frozen.test.mjs", "tests/other.test.mjs"],
+    });
+    assert.equal(result.passed, false);
+    assert.equal(result.oracleViolation, true);
+    assert.match(result.detail, /tests\/frozen\.test\.mjs/);
+    assert.match(result.detail, /tests\/other\.test\.mjs/);
+    assert.ok(!result.detail.includes("src/a.js"), "only intersecting paths are named as violations");
+  });
+
+  it("matches a frozen entry naming a directory by path prefix", () => {
+    const result = runFrozenProbe({
+      frozen: ["tests/acceptance"],
+      headingPresent: true,
+      changedPaths: ["tests/acceptance/deep/nested.test.mjs"],
+    });
+    assert.equal(result.passed, false);
+    assert.equal(result.oracleViolation, true);
+    assert.match(result.detail, /tests\/acceptance\/deep\/nested\.test\.mjs/);
+  });
+
+  it("does not match a directory that merely shares a name prefix", () => {
+    const result = runFrozenProbe({
+      frozen: ["tests/acceptance"],
+      headingPresent: true,
+      changedPaths: ["tests/acceptance-scaffold/a.test.mjs"],
+    });
+    assert.equal(result.passed, true);
+  });
+
+  it("matches in the other direction too: a changed directory containing a frozen file", () => {
+    // `git status --porcelain` reports an untracked directory as one entry.
+    // Under-reporting here would let a frozen file hide inside it; the probe
+    // over-reports instead, and a human adjudicates.
+    const result = runFrozenProbe({
+      frozen: ["tests/acceptance/frozen.test.mjs"],
+      headingPresent: true,
+      changedPaths: ["tests/acceptance"],
+    });
+    assert.equal(result.passed, false);
+    assert.equal(result.oracleViolation, true);
+  });
+
+  it("never throws on missing/garbage inputs", () => {
+    assert.equal(runFrozenProbe({}).passed, true);
+    assert.equal(runFrozenProbe({ frozen: null, headingPresent: false, changedPaths: null }).passed, true);
+    assert.equal(runFrozenProbe({ frozen: ["a"], headingPresent: true, changedPaths: null }).passed, true);
+  });
+});
+
+describe("countVerifyCollected", () => {
+  it("reads tests.full.total from a real verify result", () => {
+    // Live sunaba output on this repo, 2026-08-15.
+    const verifyResult = {
+      gate_passed: true,
+      tests: { full: { status: "ok", duration: 25.126720453, passed: 2033, total: 2033 } },
+      lint: [], types: [],
+    };
+    assert.equal(countVerifyCollected(verifyResult), 2033);
+  });
+
+  it("reads the total of a failing run too (the count is collection, not success)", () => {
+    assert.equal(countVerifyCollected({ tests: { full: { status: "fail", passed: 0, total: 1 } } }), 1);
+  });
+
+  it("sums passed + failed when total is absent", () => {
+    assert.equal(countVerifyCollected({ tests: { full: { status: "fail", passed: 600, failed: 7 } } }), 607);
+    assert.equal(countVerifyCollected({ tests: { full: { status: "ok", passed: 12 } } }), 12);
+  });
+
+  it("returns null when the tests never ran (lint/type precondition failed)", () => {
+    assert.equal(
+      countVerifyCollected({ gate_passed: false, tests: { status: "skipped", message: "precondition gate failed; tests not run" } }),
+      null,
+    );
+  });
+
+  it("returns null rather than guessing on missing or uncountable shapes", () => {
+    assert.equal(countVerifyCollected(null), null);
+    assert.equal(countVerifyCollected(undefined), null);
+    assert.equal(countVerifyCollected({}), null);
+    assert.equal(countVerifyCollected({ tests: { full: {} } }), null);
+    assert.equal(countVerifyCollected({ tests: { full: { total: "2033" } } }), null);
+    assert.equal(countVerifyCollected({ output: "" }), null);
+  });
+});
+
+describe("buildVerifyBaseline collected count", () => {
+  it("records the collected count beside the lint/type counts", () => {
+    const baseline = buildVerifyBaseline({
+      gate_passed: true, lint: [], types: [],
+      tests: { full: { status: "ok", passed: 2033, total: 2033 } },
+    });
+    assert.equal(baseline.captured, true);
+    assert.equal(baseline.collected, 2033);
+    assert.equal(baseline.lint, 0);
+    assert.equal(baseline.types, 0);
+  });
+
+  it("records collected: null when no count is derivable — never a guess", () => {
+    const baseline = buildVerifyBaseline({
+      gate_passed: false, lint: [{ rule: "x" }], types: [],
+      tests: { status: "skipped" },
+      gate_fail_reasons: ["lint (eslint): 1 violation(s)"],
+    });
+    assert.equal(baseline.collected, null);
+    assert.equal(baseline.lint, 1);
+  });
+});
+
+describe("runCollectedProbe (P6)", () => {
+  it("passes when the round ran at least as many tests as the baseline", () => {
+    const same = runCollectedProbe({ collected: 607, baselineCollected: 607 });
+    assert.equal(same.probe, "P6: collected");
+    assert.equal(same.passed, true);
+    assert.equal(same.detail, "collected 607 >= baseline 607");
+
+    const more = runCollectedProbe({ collected: 620, baselineCollected: 607 });
+    assert.equal(more.passed, true);
+    assert.equal(more.detail, "collected 620 >= baseline 607");
+  });
+
+  it("fails and names both numbers when the round ran fewer tests", () => {
+    // The kusabi #197 incident: a dependency drift made 273 of 607 tests
+    // uncollectable while verify stayed green.
+    const result = runCollectedProbe({ collected: 334, baselineCollected: 607 });
+    assert.equal(result.passed, false);
+    assert.equal(result.detail, "collected 334 < baseline 607");
+    assert.equal(result.oracleViolation, true);
+  });
+
+  it("passes with the limitation stated when the BASELINE count is unavailable", () => {
+    const result = runCollectedProbe({ collected: 607, baselineCollected: null });
+    assert.equal(result.passed, true);
+    assert.equal(
+      result.detail,
+      "collected count unavailable (baseline unavailable, round 607); P6 could not compare, so this round's test count is UNCHECKED",
+    );
+    assert.equal(result.limitation, result.detail);
+    assert.equal(result.oracleViolation, undefined);
+  });
+
+  it("passes with the limitation stated when the ROUND count is unavailable", () => {
+    const result = runCollectedProbe({ collected: null, baselineCollected: 607 });
+    assert.equal(result.passed, true);
+    assert.equal(
+      result.detail,
+      "collected count unavailable (baseline 607, round unavailable); P6 could not compare, so this round's test count is UNCHECKED",
+    );
+  });
+
+  it("passes with the limitation stated when neither side has a count", () => {
+    const result = runCollectedProbe({ collected: null, baselineCollected: undefined });
+    assert.equal(result.passed, true);
+    assert.equal(
+      result.detail,
+      "collected count unavailable (baseline unavailable, round unavailable); P6 could not compare, so this round's test count is UNCHECKED",
+    );
+  });
+});
+
+describe("summariseOracleViolations", () => {
+  it("returns false when no probe carries the marker", () => {
+    assert.equal(summariseOracleViolations([
+      { probe: "P5: frozen", passed: true, detail: "no frozen path changed; frozen: [a]" },
+      { probe: "P6: collected", passed: true, detail: "collected 10 >= baseline 10" },
+    ]), false);
+    assert.equal(summariseOracleViolations([]), false);
+    assert.equal(summariseOracleViolations(null), false);
+  });
+
+  it("names every violation so the escalate reason can carry it", () => {
+    const summary = summariseOracleViolations([
+      { probe: "P3: deliverables", passed: false, detail: "no declared deliverable touched" },
+      { probe: "P5: frozen", passed: false, detail: "frozen path(s) changed: [tests/a.test.mjs]", oracleViolation: true },
+      { probe: "P6: collected", passed: false, detail: "collected 3 < baseline 9", oracleViolation: true },
+    ]);
+    assert.match(summary, /P5: frozen: frozen path\(s\) changed: \[tests\/a\.test\.mjs\]/);
+    assert.match(summary, /P6: collected: collected 3 < baseline 9/);
+    // A non-oracle probe failure is NOT an oracle violation: it reworks.
+    assert.ok(!summary.includes("P3: deliverables"));
+  });
+});
+
+describe("runVerifyProbe collected count (P6 input)", () => {
+  function verifyCallTool(results) {
+    const calls = [];
+    const fn = async (toolName, params) => {
+      if (toolName !== "verify_in_container") return { output: "" };
+      calls.push(params);
+      return results[Math.min(calls.length - 1, results.length - 1)];
+    };
+    fn.calls = calls;
+    return fn;
+  }
+
+  it("carries the count of the green fast-path run", async () => {
+    const callTool = verifyCallTool([
+      { gate_passed: true, tests: { full: { status: "ok", passed: 2033, total: 2033 } } },
+    ]);
+    const result = await runVerifyProbe({ callTool, container: "cid" });
+    assert.equal(result.passed, true);
+    assert.equal(result.collected, 2033);
+    assert.equal(callTool.calls.length, 1);
+  });
+
+  it("carries the count of the run whose tests actually executed (tolerated re-run)", async () => {
+    // The first call's tests were SKIPPED by the lint precondition, so it
+    // measured nothing; the tolerated re-run is the one that ran tests.
+    const callTool = verifyCallTool([
+      {
+        gate_passed: false,
+        lint: [{ rule: "no-unused-vars" }], types: [],
+        tests: { status: "skipped", message: "precondition gate failed; tests not run" },
+        gate_fail_reasons: ["lint (eslint): 1 violation(s)"],
+      },
+      { gate_passed: true, lint: [], types: [], tests: { full: { status: "ok", passed: 42, total: 42 } } },
+    ]);
+    const result = await runVerifyProbe({
+      callTool, container: "cid",
+      baseline: { captured: true, gate_passed: false, lint: 1, types: 0, collected: 42, raw: {} },
+    });
+    assert.equal(result.passed, true);
+    assert.equal(result.collected, 42);
+    assert.equal(callTool.calls.length, 2, "P2's own tolerated re-run — P6 adds none");
+  });
+
+  it("carries the failing run's count (tests ran and failed)", async () => {
+    const callTool = verifyCallTool([
+      { gate_passed: false, lint: [], types: [], tests: { full: { status: "fail", passed: 40, failed: 2 } } },
+    ]);
+    const result = await runVerifyProbe({ callTool, container: "cid" });
+    assert.equal(result.passed, false);
+    assert.equal(result.collected, 42);
+  });
+
+  it("carries null when no run got as far as executing tests", async () => {
+    const callTool = verifyCallTool([
+      {
+        gate_passed: false,
+        lint: [{ rule: "x" }], types: [],
+        tests: { status: "skipped" },
+        gate_fail_reasons: ["lint (eslint): 1 violation(s)"],
+      },
+    ]);
+    const result = await runVerifyProbe({ callTool, container: "cid" });
+    assert.equal(result.passed, false, "strict without a baseline (unchanged)");
+    assert.equal(result.collected, null);
+  });
+});
+
+describe("runProbePhase — P5/P6 wiring (kusabi #197)", () => {
+  // No worktree baseline is passed, so P3's newlyChangedPaths is null and the
+  // fallback rule applies: P5 sees the full `git status --porcelain` set.
+  function oracleCallTool({ status = "", verifyResults } = {}) {
+    const results = verifyResults ?? [
+      { gate_passed: true, lint: [], types: [], tests: { full: { status: "ok", passed: 10, total: 10 } } },
+    ];
+    const verifyCalls = [];
+    const fn = async (toolName, params) => {
+      if (toolName === "verify_in_container") {
+        verifyCalls.push(params);
+        return results[Math.min(verifyCalls.length - 1, results.length - 1)];
+      }
+      if (toolName !== "sandbox_exec") return { output: "" };
+      const cmd = params.commands[0];
+      if (cmd === "git status --porcelain") return { output: status };
+      return { output: "" };
+    };
+    fn.verifyCalls = verifyCalls;
+    return fn;
+  }
+
+  const GREEN_BASELINE = { captured: true, gate_passed: true, lint: 0, types: 0, collected: 10, raw: {} };
+
+  it("appends P5 and P6 after P4, in order", async () => {
+    const callTool = oracleCallTool({ status: " M src/a.js\n" });
+    const result = await runProbePhase({
+      baseSha: "abc1234", container: "cid",
+      brief: "## Deliverables\n\n- `src/a.js`\n",
+      callTool, verifyBaseline: GREEN_BASELINE,
+    });
+    assert.deepEqual(
+      result.probeResults.map((p) => p.probe),
+      ["P1: HEAD clean", "P2: verify gate", "P3: deliverables", "P4: smoke", "P5: frozen", "P6: collected"],
+    );
+  });
+
+  it("a brief with no `## Frozen Tests` section keeps the round green and the marker false", async () => {
+    const callTool = oracleCallTool({ status: " M src/a.js\n" });
+    const result = await runProbePhase({
+      baseSha: "abc1234", container: "cid",
+      brief: "## Deliverables\n\n- `src/a.js`\n",
+      callTool, verifyBaseline: GREEN_BASELINE,
+    });
+    const p5 = result.probeResults.find((p) => p.probe === "P5: frozen");
+    assert.equal(p5.passed, true);
+    assert.equal(p5.detail, "no Frozen Tests declared; check skipped");
+    assert.equal(result.probesGreen, true);
+    assert.equal(result.oracleViolation, false);
+  });
+
+  it("a change set touching a frozen path fails P5 and raises the oracle marker naming it", async () => {
+    const callTool = oracleCallTool({ status: " M src/a.js\n M tests/frozen.test.mjs\n" });
+    const result = await runProbePhase({
+      baseSha: "abc1234", container: "cid",
+      brief: [
+        "## Deliverables",
+        "",
+        "- `src/a.js`",
+        "",
+        "## Frozen Tests (do not touch)",
+        "",
+        "- `tests/frozen.test.mjs`",
+        "",
+      ].join("\n"),
+      callTool, verifyBaseline: GREEN_BASELINE,
+    });
+    const p5 = result.probeResults.find((p) => p.probe === "P5: frozen");
+    assert.equal(p5.passed, false);
+    assert.match(p5.detail, /tests\/frozen\.test\.mjs/);
+    assert.equal(result.probesGreen, false);
+    assert.match(result.oracleViolation, /P5: frozen/);
+    assert.match(result.oracleViolation, /tests\/frozen\.test\.mjs/);
+  });
+
+  it("a round that runs fewer tests than the baseline fails P6 and raises the marker", async () => {
+    const callTool = oracleCallTool({
+      status: " M src/a.js\n",
+      verifyResults: [
+        { gate_passed: true, lint: [], types: [], tests: { full: { status: "ok", passed: 334, total: 334 } } },
+      ],
+    });
+    const result = await runProbePhase({
+      baseSha: "abc1234", container: "cid",
+      brief: "## Deliverables\n\n- `src/a.js`\n",
+      callTool,
+      verifyBaseline: { captured: true, gate_passed: true, lint: 0, types: 0, collected: 607, raw: {} },
+    });
+    const p6 = result.probeResults.find((p) => p.probe === "P6: collected");
+    assert.equal(p6.passed, false);
+    assert.equal(p6.detail, "collected 334 < baseline 607");
+    assert.equal(result.probesGreen, false);
+    assert.match(result.oracleViolation, /P6: collected: collected 334 < baseline 607/);
+  });
+
+  it("issues no second verify_in_container call for P6", async () => {
+    // P2 already ran verify this round; P6 reuses that run's result.  The call
+    // log is the assertion — a re-run would double the round's most expensive
+    // container call.
+    const callTool = oracleCallTool({ status: " M src/a.js\n" });
+    await runProbePhase({
+      baseSha: "abc1234", container: "cid",
+      brief: "## Deliverables\n\n- `src/a.js`\n",
+      callTool, verifyBaseline: GREEN_BASELINE,
+    });
+    assert.equal(callTool.verifyCalls.length, 1, "exactly one verify per round: P2's");
+  });
+
+  it("P6 passes and states the limitation when the baseline carries no count", async () => {
+    const callTool = oracleCallTool({ status: " M src/a.js\n" });
+    const result = await runProbePhase({
+      baseSha: "abc1234", container: "cid",
+      brief: "## Deliverables\n\n- `src/a.js`\n",
+      callTool,
+      // An old chain.json, recorded before the collected count existed.
+      verifyBaseline: { captured: true, gate_passed: true, lint: 0, types: 0, raw: {} },
+    });
+    const p6 = result.probeResults.find((p) => p.probe === "P6: collected");
+    assert.equal(p6.passed, true);
+    assert.match(p6.detail, /collected count unavailable \(baseline unavailable, round 10\)/);
+    assert.equal(result.probesGreen, true);
+    assert.equal(result.oracleViolation, false);
+  });
+
+  it("a `## Frozen Tests` heading with zero parsable entries fails P5 without raising the marker", async () => {
+    const callTool = oracleCallTool({ status: " M src/a.js\n" });
+    const result = await runProbePhase({
+      baseSha: "abc1234", container: "cid",
+      brief: "## Deliverables\n\n- `src/a.js`\n\n## Frozen Tests\n\nnothing parseable here\n",
+      callTool, verifyBaseline: GREEN_BASELINE,
+    });
+    const p5 = result.probeResults.find((p) => p.probe === "P5: frozen");
+    assert.equal(p5.passed, false);
+    assert.match(p5.detail, /heading present but no entries parsed/);
+    assert.equal(result.probesGreen, false);
+    assert.equal(result.oracleViolation, false, "a brief-syntax defect is not a violation of the oracle");
   });
 });

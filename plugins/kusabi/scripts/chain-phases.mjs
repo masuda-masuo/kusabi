@@ -34,6 +34,7 @@ import {
 import {
   hasSectionHeading,
   parseDeliverables,
+  parseFrozenTests,
   parseSmoke,
   parseChangedPaths,
 } from "./brief-parsing.mjs";
@@ -424,9 +425,12 @@ export async function runImplementPhase({
 }
 
 /**
- * Run deterministic probes P1–P4 via sunaba-rpc.
+ * Run deterministic probes P1–P6 via sunaba-rpc.
  *
- * Returns probe results and side data needed by the review phase.
+ * Returns probe results and side data needed by the review phase, plus
+ * `oracleViolation` — the P5/P6 marker that routes the round to `escalate`
+ * (kusabi #197).  It is `false` when no oracle probe was violated, and a
+ * string naming every violation when one was.
  */
 export async function runProbePhase({ baseSha, container, brief, callTool, worktreeBaseline, verifyBaseline }) {
   const chainDeliverables = parseDeliverables(brief);
@@ -477,6 +481,28 @@ export async function runProbePhase({ baseSha, container, brief, callTool, workt
     });
     probeResults.push(p4Result);
 
+    // ---- P5: frozen (kusabi #197) ----
+    // Reuses the round's newly-changed set exactly as computed above,
+    // fallback rule included: there is one change-collection mechanism in the
+    // chain and this is not a second one.
+    const p5Result = runFrozenProbe({
+      frozen: parseFrozenTests(brief),
+      headingPresent: hasSectionHeading(brief, "Frozen Tests"),
+      changedPaths: chainNewlyChanged,
+    });
+    probeResults.push(p5Result);
+
+    // ---- P6: collected (kusabi #197) ----
+    // Reads P2's count.  No second verify_in_container call is issued: the
+    // round already paid for that run.
+    const p6Result = runCollectedProbe({
+      collected: p2Result.collected ?? null,
+      baselineCollected: verifyBaseline?.captured === true
+        ? (verifyBaseline.collected ?? null)
+        : null,
+    });
+    probeResults.push(p6Result);
+
     probesGreen = probeResults.every(function (p) { return p.passed; });
   } catch (probeErr) {
     probeResults.push({ probe: "sunaba-rpc", passed: false, detail: String(probeErr) });
@@ -494,6 +520,10 @@ export async function runProbePhase({ baseSha, container, brief, callTool, workt
     chainUntracked: baseCtx.chainUntracked,
     chainTruncation: { ...baseCtx.chainTruncation, status: chainStatusTruncation },
     worktreeChanged,
+    // A probe-phase exception is not an oracle violation: it means the round
+    // could not be measured, which probesGreen=false already routes.  Only a
+    // P5/P6 result that actually fired sets this.
+    oracleViolation: summariseOracleViolations(probeResults),
   };
 }
 
@@ -867,7 +897,7 @@ export function shouldSkipReview({ chainStatusObserved, chainChangedPaths, chain
 }
 
 /**
- * Render the round's deterministic probe results (P1\u2013P4) into the review
+ * Render the round's deterministic probe results (P1–P6) into the review
  * prompt (kusabi #236).
  *
  * One line per probe: name, pass state, one-line detail.  The detail is
@@ -957,7 +987,7 @@ export async function runReviewPhase({
       .replaceAll("{{OUTPUT_SCHEMA}}", JSON.stringify(schemaJson))
       .replaceAll("{{REVIEW_INPUT}}", reviewInput)
       .replaceAll("{{PRIOR_FINDINGS}}", priorFindings)
-      // kusabi #236: the round's deterministic probe results (P1\u2013P4) reach
+      // kusabi #236: the round's deterministic probe results (P1–P6) reach
       // the reviewer as {{PROBE_REPORT}}, so the reviewer does not spend
       // findings re-litigating what the probes already measured.  A round
       // with no recorded probes renders the explicit absence marker, never an
@@ -1499,7 +1529,8 @@ export function renderProviderExhaustedOutcome({ chainId, round, phase, jobError
 }
 
 // =========================================================================
-// Deterministic probes — P1, P2, P3, P4
+// Deterministic probes — P1, P2, P3, P4 (P5/P6 are further down, beside
+// runDeliverablesProbe, because they consume what P2/P3 produce)
 //
 // These are also used by cmdTask so they are exported from this module and
 // re-exported from kusabi-companion.mjs for backward-compatible test imports.
@@ -1678,10 +1709,45 @@ export function countVerifyViolations(verifyResult, gate) {
 }
 
 /**
+ * Count the tests a verify result actually RAN (kusabi #197, the P6 oracle).
+ *
+ * "Verify green" means "the tests that ran passed", not "the tests still
+ * exist": a dependency drift once made 273 of 607 tests uncollectable (an
+ * import failure makes tests stop existing rather than fail) while verify
+ * stayed green.  The number below is what makes that visible.
+ *
+ * Counting authority: the STRUCTURED fields of the verify result, never a
+ * substring match on free text.  `tests.full.total` is the count of tests the
+ * full run collected (verified against live sunaba output on this repo,
+ * 2026-08-15: `{"tests": {"full": {"status": "ok", "duration": 25.1,
+ * "passed": 2033, "total": 2033}}}`).  When `total` is absent but the run
+ * reported passed/failed counts, their sum is the number that ran.  When
+ * neither is derivable the count is null — never a guess: a fabricated count
+ * would either mask a real decrease or invent one.
+ *
+ * `tests.full` is absent whenever the tests did not run at all (the lint/type
+ * precondition failed, `tests.status === "skipped"`), which is null for the
+ * same reason: no tests ran, so no count was measured.
+ *
+ * @param {object|null} verifyResult  — a verify_in_container result.
+ * @returns {number|null} Tests collected by the full run, or null when not countable.
+ */
+export function countVerifyCollected(verifyResult) {
+  const full = verifyResult?.tests?.full;
+  if (!full || typeof full !== "object") return null;
+  if (Number.isInteger(full.total)) return full.total;
+  const passed = Number.isInteger(full.passed) ? full.passed : null;
+  const failed = Number.isInteger(full.failed) ? full.failed : null;
+  if (passed === null && failed === null) return null;
+  return (passed ?? 0) + (failed ?? 0);
+}
+
+/**
  * Build the chain-start verify baseline record from a verify result.
  *
  * @param {object|null} verifyResult
- * @returns {{ captured: true, gate_passed: boolean, lint: number|null, types: number|null, raw: object }}
+ * @returns {{ captured: true, gate_passed: boolean, lint: number|null, types: number|null,
+ *             collected: number|null, raw: object }}
  */
 export function buildVerifyBaseline(verifyResult) {
   return {
@@ -1689,6 +1755,10 @@ export function buildVerifyBaseline(verifyResult) {
     gate_passed: verifyResult?.gate_passed === true,
     lint: countVerifyViolations(verifyResult, "lint"),
     types: countVerifyViolations(verifyResult, "types"),
+    // The count of tests the base itself runs (kusabi #197).  Recorded at
+    // chain start beside the lint/type counts and reused by every round —
+    // chain-resume included, which never re-captures on a modified worktree.
+    collected: countVerifyCollected(verifyResult),
     raw: verifyResult ?? null,
   };
 }
@@ -1710,13 +1780,38 @@ export function buildVerifyBaseline(verifyResult) {
  * @param {string}   opts.container
  * @param {object|null} [opts.baseline] — chain-start verify baseline
  *        (`captureVerifyBaseline` output), or null for strict behaviour.
- * @returns {Promise<object>} { probe, passed, detail }
+ * @returns {Promise<object>} { probe, passed, detail, collected }
+ *   `collected` is the number of tests the run that actually executed tests
+ *   collected (null when no run got that far) — P6 reads it off this result
+ *   instead of issuing a verify call of its own.
  */
 export async function runVerifyProbe({ callTool, container, baseline }) {
+  // P6 (kusabi #197) must not run verify a second time per round: P2 already
+  // ran it, so the collected-test count is stamped onto EVERY return path of
+  // the gate below by this wrapper.  `collected` follows the run whose tests
+  // actually executed — the tolerated re-run when there was one, otherwise
+  // the first call (null when the tests never ran at all).
+  const counted = { collected: null };
+  const result = await runVerifyGate(counted, { callTool, container, baseline });
+  result.collected = counted.collected;
+  return result;
+}
+
+/**
+ * The P2 gate itself.  Split out only so `runVerifyProbe` can stamp the
+ * collected count on every return path without threading it through nine
+ * return statements (a field a future branch could silently forget).
+ *
+ * @param {{collected: number|null}} counted  — out-parameter for the count.
+ * @param {object} opts  — as runVerifyProbe.
+ * @returns {Promise<object>} { probe, passed, detail }
+ */
+async function runVerifyGate(counted, { callTool, container, baseline }) {
   const verifyResult = await callTool("verify_in_container", {
     container_id: container,
     path: ".",
   });
+  counted.collected = countVerifyCollected(verifyResult);
 
   // Fast path: gate green → PASS (byte-identical to today).
   if (verifyResult?.gate_passed === true) {
@@ -1810,6 +1905,11 @@ export async function runVerifyProbe({ callTool, container, baseline }) {
     path: ".",
     ...skips,
   });
+  // This is the run whose tests actually executed, so its count is the round's
+  // collected count (kusabi #197).  The first call's tests were skipped by the
+  // precondition, so it measured nothing; `??` keeps that null rather than
+  // letting an unmeasurable re-run overwrite a count with one.
+  counted.collected = countVerifyCollected(retryResult) ?? counted.collected;
   const testsGreen = retryResult?.gate_passed === true;
   // On a failed retry, distinguish "tests ran and failed" from "still blocked
   // before tests" (an untolerated precondition gate — e.g. patch_targets — or
@@ -1885,6 +1985,161 @@ export async function runDeliverablesProbe({ deliverables, headingPresent, callT
   probeResult.statusTruncation = statusCapture.truncation;
   probeResult.worktreeChanged = worktreeChanged;
   return probeResult;
+}
+
+// =========================================================================
+// P5 / P6 — the deterministic oracle probes (kusabi #197)
+// =========================================================================
+//
+// Both are PURE: P5 reads the change set P3 already computed, P6 reads the
+// count P2 already measured.  Neither adds a container call, and neither
+// re-derives evidence another probe owns.
+//
+// A failure of either carries `oracleViolation: true`.  That marker is the
+// whole point of the pair: it routes the round to `escalate`, never to an
+// automatic rework, because the correct resolution may be "this deletion is
+// legitimate, the human approves it" — a judgement no worker can make and no
+// rework round can reach.  Escalate IS the exit (kusabi #173: a deterministic
+// check with no exit dead-ends chains).
+
+/**
+ * P5: frozen — the round's change set must not touch a declared frozen path.
+ *
+ * The frozen declaration is the brief's `## Frozen Tests` section; recognition
+ * and item syntax are exactly the Deliverables set (`parseFrozenTests`).  The
+ * change set is the one P3 already computed — the round's NEWLY changed paths
+ * with `runProbePhase`'s fallback applied, so an unmeasurable round is
+ * compared against the full changed set rather than against "nothing".
+ *
+ * Matching is prefix-based in BOTH directions, the same rule P3 uses: a frozen
+ * entry naming a directory matches every changed path inside it, and a changed
+ * path naming a directory (an untracked `dir/` in `git status --porcelain`)
+ * matches a frozen entry inside it.  The second direction over-reports rather
+ * than under-reports, which is the right bias for a detector whose failure
+ * mode is a human being asked one unnecessary question.
+ *
+ * @param {object} opts
+ * @param {string[]} opts.frozen          — declared frozen paths.
+ * @param {boolean}  opts.headingPresent  — a `## Frozen Tests` heading exists.
+ * @param {string[]} opts.changedPaths    — the round's changed paths.
+ * @returns {{ probe: string, passed: boolean, detail: string, oracleViolation?: true }}
+ */
+export function runFrozenProbe({ frozen, headingPresent, changedPaths }) {
+  const probe = "P5: frozen";
+  const frozenArr = Array.isArray(frozen) ? frozen : [];
+  const changedArr = Array.isArray(changedPaths) ? changedPaths : [];
+
+  if (frozenArr.length === 0) {
+    // Heading present but nothing parsed: the declared check would silently
+    // not run.  Same author-facing rule as P3/P4 — tell the author to fix the
+    // brief syntax rather than let them believe the oracle ran.  No
+    // `oracleViolation` marker: nothing was violated, the declaration is
+    // unreadable, and that is a brief defect the normal disposition table
+    // already routes (exactly as it routes a zero-entry P3/P4).
+    if (headingPresent) {
+      return {
+        probe,
+        passed: false,
+        detail: "## Frozen Tests heading present but no entries parsed; check brief syntax",
+      };
+    }
+    return { probe, passed: true, detail: "no Frozen Tests declared; check skipped" };
+  }
+
+  const touched = [];
+  for (const cp of changedArr) {
+    const hit = frozenArr.some(function (f) {
+      return cp === f || cp.startsWith(f + "/") || f.startsWith(cp + "/");
+    });
+    if (hit && !touched.includes(cp)) touched.push(cp);
+  }
+
+  if (touched.length === 0) {
+    return {
+      probe,
+      passed: true,
+      detail: "no frozen path changed; frozen: [" + frozenArr.join(", ") + "]",
+    };
+  }
+
+  return {
+    probe,
+    passed: false,
+    detail:
+      "frozen path(s) changed: [" + touched.join(", ") + "]; " +
+      "frozen: [" + frozenArr.join(", ") + "]",
+    oracleViolation: true,
+  };
+}
+
+/**
+ * P6: collected — the round's verify must not run fewer tests than the base.
+ *
+ * Both numbers come from `countVerifyCollected`: the baseline's from the
+ * chain-start capture recorded on `chain.json` (never re-captured, so
+ * chain-resume compares against the same base as round 1), the round's from
+ * P2's own verify run.
+ *
+ * Either side missing → PASS: an unknown is not a decrease, and failing on it
+ * would fail every chain whose verify shape we cannot count.  But the gap is
+ * stated in the detail, never left silent — a probe that says nothing reads as
+ * "checked, fine", which is the exact confusion this pair exists to remove.
+ *
+ * @param {object} opts
+ * @param {number|null} opts.collected          — tests this round ran.
+ * @param {number|null} opts.baselineCollected  — tests the chain-start base ran.
+ * @returns {{ probe: string, passed: boolean, detail: string,
+ *             limitation?: string, oracleViolation?: true }}
+ */
+export function runCollectedProbe({ collected, baselineCollected }) {
+  const probe = "P6: collected";
+  const roundOk = Number.isInteger(collected);
+  const baseOk = Number.isInteger(baselineCollected);
+
+  if (!roundOk || !baseOk) {
+    const detail =
+      "collected count unavailable (baseline " +
+      (baseOk ? String(baselineCollected) : "unavailable") +
+      ", round " + (roundOk ? String(collected) : "unavailable") +
+      "); P6 could not compare, so this round's test count is UNCHECKED";
+    return { probe, passed: true, detail, limitation: detail };
+  }
+
+  if (collected >= baselineCollected) {
+    return {
+      probe,
+      passed: true,
+      detail: "collected " + collected + " >= baseline " + baselineCollected,
+    };
+  }
+
+  return {
+    probe,
+    passed: false,
+    detail: "collected " + collected + " < baseline " + baselineCollected,
+    oracleViolation: true,
+  };
+}
+
+/**
+ * Summarise the round's oracle violations into the single input
+ * `deriveDisposition` routes on.
+ *
+ * One function owns the question "did an oracle probe fail this round?", and
+ * it answers from the probe results themselves — no second list of probe
+ * names to keep in step with the first.
+ *
+ * @param {Array<object>|null|undefined} probeResults
+ * @returns {string|false} A human-readable summary naming every violation
+ *   (so the escalate line names it), or false when there is none.
+ */
+export function summariseOracleViolations(probeResults) {
+  const violated = (Array.isArray(probeResults) ? probeResults : [])
+    .filter(function (p) { return p && p.oracleViolation === true; });
+  if (violated.length === 0) return false;
+  return violated.map(function (p) {
+    return (p.probe || "(unnamed probe)") + ": " + (p.detail || "(no detail)");
+  }).join("; ");
 }
 
 // =========================================================================
@@ -2139,11 +2394,17 @@ const REVIEW_SEAT_FAILURE_REASONS = {
   unparseable: "unexpected verdict: unparseable",
 };
 
-// The deterministic probes a replacement seat requires green.  runProbePhase
-// always records all four (P1 HEAD clean / P2 verify gate / P3 deliverables /
-// P4 smoke) on a run that got far enough to be green; a shorter list means the
-// probe phase threw partway, so the record cannot testify that the work is
-// intact.
+// The deterministic probes a replacement seat requires a record to COVER.
+// runProbePhase always records at least these four (P1 HEAD clean / P2 verify
+// gate / P3 deliverables / P4 smoke) on a run that got far enough to be green;
+// a shorter list means the probe phase threw partway, so the record cannot
+// testify that the work is intact.
+//
+// P5/P6 (kusabi #197) are deliberately NOT added here: this is a coverage
+// floor, and records written before those probes existed must stay resumable.
+// It costs nothing in strictness — the all-green check below runs over EVERY
+// entry the record holds, so a red P5 disqualifies a seat replacement whether
+// or not P5 is named in this list.
 const REVIEW_SEAT_PROBES = ["P1", "P2", "P3", "P4"];
 
 /** Not a seat failure at all — the caller keeps its existing refusal verbatim. */

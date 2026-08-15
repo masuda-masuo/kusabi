@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import {
   parseOrchestratorSignature,
   parseDeliverables,
+  parseFrozenTests,
   parseSmoke,
   hasSectionHeading,
   parseChangedPaths,
@@ -718,5 +719,91 @@ describe("findSmokeViolations", () => {
     assert.deepEqual(findSmokeViolations(null), []);
     assert.deepEqual(findSmokeViolations(undefined), []);
     assert.deepEqual(findSmokeViolations(42), []);
+  });
+});
+
+
+// parseFrozenTests — the P5 oracle's declaration (kusabi #197)
+// ---------------------------------------------------------------------------
+//
+// Frozen Tests reuses the shared section walker and the Deliverables path
+// extraction verbatim, so these tests assert that the reuse actually holds:
+// same accepted item syntaxes, same heading rule, same path cleanup.
+
+describe("parseFrozenTests", () => {
+  it("parses backtick-quoted paths from unordered bullets", () => {
+    const brief = [
+      "## Frozen Tests",
+      "",
+      "- `plugins/kusabi/scripts/chain-phases.test.mjs`",
+      "- `plugins/kusabi/scripts/disposition.test.mjs`",
+    ].join("\n");
+    assert.deepEqual(parseFrozenTests(brief), [
+      "plugins/kusabi/scripts/chain-phases.test.mjs",
+      "plugins/kusabi/scripts/disposition.test.mjs",
+    ]);
+  });
+
+  it("accepts the same item syntaxes as Deliverables (ordered, bare token, code block)", () => {
+    const ordered = "## Frozen Tests\n1. `tests/a.test.mjs`\n2) tests/b.test.mjs\n";
+    assert.deepEqual(parseFrozenTests(ordered), ["tests/a.test.mjs", "tests/b.test.mjs"]);
+
+    const bare = "## Frozen Tests\n\n- tests/c.test.mjs — do not touch\n";
+    assert.deepEqual(parseFrozenTests(bare), ["tests/c.test.mjs"]);
+
+    const fenced = "## Frozen Tests\n\n```\ntests/d.test.mjs\ntests/e.test.mjs\n```\n";
+    assert.deepEqual(parseFrozenTests(fenced), ["tests/d.test.mjs", "tests/e.test.mjs"]);
+  });
+
+  it("strips trailing punctuation and trailing slashes", () => {
+    const brief = "## Frozen Tests\n- `tests/unit/`,\n- `tests/e2e/`\n";
+    assert.deepEqual(parseFrozenTests(brief), ["tests/unit", "tests/e2e"]);
+  });
+
+  it("recognises an annotated heading (word-boundary prefix match, kusabi #167)", () => {
+    const brief = "## Frozen Tests (do not touch)\n\n- `tests/a.test.mjs`\n";
+    assert.deepEqual(parseFrozenTests(brief), ["tests/a.test.mjs"]);
+    assert.equal(hasSectionHeading(brief, "Frozen Tests"), true);
+  });
+
+  it("does not match a look-alike heading", () => {
+    // Word-boundary rule: the character after the section name must not be
+    // alphanumeric or underscore.
+    const brief = "## Frozen Tests2\n\n- `tests/a.test.mjs`\n";
+    assert.deepEqual(parseFrozenTests(brief), []);
+    assert.equal(hasSectionHeading(brief, "Frozen Tests"), false);
+  });
+
+  it("is case-sensitive: `## Frozen tests` is not the section", () => {
+    // The walker's case-sensitivity is shared behaviour (it is what keeps
+    // `## Deliverables` from matching `## deliverables`); Frozen Tests
+    // inherits it rather than growing a private matcher.
+    const brief = "## Frozen tests\n\n- `tests/a.test.mjs`\n";
+    assert.deepEqual(parseFrozenTests(brief), []);
+    assert.equal(hasSectionHeading(brief, "Frozen Tests"), false);
+  });
+
+  it("ends the section at the next ## heading", () => {
+    const brief = [
+      "## Frozen Tests",
+      "- `tests/a.test.mjs`",
+      "## Non-goals",
+      "- `tests/b.test.mjs`",
+    ].join("\n");
+    assert.deepEqual(parseFrozenTests(brief), ["tests/a.test.mjs"]);
+  });
+
+  it("returns [] when the section is absent, and never throws on non-string input", () => {
+    assert.deepEqual(parseFrozenTests("## Deliverables\n- `src/a.js`\n"), []);
+    assert.deepEqual(parseFrozenTests(""), []);
+    assert.deepEqual(parseFrozenTests(null), []);
+    assert.deepEqual(parseFrozenTests(undefined), []);
+    assert.deepEqual(parseFrozenTests(42), []);
+  });
+
+  it("distinguishes 'heading absent' from 'heading present, zero entries' (P5 needs both)", () => {
+    const empty = "## Frozen Tests\n\nnothing parseable here\n\n## Next\n";
+    assert.deepEqual(parseFrozenTests(empty), []);
+    assert.equal(hasSectionHeading(empty, "Frozen Tests"), true);
   });
 });

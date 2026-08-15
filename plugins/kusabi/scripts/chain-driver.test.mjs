@@ -854,9 +854,12 @@ describe("runChainDriver resume", () => {
       ["recorded before the escalate", "recorded before the escalate", "recorded before the escalate", "recorded before the escalate"],
     );
     // ...and the live probe fields are the FRESH run, not the recorded one.
+    // The re-validation set is the FULL probe set: P5/P6 are re-measured with
+    // the rest (kusabi #197 follow-up), so a violation that landed in the gap
+    // cannot reach an accept.
     assert.deepEqual(
       round1.probeResults.map((p) => p.probe),
-      ["P1: HEAD clean", "P2: verify gate", "P3: deliverables", "P4: smoke"],
+      ["P1: HEAD clean", "P2: verify gate", "P3: deliverables", "P4: smoke", "P5: frozen", "P6: collected"],
     );
     assert.ok(round1.probeResults.every((p) => p.passed));
     assert.ok(
@@ -2765,6 +2768,498 @@ describe("runChainDriver rework scheduling", () => {
       const control = readChainControl(chainDir);
       assert.equal(control.status, "completed");
       assert.equal(control.round, 4);
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+});
+
+
+// =========================================================================
+// runChainDriver — P5/P6 oracle routing (kusabi #197)
+// -------------------------------------------------------------------------
+// A frozen-test edit or a drop in the collected test count must terminate the
+// round as `escalate` with the violation named — never a rework, never an
+// accept, whatever the reviewer said.  These drive the real round loop so the
+// wiring from probe → round record → deriveDisposition is covered end to end.
+// =========================================================================
+
+describe("runChainDriver oracle routing", () => {
+  const FROZEN_BRIEF = [
+    "Implement X.",
+    "",
+    "## Deliverables",
+    "- src/foo.js",
+    "",
+    "## Frozen Tests (do not touch)",
+    "- tests/frozen.test.mjs",
+    "",
+  ].join("\n");
+
+  const PLAIN_BRIEF = "Implement X.\n\n## Deliverables\n- src/foo.js\n";
+
+  function oracleCallTool({ statusOutput, verifyResult }) {
+    return async (toolName, params) => {
+      if (toolName === "verify_in_container") return verifyResult;
+      if (toolName !== "sandbox_exec") return { output: "" };
+      const cmd = params.commands[0];
+      // captureWorktreeState: capture failure → baseline null (graceful)
+      if (cmd.startsWith("cd /workspace &&") && cmd.includes("TMPIDX=")) {
+        return { output: "ERROR_NO_INDEX\n" };
+      }
+      if (cmd === "git rev-parse HEAD") return { output: "abc123\n" };
+      if (cmd === "git status --porcelain") return { output: statusOutput };
+      if (cmd === "git log --oneline -5") return { output: "abc123 latest change\n" };
+      if (cmd === "git ls-files --others --exclude-standard") return { output: "" };
+      return { output: "" };
+    };
+  }
+
+  // The reviewer APPROVES in every case below: the oracle must override it.
+  function approvingDispatch() {
+    return async (opts) => {
+      if (opts.kind === "review") {
+        return {
+          job: {
+            id: "job-rev-1", status: "completed", modelEntry: "fake/review", modelVariant: null,
+            fallbacks: null, sessionID: "sess-rev", usage: null, error: null,
+          },
+          resultText: JSON.stringify({ verdict: "approve", findings: [], summary: "ok" }),
+        };
+      }
+      return {
+        job: {
+          id: "job-imp-1", status: "completed", modelEntry: "fake/model", modelVariant: null,
+          fallbacks: null, sessionID: "sess-imp-1", usage: null, error: null,
+        },
+        resultText: "implemented",
+      };
+    };
+  }
+
+  async function runFreshChain({ brief, statusOutput, verifyResult, verifyBaseline }) {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-oracle-"));
+    const chainDir = path.join(tmp, "chains", "chain-oracle");
+    fs.mkdirSync(chainDir, { recursive: true });
+    writeChainControl(chainDir, {
+      chainId: "chain-oracle", container: "cid-1", pid: process.pid,
+      status: "running", round: 0, startedAt: new Date().toISOString(),
+    });
+    const text = await runChainDriver({
+      cwd: tmp, stateDir: tmp, chainDir, chainId: "chain-oracle", container: "cid-1",
+      model: "fake/model", modelChain: [["fake/model"]], maxRounds: 4,
+      brief, orchestrator: null, baseSha: "abc123", worktreeBaseline: null,
+      verifyBaseline,
+      callTool: oracleCallTool({ statusOutput, verifyResult }),
+      dispatchWithFallback: approvingDispatch(),
+      keepServe: true,
+      signalReceived: () => false,
+      resume: null,
+    });
+    return { tmp, chainDir, text };
+  }
+
+  const GREEN_VERIFY = {
+    gate_passed: true, lint: [], types: [],
+    tests: { full: { status: "ok", passed: 10, total: 10 } },
+  };
+  const GREEN_BASELINE = { captured: true, gate_passed: true, lint: 0, types: 0, collected: 10, raw: {} };
+
+  it("escalates (never reworks, never accepts) when the round touched a frozen path", async () => {
+    const { tmp, chainDir, text } = await runFreshChain({
+      brief: FROZEN_BRIEF,
+      statusOutput: " M src/foo.js\n M tests/frozen.test.mjs\n",
+      verifyResult: GREEN_VERIFY,
+      verifyBaseline: GREEN_BASELINE,
+    });
+    try {
+      // The reviewer approved; the oracle overrides it and names the path.
+      assert.match(text, /escalated at round 1/);
+      assert.match(text, /oracle violation/);
+      assert.match(text, /tests\/frozen\.test\.mjs/);
+
+      const round1 = readJson(path.join(chainDir, "round-1.json"));
+      assert.equal(round1.verdict, "approve");
+      assert.equal(round1.disposition.disposition, "escalate");
+      const p5 = round1.probeResults.find((p) => p.probe === "P5: frozen");
+      assert.equal(p5.passed, false);
+      assert.match(p5.detail, /tests\/frozen\.test\.mjs/);
+      assert.match(round1.oracleViolation, /P5: frozen/);
+
+      // Terminal, and terminal as an ESCALATE — not a failed chain.
+      const control = readChainControl(chainDir);
+      assert.equal(control.status, "completed");
+      assert.equal(control.round, 1);
+      assert.equal(fs.existsSync(path.join(chainDir, "chain.json")), true);
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("escalates when the round's verify ran fewer tests than the chain-start baseline", async () => {
+    const { tmp, chainDir, text } = await runFreshChain({
+      brief: PLAIN_BRIEF,
+      statusOutput: " M src/foo.js\n",
+      verifyResult: {
+        gate_passed: true, lint: [], types: [],
+        tests: { full: { status: "ok", passed: 334, total: 334 } },
+      },
+      verifyBaseline: { captured: true, gate_passed: true, lint: 0, types: 0, collected: 607, raw: {} },
+    });
+    try {
+      assert.match(text, /escalated at round 1/);
+      assert.match(text, /collected 334 < baseline 607/);
+
+      const round1 = readJson(path.join(chainDir, "round-1.json"));
+      assert.equal(round1.verdict, "approve");
+      assert.equal(round1.disposition.disposition, "escalate");
+      const p6 = round1.probeResults.find((p) => p.probe === "P6: collected");
+      assert.equal(p6.passed, false);
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("a brief with no `## Frozen Tests` section still accepts on an approve with green probes", async () => {
+    const { tmp, chainDir, text } = await runFreshChain({
+      brief: PLAIN_BRIEF,
+      statusOutput: " M src/foo.js\n",
+      verifyResult: GREEN_VERIFY,
+      verifyBaseline: GREEN_BASELINE,
+    });
+    try {
+      assert.match(text, /accepted at round 1/);
+      const round1 = readJson(path.join(chainDir, "round-1.json"));
+      assert.equal(round1.disposition.disposition, "accept");
+      assert.equal(round1.probesGreen, true);
+      assert.equal(round1.oracleViolation, false);
+      const p5 = round1.probeResults.find((p) => p.probe === "P5: frozen");
+      assert.equal(p5.passed, true);
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+});
+
+
+// =========================================================================
+// runChainDriver — P5/P6 on the resumed-accept re-validation (kusabi #197
+// follow-up)
+// -------------------------------------------------------------------------
+// The #262 re-validation re-measures the probe truth an accept from a
+// review-resume is about to finalise on.  P5/P6 belong in that set: the
+// recorded marker only covers violations measured BEFORE the stop/escalate,
+// and the truths P5 and P6 read (the change set, the collected count) are
+// exactly the ones that move in the gap.  A frozen-path edit landed in the
+// gap is invisible to P1–P4 — HEAD unchanged, tests still green — so without
+// these the accept would finalise with `oracleViolation` still false.
+//
+// The recorded round below is ALL SIX probes green with no violation
+// recorded: the round itself measured nothing wrong.  Everything these tests
+// catch happened after it.
+// =========================================================================
+
+describe("runChainDriver resumed-accept oracle re-validation (kusabi #197 follow-up)", () => {
+  const FROZEN_BRIEF = [
+    "Implement X.",
+    "",
+    "## Deliverables",
+    "- src/foo.js",
+    "",
+    "## Frozen Tests (do not touch)",
+    "- tests/frozen.test.mjs",
+    "",
+  ].join("\n");
+
+  const PLAIN_BRIEF = "Implement X.\n\n## Deliverables\n- src/foo.js\n";
+
+  // Round 1 implemented, all six probes recorded green, then the review SEAT
+  // died mid-stream and the chain escalated on it (#248) — the record a
+  // replacement review seat resumes from.
+  function seatDeadRoundAllGreen() {
+    return {
+      round: 1,
+      reworkScope: "full",
+      // Round 1 of the original run: the implement phase stamps this on every
+      // record, and the escalate renderer reads it back per round.
+      resumeMethod: { type: "fresh_session" },
+      modelEntry: "fake/model",
+      implementJobId: "job-imp-1",
+      reviewJobId: "job-rev-1",
+      sessionID: "sess-1",
+      tierBefore: 0,
+      tierAfter: 0,
+      reworkCount: 0,
+      probesGreen: true,
+      probeResults: [
+        { probe: "P1: HEAD clean", passed: true, detail: "recorded before the escalate" },
+        { probe: "P2: verify gate", passed: true, detail: "recorded before the escalate" },
+        { probe: "P3: deliverables", passed: true, detail: "recorded before the escalate" },
+        { probe: "P4: smoke", passed: true, detail: "recorded before the escalate" },
+        { probe: "P5: frozen", passed: true, detail: "recorded before the escalate" },
+        { probe: "P6: collected", passed: true, detail: "recorded before the escalate" },
+      ],
+      // Nothing was violated as of the escalate.  The gap is the subject here.
+      oracleViolation: false,
+      worktreeChanged: true,
+      verdict: "partial",
+      reviewParseable: true,
+      reviewPartial: true,
+      reviewFindingCount: 3,
+      disposition: {
+        disposition: "escalate",
+        reason: "partial review: stream ended before the verdict line",
+      },
+    };
+  }
+
+  function makeResumableChain({ brief, verifyBaseline }) {
+    const records = [seatDeadRoundAllGreen()];
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-revalidate-oracle-"));
+    const chainDir = path.join(tmp, "chains", "chain-test");
+    fs.mkdirSync(chainDir, { recursive: true });
+    writeJson(path.join(chainDir, "chain.json"), {
+      chainId: "chain-test", container: "cid-1", model: "fake/model",
+      modelChain: [["fake/model"]], maxRounds: 4,
+      brief, orchestrator: null, records,
+      baseSha: "abc123",
+      chainTotals: computeChainTotals(records),
+      strategized: false, followupIssueDraft: null,
+      verifyBaseline,
+    });
+    writeChainControl(chainDir, {
+      chainId: "chain-test", container: "cid-1", pid: 0,
+      status: "completed", round: 1,
+      finishedAt: "2026-08-01T01:00:00.000Z",
+    });
+    return { tmp, chainDir };
+  }
+
+  // The worktree as it stands NOW, at resume time: `statusOutput` is the
+  // fresh change set, `verifyResult` the fresh verify run.  Verify calls are
+  // counted so the tests can assert P6 buys no second one — it reads the
+  // fresh P2's count, exactly as it does in a normal round.
+  function revalidationCallTool({ statusOutput, verifyResult }) {
+    const verifyCalls = [];
+    const fn = async (toolName, params) => {
+      if (toolName === "verify_in_container") {
+        verifyCalls.push(params);
+        return verifyResult;
+      }
+      if (toolName !== "sandbox_exec") return { output: "" };
+      const cmd = params.commands[0];
+      // captureWorktreeState: capture failure → baseline null (graceful)
+      if (cmd.startsWith("cd /workspace &&") && cmd.includes("TMPIDX=")) {
+        return { output: "ERROR_NO_INDEX\n" };
+      }
+      if (cmd === "git rev-parse HEAD") return { output: "abc123\n" };
+      if (cmd === "git status --porcelain") return { output: statusOutput };
+      if (cmd === "git log --oneline -5") return { output: "abc123 latest change\n" };
+      if (cmd === "git diff") return { output: "diff --git a/src/foo.js b/src/foo.js\n" };
+      if (cmd === "git ls-files --others --exclude-standard") return { output: "" };
+      return { output: "" };
+    };
+    fn.verifyCalls = verifyCalls;
+    return fn;
+  }
+
+  // The replacement review APPROVES in every case below: the freshly measured
+  // oracle must override it.
+  function approvingDispatch() {
+    return async (opts) => {
+      if (opts.kind === "review") {
+        return {
+          job: {
+            id: "job-rev-2", status: "completed", modelEntry: "fake/review", modelVariant: null,
+            fallbacks: null, sessionID: "sess-rev-2", usage: null, error: null,
+          },
+          resultText: JSON.stringify({ verdict: "approve", findings: [], summary: "ok" }),
+        };
+      }
+      return {
+        job: {
+          id: "job-imp-1", status: "completed", modelEntry: "fake/model", modelVariant: null,
+          fallbacks: null, sessionID: "sess-imp-1", usage: null, error: null,
+        },
+        resultText: "implemented",
+      };
+    };
+  }
+
+  // Mirrors cmdChainResume for the replacement-seat entry.
+  async function resumeWith({ chainDir, brief, callTool }) {
+    const resolution = resolveChainResume({
+      control: readChainControl(chainDir),
+      chainJson: readJson(path.join(chainDir, "chain.json")),
+    });
+    assert.equal(resolution.ok, true);
+    assert.equal(resolution.position.phase, "review");
+    assert.equal(resolution.position.reviewSeatReplacement, true);
+    rearmChainControl({ chainDir, round: resolution.position.round });
+    const tmp = path.dirname(path.dirname(chainDir));
+    const chainJson = readJson(path.join(chainDir, "chain.json"));
+    return runChainDriver({
+      cwd: tmp, stateDir: tmp, chainDir, chainId: "chain-test", container: "cid-1",
+      model: "fake/model", modelChain: [["fake/model"]], maxRounds: 4,
+      brief, orchestrator: null, baseSha: "abc123", worktreeBaseline: null,
+      // Reuse the recorded baseline; never re-capture (kusabi #173).
+      verifyBaseline: chainJson.verifyBaseline ?? null,
+      callTool,
+      dispatchWithFallback: approvingDispatch(),
+      keepServe: true,
+      signalReceived: () => false,
+      resume: resolution.position,
+    });
+  }
+
+  const GREEN_VERIFY_10 = {
+    gate_passed: true, lint: [], types: [],
+    tests: { full: { status: "ok", passed: 10, total: 10 } },
+  };
+  const BASELINE_10 = { captured: true, gate_passed: true, lint: 0, types: 0, collected: 10, raw: {} };
+
+  it("escalates a resumed accept whose FRESH change set touches a frozen path (P5 measured after the gap)", async () => {
+    const { tmp, chainDir } = makeResumableChain({
+      brief: FROZEN_BRIEF,
+      verifyBaseline: BASELINE_10,
+    });
+    // The gap: a frozen-test file was edited after the escalate.  HEAD never
+    // moved and the tests still pass, so P1–P4 are all green — only P5 can
+    // see this.
+    const callTool = revalidationCallTool({
+      statusOutput: " M src/foo.js\n M tests/frozen.test.mjs\n",
+      verifyResult: GREEN_VERIFY_10,
+    });
+    try {
+      const text = await resumeWith({ chainDir, brief: FROZEN_BRIEF, callTool });
+
+      // The replacement review approved; the freshly measured oracle overrides
+      // it and names the path.
+      assert.doesNotMatch(text, /accepted at round/);
+      assert.match(text, /escalated at round 1/);
+      assert.match(text, /oracle violation/);
+      assert.match(text, /tests\/frozen\.test\.mjs/);
+
+      const round1 = readJson(path.join(chainDir, "round-1.json"));
+      assert.equal(round1.verdict, "approve");
+      assert.equal(round1.disposition.disposition, "escalate");
+
+      // The round record's FRESH probe results carry the failing P5, and
+      // P1–P4 are green — the violation is the only reason for the escalate.
+      const freshP5 = round1.probeResults.find((p) => p.probe === "P5: frozen");
+      assert.equal(freshP5.passed, false);
+      assert.match(freshP5.detail, /tests\/frozen\.test\.mjs/);
+      for (const name of ["P1: HEAD clean", "P2: verify gate", "P3: deliverables", "P4: smoke"]) {
+        assert.equal(round1.probeResults.find((p) => p.probe === name).passed, true, name + " must be green");
+      }
+      assert.equal(round1.probesGreen, false);
+      // The live marker is the fresh measurement, not the recorded false.
+      assert.match(round1.oracleViolation, /P5: frozen/);
+
+      // Both truths stay on the record: recorded green with no violation,
+      // beside the fresh red.
+      assert.equal(round1.probesRevalidated.probesGreen, true);
+      assert.equal(round1.probesRevalidated.oracleViolation, false);
+      assert.equal(round1.probesRevalidated.recordedDisposition.disposition, "accept");
+      assert.deepEqual(
+        round1.probesRevalidated.probeResults.map((p) => p.detail),
+        Array(6).fill("recorded before the escalate"),
+      );
+
+      // P6 read the fresh P2's count: no second verify call was issued.
+      assert.equal(callTool.verifyCalls.length, 1);
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("escalates a resumed accept whose FRESH collected count is below the chain-start baseline (P6)", async () => {
+    const { tmp, chainDir } = makeResumableChain({
+      brief: PLAIN_BRIEF,
+      verifyBaseline: { captured: true, gate_passed: true, lint: 0, types: 0, collected: 607, raw: {} },
+    });
+    // The gap: 273 tests stopped being collectable.  The gate is still green
+    // — the tests that ran passed — so only P6 can see this.
+    const callTool = revalidationCallTool({
+      statusOutput: " M src/foo.js\n",
+      verifyResult: {
+        gate_passed: true, lint: [], types: [],
+        tests: { full: { status: "ok", passed: 334, total: 334 } },
+      },
+    });
+    try {
+      const text = await resumeWith({ chainDir, brief: PLAIN_BRIEF, callTool });
+
+      assert.doesNotMatch(text, /accepted at round/);
+      assert.match(text, /escalated at round 1/);
+      assert.match(text, /oracle violation/);
+      assert.match(text, /collected 334 < baseline 607/);
+
+      const round1 = readJson(path.join(chainDir, "round-1.json"));
+      assert.equal(round1.verdict, "approve");
+      assert.equal(round1.disposition.disposition, "escalate");
+      const freshP6 = round1.probeResults.find((p) => p.probe === "P6: collected");
+      assert.equal(freshP6.passed, false);
+      assert.match(freshP6.detail, /collected 334 < baseline 607/);
+      assert.equal(round1.probeResults.find((p) => p.probe === "P2: verify gate").passed, true);
+      assert.match(round1.oracleViolation, /P6: collected/);
+      assert.equal(round1.probesRevalidated.probesGreen, true);
+      assert.equal(round1.probesRevalidated.oracleViolation, false);
+      assert.equal(round1.probesRevalidated.recordedDisposition.disposition, "accept");
+      assert.equal(callTool.verifyCalls.length, 1);
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("leaves the accept standing when the fresh P5/P6 are green — no Frozen Tests section, no derivable count", async () => {
+    // No `## Frozen Tests` heading → P5 skipped-and-green; a verify result
+    // with no `tests.full` and a baseline with no `collected` → P6 cannot
+    // compare, which is a PASS with the limitation stated.  This is the
+    // unchanged-behaviour case.
+    const { tmp, chainDir } = makeResumableChain({
+      brief: PLAIN_BRIEF,
+      verifyBaseline: { captured: true, gate_passed: true, lint: 0, types: 0, raw: {} },
+    });
+    const callTool = revalidationCallTool({
+      statusOutput: " M src/foo.js\n",
+      verifyResult: { gate_passed: true },
+    });
+    try {
+      const text = await resumeWith({ chainDir, brief: PLAIN_BRIEF, callTool });
+
+      assert.match(text, /accepted at round 1/);
+      assert.doesNotMatch(text, /oracle violation/);
+
+      const round1 = readJson(path.join(chainDir, "round-1.json"));
+      assert.equal(round1.verdict, "approve");
+      assert.equal(round1.disposition.disposition, "accept");
+      assert.equal(round1.probesGreen, true);
+      assert.equal(round1.oracleViolation, false);
+
+      // The fresh set really is all six, and the two new ones are green for
+      // the stated reasons — not silently absent.
+      assert.deepEqual(
+        round1.probeResults.map((p) => p.probe),
+        ["P1: HEAD clean", "P2: verify gate", "P3: deliverables", "P4: smoke", "P5: frozen", "P6: collected"],
+      );
+      const freshP5 = round1.probeResults.find((p) => p.probe === "P5: frozen");
+      assert.equal(freshP5.passed, true);
+      assert.match(freshP5.detail, /no Frozen Tests declared; check skipped/);
+      const freshP6 = round1.probeResults.find((p) => p.probe === "P6: collected");
+      assert.equal(freshP6.passed, true);
+      assert.match(freshP6.detail, /UNCHECKED/);
+
+      // The re-validation still fired exactly once and still preserved the
+      // recorded truth beside the fresh run.
+      assert.equal(callTool.verifyCalls.length, 1);
+      assert.equal(round1.probesRevalidated.probesGreen, true);
+      assert.equal(round1.probesRevalidated.oracleViolation, false);
+      assert.equal(round1.probesRevalidated.recordedDisposition.disposition, "accept");
+
+      const control = readChainControl(chainDir);
+      assert.equal(control.status, "completed");
+      assert.equal(control.round, 1);
     } finally {
       fs.rmSync(tmp, { recursive: true, force: true });
     }

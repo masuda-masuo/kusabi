@@ -9,7 +9,7 @@
 
 import { parseArgs, parseModel, resolveModel, reviewDenyTools, WRITE_TOOL_NAMES, validateChainEntries, splitRouteBackend, resolveChainBackend, stripBackendPrefixChain, resolveModelBackend, chainNamesBackend, backendSupportsResume } from "./cli.mjs";
 import { renderReview, renderChainShow, renderJobLine, renderHeader, extractJson } from "./render.mjs";
-import { hasSectionHeading, parseDeliverables, parseSmoke, parseOrchestratorSignature } from "./brief-parsing.mjs";
+import { hasSectionHeading, parseDeliverables, parseFrozenTests, parseSmoke, parseOrchestratorSignature } from "./brief-parsing.mjs";
 import { cmdInstallCli, diagnoseCompanionShim, formatShimSetupLine } from "./install-cli.mjs";
 // The chain driver (kusabi #264 PR 2/2).  chain-driver.mjs imports helpers
 // back from this module; see its header for why that cycle is safe and why
@@ -63,6 +63,8 @@ import {
   runHeadCleanProbe,
   runVerifyProbe,
   runDeliverablesProbe,
+  runFrozenProbe,
+  runCollectedProbe,
 } from "./chain-phases.mjs";
 
 // Re-export so external consumers (tests) that import these functions
@@ -72,6 +74,8 @@ export {
   runHeadCleanProbe,
   runVerifyProbe,
   runDeliverablesProbe,
+  runFrozenProbe,
+  runCollectedProbe,
 };
 
 /**
@@ -86,6 +90,8 @@ export function __testProbeBindings() {
     runHeadCleanProbe: typeof runHeadCleanProbe,
     runVerifyProbe: typeof runVerifyProbe,
     runDeliverablesProbe: typeof runDeliverablesProbe,
+    runFrozenProbe: typeof runFrozenProbe,
+    runCollectedProbe: typeof runCollectedProbe,
   };
 }
 
@@ -1017,6 +1023,26 @@ async function cmdTask(cwd, { flags, text }) {
         headingPresent: smokeHeadingPresent,
       });
       probeResults.push(p4Result);
+
+      // P5: frozen (kusabi #197).  The probes are shared with the chain, so a
+      // single `task --container` gets the oracle for free — on this path the
+      // change set is the full `git status --porcelain` one (no worktree
+      // baseline is captured for a standalone task).
+      const p5Result = runFrozenProbe({
+        frozen: parseFrozenTests(text),
+        headingPresent: hasSectionHeading(text, "Frozen Tests"),
+        changedPaths: p3Result.newlyChangedPaths ?? p3Result.changedPaths,
+      });
+      probeResults.push(p5Result);
+
+      // P6: collected (kusabi #197).  A standalone task has no chain-start
+      // verify baseline, so there is nothing to compare against; the probe
+      // passes and says so rather than staying silent.
+      const p6Result = runCollectedProbe({
+        collected: p2Result.collected ?? null,
+        baselineCollected: null,
+      });
+      probeResults.push(p6Result);
 
       job.probeResults = probeResults;
       job.probesGreen = probeResults.every(function (p) { return p.passed; });

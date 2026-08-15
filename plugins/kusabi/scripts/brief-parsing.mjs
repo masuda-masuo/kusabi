@@ -124,25 +124,27 @@ export function hasSectionHeading(briefText, headingName) {
 }
 
 // ---------------------------------------------------------------------------
-// parseDeliverables — pure function parsing ## Deliverables section from a
-// brief text.
+// parsePathSection — shared path-item extractor behind parseDeliverables and
+// parseFrozenTests.
 // ---------------------------------------------------------------------------
 
 /**
- * Parse an optional `## Deliverables` section from a brief text.
+ * Parse a `## ` section whose items are repo-relative paths.
  *
- * Uses the shared section walker (parseSectionItems).  From each item,
- * extract the file path: the first backtick-quoted token if present, else
- * the first whitespace-delimited token.  Strip trailing punctuation AND
- * trailing slashes (fixes #79).
+ * Uses the shared section walker (parseSectionItems), so heading recognition
+ * is identical for every path section: word-boundary prefix match,
+ * case-sensitive (kusabi #167).  From each item, extract the file path: the
+ * first backtick-quoted token if present, else the first whitespace-delimited
+ * token.  Strip trailing punctuation AND trailing slashes (fixes #79).
  *
- * @param {string|null|undefined} briefText  The full brief text.
+ * @param {string|null|undefined} briefText   The full brief text.
+ * @param {string}                headingName e.g. "Deliverables".
  * @returns {string[]}  Repo-relative path strings; [] when section absent or empty.
  *                      Never throws.
  */
-export function parseDeliverables(briefText) {
-  const { items } = parseSectionItems(briefText, "Deliverables");
-  const deliverables = [];
+function parsePathSection(briefText, headingName) {
+  const { items } = parseSectionItems(briefText, headingName);
+  const paths = [];
   for (const item of items) {
     const content = item.content;
     // First backtick-quoted token, else first whitespace-delimited token
@@ -158,9 +160,51 @@ export function parseDeliverables(briefText) {
 
     // Strip trailing punctuation, then trailing slashes (fixes #79)
     path = path.replace(/[,;.:!?]+$/, "").replace(/\/+$/, "").trim();
-    if (path) deliverables.push(path);
+    if (path) paths.push(path);
   }
-  return deliverables;
+  return paths;
+}
+
+// ---------------------------------------------------------------------------
+// parseDeliverables — pure function parsing ## Deliverables section from a
+// brief text.
+// ---------------------------------------------------------------------------
+
+/**
+ * Parse an optional `## Deliverables` section from a brief text.
+ *
+ * @param {string|null|undefined} briefText  The full brief text.
+ * @returns {string[]}  Repo-relative path strings; [] when section absent or empty.
+ *                      Never throws.
+ */
+export function parseDeliverables(briefText) {
+  return parsePathSection(briefText, "Deliverables");
+}
+
+// ---------------------------------------------------------------------------
+// parseFrozenTests — pure function parsing ## Frozen Tests section from a
+// brief text (kusabi #197, the P5 oracle).
+// ---------------------------------------------------------------------------
+
+/**
+ * Parse an optional `## Frozen Tests` section from a brief text.
+ *
+ * `Frozen Tests` is the canonical heading spelling (the investigate agent
+ * writes it, `plugins/kusabi/opencode-agents/kusabi-investigate.md`).  Item
+ * syntax and path extraction are EXACTLY the Deliverables set — both go
+ * through parsePathSection — so a brief author has one rule to learn, and
+ * the annotated heading `## Frozen Tests (do not touch)` is recognised for
+ * the same reason `## Deliverables (files that must change)` is.
+ *
+ * Each entry is a repo-relative path; an entry naming a directory is matched
+ * by prefix at the consumption point (the P5 probe), not here.
+ *
+ * @param {string|null|undefined} briefText  The full brief text.
+ * @returns {string[]}  Repo-relative path strings; [] when section absent or empty.
+ *                      Never throws.
+ */
+export function parseFrozenTests(briefText) {
+  return parsePathSection(briefText, "Frozen Tests");
 }
 
 // ---------------------------------------------------------------------------

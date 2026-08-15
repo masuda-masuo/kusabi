@@ -33,6 +33,7 @@ import { renderFollowupDraft } from "./render.mjs";
 import {
   hasSectionHeading,
   parseDeliverables,
+  parseFrozenTests,
   parseSmoke,
   briefRequestsPublish,
   findSmokeViolations,
@@ -79,6 +80,9 @@ import {
   runSmokeProbe,
   runVerifyProbe,
   runDeliverablesProbe,
+  runFrozenProbe,
+  runCollectedProbe,
+  summariseOracleViolations,
 } from "./chain-phases.mjs";
 import { captureWorktreeState } from "./worktree-baseline.mjs";
 
@@ -207,8 +211,19 @@ export function renderChainBanner({ chainId, tierCount, reworkTierCount, reworkK
 // of the very state this re-run exists to measure (kusabi #262 follow-up).
 // A measurement must not change what it measures: the operator must find
 // the worktree exactly as it was, and the red P1 alone must carry the
-// verdict.  P2–P4 are the shared probes; the assembly mirrors
+// verdict.  P2–P6 are the shared probes; the assembly mirrors
 // runProbePhase's so the two phases cannot drift.
+//
+// P5/P6 (kusabi #197) ARE re-run here (kusabi #197 follow-up).  The recorded
+// marker only covers violations measured BEFORE the stop/escalate, and this
+// phase exists precisely because the worktree can move in the gap — P5's
+// subject (the change set) and P6's subject (the collected count) are exactly
+// the truths that move.  A frozen-path edit landed in the gap is invisible to
+// P1–P4 (HEAD unchanged → P1 green, tests still pass → P2 green), so an accept
+// could finalise with no violation recorded at all.  Detection must never
+// depend on per-round attention (kusabi #197), so the fresh marker — derived
+// from the FRESH results, not the recorded one — is what finishRound re-derives
+// the disposition with.
 async function runRevalidationProbePhase({ baseSha, container, brief, callTool, verifyBaseline }) {
   const probeResults = [];
   let worktreeChanged = null;
@@ -217,7 +232,8 @@ async function runRevalidationProbePhase({ baseSha, container, brief, callTool, 
 
     // P2 keeps the chain-start verify baseline (kusabi #173): re-capturing
     // it here would measure the round's own changes as the baseline.
-    probeResults.push(await runVerifyProbe({ callTool, container, baseline: verifyBaseline }));
+    const p2Result = await runVerifyProbe({ callTool, container, baseline: verifyBaseline });
+    probeResults.push(p2Result);
 
     const p3Result = await runDeliverablesProbe({
       deliverables: parseDeliverables(brief),
@@ -240,6 +256,32 @@ async function runRevalidationProbePhase({ baseSha, container, brief, callTool, 
       container,
       headingPresent: hasSectionHeading(brief, "Smoke"),
     }));
+
+    // ---- P5: frozen (kusabi #197) ----
+    // The same probe function and the same fallback rule as the normal round
+    // (runProbePhase): the fresh change set is this run's newly-changed paths,
+    // falling back to the full changed set when the comparison could not be
+    // made.  Here that fallback is the ONLY case — P3 above runs with no
+    // worktree baseline (the resumed round's changes ARE the subject), so
+    // `newlyChangedPaths` is null and P5 is evaluated against the full set.
+    // No second collection: there is one change-collection mechanism.
+    probeResults.push(runFrozenProbe({
+      frozen: parseFrozenTests(brief),
+      headingPresent: hasSectionHeading(brief, "Frozen Tests"),
+      changedPaths: p3Result.newlyChangedPaths ?? p3Result.changedPaths,
+    }));
+
+    // ---- P6: collected (kusabi #197) ----
+    // Reads the FRESH P2's count against the chain-start baseline recorded on
+    // chain.json — never a re-captured one (kusabi #173), so the resumed round
+    // is compared against the same base as round 1.  Null-tolerant on either
+    // side, exactly as in the round: an unknown is not a decrease.
+    probeResults.push(runCollectedProbe({
+      collected: p2Result.collected ?? null,
+      baselineCollected: verifyBaseline?.captured === true
+        ? (verifyBaseline.collected ?? null)
+        : null,
+    }));
   } catch (probeErr) {
     probeResults.push({ probe: "sunaba-rpc", passed: false, detail: String(probeErr) });
   }
@@ -247,6 +289,11 @@ async function runRevalidationProbePhase({ baseSha, container, brief, callTool, 
     probesGreen: probeResults.every(function (p) { return p.passed; }),
     probeResults,
     worktreeChanged,
+    // Measured on the CURRENT worktree, so it supersedes the recorded marker
+    // in the re-derivation (kusabi #197 follow-up).  A probe-phase exception
+    // is not a violation — only a P5/P6 result that actually fired sets this,
+    // exactly as in runProbePhase.
+    oracleViolation: summariseOracleViolations(probeResults),
   };
 }
 
@@ -805,9 +852,18 @@ export async function runChainDriver({
 
     // The derivation is a closure because it runs twice on the re-validation
     // path below (kusabi #262): once on the truth this round arrived with,
-    // once on the truth re-measured for an accept.  Every input except
-    // probesGreen is identical between the two calls, so they cannot drift.
-    const deriveWith = function (green) {
+    // once on the truth re-measured for an accept.  Every input except the
+    // two the probes measure — probesGreen and the oracle marker — is
+    // identical between the two calls, so they cannot drift.
+    //
+    // The P5/P6 oracle marker (kusabi #197) is probe truth like probesGreen,
+    // so it moves with it: the recorded marker decides the first derivation,
+    // and the one re-measured on the current worktree decides the second
+    // (kusabi #197 follow-up).  A frozen-path edit or a collected-count drop
+    // that landed AFTER the stop/escalate is invisible to the recorded marker
+    // — it is exactly what the re-validation exists to catch.
+    const recordedOracleViolation = probeCtx.oracleViolation ?? false;
+    const deriveWith = function (green, oracleViolation) {
       return deriveDisposition({
         verdict: chainVerdict || "needs-attention",
         probesGreen: green,
@@ -816,9 +872,10 @@ export async function runChainDriver({
         repeatedAreas: chainRepeatedAreas,
         findingSeverities,
         strategizeEligible: !strategized,
+        oracleViolation,
       });
     };
-    let disposition = deriveWith(probesGreen);
+    let disposition = deriveWith(probesGreen, recordedOracleViolation);
 
     // ---- lazy re-validation of RECORDED probe truth (kusabi #262) ----
     // A review-resumed round (the #153 interrupted round, or the #248
@@ -856,10 +913,17 @@ export async function runChainDriver({
         probesGreen,
         probeResults: roundRecord.probeResults ?? null,
         worktreeChanged: roundRecord.worktreeChanged ?? null,
+        // The recorded P5/P6 marker is preserved for the same reason as the
+        // recorded probe results (kusabi #197 follow-up): the live field now
+        // carries the freshly measured one.
+        oracleViolation: recordedOracleViolation,
       };
       probesGreen = fresh.probesGreen;
       roundRecord.probesGreen = fresh.probesGreen;
       roundRecord.probeResults = fresh.probeResults;
+      // The live marker is the fresh measurement, so a later reader (a second
+      // review-resume of this round) reads what the current worktree said.
+      roundRecord.oracleViolation = fresh.oracleViolation;
       // Overwrite a live record field only with an actually measured value.
       // This run carries no worktree baseline (see runRevalidationProbePhase),
       // so P3 cannot measure worktreeChanged — it is null.  A recorded true
@@ -869,8 +933,10 @@ export async function runChainDriver({
       }
       // Fresh green → the accept stands unchanged.  Fresh red → this is the
       // disposition of a round with red probes, exactly as a normal round
-      // would derive it; the accept never finalises.
-      disposition = deriveWith(probesGreen);
+      // would derive it; the accept never finalises.  A fresh P5/P6 violation
+      // escalates the resumed round the same way it escalates a normal one
+      // (kusabi #197 follow-up), so the marker handed over is the fresh one.
+      disposition = deriveWith(probesGreen, fresh.oracleViolation);
     }
     roundRecord.disposition = disposition;
 
@@ -1110,6 +1176,11 @@ export async function runChainDriver({
           // an accept must re-measure before finalising on it (kusabi #262);
           // this flag is what tells finishRound the truth is second-hand.
           probesFromRecord: true,
+          // The oracle marker is recorded truth too (kusabi #197): a round
+          // that escalated on a frozen-path edit must still escalate when a
+          // replacement review seat approves it.  Old records have no field;
+          // absent reads as "no violation recorded", which is what it was.
+          oracleViolation: roundRecord.oracleViolation ?? false,
           chainChangedPaths: reviewCtx.chainChangedPaths,
           chainNewlyChanged: reviewCtx.chainNewlyChanged,
           chainStatusObserved: reviewCtx.chainStatusObserved,
@@ -1261,7 +1332,7 @@ export async function runChainDriver({
         return outcome;
       }
 
-      // ---- phase 4: deterministic probes (P1–P4) ----
+      // ---- phase 4: deterministic probes (P1–P6) ----
       const probeResult = await runProbePhase({
         baseSha: effectiveBaseSha, container, brief, callTool,
         worktreeBaseline: effectiveBaseline, verifyBaseline: effectiveVerifyBaseline,
@@ -1269,6 +1340,10 @@ export async function runChainDriver({
       roundRecord.probesGreen = probeResult.probesGreen;
       roundRecord.probeResults = probeResult.probeResults;
       roundRecord.worktreeChanged = probeResult.worktreeChanged;
+      // The P5/P6 oracle marker (kusabi #197) is persisted like any other
+      // probe truth: a review-resume of this round reads it back, so a frozen
+      // edit cannot be forgotten by the round that carried it.
+      roundRecord.oracleViolation = probeResult.oracleViolation;
 
       // ---- stop check: a stop requested during implement must not buy a
       // review job, and must not leave the container busy while the

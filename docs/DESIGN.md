@@ -89,7 +89,8 @@ When fail-fast triggers, the session is aborted immediately and the job's status
 Transplant the two-layer structure from dev-workflow-orchestrator (prototype): **"acceptance test = frozen, read-only oracle / development test = mutable scaffold"**. Does not carry over FSM etc.
 
 - The brief's `## Acceptance Criteria` is a frozen contract. Files listed under `## Frozen Tests` are off-limits to implement/respond workers
-- Add one step to the inspection/acceptance by the orchestrator procedure: before publish, mechanically verify via diff that there are no changes to the frozen test paths (if there are, revert without asking why). Then confirm satisfaction of the acceptance criteria
+- **Enforced mechanically, not by inspection** (kusabi #197, **implemented**): the chain's deterministic probes carry it. **P5 (frozen)** intersects the round's change set with the brief's `## Frozen Tests` paths; **P6 (collected)** compares the number of tests the round's verify actually ran against the chain-start baseline — "verify green" means "the tests that ran passed", not "the tests still exist" (the motivating incident: a dependency drift made 273 of 607 tests uncollectable while verify stayed green). See `docs/design/phase-chain.md` §3.5.2. Detection no longer depends on the orchestrator remembering to diff the frozen paths before publish
+- A P5/P6 failure ends the round as **escalate**, never an automatic rework: a frozen-path edit or a count decrease can be legitimate (test consolidation, moves, deliberate deletion), so the *judgement* stays the human's — only the *detection* is mechanical. The orchestrator's job is to adjudicate the named violation, not to find it
 - Source: dev-workflow-orchestrator design philosophy. The two-layer test structure (frozen oracle + mutable scaffold) reduces reliance on the honesty of the worker's verify
 
 ## 6. Failure and recovery
@@ -192,12 +193,12 @@ Reference: issue #36 comment "Decision 5: accept-with-followup (economic cutoff 
 
 | Stage | Content | Prerequisite |
 |---|---|---|
-| **B** | Brief-declaration probes: `kind: refactor` / `baseline_collected: N` format. Migration byte identity (P5) | Stage A stable operation |
+| **B** | Brief-declaration probes: `kind: refactor` format. Migration byte identity (unnumbered — P1–P6 are taken by the implemented probes) | Stage A stable operation |
 | **B** | Decision 5 (accept-with-followup) — **done**. Decision 4 (strategist stage) — **done** | Stage A |
 | **C** | Patch-target audit (future, unnumbered): mechanically classify patch/monkeypatch.setattr targets via AST. Use only for mock-target determination; exclude system-under-test tests | Stage B |
 | **D** | Connect discard path to #33 (best-of-N) | Stage C, awaiting real-world experience |
 
-The deliverables probe (P3) and the smoke probe (P4) are now implemented; see `docs/design/phase-chain.md` §3.5.2. P5 (migration byte identity) remains as future work.
+The deliverables probe (P3), the smoke probe (P4), the frozen-tests probe (P5) and the collected-count probe (P6) are now implemented; see `docs/design/phase-chain.md` §3.5.2. The `baseline_collected: N` book-keeping format this stage once envisaged is superseded: the count is captured automatically at chain start (`buildVerifyBaseline`, `collected`) and compared by P6, so no brief declares it. Migration byte identity remains as future work.
 
 Reference: issue #36 comment "Design confirmation before starting → Decision 3: stage split (1 PR = 1 stage)"
 
