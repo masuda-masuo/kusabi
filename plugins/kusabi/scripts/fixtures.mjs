@@ -63,6 +63,10 @@ export const FAKE_PAGE_LIMIT = 50;
 // subshell, with stdout+stderr redirected to a file, marker echoed after.
 export const REDIRECT_RE = /^\( [\s\S]* \) >\/tmp\/kusabi-smoke-\d+-\d+\.log 2>&1; echo SMOKE_EXIT=\$\?$/;
 
+// The SHA the fake's `git rev-parse HEAD` reports.  Exported so a test that
+// wants to model a HEAD-moving command can say which SHA HEAD moved AWAY from.
+export const FAKE_HEAD_SHA = "1f0e3dad99908345f7439f8ffabdffc4";
+
 export function createFakeCallTool({
   exitCode = 0,
   capturedOutput = "",
@@ -108,6 +112,15 @@ export function createFakeCallTool({
         output: emitted.slice(0, FAKE_PAGE_LIMIT).join("\n") + "\n",
         truncated: emitted.length > FAKE_PAGE_LIMIT,
       };
+    }
+
+    // HEAD read.  The baseline smoke's guard (kusabi #292) captures HEAD
+    // beside `git status --porcelain` before and after the run, and treats an
+    // unreadable HEAD as a failed measurement, so the fake must answer this
+    // like a working container: the same SHA both times, i.e. a smoke that
+    // left HEAD where it found it.
+    if (cmd === "git rev-parse HEAD") {
+      return { output: FAKE_HEAD_SHA + "\n" };
     }
 
     // Diagnostic read call (tail of the output file)
