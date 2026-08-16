@@ -688,6 +688,12 @@ function roundDerivedStatus(rounds) {
     return `accepted-with-followup at round ${lastRound.round} (${lastRound.disposition.reason || "economic cutoff"})`;
   } else if (lastRound?.disposition?.disposition === "escalate") {
     return `escalated at round ${lastRound.round} (${lastRound.disposition.reason || "unknown"})`;
+  } else if (lastRound?.disposition?.disposition === "refused-brief-defect") {
+    // kusabi #293.  Named as a BRIEF defect on the status line itself: the
+    // reader's first question about a chain that produced nothing is whose
+    // fault it was, and this is the one outcome where the answer is "the
+    // brief's".
+    return `refused at round ${lastRound.round} — brief defect (${lastRound.disposition.reason || "worker refused"})`;
   }
   return null;
 }
@@ -808,6 +814,30 @@ export function renderChainShow(chain, rounds, unreadable = [], control = null) 
       const disp = round.disposition.disposition || "unknown";
       const reason = round.disposition.reason ? ` (${round.disposition.reason})` : "";
       lines.push(`  disposition: ${disp}${reason}`);
+    }
+
+    // Refusal (kusabi #293): the disposition line above says a refusal
+    // happened; these lines say WHAT was refused.  The two named items and
+    // the one-line why are the whole payload the orchestrator acts on, so
+    // they are rendered verbatim and never truncated.
+    if (round.refusal && Array.isArray(round.refusal.anchors)) {
+      lines.push(`  refusal: contradicting items named by the worker`);
+      for (const anchor of round.refusal.anchors) {
+        if (!anchor || typeof anchor !== "object") continue;
+        lines.push(`    - ${anchor.text || anchor.name || "(unnamed)"} [${anchor.kind || "?"}]`);
+      }
+      lines.push(`    why: ${round.refusal.why || "(not recorded)"}`);
+    }
+    // A refusal block in a round that DID change files is not a refusal, and
+    // the routing ignored it.  Surfacing the inconsistency is the point: the
+    // worker said one thing and did another.
+    if (round.strayRefusalBlock) {
+      lines.push(`  !! stray refusal block: ${round.strayRefusalBlock.note || "refusal block present in a round that did not stop empty"}`);
+    }
+    // A refusal that was attempted and did not qualify: the round was a
+    // discard, and this says why it was not read as a refusal.
+    if (round.refusalRejected) {
+      lines.push(`  !! refusal not qualifying: ${round.refusalRejected}`);
     }
 
     // Worktree change status (baseline-aware)

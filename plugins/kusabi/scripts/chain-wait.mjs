@@ -48,7 +48,13 @@ export const TERMINAL_CHAIN_STATUSES = new Set(["completed", "cancelled", "faile
  * chain.json until the resumed round reaches its own boundary.  See the
  * terminal decision in readChainSnapshot for how that case is told apart.
  */
-export const TERMINAL_DISPOSITIONS = new Set(["accept", "accept-with-followup", "escalate", "max-rounds"]);
+export const TERMINAL_DISPOSITIONS = new Set([
+  "accept", "accept-with-followup", "escalate", "max-rounds",
+  // A qualifying refusal (kusabi #293): the worker named two contradicting
+  // brief items and stopped without editing.  Terminal like any other decided
+  // chain -- the wait reports it, and judging it stays the orchestrator's job.
+  "refused-brief-defect",
+]);
 
 export const DEFAULT_POLL_INTERVAL_MS = 2_000;
 export const DEFAULT_APPEAR_TIMEOUT_MS = 120_000;

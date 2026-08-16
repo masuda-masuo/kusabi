@@ -104,13 +104,46 @@ export function deriveReworkStrategy({ reworkCount, strategized, verdict, probes
  *   escalate; combined internally with `round < maxRounds` (see strategizeAllowed) because a
  *   strategist job produced on the final round has no next round left to consume its output, so
  *   the final round never strategizes even when strategizeEligible is true.
+ * @param {boolean|string} [opts.refusal] — a QUALIFYING refusal (kusabi #293): the round changed
+ *   nothing and its report named two contradicting items (see `classifyRefusalOutcome` in
+ *   probe-decisions.mjs).  Truthy routes the round to the terminal `refused-brief-defect`; a string
+ *   additionally NAMES the two items in the reason, which is what puts the contradiction in front
+ *   of the orchestrator.  It is checked FIRST, ahead of every other row including the oracle and
+ *   the max-rounds terminal, because a defective brief invalidates the premise those rows judge.
  * @param {boolean|string} [opts.oracleViolation] — the deterministic oracle marker (kusabi #197):
  *   a P5 (frozen tests) or P6 (collected count) probe failed this round.  Truthy routes the round
  *   to `escalate`; a string additionally NAMES the violation in the reason, which is what puts it
  *   in front of the human on the escalate line.
- * @returns {{ disposition: "accept"|"accept-with-followup"|"strategize"|"rework"|"escalate", reason?: string }}
+ * @returns {{ disposition: "accept"|"accept-with-followup"|"strategize"|"rework"|"escalate"|"refused-brief-defect", reason?: string }}
  */
-export function deriveDisposition({ verdict, probesGreen, round, maxRounds, repeatedAreas, findingSeverities, strategizeEligible, oracleViolation }) {
+export function deriveDisposition({ verdict, probesGreen, round, maxRounds, repeatedAreas, findingSeverities, strategizeEligible, oracleViolation, refusal }) {
+  // ---- qualifying refusal (kusabi #293) ----
+  // The worker read the brief, found it self-contradictory, named both items
+  // and stopped without editing.  Nothing below this line can judge that
+  // round, because every other row assumes a coherent brief: an empty change
+  // set reads as a discard, a rework would send the worker back to satisfy
+  // requirements that cannot both be satisfied, and the max-rounds terminal
+  // would spend the remaining budget on the same impossibility.  The defect
+  // is the BRIEF's, so the chain ends here and the brief's author decides.
+  // It must never auto-accept, and it never buys a rework round: finishRound
+  // computes a rework strategy only for disposition `rework`, so the rework
+  // counter is untouched by construction.
+  //
+  // Spurious refusals are the abuse case, and they are bounded on the OTHER
+  // side: the block only qualifies when it names two items a human can look
+  // up, and a refusal always lands in front of the orchestrator rather than
+  // buying the worker an early exit.
+  const refused =
+    refusal === true ||
+    (typeof refusal === "string" && refusal.trim() !== "");
+  if (refused) {
+    const named = typeof refusal === "string" ? " — " + refusal.trim() : "";
+    return {
+      disposition: "refused-brief-defect",
+      reason: "worker refused: the brief contradicts itself, no implementation satisfies both items" + named,
+    };
+  }
+
   // ---- deterministic oracle violation (kusabi #197) ----
   // A frozen-test edit or a drop in the collected test count must reach a
   // HUMAN, never a rework round: the correct resolution may be "this deletion

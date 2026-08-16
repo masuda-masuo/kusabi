@@ -32,6 +32,8 @@ import {
   runSmokeProbe,
 } from "./chain-phases.mjs";
 import { readJson, writeJson } from "./state-paths.mjs";
+import { renderChainShow } from "./render.mjs";
+import { TERMINAL_DISPOSITIONS } from "./chain-wait.mjs";
 
 // publishWarningForBrief — chain-start publish guard (kusabi #153)
 // ---------------------------------------------------------------------------
@@ -4198,6 +4200,478 @@ describe("CLI smoke baseline (kusabi #292)", () => {
       }
     } finally {
       server.close();
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+});
+
+// =========================================================================
+// runChainDriver — qualifying refusal (kusabi #293)
+// -------------------------------------------------------------------------
+// An empty change set used to mean exactly one thing: discard → escalate.
+// These drive the three cases that population now splits into, end to end
+// through the real driver, and check the two properties the mechanism is
+// worth nothing without: a refusal is TERMINAL and distinct, and it costs
+// the worker neither a rework round nor a discard on its record.
+// =========================================================================
+
+describe("runChainDriver qualifying refusal (kusabi #293)", () => {
+  const BRIEF = "Implement X.\n\n## Deliverables\n- src/foo.js\n";
+
+  // REFUSAL_REPORT anchors on "## Frozen tests" and on
+  // plugins/kusabi/scripts/chain-phases.test.mjs.  The existence gate
+  // (verifyRefusalAnchors) lets a block qualify only when each anchor names
+  // a REAL item -- a heading the brief actually has, a file the worktree
+  // actually contains -- so the qualifying tests must run against a brief
+  // that carries the heading AND a cwd that contains the file (the fixture
+  // pattern proven in the "existence gate: a block naming two REAL items"
+  // test below).
+  const GATE_BRIEF = "Implement X.\n\n## Frozen tests\n\nAll existing tests pass unchanged.\n\n## Deliverables\n- src/foo.js\n";
+
+  const REFUSAL_REPORT = [
+    "I stopped without editing: the brief cannot be satisfied.",
+    "",
+    "```kusabi-refusal",
+    "anchor: ## Frozen tests",
+    "anchor: plugins/kusabi/scripts/chain-phases.test.mjs",
+    "why: the frozen section requires every existing test to pass unchanged, while the spec requires the opposite output for the input that test pins.",
+    "```",
+    "",
+    "No files were changed.",
+  ].join("\n");
+
+  // Two anchors, neither of them a NAMED item: free prose does not qualify.
+  const PROSE_REFUSAL_REPORT = [
+    "```kusabi-refusal",
+    "anchor: the brief wants the tests untouched",
+    "anchor: and it also wants different output",
+    "why: they conflict.",
+    "```",
+  ].join("\n");
+
+  function refusalCallTool({ statusOutput }) {
+    return async (toolName, params) => {
+      if (toolName === "verify_in_container") {
+        return {
+          gate_passed: true, lint: [], types: [],
+          tests: { full: { status: "ok", passed: 10, total: 10 } },
+        };
+      }
+      if (toolName !== "sandbox_exec") return { output: "" };
+      const cmd = params.commands[0];
+      if (cmd.startsWith("cd /workspace &&") && cmd.includes("TMPIDX=")) {
+        return { output: "ERROR_NO_INDEX\n" };
+      }
+      if (cmd === "git rev-parse HEAD") return { output: "abc123\n" };
+      if (cmd === "git status --porcelain") return { output: statusOutput };
+      if (cmd === "git log --oneline -5") return { output: "abc123 latest change\n" };
+      if (cmd === "git ls-files --others --exclude-standard") return { output: "" };
+      return { output: "" };
+    };
+  }
+
+  // The reviewer APPROVES whenever it is dispatched at all: on the refusal
+  // path it must never be dispatched, and on the stray-block path the
+  // ordinary accept must survive the stray block untouched.
+  function reportingDispatch(implementReport) {
+    const dispatch = async (opts) => {
+      if (opts.kind === "review") {
+        return {
+          job: {
+            id: "job-rev-1", status: "completed", modelEntry: "fake/review", modelVariant: null,
+            fallbacks: null, sessionID: "sess-rev", usage: null, error: null,
+          },
+          resultText: JSON.stringify({ verdict: "approve", findings: [], summary: "ok" }),
+        };
+      }
+      return {
+        job: {
+          id: "job-imp-" + (opts.round ?? 1), status: "completed", modelEntry: "fake/model",
+          modelVariant: null, fallbacks: null, sessionID: "sess-imp-1", usage: null, error: null,
+        },
+        resultText: implementReport,
+      };
+    };
+    const calls = [];
+    const wrapped = async (opts) => { calls.push(opts); return dispatch(opts); };
+    wrapped.calls = calls;
+    return wrapped;
+  }
+
+  async function runFreshChain({ statusOutput, implementReport, gate = false }) {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-refusal-"));
+    const chainDir = path.join(tmp, "chains", "chain-refusal");
+    fs.mkdirSync(chainDir, { recursive: true });
+    if (gate) {
+      // The existence gate verifies REFUSAL_REPORT's repo-path anchor
+      // against the worktree at cwd, so the anchor file must really exist
+      // there; the brief is GATE_BRIEF, which really has the heading.
+      fs.mkdirSync(path.join(tmp, "plugins", "kusabi", "scripts"), { recursive: true });
+      fs.writeFileSync(path.join(tmp, "plugins", "kusabi", "scripts", "chain-phases.test.mjs"), "// fixture\n");
+    }
+    writeChainControl(chainDir, {
+      chainId: "chain-refusal", container: "cid-1", pid: process.pid,
+      status: "running", round: 0, startedAt: new Date().toISOString(),
+    });
+    const dispatch = reportingDispatch(implementReport);
+    const text = await runChainDriver({
+      cwd: tmp, stateDir: tmp, chainDir, chainId: "chain-refusal", container: "cid-1",
+      model: "fake/model", modelChain: [["fake/model"], ["fake/pro"]], maxRounds: 4,
+      brief: gate ? GATE_BRIEF : BRIEF, orchestrator: null, baseSha: "abc123", worktreeBaseline: null,
+      verifyBaseline: { captured: true, gate_passed: true, lint: 0, types: 0, collected: 10, raw: {} },
+      callTool: refusalCallTool({ statusOutput }),
+      dispatchWithFallback: dispatch,
+      keepServe: true,
+      signalReceived: () => false,
+      resume: null,
+    });
+    return { tmp, chainDir, text, dispatch };
+  }
+
+  it("empty change set + qualifying block: terminal refused-brief-defect, attributed as a refusal", async () => {
+    // gate: the block's anchors must be REAL items, so run against the brief
+    // carrying the "## Frozen tests" heading and a cwd containing the anchor
+    // file (the fixture pattern of the "existence gate: REAL items" test).
+    const { tmp, chainDir, text, dispatch } = await runFreshChain({
+      statusOutput: "",
+      implementReport: REFUSAL_REPORT,
+      gate: true,
+    });
+    try {
+      // The chain ends on the refusal, and the outcome names both items.
+      assert.match(text, /refused at round 1/);
+      assert.match(text, /## Frozen tests/);
+      assert.match(text, /plugins\/kusabi\/scripts\/chain-phases\.test\.mjs/);
+      assert.match(text, /BRIEF defect/);
+      assert.doesNotMatch(text, /accepted at round/);
+      assert.doesNotMatch(text, /escalated at round/);
+
+      // No review seat was bought: the round changed nothing to review.
+      assert.equal(dispatch.calls.some((c) => c.kind === "review"), false);
+
+      const round1 = readJson(path.join(chainDir, "round-1.json"));
+      assert.equal(round1.disposition.disposition, "refused-brief-defect");
+      // Attribution: a refusal, never a discard charged to the worker seat.
+      assert.equal(round1.roundOutcome, "refusal");
+      assert.equal(round1.verdict, "refusal");
+      assert.notEqual(round1.verdict, "discard");
+      assert.equal(round1.refusal.anchors.length, 2);
+      assert.deepEqual(round1.refusal.anchors.map((a) => a.kind), ["brief-section", "repo-path"]);
+      assert.match(round1.refusal.why, /opposite output/);
+      assert.equal(round1.strayRefusalBlock, undefined);
+
+      // The rework budget is untouched: no second round, no rework strategy.
+      assert.equal(round1.reworkCount, 0);
+      assert.equal(round1.pendingReworkStrategy, null);
+      assert.equal(fs.existsSync(path.join(chainDir, "round-2.json")), false);
+      assert.equal(readJson(path.join(chainDir, "chain.json")).records.length, 1);
+
+      // Terminal for chain-wait, both by control status and by disposition.
+      const control = readChainControl(chainDir);
+      assert.equal(control.status, "completed");
+      assert.equal(control.round, 1);
+      assert.equal(TERMINAL_DISPOSITIONS.has("refused-brief-defect"), true);
+
+      // chain-show renders the disposition line plus the two named items.
+      const shown = renderChainShow(
+        readJson(path.join(chainDir, "chain.json")),
+        [round1],
+        [],
+        control,
+      );
+      assert.match(shown, /status: refused at round 1 — brief defect/);
+      assert.match(shown, /disposition: refused-brief-defect/);
+      assert.match(shown, /refusal: contradicting items named by the worker/);
+      assert.match(shown, /- ## Frozen tests \[brief-section\]/);
+      assert.match(shown, /- plugins\/kusabi\/scripts\/chain-phases\.test\.mjs \[repo-path\]/);
+      assert.match(shown, /why: the frozen section requires/);
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("an interruption between implement and finishRound survives chain-resume: the resumed round still refuses (kusabi #293 review)", async () => {
+    // The designed stop point (kusabi #153①): a stop requested while the
+    // implement round is in flight is honoured AFTER the probes, persisting
+    // the partial round.  The refusal descriptor must be persisted with it --
+    // the report text is deliberately discarded, so the parse cannot be
+    // repeated after the stop -- or the review-resume would classify the
+    // empty change set as a discard and charge the honest refusal to the
+    // worker seat exactly as before #293.
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-refusal-stop-"));
+    const chainDir = path.join(tmp, "chains", "chain-refusal");
+    fs.mkdirSync(chainDir, { recursive: true });
+    // The existence gate verifies REFUSAL_REPORT's repo-path anchor against
+    // the worktree at cwd, so the anchor file must really exist there (and
+    // the brief must be GATE_BRIEF, which really has the heading) -- both
+    // runs below must see the same REAL items, fresh and resumed alike.
+    fs.mkdirSync(path.join(tmp, "plugins", "kusabi", "scripts"), { recursive: true });
+    fs.writeFileSync(path.join(tmp, "plugins", "kusabi", "scripts", "chain-phases.test.mjs"), "// fixture\n");
+    writeChainControl(chainDir, {
+      chainId: "chain-refusal", container: "cid-1", pid: process.pid,
+      status: "running", round: 0, startedAt: new Date().toISOString(),
+    });
+    const dispatch = reportingDispatch(REFUSAL_REPORT);
+    const dispatchWithStop = async (opts) => {
+      const result = await dispatch(opts);
+      if (opts.kind === "task") {
+        // The stop arrives while the round is in flight -- exactly what
+        // chain-cancel does via requestChainStop.
+        writeChainControl(chainDir, {
+          ...readChainControl(chainDir),
+          stopRequestedAt: new Date().toISOString(),
+          stopRequestedBy: "test",
+        });
+      }
+      return result;
+    };
+    try {
+      const cancelled = await runChainDriver({
+        cwd: tmp, stateDir: tmp, chainDir, chainId: "chain-refusal", container: "cid-1",
+        model: "fake/model", modelChain: [["fake/model"], ["fake/pro"]], maxRounds: 4,
+        brief: GATE_BRIEF, orchestrator: null, baseSha: "abc123", worktreeBaseline: null,
+        verifyBaseline: { captured: true, gate_passed: true, lint: 0, types: 0, collected: 10, raw: {} },
+        callTool: refusalCallTool({ statusOutput: "" }),
+        dispatchWithFallback: dispatchWithStop,
+        keepServe: true,
+        signalReceived: () => false,
+        resume: null,
+      });
+      assert.match(cancelled, /cancelled during round 1/);
+
+      // The partial round is persisted WITH the refusal descriptor on it.
+      const partial = readJson(path.join(chainDir, "round-1.json"));
+      assert.equal(partial.interrupted, true);
+      assert.equal(partial.interruptedAfter, "probes");
+      assert.equal(partial.implementRefusal.qualifies, true);
+      assert.equal(partial.implementRefusal.anchors.length, 2);
+      assert.match(partial.implementRefusal.why, /opposite output/);
+
+      // Resume exactly as cmdChainResume wires it: resolve the position from
+      // the records alone, re-arm the control, run the driver at the same
+      // round's review phase.
+      const resolution = resolveChainResume({
+        control: readChainControl(chainDir),
+        chainJson: readJson(path.join(chainDir, "chain.json")),
+      });
+      assert.equal(resolution.ok, true);
+      assert.equal(resolution.position.phase, "review");
+      assert.equal(resolution.position.round, 1);
+      rearmChainControl({
+        chainDir,
+        round: resolution.position.phase === "review" ? resolution.position.round : resolution.position.round - 1,
+      });
+
+      const text = await runChainDriver({
+        cwd: tmp, stateDir: tmp, chainDir, chainId: "chain-refusal", container: "cid-1",
+        model: "fake/model", modelChain: [["fake/model"], ["fake/pro"]], maxRounds: 4,
+        brief: GATE_BRIEF, orchestrator: null, baseSha: "abc123", worktreeBaseline: null,
+        // Mirror cmdChainResume: reuse the verify baseline recorded in
+        // chain.json; never re-capture on the modified worktree (kusabi #173).
+        verifyBaseline: readJson(path.join(chainDir, "chain.json")).verifyBaseline ?? null,
+        callTool: refusalCallTool({ statusOutput: "" }),
+        dispatchWithFallback: dispatch,
+        keepServe: true,
+        signalReceived: () => false,
+        resume: resolution.position,
+      });
+
+      // The resumed round terminates as the refusal the original finishRound
+      // would have produced -- never as a worker discard.
+      assert.match(text, /refused at round 1/);
+      assert.match(text, /## Frozen tests/);
+      assert.match(text, /BRIEF defect/);
+      assert.doesNotMatch(text, /escalated at round/);
+
+      const round1 = readJson(path.join(chainDir, "round-1.json"));
+      assert.equal(round1.disposition.disposition, "refused-brief-defect");
+      // Attribution: a refusal, never a discard charged to the worker seat.
+      assert.equal(round1.roundOutcome, "refusal");
+      assert.equal(round1.verdict, "refusal");
+      assert.notEqual(round1.verdict, "discard");
+      assert.equal(round1.refusal.anchors.length, 2);
+      assert.match(round1.refusal.why, /opposite output/);
+      // The interruption history stays visible on the completed round.
+      assert.equal(round1.wasInterrupted, true);
+      assert.equal(round1.resumed, true);
+      // Terminal on the first round: no rework, no second round.
+      assert.equal(round1.reworkCount, 0);
+      assert.equal(round1.pendingReworkStrategy, null);
+      assert.equal(fs.existsSync(path.join(chainDir, "round-2.json")), false);
+
+      // No review seat was bought on the resumed path either: the round
+      // changed nothing to review.
+      assert.equal(dispatch.calls.some((c) => c.kind === "review"), false);
+
+      const control = readChainControl(chainDir);
+      assert.equal(control.status, "completed");
+      assert.equal(control.round, 1);
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("empty change set + no block: discard → escalate, exactly as before", async () => {
+    const { tmp, chainDir, text } = await runFreshChain({
+      statusOutput: "",
+      implementReport: "Implemented the feature. All tests pass.",
+    });
+    try {
+      assert.match(text, /escalated at round 1/);
+      assert.doesNotMatch(text, /refused at round/);
+      const round1 = readJson(path.join(chainDir, "round-1.json"));
+      assert.equal(round1.verdict, "discard");
+      assert.equal(round1.verdictSource, "probe");
+      assert.equal(round1.disposition.disposition, "escalate");
+      assert.equal(round1.roundOutcome, undefined);
+      assert.equal(round1.refusal, undefined);
+      assert.equal(round1.refusalRejected, undefined);
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("empty change set + block with no named anchors: still a discard, shortfall recorded", async () => {
+    const { tmp, chainDir, text } = await runFreshChain({
+      statusOutput: "",
+      implementReport: PROSE_REFUSAL_REPORT,
+    });
+    try {
+      // Routing is the pre-existing discard → escalate, byte for byte.
+      assert.match(text, /escalated at round 1/);
+      assert.doesNotMatch(text, /refused at round/);
+      const round1 = readJson(path.join(chainDir, "round-1.json"));
+      assert.equal(round1.verdict, "discard");
+      assert.equal(round1.disposition.disposition, "escalate");
+      assert.equal(round1.refusal, undefined);
+      // …but the attempt is visible, so the round does not read as a lazy one.
+      assert.match(round1.refusalRejected, /did not qualify/);
+      assert.match(round1.refusalRejected, /no named anchors/);
+      const shown = renderChainShow(
+        readJson(path.join(chainDir, "chain.json")), [round1], [], readChainControl(chainDir),
+      );
+      assert.match(shown, /!! refusal not qualifying:/);
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("a round that edited files never refuses, whatever its report says", async () => {
+    const { tmp, chainDir, text } = await runFreshChain({
+      statusOutput: " M src/foo.js\n",
+      implementReport: REFUSAL_REPORT,
+    });
+    try {
+      // Normal routes apply: the reviewer approved and the probes are green.
+      assert.match(text, /accepted at round 1/);
+      assert.doesNotMatch(text, /refused at round/);
+      const round1 = readJson(path.join(chainDir, "round-1.json"));
+      assert.equal(round1.disposition.disposition, "accept");
+      assert.equal(round1.verdict, "approve");
+      assert.equal(round1.refusal, undefined);
+      // The stray block is surfaced rather than swallowed.
+      assert.equal(round1.strayRefusalBlock.anchors.length, 2);
+      assert.match(round1.strayRefusalBlock.note, /accompanied by edits is not a refusal/);
+      const shown = renderChainShow(
+        readJson(path.join(chainDir, "chain.json")), [round1], [], readChainControl(chainDir),
+      );
+      assert.match(shown, /!! stray refusal block:/);
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("existence gate: a block naming two REAL items still refuses end to end", async () => {
+    // The gate must not reject honest refusals: the two anchors here check
+    // out against the brief and the worktree (a real heading, a real file at
+    // cwd), so the round terminates as a refusal exactly as before the gate.
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-refusal-gate-"));
+    const chainDir = path.join(tmp, "chains", "chain-refusal");
+    fs.mkdirSync(chainDir, { recursive: true });
+    fs.mkdirSync(path.join(tmp, "plugins", "kusabi", "scripts"), { recursive: true });
+    fs.writeFileSync(path.join(tmp, "plugins", "kusabi", "scripts", "chain-phases.test.mjs"), "// fixture\n");
+    writeChainControl(chainDir, {
+      chainId: "chain-refusal", container: "cid-1", pid: process.pid,
+      status: "running", round: 0, startedAt: new Date().toISOString(),
+    });
+    const gateBrief = "Implement X.\n\n## Frozen tests\n\nAll existing tests pass unchanged.\n\n## Deliverables\n- src/foo.js\n";
+    const dispatch = reportingDispatch(REFUSAL_REPORT);
+    try {
+      const text = await runChainDriver({
+        cwd: tmp, stateDir: tmp, chainDir, chainId: "chain-refusal", container: "cid-1",
+        model: "fake/model", modelChain: [["fake/model"], ["fake/pro"]], maxRounds: 4,
+        brief: gateBrief, orchestrator: null, baseSha: "abc123", worktreeBaseline: null,
+        verifyBaseline: { captured: true, gate_passed: true, lint: 0, types: 0, collected: 10, raw: {} },
+        callTool: refusalCallTool({ statusOutput: "" }),
+        dispatchWithFallback: dispatch,
+        keepServe: true,
+        signalReceived: () => false,
+        resume: null,
+      });
+      assert.match(text, /refused at round 1/);
+      assert.match(text, /## Frozen tests/);
+      assert.match(text, /plugins\/kusabi\/scripts\/chain-phases\.test\.mjs/);
+      const round1 = readJson(path.join(chainDir, "round-1.json"));
+      assert.equal(round1.disposition.disposition, "refused-brief-defect");
+      assert.equal(round1.roundOutcome, "refusal");
+      assert.equal(round1.verdict, "refusal");
+      assert.equal(round1.refusal.anchors.length, 2);
+      assert.equal(round1.refusal.qualifies, true);
+      // The verified descriptor replaced the shape-only stamp on the record.
+      assert.equal(round1.implementRefusal.qualifies, true);
+      assert.equal(round1.refusalRejected, undefined);
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("existence gate: invented anchors no longer qualify — discard with the miss recorded", async () => {
+    // The exact abuse case the gate exists for: REFUSAL_REPORT names
+    // "## Frozen tests" although this brief has no such section, and the
+    // worktree (cwd) contains no such file.  Before the gate the block
+    // qualified on shape alone and terminated as a refusal; now both anchors
+    // are unnamed, the round is the pre-existing discard, and the miss is
+    // recorded so the round does not read as a lazy one.
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-refusal-forge-"));
+    const chainDir = path.join(tmp, "chains", "chain-refusal");
+    fs.mkdirSync(chainDir, { recursive: true });
+    writeChainControl(chainDir, {
+      chainId: "chain-refusal", container: "cid-1", pid: process.pid,
+      status: "running", round: 0, startedAt: new Date().toISOString(),
+    });
+    const dispatch = reportingDispatch(REFUSAL_REPORT);
+    try {
+      const text = await runChainDriver({
+        cwd: tmp, stateDir: tmp, chainDir, chainId: "chain-refusal", container: "cid-1",
+        model: "fake/model", modelChain: [["fake/model"], ["fake/pro"]], maxRounds: 4,
+        brief: "Implement X.\n\n## Deliverables\n- src/foo.js\n", orchestrator: null,
+        baseSha: "abc123", worktreeBaseline: null,
+        verifyBaseline: { captured: true, gate_passed: true, lint: 0, types: 0, collected: 10, raw: {} },
+        callTool: refusalCallTool({ statusOutput: "" }),
+        dispatchWithFallback: dispatch,
+        keepServe: true,
+        signalReceived: () => false,
+        resume: null,
+      });
+      // Routing is the pre-existing discard → escalate; the forgery does not ride.
+      assert.match(text, /escalated at round 1/);
+      assert.doesNotMatch(text, /refused at round/);
+      const round1 = readJson(path.join(chainDir, "round-1.json"));
+      assert.equal(round1.verdict, "discard");
+      assert.equal(round1.verdictSource, "probe");
+      assert.equal(round1.disposition.disposition, "escalate");
+      assert.equal(round1.refusal, undefined);
+      // The attempt is visible, with each invented anchor named and why.
+      assert.match(round1.refusalRejected, /did not qualify/);
+      assert.match(round1.refusalRejected, /anchor\(s\) not found/);
+      assert.match(round1.refusalRejected, /## Frozen tests \(no such heading in the brief\)/);
+      assert.match(round1.refusalRejected, /chain-phases\.test\.mjs \(no such file or directory in the repo\)/);
+      // The verified descriptor replaced the shape-only stamp on the record.
+      assert.equal(round1.implementRefusal.qualifies, false);
+      // No rework budget consumed by the forgery: same as any discard.
+      assert.equal(round1.reworkCount, 0);
+      assert.equal(round1.pendingReworkStrategy, null);
+    } finally {
       fs.rmSync(tmp, { recursive: true, force: true });
     }
   });
