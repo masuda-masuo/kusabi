@@ -33,6 +33,12 @@ import {
   chainIdForJob,
   collectChainStatuses,
 } from "./chain-control.mjs";
+import {
+  waitForChain,
+  DEFAULT_POLL_INTERVAL_MS,
+  DEFAULT_APPEAR_TIMEOUT_MS,
+  DEFAULT_PROGRESS_TIMEOUT_MS,
+} from "./chain-wait.mjs";
 import { jobDir, saveJob, loadJob, listJobs, latestJob } from "./job-store.mjs";
 import { opencodeBin, serverHealthy, ensureServer, reapIdleServes, reapOrphanedServes, runningRecordIsStale, isOurServe, api } from "./serve-lifecycle.mjs";
 import { runPrompt, dispatchWithFallback } from "./prompt-execution.mjs";
@@ -1772,6 +1778,69 @@ function cmdChainShow(cwd, { text }) {
 }
 
 // ---------------------------------------------------------------------------
+// chain-wait
+// ---------------------------------------------------------------------------
+
+/**
+ * Read a flag holding a duration in seconds and return it in milliseconds.
+ * A malformed value is refused rather than silently falling back to the
+ * default: a wait that silently used a 2h bound because "--appear-timeout 1O"
+ * had a letter in it is the same unread-error failure chain-wait exists to end.
+ */
+function waitDurationFlag(flags, name, fallbackMs) {
+  const raw = flags[name];
+  if (raw === undefined) return fallbackMs;
+  const seconds = Number(raw);
+  if (!Number.isFinite(seconds) || seconds <= 0) {
+    throw new Error(`--${name} expects a positive number of seconds, got: ${raw}`);
+  }
+  return seconds * 1000;
+}
+
+/**
+ * chain-wait — block until a chain reaches a terminal state, print a one-line
+ * digest, exit 0.  Every way the WAIT failed (unknown id, nothing appeared,
+ * stall) throws, and main()'s catch turns that into a non-zero exit: the
+ * caller scripts on the exit code, so the two must never be confused.
+ *
+ * Runs no LLM, spawns no serve, holds nothing that needs cleanup — safe to
+ * SIGTERM at any moment, which is what makes it trackable by the caller's
+ * harness where the detached chain itself is not.
+ */
+function cmdChainWait(cwd, { flags, text }) {
+  const stateDir = stateDirFor(cwd);
+  const chainsDir = path.join(stateDir, "chains");
+  const chainId = text.trim() || null;
+  const next = !!flags.next;
+
+  if (next && chainId) {
+    throw new Error(`chain-wait --next waits for the NEXT chain to appear and takes no chain id (got ${chainId})`);
+  }
+  if (!next && !chainId) {
+    throw new Error("chain-wait requires a chain id. Usage: chain-wait <chainId> | chain-wait --next [--since <ISO>]");
+  }
+  if (flags.since && !next) {
+    throw new Error("--since is only meaningful with chain-wait --next (it bounds which chain counts as new)");
+  }
+
+  let since = null;
+  if (next && flags.since) {
+    since = Date.parse(flags.since);
+    if (Number.isNaN(since)) throw new Error(`--since expects an ISO timestamp, got: ${flags.since}`);
+  }
+
+  return waitForChain({
+    chainsDir,
+    chainId,
+    next,
+    since,
+    pollIntervalMs: waitDurationFlag(flags, "poll-interval", DEFAULT_POLL_INTERVAL_MS),
+    appearTimeoutMs: waitDurationFlag(flags, "appear-timeout", DEFAULT_APPEAR_TIMEOUT_MS),
+    progressTimeoutMs: waitDurationFlag(flags, "progress-timeout", DEFAULT_PROGRESS_TIMEOUT_MS),
+  }).then((result) => result.digest);
+}
+
+// ---------------------------------------------------------------------------
 // chain-stats
 // ---------------------------------------------------------------------------
 
@@ -1989,6 +2058,7 @@ function usage() {
     "  chain      Run implement→review→rework chain until acceptance or escalate",
     "  chain-resume  Resume a cancelled chain from its last recorded phase boundary, or buy a replacement review seat for a chain that escalated on a dead review seat over green probes (reads chain.json / control.json; same chain lifecycle as chain)",
     "  chain-show Print a compact plain-text digest of a chain (read-only, no LLM)",
+    "  chain-wait Block until a chain reaches a terminal state, print a one-line digest, exit 0 (read-only, no LLM, no serve; safe to SIGTERM at any moment). Non-zero means the WAIT itself failed — unknown chain id, nothing appeared under --next, or the chain stalled — never a disposition you dislike",
     "  chain-stats Aggregate every chain record and print a summary (read-only, no LLM)",
     "  metrics-ingest  Ingest transcripts + chain records + delegated-job records into a durable SQLite store (read-only source, no LLM)",
     "  metrics-report  Query/report over the SQLite metrics store (read-only, no LLM, never ingests)",
@@ -2015,6 +2085,11 @@ function usage() {
     "  --cursor-rule (install-cli: also symlink the alwaysApply kusabi-delegate rule into <cursor dir>/rules; opt-in, since it taxes every conversation on the machine)",
     "  --prior <text> (review: prior findings for anti-ratchet)",
     "  --max-rounds <N> (chain: max rounds, default 4)",
+    "  --next (chain-wait: wait for a chain to APPEAR and then wait on it, instead of naming one; selects the newest chain that is new since the wait started OR was already there and has not reached a terminal state, so a chain the dispatch created in the moment before the wait started still counts and a chain that finished earlier never does; a dispatch that dies before creating a chain directory exits non-zero here instead of looking finished)",
+    "  --since <ISO> (chain-wait --next: only a chain created at or after this stamp counts as the one to wait for, terminal or not — the precise tool, with an explicit chain id, when several chains run in one workspace at once and the default newest-unfinished selection would be ambiguous)",
+    "  --poll-interval <s> (chain-wait: state poll interval, default 2)",
+    "  --appear-timeout <s> (chain-wait: bound on --next, and on a chain directory that never gets a control record, default 120)",
+    "  --progress-timeout <s> (chain-wait: give up on a chain whose state has not moved for this long even though its process is alive, default 7200)",
     "  --since <ISO> (chain-stats: start of time range, inclusive)",
     "  --until <ISO> (chain-stats: end of time range, exclusive)",
     "  --compare <ISO> (chain-stats: show before/after comparison at cutoff)",
@@ -2117,6 +2192,18 @@ async function main() {
     throw new Error(`--cursor-rule is only supported by install-cli (got subcommand ${subcommand ?? "(none)"})`);
   }
 
+  // The chain-wait bounds are wait decisions; on any other subcommand they
+  // would be silently ignored, and a wait flag that did nothing is exactly
+  // the silent-failure class chain-wait exists to remove.  (--since is shared
+  // with chain-stats / metrics, so it is checked inside cmdChainWait instead.)
+  if (subcommand !== "chain-wait" && subcommand !== "chainWait") {
+    for (const flag of ["next", "poll-interval", "appear-timeout", "progress-timeout"]) {
+      if (parsed.flags[flag] !== undefined) {
+        throw new Error(`--${flag} is only supported by chain-wait (got subcommand ${subcommand ?? "(none)"})`);
+      }
+    }
+  }
+
   switch (subcommand) {
     case "setup":
       return cmdSetup(cwd);
@@ -2149,6 +2236,9 @@ async function main() {
     case "chain-show":
     case "chainShow":
       return cmdChainShow(cwd, parsed);
+    case "chain-wait":
+    case "chainWait":
+      return cmdChainWait(cwd, parsed);
     case "chain-stats":
     case "chainStats":
       return cmdChainStats(cwd, parsed);
@@ -2159,7 +2249,7 @@ async function main() {
     case "metricsReport":
       return cmdMetricsReport(cwd, parsed);
     default:
-      throw new Error(`unknown subcommand: ${subcommand ?? "(none)"}. Use setup|task|review|chain|chain-resume|chain-show|chain-stats|metrics-ingest|metrics-report|chain-cancel|status|result|cancel|serve-stop|install-agents|install-cli|salvage`);
+      throw new Error(`unknown subcommand: ${subcommand ?? "(none)"}. Use setup|task|review|chain|chain-resume|chain-show|chain-wait|chain-stats|metrics-ingest|metrics-report|chain-cancel|status|result|cancel|serve-stop|install-agents|install-cli|salvage`);
   }
 }
 
