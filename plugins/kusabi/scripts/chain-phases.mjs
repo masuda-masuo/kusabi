@@ -30,6 +30,8 @@ import {
   groupFindingsByKind,
   extractJson,
   recoverVerdictFromText,
+  roundDiscardReason,
+  roundChangedColumn,
 } from "./render.mjs";
 import {
   hasSectionHeading,
@@ -994,6 +996,19 @@ export async function runReviewPhase({
     roundRecord.verdict = "discard";
     roundRecord.verdictSource = "probe";
     roundRecord.reviewParseable = false;
+    // What this discard does NOT mean (kusabi #299).  The round added nothing
+    // SINCE THE BASELINE, which is why the review was skipped — it says
+    // nothing about whether earlier rounds' work is still in the worktree.
+    // In the motivating incident (chain-msvthdq26fdc, 2026-08-16) it was: the
+    // empty round was discarded, the chain escalated reading "reviewer
+    // discarded the work", and the intact rounds-1–2 worktree it was sitting
+    // on eventually shipped.  So record the other fact too, straight from the
+    // change set P3 already captured (`git status --porcelain` against the
+    // chain base, which P1 leaves HEAD parked at) — no second collection
+    // mechanism, and no container call of its own.  Distinct from
+    // `worktreeChanged`, which is measured against the RUN's baseline and is
+    // false on exactly this path.
+    roundRecord.worktreeDirtyVsBase = Array.isArray(chainChangedPaths) && chainChangedPaths.length > 0;
   }
 
   let chainVerdict = roundRecord.verdict; // may already be set by probe skip above
@@ -1463,7 +1478,13 @@ export function renderAcceptWithFollowupOutcome({ chainId, round, chainParsedRev
  * Render the outcome string for escalation.
  */
 export function renderEscalateOutcome({ chainId, round, disposition, orchestrator, roundRecord, records }) {
-  const reason = disposition.reason || "unknown";
+  // The first line carries the reason an orchestrator reads first.  For a
+  // probe-sourced discard the recorded reason is deriveDisposition's generic
+  // "reviewer discarded the work" — the wrong thing to hand over over an
+  // intact worktree (kusabi #299): say the round was empty and whether the
+  // worktree still holds the prior rounds' work.  Reviewer-verdict discards
+  // keep the recorded reason.  roundDiscardReason owns the condition.
+  const reason = roundDiscardReason(roundRecord, disposition.reason || "unknown");
   const orchLine = orchestrator?.model ? "orchestrator=" + orchestrator.model : "";
   const lines = [
     "Chain " + chainId + " escalated at round " + round + ": " + reason,
@@ -1476,7 +1497,7 @@ export function renderEscalateOutcome({ chainId, round, disposition, orchestrato
   for (let ri = 0; ri < records.length; ri++) {
     const r = records[ri];
     const detail = r.resumeMethod.detail ? ": " + r.resumeMethod.detail : "";
-    const changed = (r.worktreeChanged === undefined || r.worktreeChanged === null) ? "unknown" : r.worktreeChanged ? "yes" : "NO";
+    const changed = roundChangedColumn(r);
     lines.push("Round " + (ri + 1) + ": model=" + (r.modelEntry || "?") + ", verdict=" + r.verdict + ", probesGreen=" + r.probesGreen + ", changed=" + changed + ", resume=" + r.resumeMethod.type + detail);
   }
   lines.push("", "Hand over to orchestrator for final judgement.");
@@ -1513,7 +1534,7 @@ export function renderRefusalOutcome({ chainId, round, disposition, orchestrator
   for (let ri = 0; ri < records.length; ri++) {
     const r = records[ri];
     const detail = r.resumeMethod?.detail ? ": " + r.resumeMethod.detail : "";
-    const changed = (r.worktreeChanged === undefined || r.worktreeChanged === null) ? "unknown" : r.worktreeChanged ? "yes" : "NO";
+    const changed = roundChangedColumn(r);
     lines.push("Round " + (ri + 1) + ": model=" + (r.modelEntry || "?") + ", outcome=" + (r.roundOutcome || r.verdict) + ", changed=" + changed + ", resume=" + (r.resumeMethod?.type || "?") + detail);
   }
   lines.push(
@@ -1544,7 +1565,7 @@ export function renderMaxRoundsOutcome({ chainId, maxRounds, records, orchestrat
   for (let ri2 = 0; ri2 < records.length; ri2++) {
     const r2 = records[ri2];
     const detail2 = r2.resumeMethod.detail ? ": " + r2.resumeMethod.detail : "";
-    const changed2 = (r2.worktreeChanged === undefined || r2.worktreeChanged === null) ? "unknown" : r2.worktreeChanged ? "yes" : "NO";
+    const changed2 = roundChangedColumn(r2);
     lines.push("Round " + (ri2 + 1) + ": model=" + (r2.modelEntry || "?") + ", verdict=" + r2.verdict + ", probesGreen=" + r2.probesGreen + ", changed=" + changed2 + ", resume=" + r2.resumeMethod.type + detail2);
   }
   lines.push("", "Hand over to orchestrator for final judgement.");
@@ -1591,7 +1612,7 @@ export function renderProviderExhaustedOutcome({ chainId, round, phase, jobError
     for (let ri = 0; ri < records.length; ri++) {
       const r = records[ri];
       const detail = r.resumeMethod?.detail ? ": " + r.resumeMethod.detail : "";
-      const changed = (r.worktreeChanged === undefined || r.worktreeChanged === null) ? "unknown" : r.worktreeChanged ? "yes" : "NO";
+      const changed = roundChangedColumn(r);
       lines.push(
         "  Round " + (ri + 1) + ": model=" + (r.modelEntry || "?") +
         ", verdict=" + (r.verdict || "n/a") +

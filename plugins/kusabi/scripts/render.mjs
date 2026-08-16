@@ -671,6 +671,90 @@ export function renderFollowupDraft({ chainId, briefTitle, findings } = {}) {
 }
 
 /**
+ * The discard reason to show for a probe-sourced discard (kusabi #299).
+ *
+ * A round P3 skipped because it added nothing since the baseline carries the
+ * verdict `discard` with `verdictSource: "probe"` — no reviewer ever saw it.
+ * Its recorded disposition reason is deriveDisposition's generic "reviewer
+ * discarded the work", which is the wrong thing to tell an operator: the
+ * motivating incident (chain-msvthdq26fdc, 2026-08-16) escalated reading that
+ * over a worktree whose earlier rounds were intact and eventually shipped.
+ * So every surface that would surface the discard reason is re-keyed on
+ * verdictSource "probe" through the shared describers below, with the
+ * dirty-vs-base fact in the wording; reviewer-verdict discards (verdictSource
+ * not "probe") keep the recorded reason unchanged.  Three states, never a
+ * guess: records predating the field render "not recorded".
+ *
+ * @param {object} round
+ * @returns {string}
+ */
+function probeDiscardReason(round) {
+  if (round.worktreeDirtyVsBase === true) {
+    return "empty round discarded by probe; worktree still DIRTY vs the chain base";
+  }
+  if (round.worktreeDirtyVsBase === false) {
+    return "empty round discarded by probe; worktree CLEAN vs the chain base";
+  }
+  return "empty round discarded by probe; dirty-vs-base not recorded";
+}
+
+/**
+ * The discard reason to SHOW for a round's disposition (kusabi #299).
+ *
+ * Shared by every surface that renders a round's disposition reason — the
+ * chain-show status headline, the chain-show disposition line, the terminal
+ * escalate outcome's first line, and the reason persisted on the finalised
+ * chain record.  A probe-sourced discard substitutes the probe wording (see
+ * probeDiscardReason) for the recorded reason, because deriveDisposition's
+ * generic "reviewer discarded the work" is the wrong thing to read over a
+ * worktree whose earlier rounds are intact; any other round — including a
+ * reviewer-verdict discard — renders the recorded reason (the fallback)
+ * unchanged.  No renderer keeps its own copy of the probe-discard condition.
+ *
+ * @param {object}  round          — the round record being described.
+ * @param {string}  fallbackReason — the recorded reason for non-probe rounds.
+ * @returns {string}
+ */
+export function roundDiscardReason(round, fallbackReason) {
+  if (round && round.verdict === "discard" && round.verdictSource === "probe") {
+    return probeDiscardReason(round);
+  }
+  return fallbackReason;
+}
+
+/**
+ * The `changed=` column value for a round (kusabi #299).
+ *
+ * Shared by every surface that renders a round's changed flag — the
+ * chain-show `changed:` line, the terminal outcome round summaries (escalate,
+ * max-rounds, refusal, provider-exhausted) and the postable review record's
+ * round line.  Folds the probe-discard case into the column itself: such a
+ * round's `worktreeChanged` is false BY CONSTRUCTION (it added nothing since
+ * the baseline), so a bare "NO" would read as "nothing is in the worktree" —
+ * the opposite of the recorded `worktreeDirtyVsBase` fact — and the column
+ * states that fact instead.  No renderer keeps its own copy of the rule.
+ *
+ * @param {object} round
+ * @returns {string} "unknown" | "yes" | "NO" | "NO (worktree DIRTY/CLEAN vs
+ *                   the chain base)" | "NO (dirty-vs-base not recorded)"
+ */
+export function roundChangedColumn(round) {
+  if (round && round.verdict === "discard" && round.verdictSource === "probe") {
+    if (round.worktreeDirtyVsBase === true) {
+      return "NO (worktree DIRTY vs chain base)";
+    }
+    if (round.worktreeDirtyVsBase === false) {
+      return "NO (worktree CLEAN vs chain base)";
+    }
+    return "NO (dirty-vs-base not recorded)";
+  }
+  if (round.worktreeChanged === undefined || round.worktreeChanged === null) {
+    return "unknown";
+  }
+  return round.worktreeChanged ? "yes" : "NO";
+}
+
+/**
  * Resolve the status label for a chain by combining the control record
  * (explicit lifecycle status) with the round-derived disposition when the
  * control record is absent (old chains from before stop-lever).
@@ -687,7 +771,14 @@ function roundDerivedStatus(rounds) {
   } else if (lastRound?.disposition?.disposition === "accept-with-followup") {
     return `accepted-with-followup at round ${lastRound.round} (${lastRound.disposition.reason || "economic cutoff"})`;
   } else if (lastRound?.disposition?.disposition === "escalate") {
-    return `escalated at round ${lastRound.round} (${lastRound.disposition.reason || "unknown"})`;
+    // A probe-sourced discard's recorded reason ("reviewer discarded the
+    // work") is the wrong headline for a round no reviewer ever saw: say the
+    // round was empty and whether the worktree still holds the prior rounds'
+    // work (kusabi #299).  Reviewer-verdict discards render unchanged.
+    // roundDiscardReason owns the probe-discard condition — no renderer keeps
+    // its own copy of the rule.
+    const reason = roundDiscardReason(lastRound, lastRound.disposition.reason || "unknown");
+    return `escalated at round ${lastRound.round} (${reason})`;
   } else if (lastRound?.disposition?.disposition === "refused-brief-defect") {
     // kusabi #293.  Named as a BRIEF defect on the status line itself: the
     // reader's first question about a chain that produced nothing is whose
@@ -809,11 +900,38 @@ export function renderChainShow(chain, rounds, unreadable = [], control = null) 
       lines.push(`  verdict: ${round.verdict}${parseableNote}${seatNote}`);
     }
 
+    // A probe-sourced discard is NOT a reviewer's discard (kusabi #299): no
+    // reviewer ever saw this round, it was skipped because the round added
+    // nothing since the baseline.  Whether the WORKTREE is still dirty
+    // against the chain base is the fact that decides where an inspection
+    // starts, so say it here rather than leaving the digest reading "the work
+    // is gone" over an intact tree.  Reviewer-verdict discards render
+    // unchanged — this block is keyed on verdictSource "probe".
+    if (round.verdict === "discard" && round.verdictSource === "probe") {
+      if (round.worktreeDirtyVsBase === true) {
+        lines.push(`  empty round discarded (no reviewer ran); worktree still DIRTY vs the chain base — prior rounds' work is intact, inspect the container`);
+      } else if (round.worktreeDirtyVsBase === false) {
+        lines.push(`  empty round discarded (no reviewer ran); worktree CLEAN vs the chain base — nothing is left in the container`);
+      } else {
+        // Records written before the fact was recorded, and the resumed-review
+        // path that never runs this branch.  Unknown is stated, never guessed.
+        lines.push(`  empty round discarded (no reviewer ran); dirty-vs-base not recorded`);
+      }
+    }
+
     // Disposition + reason
     if (round.disposition) {
       const disp = round.disposition.disposition || "unknown";
-      const reason = round.disposition.reason ? ` (${round.disposition.reason})` : "";
-      lines.push(`  disposition: ${disp}${reason}`);
+      // A probe-sourced discard's recorded reason is deriveDisposition's
+      // generic "reviewer discarded the work" — the wrong wording for a round
+      // no reviewer ever saw.  Say it was empty and whether the worktree
+      // still holds the prior rounds' work instead (kusabi #299).
+      // Reviewer-verdict discards render the recorded reason unchanged.
+      // roundDiscardReason owns the probe-discard condition — no renderer
+      // keeps its own copy of the rule.
+      const reason = roundDiscardReason(round, round.disposition.reason || "");
+      const reasonNote = reason ? ` (${reason})` : "";
+      lines.push(`  disposition: ${disp}${reasonNote}`);
     }
 
     // Refusal (kusabi #293): the disposition line above says a refusal
@@ -840,15 +958,12 @@ export function renderChainShow(chain, rounds, unreadable = [], control = null) 
       lines.push(`  !! refusal not qualifying: ${round.refusalRejected}`);
     }
 
-    // Worktree change status (baseline-aware)
-    // null and undefined both mean "unknown" — null happens when the per-round
-    // capture failed; undefined means the record predates the baseline feature.
-    if (round.worktreeChanged === undefined || round.worktreeChanged === null) {
-      lines.push(`  changed: unknown`);
-    } else {
-      const wc = round.worktreeChanged ? "yes" : "NO";
-      lines.push(`  changed: ${wc}`);
-    }
+    // Worktree change status (baseline-aware).  The probe-discard fold lives
+    // in roundChangedColumn (kusabi #299): such a round's worktreeChanged is
+    // false by construction, so the column states the recorded
+    // worktreeDirtyVsBase fact instead of a bare NO that reads as "nothing is
+    // in the worktree".
+    lines.push(`  changed: ${roundChangedColumn(round)}`);
 
     // Tier info (B8: which levers were pulled)
     if (round.tierBefore !== undefined) {
@@ -1205,8 +1320,13 @@ export function renderReviewRecord(record) {
     const verdict = round.verdict || "?";
     const verdictSource = round.verdictSource || "parsed";
     const roundDisposition = round.disposition?.disposition ?? "?";
-    const changed = (round.worktreeChanged === undefined || round.worktreeChanged === null)
-      ? "unknown" : round.worktreeChanged ? "yes" : "no";
+    // The shared changed-column describer (kusabi #299) folds the
+    // probe-discard case in; this record's style is lowercase "no" for an
+    // ordinary no-change round, so the plain NO value is mapped down (a
+    // probe-discard round's value carries the dirty-vs-base wording and is
+    // passed through as-is).
+    const changedCol = roundChangedColumn(round);
+    const changed = changedCol === "NO" ? "no" : changedCol;
     lines.push(`Round ${roundNo} — model: ${model}, verdict: ${verdict} (${verdictSource}), disposition: ${roundDisposition}, changed: ${changed}`);
     // Replacement review seats (kusabi #248): the verdict above came from the
     // LAST seat this round bought.  A seat that died mid-stream is named here

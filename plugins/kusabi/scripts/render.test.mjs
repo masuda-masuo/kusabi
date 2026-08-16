@@ -12,6 +12,8 @@ import {
   renderStrategistPrompt,
   renderReviewRecord,
   recoverVerdictFromText,
+  roundDiscardReason,
+  roundChangedColumn,
 } from "./render.mjs";
 import { sampleParsed } from "./fixtures.mjs";
 
@@ -542,6 +544,205 @@ describe("renderChainShow", () => {
     ];
     const result = renderChainShow(chain, rounds);
     assert.match(result, /status: escalated at round 1 \(reviewer discarded the work\)/);
+    // A reviewer's discard renders unchanged: the probe-discard line below is
+    // keyed on verdictSource "probe", which this round does not carry.
+    assert.doesNotMatch(result, /empty round discarded/);
+  });
+
+  // ---- probe-discarded empty rounds say where the work is (kusabi #299) ----
+  // The digest must not read "reviewer discarded the work" over a worktree
+  // that still holds every earlier round's changes.
+
+  it("probe-discarded round on a dirty tree says the prior work is still there", () => {
+    const chain = { chainId: "chain-empty-round" };
+    const rounds = [
+      {
+        round: 3,
+        verdict: "discard",
+        verdictSource: "probe",
+        worktreeDirtyVsBase: true,
+        disposition: { disposition: "escalate", reason: "reviewer discarded the work" },
+      },
+    ];
+    const result = renderChainShow(chain, rounds);
+    assert.match(result, /empty round discarded \(no reviewer ran\)/);
+    assert.match(result, /still DIRTY vs the chain base/);
+    assert.match(result, /work is intact/);
+  });
+
+  it("probe-discarded round on a clean tree says nothing is left", () => {
+    const rounds = [
+      { round: 1, verdict: "discard", verdictSource: "probe", worktreeDirtyVsBase: false },
+    ];
+    const result = renderChainShow({ chainId: "chain-clean" }, rounds);
+    assert.match(result, /empty round discarded \(no reviewer ran\)/);
+    assert.match(result, /CLEAN vs the chain base/);
+    assert.doesNotMatch(result, /DIRTY vs the chain base/);
+  });
+
+  it("probe-discarded round from a record predating the field states the gap", () => {
+    const rounds = [
+      { round: 1, verdict: "discard", verdictSource: "probe" },
+    ];
+    const result = renderChainShow({ chainId: "chain-legacy" }, rounds);
+    assert.match(result, /dirty-vs-base not recorded/);
+  });
+
+  // ---- the status headline and the disposition line must not read
+  // "reviewer discarded the work" for a round no reviewer ever saw ----
+  // The recorded disposition reason on a probe-discarded round is
+  // deriveDisposition's generic discard text, so both surfaces are re-keyed
+  // on verdictSource "probe"; these pin that the incident's misleading phrase
+  // is gone from the two most prominent renderings of the round.
+
+  it("status headline of a probe-discarded round says the round was empty and the worktree is still dirty", () => {
+    const chain = { chainId: "chain-empty-round" };
+    const rounds = [
+      {
+        round: 3,
+        verdict: "discard",
+        verdictSource: "probe",
+        worktreeDirtyVsBase: true,
+        disposition: { disposition: "escalate", reason: "reviewer discarded the work" },
+      },
+    ];
+    const result = renderChainShow(chain, rounds);
+    assert.match(result, /status: escalated at round 3 \(empty round discarded by probe; worktree still DIRTY vs the chain base\)/);
+    assert.doesNotMatch(result, /status:.*reviewer discarded the work/);
+  });
+
+  it("disposition line of a probe-discarded round carries the probe-discard wording, not the reviewer's", () => {
+    const rounds = [
+      {
+        round: 3,
+        verdict: "discard",
+        verdictSource: "probe",
+        worktreeDirtyVsBase: true,
+        disposition: { disposition: "escalate", reason: "reviewer discarded the work" },
+      },
+    ];
+    const result = renderChainShow({ chainId: "chain-empty-round" }, rounds);
+    assert.match(result, /disposition: escalate \(empty round discarded by probe; worktree still DIRTY vs the chain base\)/);
+    assert.doesNotMatch(result, /disposition: escalate \(reviewer discarded the work\)/);
+  });
+
+  it("probe-discarded round on a clean tree: headline and disposition say the worktree is CLEAN", () => {
+    const rounds = [
+      {
+        round: 1,
+        verdict: "discard",
+        verdictSource: "probe",
+        worktreeDirtyVsBase: false,
+        disposition: { disposition: "escalate", reason: "reviewer discarded the work" },
+      },
+    ];
+    const result = renderChainShow({ chainId: "chain-clean" }, rounds);
+    assert.match(result, /status: escalated at round 1 \(empty round discarded by probe; worktree CLEAN vs the chain base\)/);
+    assert.match(result, /disposition: escalate \(empty round discarded by probe; worktree CLEAN vs the chain base\)/);
+  });
+
+  it("probe-discarded round from a record predating the field: headline and disposition state the gap", () => {
+    const rounds = [
+      {
+        round: 1,
+        verdict: "discard",
+        verdictSource: "probe",
+        disposition: { disposition: "escalate", reason: "reviewer discarded the work" },
+      },
+    ];
+    const result = renderChainShow({ chainId: "chain-legacy" }, rounds);
+    assert.match(result, /status: escalated at round 1 \(empty round discarded by probe; dirty-vs-base not recorded\)/);
+    assert.match(result, /disposition: escalate \(empty round discarded by probe; dirty-vs-base not recorded\)/);
+  });
+
+  it("a reviewer-verdict discard keeps 'reviewer discarded the work' on the headline and the disposition line", () => {
+    const rounds = [
+      {
+        round: 1,
+        verdict: "discard",
+        disposition: { disposition: "escalate", reason: "reviewer discarded the work" },
+      },
+    ];
+    const result = renderChainShow({ chainId: "chain-reviewer-discard" }, rounds);
+    assert.match(result, /status: escalated at round 1 \(reviewer discarded the work\)/);
+    assert.match(result, /disposition: escalate \(reviewer discarded the work\)/);
+  });
+
+  // The digest's changed: line is one of the surfaces the shared describer
+  // roundChangedColumn feeds (kusabi #299): a probe-discarded round's
+  // worktreeChanged is false by construction, so the line states the recorded
+  // dirty-vs-base fact instead of a bare NO that reads as "nothing there".
+  it("the changed line of a probe-discarded round states the dirty-vs-base fact, not a bare NO", () => {
+    const rounds = [
+      { round: 1, verdict: "discard", verdictSource: "probe", worktreeDirtyVsBase: true, worktreeChanged: false },
+    ];
+    const result = renderChainShow({ chainId: "chain-empty-round" }, rounds);
+    assert.match(result, /changed: NO \(worktree DIRTY vs chain base\)/);
+  });
+
+  it("the changed line of a probe-discarded clean round states CLEAN", () => {
+    const rounds = [
+      { round: 1, verdict: "discard", verdictSource: "probe", worktreeDirtyVsBase: false, worktreeChanged: false },
+    ];
+    const result = renderChainShow({ chainId: "chain-clean" }, rounds);
+    assert.match(result, /changed: NO \(worktree CLEAN vs chain base\)/);
+  });
+
+  it("the changed line of a reviewer-verdict discard stays a bare NO", () => {
+    const rounds = [
+      { round: 1, verdict: "discard", worktreeChanged: false },
+    ];
+    const result = renderChainShow({ chainId: "chain-reviewer-discard" }, rounds);
+    assert.match(result, /changed: NO$/m);
+    assert.doesNotMatch(result, /changed: NO \(/);
+  });
+
+  // ---- shared round describers (kusabi #299) ----
+  // roundDiscardReason and roundChangedColumn are the single home of the
+  // probe-discard re-keying; every renderer — chain-show, the terminal
+  // outcomes, the postable review record — calls them instead of keeping its
+  // own copy of the condition.
+
+  it("roundDiscardReason: probe-discard rounds get the probe wording, all others the recorded reason", () => {
+    assert.equal(
+      roundDiscardReason({ verdict: "discard", verdictSource: "probe", worktreeDirtyVsBase: true }, "reviewer discarded the work"),
+      "empty round discarded by probe; worktree still DIRTY vs the chain base",
+    );
+    assert.equal(
+      roundDiscardReason({ verdict: "discard", verdictSource: "probe", worktreeDirtyVsBase: false }, "reviewer discarded the work"),
+      "empty round discarded by probe; worktree CLEAN vs the chain base",
+    );
+    assert.equal(
+      roundDiscardReason({ verdict: "discard", verdictSource: "probe" }, "reviewer discarded the work"),
+      "empty round discarded by probe; dirty-vs-base not recorded",
+    );
+    // Reviewer-verdict discard and any non-discard verdict: fallback verbatim.
+    assert.equal(roundDiscardReason({ verdict: "discard" }, "reviewer discarded the work"), "reviewer discarded the work");
+    assert.equal(roundDiscardReason({ verdict: "approve" }, "some reason"), "some reason");
+    assert.equal(roundDiscardReason(null, "some reason"), "some reason");
+  });
+
+  it("roundChangedColumn: unknown / yes / NO for ordinary rounds", () => {
+    assert.equal(roundChangedColumn({}), "unknown");
+    assert.equal(roundChangedColumn({ worktreeChanged: null }), "unknown");
+    assert.equal(roundChangedColumn({ worktreeChanged: true }), "yes");
+    assert.equal(roundChangedColumn({ worktreeChanged: false }), "NO");
+    assert.equal(roundChangedColumn({ verdict: "discard", worktreeChanged: false }), "NO");
+  });
+
+  it("roundChangedColumn: probe-discarded rounds state dirty-vs-base instead of a bare NO", () => {
+    assert.equal(
+      roundChangedColumn({ verdict: "discard", verdictSource: "probe", worktreeDirtyVsBase: true, worktreeChanged: false }),
+      "NO (worktree DIRTY vs chain base)",
+    );
+    assert.equal(
+      roundChangedColumn({ verdict: "discard", verdictSource: "probe", worktreeDirtyVsBase: false, worktreeChanged: false }),
+      "NO (worktree CLEAN vs chain base)",
+    );
+    assert.equal(
+      roundChangedColumn({ verdict: "discard", verdictSource: "probe", worktreeChanged: false }),
+      "NO (dirty-vs-base not recorded)",
+    );
   });
 
   it("renders incomplete status when chain has no rounds", () => {

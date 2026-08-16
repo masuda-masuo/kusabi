@@ -99,7 +99,10 @@ export function deriveReworkStrategy({ reworkCount, strategized, verdict, probes
  * @param {number}  opts.round        — 1-based current round number
  * @param {number}  opts.maxRounds
  * @param {boolean} opts.repeatedAreas — same file area flagged 2+ rounds
- * @param {string[]} [opts.findingSeverities] — severity strings from the round's review findings
+ * @param {string[]} [opts.findingSeverities] — severity strings from the round's review findings.
+ *   Absent, non-array or EMPTY means the review named no findings at all; with `needs-attention`
+ *   over green probes that is an incomplete review and escalates (kusabi #299), because a rework
+ *   round would be dispatched with an empty work list.
  * @param {boolean} [opts.strategizeEligible] — true on first stagnation to get strategize instead of
  *   escalate; combined internally with `round < maxRounds` (see strategizeAllowed) because a
  *   strategist job produced on the final round has no next round left to consume its output, so
@@ -182,6 +185,40 @@ export function deriveDisposition({ verdict, probesGreen, round, maxRounds, repe
   // has value for rounds that cannot ship as-is.
   if (probesGreen && verdict === "needs-attention" && Array.isArray(findingSeverities) && findingSeverities.length > 0 && findingSeverities.every(function (s) { return s === "low" || s === "medium"; })) {
     return { disposition: "accept-with-followup", reason: "probes green; remaining findings all minor" };
+  }
+
+  // ---- needs-attention that named ZERO findings (kusabi #299) ----
+  // The reviewer said the work needs attention and then named nothing that
+  // needs it.  Over GREEN probes there is no work item anywhere: not in the
+  // findings (the list is empty or absent) and not in the probes (they
+  // passed).  A rework round would therefore dispatch an implement with an
+  // empty work list, which is the incident this row exists for
+  // (chain-msvthdq26fdc, 2026-08-16): the rework had nothing to fix, changed
+  // no files, P3 discarded the empty round, and the chain escalated reading
+  // "reviewer discarded the work" over a worktree whose earlier rounds were
+  // intact and eventually shipped.
+  //
+  // So this is an INCOMPLETE REVIEW, the same family as `partial` (findings
+  // without a verdict line, kusabi #202) and `approve-partial`: it is not an
+  // approval, it must not silently buy a rework round, and only a human can
+  // judge whether "needs attention, nothing named" is a clean bill of health
+  // or a review that fell over.  Escalate, with the zero-findings fact in the
+  // reason so the digest says it without the operator opening the record.
+  //
+  // Two deliberate exclusions:
+  //   - `probesGreen === false`: a probe failure IS concrete work for the
+  //     implement even when the reviewer named nothing, so the rework /
+  //     repeatedAreas rows below keep that case unchanged.
+  //   - `repeatedAreas`: those rows (strategize, stagnation escalate) name a
+  //     concrete stall, which is the more informative thing to tell the
+  //     operator, and they already route away from a blind rework.
+  const noFindingsNamed = !Array.isArray(findingSeverities) || findingSeverities.length === 0;
+  if (probesGreen && verdict === "needs-attention" && !repeatedAreas && noFindingsNamed) {
+    return {
+      disposition: "escalate",
+      reason: "needs-attention with an empty finding list (zero findings named) over green probes: " +
+        "the review is incomplete and there is nothing to rework, so a human decides",
+    };
   }
 
   // Hard limit: max rounds reached without acceptance → escalate

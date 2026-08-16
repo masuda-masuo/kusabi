@@ -1574,6 +1574,76 @@ describe("renderEscalateOutcome", () => {
     const result = renderEscalateOutcome({ chainId, round: 1, disposition: { disposition: "escalate" }, orchestrator: null, roundRecord, records });
     assert.ok(result.includes("unknown"));
   });
+
+  // ---- probe-discarded rounds: the terminal handover must not read
+  // "reviewer discarded the work" over an intact worktree (kusabi #299) ----
+  // chain-show's headline and disposition line were re-keyed first; these pin
+  // the surfaces the ORCHESTRATOR actually reads on escalation: the outcome's
+  // first line and its per-round changed flag (which a probe-discarded
+  // round's worktreeChanged makes false BY CONSTRUCTION, so the column states
+  // the recorded dirty-vs-base fact instead of a bare NO).
+
+  it("probe-discarded round: first line states the probe-discard wording, never the reviewer's", () => {
+    const roundRecord = {
+      findingsText: "issue",
+      verdict: "discard",
+      verdictSource: "probe",
+      worktreeDirtyVsBase: true,
+    };
+    const records = [
+      { resumeMethod: { type: "continue_session" }, modelEntry: "test/gpt-4", verdict: "discard", verdictSource: "probe", worktreeDirtyVsBase: true, worktreeChanged: false, probesGreen: true },
+    ];
+    const disposition = { disposition: "escalate", reason: "reviewer discarded the work" };
+    const result = renderEscalateOutcome({ chainId, round: 1, disposition, orchestrator: null, roundRecord, records });
+    assert.ok(result.includes("Chain chain-esc789 escalated at round 1: empty round discarded by probe; worktree still DIRTY vs the chain base"));
+    assert.doesNotMatch(result, /reviewer discarded the work/);
+  });
+
+  it("probe-discarded round: the changed flag states dirty-vs-base, not a bare NO", () => {
+    const roundRecord = {
+      findingsText: "issue",
+      verdict: "discard",
+      verdictSource: "probe",
+      worktreeDirtyVsBase: true,
+    };
+    const records = [
+      { resumeMethod: { type: "continue_session" }, modelEntry: "test/gpt-4", verdict: "discard", verdictSource: "probe", worktreeDirtyVsBase: true, worktreeChanged: false, probesGreen: true },
+    ];
+    const disposition = { disposition: "escalate", reason: "reviewer discarded the work" };
+    const result = renderEscalateOutcome({ chainId, round: 1, disposition, orchestrator: null, roundRecord, records });
+    assert.ok(result.includes("Round 1: model=test/gpt-4, verdict=discard, probesGreen=true, changed=NO (worktree DIRTY vs chain base), resume=continue_session"));
+  });
+
+  it("probe-discarded round on a clean tree: first line and changed flag say CLEAN", () => {
+    const roundRecord = {
+      findingsText: "issue",
+      verdict: "discard",
+      verdictSource: "probe",
+      worktreeDirtyVsBase: false,
+    };
+    const records = [
+      { resumeMethod: { type: "continue_session" }, modelEntry: "test/gpt-4", verdict: "discard", verdictSource: "probe", worktreeDirtyVsBase: false, worktreeChanged: false, probesGreen: true },
+    ];
+    const disposition = { disposition: "escalate", reason: "reviewer discarded the work" };
+    const result = renderEscalateOutcome({ chainId, round: 1, disposition, orchestrator: null, roundRecord, records });
+    assert.ok(result.includes("Chain chain-esc789 escalated at round 1: empty round discarded by probe; worktree CLEAN vs the chain base"));
+    assert.ok(result.includes("changed=NO (worktree CLEAN vs chain base), resume=continue_session"));
+  });
+
+  it("a reviewer-verdict discard keeps the recorded reason and a bare changed=NO", () => {
+    const roundRecord = {
+      findingsText: "issue",
+      verdict: "discard",
+      worktreeChanged: false,
+    };
+    const records = [
+      { resumeMethod: { type: "continue_session" }, modelEntry: "test/gpt-4", verdict: "discard", worktreeChanged: false, probesGreen: true },
+    ];
+    const disposition = { disposition: "escalate", reason: "reviewer discarded the work" };
+    const result = renderEscalateOutcome({ chainId, round: 1, disposition, orchestrator: null, roundRecord, records });
+    assert.ok(result.includes("Chain chain-esc789 escalated at round 1: reviewer discarded the work"));
+    assert.ok(result.includes("changed=NO, resume=continue_session"));
+  });
 });
 
 // renderMaxRoundsOutcome  —  pure
@@ -1611,6 +1681,17 @@ describe("renderMaxRoundsOutcome", () => {
     const result = renderMaxRoundsOutcome({ chainId, maxRounds: 3, records: [], orchestrator: null });
     assert.ok(result.includes("(none)"));
     assert.ok(result.includes("reached max rounds (3)"));
+  });
+
+  // The max-rounds terminal's round summaries are another surface an
+  // orchestrator reads on handover: a probe-discarded round's changed flag
+  // states the recorded dirty-vs-base fact (kusabi #299), never a bare NO.
+  it("a probe-discarded round's changed flag states dirty-vs-base", () => {
+    const records = [
+      { resumeMethod: { type: "continue_session" }, modelEntry: "test/gpt-4", verdict: "discard", verdictSource: "probe", worktreeDirtyVsBase: true, worktreeChanged: false, probesGreen: true },
+    ];
+    const result = renderMaxRoundsOutcome({ chainId, maxRounds: 1, records, orchestrator: null });
+    assert.ok(result.includes("Round 1: model=test/gpt-4, verdict=discard, probesGreen=true, changed=NO (worktree DIRTY vs chain base), resume=continue_session"));
   });
 });
 
@@ -3710,6 +3791,45 @@ describe("runReviewPhase — unparseable-output retry (issue #145)", () => {
     assert.equal(roundRecord.reviewUnparseableRetried, undefined);
     assert.equal(roundRecord.reviewFirstUsage, undefined);
     assert.equal(roundRecord.reviewFirstFallbacks, undefined);
+  });
+
+  // ---- the discarded round says whether the work is still there (kusabi #299) ----
+  // "This round added nothing since the baseline" and "the container is empty"
+  // are different facts, and the incident happened because the record only
+  // carried the first one.  Both are now recorded, from the change set P3
+  // already captured.
+
+  it("probe-driven skipReview on a dirty tree: records worktreeDirtyVsBase true", async () => {
+    // The incident shape: rounds 1–2 changed these files, this round added
+    // nothing of its own, so newlyChanged is empty while the tree is dirty.
+    const { result, roundRecord } = await runWith([], {
+      chainChangedPaths: ["src/foo.js", "src/bar.js"],
+      chainNewlyChanged: [],
+      chainStatusObserved: true,
+      chainDeliverables: ["src/foo.js"],
+    });
+
+    assert.equal(result.skipReview, true);
+    assert.equal(roundRecord.verdict, "discard");
+    assert.equal(roundRecord.verdictSource, "probe");
+    assert.equal(roundRecord.worktreeDirtyVsBase, true);
+  });
+
+  it("probe-driven skipReview on a clean tree: records worktreeDirtyVsBase false", async () => {
+    const { roundRecord } = await runWith([], {
+      chainChangedPaths: [],
+      chainNewlyChanged: [],
+      chainStatusObserved: true,
+      chainDeliverables: ["src/foo.js"],
+    });
+
+    assert.equal(roundRecord.worktreeDirtyVsBase, false);
+  });
+
+  it("a round that WAS reviewed carries no worktreeDirtyVsBase — the field is the probe-discard's own", async () => {
+    const { result, roundRecord } = await runWith([fakeJob("job-ok", VALID)]);
+    assert.equal(result.skipReview, false);
+    assert.equal(roundRecord.worktreeDirtyVsBase, undefined);
   });
 });
 

@@ -296,8 +296,14 @@ describe("runChainDriver resume", () => {
     const { chainDir } = makeChainState({ records: [partial] });
     // Review finds problems → rework; the next round's implement hits provider
     // exhaustion so the test can observe the carried tier/reworkCount.
+    // The finding has to be NAMED: since kusabi #299 a needs-attention that
+    // names nothing over green probes escalates instead of reworking, and
+    // this test is about the rework ladder, not about that row.
     const dispatch = makeFakeDispatch({
-      reviewResult: JSON.stringify({ verdict: "needs-attention", findings: [] }),
+      reviewResult: JSON.stringify({
+        verdict: "needs-attention",
+        findings: [{ severity: "high", title: "Still broken", file: "src/foo.js", line_start: 1 }],
+      }),
       implementStatus: "provider-error",
     });
 
@@ -752,7 +758,7 @@ describe("runChainDriver resume", () => {
 
     const text = await resumeChain({ chainDir, dispatch, statusOutput: "" });
 
-    assert.match(text, /escalated at round 1: reviewer discarded the work/);
+    assert.match(text, /escalated at round 1: empty round discarded by probe; worktree CLEAN vs the chain base/);
     assert.equal(dispatch.calls.length, 0); // skip path: no review job dispatched
     const round1 = readJson(path.join(chainDir, "round-1.json"));
     assert.equal(round1.verdict, "discard");
@@ -2287,9 +2293,11 @@ describe("runChainDriver rework scheduling", () => {
     return JSON.stringify({ verdict, findings, summary: "s" });
   }
 
-  function makeCallTool() {
+  // `gatePassed: false` makes P2 red, which is what a probe-failure rework
+  // (the "full" scope, per resolveReworkScope) actually looks like.
+  function makeCallTool({ gatePassed = true } = {}) {
     return async (toolName, params) => {
-      if (toolName === "verify_in_container") return { gate_passed: true };
+      if (toolName === "verify_in_container") return { gate_passed: gatePassed };
       if (toolName !== "sandbox_exec") return { output: "" };
       const cmd = params.commands[0];
       if (cmd.startsWith("cd /workspace &&") && cmd.includes("TMPIDX=")) return { output: "ERROR_NO_INDEX\n" };
@@ -2339,7 +2347,7 @@ describe("runChainDriver rework scheduling", () => {
     return { dispatch, calls };
   }
 
-  function runFresh({ maxRounds, reviewResults }) {
+  function runFresh({ maxRounds, reviewResults, callTool = makeCallTool() }) {
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-sched-"));
     const chainDir = path.join(tmp, "chains", "chain-test");
     fs.mkdirSync(chainDir, { recursive: true });
@@ -2355,7 +2363,7 @@ describe("runChainDriver rework scheduling", () => {
           cwd: tmp, stateDir: tmp, chainDir, chainId: "chain-test", container: "cid-1",
           model: "fake/model", modelChain: [["fake/model"]], maxRounds,
           brief: BRIEF, orchestrator: null, baseSha: "abc123", worktreeBaseline: null,
-          callTool: makeCallTool(), dispatchWithFallback: dispatch,
+          callTool, dispatchWithFallback: dispatch,
           keepServe: true, signalReceived: () => false, resume: null,
         });
       },
@@ -2550,6 +2558,12 @@ describe("runChainDriver rework scheduling", () => {
         reviewResult("needs-attention", []),
         reviewResult("needs-attention", []),
       ],
+      // A "full" round IS the probe-failure rework (resolveReworkScope: no
+      // structured findings → the whole prior findingsText), so the red gate
+      // is what makes this the full-round chain the test is about.  Since
+      // kusabi #299, needs-attention naming nothing over GREEN probes is an
+      // incomplete review and escalates instead of reworking.
+      callTool: makeCallTool({ gatePassed: false }),
     });
     try {
       const text = await fx.run();
