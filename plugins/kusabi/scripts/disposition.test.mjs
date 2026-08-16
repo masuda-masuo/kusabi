@@ -25,7 +25,10 @@ describe("deriveDisposition", () => {
   });
 
   it("rework: needs-attention without repeated areas", () => {
-    const result = deriveDisposition({ verdict: "needs-attention", probesGreen: true, round: 1, maxRounds: 3, repeatedAreas: false });
+    // A named high finding is what makes this a rework: since kusabi #299 a
+    // needs-attention that names NOTHING over green probes escalates instead
+    // (there would be no work list to hand the implement).
+    const result = deriveDisposition({ verdict: "needs-attention", probesGreen: true, round: 1, maxRounds: 3, repeatedAreas: false, findingSeverities: ["high"] });
     assert.deepEqual(result, { disposition: "rework", reason: "needs-attention" });
   });
 
@@ -128,14 +131,83 @@ describe("deriveDisposition", () => {
     assert.deepEqual(result, { disposition: "escalate", reason: "approve-partial: unverified items remain" });
   });
 
-  it("today's behavior: undefined findingSeverities", () => {
+  // ---- needs-attention naming ZERO findings (kusabi #299) ----
+  // Both of these used to buy a rework round whose work list was empty.  They
+  // now escalate: over green probes there is nothing anywhere for an
+  // implement to act on, so the REVIEW is what is incomplete.
+
+  it("escalate: undefined findingSeverities + probes green (nothing to rework)", () => {
     const result = deriveDisposition({ verdict: "needs-attention", probesGreen: true, round: 1, maxRounds: 3, repeatedAreas: false });
-    assert.deepEqual(result, { disposition: "rework", reason: "needs-attention" });
+    assert.equal(result.disposition, "escalate");
+    // The reason must name the empty finding list, so the digest says why
+    // without the operator opening the round record.
+    assert.match(result.reason, /empty finding list|zero findings/);
   });
 
-  it("today's behavior: empty findingSeverities array", () => {
+  it("escalate: empty findingSeverities array + probes green (nothing to rework)", () => {
     const result = deriveDisposition({ verdict: "needs-attention", probesGreen: true, round: 1, maxRounds: 3, repeatedAreas: false, findingSeverities: [] });
-    assert.deepEqual(result, { disposition: "rework", reason: "needs-attention" });
+    assert.equal(result.disposition, "escalate");
+    assert.match(result.reason, /empty finding list|zero findings/);
+  });
+
+  it("escalate: a non-array findingSeverities is read as zero findings, not as a rework", () => {
+    // The malformed-review guard upstream can hand us a non-array; it means
+    // the same thing as an absent list: the reviewer named nothing.
+    const result = deriveDisposition({ verdict: "needs-attention", probesGreen: true, round: 1, maxRounds: 3, repeatedAreas: false, findingSeverities: "high" });
+    assert.equal(result.disposition, "escalate");
+    assert.match(result.reason, /empty finding list|zero findings/);
+  });
+
+  it("rework (unchanged): probes RED + zero findings still reworks — the probe failure is the work", () => {
+    for (const findingSeverities of [undefined, []]) {
+      const result = deriveDisposition({ verdict: "needs-attention", probesGreen: false, round: 1, maxRounds: 3, repeatedAreas: false, findingSeverities });
+      assert.deepEqual(result, { disposition: "rework", reason: "needs-attention" }, JSON.stringify(findingSeverities));
+    }
+  });
+
+  it("accept-with-followup (unchanged): non-empty minor findings still ship with a follow-up", () => {
+    const result = deriveDisposition({ verdict: "needs-attention", probesGreen: true, round: 1, maxRounds: 3, repeatedAreas: false, findingSeverities: ["low", "medium"] });
+    assert.deepEqual(result, { disposition: "accept-with-followup", reason: "probes green; remaining findings all minor" });
+  });
+
+  it("the zero-findings row does not preempt the repeatedAreas rows", () => {
+    // repeatedAreas names a concrete stall, which is the more informative
+    // thing to tell the operator; those rows keep their own reasons.
+    const strategize = deriveDisposition({ verdict: "needs-attention", probesGreen: true, round: 2, maxRounds: 3, repeatedAreas: true, strategizeEligible: true });
+    assert.equal(strategize.disposition, "strategize");
+    const escalate = deriveDisposition({ verdict: "needs-attention", probesGreen: true, round: 2, maxRounds: 3, repeatedAreas: true });
+    assert.deepEqual(escalate, { disposition: "escalate", reason: "same file area flagged for two consecutive rounds" });
+  });
+
+  it("the zero-findings row never fires for another verdict", () => {
+    // approve + green is still a clean accept; discard/approve-partial keep
+    // their own reasons.  Only needs-attention has the empty-work-list problem.
+    assert.deepEqual(
+      deriveDisposition({ verdict: "approve", probesGreen: true, round: 1, maxRounds: 3, repeatedAreas: false }),
+      { disposition: "accept" },
+    );
+    assert.deepEqual(
+      deriveDisposition({ verdict: "discard", probesGreen: true, round: 1, maxRounds: 3, repeatedAreas: false }),
+      { disposition: "escalate", reason: "reviewer discarded the work" },
+    );
+    assert.deepEqual(
+      deriveDisposition({ verdict: "approve-partial", probesGreen: true, round: 1, maxRounds: 3, repeatedAreas: false }),
+      { disposition: "escalate", reason: "approve-partial: unverified items remain" },
+    );
+  });
+
+  it("a qualifying refusal and an oracle violation still take precedence over the zero-findings row", () => {
+    const refused = deriveDisposition({
+      verdict: "needs-attention", probesGreen: true, round: 1, maxRounds: 3,
+      repeatedAreas: false, findingSeverities: [], refusal: "## A vs b.mjs",
+    });
+    assert.equal(refused.disposition, "refused-brief-defect");
+    const oracle = deriveDisposition({
+      verdict: "needs-attention", probesGreen: true, round: 1, maxRounds: 3,
+      repeatedAreas: false, findingSeverities: [], oracleViolation: "P5: frozen — tests/a.test.mjs",
+    });
+    assert.equal(oracle.disposition, "escalate");
+    assert.match(oracle.reason, /oracle violation/);
   });
 
   it("rework (unchanged): critical severity among lows", () => {
@@ -486,7 +558,10 @@ describe("deriveDisposition — oracle violation routing (kusabi #197)", () => {
     const rows = [
       { input: { verdict: "approve", probesGreen: true }, expected: { disposition: "accept" } },
       { input: { verdict: "approve", probesGreen: false }, expected: { disposition: "rework", reason: "deterministic probes failed" } },
-      { input: { verdict: "needs-attention", probesGreen: true }, expected: { disposition: "rework", reason: "needs-attention" } },
+      // The named finding is what keeps this a rework row: a needs-attention
+      // naming nothing over green probes escalates on its own (kusabi #299),
+      // which would make this row test that rule instead of the marker.
+      { input: { verdict: "needs-attention", probesGreen: true, findingSeverities: ["high"] }, expected: { disposition: "rework", reason: "needs-attention" } },
       { input: { verdict: "discard", probesGreen: true }, expected: { disposition: "escalate", reason: "reviewer discarded the work" } },
       { input: { verdict: "approve-partial", probesGreen: true }, expected: { disposition: "escalate", reason: "approve-partial: unverified items remain" } },
     ];

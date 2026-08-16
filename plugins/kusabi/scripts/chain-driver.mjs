@@ -89,6 +89,7 @@ import {
   summariseOracleViolations,
 } from "./chain-phases.mjs";
 import { captureWorktreeState } from "./worktree-baseline.mjs";
+import { roundDiscardReason } from "./render.mjs";
 
 // The companion side of the cycle documented above.
 import {
@@ -1428,7 +1429,12 @@ export async function runChainDriver({
       finalizeChainControl({ chainDir, status: "completed", round });
       return { done: true, text: finaliseChain(
         renderEscalateOutcome({ chainId, round, disposition, orchestrator, roundRecord, records }),
-        { disposition: "escalated", round, reason: disposition.reason || null },
+        // The persisted final record's reason must not read "reviewer
+        // discarded the work" for a round no reviewer ever saw (kusabi #299):
+        // a probe-sourced discard substitutes the probe wording, exactly as
+        // the outcome text does.  Reviewer-verdict discards keep the recorded
+        // reason.  roundDiscardReason owns the condition.
+        { disposition: "escalated", round, reason: roundDiscardReason(roundRecord, disposition.reason || null) },
         round,
       ) };
     }
