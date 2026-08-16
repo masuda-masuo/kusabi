@@ -262,11 +262,16 @@ export function resolveClaudeModel({ flag, phase, config }) {
 //     (the `shiori*` glob is granted IN FULL as `mcp__shiori__*` — the
 //     round-2 3-tool expansion was a narrowing and is replaced by the glob,
 //     which is valid in claude permission rules, I4).
-//   - kaiba (all three agents, kusabi #279): the `kaiba` server's two tools
-//     (`remember`/`recall`) — the shared conclusion store.  Granted
-//     directly, they mirror no opencode table; the server only enters the
-//     generated config when the host config carries `mcpServers.kaiba`, so
-//     the entries are inert on a machine that has not configured it.
+//   - kaiba (all three agents, kusabi #279): the shared conclusion store,
+//     granted READ-ONLY — `recall` only, never `remember`.  Write
+//     permission follows the inspection hierarchy: every agent dispatched
+//     here has its output inspected, so it reads the store, and the
+//     inspecting side (the orchestrator) is the only writer.  A worker that
+//     discovers a durable fact reports it and the orchestrator decides
+//     whether to file it.  Granted directly, this mirrors no opencode
+//     table; the server only enters the generated config when the host
+//     config carries `mcpServers.kaiba`, so the entry is inert on a machine
+//     that has not configured it.
 // Passed to `claude -p` via --allowedTools.  NEVER
 // --dangerously-skip-permissions.
 const IMPLEMENT_ALLOWED_TOOLS = [
@@ -291,11 +296,13 @@ const IMPLEMENT_ALLOWED_TOOLS = [
   "mcp__sunaba__verify_in_container",
   "mcp__sunaba__lint_in_container",
   "mcp__sunaba__type_check_in_container",
-  // kaiba (kusabi #279): the shared conclusion store, reachable from every
-  // worker phase.  The two tool definitions ride in every turn's context
-  // regardless — --allowedTools is a runtime guard, not a context filter —
-  // and that cost (two definitions per turn) is accepted deliberately.
-  "mcp__kaiba__remember",
+  // kaiba (kusabi #279): the shared conclusion store, readable from every
+  // worker phase — `recall` only.  `remember` is deliberately absent: the
+  // implementer's output is inspected, so it reads the store and reports
+  // durable facts in its final report for the orchestrator to file.  Both
+  // tool definitions ride in every turn's context regardless —
+  // --allowedTools is a runtime guard, not a context filter — and that cost
+  // is accepted deliberately.
   "mcp__kaiba__recall",
   "Skill", // mirrors `skill: kusabi-*: allow` in kusabi-implement.md
 ];
@@ -312,9 +319,10 @@ const REVIEW_ALLOWED_TOOLS = [
   "mcp__sunaba__lint_in_container",
   "mcp__sunaba__type_check_in_container",
   "mcp__sunaba__sandbox_exec",
-  // kaiba (kusabi #279): the shared conclusion store — the same two tools
-  // as implement; INVESTIGATE inherits them via the spread below.
-  "mcp__kaiba__remember",
+  // kaiba (kusabi #279): the shared conclusion store — read-only, as for
+  // implement; INVESTIGATE inherits the grant via the spread below.  The
+  // reviewer is an inspected phase too: what it concludes goes in the
+  // review, and filing stays with the orchestrator.
   "mcp__kaiba__recall",
 ];
 
