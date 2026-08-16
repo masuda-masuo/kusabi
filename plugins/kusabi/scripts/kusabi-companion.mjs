@@ -60,6 +60,8 @@ import { computeReport, renderReportText, renderReportJson, missingStoreReport, 
 // cmdTask can call them directly, and re-exported for test compatibility.
 import {
   collectContainerReviewInput,
+  // The chain's container header, shared with `task --container` (kusabi #289).
+  withContainerWorkspace,
 } from "./chain-phases.mjs";
 
 // Import the probe functions locally so cmdTask can call them directly.
@@ -409,6 +411,87 @@ export function readBriefFile(flags, text) {
     }
   }
   return text;
+}
+
+// ---------------------------------------------------------------------------
+// dispatch-time brief lint (kusabi #289)
+// ---------------------------------------------------------------------------
+
+/**
+ * The dispatch-time refusal text for a brief that is missing something the
+ * companion MACHINE-READS, or null when nothing required is missing.
+ *
+ * This is a REFUSAL in the shape of the lossy-smoke check (kusabi #250,
+ * `smokeViolationReport`): same stage (before any job directory or chain
+ * state exists), same self-explaining tone, and every line names both the
+ * offending part and the remedy — a denial without the remedy just pushes the
+ * author onto a worse path.
+ *
+ * The gap it closes is that absence was SILENT.  The companion parses the
+ * signature line, `## Deliverables` and `## Smoke`, but a brief missing one of
+ * them dispatched anyway: the deliverables probe then discards a round whose
+ * section never existed, an unsigned brief cannot be attributed back to who
+ * wrote it, and an implement worker with neither `--container` nor a
+ * `## Workplace` section has nowhere to read its container id from (the
+ * kusabi #289 incident).  All three are decidable from the brief text and the
+ * flags, with no I/O, so the cheap moment to stop is before dispatch.
+ *
+ * Scope, deliberately narrow (kusabi #289 non-goals): nothing here changes
+ * what a section MEANS or how it parses — only whether absence refuses.  The
+ * deliverables and container-source rules apply to the implement phase and to
+ * a chain being started (an implement chain); other phases keep exactly the
+ * brief requirements they had, plus the signature line.  An ad-hoc `task`
+ * with no `--phase` at all is not a phase dispatch and is left alone: it is
+ * the `/kusabi:task <free text>` surface, not an orchestrator's brief.
+ *
+ * The container-source rule never fires for a chain: `chain` refuses without
+ * `--container` on its own, ahead of this call, with a message that already
+ * names the flag.
+ *
+ * @param {object} opts
+ * @param {string|null|undefined} opts.brief      The brief text.
+ * @param {string|null} [opts.phase]              The resolved --phase, or null.
+ * @param {string|null} [opts.container]          The --container value, or null.
+ * @param {boolean} [opts.chain=false]            True when a chain is starting.
+ * @returns {string|null}
+ */
+export function briefLintReport({ brief, phase = null, container = null, chain = false }) {
+  const isImplement = chain || phase === "implement";
+  const problems = [];
+
+  if (isImplement && parseDeliverables(brief).length === 0) {
+    problems.push(
+      "  - `## Deliverables` is absent or parses to zero entries: the deliverables probe reads that " +
+      "section, and a round that changes none of the files it names is discarded. Add the section " +
+      "and list the files that must change, one per bullet, each path backtick-quoted."
+    );
+  }
+
+  if (isImplement && !container && !hasSectionHeading(brief, "Workplace")) {
+    problems.push(
+      "  - no container source for the implement phase: neither `--container <cid>` on the command " +
+      "line nor a `## Workplace` section in the brief. The worker cannot guess a container name " +
+      "(kusabi #289: ten failed sandbox_attach guesses, 171s, zero edits). Pass `--container <cid>`, " +
+      "or name the container in a `## Workplace` section of the brief."
+    );
+  }
+
+  if ((chain || phase) && !parseOrchestratorSignature(brief)) {
+    problems.push(
+      "  - the orchestrator signature line is absent: add " +
+      "`Orchestrator: <model-id> | session <id> | <date>` among the FIRST 5 lines of the brief. " +
+      "Without it the job/chain record carries no orchestrator, and discard/rework rates cannot be " +
+      "attributed back to who wrote the brief."
+    );
+  }
+
+  if (problems.length === 0) return null;
+  return [
+    `brief rejected before dispatch: ${problems.length} required brief item` +
+    `${problems.length === 1 ? " is" : "s are"} missing (kusabi #289). ` +
+    "Nothing was started; fix the brief and re-run.",
+    ...problems,
+  ].join("\n");
 }
 
 // ---------------------------------------------------------------------------
@@ -955,6 +1038,16 @@ async function cmdTask(cwd, { flags, text }) {
       "Run the task on the opencode or claude backend, which enforce it."
     );
   }
+  // ---- dispatch-time brief lint (kusabi #289) ----
+  // A brief missing a machine-read section used to dispatch anyway and the
+  // gap surfaced a round later.  Refuse here: the last point before anything
+  // outside this process happens — no job record, no container read, no
+  // dispatch.  It sits AFTER the command-start config/session guards above on
+  // purpose: those describe a broken invocation rather than a broken brief,
+  // and their messages are the more specific answer when both are wrong.
+  const lintRejection = briefLintReport({ brief: text, phase, container: flags.container ?? null });
+  if (lintRejection) throw new Error(lintRejection);
+
   // ---- record baseSha before dispatching the job if --container (for probe comparison) ----
   let taskBaseSha = null;
   if (flags.container) {
@@ -975,9 +1068,15 @@ async function cmdTask(cwd, { flags, text }) {
   const taskReviewInput = await buildTaskReviewInput({ phase, flags });
 
   const guardrails = fs.readFileSync(path.join(PLUGIN_ROOT, "prompts", "task-guardrails.md"), "utf8").trim();
-  const taskPromptText = taskReviewInput
+  let taskPromptText = taskReviewInput
     ? `${guardrails}\n\n<task>\n${text}\n</task>\n\n${taskReviewInput}`
     : `${guardrails}\n\n<task>\n${text}\n</task>`;
+  // kusabi #289: `--container` was recorded on the job and used for the
+  // probes, but never DELIVERED to the worker — the chain injects it into the
+  // implement prompt, the task path did not.  Same helper, so the wording
+  // cannot drift and a brief that also names its workplace is a harmless
+  // duplicate; a no-op when `--container` was not given.
+  taskPromptText = withContainerWorkspace(taskPromptText, flags.container);
   const { job, resultText } = await dispatch({
     cwd,
     kind: "task",

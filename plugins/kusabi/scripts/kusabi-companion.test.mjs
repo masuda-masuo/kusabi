@@ -16,7 +16,12 @@ import {
   buildTaskReviewInput,
   resolveOrchestratorRecord,
   ORCH_SESSION_ENV,
+  briefLintReport,
 } from "./kusabi-companion.mjs";
+// The container header the chain injects into its implement prompt, and the
+// builder that injects it: the #289 suite at the end of this file asserts the
+// task path now sends the very same text (one wording, two paths).
+import { withContainerWorkspace, buildImplementText } from "./chain-phases.mjs";
 // Two suites below straddle the kusabi #264 PR 2/2 split and stayed here on
 // purpose (see the banner above each): the chain-finally serve-stop guard,
 // which shares the serve fixture of the two serve-stop suites around it, and
@@ -3826,7 +3831,17 @@ describe("smoke-brief refusal (kusabi #250)", () => {
     it("lets a clean smoke brief through the check (fails later, on dispatch)", () => {
       const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-smoke-chain-"));
       try {
-        const result = runChain("# Task\n\n## Smoke\n\n- `npm test`\n", tmp);
+        // The brief also carries the signature line and `## Deliverables`:
+        // both became dispatch-time requirements for a chain in kusabi #289,
+        // and this test asserts that NO refusal fires — so the brief has to be
+        // one the whole dispatch boundary accepts, not just the #250 smoke
+        // check.  Nothing else about the test changed.
+        const result = runChain(
+          "# Task\n\nOrchestrator: test-model | session s-1 | 2026-08-16\n\n"
+          + "## Deliverables\n\n- `plugins/kusabi/scripts/x.mjs`\n\n"
+          + "## Smoke\n\n- `npm test`\n",
+          tmp,
+        );
         // The dispatch itself cannot succeed here (dead sunaba endpoint); what
         // matters is that the failure is NOT the smoke refusal.
         assert.doesNotMatch(result.stdout, /brief rejected before dispatch/);
@@ -3972,5 +3987,314 @@ describe("install-cli with a missing skill source (kusabi #256)", () => {
     }
     // The shim — install-cli's primary job — is still written and reported.
     assert.match(result.stdout, /^created: .*kusabi-companion$/m);
+  });
+});
+
+// =========================================================================
+// the dispatch boundary delivers the container and refuses a broken brief
+// (kusabi #289)
+// -------------------------------------------------------------------------
+// Two gaps, both hit live on 2026-08-16.  (1) `task --phase implement
+// --container <cid>` recorded the id on the job and ran its probes with it,
+// but never told the WORKER: the chain injects the id into its implement
+// prompt, the task path did not, and a worker whose brief carried no
+// `## Workplace` section guessed ten `sandbox_attach` names, all failed, and
+// finished 171s with zero edits.  (2) The companion machine-reads the
+// signature line and `## Deliverables`, but absence was silent -- the brief
+// dispatched anyway and the gap surfaced a round later.  The refusal follows
+// the #250 lossy-smoke shape: before any state exists, naming the missing
+// item AND the remedy.
+// =========================================================================
+
+describe("brief lint and container delivery (kusabi #289)", () => {
+  const COMPANION_SCRIPT = path.join(import.meta.dirname, "kusabi-companion.mjs");
+  const SIGNATURE = "Orchestrator: claude-fable-5 | session wsl-test-1 | 2026-08-16";
+  const DELIVERABLES = "## Deliverables\n\n- `plugins/kusabi/scripts/kusabi-companion.mjs`\n";
+  // The shape of the brief in the live incident: signed, with deliverables,
+  // and with nothing anywhere that names a container.
+  const NO_WORKPLACE = `# Task\n\n${SIGNATURE}\n\n${DELIVERABLES}`;
+
+  describe("briefLintReport", () => {
+    it("passes an implement brief whose container comes from --container", () => {
+      assert.equal(
+        briefLintReport({ brief: NO_WORKPLACE, phase: "implement", container: "cid-1" }),
+        null,
+      );
+    });
+
+    it("passes an implement brief whose container comes from ## Workplace", () => {
+      const brief = `${NO_WORKPLACE}\n## Workplace\n\nContainer \`cid-1\` (kusabi main).\n`;
+      assert.equal(briefLintReport({ brief, phase: "implement", container: null }), null);
+    });
+
+    it("refuses an implement dispatch with neither source, naming both remedies", () => {
+      const report = briefLintReport({ brief: NO_WORKPLACE, phase: "implement", container: null });
+      assert.ok(report, "the incident brief must be refused");
+      assert.match(report, /brief rejected before dispatch/);
+      assert.match(report, /no container source/);
+      assert.match(report, /--container <cid>/);
+      assert.match(report, /## Workplace/);
+    });
+
+    it("refuses an implement dispatch whose ## Deliverables is absent, naming the section", () => {
+      const report = briefLintReport({
+        brief: `# Task\n\n${SIGNATURE}\n`,
+        phase: "implement",
+        container: "cid-1",
+      });
+      assert.ok(report);
+      assert.match(report, /## Deliverables/);
+    });
+
+    it("refuses a ## Deliverables heading that parses to zero entries", () => {
+      const report = briefLintReport({
+        brief: `# Task\n\n${SIGNATURE}\n\n## Deliverables\n\nTo be decided by the worker.\n`,
+        phase: "implement",
+        container: "cid-1",
+      });
+      assert.ok(report, "a heading with no parseable entry is the same failure as no heading");
+      assert.match(report, /## Deliverables/);
+    });
+
+    it("refuses a brief with no signature line, for every phase", () => {
+      const brief = `# Task\n\n${DELIVERABLES}\n## Workplace\n\nContainer \`cid-1\`.\n`;
+      for (const phase of ["draft", "investigate", "implement", "review", "respond", "salvage", "gofer"]) {
+        const report = briefLintReport({ brief, phase, container: "cid-1" });
+        assert.ok(report, `${phase} must be refused`);
+        assert.ok(
+          report.includes("Orchestrator: <model-id> | session <id> | <date>"),
+          `${phase}: the refusal must show the line to add, got: ${report}`,
+        );
+      }
+    });
+
+    it("adds nothing but the signature line to the non-implement phases", () => {
+      // Non-goal of #289: investigate/review/... keep the brief requirements
+      // they already had.  No Deliverables, no Workplace, no container.
+      for (const phase of ["draft", "investigate", "review", "respond", "salvage", "gofer"]) {
+        assert.equal(
+          briefLintReport({ brief: `# Task\n\n${SIGNATURE}\n\nLook into it.\n`, phase, container: null }),
+          null,
+          phase,
+        );
+      }
+    });
+
+    it("leaves an ad-hoc task with no --phase alone", () => {
+      // `/kusabi:task <free text>` is not an orchestrator's brief; the lint
+      // covers phase dispatches and chains.
+      assert.equal(briefLintReport({ brief: "look at the flaky test in x.mjs" }), null);
+    });
+
+    it("requires deliverables and a signature when a chain starts, listing every miss at once", () => {
+      const report = briefLintReport({ brief: "# Task\n\nImplement it.\n", container: "cid-1", chain: true });
+      assert.ok(report);
+      assert.match(report, /2 required brief items are missing/);
+      assert.match(report, /## Deliverables/);
+      assert.ok(report.includes("Orchestrator: <model-id>"));
+      // `chain` refuses a missing --container on its own, before this call:
+      // the container-source line must not double up on that message.
+      assert.doesNotMatch(report, /no container source/);
+    });
+
+    it("counts one problem in the singular", () => {
+      const report = briefLintReport({
+        brief: `# Task\n\n${DELIVERABLES}`,
+        phase: "implement",
+        container: "cid-1",
+      });
+      assert.match(report, /1 required brief item is missing/);
+    });
+  });
+
+  describe("withContainerWorkspace", () => {
+    it("names the exact container id and forbids guessing", () => {
+      const out = withContainerWorkspace("BODY", "25d03f038ba3");
+      assert.match(out, /^The workspace lives inside container `25d03f038ba3`\./);
+      assert.match(out, /Do not guess container names or call sandbox_attach\./);
+      assert.ok(out.endsWith("\n\nBODY"));
+    });
+
+    it("is a no-op without a container", () => {
+      assert.equal(withContainerWorkspace("BODY", null), "BODY");
+      assert.equal(withContainerWorkspace("BODY", undefined), "BODY");
+      assert.equal(withContainerWorkspace("BODY", ""), "BODY");
+    });
+
+    it("is the very text the chain's implement prompt carries (one wording, two paths)", () => {
+      const brief = "# Task\n\ndo it";
+      assert.equal(
+        buildImplementText({ round: 1, brief, container: "cid-1" }),
+        withContainerWorkspace(brief, "cid-1"),
+      );
+    });
+  });
+
+  describe("wiring (source guards)", () => {
+    // cmdTask is not exported; these pin the two orderings the change is
+    // about, the way the #204 review-input wiring test does.
+    const companionSource = fs.readFileSync(COMPANION_SCRIPT, "utf8");
+    const cmdTaskSource = companionSource.slice(
+      companionSource.indexOf("async function cmdTask("),
+      companionSource.indexOf("async function cmdReview("),
+    );
+
+    it("cmdTask prefixes the dispatched prompt with the container workspace header", () => {
+      assert.ok(cmdTaskSource.includes("withContainerWorkspace(taskPromptText, flags.container)"));
+      assert.ok(cmdTaskSource.includes("promptText: taskPromptText"));
+    });
+
+    it("cmdTask lints before it reads the container and before it dispatches", () => {
+      const lintAt = cmdTaskSource.indexOf("briefLintReport(");
+      assert.ok(lintAt > 0, "cmdTask must call the lint");
+      assert.ok(lintAt < cmdTaskSource.indexOf("let taskBaseSha"), "the lint precedes the container read");
+      assert.ok(lintAt < cmdTaskSource.indexOf("await dispatch({"), "the lint precedes the dispatch");
+    });
+
+    it("cmdChain lints before any chain state exists", () => {
+      const driverSource = fs.readFileSync(path.join(import.meta.dirname, "chain-driver.mjs"), "utf8");
+      const cmdChainSource = driverSource.slice(driverSource.indexOf("export async function cmdChain("));
+      const lintAt = cmdChainSource.indexOf("briefLintReport(");
+      assert.ok(lintAt > 0, "cmdChain must call the lint");
+      assert.ok(lintAt < cmdChainSource.indexOf("createChainDir(stateDir)"), "the lint precedes createChainDir");
+    });
+  });
+
+  describe("CLI", () => {
+    function briefFile(tmp, text) {
+      const file = path.join(tmp, "brief.md");
+      fs.writeFileSync(file, text, "utf8");
+      return file;
+    }
+
+    function workspaceStateDir(tmp) {
+      const hash = crypto.createHash("sha256").update(tmp).digest("hex").slice(0, 12);
+      return path.join(tmp, "state", hash);
+    }
+
+    function run(args, tmp) {
+      const env = { ...process.env };
+      delete env.KUSABI_WORKER_CONTEXT;
+      env.KUSABI_STATE_DIR = path.join(tmp, "state");
+      env.KUSABI_SUNABA_URL = "http://127.0.0.1:9/mcp";
+      env.OPENCODE_BIN = path.join(tmp, "no-such-opencode-bin");
+      return spawnSync(process.execPath, [COMPANION_SCRIPT, ...args], {
+        encoding: "utf8", cwd: tmp, env, timeout: 20_000,
+      });
+    }
+
+    it("refuses task --phase implement with no container source, before any job exists", () => {
+      const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-289-task-"));
+      try {
+        const result = run(["task", "--phase", "implement", "--brief-file", briefFile(tmp, NO_WORKPLACE)], tmp);
+        assert.notEqual(result.status, 0, result.stdout);
+        assert.match(result.stdout, /brief rejected before dispatch/);
+        assert.match(result.stdout, /no container source/);
+        assert.match(result.stdout, /## Workplace/);
+        assert.deepEqual(fs.readdirSync(path.join(workspaceStateDir(tmp), "jobs")), [], "no job may be created");
+      } finally {
+        fs.rmSync(tmp, { recursive: true, force: true });
+      }
+    });
+
+    it("refuses an unsigned brief on a phase with no other requirement", () => {
+      const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-289-sig-"));
+      try {
+        const result = run(
+          ["task", "--phase", "review", "--brief-file", briefFile(tmp, "# Task\n\nReview the diff.\n")],
+          tmp,
+        );
+        assert.notEqual(result.status, 0, result.stdout);
+        assert.match(result.stdout, /brief rejected before dispatch/);
+        assert.ok(result.stdout.includes("Orchestrator: <model-id> | session <id> | <date>"), result.stdout);
+        assert.deepEqual(fs.readdirSync(path.join(workspaceStateDir(tmp), "jobs")), [], "no job may be created");
+      } finally {
+        fs.rmSync(tmp, { recursive: true, force: true });
+      }
+    });
+
+    it("refuses a chain whose brief has no ## Deliverables, before the chain dir exists", () => {
+      const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-289-chain-"));
+      try {
+        const result = run(
+          ["chain", "--container", "cid-1", "--brief-file", briefFile(tmp, `# Task\n\n${SIGNATURE}\n\nImplement it.\n`)],
+          tmp,
+        );
+        assert.notEqual(result.status, 0, result.stdout);
+        assert.match(result.stdout, /brief rejected before dispatch/);
+        assert.match(result.stdout, /## Deliverables/);
+        assert.equal(
+          fs.existsSync(path.join(workspaceStateDir(tmp), "chains")),
+          false,
+          "no chain state may be created",
+        );
+      } finally {
+        fs.rmSync(tmp, { recursive: true, force: true });
+      }
+    });
+
+    // The live incident, end to end: the worker prompt that actually reaches
+    // the spawned CLI must name the container.  The claude backend is used
+    // because its prompt travels on stdin, where a fake binary can record it.
+    const FAKE_CLAUDE = [
+      "#!/usr/bin/env node",
+      "import fs from \"node:fs\";",
+      "fs.appendFileSync(process.env.FAKE_CLAUDE_STDIN_LOG, fs.readFileSync(0, \"utf8\"));",
+      "process.stdout.write(JSON.stringify({",
+      "  type: \"result\", is_error: false, result: \"done\", session_id: \"claude-289\",",
+      "  usage: {}, total_cost_usd: 0, duration_ms: 5, num_turns: 1,",
+      "}));",
+      "",
+    ].join("\n");
+
+    it("delivers the container id into the worker prompt of task --phase implement --container", () => {
+      const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-289-deliver-"));
+      try {
+        const binPath = path.join(tmp, "fake-claude.mjs");
+        fs.writeFileSync(binPath, FAKE_CLAUDE, "utf8");
+        fs.chmodSync(binPath, 0o755);
+        const stdinLog = path.join(tmp, "stdin.txt");
+        fs.writeFileSync(stdinLog, "", "utf8");
+        const mcpSource = path.join(tmp, "claude.json");
+        fs.writeFileSync(mcpSource, JSON.stringify({
+          mcpServers: { sunaba: { command: "npx", args: ["-y", "@sunaba/mcp-server"] } },
+        }), "utf8");
+        const stateDir = path.join(tmp, "state");
+        fs.mkdirSync(stateDir, { recursive: true });
+        fs.writeFileSync(
+          path.join(stateDir, "config.json"),
+          JSON.stringify({ models: { phases: { implement: ["claude/sonnet"] } } }),
+          "utf8",
+        );
+
+        const env = { ...process.env };
+        delete env.KUSABI_WORKER_CONTEXT;
+        env.KUSABI_STATE_DIR = stateDir;
+        env.KUSABI_SUNABA_URL = "http://127.0.0.1:9/mcp";
+        env.CLAUDE_BIN = binPath;
+        env.KUSABI_CLAUDE_MCP_SOURCE = mcpSource;
+        env.FAKE_CLAUDE_STDIN_LOG = stdinLog;
+
+        const result = spawnSync(
+          process.execPath,
+          [
+            COMPANION_SCRIPT, "task", "--phase", "implement", "--container", "cid-289",
+            "--brief-file", briefFile(tmp, NO_WORKPLACE),
+          ],
+          { encoding: "utf8", cwd: tmp, env, timeout: 30_000 },
+        );
+
+        const prompt = fs.readFileSync(stdinLog, "utf8");
+        assert.ok(
+          prompt.includes("The workspace lives inside container `cid-289`"),
+          `the worker prompt must name the container; got stdout=${result.stdout} stderr=${result.stderr} prompt=${prompt.slice(0, 400)}`,
+        );
+        // The brief itself still travels, unchanged, in the task block.
+        assert.match(prompt, /<task>/);
+        assert.ok(prompt.includes(SIGNATURE), prompt.slice(0, 400));
+      } finally {
+        fs.rmSync(tmp, { recursive: true, force: true });
+      }
+    });
   });
 });

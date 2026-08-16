@@ -89,6 +89,7 @@ import { captureWorktreeState } from "./worktree-baseline.mjs";
 // The companion side of the cycle documented above.
 import {
   readBriefFile,
+  briefLintReport,
   resolveOrchestratorRecord,
   loadConfig,
   resolveDispatchBackend,
@@ -378,9 +379,23 @@ export async function cmdChain(cwd, { flags, text }) {
     ? resolveDispatchBackend({ flags, phase: "rework", config })
     : implementDispatch;
   const reviewDispatch = resolveDispatchBackend({ flags, phase: "review", config });
-  const { chainId, chainDir } = createChainDir(stateDir);
+  // Both checked BEFORE createChainDir (kusabi #289): a refusal must leave no
+  // chain state behind, and the container requirement used to fire one line
+  // after the directory it orphaned.  The message is unchanged, and it stays
+  // ahead of the lint so `chain` without --container keeps naming the flag
+  // rather than reporting a missing container SOURCE.
   const container = flags.container;
   if (!container) throw new Error("chain requires --container <cid>");
+
+  // ---- dispatch-time brief lint (kusabi #289) ----
+  // A chain being started is an implement dispatch, so it carries the
+  // implement requirements: `## Deliverables` (the probe reads it every
+  // round) and the signature line.  Same stage as the smoke refusal above and
+  // as the :variant rejection: nothing has been created yet.
+  const lintRejection = briefLintReport({ brief: text, container, chain: true });
+  if (lintRejection) throw new Error(lintRejection);
+
+  const { chainId, chainDir } = createChainDir(stateDir);
   const maxRounds = Number(flags["max-rounds"] ?? 4); // B6: default maxRounds is 4
   const brief = text;
 
