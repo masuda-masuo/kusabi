@@ -3,10 +3,16 @@ import assert from "node:assert/strict";
 import os from "node:os";
 import path from "node:path";
 import fs from "node:fs";
+import http from "node:http";
+import { spawn } from "node:child_process";
 import { dispatchWithFallback } from "./prompt-execution.mjs";
 import { claudeDispatch } from "./claude-dispatch.mjs";
+import { createFakeCallTool, FAKE_HEAD_SHA } from "./fixtures.mjs";
 import {
   publishWarningForBrief,
+  smokeBaselineReport,
+  renderSmokeBaselineReport,
+  renderSmokeDirtReport,
   runChainDriver,
   effectiveTierCount,
   renderChainBanner,
@@ -23,6 +29,7 @@ import {
 import {
   resolveChainResume,
   computeChainTotals,
+  runSmokeProbe,
 } from "./chain-phases.mjs";
 import { readJson, writeJson } from "./state-paths.mjs";
 
@@ -3261,6 +3268,936 @@ describe("runChainDriver resumed-accept oracle re-validation (kusabi #197 follow
       assert.equal(control.status, "completed");
       assert.equal(control.round, 1);
     } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+});
+
+// =========================================================================
+// smoke baseline probe — dispatch is refused when the declared smoke is
+// already red (kusabi #292)
+// -------------------------------------------------------------------------
+// P4 runs AFTER a round, against the worker's changes.  A `## Smoke` line
+// that could not pass BEFORE anything was touched — pre-existing debt in the
+// target files, or a command that cannot pass in the probe shell — therefore
+// surfaces a full round later and reads exactly like a failed round.  The
+// baseline runs the same commands through the same executor on the checkout
+// as handed over, and refuses the dispatch instead.
+// =========================================================================
+
+describe("smokeBaselineReport (kusabi #292)", () => {
+  const SMOKE_BRIEF = "# Task\n\n## Smoke\n\n- `npm test`\n";
+
+  it("executes nothing and returns null when the brief declares no smoke", async () => {
+    // The guard only ever guards DECLARED smoke: a brief without the section
+    // must reach the worker having spent no container call at all.
+    const calls = [];
+    const spyCallTool = async (toolName, params) => {
+      calls.push([toolName, params]);
+      return { output: "" };
+    };
+    const noSmoke = "Implement X.\n\n## Deliverables\n- src/foo.js\n";
+    assert.equal(await smokeBaselineReport({ brief: noSmoke, callTool: spyCallTool, container: "cid" }), null);
+    assert.equal(await smokeBaselineReport({ brief: "", callTool: spyCallTool, container: "cid" }), null);
+    assert.equal(await smokeBaselineReport({ brief: null, callTool: spyCallTool, container: "cid" }), null);
+    assert.deepEqual(calls, [], "no smoke declared must mean no baseline execution");
+  });
+
+  it("returns null when the declared smoke is green on the pristine checkout", async () => {
+    const report = await smokeBaselineReport({
+      brief: SMOKE_BRIEF,
+      callTool: createFakeCallTool({ exitCode: 0 }),
+      container: "fake-cid",
+    });
+    assert.equal(report, null);
+  });
+
+  it("refuses with the failing command, both exit codes, and the pre-dates statement", async () => {
+    const report = await smokeBaselineReport({
+      brief: SMOKE_BRIEF,
+      callTool: createFakeCallTool({ exitCode: 1, capturedOutput: "1 test failed" }),
+      container: "fake-cid",
+    });
+    assert.ok(report, "a red baseline must produce a refusal");
+    assert.match(report, /`npm test`/);
+    assert.match(report, /expected exit 0/);
+    assert.match(report, /observed exit 1/);
+    // The whole point of the refusal: the author must read it as "the brief or
+    // the baseline is at fault", never as a worker's failed round.
+    assert.match(report, /before any worker change/);
+    // The captured output rides along, as it does in the post-round detail —
+    // otherwise the author has to re-measure by hand to see why it is red.
+    assert.match(report, /1 test failed/);
+  });
+
+  it("compares against the declared `exit <N>` expectation", async () => {
+    const brief = "## Smoke\n\n- `bash -c 'exit 2'` (exit 2)\n";
+    assert.equal(
+      await smokeBaselineReport({ brief, callTool: createFakeCallTool({ exitCode: 2 }), container: "cid" }),
+      null,
+    );
+    const report = await smokeBaselineReport({
+      brief,
+      callTool: createFakeCallTool({ exitCode: 0 }),
+      container: "cid",
+    });
+    assert.ok(report, "exit 0 against a declared exit 2 is still a red baseline");
+    assert.match(report, /expected exit 2, observed exit 0/);
+  });
+
+  it("does not report an unobservable exit code as a mismatch", async () => {
+    const report = await smokeBaselineReport({
+      brief: SMOKE_BRIEF,
+      callTool: createFakeCallTool({ omitMarker: true }),
+      container: "cid",
+    });
+    assert.ok(report);
+    assert.match(report, /exit code could not be observed/);
+    assert.ok(!report.includes("observed exit"), report);
+  });
+
+  it("reports a timed-out command as timed out, not as an exit code", async () => {
+    const report = await smokeBaselineReport({
+      brief: SMOKE_BRIEF,
+      callTool: createFakeCallTool({ timeoutAsData: true }),
+      container: "cid",
+    });
+    assert.ok(report);
+    assert.match(report, /timed out with no exit code/);
+    assert.ok(!report.includes("observed exit"), report);
+  });
+
+  it("names every failing entry when the brief declares several", async () => {
+    const brief = "## Smoke\n\n- `npm test`\n- `npm run lint`\n";
+    const report = await smokeBaselineReport({
+      brief,
+      callTool: createFakeCallTool({ exitCode: 1 }),
+      container: "cid",
+    });
+    assert.ok(report);
+    assert.match(report, /`npm test`/);
+    assert.match(report, /`npm run lint`/);
+  });
+
+  it("agrees with the post-round probe: same executor, same verdict", async () => {
+    // The baseline must never be a second opinion about the same command —
+    // a baseline green that P4 would call red (or the reverse) would make the
+    // refusal untrustworthy in exactly the case it exists for.
+    for (const exitCode of [0, 1, 2]) {
+      const entries = [{ command: "npm test", expectedExit: 0 }];
+      const probe = await runSmokeProbe({
+        entries,
+        callTool: createFakeCallTool({ exitCode }),
+        container: "cid",
+        headingPresent: true,
+      });
+      const report = await smokeBaselineReport({
+        brief: SMOKE_BRIEF,
+        callTool: createFakeCallTool({ exitCode }),
+        container: "cid",
+      });
+      assert.equal(report === null, probe.passed, `exit ${exitCode}: baseline and P4 disagree`);
+    }
+  });
+
+  // A fake whose `git status --porcelain` answers are scripted per call; the
+  // smoke entry itself is served by createFakeCallTool's routing.  `statuses`
+  // holds one porcelain output per git-status call; a "!THROW!" entry makes
+  // that call throw, modelling an RPC failure mid-measurement.
+  function fakeCallToolWithGitStatus({ exitCode = 0, statuses = [] } = {}) {
+    let statusCalls = 0;
+    return async (toolName, params) => {
+      if (toolName !== "sandbox_exec") return { output: "" };
+      if (params.commands[0] === "git status --porcelain") {
+        const scripted = statuses[statusCalls] ?? "";
+        statusCalls++;
+        if (scripted === "!THROW!") throw new Error("rpc exploded");
+        return { output: scripted };
+      }
+      return createFakeCallTool({ exitCode })(toolName, params);
+    };
+  }
+
+  it("refuses a passing smoke that wrote to the worktree, naming what it added", async () => {
+    // The baseline runs in the very container the worker is then handed: a
+    // green exit code with write side effects is still a refusal, because the
+    // dirt would land in the round's diff and review as the worker's work.
+    const report = await smokeBaselineReport({
+      brief: SMOKE_BRIEF,
+      callTool: fakeCallToolWithGitStatus({
+        exitCode: 0,
+        statuses: ["", "?? coverage/\n M src/generated.js\n"],
+      }),
+      container: "cid",
+    });
+    assert.ok(report, "a smoke that dirtied the tree must be refused even though it passed");
+    assert.match(report, /modified the worktree/);
+    assert.match(report, /\?\? coverage\//);
+    assert.match(report, /M src\/generated\.js/);
+    assert.match(report, /no job and no round state exist/);
+  });
+
+  it("does not refuse a passing smoke that left the worktree unchanged", async () => {
+    const report = await smokeBaselineReport({
+      brief: SMOKE_BRIEF,
+      callTool: fakeCallToolWithGitStatus({ exitCode: 0, statuses: ["", ""] }),
+      container: "cid",
+    });
+    assert.equal(report, null);
+  });
+
+  it("refuses when a red smoke also dirtied the tree, naming both", async () => {
+    const report = await smokeBaselineReport({
+      brief: SMOKE_BRIEF,
+      callTool: fakeCallToolWithGitStatus({ exitCode: 1, statuses: ["", "?? build/\n"] }),
+      container: "cid",
+    });
+    assert.ok(report, "a red AND dirtying smoke is refused, with both facts reported");
+    assert.match(report, /`npm test`: expected exit 0, observed exit 1/);
+    assert.match(report, /modified the worktree/);
+    assert.match(report, /\?\? build\//);
+  });
+
+  it("refuses when the worktree state cannot be verified after the run", async () => {
+    // Fail-closed, like the probe's own "unobservable": a guard whose whole
+    // point is that the smoke left no dirt must not silently pass when the
+    // measurement that would prove it is unavailable.
+    const report = await smokeBaselineReport({
+      brief: SMOKE_BRIEF,
+      callTool: fakeCallToolWithGitStatus({ exitCode: 0, statuses: ["", "!THROW!"] }),
+      container: "cid",
+    });
+    assert.ok(report, "an unverifiable after-state is a refusal, not a pass");
+    assert.match(report, /could not be verified/);
+  });
+
+  it("ignores pre-existing dirt the smoke did not add", async () => {
+    // The comparison is the delta: whatever the prepared container already
+    // carried is not this smoke's doing, and not this refusal's business.
+    const report = await smokeBaselineReport({
+      brief: SMOKE_BRIEF,
+      callTool: fakeCallToolWithGitStatus({ exitCode: 0, statuses: [" M pre.js\n", " M pre.js\n"] }),
+      container: "cid",
+    });
+    assert.equal(report, null);
+  });
+});
+
+describe("renderSmokeDirtReport (kusabi #292)", () => {
+  const ok = (lines) => ({ ok: true, lines });
+
+  it("returns null when both captures are clean", () => {
+    assert.equal(renderSmokeDirtReport({ before: ok([]), after: ok([]) }), null);
+  });
+
+  it("names every line the smoke added and only those", () => {
+    const report = renderSmokeDirtReport({
+      before: ok([" M pre-existing.js"]),
+      after: ok([" M pre-existing.js", "?? coverage/", " M src/generated.js"]),
+    });
+    assert.ok(report);
+    assert.match(report, /\?\? coverage\//);
+    assert.match(report, /M src\/generated\.js/);
+    assert.doesNotMatch(report, /pre-existing/);
+  });
+
+  it("reports a failed capture as unverifiable, with the reason", () => {
+    const report = renderSmokeDirtReport({
+      before: { ok: false, reason: "git status could not be run: boom" },
+      after: ok([]),
+    });
+    assert.ok(report);
+    assert.match(report, /could not be verified/);
+    assert.match(report, /boom/);
+  });
+
+  it("treats missing captures defensively as failures", () => {
+    const report = renderSmokeDirtReport({ before: undefined, after: null });
+    assert.ok(report);
+    assert.match(report, /could not be verified/);
+    assert.match(report, /pre-run git status capture failed/);
+    assert.match(report, /post-run git status capture failed/);
+  });
+});
+
+// =========================================================================
+// the baseline's HEAD guard (kusabi #292 follow-up)
+// -------------------------------------------------------------------------
+// `git status --porcelain` cannot see a HEAD move: a smoke that commits, or
+// checks out another SHA, leaves a listing identical to the one taken before
+// it ran, so the dirt guard passes it.  captureBaseSha runs AFTER the
+// baseline, so that moved HEAD then becomes the chain's recorded base and
+// every later comparison silently measures the wrong tree.  HEAD is therefore
+// captured beside the listing, in the same before/after pair, and a move is
+// refused in the same shape as dirt.
+// =========================================================================
+
+describe("renderSmokeDirtReport HEAD guard (kusabi #292 follow-up)", () => {
+  const at = (head, lines = []) => ({ ok: true, lines, head });
+
+  it("returns null when HEAD is where it was, with a clean listing", () => {
+    assert.equal(renderSmokeDirtReport({ before: at("abc123"), after: at("abc123") }), null);
+  });
+
+  it("refuses when HEAD moved, naming both SHAs and not claiming dirt", () => {
+    const report = renderSmokeDirtReport({ before: at("abc123"), after: at("def456") });
+    assert.ok(report, "a moved HEAD must be refused even with an identical listing");
+    assert.match(report, /moved HEAD/);
+    assert.match(report, /abc123/);
+    assert.match(report, /def456/);
+    assert.match(report, /no job and no round state exist/);
+    // The listing WAS clean; saying otherwise would send the author hunting
+    // for files the smoke never wrote.
+    assert.doesNotMatch(report, /modified the worktree/);
+  });
+
+  it("names the base-SHA consequence, not just the move", () => {
+    // The refusal has to explain why a moved HEAD is worse than it looks: the
+    // chain's base is captured after the baseline, so nothing downstream ever
+    // reports this as wrong.
+    const report = renderSmokeDirtReport({ before: at("abc123"), after: at("def456") });
+    assert.match(report, /base SHA is captured after the baseline/);
+  });
+
+  it("reports a moved HEAD and added dirt as two separate refusals", () => {
+    const report = renderSmokeDirtReport({
+      before: at("abc123", [" M pre.js"]),
+      after: at("def456", [" M pre.js", "?? coverage/"]),
+    });
+    assert.ok(report);
+    assert.match(report, /moved HEAD/);
+    assert.match(report, /modified the worktree/);
+    assert.match(report, /\?\? coverage\//);
+    assert.doesNotMatch(report, /pre\.js/);
+  });
+
+  it("reports an unreadable HEAD as unverifiable, with the reason", () => {
+    const report = renderSmokeDirtReport({
+      before: at("abc123"),
+      after: { ok: false, reason: "git rev-parse HEAD could not be run: boom" },
+    });
+    assert.ok(report, "an unreadable HEAD is a refusal, not a pass");
+    assert.match(report, /could not be verified/);
+    assert.match(report, /git rev-parse HEAD could not be run: boom/);
+  });
+});
+
+describe("smokeBaselineReport HEAD guard (kusabi #292 follow-up)", () => {
+  const SMOKE_BRIEF = "# Task\n\n## Smoke\n\n- `npm test`\n";
+
+  // Scripts both halves of the guard's capture pair.  `statuses` holds one
+  // `git status --porcelain` output per call, `heads` one `git rev-parse HEAD`
+  // output per call; a "!THROW!" entry makes that call throw, modelling an RPC
+  // failure mid-measurement.  Unscripted calls fall through to
+  // createFakeCallTool, which reports FAKE_HEAD_SHA every time -- a container
+  // whose HEAD did not move.
+  function fakeCallToolWithContainerState({ exitCode = 0, statuses = [], heads = [] } = {}) {
+    let statusCalls = 0;
+    let headCalls = 0;
+    return async (toolName, params) => {
+      if (toolName !== "sandbox_exec") return { output: "" };
+      const cmd = params.commands[0];
+      if (cmd === "git status --porcelain") {
+        const scripted = statuses[statusCalls] ?? "";
+        statusCalls++;
+        if (scripted === "!THROW!") throw new Error("status rpc exploded");
+        return { output: scripted };
+      }
+      if (cmd === "git rev-parse HEAD" && headCalls < heads.length) {
+        const scripted = heads[headCalls];
+        headCalls++;
+        if (scripted === "!THROW!") throw new Error("rev-parse rpc exploded");
+        return { output: scripted };
+      }
+      return createFakeCallTool({ exitCode })(toolName, params);
+    };
+  }
+
+  it("refuses a green smoke that moved HEAD while leaving the listing clean", async () => {
+    const report = await smokeBaselineReport({
+      brief: SMOKE_BRIEF,
+      callTool: fakeCallToolWithContainerState({
+        exitCode: 0,
+        statuses: ["", ""],
+        heads: ["aaa111\n", "bbb222\n"],
+      }),
+      container: "cid",
+    });
+    assert.ok(report, "a smoke that committed must be refused even though nothing is dirty");
+    assert.match(report, /moved HEAD/);
+    assert.match(report, /aaa111/);
+    assert.match(report, /bbb222/);
+    assert.match(report, /no job and no round state exist/);
+    assert.doesNotMatch(report, /modified the worktree/);
+  });
+
+  it("does not refuse a green smoke that left both the listing and HEAD alone", async () => {
+    const report = await smokeBaselineReport({
+      brief: SMOKE_BRIEF,
+      callTool: fakeCallToolWithContainerState({
+        exitCode: 0,
+        statuses: [" M pre.js\n", " M pre.js\n"],
+        heads: [`${FAKE_HEAD_SHA}\n`, `${FAKE_HEAD_SHA}\n`],
+      }),
+      container: "cid",
+    });
+    assert.equal(report, null);
+  });
+
+  it("refuses when the pre-run HEAD read fails", async () => {
+    const report = await smokeBaselineReport({
+      brief: SMOKE_BRIEF,
+      callTool: fakeCallToolWithContainerState({ exitCode: 0, heads: ["!THROW!"] }),
+      container: "cid",
+    });
+    assert.ok(report, "an unread HEAD is a refusal, not a pass");
+    assert.match(report, /could not be verified/);
+    assert.match(report, /rev-parse rpc exploded/);
+  });
+
+  it("refuses when the post-run HEAD read fails", async () => {
+    const report = await smokeBaselineReport({
+      brief: SMOKE_BRIEF,
+      callTool: fakeCallToolWithContainerState({ exitCode: 0, heads: ["aaa111\n", "!THROW!"] }),
+      container: "cid",
+    });
+    assert.ok(report);
+    assert.match(report, /could not be verified/);
+    assert.match(report, /rev-parse rpc exploded/);
+  });
+
+  it("refuses when the HEAD read comes back empty", async () => {
+    // A working `git rev-parse HEAD` always prints a SHA, so an empty answer
+    // is a failed measurement -- not a HEAD that happens to equal the other
+    // empty answer, which is how a "" == "" comparison would read it.
+    const report = await smokeBaselineReport({
+      brief: SMOKE_BRIEF,
+      callTool: fakeCallToolWithContainerState({ exitCode: 0, heads: ["", ""] }),
+      container: "cid",
+    });
+    assert.ok(report, "an empty HEAD read must not be compared as if it were a SHA");
+    assert.match(report, /could not be verified/);
+    assert.match(report, /no SHA/);
+  });
+});
+
+describe("smoke baseline refusal wording: red vs unmeasurable (kusabi #292 follow-up)", () => {
+  const SMOKE_BRIEF = "# Task\n\n## Smoke\n\n- `npm test`\n";
+  const FIX_THE_BRIEF = /Fix the brief's smoke command/;
+
+  it("keeps the fix-the-brief wording for a command that ran and exited wrong", () => {
+    const report = renderSmokeBaselineReport({
+      entries: [{ command: "npm test", expectedExit: 0 }],
+      observed: [{ command: "npm test", observed: 1 }],
+    });
+    assert.match(report, /is already red on the checkout as handed to the worker/);
+    assert.match(report, FIX_THE_BRIEF);
+  });
+
+  it("keeps the fix-the-brief wording for a command that ran and timed out", () => {
+    // A timeout is a fact about the command: it WAS executed, it simply never
+    // finished.  That is the brief's smoke line (or the checkout) to fix.
+    const report = renderSmokeBaselineReport({
+      entries: [{ command: "npm test", expectedExit: 0 }],
+      observed: [{ command: "npm test", observed: "timeout" }],
+    });
+    assert.match(report, FIX_THE_BRIEF);
+  });
+
+  it("does not blame the brief when the call itself threw", () => {
+    // Nothing was learned about the command, so telling the author to go and
+    // rewrite a smoke line that may be perfectly correct is a wrong
+    // accusation -- and sends them to the wrong place while the container is
+    // the thing that is broken.
+    const report = renderSmokeBaselineReport({
+      entries: [{ command: "npm test", expectedExit: 0 }],
+      observed: [{ command: "npm test", observed: "Error: rpc exploded" }],
+    });
+    assert.ok(report);
+    assert.doesNotMatch(report, FIX_THE_BRIEF);
+    assert.match(report, /could not be measured/);
+    assert.match(report, /container or infrastructure failure/);
+    assert.match(report, /Check the container/);
+    // The failure itself is still named, per entry, exactly as before.
+    assert.match(report, /`npm test`: expected exit 0, could not be run: Error: rpc exploded/);
+  });
+
+  it("does not blame the brief when the exit code never came back", () => {
+    const report = renderSmokeBaselineReport({
+      entries: [{ command: "npm test", expectedExit: 0 }],
+      observed: [{ command: "npm test", observed: "unobservable" }],
+    });
+    assert.doesNotMatch(report, FIX_THE_BRIEF);
+    assert.match(report, /could not be measured/);
+  });
+
+  it("does not blame the brief when the entry was never executed", () => {
+    const report = renderSmokeBaselineReport({
+      entries: [{ command: "npm test", expectedExit: 0 }],
+      observed: [],
+    });
+    assert.doesNotMatch(report, FIX_THE_BRIEF);
+    assert.match(report, /not executed/);
+  });
+
+  it("keeps the fix-the-brief wording when one entry ran red and another could not be measured", () => {
+    // A genuinely red command IS present, so the author's fix list starts
+    // there; the unmeasured entry is still named on its own line.
+    const report = renderSmokeBaselineReport({
+      entries: [
+        { command: "npm test", expectedExit: 0 },
+        { command: "npm run lint", expectedExit: 0 },
+      ],
+      observed: [
+        { command: "npm test", observed: 1 },
+        { command: "npm run lint", observed: "Error: rpc exploded" },
+      ],
+    });
+    assert.match(report, FIX_THE_BRIEF);
+    assert.match(report, /`npm test`: expected exit 0, observed exit 1/);
+    assert.match(report, /`npm run lint`: expected exit 0, could not be run: Error: rpc exploded/);
+  });
+
+  it("carries the split wording through the baseline run itself", async () => {
+    const red = await smokeBaselineReport({
+      brief: SMOKE_BRIEF,
+      callTool: createFakeCallTool({ exitCode: 1 }),
+      container: "cid",
+    });
+    assert.match(red, FIX_THE_BRIEF);
+
+    const unmeasured = await smokeBaselineReport({
+      brief: SMOKE_BRIEF,
+      callTool: createFakeCallTool({ omitMarker: true }),
+      container: "cid",
+    });
+    assert.ok(unmeasured, "an unmeasurable baseline is still a refusal");
+    assert.doesNotMatch(unmeasured, FIX_THE_BRIEF);
+    assert.match(unmeasured, /could not be measured/);
+    assert.match(unmeasured, /exit code could not be observed/);
+  });
+});
+
+describe("renderSmokeBaselineReport (kusabi #292)", () => {
+  it("returns null when every entry met its expectation", () => {
+    assert.equal(renderSmokeBaselineReport({
+      entries: [{ command: "npm test", expectedExit: 0 }],
+      observed: [{ command: "npm test", observed: 0 }],
+    }), null);
+    assert.equal(renderSmokeBaselineReport({ entries: [], observed: [] }), null);
+  });
+
+  it("reports an entry with no observation as not executed", () => {
+    const report = renderSmokeBaselineReport({
+      entries: [{ command: "npm test", expectedExit: 0 }],
+      observed: [],
+    });
+    assert.match(report, /`npm test`: expected exit 0, not executed/);
+  });
+
+  it("keeps a passing entry out of the refusal", () => {
+    const report = renderSmokeBaselineReport({
+      entries: [
+        { command: "npm test", expectedExit: 0 },
+        { command: "npm run lint", expectedExit: 0 },
+      ],
+      observed: [
+        { command: "npm test", observed: 0 },
+        { command: "npm run lint", observed: 2 },
+      ],
+    });
+    assert.doesNotMatch(report, /npm test/);
+    assert.match(report, /`npm run lint`: expected exit 0, observed exit 2/);
+  });
+});
+
+describe("smoke baseline wiring (kusabi #292)", () => {
+  const driverSource = fs.readFileSync(path.join(import.meta.dirname, "chain-driver.mjs"), "utf8");
+  const companionSource = fs.readFileSync(path.join(import.meta.dirname, "kusabi-companion.mjs"), "utf8");
+
+  // The body of the top-level function starting at `anchor`, i.e. up to the
+  // next top-level export.
+  function functionSource(source, anchor) {
+    const start = source.indexOf(anchor);
+    assert.ok(start >= 0, `anchor not found: ${anchor}`);
+    const end = source.indexOf("\nexport ", start + anchor.length);
+    return source.slice(start, end === -1 ? undefined : end);
+  }
+
+  it("cmdChain runs the baseline before any chain state is created", () => {
+    const body = functionSource(driverSource, "export async function cmdChain(");
+    const baselineAt = body.indexOf("smokeBaselineReport(");
+    const createAt = body.indexOf("createChainDir(");
+    assert.ok(baselineAt > 0, "cmdChain must run the baseline");
+    assert.ok(createAt > 0, "cmdChain must still create the chain dir");
+    assert.ok(baselineAt < createAt, "the baseline must run before any chain state exists");
+  });
+
+  it("cmdChainResume performs no baseline execution", () => {
+    // By resume time the worktree carries the previous rounds' changes, so a
+    // baseline run there would measure the worker's work and call it the
+    // brief's fault.  #250's parse-time check is the only smoke guard on this
+    // path.
+    const body = functionSource(driverSource, "export async function cmdChainResume(");
+    assert.ok(!body.includes("smokeBaselineReport("), "resume must not re-run the baseline");
+    assert.ok(body.includes("smokeViolationReport("), "resume keeps the #250 parse check");
+    // One call site in the whole driver, and it is cmdChain's.
+    assert.equal(driverSource.split("await smokeBaselineReport(").length - 1, 1);
+  });
+
+  it("cmdTask runs the baseline before the dispatch", () => {
+    const body = companionSource.slice(
+      companionSource.indexOf("async function cmdTask("),
+      companionSource.indexOf("async function cmdReview("),
+    );
+    const baselineAt = body.indexOf("smokeBaselineReport(");
+    const dispatchAt = body.indexOf("await dispatch({");
+    assert.ok(baselineAt > 0, "cmdTask must run the baseline");
+    assert.ok(dispatchAt > 0, "cmdTask must still dispatch");
+    assert.ok(baselineAt < dispatchAt, "the baseline must run before the job is dispatched");
+  });
+});
+
+describe("CLI smoke baseline (kusabi #292)", () => {
+  const COMPANION_SCRIPT = path.join(import.meta.dirname, "kusabi-companion.mjs");
+
+  // A minimal sunaba MCP endpoint: callTool POSTs initialize (needs the
+  // mcp-session-id response header), notifications/initialized, then
+  // tools/call (parsed as SSE, unwrapped from result.content[0].text as
+  // JSON).  Every tools/call answers with the same tool result, which is all
+  // the baseline run needs: it is the FIRST container call the chain makes.
+  // The one exception is `git status --porcelain` \u2014 the baseline's worktree
+  // guard (kusabi #292) captures it before and after the smoke \u2014 which is
+  // routed to its own scripted output: a string answers every call the same
+  // way, an array one entry per call (a "!THROW!" entry makes the call throw).
+  // The SHA the stub reports for `git rev-parse HEAD` unless a test scripts
+  // something else: one value answering every call is a container whose HEAD
+  // never moved, which is what every pre-existing case here assumes.
+  const STUB_HEAD_SHA = "7c0ffee0000000000000000000000000deadbeef";
+
+  function startSunabaStub({ toolResult, gitStatus = "", gitHead = STUB_HEAD_SHA }) {
+    let gitStatusCalls = 0;
+    let gitHeadCalls = 0;
+    const server = http.createServer((req, res) => {
+      res.on("error", () => {});
+      let body = "";
+      req.on("data", (chunk) => { body += chunk; });
+      req.on("end", () => {
+        let payload = null;
+        try {
+          payload = JSON.parse(body);
+        } catch {
+          // not JSON \u2014 still answer the handshake
+        }
+        res.setHeader("mcp-session-id", "stub-session");
+        res.writeHead(200, { "content-type": "text/event-stream" });
+        let callResult = toolResult;
+        const isGitStatus = payload?.method === "tools/call"
+          && payload.params?.name === "sandbox_exec"
+          && payload.params?.arguments?.commands?.[0] === "git status --porcelain";
+        if (isGitStatus) {
+          const statuses = Array.isArray(gitStatus) ? gitStatus : [gitStatus];
+          const scripted = statuses[gitStatusCalls] ?? "";
+          if (scripted === "!THROW!") {
+            res.end("data: {\"jsonrpc\":\"2.0\",\"error\":{\"code\":-32000,\"message\":\"stub rpc exploded\"}}\n\n");
+            return;
+          }
+          callResult = { output: scripted };
+          gitStatusCalls++;
+        }
+        // `git rev-parse HEAD` rides in the same capture as the status
+        // listing (kusabi #292 follow-up), so it is routed the same way: a
+        // string answers every call identically (HEAD never moved), an array
+        // one entry per call, "!THROW!" makes that call fail.
+        const isGitHead = payload?.method === "tools/call"
+          && payload.params?.name === "sandbox_exec"
+          && payload.params?.arguments?.commands?.[0] === "git rev-parse HEAD";
+        if (isGitHead) {
+          const heads = Array.isArray(gitHead) ? gitHead : [gitHead];
+          const scripted = heads[gitHeadCalls] ?? heads[heads.length - 1] ?? "";
+          if (scripted === "!THROW!") {
+            res.end("data: {\"jsonrpc\":\"2.0\",\"error\":{\"code\":-32000,\"message\":\"stub head read exploded\"}}\n\n");
+            return;
+          }
+          callResult = { output: `${scripted}\n` };
+          gitHeadCalls++;
+        }
+        const envelope = payload?.method === "tools/call"
+          ? {
+            jsonrpc: "2.0",
+            id: payload.id ?? 1,
+            result: { content: [{ type: "text", text: JSON.stringify(callResult) }] },
+          }
+          : {
+            jsonrpc: "2.0",
+            id: payload?.id ?? 1,
+            result: {
+              protocolVersion: "2024-11-05",
+              capabilities: {},
+              serverInfo: { name: "kusabi-stub", version: "0.0.0" },
+            },
+          };
+        res.end(`data: ${JSON.stringify(envelope)}\n\n`);
+      });
+    });
+    return new Promise((resolve, reject) => {
+      server.once("error", reject);
+      server.listen(0, "127.0.0.1", () => {
+        const { port } = server.address();
+        resolve({ server, url: `http://127.0.0.1:${port}/mcp` });
+      });
+    });
+  }
+
+  // spawn, not spawnSync: spawnSync blocks this process's event loop, so the
+  // stub above could never answer the child.
+  function runCompanion(args, { cwd, stateRootDir, url }) {
+    return new Promise((resolve) => {
+      const env = { ...process.env };
+      delete env.KUSABI_WORKER_CONTEXT;
+      env.KUSABI_STATE_DIR = stateRootDir;
+      env.KUSABI_SUNABA_URL = url;
+      env.OPENCODE_BIN = path.join(cwd, "no-such-opencode-bin");
+      const child = spawn(process.execPath, [COMPANION_SCRIPT, ...args], { cwd, env });
+      let stdout = "";
+      let stderr = "";
+      child.stdout.on("data", (chunk) => { stdout += chunk; });
+      child.stderr.on("data", (chunk) => { stderr += chunk; });
+      const timer = setTimeout(() => child.kill("SIGTERM"), 20_000);
+      child.on("close", (code) => {
+        clearTimeout(timer);
+        resolve({ status: code, stdout, stderr });
+      });
+    });
+  }
+
+  // The child hashes its own cwd to pick a state dir; on a host where the
+  // temp path is a symlink that hash is not reproducible here.  Scan every
+  // workspace dir instead — the claim is that NO round state exists anywhere.
+  function workspaceDirs(stateRootDir) {
+    if (!fs.existsSync(stateRootDir)) return [];
+    return fs.readdirSync(stateRootDir).map((d) => path.join(stateRootDir, d));
+  }
+
+  it("refuses the dispatch and creates no round state when the baseline is red", async () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-smoke-baseline-red-"));
+    const { server, url } = await startSunabaStub({ toolResult: { output: "SMOKE_EXIT=1\n" } });
+    try {
+      const briefPath = path.join(tmp, "brief.md");
+      fs.writeFileSync(briefPath, "# Task\n\nOrchestrator: test-model | session s-1 | 2026-08-16\n\n## Deliverables\n\n- `src/x.mjs`\n\n## Smoke\n\n- `npm test`\n");
+      const stateRootDir = path.join(tmp, "state");
+      const result = await runCompanion(
+        ["chain", "--container", "cid-1", "--brief-file", briefPath],
+        { cwd: tmp, stateRootDir, url },
+      );
+
+      assert.notEqual(result.status, 0, result.stdout);
+      assert.match(result.stdout, /dispatch refused/);
+      assert.match(result.stdout, /`npm test`: expected exit 0, observed exit 1/);
+      assert.match(result.stdout, /before any worker change/);
+
+      for (const dir of workspaceDirs(stateRootDir)) {
+        assert.ok(!fs.existsSync(path.join(dir, "chains")), "no chain state may be created");
+        const jobsDir = path.join(dir, "jobs");
+        if (fs.existsSync(jobsDir)) {
+          assert.deepEqual(fs.readdirSync(jobsDir), [], "no job may be created");
+        }
+      }
+    } finally {
+      server.close();
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("dispatches as before when the baseline is green", async () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-smoke-baseline-green-"));
+    const { server, url } = await startSunabaStub({ toolResult: { output: "SMOKE_EXIT=0\n" } });
+    try {
+      const briefPath = path.join(tmp, "brief.md");
+      fs.writeFileSync(briefPath, "# Task\n\nOrchestrator: test-model | session s-1 | 2026-08-16\n\n## Deliverables\n\n- `src/x.mjs`\n\n## Smoke\n\n- `npm test`\n");
+      const stateRootDir = path.join(tmp, "state");
+      const result = await runCompanion(
+        ["chain", "--container", "cid-1", "--max-rounds", "1", "--brief-file", briefPath],
+        { cwd: tmp, stateRootDir, url },
+      );
+
+      // The dispatch itself cannot succeed (OPENCODE_BIN does not exist);
+      // what matters is that the chain got PAST the baseline — it printed its
+      // start banner and created its chain state, exactly as before #292.
+      assert.doesNotMatch(result.stdout, /dispatch refused/);
+      assert.match(result.stdout, /^Chain .*tiers=/m);
+      const chained = workspaceDirs(stateRootDir).some((d) => fs.existsSync(path.join(d, "chains")));
+      assert.ok(chained, `the chain must proceed to create its state: ${result.stdout}`);
+    } finally {
+      server.close();
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses a passing smoke that dirtied the worktree, before any round state", async () => {
+    // Green exit code, but the smoke wrote: the baseline's own execution
+    // dirtied the tree the worker would be handed, so the dispatch must be
+    // refused with the dirt named \u2014 a worker inheriting it would carry the
+    // artifacts into the round's diff and review as its own work.
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-smoke-baseline-dirt-"));
+    const { server, url } = await startSunabaStub({
+      toolResult: { output: "SMOKE_EXIT=0\n" },
+      gitStatus: ["", "?? coverage/\n"],
+    });
+    try {
+      const briefPath = path.join(tmp, "brief.md");
+      fs.writeFileSync(briefPath, "# Task\n\nOrchestrator: test-model | session s-1 | 2026-08-16\n\n## Deliverables\n\n- `src/x.mjs`\n\n## Smoke\n\n- `npm test`\n");
+      const stateRootDir = path.join(tmp, "state");
+      const result = await runCompanion(
+        ["chain", "--container", "cid-1", "--max-rounds", "1", "--brief-file", briefPath],
+        { cwd: tmp, stateRootDir, url },
+      );
+
+      assert.notEqual(result.status, 0, result.stdout);
+      assert.match(result.stdout, /dispatch refused/);
+      assert.match(result.stdout, /modified the worktree/);
+      assert.match(result.stdout, /\?\? coverage\//);
+      for (const dir of workspaceDirs(stateRootDir)) {
+        assert.ok(!fs.existsSync(path.join(dir, "chains")), "no chain state may be created");
+        const jobsDir = path.join(dir, "jobs");
+        if (fs.existsSync(jobsDir)) {
+          assert.deepEqual(fs.readdirSync(jobsDir), [], "no job may be created");
+        }
+      }
+    } finally {
+      server.close();
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses when the post-smoke worktree check itself fails", async () => {
+    // Fail-closed: a guard whose verdict is "the smoke left no dirt" must not
+    // dispatch when the measurement that would prove it came back as an RPC
+    // error \u2014 same stance as an unobservable exit code being a red baseline.
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-smoke-baseline-unverifiable-"));
+    const { server, url } = await startSunabaStub({
+      toolResult: { output: "SMOKE_EXIT=0\n" },
+      gitStatus: ["", "!THROW!"],
+    });
+    try {
+      const briefPath = path.join(tmp, "brief.md");
+      fs.writeFileSync(briefPath, "# Task\n\nOrchestrator: test-model | session s-1 | 2026-08-16\n\n## Deliverables\n\n- `src/x.mjs`\n\n## Smoke\n\n- `npm test`\n");
+      const stateRootDir = path.join(tmp, "state");
+      const result = await runCompanion(
+        ["chain", "--container", "cid-1", "--max-rounds", "1", "--brief-file", briefPath],
+        { cwd: tmp, stateRootDir, url },
+      );
+
+      assert.notEqual(result.status, 0, result.stdout);
+      assert.match(result.stdout, /dispatch refused/);
+      assert.match(result.stdout, /could not be verified/);
+      assert.match(result.stdout, /stub rpc exploded/);
+      for (const dir of workspaceDirs(stateRootDir)) {
+        assert.ok(!fs.existsSync(path.join(dir, "chains")), "no chain state may be created");
+      }
+    } finally {
+      server.close();
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses a smoke that moved HEAD behind a clean status listing, before any round state", async () => {
+    // The blind spot this closes (kusabi #292 follow-up): the smoke commits,
+    // so `git status --porcelain` is EMPTY both times and the dirt guard sees
+    // a spotless container -- while the chain's base SHA, captured after the
+    // baseline, is now the SHA the smoke created.  Every later comparison
+    // would run against it and report nothing wrong.
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-smoke-baseline-headmove-"));
+    const { server, url } = await startSunabaStub({
+      toolResult: { output: "SMOKE_EXIT=0\n" },
+      gitStatus: ["", ""],
+      gitHead: ["1111111111111111111111111111111111111111", "2222222222222222222222222222222222222222"],
+    });
+    try {
+      const briefPath = path.join(tmp, "brief.md");
+      fs.writeFileSync(briefPath, "# Task\n\nOrchestrator: test-model | session s-1 | 2026-08-16\n\n## Deliverables\n\n- `src/x.mjs`\n\n## Smoke\n\n- `npm test`\n");
+      const stateRootDir = path.join(tmp, "state");
+      const result = await runCompanion(
+        ["chain", "--container", "cid-1", "--max-rounds", "1", "--brief-file", briefPath],
+        { cwd: tmp, stateRootDir, url },
+      );
+
+      assert.notEqual(result.status, 0, result.stdout);
+      assert.match(result.stdout, /dispatch refused/);
+      assert.match(result.stdout, /moved HEAD/);
+      assert.match(result.stdout, /1111111111111111111111111111111111111111/);
+      assert.match(result.stdout, /2222222222222222222222222222222222222222/);
+      // A clean listing must not be reported as dirt: the two failures are
+      // distinct and only the real one may be named.
+      assert.doesNotMatch(result.stdout, /modified the worktree/);
+      for (const dir of workspaceDirs(stateRootDir)) {
+        assert.ok(!fs.existsSync(path.join(dir, "chains")), "no chain state may be created");
+        const jobsDir = path.join(dir, "jobs");
+        if (fs.existsSync(jobsDir)) {
+          assert.deepEqual(fs.readdirSync(jobsDir), [], "no job may be created");
+        }
+      }
+    } finally {
+      server.close();
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses when the HEAD read itself fails", async () => {
+    // Same fail-closed stance as the status capture: HEAD unread means "the
+    // smoke moved nothing" cannot be claimed, so the dispatch does not happen.
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-smoke-baseline-headfail-"));
+    const { server, url } = await startSunabaStub({
+      toolResult: { output: "SMOKE_EXIT=0\n" },
+      gitHead: ["!THROW!"],
+    });
+    try {
+      const briefPath = path.join(tmp, "brief.md");
+      fs.writeFileSync(briefPath, "# Task\n\nOrchestrator: test-model | session s-1 | 2026-08-16\n\n## Deliverables\n\n- `src/x.mjs`\n\n## Smoke\n\n- `npm test`\n");
+      const stateRootDir = path.join(tmp, "state");
+      const result = await runCompanion(
+        ["chain", "--container", "cid-1", "--max-rounds", "1", "--brief-file", briefPath],
+        { cwd: tmp, stateRootDir, url },
+      );
+
+      assert.notEqual(result.status, 0, result.stdout);
+      assert.match(result.stdout, /dispatch refused/);
+      assert.match(result.stdout, /could not be verified/);
+      assert.match(result.stdout, /stub head read exploded/);
+      for (const dir of workspaceDirs(stateRootDir)) {
+        assert.ok(!fs.existsSync(path.join(dir, "chains")), "no chain state may be created");
+      }
+    } finally {
+      server.close();
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses a single-shot task with a red baseline, before any job exists", async () => {
+    // `task --container` runs the same P4 after the worker returns, so the
+    // same red would be recorded against the same innocent worker.
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-smoke-baseline-task-"));
+    const { server, url } = await startSunabaStub({ toolResult: { output: "SMOKE_EXIT=1\n" } });
+    try {
+      const briefPath = path.join(tmp, "brief.md");
+      fs.writeFileSync(briefPath, "# Task\n\nOrchestrator: test-model | session s-1 | 2026-08-16\n\n## Deliverables\n\n- `src/x.mjs`\n\n## Smoke\n\n- `npm test`\n");
+      const stateRootDir = path.join(tmp, "state");
+      const result = await runCompanion(
+        ["task", "--phase", "implement", "--container", "cid-1", "--brief-file", briefPath],
+        { cwd: tmp, stateRootDir, url },
+      );
+
+      assert.notEqual(result.status, 0, result.stdout);
+      assert.match(result.stdout, /dispatch refused/);
+      assert.match(result.stdout, /`npm test`: expected exit 0, observed exit 1/);
+      for (const dir of workspaceDirs(stateRootDir)) {
+        const jobsDir = path.join(dir, "jobs");
+        if (fs.existsSync(jobsDir)) {
+          assert.deepEqual(fs.readdirSync(jobsDir), [], "no job may be created");
+        }
+      }
+    } finally {
+      server.close();
       fs.rmSync(tmp, { recursive: true, force: true });
     }
   });

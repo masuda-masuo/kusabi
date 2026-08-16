@@ -39,6 +39,7 @@ import {
   findSmokeViolations,
   SMOKE_VIOLATION_NO_ENTRIES,
 } from "./brief-parsing.mjs";
+import { checkSmokeProbe } from "./probe-decisions.mjs";
 import { deriveDisposition } from "./disposition.mjs";
 import { stateRoot, stateDirFor, readJson, writeJson } from "./state-paths.mjs";
 import {
@@ -78,6 +79,8 @@ import {
   archiveFailedReviewSeat,
   collectReviewContext,
   runSmokeProbe,
+  runSmokeEntries,
+  captureGitStatusPorcelain,
   runVerifyProbe,
   runDeliverablesProbe,
   runFrozenProbe,
@@ -162,6 +165,269 @@ export function smokeViolationReport(brief) {
     );
   }
   return lines.join("\n");
+}
+
+// The first line of the smoke-baseline refusal for a command that RAN and did
+// not meet its expectation (kusabi #292).  Shared by the renderer and its
+// caller so the two cannot word the same refusal differently.
+const SMOKE_BASELINE_HEADER =
+  "dispatch refused: the declared ## Smoke is already red on the checkout as handed to the " +
+  "worker, before any worker change (kusabi #292). Nothing was dispatched: no job and no round " +
+  "state exist. Fix the brief's smoke command, or the baseline it measures, then re-run.";
+
+// The same refusal when nothing was ever measured: the RPC call throwing, or
+// an exit code that never came back.  Telling the author to fix the brief's
+// smoke command there is a wrong accusation (kusabi #292 follow-up) — the
+// command was never seen to complete, so nothing at all was learned about it,
+// and the brief is exactly as likely to be correct as before.  What failed is
+// the measurement, and the measurement runs in the container.
+const SMOKE_BASELINE_UNMEASURED_HEADER =
+  "dispatch refused: the declared ## Smoke could not be measured on the checkout as handed to " +
+  "the worker (kusabi #292). The command was never seen to complete, so the baseline is " +
+  "unknown, not red: this is a container or infrastructure failure, not a fault in the brief. " +
+  "Nothing was dispatched: no job and no round state exist. Check the container, then re-run.";
+
+// Whether an observation means the command RAN — a numeric exit code, or a
+// timeout (the command was executed and simply never finished, which is a
+// fact about the command, not about the measurement).  Everything else — a
+// thrown call error, an exit code that never came back, no observation at all
+// — means the baseline is unknown rather than red, and takes the header that
+// says so.
+function baselineObservationRan(obs) {
+  if (!obs) return false;
+  return typeof obs.observed === "number" || obs.observed === "timeout";
+}
+
+// How one observed smoke result reads in the refusal.  The numeric case names
+// the actual exit code next to the expected one; the other cases must NOT read
+// like an exit-code mismatch, because no exit code was seen at all.
+function describeBaselineObservation(obs) {
+  if (!obs) return "not executed";
+  if (obs.observed === "timeout") return "timed out with no exit code";
+  if (obs.observed === "unobservable") return "exit code could not be observed";
+  if (typeof obs.observed === "number") return `observed exit ${obs.observed}`;
+  return `could not be run: ${obs.observed}`;
+}
+
+/**
+ * Render the smoke-baseline refusal from the declared entries and what the
+ * executor observed, or null when every entry met its expectation.
+ *
+ * Pure: the caller does the running.  Each failing entry is named with its
+ * own command, its expected exit code and the actual observation, because the
+ * author of the brief has to be able to tell WHICH declared line is the
+ * problem without re-running anything by hand.  The captured output tail rides
+ * along when the executor collected one, exactly as the post-round probe's
+ * detail carries it.
+ *
+ * The header depends on WHAT failed (kusabi #292 follow-up).  A command that
+ * ran and exited wrong is the brief's or the baseline's to fix, and says so.
+ * A command that was never seen to complete — the call threw, the exit code
+ * never came back — taught nothing about the brief, so it must not tell the
+ * author to go and fix a smoke line that may be perfectly correct; that
+ * refusal names the failed measurement and points at the container.  When
+ * both kinds are present the fix-the-brief header stands: a genuinely red
+ * command IS there, and the per-entry lines still name the unmeasured ones.
+ *
+ * @param {{entries: Array<{command: string, expectedExit: number}>,
+ *          observed: Array<{command: string, observed: number|string, diagnostic?: string}>}} opts
+ * @returns {string|null}
+ */
+export function renderSmokeBaselineReport({ entries, observed }) {
+  const entriesArr = Array.isArray(entries) ? entries : [];
+  const observedArr = Array.isArray(observed) ? observed : [];
+  const lines = [];
+  let anyRan = false;
+  for (const entry of entriesArr) {
+    const obs = observedArr.find(function (o) { return o.command === entry.command; });
+    if (obs && obs.observed === entry.expectedExit) continue;
+    if (baselineObservationRan(obs)) anyRan = true;
+    lines.push(
+      `  - \`${entry.command}\`: expected exit ${entry.expectedExit}, ` +
+      describeBaselineObservation(obs)
+    );
+    if (obs?.diagnostic) {
+      lines.push("    ── output tail ──");
+      lines.push(obs.diagnostic);
+    }
+  }
+  if (lines.length === 0) return null;
+  return [anyRan ? SMOKE_BASELINE_HEADER : SMOKE_BASELINE_UNMEASURED_HEADER, ...lines].join("\n");
+}
+
+// The first line of the worktree-dirt refusal (kusabi #292 follow-up): the
+// declared smoke PASSED, but running it wrote to the worktree in the very
+// container the worker would then be handed.  The worker must start from the
+// checkout the baseline measured; a smoke with write side effects would land
+// its artifacts and mutations in the round's diff and review as the worker's
+// work -- the same wrongful-conviction class the baseline refusal exists for,
+// now entered through the baseline's own execution.  Shared by the renderer
+// and its caller so the two cannot word the same refusal differently.
+const SMOKE_DIRT_HEADER =
+  "dispatch refused: the declared ## Smoke passed, but running it modified the worktree in the " +
+  "container the worker would have been handed (kusabi #292). The worker must start from the " +
+  "checkout the baseline measured: smoke with write side effects -- coverage output, build " +
+  "artifacts, lockfile regeneration, --fix formatters, snapshot updates -- would land in the " +
+  "round's diff and review as the worker's work. Nothing was dispatched: no job and no round " +
+  "state exist. Make the smoke command read-only, or prepare a container it cannot dirty, then " +
+  "re-run.";
+
+// The refusal for a baseline smoke that moved HEAD (kusabi #292 follow-up).
+// `git status --porcelain` cannot see this: a smoke that commits, or checks
+// out another SHA, leaves a listing identical to the one taken before it ran,
+// so the dirt guard passes it.  It is the worse of the two failures, because
+// captureBaseSha runs AFTER the baseline: the smoke-moved HEAD is recorded as
+// the chain's base, and from then on P1's HEAD check, the deliverables probe
+// and the review's diff-vs-base all measure the round against a tree nobody
+// chose.  Nothing about that surfaces as an error — it just quietly measures
+// the wrong thing, which is exactly the wrongful-conviction class this whole
+// guard exists for.  Shared by the renderer and its caller so the two cannot
+// word the same refusal differently.
+const SMOKE_HEAD_MOVE_HEADER =
+  "dispatch refused: running the declared ## Smoke moved HEAD in the container the worker " +
+  "would have been handed (kusabi #292). The chain's base SHA is captured after the baseline, " +
+  "so the smoke-moved HEAD would be recorded as the base every later measurement compares " +
+  "against: the HEAD-clean probe, the deliverables probe and the review's diff-vs-base would " +
+  "all measure the round against the wrong tree, with nothing reported as wrong. Nothing was " +
+  "dispatched: no job and no round state exist. Make the smoke command leave HEAD alone — no " +
+  "commit, no checkout, no reset — or prepare a container it cannot move, then re-run.";
+
+// The same refusal when the guard cannot see: the smoke passed, but whether it
+// left the worktree and HEAD unchanged could not be verified.  Refusing on an
+// unverifiable measurement, not silently passing, is the fail-closed stance the
+// smoke probe itself takes (an unobservable exit code is a red baseline, not a
+// skipped one).
+const SMOKE_DIRT_UNVERIFIABLE_HEADER =
+  "dispatch refused: the declared ## Smoke passed, but whether it left the worktree and HEAD " +
+  "unchanged could not be verified (kusabi #292). Nothing was dispatched: no job and no round " +
+  "state exist. The worktree and HEAD must be proven unchanged before the worker is handed the " +
+  "container; check the container by hand and re-run.";
+
+/**
+ * Render the refusal for a baseline smoke that CHANGED the container it ran
+ * in -- a dirtied worktree, a moved HEAD, or both -- from the captures taken
+ * immediately before and after the run; null when the smoke demonstrably left
+ * both unchanged.
+ *
+ * Pure: the caller does the running.  The worktree comparison is the DELTA --
+ * lines in the after-capture that were not in the before-capture -- because
+ * the guard is about what THIS smoke added to the tree the worker is handed,
+ * not about whatever pre-existing dirt the prepared container may already
+ * carry.  Only the delta lines are named, so the author sees exactly what the
+ * command wrote.  HEAD is compared as a whole instead: there is no "pre-
+ * existing" HEAD move to forgive, and the porcelain listing cannot show one
+ * at all (kusabi #292 follow-up) -- a smoke that commits leaves a listing
+ * identical to the one before it ran.  Both are reported when both happened;
+ * neither hides the other, because each is separately the author's to fix.
+ *
+ * When either capture is a failure record (call error, truncated listing,
+ * unreadable HEAD), no comparison can be computed: the verdict "left
+ * unchanged" cannot be built from a listing that could have dropped the dirt,
+ * so the refusal says the verification itself failed rather than claiming a
+ * clean bill.
+ *
+ * @param {object} opts
+ * @param {{ok: true, lines: string[], head?: string}|{ok: false, reason: string}|null|undefined} opts.before
+ * @param {{ok: true, lines: string[], head?: string}|{ok: false, reason: string}|null|undefined} opts.after
+ * @returns {string|null}
+ */
+export function renderSmokeDirtReport({ before, after }) {
+  const problems = [];
+  if (!before || before.ok !== true) {
+    problems.push(before?.reason ?? "the pre-run git status capture failed");
+  }
+  if (!after || after.ok !== true) {
+    problems.push(after?.reason ?? "the post-run git status capture failed");
+  }
+  if (problems.length > 0) {
+    return [SMOKE_DIRT_UNVERIFIABLE_HEADER, ...problems.map((p) => `  - ${p}`)].join("\n");
+  }
+  const reports = [];
+  if (before.head !== after.head) {
+    reports.push([
+      SMOKE_HEAD_MOVE_HEADER,
+      `  HEAD before the smoke: ${before.head}`,
+      `  HEAD after the smoke:  ${after.head}`,
+    ].join("\n"));
+  }
+  const beforeLines = new Set(Array.isArray(before.lines) ? before.lines : []);
+  const afterLines = Array.isArray(after.lines) ? after.lines : [];
+  const delta = afterLines.filter((line) => !beforeLines.has(line));
+  if (delta.length > 0) {
+    reports.push([
+      SMOKE_DIRT_HEADER,
+      "  Worktree entries the smoke added:",
+      ...delta.map((line) => `    - ${line}`),
+    ].join("\n"));
+  }
+  if (reports.length === 0) return null;
+  return reports.join("\n\n");
+}
+
+/**
+ * The dispatch refusal text for a brief whose declared `## Smoke` is ALREADY
+ * red before the worker touches anything (kusabi #292), or whose declared
+ * smoke, while green, changed the container it was run in (wrote to the
+ * worktree, or moved HEAD); null when the baseline is green AND left the
+ * container as it found it.
+ *
+ * The P4 probe runs AFTER a round, against the worker's changes.  When the
+ * declared smoke cannot pass on the checkout the worker was handed — pre-
+ * existing debt in the target files, or an orchestrator-authored command that
+ * cannot pass in the probe shell — that red is not the worker's, but it
+ * surfaces a full round later and reads exactly like a failed round.  Both
+ * variants happened live, each costing a round plus a manual baseline
+ * re-measurement at inspection.  Measuring it here converts that into a
+ * refusal the author can act on immediately: the brief or the baseline is at
+ * fault, and neither is fixable from inside the round.
+ *
+ * The run uses runSmokeEntries and checkSmokeProbe — the post-round probe's
+ * own executor and its own exit-code comparison — so a baseline green can
+ * never mean something different from a P4 green.  The baseline executes in
+ * the very container the worker is then handed, so `git status --porcelain`
+ * AND `git rev-parse HEAD` are captured immediately before and after the run
+ * (captureGitStatusPorcelain + renderSmokeDirtReport): a PASSING smoke that
+ * writes — coverage output, build artifacts, a regenerated lockfile, --fix,
+ * snapshot updates — would otherwise hand the worker a dirtied tree whose
+ * artifacts and mutations land in the round's diff and review as the worker's
+ * work, and a PASSING smoke that commits or checks out would hand it a moved
+ * HEAD that the captureBaseSha call below then records as the chain's base
+ * (kusabi #292 follow-up) — poisoning every later comparison against a base
+ * nobody chose, with nothing reported as wrong.  A baseline that dirties or
+ * moves HEAD is refused with what it changed, never dispatched.
+ *
+ * No declared smoke means no execution at all: an undeclared `## Smoke`
+ * dispatches exactly as before, with not a single container call spent.
+ *
+ * @param {object} opts
+ * @param {string|null|undefined} opts.brief
+ * @param {Function} opts.callTool   The RPC callTool function (injectable).
+ * @param {string}   opts.container  Container the worker will be handed.
+ * @returns {Promise<string|null>}
+ */
+export async function smokeBaselineReport({ brief, callTool, container }) {
+  const entries = parseSmoke(brief ?? "");
+  if (entries.length === 0) return null;
+
+  const before = await captureGitStatusPorcelain(callTool, container);
+  const observed = await runSmokeEntries({ entries, callTool, container });
+  const after = await captureGitStatusPorcelain(callTool, container);
+
+  const probe = checkSmokeProbe(entries, observed, true);
+
+  // The renderer names the entries that missed their expectation; should the
+  // probe ever go red for something the per-entry walk cannot see, the probe's
+  // own detail carries the failure rather than nothing.
+  const smokeReport = probe.passed
+    ? null
+    : renderSmokeBaselineReport({ entries, observed })
+      ?? `${SMOKE_BASELINE_HEADER}\n  - ${probe.detail}`;
+  const dirtReport = renderSmokeDirtReport({ before, after });
+
+  // A red smoke AND a dirtied tree are both the author's to fix: both are
+  // reported, never one hiding the other.
+  if (!smokeReport && !dirtReport) return null;
+  return [smokeReport, dirtReport].filter(Boolean).join("\n\n");
 }
 
 // ---------------------------------------------------------------------------
@@ -395,6 +661,25 @@ export async function cmdChain(cwd, { flags, text }) {
   const lintRejection = briefLintReport({ brief: text, container, chain: true });
   if (lintRejection) throw new Error(lintRejection);
 
+  // ---- import callTool once for every phase that needs it ----
+  // Hoisted above createChainDir for the baseline smoke run below: that run
+  // has to happen while a refusal can still leave nothing behind.
+  const { callTool } = await import("./sunaba-rpc.mjs");
+
+  // ---- smoke baseline refusal (kusabi #292) ----
+  // Run the declared smoke against the unmodified checkout, before the
+  // container is handed to the worker.  The post-round P4 measures the same
+  // commands against the worker's changes, so a smoke line that was already
+  // red convicts an innocent worker a full round later.  Refuse at the same
+  // stage as the #250 parse refusal above — before createChainDir, so no
+  // chain state, no job and no round state exist when this fires.
+  const baselineRejection = await smokeBaselineReport({
+    brief: text,
+    callTool,
+    container,
+  });
+  if (baselineRejection) throw new Error(baselineRejection);
+
   const { chainId, chainDir } = createChainDir(stateDir);
   const maxRounds = Number(flags["max-rounds"] ?? 4); // B6: default maxRounds is 4
   const brief = text;
@@ -411,9 +696,6 @@ export async function cmdChain(cwd, { flags, text }) {
   const onSignal = () => { signalReceived = true; };
   process.on("SIGTERM", onSignal);
   process.on("SIGINT", onSignal);
-
-  // ---- import callTool once for all phases that need it ----
-  const { callTool } = await import("./sunaba-rpc.mjs");
 
   // ---- reset failed-route memo for a fresh chain run ----
   resetFailedRoutes();
