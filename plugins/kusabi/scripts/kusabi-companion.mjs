@@ -17,7 +17,7 @@ import { flushAndExit } from "./flush-and-exit.mjs";
 // The chain driver (kusabi #264 PR 2/2).  chain-driver.mjs imports helpers
 // back from this module; see its header for why that cycle is safe and why
 // nothing moved is re-exported from here.
-import { cmdChain, cmdChainResume } from "./chain-driver.mjs";
+import { cmdChain, cmdChainResume, smokeBaselineReport } from "./chain-driver.mjs";
 import { cursorUsageDir, resolveLatestCursorSession } from "./cursor-statusline-sink.mjs";
 import { parseReviewJsonl } from "./review-jsonl.mjs";
 import fs from "node:fs";
@@ -1059,6 +1059,24 @@ async function cmdTask(cwd, { flags, text }) {
       });
       taskBaseSha = (gitRev?.output ?? "").trim() || null;
     } catch { /* probe will handle missing baseSha */ }
+  }
+
+  // ---- smoke baseline refusal (kusabi #292) ----
+  // Same guard as the chain's first round, for the single-shot dispatch: the
+  // P4 below runs AFTER the worker has changed things, so a `## Smoke` line
+  // that could not pass on the checkout as handed over would be reported as
+  // the worker's failure.  Measured here with the probe's own executor, and
+  // refused before any job record exists.  A task with no declared smoke (or
+  // no --container to run it in) executes nothing extra and dispatches
+  // exactly as before.
+  if (flags.container) {
+    const { callTool } = await import("./sunaba-rpc.mjs");
+    const baselineRejection = await smokeBaselineReport({
+      brief: text,
+      callTool,
+      container: flags.container,
+    });
+    if (baselineRejection) throw new Error(baselineRejection);
   }
 
   // ---- review input (container review only) ----

@@ -1636,6 +1636,132 @@ export async function runSmokeEntry({ entry, callTool, container, entryIndex }) 
 }
 
 /**
+ * Run every declared smoke entry and return the raw observations.
+ *
+ * The executor half of the smoke probe, split out of runSmokeProbe unchanged
+ * so the pre-dispatch baseline run (kusabi #292) shares this exact loop: a
+ * second executor would drift from the one the post-round probe uses, and the
+ * whole point of the baseline is that it measures the same thing at a
+ * different moment.  The verdict half stays in checkSmokeProbe; runSmokeProbe
+ * below is the two composed.
+ */
+export async function runSmokeEntries({ entries, callTool, container }) {
+  const entriesArr = Array.isArray(entries) ? entries : [];
+  const observed = [];
+  for (let i = 0; i < entriesArr.length; i++) {
+    const result = await runSmokeEntry({ entry: entriesArr[i], callTool, container, entryIndex: i });
+    observed.push(result);
+  }
+  return observed;
+}
+
+// A listing this big cannot be a realistic `git status --porcelain` page; the
+// point of the explicit window is to defeat sandbox_exec's two independent
+// truncation layers (summary head-50/tail-50 and paging), exactly as
+// captureWorktreeState does.  A cut capture must never stand in for the whole
+// listing here: the guard's verdict is "the smoke left no dirt", and that
+// verdict cannot be built from a view that could have dropped the dirt.
+const STATUS_CAPTURE_PAGE_LIMIT = 1000000;
+
+/**
+ * Read HEAD for the baseline smoke's guard.
+ *
+ * Deliberately NOT captureBaseSha: that one degrades an unreadable HEAD to
+ * null because its caller (the chain's base record) has a per-round probe to
+ * catch the consequences.  This caller has none — it is the guard itself —
+ * so an unreadable HEAD is a failure record here, in the same shape as the
+ * porcelain capture's.  An empty output is such a failure: a working
+ * `git rev-parse HEAD` always prints a SHA, so "nothing came back" means the
+ * measurement failed, not that HEAD is empty.
+ *
+ * @param {Function} callTool   The RPC callTool function (injectable).
+ * @param {string}   container  Container ID.
+ * @returns {Promise<{ok: true, sha: string} | {ok: false, reason: string}>}
+ */
+async function captureHeadForGuard(callTool, container) {
+  let result;
+  try {
+    result = await callTool("sandbox_exec", {
+      container_id: container,
+      commands: ["git rev-parse HEAD"],
+    });
+  } catch (err) {
+    return { ok: false, reason: `git rev-parse HEAD could not be run: ${err?.message ?? String(err)}` };
+  }
+  if (result === null || result === undefined) {
+    return { ok: false, reason: "git rev-parse HEAD returned no result" };
+  }
+  const sha = readExecCapture(result).text.trim().split("\n")[0].trim();
+  if (sha.length === 0) {
+    return { ok: false, reason: "git rev-parse HEAD returned no SHA (HEAD could not be read)" };
+  }
+  return { ok: true, sha };
+}
+
+/**
+ * Capture what the baseline smoke must not change: the `git status --porcelain`
+ * listing AND the HEAD SHA, both read from inside the container.
+ *
+ * The read-only measurement the baseline smoke's worktree guard (kusabi #292
+ * follow-up) is built on: the baseline runs the declared smoke in the very
+ * container the worker is then handed, so a PASSING smoke with write side
+ * effects (coverage output, build artifacts, lockfile regeneration, --fix
+ * formatters, snapshot updates) would leave the worker a dirtied tree whose
+ * untracked artifacts and tracked-file mutations land in the round's diff and
+ * review as the worker's work.  Comparing a capture taken immediately before
+ * the run with one taken immediately after isolates exactly what the smoke
+ * itself added.
+ *
+ * HEAD rides in the same capture because the porcelain listing CANNOT see it:
+ * a smoke that commits, or checks out another SHA, leaves a listing identical
+ * to the one before it ran (kusabi #292 follow-up).  That blind spot is worse
+ * than dirt — captureBaseSha runs AFTER the baseline, so a smoke-moved HEAD
+ * would be recorded as the chain's base and silently become the thing P1, the
+ * deliverables probe and the review's diff-vs-base all measure against.  Two
+ * numbers from one moment: taking them together is what makes "the smoke
+ * changed nothing" a claim about the container rather than about one listing.
+ *
+ * The capture is requested with truncation defeated (verbose "full" + a
+ * page-limit far beyond any real listing) because the verdict depends on the
+ * listing being COMPLETE.  When the call throws or the server still reports
+ * the output cut, the capture is a failure record, never a partial listing:
+ * a guard that is supposed to prove the smoke left no dirt cannot stand on a
+ * view that could have dropped the very entry that dirtied the tree.  An
+ * unreadable HEAD is the same kind of failure record, for the same reason.
+ *
+ * @param {Function} callTool   The RPC callTool function (injectable).
+ * @param {string}   container  Container ID.
+ * @returns {Promise<{ok: true, lines: string[], head: string} | {ok: false, reason: string}>}
+ */
+export async function captureGitStatusPorcelain(callTool, container) {
+  let result;
+  try {
+    result = await callTool("sandbox_exec", {
+      container_id: container,
+      commands: ["git status --porcelain"],
+      verbose: "full",
+      limit: STATUS_CAPTURE_PAGE_LIMIT,
+    });
+  } catch (err) {
+    return { ok: false, reason: `git status could not be run: ${err?.message ?? String(err)}` };
+  }
+  if (result === null || result === undefined) {
+    return { ok: false, reason: "git status returned no result" };
+  }
+  const capture = readExecCapture(result);
+  if (capture.truncation.truncated) {
+    return { ok: false, reason: "git status output was truncated (the listing is not complete)" };
+  }
+  const lines = capture.text
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0);
+  const head = await captureHeadForGuard(callTool, container);
+  if (head.ok !== true) return { ok: false, reason: head.reason };
+  return { ok: true, lines, head: head.sha };
+}
+
+/**
  * Run all smoke entries and return the P4 probe result.
  */
 export async function runSmokeProbe({ entries, callTool, container, headingPresent }) {
@@ -1646,11 +1772,7 @@ export async function runSmokeProbe({ entries, callTool, container, headingPrese
     return checkSmokeProbe([], [], hdgPresent);
   }
 
-  const observed = [];
-  for (let i = 0; i < entriesArr.length; i++) {
-    const result = await runSmokeEntry({ entry: entriesArr[i], callTool, container, entryIndex: i });
-    observed.push(result);
-  }
+  const observed = await runSmokeEntries({ entries: entriesArr, callTool, container });
 
   return checkSmokeProbe(entriesArr, observed, true);
 }
