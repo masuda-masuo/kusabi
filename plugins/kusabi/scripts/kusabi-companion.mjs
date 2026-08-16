@@ -11,6 +11,9 @@ import { parseArgs, parseModel, resolveModel, reviewDenyTools, WRITE_TOOL_NAMES,
 import { renderReview, renderChainShow, renderJobLine, renderHeader, extractJson } from "./render.mjs";
 import { hasSectionHeading, parseDeliverables, parseFrozenTests, parseSmoke, parseOrchestratorSignature } from "./brief-parsing.mjs";
 import { cmdInstallCli, diagnoseCompanionShim, formatShimSetupLine } from "./install-cli.mjs";
+// Exit path only (kusabi #243); its own module since kusabi #277 so that the
+// test children exercising it do not import everything above.
+import { flushAndExit } from "./flush-and-exit.mjs";
 // The chain driver (kusabi #264 PR 2/2).  chain-driver.mjs imports helpers
 // back from this module; see its header for why that cycle is safe and why
 // nothing moved is re-exported from here.
@@ -2275,60 +2278,13 @@ export function commandOutcome(output) {
   return { text: typeof output === "string" ? output : "", exitCode: 0 };
 }
 
-/**
- * Drain stdout and stderr, then process.exit(code).
- *
- * Piped stdout is buffered asynchronously. process.exit() drops whatever is
- * still in that buffer, so a payload over the pipe capacity (typically 64KiB)
- * arrives truncated mid-line (kusabi #243). File redirects write synchronously
- * and do not show the bug. An empty write's callback fires only after prior
- * chunks have been handed to the kernel — empirically the 200KiB delayed-pipe
- * case (`| (sleep 1; cat)`) delivers in full, while a bare process.exit() stops
- * at 65536. We still process.exit afterwards so leftover handles (serve
- * sockets/timers from ensureServer) cannot hang the process. TTY and file
- * dests typically invoke the callback on the next tick with no extra delay.
- *
- * @param {number} code
- */
-export function flushAndExit(code) {
-  const exitCode = Number.isInteger(code) ? code : 1;
-  process.exitCode = exitCode;
-
-  let pending = 2;
-  let exited = false;
-  const done = () => {
-    if (exited) return;
-    pending -= 1;
-    if (pending > 0) return;
-    exited = true;
-    process.exit(exitCode);
-  };
-
-  drainStream(process.stdout, done);
-  drainStream(process.stderr, done);
-}
-
-/** @param {NodeJS.WriteStream} stream @param {() => void} cb */
-function drainStream(stream, cb) {
-  let settled = false;
-  const settle = () => {
-    if (settled) return;
-    settled = true;
-    cb();
-  };
-
-  if (!stream || typeof stream.write !== "function" || stream.destroyed || stream.writableFinished) {
-    settle();
-    return;
-  }
-
-  stream.once("error", settle);
-  try {
-    stream.write("", settle);
-  } catch {
-    settle();
-  }
-}
+// flushAndExit (kusabi #243) lives in ./flush-and-exit.mjs since kusabi #277.
+// Its behaviour is unchanged and this file is still one of its callers — the
+// move is about what a *child process* pays to import it.  The #243 tests
+// spawn a node child that imports flushAndExit, writes 150KiB and exits, all
+// inside one wall-clock budget; when the import was of this module, a large
+// share of that budget was this module's import graph rather than the drain
+// under test.  See the header of flush-and-exit.mjs.
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
   main()

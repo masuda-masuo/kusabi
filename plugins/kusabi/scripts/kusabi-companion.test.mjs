@@ -3396,59 +3396,167 @@ describe("setup companion-shim diagnosis", () => {
 // flushAndExit — piped stdout must survive process.exit (kusabi #243).
 // Truncation only reproduces when the consumer is slower than the writer:
 // a delayed pipe (`pause` then `resume` after 1s), not a file redirect.
+//
+// kusabi #277: this suite timed out three times in two days in CI, across
+// both large-payload variants, always as `timed out after 15000ms; got 0
+// bytes; stderr=`.  The defect was in the collector, not in flushAndExit.
+// `stdio: "pipe"` is a Unix socketpair, whose send buffer (~208KiB on Linux)
+// can accept the whole 150,000-byte payload in one go; when it does, the
+// child drains and exits within milliseconds — long before a reader that
+// waits a second.  The old collector attached its `data`/`end` listeners at
+// resume time, so that child's stdout had already ended before anything was
+// listening: no data, no `end`, promise pending, bound reached, zero bytes
+// reported for a payload that had in fact been delivered in full.  Whether
+// the socket swallows the payload whole is a race, which is why the failure
+// was intermittent and why a re-run on the same commit went green.
+//
+// Three things keep it fixed and keep the next failure readable:
+//
+//   1. the collector listens from the start and uses pause/resume purely for
+//      flow control, so no exit can outrun the reader (regression test:
+//      "delivers a payload from a child that exits before the reader
+//      resumes");
+//   2. the children import ./flush-and-exit.mjs, whose import graph is node
+//      builtins only.  Importing kusabi-companion.mjs put its whole graph of
+//      cold `import` inside the measured window — noise that both widened
+//      the race above and, from the parent, is indistinguishable from a hang;
+//   3. every child announces itself on stderr before its first stdout byte,
+//      and the collector budgets the two phases separately: spawn→marker gets
+//      a generous bound of its own (startup, which CI contention can stretch
+//      arbitrarily and which proves nothing about #243), and the drain bound
+//      starts at the marker.  A timeout now names its phase and carries the
+//      marker state, bytes read and elapsed ms.
+//
+// The 15s total is unchanged; it is split, not raised.
 // ---------------------------------------------------------------------------
 
 describe("flushAndExit (kusabi #243)", () => {
   const COMPANION_SCRIPT = path.join(import.meta.dirname, "kusabi-companion.mjs");
+  const FLUSH_MODULE = path.join(import.meta.dirname, "flush-and-exit.mjs");
   const LARGE = 150_000;
+  // Comfortably past the stdio socket's send buffer (~208KiB on Linux), so the
+  // kernel cannot swallow the payload whole before flushAndExit runs.
+  const OVERSIZED = 1_000_000;
+  const READY = "flush-child-ready\n";
+  const FLUSHING = "flush-child-flushing\n";
 
-  function spawnFlushChild({ bytes, exitCode, leftoverTimer = false }) {
-    const lines = [`import { flushAndExit } from ${JSON.stringify(COMPANION_SCRIPT)};`];
-    if (leftoverTimer) lines.push("setInterval(() => {}, 60_000);");
-    if (bytes > 0) lines.push(`process.stdout.write("x".repeat(${bytes}));`);
-    lines.push(`flushAndExit(${exitCode});`);
+  const IMPORT_FLUSH = `import { flushAndExit } from ${JSON.stringify(FLUSH_MODULE)};`;
+  const WRITE_READY = `process.stderr.write(${JSON.stringify(READY)});`;
+
+  function spawnSource(lines) {
     return spawn(process.execPath, ["--input-type=module", "-e", lines.join("\n")], {
       stdio: ["ignore", "pipe", "pipe"],
     });
   }
 
-  function collectDelayedPipe(child, { delayMs = 1000, timeoutMs = 15_000 } = {}) {
+  // Marker first, payload second: everything the child spends on startup is
+  // then outside the bound that guards the drain.
+  function spawnFlushChild({ bytes, exitCode, leftoverTimer = false }) {
+    const lines = [IMPORT_FLUSH];
+    if (leftoverTimer) lines.push("setInterval(() => {}, 60_000);");
+    lines.push(WRITE_READY);
+    if (bytes > 0) lines.push(`process.stdout.write("x".repeat(${bytes}));`);
+    lines.push(`flushAndExit(${exitCode});`);
+    return spawnSource(lines);
+  }
+
+  /**
+   * Read a child's stdout through a deliberately slow consumer.
+   *
+   * The reader stays paused until `delayMs` after the ready marker (or until
+   * `resumeOn` appears on stderr), which is what fills the pipe and makes a
+   * dropped buffer visible.  Basing that delay on the marker rather than on
+   * spawn also means a slow-starting child still meets a genuinely paused
+   * reader instead of one that has already given up and drained.
+   */
+  function collectDelayedPipe(
+    child,
+    { delayMs = 1000, startTimeoutMs = 10_000, drainTimeoutMs = 5_000, resumeOn = null } = {},
+  ) {
     return new Promise((resolve, reject) => {
+      const spawnedAt = Date.now();
       const chunks = [];
       let stderr = "";
+      let markerAt = null;
       let code = null;
       let signal = null;
       let stdoutEnded = false;
       let closed = false;
       let reading = false;
+      let startTimer = null;
+      let drainTimer = null;
+      let readTimer = null;
+
+      const bytes = () => chunks.reduce((n, c) => n + c.length, 0);
+      const elapsed = () => Date.now() - spawnedAt;
+      const clearAll = () => {
+        clearTimeout(startTimer);
+        clearTimeout(drainTimer);
+        clearTimeout(readTimer);
+      };
+
+      const fail = (message) => {
+        clearAll();
+        child.kill("SIGKILL");
+        reject(new Error(message));
+      };
 
       const tryResolve = () => {
         if (!closed || !stdoutEnded) return;
-        clearTimeout(timer);
-        resolve({ code, signal, stdout: Buffer.concat(chunks), stderr });
+        clearAll();
+        resolve({
+          code,
+          signal,
+          stdout: Buffer.concat(chunks),
+          stderr,
+          markerSeen: markerAt !== null,
+          msToMarker: markerAt === null ? null : markerAt - spawnedAt,
+        });
       };
+
+      // Listeners go on now, before anything can arrive, and pause() is the
+      // only thing holding the data back.  Attaching them at resume time was
+      // the kusabi #277 flake: a child that finished before the reader
+      // resumed had already ended its stdout, so a listener added afterwards
+      // saw neither `data` nor `end` and the promise ran to its bound
+      // reporting zero bytes — with the child's payload sitting unread.
+      child.stdout.on("data", (c) => { chunks.push(c); });
+      child.stdout.on("end", () => { stdoutEnded = true; tryResolve(); });
+      child.stdout.pause();
 
       const beginRead = () => {
         if (reading) return;
         reading = true;
-        clearTimeout(startRead);
-        child.stdout.on("data", (c) => { chunks.push(c); });
-        child.stdout.on("end", () => { stdoutEnded = true; tryResolve(); });
+        clearTimeout(readTimer);
         child.stdout.resume();
       };
 
-      child.stderr.on("data", (c) => { stderr += c; });
-      child.stdout.pause();
-      const startRead = setTimeout(beginRead, delayMs);
+      const onMarker = () => {
+        if (markerAt !== null) return;
+        markerAt = Date.now();
+        clearTimeout(startTimer);
+        if (resumeOn === null) readTimer = setTimeout(beginRead, delayMs);
+        drainTimer = setTimeout(() => fail(
+          `flush child stalled after start: marker seen ${markerAt - spawnedAt}ms after spawn, ` +
+          `then no exit within ${drainTimeoutMs}ms of it; ${bytes()} bytes of stdout read ` +
+          `(reader resumed: ${reading ? "yes" : "no"}); ${elapsed()}ms elapsed; ` +
+          `stderr=${JSON.stringify(stderr)}`,
+        ), drainTimeoutMs);
+      };
 
-      const timer = setTimeout(() => {
-        child.kill("SIGKILL");
-        reject(new Error(`timed out after ${timeoutMs}ms; got ${Buffer.concat(chunks).length} bytes; stderr=${stderr}`));
-      }, timeoutMs);
+      child.stderr.on("data", (c) => {
+        stderr += c;
+        if (stderr.includes(READY)) onMarker();
+        if (resumeOn !== null && stderr.includes(resumeOn)) beginRead();
+      });
+
+      startTimer = setTimeout(() => fail(
+        `flush child never started: marker not seen within ${startTimeoutMs}ms of spawn; ` +
+        `${bytes()} bytes of stdout read; ${elapsed()}ms elapsed; stderr=${JSON.stringify(stderr)}`,
+      ), startTimeoutMs);
 
       child.on("error", (err) => {
-        clearTimeout(timer);
-        clearTimeout(startRead);
+        clearAll();
         reject(err);
       });
       child.on("close", (c, s) => {
@@ -3478,8 +3586,80 @@ describe("flushAndExit (kusabi #243)", () => {
 
   it("exits even when a leftover timer handle remains", async () => {
     const child = spawnFlushChild({ bytes: 0, exitCode: 0, leftoverTimer: true });
-    const result = await collectDelayedPipe(child, { delayMs: 0, timeoutMs: 5_000 });
+    const result = await collectDelayedPipe(child, { delayMs: 0, drainTimeoutMs: 5_000 });
     assert.equal(result.code, 0, result.stderr);
+  });
+
+  // kusabi #277 candidate B: "the non-zero path deadlocks when stdout is a
+  // full, paused pipe".  Refuted, and pinned here so it stays refuted.  The
+  // reader holds the pipe shut until the child reports the entire payload
+  // still sitting in its stream buffer — an event, not a sleep, so the child
+  // is provably inside flushAndExit with nothing flushed when reading starts.
+  // Both codes then deliver every byte, which is what "code reaches only
+  // process.exitCode and the process.exit argument" predicts.
+  it("drains an oversized, full pipe identically for exit 0 and exit 7 (kusabi #277)", async () => {
+    for (const exitCode of [0, 7]) {
+      const child = spawnSource([
+        IMPORT_FLUSH,
+        WRITE_READY,
+        `process.stdout.write("z".repeat(${OVERSIZED}));`,
+        `process.stderr.write("queued=" + process.stdout.writableLength + "\\n");`,
+        `process.stderr.write(${JSON.stringify(FLUSHING)});`,
+        `flushAndExit(${exitCode});`,
+      ]);
+      const result = await collectDelayedPipe(child, { resumeOn: FLUSHING });
+      const queued = Number(/queued=(\d+)/.exec(result.stderr)?.[1] ?? -1);
+      assert.ok(queued > 65_536, `expected a full pipe at flush time, queued=${queued}`);
+      assert.equal(result.code, exitCode, result.stderr);
+      assert.equal(result.stdout.length, OVERSIZED, `exit ${exitCode}: ${result.stderr}`);
+      assert.equal(result.stdout.toString("utf8"), "z".repeat(OVERSIZED));
+    }
+  });
+
+  // The kusabi #277 flake itself, reduced to something deterministic: a
+  // payload small enough that the stdio socket takes it whole means the child
+  // is finished and reaped before the delayed reader ever resumes.  Against
+  // the old collector this hung 10/10 and reported `got 0 bytes` — the exact
+  // CI signature, for a child that had in fact delivered every byte.
+  it("delivers a payload from a child that exits before the reader resumes (kusabi #277)", async () => {
+    const SMALL = 4_096;
+    const child = spawnFlushChild({ bytes: SMALL, exitCode: 0 });
+    const result = await collectDelayedPipe(child);
+    assert.equal(result.code, 0, result.stderr);
+    assert.equal(result.stdout.length, SMALL);
+    assert.equal(result.stdout.toString("utf8"), "x".repeat(SMALL));
+  });
+
+  it("a timeout before the marker names the spawn phase (kusabi #277)", async () => {
+    const child = spawnSource(["setInterval(() => {}, 60_000);"]);
+    await assert.rejects(
+      () => collectDelayedPipe(child, { startTimeoutMs: 300 }),
+      (err) => {
+        assert.match(err.message, /never started/);
+        assert.match(err.message, /marker not seen within 300ms/);
+        assert.match(err.message, /0 bytes of stdout read/);
+        assert.match(err.message, /\d+ms elapsed/);
+        return true;
+      },
+    );
+  });
+
+  it("a timeout after the marker names the drain phase (kusabi #277)", async () => {
+    const child = spawnSource([
+      WRITE_READY,
+      `process.stdout.write("y".repeat(1024));`,
+      "setInterval(() => {}, 60_000);",
+    ]);
+    await assert.rejects(
+      () => collectDelayedPipe(child, { delayMs: 0, drainTimeoutMs: 1_500 }),
+      (err) => {
+        assert.match(err.message, /stalled after start/);
+        assert.match(err.message, /marker seen \d+ms after spawn/);
+        assert.match(err.message, /1024 bytes of stdout read \(reader resumed: yes\)/);
+        assert.match(err.message, /\d+ms elapsed/);
+        return true;
+      },
+    );
   });
 
   it("companion --help still exits 0", () => {
@@ -3506,6 +3686,28 @@ describe("flushAndExit (kusabi #243)", () => {
     assert.match(cli, /flushAndExit\(exitCode\)/);
     assert.match(cli, /flushAndExit\(1\)/);
     assert.equal([...cli.matchAll(/process\.exit\(/g)].length, 0);
+  });
+
+  // One definition, no copy: the children above would happily pass against a
+  // duplicate that the companion never calls (kusabi #277).
+  it("the companion imports flushAndExit instead of defining its own", () => {
+    const source = fs.readFileSync(COMPANION_SCRIPT, "utf8");
+    assert.match(source, /^import \{ flushAndExit \} from "\.\/flush-and-exit\.mjs";$/m);
+    assert.equal([...source.matchAll(/function flushAndExit\s*\(/g)].length, 0);
+  });
+
+  // The child's import cost is the measured window's noise floor; keep it at
+  // node builtins (kusabi #277).
+  it("flush-and-exit.mjs imports node builtins only", () => {
+    const source = fs.readFileSync(FLUSH_MODULE, "utf8");
+    const code = source.replace(/\/\*[\s\S]*?\*\//g, "").replace(/^\s*\/\/.*$/gm, "");
+    const specifiers = [...code.matchAll(/\bfrom\s+"([^"]+)"/g)].map((m) => m[1]);
+    assert.ok(specifiers.length > 0, "expected flush-and-exit.mjs to import something");
+    for (const specifier of specifiers) {
+      assert.ok(specifier.startsWith("node:"), `flush-and-exit.mjs must not import ${specifier}`);
+    }
+    assert.equal([...code.matchAll(/\bimport\s*\(/g)].length, 0, "no dynamic import");
+    assert.equal([...code.matchAll(/\brequire\s*\(/g)].length, 0, "no require");
   });
 });
 
