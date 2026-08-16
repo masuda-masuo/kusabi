@@ -164,6 +164,45 @@ describe("readChainSnapshot", () => {
     assert.equal(readChainSnapshot(chainsDir, "chain-window").terminal, true);
   });
 
+  it("is not terminal on a resumed chain still carrying the previous round's disposition (#286)", () => {
+    // chain-resume rearms control.json (status back to `running`, resumedAt
+    // stamped) while chain.json still holds the round that escalated.
+    const dir = makeChainDir(chainsDir, "chain-resumed");
+    writeControl(dir, { ...runningControl("chain-resumed"), resumedAt: "2026-08-16T01:00:00.000Z" });
+    writeChainJson(dir, { chainId: "chain-resumed", records: [{ round: 1, disposition: { disposition: "escalate" } }] });
+    assert.equal(readChainSnapshot(chainsDir, "chain-resumed").terminal, false);
+  });
+
+  it("is terminal on a resumed chain once its status is terminal again", () => {
+    const dir = makeChainDir(chainsDir, "chain-resumed-done");
+    writeControl(dir, {
+      ...runningControl("chain-resumed-done"), status: "completed", resumedAt: "2026-08-16T01:00:00.000Z",
+    });
+    writeChainJson(dir, {
+      chainId: "chain-resumed-done",
+      records: [{ round: 1, disposition: { disposition: "escalate" } }],
+    });
+    assert.equal(readChainSnapshot(chainsDir, "chain-resumed-done").terminal, true);
+  });
+
+  it("is terminal on a terminal status whatever the disposition and resumedAt say", () => {
+    for (const disposition of ["rework", "escalate", null]) {
+      const chainId = `chain-status-wins-${disposition ?? "none"}`;
+      const dir = makeChainDir(chainsDir, chainId);
+      writeControl(dir, { ...runningControl(chainId), status: "failed", resumedAt: "2026-08-16T01:00:00.000Z" });
+      if (disposition) writeChainJson(dir, { chainId, records: [{ round: 1, disposition: { disposition } }] });
+      assert.equal(readChainSnapshot(chainsDir, chainId).terminal, true, String(disposition));
+    }
+  });
+
+  it("is terminal on a terminal disposition with no control record at all (crash recovery)", () => {
+    const dir = makeChainDir(chainsDir, "chain-crashed");
+    writeChainJson(dir, { chainId: "chain-crashed", records: [{ round: 1, disposition: { disposition: "accept" } }] });
+    const snapshot = readChainSnapshot(chainsDir, "chain-crashed");
+    assert.equal(snapshot.status, "unknown");
+    assert.equal(snapshot.terminal, true);
+  });
+
   it("is not terminal on a rework disposition (another round is coming)", () => {
     const dir = makeChainDir(chainsDir, "chain-rework");
     writeControl(dir, runningControl("chain-rework"));
@@ -285,6 +324,44 @@ describe("waitForChain on a running chain", () => {
     });
 
     assert.equal(sleeps, 3);
+    assert.equal(result.status, "completed");
+    assert.match(result.digest, /status=completed disposition=accept rounds=2/);
+  });
+
+  it("keeps waiting on a resumed chain until the resumed round decides it (#286)", async () => {
+    // Live symptom: `status=running disposition=escalate rounds=1 waited=0s`,
+    // exit 0, the instant the wait started.
+    const dir = makeChainDir(chainsDir, "chain-resumed-wait");
+    writeControl(dir, { ...runningControl("chain-resumed-wait"), resumedAt: "2026-08-16T01:00:00.000Z" });
+    writeChainJson(dir, {
+      chainId: "chain-resumed-wait",
+      records: [{ round: 1, disposition: { disposition: "escalate" } }],
+    });
+
+    let sleeps = 0;
+    const sleep = async () => {
+      sleeps += 1;
+      if (sleeps === 2) {
+        writeChainJson(dir, {
+          chainId: "chain-resumed-wait",
+          records: [
+            { round: 1, disposition: { disposition: "escalate" } },
+            { round: 2, disposition: { disposition: "accept" } },
+          ],
+        });
+        writeControl(dir, {
+          ...runningControl("chain-resumed-wait", { round: 2 }),
+          status: "completed",
+          resumedAt: "2026-08-16T01:00:00.000Z",
+        });
+      }
+    };
+
+    const result = await waitForChain({
+      chainsDir, chainId: "chain-resumed-wait", sleep, probeProcess: ALIVE, pollIntervalMs: 1,
+    });
+
+    assert.equal(sleeps, 2);
     assert.equal(result.status, "completed");
     assert.match(result.digest, /status=completed disposition=accept rounds=2/);
   });

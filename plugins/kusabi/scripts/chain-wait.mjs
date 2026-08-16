@@ -42,6 +42,11 @@ export const TERMINAL_CHAIN_STATUSES = new Set(["completed", "cancelled", "faile
  * driver writes chain.json (with the round's disposition) and finalises
  * control.json immediately after, so this only ever matters inside that
  * window — but reading it keeps a wait from sleeping through a decided chain.
+ *
+ * The one place it lies is after a chain-resume: rearmChainControl puts the
+ * status back to "running" while the previous round's disposition sits in
+ * chain.json until the resumed round reaches its own boundary.  See the
+ * terminal decision in readChainSnapshot for how that case is told apart.
  */
 export const TERMINAL_DISPOSITIONS = new Set(["accept", "accept-with-followup", "escalate", "max-rounds"]);
 
@@ -116,6 +121,28 @@ export function readChainSnapshot(chainsDir, chainId) {
   const rounds = records.length || (Number.isFinite(control?.round) ? control.round : 0);
   const pid = Number.isFinite(control?.pid) ? control.pid : null;
 
+  // `running` + a terminal disposition has two causes, and only one of them
+  // means "done":
+  //
+  //   - the pre-finalise window: persistChainState writes chain.json and
+  //     finalizeChainControl writes control.json a moment later, so the
+  //     disposition is on disk before the status catches up.  Terminal.
+  //   - resume residue (#286): rearmChainControl put the status back to
+  //     `running`, but the PREVIOUS round's disposition stays in chain.json
+  //     until the resumed round reaches its own boundary.  Not terminal —
+  //     reading it as one made chain-wait exit 0 the instant it started.
+  //
+  // `resumedAt` is what separates them: rearmChainControl writes it, a chain
+  // in its first pre-finalise window has never had one.
+  //
+  // Residual, accepted deliberately: a resumed chain that dies inside its own
+  // pre-finalise window still carries resumedAt with status `running`, so the
+  // wait sleeps until its timeout and exits non-zero.  A false timeout fails
+  // loud, a false terminal fails silent; telling those two apart would need a
+  // new persisted field, which is not worth it here.
+  const resumeResidue = Boolean(control?.resumedAt) && status === "running";
+  const settledByDisposition = TERMINAL_DISPOSITIONS.has(disposition) && !resumeResidue;
+
   return {
     chainId,
     chainDir,
@@ -125,7 +152,7 @@ export function readChainSnapshot(chainsDir, chainId) {
     disposition,
     rounds,
     pid,
-    terminal: exists && (TERMINAL_CHAIN_STATUSES.has(status) || TERMINAL_DISPOSITIONS.has(disposition)),
+    terminal: exists && (TERMINAL_CHAIN_STATUSES.has(status) || settledByDisposition),
     // Any observable movement, including a rewrite that changed no field we
     // read: a chain still writing is a chain still working.
     fingerprint: JSON.stringify([
