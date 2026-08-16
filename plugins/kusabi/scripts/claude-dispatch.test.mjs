@@ -811,11 +811,28 @@ describe("allowedToolsForAgent", () => {
     assert.throws(() => allowedToolsForAgent("custom-agent"), /no permission allowlist/);
   });
 
-  it("grants both kaiba tools to all three supported agents (kusabi #279)", () => {
+  it("grants kaiba READ-ONLY to all three supported agents — recall, never remember (kusabi #279)", () => {
+    // Write permission follows the inspection hierarchy: every agent
+    // dispatched here has its output inspected, so it reads the store and
+    // reports durable facts for the orchestrator to file.  On the store's
+    // first day workers filed review summaries and completion reports, which
+    // the prompt-level contract failed to prevent — so the grant itself is
+    // the guard now.
     for (const agent of ["kusabi-implement", "kusabi-review", "kusabi-investigate"]) {
       const csv = allowedToolsForAgent(agent);
-      assert.ok(csv.includes("mcp__kaiba__remember"), `${agent} must allow mcp__kaiba__remember`);
       assert.ok(csv.includes("mcp__kaiba__recall"), `${agent} must allow mcp__kaiba__recall`);
+      assert.ok(!csv.includes("mcp__kaiba__remember"), `${agent} must NOT allow mcp__kaiba__remember`);
+    }
+  });
+
+  it("no phase toolset pairs kaiba recall with remember, and none grants a kaiba wildcard", () => {
+    // The invariant stated over every entry of ALLOWED_TOOLS rather than the
+    // three agent names: a future phase added to the map is covered too.  A
+    // glob like `mcp__kaiba__*` would re-allow remember by pattern, so the
+    // only acceptable kaiba entry is the exact recall tool.
+    for (const [phase, csv] of Object.entries(ALLOWED_TOOLS)) {
+      const kaibaTools = csv.split(",").filter(t => t.startsWith("mcp__kaiba__"));
+      assert.deepEqual(kaibaTools, ["mcp__kaiba__recall"], `${phase}: kaiba must be recall-only`);
     }
   });
 });

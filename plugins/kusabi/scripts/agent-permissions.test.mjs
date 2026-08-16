@@ -89,6 +89,19 @@ export function checkAgentPermissions(permission, roleName) {
     violations.push(`"sunaba_sandbox_issue_write" granted to "${roleName}", but only draft/investigate may have it`);
   }
 
+  // 8. kaiba is READ-ONLY for every worker phase: `kaiba_recall` is the only
+  //    grant that may appear under the kaiba prefix.  Write permission
+  //    follows the inspection hierarchy — an agent whose output is inspected
+  //    reads the shared conclusion store, and the inspecting side (the
+  //    orchestrator) is the only writer; a worker that discovers a durable
+  //    fact reports it instead of filing it.  A `kaiba*` glob would re-allow
+  //    `kaiba_remember` under findLast, so the wildcard is a violation too.
+  for (const [tool, value] of entries) {
+    if (value === "allow" && tool.startsWith("kaiba") && tool !== "kaiba_recall") {
+      violations.push(`Non-recall kaiba grant "${tool}" is allowed (role: ${roleName})`);
+    }
+  }
+
   return violations;
 }
 
@@ -224,6 +237,15 @@ describe("agent permission allowlists", () => {
         violations,
         [],
         `${roleName}: Permission violations:\n  ${violations.join("\n  ")}`,
+      );
+
+      // Read access is the other half of the read-only contract: rule 8
+      // rejects any kaiba grant beyond recall, but only this assertion
+      // notices recall going missing entirely.
+      assert.equal(
+        permission["kaiba_recall"],
+        "allow",
+        `${roleName}: kaiba_recall must be granted — every worker phase reads the shared conclusion store`,
       );
     });
   }
@@ -376,6 +398,35 @@ describe("agent permission allowlists", () => {
         },
         "investigate",
       );
+      assert.deepEqual(violations, []);
+    });
+
+    // --- kaiba is read-only for every phase ---
+    const READ_CORE = {
+      "*": "deny",
+      "sunaba_sandbox_attach": "allow",
+      "sunaba_read_file_range": "allow",
+      "sunaba_search_in_container": "allow",
+      "sunaba_list_files": "allow",
+      "sunaba_diff_in_container": "allow",
+      "sunaba_issue_view": "allow",
+    };
+
+    it('"kaiba_remember" granted to any role', () => {
+      const violations = checkAgentPermissions(
+        { ...READ_CORE, "kaiba_recall": "allow", "kaiba_remember": "allow" },
+        "review",
+      );
+      assert.ok(violations.some(v => v.includes("kaiba_remember")));
+    });
+
+    it('a "kaiba*" glob is a violation — it re-allows remember by pattern', () => {
+      const violations = checkAgentPermissions({ ...READ_CORE, "kaiba*": "allow" }, "review");
+      assert.ok(violations.some(v => v.includes("kaiba*")));
+    });
+
+    it('"kaiba_recall" alone passes', () => {
+      const violations = checkAgentPermissions({ ...READ_CORE, "kaiba_recall": "allow" }, "review");
       assert.deepEqual(violations, []);
     });
 
