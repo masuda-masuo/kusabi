@@ -40,6 +40,7 @@ import {
 } from "./brief-parsing.mjs";
 import {
   checkSmokeProbe,
+  parseRefusalBlock,
 } from "./probe-decisions.mjs";
 // The JSONL review wire format (kusabi #202).  Tried before extractJson;
 // a reviewer that still emits one JSON object takes the path below unchanged.
@@ -414,9 +415,24 @@ export async function runImplementPhase({
     explicitModel: isFirstRound ? flagsModel : null,
   });
 
-  // Ignore resultText from non-completed jobs; the chain reads the result
-  // from the job store.
-  void resultText;
+  // The report text is read for exactly one thing (kusabi #293): the
+  // structured refusal block a worker writes when it stops without editing
+  // because the brief contradicts itself.  Only the PARSED descriptor leaves
+  // this function -- the report itself can carry a whole git diff, and the
+  // round record must not grow one.  Gated on `completed` for the same reason
+  // the review retry is: a failed job's text is empty or garbage, and a
+  // refusal must never be inferred from a job that died.
+  //
+  // The descriptor is stamped onto the round record AT PARSE TIME because the
+  // driver has a designed interruption point between this phase and
+  // finishRound (the stop-check after the probes, kusabi #153①): the
+  // partial round is persisted as-is at that stop, and the review-resume path
+  // must route the refusal that round carried -- without the stamp, a resumed
+  // refusal round would classify as a worker discard.  Stamped here, the
+  // record is the single source of truth for both the fresh path (which
+  // passes the same descriptor to finishRound) and the resume path (which
+  // reads it back); no second measurement exists.
+  const implementRefusal = job.status === "completed" ? parseRefusalBlock(resultText) : null;
 
   return {
     roundRecord: {
@@ -431,6 +447,11 @@ export async function runImplementPhase({
       implementJobId: job.id,
       sessionID: job.sessionID,
       implementUsage: job.usage || null,
+      // The parsed refusal descriptor, stamped at parse time (see above);
+      // null when the report carried no block -- the ordinary case.  The
+      // caller still decides what it means: whether a refusal is genuine
+      // depends on the change set, which this phase has not measured yet.
+      implementRefusal,
     },
     implementJobStatus: job.status,
     implementJobError: job.error || null,
@@ -440,6 +461,11 @@ export async function runImplementPhase({
     // renderer uses it to show the classification instead of the generic
     // capacity advice.
     implementJobFailure: job.failure || null,
+    // The parsed refusal block (kusabi #293), or null when the report carried
+    // none -- the ordinary case.  The caller decides what it means; whether a
+    // refusal is genuine depends on the change set, which this phase has not
+    // measured yet.
+    implementRefusal,
     session: resolvedSession,
   };
 }
@@ -1454,6 +1480,49 @@ export function renderEscalateOutcome({ chainId, round, disposition, orchestrato
     lines.push("Round " + (ri + 1) + ": model=" + (r.modelEntry || "?") + ", verdict=" + r.verdict + ", probesGreen=" + r.probesGreen + ", changed=" + changed + ", resume=" + r.resumeMethod.type + detail);
   }
   lines.push("", "Hand over to orchestrator for final judgement.");
+  return lines.join("\n");
+}
+
+/**
+ * Render the outcome string for a qualifying refusal (kusabi #293).
+ *
+ * Reads like the escalate outcome on purpose -- both hand the chain to the
+ * orchestrator -- but says the opposite thing about WHOSE defect it is, and
+ * names the two contradicting items on their own lines so the orchestrator
+ * can open both without reading the round record.  The absence of findings
+ * is stated rather than left blank: this round never ran a review.
+ */
+export function renderRefusalOutcome({ chainId, round, disposition, orchestrator, roundRecord, records }) {
+  const refusal = roundRecord?.refusal || null;
+  const orchLine = orchestrator?.model ? "orchestrator=" + orchestrator.model : "";
+  const lines = [
+    "Chain " + chainId + " refused at round " + round + ": the brief contradicts itself.",
+    orchLine,
+    "",
+    "Contradicting items named by the worker:",
+  ];
+  const anchors = Array.isArray(refusal?.anchors) ? refusal.anchors : [];
+  if (anchors.length > 0) {
+    for (const a of anchors) lines.push("- " + a.text + "  [" + a.kind + "]");
+  } else {
+    // Unreachable through the driver (the disposition requires two named
+    // anchors), but a renderer must never present an empty list as a fact.
+    lines.push("- (not recorded)");
+  }
+  lines.push("", "Why they cannot both hold:", refusal?.why || "(not recorded)", "");
+  for (let ri = 0; ri < records.length; ri++) {
+    const r = records[ri];
+    const detail = r.resumeMethod?.detail ? ": " + r.resumeMethod.detail : "";
+    const changed = (r.worktreeChanged === undefined || r.worktreeChanged === null) ? "unknown" : r.worktreeChanged ? "yes" : "NO";
+    lines.push("Round " + (ri + 1) + ": model=" + (r.modelEntry || "?") + ", outcome=" + (r.roundOutcome || r.verdict) + ", changed=" + changed + ", resume=" + (r.resumeMethod?.type || "?") + detail);
+  }
+  lines.push(
+    "",
+    "No review was dispatched (the round changed nothing) and no rework was spent.",
+    "This is a BRIEF defect, not a worker failure: fix the contradiction in the brief " +
+      "and dispatch again, or decide which of the two items gives way.",
+    disposition?.reason ? "Recorded reason: " + disposition.reason : "",
+  );
   return lines.join("\n");
 }
 

@@ -500,3 +500,68 @@ describe("deriveDisposition — oracle violation routing (kusabi #197)", () => {
     }
   });
 });
+
+// deriveDisposition — qualifying refusal (kusabi #293)
+// ---------------------------------------------------------------------------
+// The row exists so an honest stop stops being indistinguishable from a lazy
+// empty round.  What matters is that it is TERMINAL and that it is distinct:
+// not accept (nothing was built), not rework (the worker cannot fix a brief),
+// not escalate/discard (the failure is not the worker's).
+
+describe("deriveDisposition qualifying refusal (kusabi #293)", () => {
+  const NAMED = "## Frozen tests vs src/foo.test.mjs — the test pins the old output";
+
+  it("routes a qualifying refusal to refused-brief-defect and names the items", () => {
+    const result = deriveDisposition({
+      verdict: "discard", probesGreen: false, round: 1, maxRounds: 4,
+      repeatedAreas: false, refusal: NAMED,
+    });
+    assert.equal(result.disposition, "refused-brief-defect");
+    assert.match(result.reason, /brief contradicts itself/);
+    assert.match(result.reason, /## Frozen tests vs src\/foo\.test\.mjs/);
+  });
+
+  it("accepts a bare `true` marker, with no named items in the reason", () => {
+    const result = deriveDisposition({
+      verdict: "discard", probesGreen: false, round: 1, maxRounds: 4,
+      repeatedAreas: false, refusal: true,
+    });
+    assert.equal(result.disposition, "refused-brief-defect");
+    assert.doesNotMatch(result.reason, /—/);
+  });
+
+  it("takes precedence over the P5/P6 oracle violation", () => {
+    const result = deriveDisposition({
+      verdict: "approve", probesGreen: false, round: 1, maxRounds: 4,
+      repeatedAreas: false, oracleViolation: "P5: frozen — tests/frozen.test.mjs",
+      refusal: NAMED,
+    });
+    assert.equal(result.disposition, "refused-brief-defect");
+  });
+
+  it("takes precedence over the max-rounds terminal (never spends the last round)", () => {
+    const result = deriveDisposition({
+      verdict: "needs-attention", probesGreen: false, round: 4, maxRounds: 4,
+      repeatedAreas: true, refusal: NAMED,
+    });
+    assert.equal(result.disposition, "refused-brief-defect");
+  });
+
+  it("never accepts, whatever the verdict says", () => {
+    const result = deriveDisposition({
+      verdict: "approve", probesGreen: true, round: 1, maxRounds: 4,
+      repeatedAreas: false, refusal: NAMED,
+    });
+    assert.equal(result.disposition, "refused-brief-defect");
+  });
+
+  it("is inert when absent, false, or an empty string — every other row is untouched", () => {
+    for (const refusal of [undefined, null, false, "", "   "]) {
+      const result = deriveDisposition({
+        verdict: "approve", probesGreen: true, round: 1, maxRounds: 4,
+        repeatedAreas: false, refusal,
+      });
+      assert.deepEqual(result, { disposition: "accept" }, "refusal=" + JSON.stringify(refusal));
+    }
+  });
+});

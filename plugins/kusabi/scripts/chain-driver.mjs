@@ -39,7 +39,7 @@ import {
   findSmokeViolations,
   SMOKE_VIOLATION_NO_ENTRIES,
 } from "./brief-parsing.mjs";
-import { checkSmokeProbe } from "./probe-decisions.mjs";
+import { checkSmokeProbe, classifyRefusalOutcome, verifyRefusalAnchors } from "./probe-decisions.mjs";
 import { deriveDisposition } from "./disposition.mjs";
 import { stateRoot, stateDirFor, readJson, writeJson } from "./state-paths.mjs";
 import {
@@ -71,6 +71,7 @@ import {
   renderAcceptOutcome,
   renderAcceptWithFollowupOutcome,
   renderEscalateOutcome,
+  renderRefusalOutcome,
   renderMaxRoundsOutcome,
   handleProviderExhaustion,
   recordReworkEscalation,
@@ -1080,10 +1081,22 @@ export async function runChainDriver({
       : text + "\n\n" + "review record: (write failed: " + (writeError?.message || "unknown error") + " — chain state dir " + chainDir + ")";
   }
 
+  // Existence predicate for refusal anchors (kusabi #293): the worktree is
+  // `cwd`, and the driver process runs inside the container that holds it.
+  // `verifyRefusalAnchors` rejects `..` and `.git` paths before asking, so
+  // the join cannot escape the worktree; a miss is `false`, never a throw.
+  function repoPathExists(name) {
+    try {
+      return fs.existsSync(path.join(cwd, name));
+    } catch {
+      return false;
+    }
+  }
+
   // Phases 5–13 (review → disposition → persistence → strategize), shared by
   // fresh rounds and review-resumes.  Mutates the cross-round state above in
   // place; returns { done: true, text } when the chain ended.
-  async function finishRound({ round, roundRecord, previousRecord, probeCtx }) {
+  async function finishRound({ round, roundRecord, previousRecord, probeCtx, implementRefusal = null }) {
     const {
       chainChangedPaths, chainNewlyChanged, chainStatusObserved,
       chainStatusOutput, chainBaseLog, chainDeliverables, chainUntracked, chainTruncation,
@@ -1108,6 +1121,62 @@ export async function runChainDriver({
       chainChangedPaths, chainNewlyChanged, chainStatusObserved, chainDeliverables,
       flagsModel, _dispatchWithFallback: reviewDispatch,
     });
+    // ---- phase 5b: qualifying refusal (kusabi #293) ----
+    // `skipReview` is the empty-change-set signal the discard has always been
+    // decided on, so routing here can only ever DIVIDE that population --
+    // a round that changed files takes the same path it did before, and an
+    // empty round whose report carries no qualifying block still discards
+    // byte for byte.
+    //
+    // The parse is shape-only; the NAMED items must exist before the block
+    // may qualify (phase-chain.md §3.5.4a): a brief-section anchor must be a
+    // heading the brief really has, and a repo-path anchor must be a file or
+    // directory the worktree really contains -- a forged `src/nonexistent.mjs`
+    // or an invented heading counts as unnamed, disqualifying unless two real
+    // items remain.  Both inputs are in scope here: the chain's own brief
+    // text, and the worktree at `cwd`.  The fresh path and the review-resume
+    // path (which also lands here, descriptor read back off the record)
+    // therefore derive the same verdict.  The verified descriptor replaces
+    // the parse-time stamp on the record, so the record never keeps a
+    // shape-only verdict that classification has already rejected.
+    const verifiedRefusal = implementRefusal
+      ? verifyRefusalAnchors(implementRefusal, {
+          brief,
+          pathExists: repoPathExists,
+        })
+      : null;
+    if (implementRefusal) roundRecord.implementRefusal = verifiedRefusal;
+    const refusalOutcome = classifyRefusalOutcome({
+      changeSetEmpty: skipReview,
+      refusal: verifiedRefusal,
+    });
+    if (refusalOutcome.outcome === "refusal") {
+      // The round's outcome is a refusal, NOT a discard: seat metrics count
+      // `verdict`, and leaving `discard` there would charge the worker for
+      // reading the brief correctly -- the pressure this whole path exists to
+      // remove.  `verdictSource` stays "probe" (no reviewer decided this).
+      roundRecord.roundOutcome = "refusal";
+      roundRecord.refusal = refusalOutcome.refusal;
+      roundRecord.verdict = "refusal";
+      roundRecord.verdictSource = "probe";
+      roundRecord.findingsText = "(no review — the worker refused the brief as self-contradictory)";
+    } else if (refusalOutcome.strayRefusal) {
+      // The worker wrote a refusal block AND edited files.  That is not a
+      // refusal, so nothing about the routing changes -- but the
+      // inconsistency is the orchestrator's to see, not the record's to
+      // swallow.
+      roundRecord.strayRefusalBlock = {
+        anchors: refusalOutcome.strayRefusal.anchors,
+        why: refusalOutcome.strayRefusal.why,
+        note: refusalOutcome.detail,
+      };
+    } else if (refusalOutcome.detail) {
+      // Empty round, refusal ATTEMPTED but the block did not qualify.  The
+      // routing is the pre-existing discard; recording why it fell short
+      // keeps the orchestrator from reading the round as a lazy empty one.
+      roundRecord.refusalRejected = refusalOutcome.detail;
+    }
+
     const chainVerdict = roundRecord.verdict;
     const chainFindingsText = roundRecord.findingsText;
     // ---- stop on review provider exhaustion ----
@@ -1170,6 +1239,12 @@ export async function runChainDriver({
         findingSeverities,
         strategizeEligible: !strategized,
         oracleViolation,
+        // A qualifying refusal (kusabi #293) is fixed for the round: it is
+        // measured from the change set and the report, neither of which the
+        // re-validation below re-measures, so both derivations see the same
+        // value.  The named items travel in the string so the terminal line
+        // carries them.
+        refusal: refusalOutcome.outcome === "refusal" ? refusalOutcome.detail : null,
       });
     };
     let disposition = deriveWith(probesGreen, recordedOracleViolation);
@@ -1318,6 +1393,19 @@ export async function runChainDriver({
     updateChainControlRound({ chainDir, round });
 
     // ---- phase 8: disposition handling ----
+    // A qualifying refusal is terminal and lands in the orchestrator's hands
+    // (kusabi #293).  `completed` like every other decided chain: the chain
+    // ran correctly and produced a decision -- what is defective is the
+    // brief, which the outcome text says in as many words.
+    if (disposition.disposition === "refused-brief-defect") {
+      finalizeChainControl({ chainDir, status: "completed", round });
+      return { done: true, text: finaliseChain(
+        renderRefusalOutcome({ chainId, round, disposition, orchestrator, roundRecord, records }),
+        { disposition: "refused-brief-defect", round, reason: disposition.reason || null },
+        round,
+      ) };
+    }
+
     if (disposition.disposition === "accept") {
       finalizeChainControl({ chainDir, status: "completed", round });
       return { done: true, text: finaliseChain(
@@ -1495,6 +1583,14 @@ export async function runChainDriver({
           // previous COMPLETE round is the one before it.
           previousRecord: records.length >= 2 ? records[records.length - 2] : null,
           probeCtx,
+          // No implement job runs on this path, so the refusal is READ from
+          // the persisted record (kusabi #293): runImplementPhase stamps the
+          // parsed descriptor at parse time, and the interrupted round was
+          // persisted with it -- a stop between implement and finishRound
+          // (kusabi #153①) must not convert an honest refusal into a worker
+          // discard on resume.  Records predating the stamp read as null and
+          // route exactly as they did before refusals existed.
+          implementRefusal: roundRecord.implementRefusal ?? null,
         });
         if (result.done) return result.text;
         continue;
@@ -1574,6 +1670,7 @@ export async function runChainDriver({
         implementJobStatus,
         implementJobError,
         implementJobFailure,
+        implementRefusal,
       } = await runImplementPhase({
         cwd, chainId, round, isFirstRound, implementText, modelChain: roundModelChain,
         tierIndex: currentTierIndex,
@@ -1669,6 +1766,7 @@ export async function runChainDriver({
         roundRecord,
         previousRecord,
         probeCtx: probeResult,
+        implementRefusal,
       });
       if (result.done) return result.text;
     }
