@@ -231,6 +231,12 @@ Worker reports are claims, not evidence. They have been false before.
   post it to the archive repository. Posting is orchestrator-exclusive, by the same
   exit principle as publish; an unposted record is write-only state the next brief
   cannot learn from.
+- **Move your work queue in the same turn that a chain terminates or a merge is
+  confirmed.** A session's end cannot be relied on to do it — the sessions that need
+  closing hygiene most (freezes, context exhaustion, kills) never get it, and a queue
+  frozen at "chain running" makes the next session rebuild state from issue/PR lists.
+  The terminal digest and the merge confirmation each arrive as a turn; the one-line
+  queue update belongs in that turn, not at the end.
 
 ## Publish
 
