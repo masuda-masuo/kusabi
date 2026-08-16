@@ -293,6 +293,29 @@ export function resolveReworkScope(previousRecord) {
 }
 
 /**
+ * Prepend the workspace header naming the exact container ID, or return the
+ * text unchanged when there is no container.
+ *
+ * Extracted from buildImplementText (kusabi #289) because the single-shot
+ * `task --container <cid>` path needs the SAME sentence: the chain injected
+ * the id into its implement prompt while `task` only recorded it on the job,
+ * so a worker dispatched by `task --phase implement --container <cid>` with a
+ * brief that carried no `## Workplace` section had nothing to read the id out
+ * of — one such job guessed ten `sandbox_attach` names, all failed, and
+ * finished 171s with zero edits.  One function, one wording: a brief that
+ * also names its workplace is then a harmless duplicate, and a stale id in a
+ * brief loses to the fresh `--container` value stated first.
+ *
+ * @param {string} text                     The prompt text to prefix.
+ * @param {string|null|undefined} container  The container ID, if any.
+ * @returns {string}
+ */
+export function withContainerWorkspace(text, container) {
+  if (!container) return text;
+  return "The workspace lives inside container `" + container + "`. Pass this exact ID as `container_id` to every sunaba tool call. Do not guess container names or call sandbox_attach.\n\n" + text;
+}
+
+/**
  * Build the implement prompt text for a chain round.
  *
  * When `container` is given, a header naming the exact container ID is
@@ -339,10 +362,7 @@ export function buildImplementText({ round, brief, previousRecord, container, re
   } else {
     text = brief;
   }
-  if (container) {
-    return "The workspace lives inside container `" + container + "`. Pass this exact ID as `container_id` to every sunaba tool call. Do not guess container names or call sandbox_attach.\n\n" + text;
-  }
-  return text;
+  return withContainerWorkspace(text, container);
 }
 
 /**
