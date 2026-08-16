@@ -140,6 +140,13 @@ end up re-running a doomed cheap round three times.
   file let a reviewer refute the orchestrator's own mistaken claim from the real
   source; had the brief stated the answer, the worker would have copied it and the
   reviewer would have confirmed the copy.
+- **Before declaring an existing behaviour wrong or legacy in a spec that also
+  freezes "all existing tests pass unchanged", grep the existing tests for that
+  behaviour.** The two criteria can silently demand opposite outputs for the same
+  input, and no implementation can satisfy both. One grep at authoring time catches
+  it; skipping it cost a full round on a worker's (correct) refusal — the redundancy
+  is also the safety net, so when the contradiction fires, fix the brief, not the
+  frozen test.
 - **Paste facts you have already verified** rather than making the worker re-derive
   them — but the thing you name instead of state is the claim you have *not* verified.
   Both halves belong in one item. A worker made to re-derive confirmed facts once spent its
