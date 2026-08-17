@@ -893,11 +893,12 @@ export function renderChainShow(chain, rounds, unreadable = [], control = null) 
 
     // Verdict
     if (round.verdict) {
+      const salvagedNote = round.salvagedVerdict === true ? " (salvaged)" : "";
       const parseableNote = round.reviewParseable === false ? " (unparseable)" : "";
       // Name the seat the verdict came from, so a replacement verdict is
       // never mistaken for the round's first and only review.
       const seatNote = seatFailures.length > 0 ? ` (replacement seat ${seatFailures.length + 1})` : "";
-      lines.push(`  verdict: ${round.verdict}${parseableNote}${seatNote}`);
+      lines.push(`  verdict: ${round.verdict}${salvagedNote}${parseableNote}${seatNote}`);
     }
 
     // A probe-sourced discard is NOT a reviewer's discard (kusabi #299): no

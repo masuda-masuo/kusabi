@@ -884,6 +884,8 @@ export function parseReviewResult(reviewResultText) {
       reviewParseable: true,
       reviewPartial: jsonl.partial,
       reviewFindingCount: jsonl.findingCount,
+      partialDiagnosis: jsonl.partialDiagnosis || null,
+      salvagedVerdict: jsonl.review?.salvagedVerdict === true,
     };
   }
 
@@ -923,14 +925,32 @@ export function parseReviewResult(reviewResultText) {
     const chainFindingsText = renderGroupedFindingsText(findingsArray);
     // The single-object path is never partial: the object either carries a
     // verdict or it is not this path at all.
-    return { chainParsedReview: parsed, chainVerdict, chainFindingsText, reviewParseable, reviewPartial: false, reviewFindingCount: findingsArray.length };
+    return {
+      chainParsedReview: parsed,
+      chainVerdict,
+      chainFindingsText,
+      reviewParseable,
+      reviewPartial: false,
+      reviewFindingCount: findingsArray.length,
+      partialDiagnosis: null,
+      salvagedVerdict: false,
+    };
   }
 
   // A2: unparseable review is recorded as a distinct state
   const recoveredV = recoverVerdictFromText(reviewResultText);
   const chainVerdict = recoveredV ? recoveredV.verdict : "unparseable";
   const chainFindingsText = "(review output could not be parsed)";
-  return { chainParsedReview: null, chainVerdict, chainFindingsText, reviewParseable, reviewPartial: false, reviewFindingCount: 0 };
+  return {
+    chainParsedReview: null,
+    chainVerdict,
+    chainFindingsText,
+    reviewParseable,
+    reviewPartial: false,
+    reviewFindingCount: 0,
+    partialDiagnosis: null,
+    salvagedVerdict: false,
+  };
 }
 
 /**
@@ -1086,6 +1106,7 @@ export async function runReviewPhase({
       chainParsedReview: _parsed, chainVerdict: _verdict,
       chainFindingsText: _findings, reviewParseable: _parseable,
       reviewPartial: _partial, reviewFindingCount: _findingCount,
+      partialDiagnosis: _partialDiagnosis, salvagedVerdict: _salvagedVerdict,
     } = parseReviewResult(reviewResultText);
 
     // ---- retry once on unparseable output ----
@@ -1121,7 +1142,8 @@ export async function runReviewPhase({
       ({ job: reviewJob, resultText: reviewResultText } = await _dispatch(reviewDispatchOptions));
       ({ chainParsedReview: _parsed, chainVerdict: _verdict,
          chainFindingsText: _findings, reviewParseable: _parseable,
-         reviewPartial: _partial, reviewFindingCount: _findingCount } = parseReviewResult(reviewResultText));
+         reviewPartial: _partial, reviewFindingCount: _findingCount,
+         partialDiagnosis: _partialDiagnosis, salvagedVerdict: _salvagedVerdict } = parseReviewResult(reviewResultText));
     }
 
     roundRecord.reviewJobId = reviewJob.id;
@@ -1145,12 +1167,18 @@ export async function runReviewPhase({
     if (!reviewParseable) {
       roundRecord.verdictSource = "recovered-from-token";
     }
+    if (_salvagedVerdict) {
+      roundRecord.salvagedVerdict = true;
+    }
     // Partial review (kusabi #202): the record must make it visible that the
     // review was incomplete, and how many findings it did carry.  Written
     // only when partial, so records for complete reviews are unchanged.
     if (_partial) {
       roundRecord.reviewPartial = true;
       roundRecord.reviewFindingCount = _findingCount;
+      if (_partialDiagnosis) {
+        roundRecord.reviewPartialDiagnosis = _partialDiagnosis;
+      }
     }
     roundRecord.findingsText = chainFindingsText;
 
@@ -1190,8 +1218,8 @@ export async function runReviewPhase({
  * must not add, so archiving CLEARS them rather than trusting the overwrite.
  */
 const REVIEW_SEAT_RECORD_FIELDS = [
-  "verdict", "verdictSource", "reviewParseable",
-  "reviewPartial", "reviewFindingCount",
+  "verdict", "verdictSource", "reviewParseable", "salvagedVerdict",
+  "reviewPartial", "reviewFindingCount", "reviewPartialDiagnosis",
   "reviewJobId", "reviewUsage", "reviewModelEntry", "reviewModelVariant",
   "reviewFallbacks", "reviewJobFailure",
   "reviewUnparseableRetried", "reviewFirstJobId", "reviewFirstUsage", "reviewFirstFallbacks",
@@ -2653,9 +2681,11 @@ export function handleProviderExhaustion({
 // over an intact implementation, and only it may be re-bought by chain-resume.
 //
 // The two seat-failure states the review parser can produce (`partial`,
-// `unparseable`) each escalate through deriveDisposition with ONE reason
-// string; the map is keyed by verdict so a seat-failure verdict carrying the
-// other verdict's reason reads as inconsistent records, not as eligible.
+// `unparseable`) each escalate through deriveDisposition with a reason
+// starting with one of these base strings (suffixed by partialDiagnosis
+// when available, kusabi #312); the map is keyed by verdict so a seat-failure
+// verdict carrying the other verdict's reason reads as inconsistent records,
+// not as eligible.
 // `needs-attention` and `discard` are deliberately absent: those are completed
 // reviews judging the work, and they keep today's refusal.
 const REVIEW_SEAT_FAILURE_REASONS = {
@@ -2748,11 +2778,14 @@ export function classifyReviewSeatReplacement(chainJson) {
       `${where} record has no \`disposition.reason\` — the escalate cause cannot be established`
     );
   }
-  if (reason !== expectedReason) {
+  if (!reason.startsWith(expectedReason)) {
     // The OTHER seat-failure reason next to this verdict is contradictory
     // records; anything else (max-rounds, discard, repeated areas) is simply
     // a different escalate, which keeps the refusal verbatim.
-    return Object.values(REVIEW_SEAT_FAILURE_REASONS).includes(reason)
+    const isOtherSeatFailure = Object.entries(REVIEW_SEAT_FAILURE_REASONS).some(
+      ([otherVerdict, otherBase]) => otherVerdict !== verdict && reason.startsWith(otherBase)
+    );
+    return isOtherSeatFailure
       ? seatRecordsUndecidable(
         `${where} record is inconsistent: verdict \`${verdict}\` with \`disposition.reason\` "${reason}"`
       )
