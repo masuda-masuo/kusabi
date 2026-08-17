@@ -2772,10 +2772,45 @@ describe("parseReviewResult — JSONL review stream (kusabi #202)", () => {
 
     assert.equal(result.chainVerdict, "approve");
     assert.equal(result.reviewPartial, false);
+    assert.equal(result.salvagedVerdict, false);
+    assert.equal(result.partialDiagnosis, null);
     assert.equal(result.chainFindingsText, "(no structured findings)");
     assert.deepEqual(result.chainParsedReview, {
       verdict: "approve", summary: "Nothing to block on.", findings: [], next_steps: [],
     });
+  });
+
+  it("salvages the verdict from an unterminated JSONL verdict line (kusabi #312)", () => {
+    const stream = [
+      JSON.stringify({ type: "finding", ...MECHANICAL_FINDING }),
+      '{"type":"verdict","verdict":"approve","summary":"LGTM',
+    ].join("\n");
+
+    const result = parseReviewResult(stream);
+
+    assert.equal(result.chainVerdict, "approve");
+    assert.equal(result.reviewPartial, false);
+    assert.equal(result.reviewParseable, true);
+    assert.equal(result.salvagedVerdict, true);
+    assert.equal(result.partialDiagnosis, null);
+    assert.equal(result.chainParsedReview.salvagedVerdict, true);
+  });
+
+  it("returns partialDiagnosis and salvagedVerdict: false when a JSONL stream is partial (kusabi #312)", () => {
+    const stream = [
+      JSON.stringify({ type: "finding", ...DESIGN_FINDING }),
+      "Point 3 — I still need to check the empty-strea",
+    ].join("\n");
+
+    const result = parseReviewResult(stream);
+
+    assert.equal(result.chainVerdict, "partial");
+    assert.equal(result.reviewPartial, true);
+    assert.equal(result.salvagedVerdict, false);
+    assert.equal(
+      result.partialDiagnosis,
+      "format: records present but no verdict record arrived",
+    );
   });
 });
 
@@ -3965,6 +4000,36 @@ describe("runReviewPhase — partial JSONL review (kusabi #202)", () => {
     assert.equal(roundRecord.reviewPartial, true);
     assert.equal(roundRecord.reviewFindingCount, 2);
   });
+
+  it("populates reviewPartialDiagnosis on roundRecord for partial stream with diagnosis (kusabi #312)", async () => {
+    const { roundRecord } = await runWith([
+      fakeJob("job-truncated", TRUNCATED),
+    ]);
+
+    assert.equal(roundRecord.verdict, "partial");
+    assert.equal(roundRecord.reviewPartial, true);
+    assert.equal(
+      roundRecord.reviewPartialDiagnosis,
+      "format: records present but no verdict record arrived",
+    );
+    assert.equal(roundRecord.salvagedVerdict, undefined);
+  });
+
+  it("populates salvagedVerdict on roundRecord for salvaged verdict stream (kusabi #312)", async () => {
+    const SALVAGED_STREAM = [
+      JSON.stringify(FINDING_1),
+      '{"type":"verdict","verdict":"approve","summary":"Ship. ' + "x".repeat(100),
+    ].join("\n");
+
+    const { roundRecord } = await runWith([
+      fakeJob("job-salvaged", SALVAGED_STREAM),
+    ]);
+
+    assert.equal(roundRecord.verdict, "approve");
+    assert.equal(roundRecord.salvagedVerdict, true);
+    assert.equal(roundRecord.reviewPartial, undefined);
+    assert.equal(roundRecord.reviewPartialDiagnosis, undefined);
+  });
 });
 
 // =========================================================================
@@ -5025,6 +5090,23 @@ describe("resolveChainResume", () => {
     assert.equal(result.ok, true, result.error);
     assert.equal(result.position.phase, "review");
   });
+
+  it("allows seat replacement when partial disposition reason has diagnosis suffix (kusabi #312)", () => {
+    const result = resolveChainResume({
+      control: seatControl,
+      chainJson: baseChainJson({
+        records: [deadSeatRound({
+          disposition: {
+            disposition: "escalate",
+            reason: "partial review: stream ended before the verdict line (format: records present but no verdict record arrived)",
+          },
+        })],
+      }),
+    });
+    assert.equal(result.ok, true, result.error);
+    assert.equal(result.position.phase, "review");
+    assert.equal(result.position.reviewSeatReplacement, true);
+  });
 });
 
 // =========================================================================
@@ -5032,6 +5114,26 @@ describe("resolveChainResume", () => {
 // =========================================================================
 
 describe("classifyReviewSeatReplacement", () => {
+  function seatEligibleRecord(overrides = {}) {
+    return {
+      round: 1,
+      implementJobId: "job-imp-1",
+      probesGreen: true,
+      probeResults: [
+        { probe: "P1: HEAD clean", passed: true },
+        { probe: "P2: verify gate", passed: true },
+        { probe: "P3: deliverables", passed: true },
+        { probe: "P4: smoke", passed: true },
+      ],
+      verdict: "partial",
+      disposition: {
+        disposition: "escalate",
+        reason: "partial review: stream ended before the verdict line",
+      },
+      ...overrides,
+    };
+  }
+
   it("is not a seat failure when there are no records", () => {
     const result = classifyReviewSeatReplacement({ records: [] });
     assert.equal(result.eligible, false);
@@ -5056,6 +5158,113 @@ describe("classifyReviewSeatReplacement", () => {
     assert.equal(result.eligible, false);
     assert.match(result.detail, /`round`/);
   });
+
+  it("classifies partial with bare base reason as eligible (AC2a)", () => {
+    const result = classifyReviewSeatReplacement({
+      records: [seatEligibleRecord()],
+    });
+    assert.equal(result.eligible, true);
+    assert.equal(result.detail, null);
+  });
+
+  it("classifies partial with diagnosis suffixed reason as eligible (AC2b)", () => {
+    const result = classifyReviewSeatReplacement({
+      records: [seatEligibleRecord({
+        disposition: {
+          disposition: "escalate",
+          reason: "partial review: stream ended before the verdict line (format: records present but no verdict record arrived)",
+        },
+      })],
+    });
+    assert.equal(result.eligible, true);
+    assert.equal(result.detail, null);
+  });
+
+  it("classifies unparseable with bare base reason as eligible", () => {
+    const result = classifyReviewSeatReplacement({
+      records: [seatEligibleRecord({
+        verdict: "unparseable",
+        disposition: {
+          disposition: "escalate",
+          reason: "unexpected verdict: unparseable",
+        },
+      })],
+    });
+    assert.equal(result.eligible, true);
+    assert.equal(result.detail, null);
+  });
+
+  it("classifies partial paired with other base reason (bare or suffixed) as inconsistent records (AC2c)", () => {
+    const bareOther = classifyReviewSeatReplacement({
+      records: [seatEligibleRecord({
+        verdict: "partial",
+        disposition: {
+          disposition: "escalate",
+          reason: "unexpected verdict: unparseable",
+        },
+      })],
+    });
+    assert.equal(bareOther.eligible, false);
+    assert.match(bareOther.detail, /inconsistent: verdict `partial` with `disposition\.reason` "unexpected verdict: unparseable"/);
+
+    const suffixedOther = classifyReviewSeatReplacement({
+      records: [seatEligibleRecord({
+        verdict: "partial",
+        disposition: {
+          disposition: "escalate",
+          reason: "unexpected verdict: unparseable (format: garbage)",
+        },
+      })],
+    });
+    assert.equal(suffixedOther.eligible, false);
+    assert.match(suffixedOther.detail, /inconsistent: verdict `partial` with `disposition\.reason` "unexpected verdict: unparseable \(format: garbage\)"/);
+  });
+
+  it("classifies unparseable paired with partial base reason (bare or suffixed) as inconsistent records", () => {
+    const barePartial = classifyReviewSeatReplacement({
+      records: [seatEligibleRecord({
+        verdict: "unparseable",
+        disposition: {
+          disposition: "escalate",
+          reason: "partial review: stream ended before the verdict line",
+        },
+      })],
+    });
+    assert.equal(barePartial.eligible, false);
+    assert.match(barePartial.detail, /inconsistent: verdict `unparseable` with `disposition\.reason` "partial review: stream ended before the verdict line"/);
+
+    const suffixedPartial = classifyReviewSeatReplacement({
+      records: [seatEligibleRecord({
+        verdict: "unparseable",
+        disposition: {
+          disposition: "escalate",
+          reason: "partial review: stream ended before the verdict line (format: broken)",
+        },
+      })],
+    });
+    assert.equal(suffixedPartial.eligible, false);
+    assert.match(suffixedPartial.detail, /inconsistent: verdict `unparseable` with `disposition\.reason` "partial review: stream ended before the verdict line \(format: broken\)"/);
+  });
+
+  it("classifies unrelated escalate reasons as NOT_A_SEAT_FAILURE (AC2d)", () => {
+    for (const reason of [
+      "max rounds (3) reached without acceptance",
+      "reviewer discarded the work",
+      "repeated finding areas across rounds",
+    ]) {
+      const result = classifyReviewSeatReplacement({
+        records: [seatEligibleRecord({
+          verdict: "partial",
+          disposition: {
+            disposition: "escalate",
+            reason,
+          },
+        })],
+      });
+      assert.equal(result.eligible, false);
+      assert.equal(result.detail, null);
+    }
+  });
 });
 
 describe("archiveFailedReviewSeat", () => {
@@ -5067,8 +5276,10 @@ describe("archiveFailedReviewSeat", () => {
       verdict: "partial",
       verdictSource: "recovered-from-token",
       reviewParseable: false,
+      salvagedVerdict: true,
       reviewPartial: true,
       reviewFindingCount: 4,
+      reviewPartialDiagnosis: "format: records present but no verdict record arrived",
       reviewJobId: "job-rev-2",
       reviewUsage: { available: true, input: 10, output: 5, cost: 0.5 },
       reviewModelEntry: "fake/model",
@@ -5092,6 +5303,8 @@ describe("archiveFailedReviewSeat", () => {
     const seat = record.reviewSeatFailures[0];
     assert.equal(seat.seat, 1);
     assert.equal(seat.verdict, "partial");
+    assert.equal(seat.salvagedVerdict, true);
+    assert.equal(seat.reviewPartialDiagnosis, "format: records present but no verdict record arrived");
     assert.equal(seat.reviewJobId, "job-rev-2");
     assert.equal(seat.disposition.disposition, "escalate");
     assert.deepEqual(seat.findingFiles, ["a.mjs"]);
@@ -5099,7 +5312,8 @@ describe("archiveFailedReviewSeat", () => {
     // clean replacement verdict must not inherit "partial" or
     // "recovered-from-token" from the seat that died.
     for (const field of [
-      "verdict", "verdictSource", "reviewParseable", "reviewPartial", "reviewFindingCount",
+      "verdict", "verdictSource", "reviewParseable", "salvagedVerdict",
+      "reviewPartial", "reviewFindingCount", "reviewPartialDiagnosis",
       "reviewJobId", "reviewUsage", "reviewModelEntry", "reviewModelVariant", "reviewFallbacks",
       "reviewJobFailure", "reviewUnparseableRetried", "reviewFirstJobId", "reviewFirstUsage",
       "reviewFirstFallbacks", "findingsText", "findings", "findingFiles", "disposition",

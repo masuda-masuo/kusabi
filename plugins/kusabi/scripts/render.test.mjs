@@ -514,6 +514,36 @@ describe("renderChainShow", () => {
     assert.doesNotMatch(result, /review:/);
   });
 
+  it("renders salvaged verdict with (salvaged) marker (kusabi #312)", () => {
+    const chain = { chainId: "chain-salvaged" };
+    const rounds = [
+      {
+        round: 1,
+        verdict: "approve",
+        salvagedVerdict: true,
+        disposition: { disposition: "accept" },
+        resumeMethod: { type: "continue_session" },
+      },
+    ];
+    const result = renderChainShow(chain, rounds);
+    assert.match(result, /verdict: approve \(salvaged\)/);
+  });
+
+  it("renders non-salvaged verdict without (salvaged) marker", () => {
+    const chain = { chainId: "chain-clean" };
+    const rounds = [
+      {
+        round: 1,
+        verdict: "approve",
+        disposition: { disposition: "accept" },
+        resumeMethod: { type: "continue_session" },
+      },
+    ];
+    const result = renderChainShow(chain, rounds);
+    assert.match(result, /verdict: approve/);
+    assert.doesNotMatch(result, /verdict: approve \(salvaged\)/);
+  });
+
   it("renders without probe results when probes are absent", () => {
     const chain = { chainId: "chain-noprobe" };
     const rounds = [

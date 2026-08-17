@@ -1283,6 +1283,7 @@ export async function runChainDriver({
         // function of the brief alone, and the re-validation below re-measures
         // the worktree, never the brief.
         briefSyntaxDefect,
+        partialDiagnosis: roundRecord.reviewPartialDiagnosis ?? chainParsedReview?.partialDiagnosis,
       });
     };
     let disposition = deriveWith(probesGreen, recordedOracleViolation);

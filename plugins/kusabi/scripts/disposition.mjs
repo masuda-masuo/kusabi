@@ -127,7 +127,7 @@ export function deriveReworkStrategy({ reworkCount, strategized, verdict, probes
  *   in front of the human on the escalate line.
  * @returns {{ disposition: "accept"|"accept-with-followup"|"strategize"|"rework"|"escalate"|"refused-brief-defect", reason?: string }}
  */
-export function deriveDisposition({ verdict, probesGreen, round, maxRounds, repeatedAreas, findingSeverities, strategizeEligible, oracleViolation, refusal, briefSyntaxDefect }) {
+export function deriveDisposition({ verdict, probesGreen, round, maxRounds, repeatedAreas, findingSeverities, strategizeEligible, oracleViolation, refusal, briefSyntaxDefect, partialDiagnosis }) {
   // ---- qualifying refusal (kusabi #293) ----
   // The worker read the brief, found it self-contradictory, named both items
   // and stopped without editing.  Nothing below this line can judge that
@@ -357,10 +357,14 @@ export function deriveDisposition({ verdict, probesGreen, round, maxRounds, repe
     // explicitly rather than left to the `default` branch below, so the
     // escalation is a decision with an honest reason instead of reading like
     // an internal error.
-    case "partial":
+    case "partial": {
       disposition = "escalate";
-      reason = "partial review: stream ended before the verdict line";
+      const diagSuffix = typeof partialDiagnosis === "string" && partialDiagnosis.trim() !== ""
+        ? ` (${partialDiagnosis.trim()})`
+        : "";
+      reason = `partial review: stream ended before the verdict line${diagSuffix}`;
       break;
+    }
 
     default:
       disposition = "escalate";
