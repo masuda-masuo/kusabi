@@ -10,6 +10,7 @@ import {
   waitForChain,
   readChainSnapshot,
   listChainIds,
+  chainDirCreatedAt,
   looksLikeChainProcess,
   probeChainProcess,
   formatWaitDigest,
@@ -37,6 +38,17 @@ function makeChainDir(chainsDir, chainId) {
   const dir = path.join(chainsDir, chainId);
   fs.mkdirSync(dir, { recursive: true });
   return dir;
+}
+
+// Deterministic creation stamps for the same-stamp tests (kusabi #309): real
+// directory birthtimes carry sub-millisecond float precision, so two dirs
+// "born in the same millisecond" cannot be manufactured reliably from the
+// filesystem — an attempt that re-created dirs until the stamps matched was
+// flaky by construction.  The waits under test inject this reader instead,
+// through the same DI seam as `sleep` / `now`.
+function stampedCreatedAt(stamps) {
+  return (chainsDir, chainId) =>
+    (Object.hasOwn(stamps, chainId) ? stamps[chainId] : chainDirCreatedAt(chainsDir, chainId));
 }
 
 function writeControl(chainDir, control) {
@@ -755,6 +767,132 @@ describe("waitForChain --next debris exclusion (kusabi #298)", () => {
     assert.equal(result.chainId, "chain-stamped-empty");
     assert.deepEqual(ignored, []);
   });
+});
+
+// ---------------------------------------------------------------------------
+// waitForChain --next — same-stamp re-selection (kusabi #309)
+// ---------------------------------------------------------------------------
+
+describe("waitForChain --next same-stamp re-selection (kusabi #309)", () => {
+  let tmp;
+  let chainsDir;
+
+  beforeEach(() => {
+    ({ tmp, chainsDir } = makeChainsDir());
+  });
+
+  afterEach(() => {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  });
+
+  it("switches to a chain born in the SAME millisecond as the locked empty dir and resolves on it", async () => {
+    // #298's rescue compared creation stamps with a strict `>`, so a real
+    // chain whose directory landed in the same millisecond as the dead
+    // dispatch's empty dir was unreachable and the wait stalled on the empty
+    // dir.  The `>=` tie-break must make that same-stamp chain reachable.
+    makeChainDir(chainsDir, "chain-same-locked");
+    // Stamps sit AT the fake clock's start (steppingClock begins at
+    // 1_000_000): a preexisting recordless dir must be inside the appear
+    // window, or the debris exclusion removes it before the switch under
+    // test ever runs and the test passes vacuously.
+    const createdAt = stampedCreatedAt({ "chain-same-locked": 1_000_000, "chain-same-real": 1_000_000 });
+
+    let sleeps = 0;
+    const sleep = async () => {
+      sleeps += 1;
+      if (sleeps === 1) {
+        const dir = makeChainDir(chainsDir, "chain-same-real");
+        writeControl(dir, runningControl("chain-same-real"));
+      }
+      if (sleeps === 2) {
+        writeControl(path.join(chainsDir, "chain-same-real"), { ...runningControl("chain-same-real"), status: "completed" });
+      }
+    };
+
+    const result = await waitForChain({
+      chainsDir, next: true, sleep, probeProcess: ALIVE, pollIntervalMs: 1,
+      appearTimeoutMs: 60_000, now: steppingClock(5_000), createdAt,
+    });
+
+    assert.equal(result.chainId, "chain-same-real");
+    assert.match(result.digest, /^chain chain-same-real: status=completed/);
+    assert.equal(sleeps, 2);
+  });
+
+  it("does not bounce between two recordless same-stamp dirs — it stalls naming one of them", async () => {
+    // With a naive `>=` the wait would switch to the same-stamp sibling and
+    // back on every poll, forever — each switch is a `continue` that skips
+    // the sleep, so it never even reaches the appear timeout.  The abandoned
+    // set bounds the wait to one hold per directory: it switches once, then
+    // stalls on the dir it holds, naming exactly one of the two.
+    makeChainDir(chainsDir, "chain-same-a");
+    const createdAt = stampedCreatedAt({ "chain-same-a": 1_000_000, "chain-same-b": 1_000_000 });
+
+    let sleeps = 0;
+    const sleep = async () => {
+      sleeps += 1;
+      if (sleeps === 1) {
+        makeChainDir(chainsDir, "chain-same-b");
+      }
+    };
+
+    await assert.rejects(
+      () => waitForChain({
+        chainsDir, next: true, sleep, probeProcess: ALIVE, pollIntervalMs: 1,
+        appearTimeoutMs: 10_000, now: steppingClock(4_000), createdAt,
+      }),
+      (err) => {
+        assert.equal(err.code, "stalled");
+        assert.match(err.message, /no control record/);
+        // The stall names ONE of the two — and never both.
+        assert.match(err.message, /chain chain-same-[ab] stalled/);
+        return true;
+      },
+    );
+    // Bounded polls, not an endless switch loop: an oscillating wait never
+    // sleeps at all, so this is what the timeout guard below would otherwise
+    // have to catch.
+    assert.ok(sleeps <= 3, `expected a bounded wait, saw ${sleeps} sleeps`);
+  }, { timeout: 15_000 });
+
+  it("never revisits a dir it switched away from, even after that dir gains a control record", async () => {
+    // The wait traded the recordless dir away; that dir then writes a control
+    // record.  The wait must not be pulled back — without the abandoned set
+    // the same-stamp sibling stays eligible, the wait would bounce back and
+    // end up on the wrong chain.  It stays on the dir it switched to instead,
+    // and stalls there.
+    const locked = makeChainDir(chainsDir, "chain-abandoned-a");
+    const createdAt = stampedCreatedAt({ "chain-abandoned-a": 1_000_000, "chain-abandoned-b": 1_000_000 });
+
+    let sleeps = 0;
+    const sleep = async () => {
+      sleeps += 1;
+      if (sleeps === 1) {
+        makeChainDir(chainsDir, "chain-abandoned-b");
+      }
+      if (sleeps === 2) {
+        // The abandoned dir is no longer recordless — it must STILL not be
+        // re-selected.
+        writeControl(locked, runningControl("chain-abandoned-a"));
+      }
+    };
+
+    await assert.rejects(
+      () => waitForChain({
+        chainsDir, next: true, sleep, probeProcess: ALIVE, pollIntervalMs: 1,
+        appearTimeoutMs: 40_000, now: steppingClock(4_000), createdAt,
+      }),
+      (err) => {
+        assert.equal(err.code, "stalled");
+        assert.match(err.message, /no control record/);
+        // The stall names the dir the wait switched TO — never the abandoned
+        // one it must not return to.
+        assert.match(err.message, /chain chain-abandoned-b stalled/);
+        assert.doesNotMatch(err.message, /chain-abandoned-a/);
+        return true;
+      },
+    );
+  }, { timeout: 15_000 });
 });
 
 // ---------------------------------------------------------------------------
