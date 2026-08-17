@@ -147,11 +147,27 @@ export function deriveDisposition({ verdict, probesGreen, round, maxRounds, repe
   const refused =
     refusal === true ||
     (typeof refusal === "string" && refusal.trim() !== "");
+  // A same-round oracle violation (P5 frozen intersection / P6 collected
+  // count drop) must not vanish behind either refused-brief-defect terminal
+  // below: the operator re-dispatches, the fresh chain starts from a clean
+  // worktree and re-baselines the collected count, so the evidence dies with
+  // this chain and would never resurface on its own.  When the oracle marker
+  // is also set, the terminal reason appends it instead of dropping it
+  // (kusabi #306; the worker-refusal sibling was flagged in the same review).
+  const oracleNamed = typeof oracleViolation === "string" && oracleViolation.trim() !== ""
+    ? " — " + oracleViolation.trim()
+    : "";
+  const oracleSuffix = (oracleViolation === true || oracleNamed !== "")
+    ? " ADDITIONALLY a deterministic oracle violation was measured this same round" + oracleNamed +
+      "; review it before re-dispatching — the evidence dies with this chain (a fresh chain starts " +
+      "from a clean worktree and re-baselines the collected count), so it will not resurface on its own."
+    : "";
+
   if (refused) {
     const named = typeof refusal === "string" ? " — " + refusal.trim() : "";
     return {
       disposition: "refused-brief-defect",
-      reason: "worker refused: the brief contradicts itself, no implementation satisfies both items" + named,
+      reason: "worker refused: the brief contradicts itself, no implementation satisfies both items" + named + oracleSuffix,
     };
   }
 
@@ -187,7 +203,7 @@ export function deriveDisposition({ verdict, probesGreen, round, maxRounds, repe
       reason: "brief-syntax defect: a probe reads a brief section that declares nothing" + named +
         ". The probe's input is the brief, not the worktree, so no worker edit can turn it green " +
         "and no rework is winnable; this is the brief author's defect, not the worker's. " +
-        "Fix the brief and re-dispatch.",
+        "Fix the brief and re-dispatch." + oracleSuffix,
     };
   }
 

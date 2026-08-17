@@ -11,6 +11,7 @@ import { createFakeCallTool, FAKE_HEAD_SHA } from "./fixtures.mjs";
 import {
   publishWarningForBrief,
   smokeBaselineReport,
+  smokeViolationReport,
   renderSmokeBaselineReport,
   renderSmokeDirtReport,
   runChainDriver,
@@ -3286,6 +3287,23 @@ describe("runChainDriver resumed-accept oracle re-validation (kusabi #197 follow
     } finally {
       fs.rmSync(tmp, { recursive: true, force: true });
     }
+  });
+});
+
+// smokeViolationReport — the chain-start refusal for a `## Smoke` section the
+// machine reads differently from what it says (kusabi #250).  Unit suite here
+// beside the other smoke refusals; the zero-entries message also carries the
+// #302 remedy (an empty section must omit its heading).
+describe("smokeViolationReport (kusabi #250)", () => {
+  it("offers omitting the heading as a remedy for a zero-entry ## Smoke section", () => {
+    const report = smokeViolationReport("## Smoke\n\nRun the usual checks.\n");
+    assert.ok(report, "a ## Smoke heading with no entry must be refused");
+    assert.match(report, /no smoke entry parsed/);
+    // Both remedies are named: fix the entries, or omit the heading.
+    assert.match(report, /bullet with a backtick-quoted command/);
+    assert.match(report, /delete the heading entirely/);
+    assert.match(report, /an empty section must omit its heading/);
+    assert.match(report, /kusabi #302/);
   });
 });
 

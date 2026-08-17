@@ -156,7 +156,8 @@ export function smokeViolationReport(brief) {
     if (v.kind === SMOKE_VIOLATION_NO_ENTRIES) {
       lines.push(
         "  - `## Smoke` heading present but no smoke entry parsed: the declared smoke check would never run. " +
-        "Write each command as a bullet with a backtick-quoted command, or inside a fenced code block."
+        "Write each command as a bullet with a backtick-quoted command, or inside a fenced code block — or " +
+        "delete the heading entirely: an empty section must omit its heading (kusabi #302)."
       );
       continue;
     }

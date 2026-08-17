@@ -708,6 +708,67 @@ describe("deriveDisposition brief-syntax defect (kusabi #303)", () => {
     }
   });
 
+  it("appends a same-round oracle violation to the terminal reason instead of dropping it", () => {
+    const result = deriveDisposition({
+      verdict: "approve", probesGreen: false, round: 1, maxRounds: 4,
+      repeatedAreas: false, briefSyntaxDefect: DEFECT,
+      oracleViolation: "P6: collected count dropped from 142 to 141",
+    });
+    assert.equal(result.disposition, "refused-brief-defect");
+    // The terminal still names the brief section...
+    assert.match(result.reason, /## Frozen Tests/);
+    // ...and now also names the measured oracle violation, so the operator
+    // re-dispatches knowing a count drop was measured this same round (a
+    // fresh chain re-baselines the collected count and the measurement
+    // would otherwise never recur).
+    assert.match(result.reason, /ADDITIONALLY a deterministic oracle violation was measured this same round/);
+    assert.match(result.reason, /P6: collected count dropped from 142 to 141/);
+    // The wording must hold for P5 frozen violations too, so it speaks of the
+    // evidence dying with the chain rather than of re-baselining alone
+    // (replacement-seat finding, kusabi #306).
+    assert.match(result.reason, /so it will not resurface on its own/);
+  });
+
+  it("appends the same oracle sentence to the worker-refusal terminal (kusabi #306 sibling)", () => {
+    const result = deriveDisposition({
+      verdict: "approve", probesGreen: false, round: 1, maxRounds: 4,
+      repeatedAreas: false, refusal: "Deliverables vs Non-goals name the same file",
+      oracleViolation: "P5: frozen: tests/a.test.mjs changed",
+    });
+    assert.equal(result.disposition, "refused-brief-defect");
+    assert.match(result.reason, /worker refused/);
+    assert.match(result.reason, /ADDITIONALLY a deterministic oracle violation was measured this same round/);
+    assert.match(result.reason, /P5: frozen: tests\/a\.test\.mjs changed/);
+  });
+
+  it("keeps the worker-refusal reason verbatim when no oracle violation rides along", () => {
+    const result = deriveDisposition({
+      verdict: "approve", probesGreen: false, round: 1, maxRounds: 4,
+      repeatedAreas: false, refusal: "Deliverables vs Non-goals name the same file",
+    });
+    assert.equal(result.disposition, "refused-brief-defect");
+    assert.equal(
+      result.reason,
+      "worker refused: the brief contradicts itself, no implementation satisfies both items — " +
+        "Deliverables vs Non-goals name the same file",
+    );
+  });
+
+  it("keeps today's reason verbatim when no oracle violation rides along", () => {
+    const result = deriveDisposition({
+      verdict: "needs-attention", probesGreen: false, round: 1, maxRounds: 4,
+      repeatedAreas: false, findingSeverities: ["high"], briefSyntaxDefect: DEFECT,
+    });
+    assert.equal(result.disposition, "refused-brief-defect");
+    assert.equal(
+      result.reason,
+      "brief-syntax defect: a probe reads a brief section that declares nothing — " + DEFECT +
+        ". The probe's input is the brief, not the worktree, so no worker edit can turn it green " +
+        "and no rework is winnable; this is the brief author's defect, not the worker's. " +
+        "Fix the brief and re-dispatch.",
+    );
+  });
+
   it("is inert when absent, false, or an empty string — worktree-reachable failures route as before", () => {
     for (const marker of [undefined, null, false, "", "   "]) {
       // verify red / deliverables untouched: still a rework.
