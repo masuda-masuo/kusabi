@@ -2947,6 +2947,16 @@ export function resolveChainResume({ control, chainJson }) {
         ),
       };
     }
+    // A refused-brief-defect ends the chain as terminal (kusabi #293): the
+    // brief itself is defective, so resuming would only re-run the same
+    // defective brief.  Refuse regardless of control freshness -- even a
+    // stale control must not re-dispatch implement on a defective brief.
+    if (lastDisposition === "refused-brief-defect") {
+      return {
+        ok: false,
+        error: `chain ended in refused-brief-defect at round ${last.round} \u2014 the brief is defective; fix the brief and re-dispatch a new chain (resume would re-run the same defective brief)`,
+      };
+    }
     const nextRound = (last.round ?? records.length) + 1;
     // ---- budget-derived guard (kusabi #60 step 2) ----
     // Mirrors the driver's budget semantics: maxRounds buys design/full
