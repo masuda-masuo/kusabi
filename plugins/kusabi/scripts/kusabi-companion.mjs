@@ -9,7 +9,7 @@
 
 import { parseArgs, parseModel, resolveModel, reviewDenyTools, WRITE_TOOL_NAMES, validateChainEntries, splitRouteBackend, resolveChainBackend, stripBackendPrefixChain, resolveModelBackend, chainNamesBackend, backendSupportsResume } from "./cli.mjs";
 import { renderReview, renderChainShow, renderJobLine, renderHeader, extractJson } from "./render.mjs";
-import { hasSectionHeading, parseDeliverables, parseFrozenTests, parseSmoke, parseOrchestratorSignature } from "./brief-parsing.mjs";
+import { hasSectionHeading, parseDeliverables, parseFrozenTests, parseSmoke, parseOrchestratorSignature, zeroEntrySections } from "./brief-parsing.mjs";
 import { cmdInstallCli, diagnoseCompanionShim, formatShimSetupLine } from "./install-cli.mjs";
 // Exit path only (kusabi #243); its own module since kusabi #277 so that the
 // test children exercising it do not import everything above.
@@ -448,6 +448,14 @@ export function readBriefFile(flags, text) {
  * `--container` on its own, ahead of this call, with a message that already
  * names the flag.
  *
+ * kusabi #302 extends the SAME zero-entries rule to the other two sections a
+ * probe machine-reads, `## Smoke` and `## Frozen Tests`: a heading that parses
+ * to nothing declares a check that cannot run, and its probe (P4/P5) reads the
+ * BRIEF, so the failure repeats every round and no worker edit can fix it.
+ * Absence still refuses nothing there — both sections stay optional — and the
+ * membership test comes from `zeroEntrySections`, i.e. the probes' own
+ * parsers, so a brief this lint accepts cannot fail P3/P4/P5 on that rule.
+ *
  * @param {object} opts
  * @param {string|null|undefined} opts.brief      The brief text.
  * @param {string|null} [opts.phase]              The resolved --phase, or null.
@@ -474,6 +482,35 @@ export function briefLintReport({ brief, phase = null, container = null, chain =
       "(kusabi #289: ten failed sandbox_attach guesses, 171s, zero edits). Pass `--container <cid>`, " +
       "or name the container in a `## Workplace` section of the brief."
     );
+  }
+
+  // ---- zero-entry `## Smoke` / `## Frozen Tests` (kusabi #302) ----
+  // The same rule the `## Deliverables` line above applies to its own
+  // section, applied to the other two sections a probe machine-reads.  A
+  // heading followed by prose (`(none frozen by name — …)`) declares a check
+  // that CANNOT run: P4/P5 fail on "heading present but no entries parsed"
+  // every round, and the input they read is the brief, which no worker can
+  // edit — the incident (chain-msvwhslx6e60, 2026-08-17) spent a whole
+  // 4-round budget on reworks that were unwinnable by construction.  The
+  // decision needs nothing but the brief text, so the cheap moment to stop is
+  // before dispatch.
+  //
+  // Absence is NOT emptiness: both sections stay optional, and a brief with
+  // no such heading is untouched here.  The entries come from
+  // `zeroEntrySections`, which calls the probes' own parsers — so a brief this
+  // lint accepts cannot fail P3/P4/P5 on the zero-entries rule.  Deliverables
+  // is skipped: its own line above already refuses that case, and doubling it
+  // would report one defect twice.
+  if (chain || phase) {
+    for (const section of zeroEntrySections(brief)) {
+      if (section.heading === "Deliverables") continue;
+      problems.push(
+        "  - `" + section.label + "` is present but parses to zero entries: the " + section.probe +
+        " probe reads that section from the BRIEF, so it would fail on syntax every round and no " +
+        "worker edit could turn it green (kusabi #302). Add entries, or delete the heading entirely " +
+        "— an empty section must omit its heading."
+      );
+    }
   }
 
   if ((chain || phase) && !parseOrchestratorSignature(brief)) {

@@ -88,6 +88,14 @@ end up re-running a doomed cheap round three times.
   bullet entries require a backtick-quoted command with an optional `exit <N>`
   annotation. The heading may carry a trailing annotation — e.g. `## Smoke (run in
   container)` — and is still recognised.
+- **If nothing is frozen, omit the `## Frozen Tests` heading — never write `(none)` under it.**
+  A machine-read heading followed by prose parses to zero entries, which fails P5 (or P4 for
+  `## Smoke`) with "heading present but no entries parsed" every single round: the probe's
+  input is the brief, so no worker edit can turn it green. One authoring slip
+  (`(none frozen by name — use judgement.)`) burned a whole 4-round budget on unwinnable
+  reworks. Dispatch now refuses such a brief outright, naming the section — an empty section
+  must omit its heading. The same applies to `## Deliverables` and `## Smoke`: entries, or no
+  heading.
 - **Keep the smoke cheap, deterministic and one command per line — never comprehensive.**
   Across nine chains sharing one author, one day and one template, briefs carrying
   `## Smoke` averaged 1.25 rounds against 2.40 without it; the winning smoke was a single

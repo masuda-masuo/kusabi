@@ -36,6 +36,7 @@ import {
   parseFrozenTests,
   parseSmoke,
   briefRequestsPublish,
+  briefSyntaxDefectSummary,
   findSmokeViolations,
   SMOKE_VIOLATION_NO_ENTRIES,
 } from "./brief-parsing.mjs";
@@ -72,6 +73,7 @@ import {
   renderAcceptWithFollowupOutcome,
   renderEscalateOutcome,
   renderRefusalOutcome,
+  renderBriefSyntaxDefectOutcome,
   renderMaxRoundsOutcome,
   handleProviderExhaustion,
   recordReworkEscalation,
@@ -1178,6 +1180,36 @@ export async function runChainDriver({
       roundRecord.refusalRejected = refusalOutcome.detail;
     }
 
+    // ---- phase 5c: brief-syntax defect (kusabi #303) ----
+    // A zero-entry `## Deliverables` / `## Smoke` / `## Frozen Tests` section
+    // fails P3/P4/P5 on syntax, and the input those probes read is the BRIEF
+    // -- the worker cannot edit it, so no rework is winnable and the chain
+    // must terminate at the FIRST occurrence rather than spend the budget on
+    // reworks that cannot succeed (the chain-msvwhslx6e60 incident).
+    //
+    // Derived from the brief text with the probes' own parsers, not from the
+    // probe results: heading-present-and-zero-entries is exactly the
+    // condition those probes fail on, so the two cannot disagree, and the
+    // value is identical on every path that reaches here -- a fresh round, a
+    // review-resume reading recorded probe truth, and the accept
+    // re-validation (kusabi #262), which re-measures the worktree but never
+    // the brief.
+    //
+    // The dispatch-time lint (kusabi #302) refuses these briefs before a
+    // chain exists, using the same parsers; this row is defense in depth for
+    // a chain that started before the lint or bypassed it.
+    const briefSyntaxDefect = briefSyntaxDefectSummary(brief);
+    if (briefSyntaxDefect) {
+      roundRecord.briefSyntaxDefect = briefSyntaxDefect;
+      // The round's outcome names WHOSE defect this is.  `verdict` is left as
+      // measured -- it is a true statement about the work the round did, and
+      // the attribution lives here and in the disposition reason.  A worker
+      // refusal is the more specific statement and keeps its own outcome.
+      if (roundRecord.roundOutcome !== "refusal") {
+        roundRecord.roundOutcome = "brief-syntax-defect";
+      }
+    }
+
     const chainVerdict = roundRecord.verdict;
     const chainFindingsText = roundRecord.findingsText;
     // ---- stop on review provider exhaustion ----
@@ -1246,6 +1278,10 @@ export async function runChainDriver({
         // value.  The named items travel in the string so the terminal line
         // carries them.
         refusal: refusalOutcome.outcome === "refusal" ? refusalOutcome.detail : null,
+        // Fixed for the round for the same reason (kusabi #303): it is a
+        // function of the brief alone, and the re-validation below re-measures
+        // the worktree, never the brief.
+        briefSyntaxDefect,
       });
     };
     let disposition = deriveWith(probesGreen, recordedOracleViolation);
@@ -1400,8 +1436,16 @@ export async function runChainDriver({
     // brief, which the outcome text says in as many words.
     if (disposition.disposition === "refused-brief-defect") {
       finalizeChainControl({ chainDir, status: "completed", round });
+      // Two ways into this terminal, and they hand over different evidence:
+      // the worker named the contradiction itself (kusabi #293), or a probe
+      // could not read a brief section (kusabi #303).  The renderer follows
+      // the round's own outcome, which phases 5b/5c stamped -- a worker
+      // refusal is the more specific statement and wins when both hold.
+      const refusalRendered = roundRecord.roundOutcome === "refusal"
+        ? renderRefusalOutcome({ chainId, round, disposition, orchestrator, roundRecord, records })
+        : renderBriefSyntaxDefectOutcome({ chainId, round, disposition, orchestrator, roundRecord, records });
       return { done: true, text: finaliseChain(
-        renderRefusalOutcome({ chainId, round, disposition, orchestrator, roundRecord, records }),
+        refusalRendered,
         { disposition: "refused-brief-defect", round, reason: disposition.reason || null },
         round,
       ) };

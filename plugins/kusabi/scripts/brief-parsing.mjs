@@ -449,3 +449,76 @@ export function parseOrchestratorSignature(briefText) {
   }
   return null;
 }
+
+// ---------------------------------------------------------------------------
+// zero-entry sections — the brief-syntax defect no worker can fix
+// (kusabi #302 / #303)
+// ---------------------------------------------------------------------------
+
+/**
+ * The `## ` sections a probe MACHINE-READS, each paired with the parser that
+ * reads it and the probe that fails when the reading comes back empty.
+ *
+ * One table, because the two consumers must not drift: the dispatch-time
+ * lint (`briefLintReport`, kusabi #302) refuses a heading that parses to
+ * zero entries, and the round-time routing (kusabi #303) terminates a chain
+ * that meets one anyway.  Both call the parsers listed here — the same
+ * functions the probes call — so "the lint accepted it" and "the probe can
+ * read it" are the same statement rather than two implementations that agree
+ * until one is edited.
+ *
+ * @type {Array<{heading: string, label: string, probe: string,
+ *               parse: function(string|null|undefined): Array<any>}>}
+ */
+export const PARSED_BRIEF_SECTIONS = [
+  { heading: "Deliverables", label: "## Deliverables", probe: "P3: deliverables", parse: parseDeliverables },
+  { heading: "Smoke", label: "## Smoke", probe: "P4: smoke", parse: parseSmoke },
+  { heading: "Frozen Tests", label: "## Frozen Tests", probe: "P5: frozen", parse: parseFrozenTests },
+];
+
+/**
+ * Every machine-read section whose heading is PRESENT but whose parser yields
+ * nothing.
+ *
+ * Absence is not emptiness: a brief with no `## Smoke` heading declares no
+ * smoke check and its probe trivially passes, while a heading followed by
+ * prose (`(none frozen by name — …)`) declares a check that can never run.
+ * Only the second is reported here, which is exactly the population both
+ * consumers act on.
+ *
+ * @param {string|null|undefined} briefText
+ * @returns {Array<{heading: string, label: string, probe: string}>}
+ *   In table order; `[]` when every present section parses.  Never throws.
+ */
+export function zeroEntrySections(briefText) {
+  return PARSED_BRIEF_SECTIONS
+    .filter(function (s) {
+      return hasSectionHeading(briefText, s.heading) && s.parse(briefText).length === 0;
+    })
+    .map(function (s) {
+      return { heading: s.heading, label: s.label, probe: s.probe };
+    });
+}
+
+/**
+ * The round-routing marker for a brief-syntax defect (kusabi #303).
+ *
+ * Shaped like `summariseOracleViolations`: `false` when the brief carries no
+ * zero-entry section, otherwise one string naming every offending section and
+ * the probe that reads it.  A truthy value routes the round to the terminal
+ * `refused-brief-defect` disposition, because the probe's input is the BRIEF,
+ * which the worker cannot edit — no rework is winnable by construction.
+ *
+ * The wording mirrors the probes' own detail lines ("## X heading present but
+ * no entries parsed") so the terminal reason and the probe result read alike.
+ *
+ * @param {string|null|undefined} briefText
+ * @returns {string|false}
+ */
+export function briefSyntaxDefectSummary(briefText) {
+  const zero = zeroEntrySections(briefText);
+  if (zero.length === 0) return false;
+  return zero.map(function (s) {
+    return s.probe + ": " + s.label + " heading present but no entries parsed";
+  }).join("; ");
+}

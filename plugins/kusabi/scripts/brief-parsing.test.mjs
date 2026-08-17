@@ -11,6 +11,9 @@ import {
   findSmokeViolations,
   SMOKE_VIOLATION_LOSSY,
   SMOKE_VIOLATION_NO_ENTRIES,
+  PARSED_BRIEF_SECTIONS,
+  zeroEntrySections,
+  briefSyntaxDefectSummary,
 } from "./brief-parsing.mjs";
 
 // parseOrchestratorSignature
@@ -805,5 +808,113 @@ describe("parseFrozenTests", () => {
     const empty = "## Frozen Tests\n\nnothing parseable here\n\n## Next\n";
     assert.deepEqual(parseFrozenTests(empty), []);
     assert.equal(hasSectionHeading(empty, "Frozen Tests"), true);
+  });
+});
+
+// zeroEntrySections / briefSyntaxDefectSummary (kusabi #302 / #303)
+// ---------------------------------------------------------------------------
+// One table, two consumers: the dispatch-time lint refuses a zero-entry
+// section, and the round-time routing terminates a chain that meets one.  Both
+// must be the SAME reading the probes make, or "the lint accepted it" stops
+// implying "the probe can read it".
+
+describe("zeroEntrySections", () => {
+  const SIG = "Orchestrator: m | session s | 2026-08-17\n";
+
+  it("reports a heading whose body is prose, per section", () => {
+    const frozen = `# T\n\n${SIG}\n## Frozen Tests\n\n(none frozen by name — use judgement.)\n`;
+    assert.deepEqual(zeroEntrySections(frozen), [
+      { heading: "Frozen Tests", label: "## Frozen Tests", probe: "P5: frozen" },
+    ]);
+
+    const smoke = `# T\n\n${SIG}\n## Smoke\n\nRun whatever seems sensible.\n`;
+    assert.deepEqual(zeroEntrySections(smoke), [
+      { heading: "Smoke", label: "## Smoke", probe: "P4: smoke" },
+    ]);
+  });
+
+  it("reports nothing for an ABSENT heading — absence is not emptiness", () => {
+    // Frozen Tests and Smoke are optional sections; a brief that declares
+    // neither declares no check, and both probes trivially pass.
+    assert.deepEqual(zeroEntrySections(`# T\n\n${SIG}\n## Deliverables\n\n- \`src/a.js\`\n`), []);
+  });
+
+  it("reports nothing when every present section parses", () => {
+    const brief = [
+      "# T", "", SIG,
+      "## Deliverables", "- `src/a.js`", "",
+      "## Smoke", "- `node --check src/a.js`", "",
+      "## Frozen Tests", "- `tests/a.test.mjs`", "",
+    ].join("\n");
+    assert.deepEqual(zeroEntrySections(brief), []);
+  });
+
+  it("reports every offending section at once, in table order", () => {
+    const brief = [
+      "# T", "", SIG,
+      "## Deliverables", "", "to be decided", "",
+      "## Smoke", "", "as appropriate", "",
+      "## Frozen Tests", "", "(none)", "",
+    ].join("\n");
+    assert.deepEqual(zeroEntrySections(brief).map((s) => s.heading), [
+      "Deliverables", "Smoke", "Frozen Tests",
+    ]);
+  });
+
+  it("uses the probes' own parsers, so an annotated heading is recognised too", () => {
+    // The word-boundary prefix match (kusabi #167) is the probes' rule, and it
+    // is inherited here rather than re-implemented.
+    const brief = `# T\n\n${SIG}\n## Frozen Tests (do not touch)\n\nnothing named.\n`;
+    assert.deepEqual(zeroEntrySections(brief).map((s) => s.heading), ["Frozen Tests"]);
+    // A look-alike heading is not the section, so nothing is reported.
+    assert.deepEqual(zeroEntrySections(`# T\n\n## Frozen Tests2\n\nprose\n`), []);
+  });
+
+  it("never throws on missing or non-string input", () => {
+    assert.deepEqual(zeroEntrySections(""), []);
+    assert.deepEqual(zeroEntrySections(null), []);
+    assert.deepEqual(zeroEntrySections(undefined), []);
+    assert.deepEqual(zeroEntrySections(42), []);
+  });
+
+  it("pairs each section with the parser the probe calls", () => {
+    // The table IS the shared contract; a parser swapped here would silently
+    // divide the lint from the probe.
+    assert.deepEqual(PARSED_BRIEF_SECTIONS.map((s) => [s.heading, s.probe]), [
+      ["Deliverables", "P3: deliverables"],
+      ["Smoke", "P4: smoke"],
+      ["Frozen Tests", "P5: frozen"],
+    ]);
+    for (const section of PARSED_BRIEF_SECTIONS) {
+      assert.equal(typeof section.parse, "function", section.heading);
+    }
+    assert.deepEqual(PARSED_BRIEF_SECTIONS[0].parse("## Deliverables\n- `src/a.js`\n"), ["src/a.js"]);
+    assert.deepEqual(PARSED_BRIEF_SECTIONS[2].parse("## Frozen Tests\n- `tests/a.test.mjs`\n"), ["tests/a.test.mjs"]);
+    assert.deepEqual(
+      PARSED_BRIEF_SECTIONS[1].parse("## Smoke\n- `node --check a.js`\n"),
+      [{ command: "node --check a.js", expectedExit: 0 }],
+    );
+  });
+});
+
+describe("briefSyntaxDefectSummary", () => {
+  it("returns false for a clean brief (the routing marker's no-op value)", () => {
+    assert.equal(briefSyntaxDefectSummary("## Frozen Tests\n- `tests/a.test.mjs`\n"), false);
+    assert.equal(briefSyntaxDefectSummary("## Deliverables\n- `src/a.js`\n"), false);
+    assert.equal(briefSyntaxDefectSummary(""), false);
+    assert.equal(briefSyntaxDefectSummary(null), false);
+  });
+
+  it("names the probe and the section, in the probes' own wording", () => {
+    const summary = briefSyntaxDefectSummary("## Frozen Tests\n\n(none frozen by name.)\n");
+    assert.equal(summary, "P5: frozen: ## Frozen Tests heading present but no entries parsed");
+  });
+
+  it("joins several defects into one string", () => {
+    const brief = "## Smoke\n\nas appropriate\n\n## Frozen Tests\n\n(none)\n";
+    const summary = briefSyntaxDefectSummary(brief);
+    assert.match(summary, /P4: smoke: ## Smoke heading present but no entries parsed/);
+    assert.match(summary, /P5: frozen: ## Frozen Tests heading present but no entries parsed/);
+    assert.match(summary, /; /);
   });
 });

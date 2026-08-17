@@ -1548,6 +1548,43 @@ export function renderRefusalOutcome({ chainId, round, disposition, orchestrator
 }
 
 /**
+ * Render the outcome string for a brief-syntax defect (kusabi #303).
+ *
+ * Same terminal family as the worker's refusal above -- both hand the chain
+ * back to the brief's author -- but the contradiction here was found by a
+ * PROBE, not by the worker, so the offending section is named from the probe
+ * marker and the round summary is the ordinary one.  The two facts an
+ * orchestrator needs first are on their own lines: which section cannot be
+ * read, and that no rework was spent because none could have won.
+ */
+export function renderBriefSyntaxDefectOutcome({ chainId, round, disposition, orchestrator, roundRecord, records }) {
+  const orchLine = orchestrator?.model ? "orchestrator=" + orchestrator.model : "";
+  const lines = [
+    "Chain " + chainId + " stopped at round " + round + ": the brief has a section a probe cannot read.",
+    orchLine,
+    "",
+    "Offending brief section(s):",
+    roundRecord?.briefSyntaxDefect || "(not recorded)",
+    "",
+  ];
+  for (let ri = 0; ri < records.length; ri++) {
+    const r = records[ri];
+    const detail = r.resumeMethod?.detail ? ": " + r.resumeMethod.detail : "";
+    const changed = roundChangedColumn(r);
+    lines.push("Round " + (ri + 1) + ": model=" + (r.modelEntry || "?") + ", outcome=" + (r.roundOutcome || r.verdict) + ", changed=" + changed + ", resume=" + (r.resumeMethod?.type || "?") + detail);
+  }
+  lines.push(
+    "",
+    "No rework was dispatched and no rework round was spent: the probe's input is the BRIEF, " +
+      "which the worker cannot edit, so every further round would fail on the same syntax.",
+    "This is a BRIEF defect, not a worker failure: add entries to the section, or delete the " +
+      "heading entirely (an empty section must omit its heading), then re-dispatch.",
+    disposition?.reason ? "Recorded reason: " + disposition.reason : "",
+  );
+  return lines.join("\n");
+}
+
+/**
  * Render the outcome string when max rounds are reached without acceptance.
  */
 export function renderMaxRoundsOutcome({ chainId, maxRounds, records, orchestrator }) {

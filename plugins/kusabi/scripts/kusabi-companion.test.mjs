@@ -4097,6 +4097,100 @@ describe("brief lint and container delivery (kusabi #289)", () => {
       assert.doesNotMatch(report, /no container source/);
     });
 
+    // ---- zero-entry `## Smoke` / `## Frozen Tests` (kusabi #302) ----
+    // The live brief of chain-msvwhslx6e60 (2026-08-17) carried a
+    // `## Frozen Tests` heading whose body was the prose `(none frozen by
+    // name — …)`.  P5 correctly failed all four rounds on "heading present but
+    // no entries parsed", and every one of those rounds was unwinnable: the
+    // probe's input is the brief, which no worker can edit.  The refusal has
+    // to happen where the brief is still editable — at dispatch.
+    it("refuses a ## Frozen Tests heading that parses to zero entries, naming the section and the remedy", () => {
+      const report = briefLintReport({
+        brief: `# Task\n\n${SIGNATURE}\n\n${DELIVERABLES}\n## Frozen Tests\n\n(none frozen by name — use judgement.)\n`,
+        phase: "implement",
+        container: "cid-1",
+      });
+      assert.ok(report, "a Frozen Tests heading with no parseable entry must be refused");
+      assert.match(report, /brief rejected before dispatch/);
+      assert.match(report, /## Frozen Tests/);
+      assert.match(report, /P5: frozen/);
+      // The remedy, verbatim: a denial without it just pushes the author onto
+      // a worse path (writing `- (none)` as an entry).
+      assert.ok(
+        report.includes("Add entries, or delete the heading entirely — an empty section must omit its heading."),
+        `the refusal must state the remedy, got: ${report}`,
+      );
+    });
+
+    it("refuses a ## Smoke heading that parses to zero entries, naming the section and the remedy", () => {
+      const report = briefLintReport({
+        brief: `# Task\n\n${SIGNATURE}\n\n${DELIVERABLES}\n## Smoke\n\nRun whatever seems sensible.\n`,
+        phase: "implement",
+        container: "cid-1",
+      });
+      assert.ok(report, "a Smoke heading with no parseable entry must be refused");
+      assert.match(report, /## Smoke/);
+      assert.match(report, /P4: smoke/);
+      assert.ok(report.includes("an empty section must omit its heading"));
+    });
+
+    it("refuses a zero-entry section on a chain dispatch too", () => {
+      const report = briefLintReport({
+        brief: `# Task\n\n${SIGNATURE}\n\n${DELIVERABLES}\n## Frozen Tests\n\n(none)\n`,
+        container: "cid-1",
+        chain: true,
+      });
+      assert.ok(report, "the chain path runs the same lint");
+      assert.match(report, /## Frozen Tests/);
+    });
+
+    it("does NOT refuse a brief whose Smoke / Frozen Tests headings are ABSENT", () => {
+      // Absence is not emptiness: both sections stay optional (a #302
+      // non-goal), and their probes trivially pass when nothing is declared.
+      const brief = `# Task\n\n${SIGNATURE}\n\n${DELIVERABLES}`;
+      assert.equal(briefLintReport({ brief, phase: "implement", container: "cid-1" }), null);
+      assert.equal(briefLintReport({ brief, container: "cid-1", chain: true }), null);
+      for (const phase of ["draft", "investigate", "review", "respond", "salvage", "gofer"]) {
+        assert.equal(
+          briefLintReport({ brief: `# Task\n\n${SIGNATURE}\n\nLook into it.\n`, phase, container: null }),
+          null,
+          phase,
+        );
+      }
+    });
+
+    it("accepts a brief whose Smoke and Frozen Tests sections do parse", () => {
+      const brief = [
+        "# Task", "", SIGNATURE, "", DELIVERABLES,
+        "## Smoke", "", "- `node --check plugins/kusabi/scripts/kusabi-companion.mjs`", "",
+        "## Frozen Tests", "", "- `plugins/kusabi/scripts/chain-phases.test.mjs`", "",
+      ].join("\n");
+      assert.equal(briefLintReport({ brief, phase: "implement", container: "cid-1" }), null);
+    });
+
+    it("reports a zero-entry ## Deliverables exactly once (its own rule owns that case)", () => {
+      // Parity, not duplication: the pre-existing deliverables line already
+      // refuses absent-or-zero-entries, so the new loop must not add a second
+      // line for the same defect.
+      const report = briefLintReport({
+        brief: `# Task\n\n${SIGNATURE}\n\n## Deliverables\n\nTo be decided by the worker.\n`,
+        phase: "implement",
+        container: "cid-1",
+      });
+      assert.match(report, /1 required brief item is missing/);
+      assert.equal(report.match(/## Deliverables/g).length, 1);
+      assert.doesNotMatch(report, /P3: deliverables/);
+    });
+
+    it("leaves an ad-hoc task with no --phase alone, zero-entry section and all", () => {
+      // `/kusabi:task <free text>` is not an orchestrator's brief; the lint
+      // covers phase dispatches and chains, and #302 does not widen that.
+      assert.equal(
+        briefLintReport({ brief: "look at it\n\n## Smoke\n\nwhatever works\n" }),
+        null,
+      );
+    });
+
     it("counts one problem in the singular", () => {
       const report = briefLintReport({
         brief: `# Task\n\n${DELIVERABLES}`,

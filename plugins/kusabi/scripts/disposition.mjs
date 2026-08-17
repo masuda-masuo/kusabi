@@ -113,13 +113,21 @@ export function deriveReworkStrategy({ reworkCount, strategized, verdict, probes
  *   additionally NAMES the two items in the reason, which is what puts the contradiction in front
  *   of the orchestrator.  It is checked FIRST, ahead of every other row including the oracle and
  *   the max-rounds terminal, because a defective brief invalidates the premise those rows judge.
+ * @param {boolean|string} [opts.briefSyntaxDefect] — a BRIEF-REACHABLE probe failure (kusabi #303):
+ *   a `## Deliverables` / `## Smoke` / `## Frozen Tests` heading that parses to zero entries, so
+ *   P3/P4/P5 fails on brief syntax (see `briefSyntaxDefectSummary` in brief-parsing.mjs).  The
+ *   probe's input is the brief file, which the worker cannot edit, so no rework can win: truthy
+ *   routes the round to the terminal `refused-brief-defect`, and a string additionally NAMES the
+ *   offending section(s) in the reason.  Checked after the worker's refusal and before the oracle.
+ *   Worktree-reachable failures (verify red, deliverables untouched, smoke exit mismatch, frozen
+ *   intersection, collected-count drop) do NOT set it and keep their existing routing.
  * @param {boolean|string} [opts.oracleViolation] — the deterministic oracle marker (kusabi #197):
  *   a P5 (frozen tests) or P6 (collected count) probe failed this round.  Truthy routes the round
  *   to `escalate`; a string additionally NAMES the violation in the reason, which is what puts it
  *   in front of the human on the escalate line.
  * @returns {{ disposition: "accept"|"accept-with-followup"|"strategize"|"rework"|"escalate"|"refused-brief-defect", reason?: string }}
  */
-export function deriveDisposition({ verdict, probesGreen, round, maxRounds, repeatedAreas, findingSeverities, strategizeEligible, oracleViolation, refusal }) {
+export function deriveDisposition({ verdict, probesGreen, round, maxRounds, repeatedAreas, findingSeverities, strategizeEligible, oracleViolation, refusal, briefSyntaxDefect }) {
   // ---- qualifying refusal (kusabi #293) ----
   // The worker read the brief, found it self-contradictory, named both items
   // and stopped without editing.  Nothing below this line can judge that
@@ -144,6 +152,42 @@ export function deriveDisposition({ verdict, probesGreen, round, maxRounds, repe
     return {
       disposition: "refused-brief-defect",
       reason: "worker refused: the brief contradicts itself, no implementation satisfies both items" + named,
+    };
+  }
+
+  // ---- brief-syntax defect (kusabi #303) ----
+  // A probe whose INPUT is the brief, not the worktree, cannot be turned
+  // green by the worker: `## Frozen Tests` followed by prose fails P5 with
+  // "heading present but no entries parsed" this round, next round and every
+  // round after, whatever the worker writes.  Routing that through the normal
+  // table (probesGreen=false -> rework) buys reworks that are unwinnable by
+  // construction -- the incident (chain-msvwhslx6e60, 2026-08-17) burned a
+  // full 4-round budget on exactly that.
+  //
+  // So it terminates here, in the same family as the worker's own refusal
+  // above: the defect is the BRIEF's, the round budget is untouched (no
+  // rework strategy is computed for a non-`rework` disposition), and the
+  // reason names the offending section plus the only fix there is.
+  //
+  // Checked AFTER the worker's refusal (that block names a contradiction only
+  // a human can resolve, and it is the more specific statement) and BEFORE
+  // the oracle: an unreadable declaration is not a violated one, and every
+  // row below assumes the brief the probes read is at least parseable.
+  //
+  // Defense in depth only: the dispatch-time lint (kusabi #302) refuses these
+  // briefs before a chain exists, using the same parsers, so a chain that
+  // reaches this row started before the lint or bypassed it.
+  const briefDefective =
+    briefSyntaxDefect === true ||
+    (typeof briefSyntaxDefect === "string" && briefSyntaxDefect.trim() !== "");
+  if (briefDefective) {
+    const named = typeof briefSyntaxDefect === "string" ? " — " + briefSyntaxDefect.trim() : "";
+    return {
+      disposition: "refused-brief-defect",
+      reason: "brief-syntax defect: a probe reads a brief section that declares nothing" + named +
+        ". The probe's input is the brief, not the worktree, so no worker edit can turn it green " +
+        "and no rework is winnable; this is the brief author's defect, not the worker's. " +
+        "Fix the brief and re-dispatch.",
     };
   }
 
