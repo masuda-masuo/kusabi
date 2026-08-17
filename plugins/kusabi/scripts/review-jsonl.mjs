@@ -13,7 +13,10 @@
 // a truncated stream still carries every finding it managed to emit, and a
 // line that is not valid JSON is IGNORED — which is what lets the reviewer
 // narrate its way through a checklist between records instead of throwing
-// that reasoning away.
+// that reasoning away.  One exception, kusabi #312: a line that is a verdict
+// record cut short — the adjudication is complete but its JSON never closed —
+// is SALVAGED rather than ignored, so a finished decision is not lost to a
+// truncated stream.
 //
 // This module is a WIRE FORMAT parser and nothing else.  It assembles the
 // records into the same in-memory review object the single-blob path
@@ -34,13 +37,54 @@ const RECORD_TYPES = new Set(["finding", "unverified", "next_step", "verdict"]);
 const REVIEW_VERDICTS = ["approve", "approve-partial", "needs-attention", "discard"];
 
 /**
+ * A VERDICT-SHAPED line is one that starts like a verdict record but failed
+ * to parse — typically the stream was cut inside the verdict's own line
+ * (kusabi #312).  Such a line is salvageable: the verdict value is still
+ * readable, so the decision should not be thrown away with the truncation.
+ */
+const VERDICT_SHAPE_RE = /^\{"type"\s*:\s*"verdict"/;
+
+/**
+ * The verdict value inside a broken verdict-shaped line.  Built from
+ * `REVIEW_VERDICTS` so the salvageable set IS the schema's enum — the array
+ * is the single source of truth, not a second copy of the alternation.
+ */
+const VERDICT_VALUE_RE = new RegExp(
+  `"verdict"\\s*:\\s*"(${REVIEW_VERDICTS.join("|")})"`,
+);
+
+/** Best-effort capture of the `"summary"` string value, cut at line end. */
+const SUMMARY_VALUE_RE = /"summary"\s*:\s*"((?:[^"\\]|\\.)*)/;
+
+/** Decode the escapes a summary may carry — best effort, the line never parsed. */
+const SUMMARY_ESCAPES = {
+  '"': '"',
+  "\\": "\\",
+  "/": "/",
+  b: "\b",
+  f: "\f",
+  n: "\n",
+  r: "\r",
+  t: "\t",
+};
+
+/**
+ * Appended to a salvaged summary so a recovered verdict is never mistaken
+ * for one the reviewer actually completed.
+ */
+const SALVAGE_MARKER = " [salvaged from an unterminated verdict line]";
+
+/**
  * Parse a JSONL review stream.
  *
  * @param {string} text — the reviewer's raw output.
  * @returns {null|{
- *   review: object,          // assembled single-object shape (see module note)
- *   verdict: string|null,    // the verdict record's verdict; null when absent
- *   partial: boolean,        // true when no verdict record arrived
+ *   review: object,          // assembled single-object shape (see module note);
+ *                            // `salvagedVerdict: true` marks a verdict
+ *                            // recovered from an unterminated verdict line
+ *   verdict: string|null,    // the closing verdict (record or salvaged)
+ *   partial: boolean,        // true when no verdict arrived, salvaged or not
+ *   partialDiagnosis: string|null, // why the stream is partial, when it is
  *   findingCount: number,
  *   recordCount: number,     // records recognised (all types)
  *   ignoredLines: number,    // non-record lines skipped (prose, fences, junk)
@@ -57,6 +101,9 @@ export function parseReviewJsonl(text) {
   const nextSteps = [];
   const unverified = [];
   let verdictRecord = null;
+  let salvaged = null;
+  let unsalvageableVerdictLine = false;
+  let salvageBlocked = false;
   let recordCount = 0;
   let ignoredLines = 0;
 
@@ -71,7 +118,34 @@ export function parseReviewJsonl(text) {
     }
     if (record === null) {
       // Prose, a code fence, a half-written line the stream was cut on — one
-      // bad line costs only that line.
+      // bad line costs only that line.  Except when the line is a VERDICT
+      // record cut short (kusabi #312): a complete adjudication whose JSON
+      // never closed is salvaged, not thrown away.
+      if (VERDICT_SHAPE_RE.test(line)) {
+        // Scope the verdict extraction to the part of the line BEFORE the
+        // "summary" key: the summary value is reviewer PROSE, and a broken
+        // line's prose may contain a raw `"verdict":"approve"` that a
+        // line-wide match would read as the decision.  The record contract
+        // puts `verdict` before `summary`; a verdict key that only appears
+        // inside the summary area is quotation, not adjudication.
+        const summaryKeyAt = line.search(/"summary"\s*:/);
+        const verdictArea = summaryKeyAt === -1 ? line : line.slice(0, summaryKeyAt);
+        const verdictMatch = verdictArea.match(VERDICT_VALUE_RE);
+        if (verdictMatch) {
+          salvaged = {
+            verdict: verdictMatch[1],
+            summary: salvageSummary(line) + SALVAGE_MARKER,
+          };
+        } else {
+          // Verdict-shaped but names no enum verdict — not a decision we may
+          // act on.  Ignored like any other broken line; the stream stays
+          // partial and the diagnosis says why.  The failed extraction also
+          // voids any EARLIER salvage: "the last one wins" includes the
+          // no-salvage outcome.
+          salvaged = null;
+          unsalvageableVerdictLine = true;
+        }
+      }
       ignoredLines++;
       continue;
     }
@@ -96,19 +170,30 @@ export function parseReviewJsonl(text) {
         // Only a schema-valid verdict closes the stream.  A verdict record
         // carrying something else is a record we understood but cannot act
         // on — the review stays partial rather than inventing a decision.
-        if (REVIEW_VERDICTS.includes(record.verdict)) verdictRecord = record;
+        // Such a record is still REAL evidence wherever it appears: it voids
+        // any salvage, standing or later, so a draft never closes a stream
+        // whose own verdict area says something else.
+        if (REVIEW_VERDICTS.includes(record.verdict)) {
+          verdictRecord = record;
+        } else {
+          salvageBlocked = true;
+        }
         break;
     }
   }
 
   if (recordCount === 0) return null; // not JSONL
 
-  const partial = verdictRecord === null;
+  // The verdict that closes the stream: a real verdict record always beats a
+  // salvaged one.  A non-enum verdict record voids the salvage — standing or
+  // future — so the stream stays partial rather than closing on a draft.
+  const verdictSource = verdictRecord ?? (salvageBlocked ? null : salvaged);
+  const partial = verdictSource === null;
   const review = {
     // "partial" is a state of its own, not an alias of any schema verdict:
     // findings but no verdict line means the review is INCOMPLETE.
-    verdict: partial ? "partial" : verdictRecord.verdict,
-    summary: assembleSummary(verdictRecord, findings.length),
+    verdict: partial ? "partial" : verdictSource.verdict,
+    summary: assembleSummary(verdictSource, findings.length),
     findings,
     next_steps: nextSteps,
   };
@@ -119,11 +204,25 @@ export function parseReviewJsonl(text) {
   if (verdictRecord && typeof verdictRecord.discard_reason === "string") {
     review.discard_reason = verdictRecord.discard_reason;
   }
+  // A salvaged verdict is marked, never silent: the operator must be able to
+  // tell a recovered decision from one the reviewer actually completed.
+  if (salvaged && verdictSource === salvaged) review.salvagedVerdict = true;
+
+  // Why the stream is partial, when it is — two distinguishable failures: a
+  // verdict-shaped line that could not be salvaged, or a stream that never
+  // produced a verdict at all.
+  let partialDiagnosis = null;
+  if (partial) {
+    partialDiagnosis = unsalvageableVerdictLine
+      ? "format: final line is verdict-shaped but unparseable"
+      : "format: records present but no verdict record arrived";
+  }
 
   return {
     review,
-    verdict: partial ? null : verdictRecord.verdict,
+    verdict: partial ? null : verdictSource.verdict,
     partial,
+    partialDiagnosis,
     findingCount: findings.length,
     recordCount,
     ignoredLines,
@@ -212,6 +311,17 @@ function withoutType(record) {
 /** The `text` payload of a next_step / unverified record, or null. */
 function recordText(record) {
   return typeof record.text === "string" && record.text !== "" ? record.text : null;
+}
+
+/**
+ * The readable prefix of the `"summary"` value of a line JSON.parse
+ * rejected — truncated at the line end, escapes decoded best-effort.
+ * Empty string when the line carries no `"summary"` key.
+ */
+function salvageSummary(line) {
+  const match = line.match(SUMMARY_VALUE_RE);
+  if (match === null) return "";
+  return match[1].replace(/\\(["\\/bfnrt])/g, (escape) => SUMMARY_ESCAPES[escape[1]]);
 }
 
 /**

@@ -459,3 +459,166 @@ describe("parseReviewJsonl — a legacy blob wearing a `type` key (kusabi #205)"
     assert.equal(parsed.partial, false);
   });
 });
+describe("parseReviewJsonl — salvaging an unterminated verdict line (kusabi #312)", () => {
+  const VERDICTS = ["approve", "approve-partial", "needs-attention", "discard"];
+  const SALVAGE_MARKER = " [salvaged from an unterminated verdict line]";
+
+  /** A verdict record cut short: valid adjudication whose JSON never closed. */
+  function brokenVerdictLine(verdict, summary) {
+    return `{"type":"verdict","verdict":"${verdict}","summary":"${summary}`;
+  }
+
+  it("salvages the verdict from a stream whose final line never closed", () => {
+    for (const verdict of VERDICTS) {
+      const summary = "Ship. " + "x".repeat(1600);
+      const result = parseReviewJsonl([
+        line(FINDING_A),
+        brokenVerdictLine(verdict, summary),
+      ].join("\n"));
+
+      assert.equal(result.partial, false, `${verdict}: not partial`);
+      assert.equal(result.verdict, verdict);
+      assert.equal(result.review.verdict, verdict);
+      assert.equal(result.review.salvagedVerdict, true);
+      assert.equal(result.review.summary, summary + SALVAGE_MARKER);
+      assert.equal(result.partialDiagnosis, null);
+      assert.deepEqual(result.review.findings, [assembled(FINDING_A)]);
+    }
+  });
+
+  it("summary prose cannot fabricate a verdict — extraction stops at the summary key", () => {
+    // A broken verdict-shaped line with NO verdict key of its own, whose
+    // summary prose quotes a raw verdict phrase.  A line-wide match would
+    // read the quotation as the decision; the scoped extraction must not.
+    const result = parseReviewJsonl([
+      line(FINDING_A),
+      '{"type":"verdict","summary":"the worker claimed "verdict":"approve" in its notes',
+    ].join("\n"));
+
+    assert.equal(result.partial, true);
+    assert.equal("salvagedVerdict" in result.review, false);
+    assert.equal(
+      result.partialDiagnosis,
+      "format: final line is verdict-shaped but unparseable",
+    );
+  });
+
+  it("a real verdict record anywhere in the stream beats a salvaged one", () => {
+    const result = parseReviewJsonl([
+      brokenVerdictLine("approve", "salvage me"),
+      line(FINDING_A),
+      line({ type: "verdict", verdict: "needs-attention", summary: "The real verdict." }),
+    ].join("\n"));
+
+    assert.equal(result.review.verdict, "needs-attention");
+    assert.equal(result.review.summary, "The real verdict.");
+    assert.equal("salvagedVerdict" in result.review, false);
+    assert.equal(result.partial, false);
+    assert.equal(result.partialDiagnosis, null);
+    assert.equal(result.ignoredLines, 1);
+  });
+
+  it("a verdict-shaped line naming no enum verdict is not salvaged", () => {
+    const result = parseReviewJsonl([
+      line(FINDING_A),
+      brokenVerdictLine("ship-it", "looks good"),
+    ].join("\n"));
+
+    assert.equal(result.partial, true);
+    assert.equal(result.verdict, null);
+    assert.equal(result.review.verdict, "partial");
+    assert.equal("salvagedVerdict" in result.review, false);
+    assert.equal(
+      result.partialDiagnosis,
+      "format: final line is verdict-shaped but unparseable",
+    );
+  });
+
+  it("a non-enum verdict record after a salvage voids it — the stream stays partial", () => {
+    // Regression: the salvage used to be monotonic, so an earlier broken
+    // "approve" draft closed the stream as an accept even though a REAL
+    // verdict record later said something else.  The record is parseable
+    // and real: it must block the salvage, leaving the review partial.
+    const result = parseReviewJsonl([
+      line(FINDING_A),
+      brokenVerdictLine("approve", "draft"),
+      line({ type: "verdict", verdict: "ship-it", summary: "shipping" }),
+    ].join("\n"));
+
+    assert.equal(result.partial, true);
+    assert.equal(result.verdict, null);
+    assert.equal(result.review.verdict, "partial");
+    assert.equal("salvagedVerdict" in result.review, false);
+    assert.equal(result.recordCount, 2); // finding + the ship-it record
+    assert.equal(result.ignoredLines, 1); // the broken draft
+    assert.equal(
+      result.partialDiagnosis,
+      "format: records present but no verdict record arrived",
+    );
+  });
+
+  it("a non-enum verdict record voids an earlier salvage even when it comes first", () => {
+    // "A real, parseable verdict record anywhere in the stream ALWAYS wins
+    // over a salvaged one" — order does not matter.
+    const result = parseReviewJsonl([
+      line({ type: "verdict", verdict: "ship-it", summary: "shipping" }),
+      line(FINDING_A),
+      brokenVerdictLine("approve", "last draft"),
+    ].join("\n"));
+
+    assert.equal(result.partial, true);
+    assert.equal(result.review.verdict, "partial");
+    assert.equal("salvagedVerdict" in result.review, false);
+  });
+
+  it("a later broken line whose verdict is not in the enum voids an earlier salvage", () => {
+    // "If several lines are verdict-shaped-but-broken, the LAST one wins" —
+    // and the last one failed extraction, so no salvage stands.
+    const result = parseReviewJsonl([
+      line(FINDING_A),
+      brokenVerdictLine("approve", "first draft"),
+      brokenVerdictLine("ship-it", "final attempt"),
+    ].join("\n"));
+
+    assert.equal(result.partial, true);
+    assert.equal(result.verdict, null);
+    assert.equal(result.review.verdict, "partial");
+    assert.equal("salvagedVerdict" in result.review, false);
+    assert.equal(
+      result.partialDiagnosis,
+      "format: final line is verdict-shaped but unparseable",
+    );
+  });
+
+  it("diagnoses a records-present stream that never emitted a verdict", () => {
+    const result = parseReviewJsonl([line(FINDING_A), line(FINDING_B)].join("\n"));
+
+    assert.equal(result.partial, true);
+    assert.equal(
+      result.partialDiagnosis,
+      "format: records present but no verdict record arrived",
+    );
+  });
+
+  it("when several broken verdict lines exist, the last salvageable one wins", () => {
+    const result = parseReviewJsonl([
+      line(FINDING_A),
+      brokenVerdictLine("approve", "first attempt"),
+      brokenVerdictLine("discard", "second thought"),
+    ].join("\n"));
+
+    assert.equal(result.review.verdict, "discard");
+    assert.equal(result.partial, false);
+    assert.equal(result.review.summary, "second thought" + SALVAGE_MARKER);
+  });
+
+  it("a salvaged discard carries no discard_reason", () => {
+    const result = parseReviewJsonl([
+      line(FINDING_A),
+      brokenVerdictLine("discard", "the brief misreads the code"),
+    ].join("\n"));
+
+    assert.equal(result.review.verdict, "discard");
+    assert.equal("discard_reason" in result.review, false);
+  });
+});
