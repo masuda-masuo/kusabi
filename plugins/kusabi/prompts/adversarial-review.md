@@ -110,6 +110,15 @@ record must never span lines):
 - The `verdict` record comes LAST, because it genuinely depends on the
   findings. It carries `verdict` and `summary` (plus `discard_reason` when
   the verdict is `discard`).
+- `summary` must be at most 500 characters. Your analysis belongs in
+  `finding` records, emitted as you conclude them — never in the verdict
+  summary. A long summary is the main way the final line breaks: a verdict
+  whose summary string never closes is a review that never verdicts
+  (kusabi #312).
+- Records are plain output lines. Never wrap them in tool-call syntax or
+  any other envelope — a wrapped record is invisible to the harness, and a
+  whole review delivered inside one is a review that never happened
+  (kusabi #312).
 - A line that is not valid JSON is IGNORED by the harness, so you may think
   aloud between records: narrate the checklist, say what you are about to
   check, record what you ruled out. Such prose is never mistaken for a
