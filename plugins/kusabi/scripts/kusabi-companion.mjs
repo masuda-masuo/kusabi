@@ -32,6 +32,7 @@ import { collectChainRecords, computeStats, renderChainStats, renderComparison }
 import {
   readChainControl,
   requestChainStop,
+  writeChainControl,
   effectiveStatus,
   chainIdForJob,
   collectChainStatuses,
@@ -1627,6 +1628,23 @@ async function cmdChainCancel(cwd, { text }) {
     throw new Error(`chain not found: ${chainId}`);
   }
 
+  // A chain directory with no control record is a dispatch that died before
+  // it ever wrote anything (kusabi #298) — a WSL shutdown leaves exactly this
+  // behind.  Nothing will ever finalise it, so it would stay a permanent trap
+  // for later bare `chain-wait --next`; healing is explicit: persist a
+  // terminal record and be done.
+  if (!readChainControl(chainDir)) {
+    writeChainControl(chainDir, {
+      chainId,
+      status: "cancelled",
+      round: 0,
+      stopRequestedAt: new Date().toISOString(),
+      stopRequestedBy: "cli",
+      finishedAt: new Date().toISOString(),
+    });
+    return `chain ${chainId} had no control record (never started) — status finalised to cancelled.`;
+  }
+
   // Request the stop via the file-based protocol.
   // requestChainStop handles the stale-pid exception internally.
   const result = requestChainStop(chainDir, "cli");
@@ -2242,7 +2260,7 @@ function usage() {
     "  --cursor-rule (install-cli: also symlink the alwaysApply kusabi-delegate rule into <cursor dir>/rules; opt-in, since it taxes every conversation on the machine)",
     "  --prior <text> (review: prior findings for anti-ratchet)",
     "  --max-rounds <N> (chain: max rounds, default 4)",
-    "  --next (chain-wait: wait for a chain to APPEAR and then wait on it, instead of naming one; selects the newest chain that is new since the wait started OR was already there and has not reached a terminal state, so a chain the dispatch created in the moment before the wait started still counts and a chain that finished earlier never does; a dispatch that dies before creating a chain directory exits non-zero here instead of looking finished)",
+    "  --next (chain-wait: wait for a chain to APPEAR and then wait on it, instead of naming one; selects the newest chain that is new since the wait started OR was already there and has not reached a terminal state, so a chain the dispatch created in the moment before the wait started still counts and a chain that finished earlier never does; a preexisting empty directory with no control record and older than --appear-timeout is debris from a dispatch that died before it wrote anything, and is skipped with a stderr note; while the selected chain is still recordless, a newer chain that appears wins instead of the wait stalling on the empty dir; a dispatch that dies before creating a chain directory exits non-zero here instead of looking finished)",
     "  --since <ISO> (chain-wait --next: only a chain created at or after this stamp counts as the one to wait for, terminal or not — the precise tool, with an explicit chain id, when several chains run in one workspace at once and the default newest-unfinished selection would be ambiguous)",
     "  --poll-interval <s> (chain-wait: state poll interval, default 2)",
     "  --appear-timeout <s> (chain-wait: bound on --next, and on a chain directory that never gets a control record, default 120)",

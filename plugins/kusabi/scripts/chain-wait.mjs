@@ -337,11 +337,7 @@ function defaultSleep(ms) {
 // ---------------------------------------------------------------------------
 
 /**
- * Wait for a chain directory to appear.
- *
- * A dispatch can die before creating one (failure mode 2: `chain-resume` with
- * no chain id, `chain` with no --container).  Without a bound that death is
- * silent; with one it is a named non-zero exit.
+ * The `--next` selection rule, built once per wait.
  *
  * Selection with an explicit `since` stamp: any chain created at or after it,
  * terminal or not.  That is the precise tool, and it is unchanged.
@@ -357,22 +353,68 @@ function defaultSleep(ms) {
  * just-dispatched chain is the only non-terminal one whichever side of the
  * start it landed on; concurrent chains in one cwd keep `--since` and an
  * explicit chain id as their precise tools.  Newest first.
+ *
+ * One default-branch exclusion (kusabi #298): a preexisting directory with no
+ * control record whose creation stamp is older than the appear window is
+ * debris — a dispatch killed before it ever wrote anything (a WSL shutdown
+ * left exactly one behind).  Nothing will ever make it terminal, so it can
+ * never be the chain the caller means; it is skipped, and the caller is told
+ * on stderr, once per directory.  A recordless directory created WITHIN the
+ * appear window is not debris: that is the normal startup shape of a
+ * just-dispatched chain whose control record has not landed yet.
+ *
+ * @param {object} opts
+ * @param {string} opts.chainsDir
+ * @param {number|null} opts.since          - explicit selection stamp.
+ * @param {number} opts.startedAt           - the wait's start stamp.
+ * @param {number} opts.appearTimeoutMs     - the appear window.
+ * @param {(chainId: string) => void} opts.reportIgnored - told once per
+ *                                         skipped debris directory.
+ * @returns {() => Array<{id: string, createdAt: number}>} a callable that
+ *   returns the eligible chain directories, newest first.
+ */
+function makeNextCandidateSelector({ chainsDir, since, startedAt, appearTimeoutMs, reportIgnored }) {
+  const preexisting = since == null ? new Set(listChainIds(chainsDir)) : null;
+  const reported = new Set();
+  const isCandidate = (id) => {
+    if (preexisting === null) return chainDirCreatedAt(chainsDir, id) >= since;
+    if (!preexisting.has(id)) return true;
+    const snapshot = readChainSnapshot(chainsDir, id);
+    if (snapshot.terminal) return false;
+    if (snapshot.control === null && chainDirCreatedAt(chainsDir, id) < startedAt - appearTimeoutMs) {
+      if (!reported.has(id)) {
+        reported.add(id);
+        reportIgnored(id);
+      }
+      return false;
+    }
+    return true;
+  };
+  return () => listChainIds(chainsDir)
+    .filter(isCandidate)
+    .map((id) => ({ id, createdAt: chainDirCreatedAt(chainsDir, id) }))
+    .sort((a, b) => (b.createdAt - a.createdAt) || a.id.localeCompare(b.id));
+}
+
+function reportIgnoredDefault(chainId) {
+  console.error(`ignoring ${chainId}: no control record, older than appear window`);
+}
+
+/**
+ * Wait for a chain directory to appear.
+ *
+ * A dispatch can die before creating one (failure mode 2: `chain-resume` with
+ * no chain id, `chain` with no --container).  Without a bound that death is
+ * silent; with one it is a named non-zero exit.
+ *
+ * Selection is the rule above; the newest eligible chain id wins.
  */
 async function waitForChainToAppear({
-  chainsDir, since, pollIntervalMs, appearTimeoutMs, sleep, now, startedAt,
+  candidates, chainsDir, since, pollIntervalMs, appearTimeoutMs, sleep, now, startedAt,
 }) {
-  const preexisting = since == null ? new Set(listChainIds(chainsDir)) : null;
-  const isCandidate = (id) => (preexisting
-    ? !preexisting.has(id) || !readChainSnapshot(chainsDir, id).terminal
-    : chainDirCreatedAt(chainsDir, id) >= since);
-
   for (;;) {
-    const candidates = listChainIds(chainsDir)
-      .filter(isCandidate)
-      .map((id) => ({ id, createdAt: chainDirCreatedAt(chainsDir, id) }))
-      .sort((a, b) => (b.createdAt - a.createdAt) || a.id.localeCompare(b.id));
-
-    if (candidates.length > 0) return candidates[0].id;
+    const list = candidates();
+    if (list.length > 0) return list[0].id;
 
     if (now() - startedAt >= appearTimeoutMs) {
       const scope = since == null
@@ -416,6 +458,9 @@ async function waitForChainToAppear({
  * @param {(pid: number|null) => "alive"|"gone"|"unverifiable"} [opts.probeProcess]
  * @param {(ms: number) => Promise<void>} [opts.sleep]
  * @param {() => number} [opts.now]
+ * @param {(chainId: string) => void} [opts.reportIgnored] - told once per chain
+ *                                     dir skipped as debris (default: one
+ *                                     stderr line).
  */
 export async function waitForChain({
   chainsDir,
@@ -428,13 +473,21 @@ export async function waitForChain({
   probeProcess = probeChainProcess,
   sleep = defaultSleep,
   now = Date.now,
+  reportIgnored = reportIgnoredDefault,
 } = {}) {
   const startedAt = now();
 
   let id = chainId;
+  // The --next selection rule.  It is also consulted while the wait holds a
+  // recordless chain, so a newer chain directory that appears mid-wait wins
+  // over the empty dir (kusabi #298).
+  let candidates = null;
   if (next) {
+    candidates = makeNextCandidateSelector({
+      chainsDir, since, startedAt, appearTimeoutMs, reportIgnored,
+    });
     id = await waitForChainToAppear({
-      chainsDir, since, pollIntervalMs, appearTimeoutMs, sleep, now, startedAt,
+      candidates, chainsDir, since, pollIntervalMs, appearTimeoutMs, sleep, now, startedAt,
     });
   } else {
     if (!id) {
@@ -487,12 +540,28 @@ export async function waitForChain({
     // A chain directory with no control record: `chain` creates the directory
     // before it validates --container, so an instant death can leave one.
     // Nothing here records a pid, so liveness cannot answer — bound it.
-    if (snapshot.control === null && now() - startedAt >= appearTimeoutMs) {
-      throw stall(
-        snapshot,
-        now() - startedAt,
-        `no control record in ${snapshot.chainDir} after ${Math.round(appearTimeoutMs / 1000)}s`,
-      );
+    if (snapshot.control === null) {
+      // While the selected chain is still recordless, a newer eligible chain
+      // directory may have appeared since the selection (kusabi #298).  An
+      // empty dir can never lose a race it was never running — the wait
+      // switches to the newer chain instead of stalling on the debris.  The
+      // selector exists only in appear mode: a NAMED chain is the caller's
+      // explicit choice and is never traded away.
+      if (candidates !== null) {
+        const lockedAt = chainDirCreatedAt(chainsDir, id);
+        const newer = candidates().find((c) => c.createdAt > lockedAt);
+        if (newer) {
+          id = newer.id;
+          continue;
+        }
+      }
+      if (now() - startedAt >= appearTimeoutMs) {
+        throw stall(
+          snapshot,
+          now() - startedAt,
+          `no control record in ${snapshot.chainDir} after ${Math.round(appearTimeoutMs / 1000)}s`,
+        );
+      }
     }
 
     const staleMs = now() - lastProgressAt;
