@@ -633,6 +633,40 @@ describe("verifyRefusalAnchors", () => {
     assert.match(noMatch.disqualification, /§3\.5 \(no such heading in the brief\)/);
   });
 
+  // kusabi #301: a worker that copies a heading verbatim may keep its ATX
+  // closing hashes (`## Frozen tests ##`).  `headingTextOf` strips them the
+  // same way `extractBriefHeadings` strips them from the brief side, so the
+  // copied spelling anchors the same section as the plain one.
+  it("verifies an anchor with ATX closing hashes copied verbatim from a heading", () => {
+    const withClosing = verifyRefusalAnchors(blockFor([
+      "anchor: ## Frozen tests ##",
+      "anchor: plugins/kusabi/scripts/chain-phases.test.mjs",
+      "why: they cannot both hold.",
+    ]), { brief: BRIEF, pathExists: realPath });
+    assert.equal(withClosing.qualifies, true);
+    assert.equal(withClosing.disqualification, null);
+
+    // The same anchor without closing hashes still verifies.
+    const plain = verifyRefusalAnchors(blockFor([
+      "anchor: ## Frozen tests",
+      "anchor: plugins/kusabi/scripts/chain-phases.test.mjs",
+      "why: they cannot both hold.",
+    ]), { brief: BRIEF, pathExists: realPath });
+    assert.equal(plain.qualifies, true);
+    assert.equal(plain.disqualification, null);
+  });
+
+  it("still fails an anchor with closing hashes that names a nonexistent section", () => {
+    const v = verifyRefusalAnchors(blockFor([
+      "anchor: ## No Such Section ##",
+      "anchor: plugins/kusabi/scripts/chain-phases.test.mjs",
+      "why: they cannot both hold.",
+    ]), { brief: BRIEF, pathExists: realPath });
+    assert.equal(v.qualifies, false);
+    // The miss records what was written, closing hashes included.
+    assert.match(v.disqualification, /## No Such Section ## \(no such heading in the brief\)/);
+  });
+
   it("treats brief-section anchors as unnamed when no brief is available", () => {
     const v = verifyRefusalAnchors(qualifiedBlock(), { pathExists: realPath });
     assert.equal(v.qualifies, false);

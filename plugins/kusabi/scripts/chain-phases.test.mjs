@@ -4550,6 +4550,45 @@ describe("resolveChainResume", () => {
     assert.match(result.error, /already finished/);
   });
 
+  // kusabi #293: refused-brief-defect is terminal.  Even a STALE control
+  // (status "running", dead pid) must not resume into a fresh implement
+  // round on the same defective brief -- the brief must be fixed and a new
+  // chain re-dispatched instead.
+  it("refuses resume for a stale control whose last round refused the brief as defective", () => {
+    const control = {
+      chainId: "chain-test", container: "cid-1", pid: 0, // dead
+      status: "running", round: 2,
+    };
+    const complete = {
+      round: 2,
+      implementJobId: "job-imp-2",
+      reviewJobId: "job-rev-2",
+      verdict: "discard",
+      disposition: { disposition: "refused-brief-defect", reason: "the two named anchors contradict" },
+    };
+    const result = resolveChainResume({ control, chainJson: baseChainJson({ records: [complete] }) });
+    assert.equal(result.ok, false);
+    assert.match(result.error, /refused-brief-defect/);
+    assert.match(result.error, /brief is defective/);
+    assert.match(result.error, /re-dispatch a new chain/);
+  });
+
+  it("refuses resume for a fresh cancelled control whose last round refused the brief as defective", () => {
+    const control = { chainId: "chain-test", container: "cid-1", pid: 0, status: "cancelled", round: 2 };
+    const complete = {
+      round: 2,
+      implementJobId: "job-imp-2",
+      reviewJobId: "job-rev-2",
+      verdict: "discard",
+      disposition: { disposition: "refused-brief-defect" },
+    };
+    const result = resolveChainResume({ control, chainJson: baseChainJson({ records: [complete] }) });
+    assert.equal(result.ok, false);
+    assert.match(result.error, /refused-brief-defect/);
+    assert.match(result.error, /brief is defective/);
+    assert.match(result.error, /re-dispatch a new chain/);
+  });
+
   it("errors when there are no round records at all", () => {
     const control = { chainId: "chain-test", container: "cid-1", pid: 0, status: "cancelled", round: 0 };
     const result = resolveChainResume({ control, chainJson: baseChainJson() });

@@ -378,9 +378,14 @@ export function extractBriefHeadings(brief) {
 
 // The anchor's heading text without its markdown marker: `## Frozen tests`
 // -> `Frozen tests`, `§3.5` -> `3.5`.  Marker depth does not matter -- the
-// item is the section, not the marker.
+// item is the section, not the marker.  ATX closing hashes (`## Frozen tests ##`)
+// are stripped the same way `extractBriefHeadings` strips them from the brief
+// side, so a worker copying a heading verbatim still anchors the same section.
 function headingTextOf(name) {
-  return String(name).replace(/^[#\u00a7]+[ \t]*/, "").trim();
+  return String(name)
+    .replace(/^[#\u00a7]+[ \t]*/, "")
+    .replace(/[ \t]+#+[ \t]*$/, "")
+    .trim();
 }
 
 // The repo path without its `:line` suffix (`src/foo.mjs:42-44` -> the file
