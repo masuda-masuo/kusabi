@@ -640,3 +640,102 @@ describe("deriveDisposition qualifying refusal (kusabi #293)", () => {
     }
   });
 });
+
+// deriveDisposition — brief-syntax defect (kusabi #303)
+// ---------------------------------------------------------------------------
+// A probe whose INPUT is the brief cannot be turned green by the worker, so
+// the normal table's `probesGreen=false → rework` row buys rounds that are
+// unwinnable by construction.  The row below is terminal, attributes the
+// defect to the brief, and must not disturb any worktree-reachable failure.
+
+describe("deriveDisposition brief-syntax defect (kusabi #303)", () => {
+  const DEFECT = "P5: frozen: ## Frozen Tests heading present but no entries parsed";
+
+  it("routes a brief-syntax probe failure to the terminal refused-brief-defect", () => {
+    const result = deriveDisposition({
+      verdict: "needs-attention", probesGreen: false, round: 1, maxRounds: 4,
+      repeatedAreas: false, findingSeverities: ["high"], briefSyntaxDefect: DEFECT,
+    });
+    assert.equal(result.disposition, "refused-brief-defect");
+    // The three properties the terminal must carry.
+    assert.match(result.reason, /## Frozen Tests/);            // names the section
+    assert.match(result.reason, /brief author's defect, not the worker's/); // attribution
+    assert.match(result.reason, /Fix the brief and re-dispatch/);           // the fix
+  });
+
+  it("replaces the rework the same evidence would otherwise have bought", () => {
+    // Same inputs, marker removed: this is the rework #303 stops buying.
+    const withoutMarker = deriveDisposition({
+      verdict: "needs-attention", probesGreen: false, round: 1, maxRounds: 4,
+      repeatedAreas: false, findingSeverities: ["high"],
+    });
+    assert.equal(withoutMarker.disposition, "rework");
+  });
+
+  it("accepts a bare `true` marker, with no section named in the reason", () => {
+    const result = deriveDisposition({
+      verdict: "needs-attention", probesGreen: false, round: 1, maxRounds: 4,
+      repeatedAreas: false, briefSyntaxDefect: true,
+    });
+    assert.equal(result.disposition, "refused-brief-defect");
+    assert.doesNotMatch(result.reason, /—/);
+  });
+
+  it("yields to the worker's own refusal, which is the more specific statement", () => {
+    const result = deriveDisposition({
+      verdict: "discard", probesGreen: false, round: 1, maxRounds: 4,
+      repeatedAreas: false,
+      refusal: "## Frozen tests vs src/foo.test.mjs — the test pins the old output",
+      briefSyntaxDefect: DEFECT,
+    });
+    assert.equal(result.disposition, "refused-brief-defect");
+    assert.match(result.reason, /brief contradicts itself/);
+  });
+
+  it("takes precedence over the oracle, the max-rounds terminal and every accept row", () => {
+    const rows = [
+      { verdict: "approve", probesGreen: false, round: 1, oracleViolation: "P5: frozen — tests/a.test.mjs" },
+      { verdict: "needs-attention", probesGreen: false, round: 4, repeatedAreas: true },
+      { verdict: "approve", probesGreen: true, round: 1 },
+      { verdict: "needs-attention", probesGreen: true, round: 1, findingSeverities: ["low"] },
+      { verdict: "discard", probesGreen: false, round: 2 },
+    ];
+    for (const row of rows) {
+      const result = deriveDisposition({
+        maxRounds: 4, repeatedAreas: false, ...row, briefSyntaxDefect: DEFECT,
+      });
+      assert.equal(result.disposition, "refused-brief-defect", JSON.stringify(row));
+    }
+  });
+
+  it("is inert when absent, false, or an empty string — worktree-reachable failures route as before", () => {
+    for (const marker of [undefined, null, false, "", "   "]) {
+      // verify red / deliverables untouched: still a rework.
+      assert.equal(
+        deriveDisposition({
+          verdict: "approve", probesGreen: false, round: 1, maxRounds: 4,
+          repeatedAreas: false, briefSyntaxDefect: marker,
+        }).disposition,
+        "rework",
+        "marker=" + JSON.stringify(marker),
+      );
+      // a frozen-path intersection: still the oracle escalate.
+      assert.equal(
+        deriveDisposition({
+          verdict: "approve", probesGreen: false, round: 1, maxRounds: 4,
+          repeatedAreas: false, oracleViolation: "P5: frozen — tests/a.test.mjs",
+          briefSyntaxDefect: marker,
+        }).disposition,
+        "escalate",
+      );
+      // green everything: still an accept.
+      assert.deepEqual(
+        deriveDisposition({
+          verdict: "approve", probesGreen: true, round: 1, maxRounds: 4,
+          repeatedAreas: false, briefSyntaxDefect: marker,
+        }),
+        { disposition: "accept" },
+      );
+    }
+  });
+});

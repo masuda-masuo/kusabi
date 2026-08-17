@@ -4690,3 +4690,207 @@ describe("runChainDriver qualifying refusal (kusabi #293)", () => {
     }
   });
 });
+
+// =========================================================================
+// runChainDriver — brief-reachable probe failure terminates (kusabi #303)
+// -------------------------------------------------------------------------
+// The chain-msvwhslx6e60 incident (2026-08-17): a `## Frozen Tests` heading
+// whose body was prose.  P5 correctly failed every round on "heading present
+// but no entries parsed" — and every one of those rounds was unwinnable,
+// because the probe's input is the BRIEF, which the worker cannot edit.  The
+// normal disposition table nonetheless read `probesGreen=false` as a rework
+// and spent the whole 4-round budget.
+//
+// These run the real driver end to end and check the two halves: a
+// brief-reachable failure terminates at its first occurrence with no rework
+// dispatched, and a worktree-reachable failure still buys its rework exactly
+// as before.
+// =========================================================================
+
+describe("runChainDriver brief-syntax defect (kusabi #303)", () => {
+  // The live shape: a canonical `## Frozen Tests` heading followed by prose.
+  const DEFECTIVE_BRIEF = [
+    "Implement X.",
+    "",
+    "## Deliverables",
+    "- src/foo.js",
+    "",
+    "## Frozen Tests",
+    "",
+    "(none frozen by name — use judgement.)",
+    "",
+  ].join("\n");
+
+  // The control group: a readable frozen section.  The round then fails P3 on
+  // a WORKTREE-reachable fact (it changed something, but not the declared
+  // deliverable), which the worker can fix — so that failure must still route
+  // to a rework.
+  const WORKTREE_FAILURE_BRIEF = [
+    "Implement X.",
+    "",
+    "## Deliverables",
+    "- src/foo.js",
+    "",
+    "## Frozen Tests",
+    "- tests/a.test.mjs",
+    "",
+  ].join("\n");
+
+  function chainCallTool({ statusOutput }) {
+    return async (toolName, params) => {
+      if (toolName === "verify_in_container") {
+        return {
+          gate_passed: true, lint: [], types: [],
+          tests: { full: { status: "ok", passed: 10, total: 10 } },
+        };
+      }
+      if (toolName !== "sandbox_exec") return { output: "" };
+      const cmd = params.commands[0];
+      if (cmd.startsWith("cd /workspace &&") && cmd.includes("TMPIDX=")) {
+        return { output: "ERROR_NO_INDEX\n" };
+      }
+      if (cmd === "git rev-parse HEAD") return { output: "abc123\n" };
+      if (cmd === "git status --porcelain") return { output: statusOutput };
+      if (cmd === "git log --oneline -5") return { output: "abc123 latest change\n" };
+      if (cmd === "git ls-files --others --exclude-standard") return { output: "" };
+      return { output: "" };
+    };
+  }
+
+  // The reviewer APPROVES every round: without the #303 row the round would
+  // derive `rework` on "deterministic probes failed", which is exactly the
+  // routing under test.
+  function approvingDispatch() {
+    const calls = [];
+    const dispatch = async (opts) => {
+      calls.push(opts);
+      if (opts.kind === "review") {
+        return {
+          job: {
+            id: "job-rev-" + calls.length, status: "completed", modelEntry: "fake/review",
+            modelVariant: null, fallbacks: null, sessionID: "sess-rev", usage: null, error: null,
+          },
+          resultText: JSON.stringify({ verdict: "approve", findings: [], summary: "ok" }),
+        };
+      }
+      return {
+        job: {
+          id: "job-imp-" + (opts.round ?? 1), status: "completed", modelEntry: "fake/model",
+          modelVariant: null, fallbacks: null, sessionID: "sess-imp-1", usage: null, error: null,
+        },
+        resultText: "Done; report follows.",
+      };
+    };
+    dispatch.calls = calls;
+    return dispatch;
+  }
+
+  async function runFresh({ brief, statusOutput }) {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-briefsyntax-"));
+    const chainDir = path.join(tmp, "chains", "chain-bsd");
+    fs.mkdirSync(chainDir, { recursive: true });
+    writeChainControl(chainDir, {
+      chainId: "chain-bsd", container: "cid-1", pid: process.pid,
+      status: "running", round: 0, startedAt: new Date().toISOString(),
+    });
+    const dispatch = approvingDispatch();
+    const text = await runChainDriver({
+      cwd: tmp, stateDir: tmp, chainDir, chainId: "chain-bsd", container: "cid-1",
+      model: "fake/model", modelChain: [["fake/model"], ["fake/pro"]], maxRounds: 4,
+      brief, orchestrator: null, baseSha: "abc123", worktreeBaseline: null,
+      verifyBaseline: { captured: true, gate_passed: true, lint: 0, types: 0, collected: 10, raw: {} },
+      callTool: chainCallTool({ statusOutput }),
+      dispatchWithFallback: dispatch,
+      keepServe: true,
+      signalReceived: () => false,
+      resume: null,
+    });
+    return { tmp, chainDir, text, dispatch };
+  }
+
+  it("terminates at round 1 with no rework dispatched, and attributes the defect to the brief", async () => {
+    const { tmp, chainDir, text, dispatch } = await runFresh({
+      brief: DEFECTIVE_BRIEF,
+      statusOutput: " M src/foo.js\n",
+    });
+    try {
+      // ---- the outcome an orchestrator reads ----
+      assert.match(text, /stopped at round 1/);
+      assert.match(text, /## Frozen Tests heading present but no entries parsed/);
+      assert.match(text, /No rework was dispatched/);
+      assert.match(text, /BRIEF defect, not a worker failure/);
+      assert.match(text, /an empty section must omit its heading/);
+      assert.doesNotMatch(text, /accepted at round/);
+      assert.doesNotMatch(text, /escalated at round/);
+      assert.doesNotMatch(text, /reached max rounds/);
+
+      const round1 = readJson(path.join(chainDir, "round-1.json"));
+      assert.equal(round1.disposition.disposition, "refused-brief-defect");
+      // The record names the offending section and whose defect it is.
+      assert.equal(
+        round1.briefSyntaxDefect,
+        "P5: frozen: ## Frozen Tests heading present but no entries parsed",
+      );
+      assert.equal(round1.roundOutcome, "brief-syntax-defect");
+      assert.match(round1.disposition.reason, /brief author's defect, not the worker's/);
+      assert.match(round1.disposition.reason, /Fix the brief and re-dispatch/);
+
+      // The probe itself is unchanged: P5 failed, and it is not an oracle
+      // violation (nothing was violated; the declaration is unreadable).
+      const p5 = round1.probeResults.find((p) => p.probe === "P5: frozen");
+      assert.equal(p5.passed, false);
+      assert.match(p5.detail, /heading present but no entries parsed/);
+      assert.equal(round1.oracleViolation, false);
+      assert.equal(round1.probesGreen, false);
+
+      // ---- no round was bought ----
+      assert.equal(round1.reworkCount, 0);
+      assert.equal(round1.pendingReworkStrategy, null);
+      assert.equal(fs.existsSync(path.join(chainDir, "round-2.json")), false);
+      assert.equal(readJson(path.join(chainDir, "chain.json")).records.length, 1);
+      assert.equal(dispatch.calls.filter((c) => c.kind !== "review").length, 1);
+
+      // ---- terminal for chain-wait and legible in chain-show ----
+      const control = readChainControl(chainDir);
+      assert.equal(control.status, "completed");
+      assert.equal(control.round, 1);
+      assert.equal(TERMINAL_DISPOSITIONS.has("refused-brief-defect"), true);
+      const shown = renderChainShow(
+        readJson(path.join(chainDir, "chain.json")), [round1], [], control,
+      );
+      assert.match(shown, /status: refused at round 1 — brief defect/);
+      assert.match(shown, /disposition: refused-brief-defect/);
+      assert.match(shown, /## Frozen Tests/);
+      // No worker refusal happened, so the worker-named-items block is absent.
+      assert.doesNotMatch(shown, /contradicting items named by the worker/);
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("leaves a WORKTREE-reachable probe failure on today's rework routing", async () => {
+    // Same fixture, readable frozen section, and a change set that touches
+    // nothing declared: P3 fails on a fact the worker can fix, so the round
+    // must still buy its rework.
+    const { tmp, chainDir, text, dispatch } = await runFresh({
+      brief: WORKTREE_FAILURE_BRIEF,
+      statusOutput: " M src/other.js\n",
+    });
+    try {
+      const round1 = readJson(path.join(chainDir, "round-1.json"));
+      assert.equal(round1.disposition.disposition, "rework");
+      assert.equal(round1.disposition.reason, "deterministic probes failed");
+      assert.equal(round1.briefSyntaxDefect, undefined);
+      assert.equal(round1.roundOutcome, undefined);
+      const p3 = round1.probeResults.find((p) => p.probe === "P3: deliverables");
+      assert.equal(p3.passed, false);
+      assert.match(p3.detail, /no declared deliverable touched/);
+      // A rework round WAS dispatched.
+      assert.equal(fs.existsSync(path.join(chainDir, "round-2.json")), true);
+      assert.ok(dispatch.calls.filter((c) => c.kind !== "review").length > 1);
+      assert.doesNotMatch(text, /stopped at round 1/);
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+});
