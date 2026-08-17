@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import fs from "node:fs";
 import crypto from "node:crypto";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { writeJson } from "./state-paths.mjs";
 import {
   waitForChain,
@@ -590,6 +590,174 @@ describe("waitForChain --next", () => {
 });
 
 // ---------------------------------------------------------------------------
+// waitForChain --next — dead-dispatch debris (kusabi #298)
+// ---------------------------------------------------------------------------
+
+describe("waitForChain --next debris exclusion (kusabi #298)", () => {
+  let tmp;
+  let chainsDir;
+
+  beforeEach(() => {
+    ({ tmp, chainsDir } = makeChainsDir());
+  });
+
+  afterEach(() => {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  });
+
+  // A clock far ahead of real time: every directory the test creates at real
+  // "now" is OLDER than the appear window, which is what a debris dir left by
+  // a dispatch killed before it wrote anything looks like to a later wait.
+  const FUTURE_CLOCK = () => steppingClock(5_000, Date.now() + 1_000_000_000);
+
+  it("skips a recordless dir older than the appear window and waits on the chain that appears after the first scan", async () => {
+    // The incident shape (2026-08-16): a WSL shutdown killed a dispatch
+    // mid-flight, leaving an empty chain dir; a later bare `--next` locked
+    // onto it and stalled while the real chain ran.
+    makeChainDir(chainsDir, "chain-debris");
+
+    const ignored = [];
+    let sleeps = 0;
+    const sleep = async () => {
+      sleeps += 1;
+      if (sleeps === 1) {
+        const dir = makeChainDir(chainsDir, "chain-real");
+        writeControl(dir, runningControl("chain-real"));
+      }
+      if (sleeps === 2) {
+        writeControl(path.join(chainsDir, "chain-real"), { ...runningControl("chain-real"), status: "completed" });
+      }
+    };
+
+    const result = await waitForChain({
+      chainsDir, next: true, sleep, probeProcess: ALIVE, pollIntervalMs: 1,
+      appearTimeoutMs: 60_000, now: FUTURE_CLOCK(), reportIgnored: (id) => ignored.push(id),
+    });
+
+    assert.equal(result.chainId, "chain-real");
+    assert.match(result.digest, /^chain chain-real: status=completed/);
+    // One stderr line per skipped dir — not one per poll.
+    assert.deepEqual(ignored, ["chain-debris"]);
+  });
+
+  it("keeps a recordless dir created within the appear window eligible", async () => {
+    // A just-dispatched chain has a directory before it has a control record:
+    // that is the normal startup shape and must never be skipped.
+    const dir = makeChainDir(chainsDir, "chain-starting");
+
+    const ignored = [];
+    let sleeps = 0;
+    const sleep = async () => {
+      sleeps += 1;
+      if (sleeps === 1) writeControl(dir, runningControl("chain-starting"));
+      if (sleeps === 2) writeControl(dir, { ...runningControl("chain-starting"), status: "completed" });
+    };
+
+    const result = await waitForChain({
+      chainsDir, next: true, sleep, probeProcess: ALIVE, pollIntervalMs: 1,
+      appearTimeoutMs: 60_000, now: steppingClock(5_000), reportIgnored: (id) => ignored.push(id),
+    });
+
+    assert.equal(result.chainId, "chain-starting");
+    assert.deepEqual(ignored, []);
+  });
+
+  it("switches to a newer chain that appears while the selected chain is still recordless", async () => {
+    // The wait locked onto the empty dir of a dispatch that never wrote a
+    // record; the real chain's dir appears afterwards.  The wait must resolve
+    // by the newer chain's terminal state, not stall on the empty one.
+    makeChainDir(chainsDir, "chain-empty");
+
+    let sleeps = 0;
+    const sleep = async () => {
+      sleeps += 1;
+      if (sleeps === 1) {
+        // A real pause so the filesystem reports a strictly later birthtime
+        // for the newer dir (dirs created in the same millisecond tie).
+        await new Promise((resolve) => setTimeout(resolve, 10));
+        const dir = makeChainDir(chainsDir, "chain-later");
+        writeControl(dir, runningControl("chain-later"));
+      }
+      if (sleeps === 2) {
+        writeControl(path.join(chainsDir, "chain-later"), { ...runningControl("chain-later"), status: "completed" });
+      }
+    };
+
+    const result = await waitForChain({
+      chainsDir, next: true, sleep, probeProcess: ALIVE, pollIntervalMs: 1,
+      appearTimeoutMs: 60_000, now: steppingClock(5_000),
+    });
+
+    assert.equal(result.chainId, "chain-later");
+    assert.match(result.digest, /^chain chain-later: status=completed/);
+  });
+
+  it("still stalls on a recordless dir when no newer chain ever appears", async () => {
+    // The bound must survive the rescue: a recordless dir that is the newest
+    // eligible chain cannot be traded away, so the wait still fails bounded.
+    makeChainDir(chainsDir, "chain-only-empty");
+
+    await assert.rejects(
+      () => waitForChain({
+        chainsDir, next: true, sleep: async () => {}, probeProcess: ALIVE,
+        pollIntervalMs: 1, appearTimeoutMs: 10_000, now: steppingClock(4_000),
+      }),
+      (err) => {
+        assert.equal(err.code, "stalled");
+        assert.match(err.message, /no control record/);
+        return true;
+      },
+    );
+  });
+
+  it("names the skipped debris dir on stderr by default", async () => {
+    makeChainDir(chainsDir, "chain-junk");
+
+    const lines = [];
+    const orig = console.error;
+    console.error = (...args) => { lines.push(args.join(" ")); };
+    try {
+      await assert.rejects(
+        () => waitForChain({
+          chainsDir, next: true, sleep: async () => {}, probeProcess: ALIVE,
+          pollIntervalMs: 1, appearTimeoutMs: 10_000, now: FUTURE_CLOCK(),
+        }),
+        (err) => err.code === "no-chain-appeared",
+      );
+    } finally {
+      console.error = orig;
+    }
+
+    assert.deepEqual(lines, ["ignoring chain-junk: no control record, older than appear window"]);
+  });
+
+  it("still selects an old recordless dir with an explicit --since stamp", async () => {
+    // The precise tool is unchanged: with --since the caller has said which
+    // chain this wait is for, so the debris exclusion does not apply.
+    const dir = makeChainDir(chainsDir, "chain-stamped-empty");
+
+    const ignored = [];
+    let sleeps = 0;
+    const sleep = async () => {
+      sleeps += 1;
+      if (sleeps === 1) writeControl(dir, runningControl("chain-stamped-empty"));
+      if (sleeps === 2) {
+        writeControl(dir, { ...runningControl("chain-stamped-empty"), status: "completed" });
+      }
+    };
+
+    const result = await waitForChain({
+      chainsDir, next: true, since: Date.now() - 60_000, sleep, probeProcess: ALIVE,
+      pollIntervalMs: 1, appearTimeoutMs: 60_000, now: FUTURE_CLOCK(),
+      reportIgnored: (id) => ignored.push(id),
+    });
+
+    assert.equal(result.chainId, "chain-stamped-empty");
+    assert.deepEqual(ignored, []);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // waitForChain — stall detection
 // ---------------------------------------------------------------------------
 
@@ -876,6 +1044,44 @@ describe("chain-wait CLI", () => {
     const result = run(["chain-wait", "--next", "--appear-timeout", "1", "--poll-interval", "1"]);
     assert.equal(result.status, 1, result.stdout);
     assert.match(result.stdout, /no chain appeared within 1s/);
+  });
+
+  it("--next skips a recordless debris dir and waits on the chain that appears after the first scan (kusabi #298)", async () => {
+    const chainsDir = workspaceChainsDir(path.join(tmp, "state"), tmp);
+    fs.mkdirSync(path.join(chainsDir, "chain-debris"), { recursive: true });
+    // The debris dir must already be OLDER than the appear window when the
+    // wait's first scan runs.  birthtime cannot be backdated, so give it a
+    // head start before the wait starts.
+    await new Promise((resolve) => setTimeout(resolve, 5_000));
+
+    const env = { ...process.env };
+    delete env.KUSABI_WORKER_CONTEXT;
+    env.KUSABI_STATE_DIR = path.join(tmp, "state");
+    const child = spawn(process.execPath, [
+      COMPANION_SCRIPT, "chain-wait", "--next",
+      "--appear-timeout", "4", "--poll-interval", "1",
+    ], { cwd: tmp, env, stdio: ["ignore", "pipe", "pipe"] });
+
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (d) => { stdout += d; });
+    child.stderr.on("data", (d) => { stderr += d; });
+
+    // The dispatch's chain dir appears AFTER the wait's first scan (which
+    // found only the debris) and completes within the appear window.
+    await new Promise((resolve) => setTimeout(resolve, 2_600));
+    const realDir = path.join(chainsDir, "chain-real");
+    fs.mkdirSync(realDir, { recursive: true });
+    writeControl(realDir, runningControl("chain-real"));
+    await new Promise((resolve) => setTimeout(resolve, 1_200));
+    writeControl(realDir, { ...runningControl("chain-real"), status: "completed" });
+
+    const status = await new Promise((resolve) => {
+      child.on("close", (code) => resolve(code));
+    });
+    assert.equal(status, 0, `${stdout}${stderr}`);
+    assert.match(stdout, /chain chain-real: status=completed/);
+    assert.match(stderr, /ignoring chain-debris: no control record, older than appear window/);
   });
 
   it("refuses --next together with a chain id", () => {

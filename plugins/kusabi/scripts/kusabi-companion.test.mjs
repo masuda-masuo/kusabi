@@ -2433,6 +2433,73 @@ setInterval(() => {}, 1000);
   });
 });
 
+// chain-cancel on a chain directory that never got a control record (kusabi
+// #298): a dispatch killed before it wrote anything leaves a permanent empty
+// dir that every later bare `chain-wait --next` would lock onto.  Healing is
+// explicit — chain-cancel must succeed and persist a terminal record, so the
+// workspace is healed without shell-deleting state dirs.  CLI subprocess, the
+// same shape the user runs.
+// ---------------------------------------------------------------------------
+
+describe("chain-cancel heals a recordless chain dir (kusabi #298)", () => {
+  const COMPANION_SCRIPT = path.join(import.meta.dirname, "kusabi-companion.mjs");
+
+  function fixture() {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-chain-cancel-"));
+    const stateRootDir = path.join(tmp, "state");
+    const cwd = path.join(tmp, "ws");
+    fs.mkdirSync(cwd, { recursive: true });
+    const hash = crypto.createHash("sha256").update(cwd).digest("hex").slice(0, 12);
+    const stateDir = path.join(stateRootDir, hash);
+    fs.mkdirSync(path.join(stateDir, "jobs"), { recursive: true });
+    const chainsDir = path.join(stateDir, "chains");
+    fs.mkdirSync(chainsDir, { recursive: true });
+    const env = { ...process.env, KUSABI_STATE_DIR: stateRootDir };
+    delete env.KUSABI_WORKER_CONTEXT;
+    return {
+      tmp, cwd, chainsDir, env,
+      run(args) {
+        return spawnSync(process.execPath, [COMPANION_SCRIPT, ...args], {
+          cwd, encoding: "utf8", env, timeout: 30_000,
+        });
+      },
+    };
+  }
+
+  it("finalises a recordless dir to cancelled; the wait then resolves instantly and --next never selects it", () => {
+    const fx = fixture();
+    try {
+      fs.mkdirSync(path.join(fx.chainsDir, "chain-debris"), { recursive: true });
+
+      const cancel = fx.run(["chain-cancel", "chain-debris"]);
+      assert.equal(cancel.status, 0, cancel.stdout + cancel.stderr);
+      assert.match(cancel.stdout, /chain-debris had no control record/);
+      assert.match(cancel.stdout, /finalised to cancelled/);
+
+      // A terminal record was persisted — not just a message.
+      const control = readChainControl(path.join(fx.chainsDir, "chain-debris"));
+      assert.equal(control.status, "cancelled");
+      assert.equal(control.chainId, "chain-debris");
+      assert.equal(control.round, 0);
+
+      // chain-wait on the healed id exits immediately with a terminal digest.
+      const wait = fx.run(["chain-wait", "chain-debris"]);
+      assert.equal(wait.status, 0, wait.stdout + wait.stderr);
+      assert.match(wait.stdout, /chain chain-debris: status=cancelled disposition=none rounds=0/);
+
+      // A bare --next must never select the cancelled dir: with nothing else
+      // around it reports that nothing appeared instead of "completing" on
+      // the debris.
+      const next = fx.run(["chain-wait", "--next", "--appear-timeout", "1", "--poll-interval", "1"]);
+      assert.equal(next.status, 1, next.stdout);
+      assert.match(next.stdout, /no chain appeared within 1s/);
+      assert.doesNotMatch(next.stdout, /chain-debris/);
+    } finally {
+      fs.rmSync(fx.tmp, { recursive: true, force: true });
+    }
+  });
+});
+
 // chain finally — fossil `running` records must not block the chain's serve
 // stop (kusabi #175).  The chain driver's finally block stops the serve for
 // the cwd unless another GENUINELY running job exists, using the same
