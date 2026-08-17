@@ -340,7 +340,11 @@ function defaultSleep(ms) {
  * The `--next` selection rule, built once per wait.
  *
  * Selection with an explicit `since` stamp: any chain created at or after it,
- * terminal or not.  That is the precise tool, and it is unchanged.
+ * terminal or not.  That is the precise tool, and it is unchanged.  Mid-wait
+ * re-selection applies in both branches while the locked chain is still
+ * recordless: a newer eligible chain that appears wins (kusabi #309), and
+ * under `--since` the newcomer must still satisfy `createdAt >= since` for
+ * the window semantics to hold.
  *
  * Selection by default: any chain that is new since the wait started, OR one
  * that was already there and has not reached a terminal state.  The second
@@ -373,15 +377,15 @@ function defaultSleep(ms) {
  * @returns {() => Array<{id: string, createdAt: number}>} a callable that
  *   returns the eligible chain directories, newest first.
  */
-function makeNextCandidateSelector({ chainsDir, since, startedAt, appearTimeoutMs, reportIgnored }) {
+function makeNextCandidateSelector({ chainsDir, since, startedAt, appearTimeoutMs, reportIgnored, createdAt = chainDirCreatedAt }) {
   const preexisting = since == null ? new Set(listChainIds(chainsDir)) : null;
   const reported = new Set();
   const isCandidate = (id) => {
-    if (preexisting === null) return chainDirCreatedAt(chainsDir, id) >= since;
+    if (preexisting === null) return createdAt(chainsDir, id) >= since;
     if (!preexisting.has(id)) return true;
     const snapshot = readChainSnapshot(chainsDir, id);
     if (snapshot.terminal) return false;
-    if (snapshot.control === null && chainDirCreatedAt(chainsDir, id) < startedAt - appearTimeoutMs) {
+    if (snapshot.control === null && createdAt(chainsDir, id) < startedAt - appearTimeoutMs) {
       if (!reported.has(id)) {
         reported.add(id);
         reportIgnored(id);
@@ -392,7 +396,7 @@ function makeNextCandidateSelector({ chainsDir, since, startedAt, appearTimeoutM
   };
   return () => listChainIds(chainsDir)
     .filter(isCandidate)
-    .map((id) => ({ id, createdAt: chainDirCreatedAt(chainsDir, id) }))
+    .map((id) => ({ id, createdAt: createdAt(chainsDir, id) }))
     .sort((a, b) => (b.createdAt - a.createdAt) || a.id.localeCompare(b.id));
 }
 
@@ -474,6 +478,7 @@ export async function waitForChain({
   sleep = defaultSleep,
   now = Date.now,
   reportIgnored = reportIgnoredDefault,
+  createdAt = chainDirCreatedAt,
 } = {}) {
   const startedAt = now();
 
@@ -482,9 +487,16 @@ export async function waitForChain({
   // recordless chain, so a newer chain directory that appears mid-wait wins
   // over the empty dir (kusabi #298).
   let candidates = null;
+  // Chain ids this wait has already traded away (kusabi #309).  A recordless
+  // dir may be switched away from while it stays recordless; once abandoned
+  // it can never be picked again, so two same-stamp empty dirs cannot make
+  // the wait bounce between them forever.  The set only grows within one
+  // wait — each directory is held at most once, so the loop terminates by
+  // construction.
+  const abandoned = new Set();
   if (next) {
     candidates = makeNextCandidateSelector({
-      chainsDir, since, startedAt, appearTimeoutMs, reportIgnored,
+      chainsDir, since, startedAt, appearTimeoutMs, reportIgnored, createdAt,
     });
     id = await waitForChainToAppear({
       candidates, chainsDir, since, pollIntervalMs, appearTimeoutMs, sleep, now, startedAt,
@@ -541,17 +553,24 @@ export async function waitForChain({
     // before it validates --container, so an instant death can leave one.
     // Nothing here records a pid, so liveness cannot answer — bound it.
     if (snapshot.control === null) {
-      // While the selected chain is still recordless, a newer eligible chain
-      // directory may have appeared since the selection (kusabi #298).  An
-      // empty dir can never lose a race it was never running — the wait
-      // switches to the newer chain instead of stalling on the debris.  The
-      // selector exists only in appear mode: a NAMED chain is the caller's
-      // explicit choice and is never traded away.
+      // While the selected chain is still recordless, a newer — or same-
+      // stamped — eligible chain directory may have appeared since the
+      // selection (kusabi #298, #309).  An empty dir can never lose a race it
+      // was never running — the wait switches to the newer chain instead of
+      // stalling on the debris.  The selector exists only in appear mode: a
+      // NAMED chain is the caller's explicit choice and is never traded away.
       if (candidates !== null) {
-        const lockedAt = chainDirCreatedAt(chainsDir, id);
-        const newer = candidates().find((c) => c.createdAt > lockedAt);
-        if (newer) {
-          id = newer.id;
+        const lockedAt = createdAt(chainsDir, id);
+        // A switch target must be at least as new as the locked dir — the
+        // same-stamp case is a real chain born in the same millisecond as the
+        // empty dir — and must be neither the locked dir itself nor one this
+        // wait already traded away: an abandoned dir is never revisited.
+        const target = candidates().find(
+          (c) => c.createdAt >= lockedAt && c.id !== id && !abandoned.has(c.id),
+        );
+        if (target) {
+          abandoned.add(id);
+          id = target.id;
           continue;
         }
       }
