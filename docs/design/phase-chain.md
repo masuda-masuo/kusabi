@@ -303,6 +303,34 @@ Artifacts are always carried over — the chain never rolls the worktree back.
 `checkpoint_restore` has been removed from the chain (issue #114). A new session
 starts fresh on the existing worktree.
 
+**The session a round hands to the next round is never the one it was told to
+abandon (kusabi #320).** `runImplementPhase` reports the lineage it
+*resolved* — the candidate it was told to resume, or the previous-record
+fallback — not the id the dispatch actually used or created.  The two
+coincide for a resuming round (the backend used the candidate) and differ
+exactly when the dispatch ran fresh: `newSession`, or a dropped cross-backend
+candidate.  Reporting the candidate there was self-defeating: round N
+dispatched fresh as asked, and round N+1 would resume the very conversation
+round N was told to walk away from.  The driver therefore clears the carry
+for `newSession` rounds (`chain-driver.mjs`, kusabi #320): round N+1
+re-derives the conversation round N **created** from round N's record (the
+`previousRecord.sessionID` fallback inside `runImplementPhase`) — the natural
+reading of "start fresh, then carry on from there".  The round record is the
+single source of truth for the hand-off.  A fresh dispatch whose job died
+before any session id was observed carries no `sessionID` on its record, so
+the next round finds nothing to re-derive and starts fresh; that is the only
+safe reading — falling back to the candidate would resurrect the abandoned
+conversation through the failure path, and a session the job DID establish is
+carried on the job itself (`runPrompt` stamps `job.sessionID` before
+dispatch; claude and agy stamp it from the CLI's response or stream init), so
+a missing id truly means no session id was ever observed.  The provenance
+reported beside the session follows it: a resumed session keeps the
+provenance it was resolved with (the previous record's backend, or the
+caller's proof for a chain-resume `initialSession`), and a fresh round's
+successor re-derives provenance from the record — the most established proof
+there is, so an agy round can always prove the conversation it resumes (the
+dispatch fails closed otherwise, kusabi #316).
+
 Evidence inputs to `deriveReworkStrategy`:
 - `reworkCount` (0-indexed: 0 = first rework)
 - `strategized` — whether a strategize has occurred
@@ -558,7 +586,12 @@ Eligible iff **all four** hold for the final round record:
 
 **Records.** The round is continued in place — one record, one round row, no double-counting in metrics ingest. Before the replacement review is dispatched, `archiveFailedReviewSeat` moves every review field of the dead seat (verdict, `verdictSource`, parseable/partial flags, job id, usage, model entry, fallbacks, findings, and the escalate `disposition` it produced) into a `reviewSeatFailures[]` entry and **clears** the live fields. Clearing is load-bearing, not tidiness: `reviewPartial` and `verdictSource` are written only conditionally by `runReviewPhase`, so a surviving value would keep describing the dead seat next to the replacement's verdict — a clean `approve` still flagged partial. The dead seat's spend stays counted (`computeChainTotals` and the ingest's review columns read the archived usages), because a seat that died still burned tokens. `chain-show` and the postable review record render each failed seat next to the replacement verdict, so a replaced round can never read as a single clean review.
 
-Cross-round state (`reworkCount`, `currentTierIndex`, `strategized`, `session`, `baseSha`) is derived from the record fields, so the resumed run continues the tier ladder exactly where the original left off. `baseSha` keeps the ORIGINAL chain base — the resumed round's diff is measured against it (P1 auto-resets HEAD to it); the worktree baseline, by contrast, is re-captured at resume time (the pre-cancel baseline is not persisted).
+Cross-round state (`reworkCount`, `currentTierIndex`, `strategized`, `session`, `baseSha`) is derived from the record fields, so the resumed run continues the tier ladder exactly where the original left off. `session` comes from the last record's `sessionID` — the session that round's
+implement dispatch actually used or created — so the resumed run continues
+the same conversation the interrupted run would have continued.  (The
+in-memory carry `runImplementPhase` reports is its *resolved* lineage and can
+differ for a round that dispatched fresh; the record is the single source of
+truth for the hand-off, kusabi #320, §3.5.5.) `baseSha` keeps the ORIGINAL chain base — the resumed round's diff is measured against it (P1 auto-resets HEAD to it); the worktree baseline, by contrast, is re-captured at resume time (the pre-cancel baseline is not persisted).
 
 **Shared lifecycle.** `chain-resume` goes through `runChainDriver` — the same round loop, stop predicate, serve stopping (unless `--keep-serve`), and terminal finalisation (including the review record, §3.5.7) as `chain`. The verify baseline is the one recorded at chain start, reused and never re-captured on the now-modified worktree (§3.5.2).
 

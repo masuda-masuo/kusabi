@@ -1867,6 +1867,19 @@ export async function runChainDriver({
       // job returned a different id, say).
       provenance = sessionProvenance ?? null;
 
+      // kusabi #320: runImplementPhase reports the lineage it RESOLVED, which
+      // for a useNewSession round is the session the round was told to walk
+      // away from — not the one its dispatch actually used or created.  That
+      // report must never become the next round's carry, or round N+1 would
+      // resume the very conversation round N was told to abandon.  Clear it
+      // here: round N+1 then re-derives the conversation round N CREATED from
+      // round N's record (runImplementPhase's previousRecord fallback) — the
+      // natural "start fresh, then carry on from there" hand-off.
+      if (useNewSession) {
+        session = undefined;
+        provenance = null;
+      }
+
       // The chain record carries the dispatch backends (kusabi #184 / #192);
       // the phase functions stay backend-blind, so they are stamped here.
       // Round records persist them via persistChainState (round-N.json and
