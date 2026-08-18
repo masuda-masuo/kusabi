@@ -4297,6 +4297,227 @@ describe("runImplementPhase session lineage guard (kusabi #192)", () => {
 });
 
 // =========================================================================
+// runImplementPhase — the round-to-round session hand-off (kusabi #320)
+// -------------------------------------------------------------------------
+// The session runImplementPhase returns is the next round's carry.  The
+// phase reports the lineage it RESOLVED — the candidate it was told to
+// resume, or the previous-record fallback — NOT the id the dispatch
+// actually used or created.  The two differ exactly when the dispatch ran
+// fresh (`useNewSession`, a dropped cross-backend candidate); the driver
+// clears the carry for useNewSession rounds (kusabi #320, chain-driver.mjs),
+// so round N+1 re-derives the conversation round N CREATED from round N's
+// record (the previousRecord fallback) — the natural "start fresh, then
+// carry on from there" hand-off.  These tests simulate the driver's
+// post-phase handling faithfully: the driver itself cannot be pushed through
+// this sequence today, because every useNewSession round is followed by
+// another fresh round under the current rework ladder.
+// =========================================================================
+
+describe("runImplementPhase round-to-round session hand-off (kusabi #320)", () => {
+  // A realistic stub: a dispatch that RESUMES echoes the session it was
+  // given (job.sessionID === opts.session), a dispatch that starts fresh
+  // creates a new id (`idPrefix` + round).  Every backend stamps the job
+  // with the session it actually used or created.
+  function makeStubDispatch({ idPrefix = "claude-uuid-", jobOverrides = {} } = {}) {
+    const calls = [];
+    const dispatch = async (opts) => {
+      calls.push(opts);
+      return {
+        job: {
+          id: "job-imp-" + (opts.round ?? 1), status: "completed", modelEntry: "opus",
+          modelVariant: null, fallbacks: null,
+          sessionID: opts.session ?? (idPrefix + (opts.round ?? 1)),
+          usage: { available: true, input: 1, output: 1, reasoning: 0, cacheRead: 0, cacheWrite: 0, cost: 0.01 },
+          error: null,
+          ...jobOverrides,
+        },
+        resultText: "implemented",
+      };
+    };
+    return { dispatch, calls };
+  }
+
+  const base = {
+    cwd: "/tmp", chainId: "chain-test", round: 2, isFirstRound: false,
+    implementText: "brief", modelChain: [["opus"]], tierIndex: 0,
+    useNewSession: false, session: undefined, sessionProvenance: null,
+    previousRecord: null, resumeMethod: { type: "continue_session", detail: "" },
+    flagsModel: null, backend: "claude",
+  };
+
+  it("after a useNewSession round the carry is cleared, so the next round resumes the session the fresh round CREATED — never the abandoned one", async () => {
+    // Round N: the strategist set newSession.  The phase resolves the
+    // candidate ("claude-uuid-1") but the dispatch runs fresh and creates
+    // "claude-uuid-2".  The phase reports the lineage it RESOLVED — the
+    // candidate — which is exactly what the driver must NOT forward.
+    const first = makeStubDispatch();
+    const roundN = await runImplementPhase({
+      ...base,
+      useNewSession: true,
+      session: "claude-uuid-1",
+      sessionProvenance: "claude",
+      previousRecord: { sessionID: "claude-uuid-1", backend: "claude" },
+      _dispatchWithFallback: first.dispatch,
+    });
+    assert.equal(first.calls[0].session, undefined, "round N dispatches fresh as asked");
+    assert.equal(roundN.session, "claude-uuid-1", "the report is the lineage the phase resolved (the candidate)");
+    assert.equal(roundN.sessionProvenance, "claude");
+    assert.equal(roundN.roundRecord.sessionID, "claude-uuid-2", "the record carries the session the dispatch CREATED");
+
+    // Round N+1, exactly as the driver feeds it after clearing the carry
+    // (chain-driver.mjs: `if (useNewSession) { session = undefined;
+    // provenance = null; }`): previousRecord = round N's record.
+    const second = makeStubDispatch();
+    await runImplementPhase({
+      ...base,
+      round: 3,
+      useNewSession: false,
+      session: undefined,
+      sessionProvenance: null,
+      previousRecord: { ...roundN.roundRecord, backend: "claude" },
+      _dispatchWithFallback: second.dispatch,
+    });
+    assert.equal(second.calls[0].session, "claude-uuid-2",
+      "round N+1 resumes the conversation round N CREATED (re-derived from the record)");
+    assert.notEqual(second.calls[0].session, "claude-uuid-1",
+      "the abandoned conversation is never resumed");
+    assert.equal(second.calls[0].sessionProvenance, "claude");
+  });
+
+  it("a normally resuming round is unaffected: same session in, same session out, same dispatch arguments", async () => {
+    const { dispatch, calls } = makeStubDispatch();
+    const result = await runImplementPhase({
+      ...base,
+      useNewSession: false,
+      session: "claude-uuid-1",
+      sessionProvenance: "claude",
+      previousRecord: { sessionID: "claude-uuid-1", backend: "claude" },
+      _dispatchWithFallback: dispatch,
+    });
+    assert.equal(calls[0].session, "claude-uuid-1", "dispatch arguments unchanged");
+    assert.equal(calls[0].sessionProvenance, "claude");
+    assert.equal(result.session, "claude-uuid-1", "same session in, same session out");
+    assert.equal(result.sessionProvenance, "claude");
+    // The driver's clear only fires for useNewSession rounds: a resume
+    // round's carry survives untouched.
+    assert.equal(result.roundRecord.sessionID, "claude-uuid-1");
+  });
+
+  it("a dropped cross-backend candidate never reaches a dispatch, and the next round re-derives only what THIS backend created", async () => {
+    // The driver drops a foreign session before the phase (session: null);
+    // the phase resolves nothing (the record fallback refuses the foreign
+    // backend) and dispatches fresh.
+    const first = makeStubDispatch();
+    const roundN = await runImplementPhase({
+      ...base,
+      useNewSession: false,
+      session: null,
+      sessionProvenance: null,
+      previousRecord: { sessionID: "ses_opencode_1", backend: "opencode" },
+      _dispatchWithFallback: first.dispatch,
+    });
+    assert.ok(first.calls[0].session == null, "the foreign session never reaches the dispatch");
+    assert.ok(roundN.session == null, "nothing was resolved to report (the driver's drop marker is preserved)");
+    assert.equal(roundN.roundRecord.sessionID, "claude-uuid-2", "the record carries the created session");
+
+    // Round N+1 on the same backend: the record fallback re-derives the
+    // session THIS round created — never the foreign one.
+    const second = makeStubDispatch();
+    await runImplementPhase({
+      ...base, round: 3,
+      useNewSession: false,
+      session: undefined,
+      sessionProvenance: null,
+      previousRecord: { ...roundN.roundRecord, backend: "claude" },
+      _dispatchWithFallback: second.dispatch,
+    });
+    assert.equal(second.calls[0].session, "claude-uuid-2");
+    assert.equal(second.calls[0].sessionProvenance, "claude");
+  });
+
+  it("a fresh dispatch whose job died before any session id was observed resumes nothing", async () => {
+    // The claude/agy failure shape: sessionID null by construction until the
+    // CLI reports one.  Round N dispatches fresh (useNewSession) and the job
+    // dies before any id was observed: the record carries no sessionID, so
+    // round N+1 has nothing to re-derive and starts fresh — a dead fresh
+    // round resumes nothing, by construction.
+    const first = makeStubDispatch({
+      jobOverrides: { status: "provider-error", sessionID: null },
+    });
+    const roundN = await runImplementPhase({
+      ...base,
+      useNewSession: true,
+      session: "claude-uuid-1",
+      sessionProvenance: "claude",
+      previousRecord: { sessionID: "claude-uuid-1", backend: "claude" },
+      _dispatchWithFallback: first.dispatch,
+    });
+    assert.equal(first.calls[0].session, undefined, "round N dispatched fresh as asked");
+    assert.equal(roundN.roundRecord.sessionID, null, "no session id was ever observed");
+
+    // Round N+1 with the driver's cleared carry: the record has no
+    // sessionID to fall back to, so the dispatch runs fresh — the abandoned
+    // candidate never surfaces.
+    const second = makeStubDispatch();
+    await runImplementPhase({
+      ...base, round: 3,
+      useNewSession: false,
+      session: undefined,
+      sessionProvenance: null,
+      previousRecord: { ...roundN.roundRecord, backend: "claude" },
+      _dispatchWithFallback: second.dispatch,
+    });
+    assert.equal(second.calls[0].session, undefined, "round N+1 starts fresh");
+  });
+
+  it("agy: the reported pair keeps the fail-closed gate satisfiable across a fresh round's hand-off", async () => {
+    // Resume: same pair in and out, so the next agy dispatch sees a proven
+    // session (assertNoAgySession).
+    const resume = makeStubDispatch({ idPrefix: "agy-conv-" });
+    const resumed = await runImplementPhase({
+      ...base, backend: "agy",
+      useNewSession: false,
+      session: "agy-conv-1",
+      sessionProvenance: "agy",
+      previousRecord: { sessionID: "agy-conv-1", backend: "agy" },
+      _dispatchWithFallback: resume.dispatch,
+    });
+    assert.equal(resume.calls[0].session, "agy-conv-1");
+    assert.equal(resume.calls[0].sessionProvenance, "agy", "the proof assertNoAgySession demands");
+    assert.equal(resumed.session, "agy-conv-1");
+    assert.equal(resumed.sessionProvenance, "agy");
+
+    // Fresh round (useNewSession): the dispatch creates "agy-conv-2"; after
+    // the driver clears the carry, the record is the proof for the next agy
+    // round — re-derived with agy provenance.
+    const fresh = makeStubDispatch({ idPrefix: "agy-conv-" });
+    const roundN = await runImplementPhase({
+      ...base, backend: "agy",
+      useNewSession: true,
+      session: "agy-conv-1",
+      sessionProvenance: "agy",
+      previousRecord: { sessionID: "agy-conv-1", backend: "agy" },
+      _dispatchWithFallback: fresh.dispatch,
+    });
+    assert.equal(fresh.calls[0].session, undefined);
+    assert.equal(roundN.roundRecord.sessionID, "agy-conv-2");
+
+    const next = makeStubDispatch({ idPrefix: "agy-conv-" });
+    await runImplementPhase({
+      ...base, backend: "agy", round: 3,
+      useNewSession: false,
+      session: undefined,
+      sessionProvenance: null,
+      previousRecord: { ...roundN.roundRecord, backend: "agy" },
+      _dispatchWithFallback: next.dispatch,
+    });
+    assert.equal(next.calls[0].session, "agy-conv-2");
+    assert.equal(next.calls[0].sessionProvenance, "agy",
+      "provenance re-derived from the record — assertNoAgySession would pass");
+  });
+});
+
+// =========================================================================
 // writeReviewRecord — postable review record at a terminal disposition
 // (kusabi #52)
 // =========================================================================

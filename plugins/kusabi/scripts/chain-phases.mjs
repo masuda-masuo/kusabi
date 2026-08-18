@@ -452,6 +452,26 @@ export async function runImplementPhase({
   // reads it back); no second measurement exists.
   const implementRefusal = job.status === "completed" ? parseRefusalBlock(resultText) : null;
 
+  // ---- report the session this round RESOLVED (kusabi #320) ----
+  // The returned session is the next round's carry.  The phase reports the
+  // lineage it resolved -- the candidate it was told to resume, or the
+  // previous-record fallback -- NOT the id the dispatch actually used or
+  // created.  The two coincide for a resuming round (the backend used the
+  // candidate) and differ exactly when the dispatch ran fresh: `useNewSession`
+  // or a dropped cross-backend candidate.  Reporting the candidate there is
+  // safe ONLY because the driver clears the carry for useNewSession rounds
+  // (kusabi #320, see chain-driver.mjs): the next round then re-derives the
+  // conversation the fresh round CREATED from the round record's `sessionID`
+  // (the previousRecord fallback above) -- the natural "start fresh, then
+  // carry on from there" hand-off.  Without that clear, round N+1 would
+  // resume the very conversation round N was told to walk away from.
+  //
+  // Failure path: if the dispatch ran fresh and the job died before any
+  // session id was observed (dispatchWithFallback's no-route error job, a
+  // backend job that never returned an id), the record carries no sessionID,
+  // the next round's fallback finds nothing to re-derive, and it starts
+  // fresh -- a dead fresh round resumes nothing, by construction.
+
   return {
     roundRecord: {
       round,
