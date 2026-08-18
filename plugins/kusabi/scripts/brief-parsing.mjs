@@ -255,12 +255,20 @@ export function parseChangedPaths(output) {
  * Uses the shared section walker (parseSectionItems).  For bullet items a
  * backtick-quoted command is REQUIRED (bullets without backticks are
  * ignored); an optional `exit <N>` annotation after the closing backtick
- * declares the expected exit code (default 0).  For code-block items each
- * non-blank line becomes a command with exit 0 (no annotation possible).
+ * declares the expected exit code (default 0).  An optional `baseline-red`
+ * annotation in the same position declares the entry is expected to fail on
+ * the unmodified checkout — the smoke targets a deliverable that does not
+ * exist yet (kusabi #315): the dispatch-time baseline treats a measured
+ * mismatch on such an entry as the annotation doing its job.  The two
+ * annotations are independent and compose in either order.  For code-block
+ * items each non-blank line becomes a command with exit 0 (no annotation
+ * possible).
  *
  * @param {string|null|undefined} briefText  The full brief text.
- * @returns {Array<{command: string, expectedExit: number}>}
- *   Parsed smoke entries; [] when absent/empty.  Never throws.
+ * @returns {Array<{command: string, expectedExit: number, baselineRed?: true}>}
+ *   Parsed smoke entries; [] when absent/empty.  `baselineRed` is present
+ *   only on entries carrying the annotation (its absence reads as false), so
+ *   unannotated entries keep their exact historical shape.  Never throws.
  */
 export function parseSmoke(briefText) {
   const { items } = parseSectionItems(briefText, "Smoke");
@@ -279,17 +287,28 @@ export function parseSmoke(briefText) {
     if (!backtickMatch) continue;
     const command = backtickMatch[1];
 
-    // Optional expected exit code — search only after the closing backtick so
-    // an "exit N" inside the command itself cannot be misread as the annotation.
+    // Optional annotations — searched only after the closing backtick so an
+    // "exit N" or "baseline-red" inside the command itself cannot be misread
+    // as an annotation.  `exit <N>` (P4's expectation) and `baseline-red`
+    // (the dispatch-time baseline's licence, kusabi #315) are independent and
+    // compose in either order.  The baseline-red match is word-boundary
+    // anchored, like the exit match, so an occurrence glued to another token
+    // ("xbaseline-red", "baseline-redx") is not the annotation.
     let expectedExit = 0;
+    let baselineRed = false;
     const afterCommand = content.slice(content.indexOf(backtickMatch[0]) + backtickMatch[0].length);
     const exitMatch = afterCommand.match(/exit\s+(\d+)/);
     if (exitMatch) {
       expectedExit = parseInt(exitMatch[1], 10);
     }
+    if (/\bbaseline-red\b/.test(afterCommand)) {
+      baselineRed = true;
+    }
 
     if (command) {
-      entries.push({ command, expectedExit });
+      // The field is emitted only when set: unannotated entries keep their
+      // exact historical shape (callers and deepEqual assertions rely on it).
+      entries.push(baselineRed ? { command, expectedExit, baselineRed } : { command, expectedExit });
     }
   }
   return entries;

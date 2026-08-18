@@ -13,6 +13,7 @@ import {
   smokeBaselineReport,
   smokeViolationReport,
   renderSmokeBaselineReport,
+  renderSmokeWrongAnnotationReport,
   renderSmokeDirtReport,
   runChainDriver,
   effectiveTierCount,
@@ -33,6 +34,7 @@ import {
   runSmokeProbe,
 } from "./chain-phases.mjs";
 import { readJson, writeJson } from "./state-paths.mjs";
+import { parseSmoke } from "./brief-parsing.mjs";
 import { renderChainShow } from "./render.mjs";
 import { TERMINAL_DISPOSITIONS } from "./chain-wait.mjs";
 
@@ -3514,6 +3516,255 @@ describe("smokeBaselineReport (kusabi #292)", () => {
       container: "cid",
     });
     assert.equal(report, null);
+  });
+});
+
+describe("smokeBaselineReport baseline-red (kusabi #315)", () => {
+  // A fake that scripts each smoke entry's outcome by command fragment, plus
+  // the guard's git status/HEAD reads like the other container-state fakes.
+  // `map` maps a command substring to a scripted outcome: a number (exit
+  // code), "timeout" (the command times out as data), or "unobservable" (the
+  // marker is never emitted).  `statuses` scripts one `git status
+  // --porcelain` output per call.
+  function fakeCallToolBySmoke({ map, statuses = [] } = {}) {
+    let statusCalls = 0;
+    return async (toolName, params) => {
+      if (toolName !== "sandbox_exec") return { output: "" };
+      const cmd = params.commands[0];
+      if (cmd === "git status --porcelain") {
+        const scripted = statuses[statusCalls] ?? "";
+        statusCalls++;
+        return { output: scripted };
+      }
+      if (cmd === "git rev-parse HEAD") {
+        return { output: FAKE_HEAD_SHA + "\n" };
+      }
+      if (cmd.includes("SMOKE_EXIT=")) {
+        for (const [frag, outcome] of Object.entries(map)) {
+          if (!cmd.includes(frag)) continue;
+          if (outcome === "timeout") return { status: "timeout", output: "", exit_code: 124 };
+          if (outcome === "unobservable") return { output: "some unrelated output\n" };
+          return { output: "SMOKE_EXIT=" + outcome + "\n" };
+        }
+      }
+      return { output: "" };
+    };
+  }
+
+  const ANNOTATED_BRIEF = "# Task\n\n## Smoke\n\n- `node --check ui/app.js` baseline-red\n";
+
+  it("dispatches when a baseline-red entry is red at base", async () => {
+    // The case #292 was built to refuse is precisely the task here: the
+    // smoke targets a deliverable the brief asks the worker to create, so
+    // red-at-base is the definition of the job, not a defect.
+    const report = await smokeBaselineReport({
+      brief: ANNOTATED_BRIEF,
+      callTool: fakeCallToolBySmoke({ map: { "ui/app.js": 1 } }),
+      container: "cid",
+    });
+    assert.equal(report, null);
+  });
+
+  it("dispatches when baseline-red entries are red at base against declared exits", async () => {
+    // Composition, both orders: `exit <N>` says what the entry must return
+    // AFTER the round; `baseline-red` says what it is expected to do BEFORE
+    // it.  Each annotated entry must be red against ITS OWN expectation.
+    const brief = "## Smoke\n\n- `test -f out/report.txt` baseline-red exit 0\n- `node --check ui/app.js` exit 2 baseline-red\n";
+    const report = await smokeBaselineReport({
+      brief,
+      callTool: fakeCallToolBySmoke({ map: { "out/report.txt": 1, "ui/app.js": 1 } }),
+      container: "cid",
+    });
+    assert.equal(report, null);
+  });
+
+  it("refuses a baseline-red entry that is green at base, naming it with its own message", async () => {
+    // The point of an explicit annotation rather than a silent exemption: an
+    // entry declared to target something that does not exist yet, which
+    // already passes, is a stale brief or an already-present deliverable —
+    // the one place the baseline run can catch it cheaply.
+    const report = await smokeBaselineReport({
+      brief: ANNOTATED_BRIEF,
+      callTool: fakeCallToolBySmoke({ map: { "ui/app.js": 0 } }),
+      container: "cid",
+    });
+    assert.ok(report, "a green annotated entry must be refused");
+    assert.match(report, /`node --check ui\/app\.js`/);
+    assert.match(report, /declared baseline-red but already passes/);
+    // Its own message: the already-red refusal's remedy (fix the command or
+    // the baseline it measures) is the opposite of the right one here, so
+    // that wording must not be reused.
+    assert.doesNotMatch(report, /already red on the checkout/);
+    assert.doesNotMatch(report, /Fix the brief's smoke command/);
+    assert.match(report, /Drop the annotation, or fix the brief/);
+    assert.match(report, /no job and no round state exist/);
+  });
+
+  it("refuses a baseline-red entry whose declared exit it already meets", async () => {
+    // Composition, wrong direction: `exit 2` declared and exit 2 observed at
+    // base means the annotated claim is already false.
+    const brief = "## Smoke\n\n- `node --check ui/app.js` exit 2 baseline-red\n";
+    const report = await smokeBaselineReport({
+      brief,
+      callTool: fakeCallToolBySmoke({ map: { "ui/app.js": 2 } }),
+      container: "cid",
+    });
+    assert.ok(report);
+    assert.match(report, /declared baseline-red but already passes with exit 2/);
+  });
+
+  it("names a genuine already-red entry and a wrongly-annotated entry together", async () => {
+    // A brief mixing both failure kinds reports both, each under its own
+    // header — never one hiding the other.
+    const brief = "## Smoke\n\n- `npm test`\n- `node --check ui/app.js` baseline-red\n";
+    const report = await smokeBaselineReport({
+      brief,
+      callTool: fakeCallToolBySmoke({ map: { "npm test": 1, "ui/app.js": 0 } }),
+      container: "cid",
+    });
+    assert.ok(report);
+    assert.match(report, /already red on the checkout as handed to the worker/);
+    assert.match(report, /`npm test`: expected exit 0, observed exit 1/);
+    assert.match(report, /declared baseline-red but already passes/);
+    assert.match(report, /`node --check ui\/app\.js`/);
+  });
+
+  it("still refuses an annotated entry that times out at base (fail closed)", async () => {
+    // The annotation licenses a measured mismatch, nothing else: a hang is
+    // not a clean failure with an exit code, and it would hang P4 after the
+    // round too — so it is refused like an unannotated timeout.
+    const report = await smokeBaselineReport({
+      brief: ANNOTATED_BRIEF,
+      callTool: fakeCallToolBySmoke({ map: { "ui/app.js": "timeout" } }),
+      container: "cid",
+    });
+    assert.ok(report, "a timeout must not be licensed by the annotation");
+    assert.match(report, /timed out with no exit code/);
+    assert.match(report, /declared baseline-red: the annotation covers a measured exit-code mismatch/);
+  });
+
+  it("still refuses an annotated entry that cannot be measured (fail closed)", async () => {
+    const report = await smokeBaselineReport({
+      brief: ANNOTATED_BRIEF,
+      callTool: fakeCallToolBySmoke({ map: { "ui/app.js": "unobservable" } }),
+      container: "cid",
+    });
+    assert.ok(report, "an unmeasurable annotated entry must be refused, not passed");
+    assert.match(report, /could not be measured/);
+    assert.match(report, /exit code could not be observed/);
+    assert.match(report, /declared baseline-red: the annotation covers a measured exit-code mismatch/);
+  });
+
+  it("the annotation licenses neither dirt nor a moved HEAD", async () => {
+    // Red at base as declared, but the run dirtied the tree: the dirt guard
+    // still refuses — the annotation covers the exit code, nothing else.
+    const report = await smokeBaselineReport({
+      brief: ANNOTATED_BRIEF,
+      callTool: fakeCallToolBySmoke({ map: { "ui/app.js": 1 }, statuses: ["", "?? coverage/\n"] }),
+      container: "cid",
+    });
+    assert.ok(report, "dirt is refused even when the smoke was red at base as declared");
+    assert.doesNotMatch(report, /declared baseline-red but already passes/);
+    assert.match(report, /modified the worktree/);
+    assert.match(report, /\?\? coverage\//);
+  });
+
+  it("the post-round probe treats an annotated entry exactly like any other", async () => {
+    // The annotation licenses red AT BASE only; after the round, P4's rules
+    // are unchanged: a red annotated entry still fails the probe, a green
+    // one still passes it.
+    const entries = parseSmoke(ANNOTATED_BRIEF);
+    assert.equal(entries[0].baselineRed, true, "the fixture must actually be annotated");
+    const redAfter = await runSmokeProbe({
+      entries,
+      callTool: createFakeCallTool({ exitCode: 1 }),
+      container: "cid",
+      headingPresent: true,
+    });
+    assert.equal(redAfter.passed, false, "red after the round is still a probe failure");
+    const greenAfter = await runSmokeProbe({
+      entries,
+      callTool: createFakeCallTool({ exitCode: 0 }),
+      container: "cid",
+      headingPresent: true,
+    });
+    assert.equal(greenAfter.passed, true, "green after the round is still a probe pass");
+  });
+});
+
+describe("renderSmokeWrongAnnotationReport (kusabi #315)", () => {
+  it("returns null when every annotated entry was red at base", () => {
+    assert.equal(renderSmokeWrongAnnotationReport({
+      entries: [{ command: "ui/app.js", expectedExit: 0, baselineRed: true }],
+      observed: [{ command: "ui/app.js", observed: 1 }],
+    }), null);
+  });
+
+  it("returns null for an annotated entry that was never measured", () => {
+    // Unmeasured observations belong to the ordinary renderer's refusal;
+    // calling the annotation stale needs a measured green.
+    assert.equal(renderSmokeWrongAnnotationReport({
+      entries: [{ command: "ui/app.js", expectedExit: 0, baselineRed: true }],
+      observed: [{ command: "ui/app.js", observed: "unobservable" }],
+    }), null);
+  });
+
+  it("names a green annotated entry under its own header", () => {
+    const report = renderSmokeWrongAnnotationReport({
+      entries: [
+        { command: "ui/app.js", expectedExit: 0, baselineRed: true },
+        { command: "npm test", expectedExit: 0 },
+      ],
+      observed: [
+        { command: "ui/app.js", observed: 0 },
+        { command: "npm test", observed: 1 },
+      ],
+    });
+    assert.ok(report);
+    assert.match(report, /`ui\/app\.js`: declared baseline-red but already passes with exit 0/);
+    assert.doesNotMatch(report, /npm test/, "unannotated entries are the other renderer's business");
+    assert.doesNotMatch(report, /already red on the checkout/, "its own message, never the already-red one");
+    assert.match(report, /Drop the annotation, or fix the brief/);
+  });
+
+  it("names every green annotated entry, and only those", () => {
+    const report = renderSmokeWrongAnnotationReport({
+      entries: [
+        { command: "a", expectedExit: 0, baselineRed: true },
+        { command: "b", expectedExit: 0, baselineRed: true },
+      ],
+      observed: [
+        { command: "a", observed: 0 },
+        { command: "b", observed: 1 },
+      ],
+    });
+    assert.match(report, /`a`: declared baseline-red but already passes/);
+    assert.doesNotMatch(report, /`b`/, "a red-at-base annotated entry is not named");
+  });
+});
+
+describe("renderSmokeBaselineReport baseline-red awareness (kusabi #315)", () => {
+  it("keeps a measured red-at-base mismatch of an annotated entry out of the refusal", () => {
+    assert.equal(renderSmokeBaselineReport({
+      entries: [
+        { command: "ui/app.js", expectedExit: 0, baselineRed: true },
+        { command: "npm test", expectedExit: 0 },
+      ],
+      observed: [
+        { command: "ui/app.js", observed: 1 },
+        { command: "npm test", observed: 0 },
+      ],
+    }), null);
+  });
+
+  it("refuses an annotated entry whose observation is not a number, with the suffix", () => {
+    const report = renderSmokeBaselineReport({
+      entries: [{ command: "ui/app.js", expectedExit: 0, baselineRed: true }],
+      observed: [{ command: "ui/app.js", observed: "timeout" }],
+    });
+    assert.ok(report);
+    assert.match(report, /`ui\/app\.js`: expected exit 0, timed out with no exit code/);
+    assert.match(report, /declared baseline-red: the annotation covers a measured exit-code mismatch/);
   });
 });
 
