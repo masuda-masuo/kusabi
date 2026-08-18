@@ -53,7 +53,7 @@ import {
   rearmChainControl,
   chainIdForJob,
 } from "./chain-control.mjs";
-import { listJobs } from "./job-store.mjs";
+import { listJobs, latestJob } from "./job-store.mjs";
 import { dispatchWithFallback, resetFailedRoutes } from "./prompt-execution.mjs";
 import {
   createChainDir,
@@ -732,6 +732,18 @@ export async function cmdChain(cwd, { flags, text }) {
   // ---- setup ----
   const stateDir = stateDirFor(cwd);
   const config = loadConfig(stateRoot());
+  // The agy dispatch resumes a session only on positive provenance
+  // (assertNoAgySession in agy-dispatch.mjs), established where the job
+  // store is in hand — here, exactly as cmdTask does: the owner record of
+  // the session names its backend.  No owner means the id's provenance is
+  // unknown and an agy chain fails closed at dispatch rather than passing
+  // the id to `--conversation`.
+  const initialSessionOwner = flags.session
+    ? latestJob(stateDir, (j) => j.sessionID === flags.session)
+    : null;
+  const sessionProvenance = initialSessionOwner
+    ? (initialSessionOwner.backend ?? "opencode")
+    : null;
   // Backend resolves PER PHASE at command start (kusabi #192): the
   // implement route-chain and the review route-chain resolve independently,
   // each from models.phases.<phase> with fallback to models.chain, then the
@@ -874,6 +886,9 @@ export async function cmdChain(cwd, { flags, text }) {
       reworkDispatchWithFallback: phaseDispatchFor(
         reworkDispatch.backend, reworkDispatch.dispatch, reworkDispatch.model),
       initialSession: flags.session,
+      // The provenance of `initialSession` (null when no session, or when
+      // the store has no record for it) — the agy dispatch's resume gate.
+      sessionProvenance,
       // The --model value in the SPELLING of the backend the resolution
       // chose, never the raw flag string (kusabi #210): a backend-naming
       // --model pins every phase onto ITS backend, so all three phase
@@ -1088,6 +1103,11 @@ export function resolveResumeDispatches({ resumeBackend, resumeReviewBackend, mo
  *        rework rounds get the clamped claude dispatch pinned to the rework
  *        model (kusabi #184 finding 1 applies per phase).
  * @param {string} [opts.initialSession]
+ * @param {string|null} [opts.sessionProvenance] — the backend the caller
+ *        established (from the job store) as the creator of `initialSession`
+ *        (and of the resumed `resume.session`, which is the same value).
+ *        The agy dispatch's resume gate: a bare UUID reaches
+ *        `--conversation` only with `"agy"` here.
  * @param {string|null} [opts.flagsModel]
  * @param {Function} [opts.signalReceived]  — getter: has SIGTERM/SIGINT fired?
  * @param {boolean} [opts.keepServe]
@@ -1114,7 +1134,7 @@ export async function runChainDriver({
   reworkBackend = null,
   reworkDispatchWithFallback = null,
   initialSession, flagsModel = null, signalReceived = () => false,
-  keepServe = false, resume = null,
+  keepServe = false, resume = null, sessionProvenance = null,
 }) {
   // Per-phase dispatch (kusabi #192): the review phase dispatches through its
   // own backend-specific dispatch unless the caller threads a single one
@@ -1159,6 +1179,7 @@ export async function runChainDriver({
   const records = resume ? resume.records : [];
   let strategized = resume ? resume.strategized : false;
   let session = resume ? resume.session : initialSession;
+  let provenance = session ? sessionProvenance : null;
   let reworkCount = resume ? resume.reworkCount : 0;
   let currentTierIndex = resume ? resume.currentTierIndex : 0;
   const startRound = resume ? resume.round : 1;
@@ -1814,9 +1835,11 @@ export async function runChainDriver({
       // traces to a record of the OTHER backend (only possible across a
       // chain-resume or a round-1/rework backend switch) it is dropped here,
       // and the same guard inside runImplementPhase covers its
-      // previousRecord.sessionID fallback.
+      // previousRecord.sessionID fallback.  Its provenance is dropped with
+      // it — an agy dispatch must never see a claude-attributed id.
       if (session && !isFirstRound && previousRecord && (previousRecord.backend ?? "opencode") !== roundBackend) {
         session = null;
+        provenance = null;
       }
 
       // ---- phase 3: implement text + dispatch ----
@@ -1824,6 +1847,7 @@ export async function runChainDriver({
       const {
         roundRecord,
         session: resolvedSession,
+        sessionProvenance,
         implementJobStatus,
         implementJobError,
         implementJobFailure,
@@ -1831,11 +1855,17 @@ export async function runChainDriver({
       } = await runImplementPhase({
         cwd, chainId, round, isFirstRound, implementText, modelChain: roundModelChain,
         tierIndex: currentTierIndex,
-        useNewSession, session, previousRecord, resumeMethod, flagsModel,
+        useNewSession, session, sessionProvenance: provenance, previousRecord, resumeMethod, flagsModel,
         backend: roundBackend,
         _dispatchWithFallback: roundDispatch,
       });
       session = resolvedSession;
+      // The provenance follows the session: the next round's dispatch needs
+      // it when (and only when) it cannot re-derive it from the round record
+      // (runImplementPhase falls back to this for a session that is not the
+      // previous record's — a chain-resume's initialSession whose recorded
+      // job returned a different id, say).
+      provenance = sessionProvenance ?? null;
 
       // The chain record carries the dispatch backends (kusabi #184 / #192);
       // the phase functions stay backend-blind, so they are stamped here.
@@ -2009,6 +2039,21 @@ export async function cmdChainResume(cwd, { flags, text }) {
   }
   const position = resolution.position;
 
+  // ---- resumed-session provenance (kusabi #316) ----
+  // The resumed run carries `position.session` (the interrupted chain's
+  // implement session) into the next implement round.  The agy dispatch
+  // resumes only on positive provenance, established where the job store is
+  // in hand — here: the session was recorded by a kusabi job, so the store
+  // names its backend.  No owner (an unusual state — the session was
+  // persisted from a kusabi job) means unknown provenance and the agy
+  // dispatch fails closed rather than passing the id to `--conversation`.
+  const resumedSessionOwner = position.session
+    ? latestJob(stateDir, (j) => j.sessionID === position.session)
+    : null;
+  const sessionProvenance = resumedSessionOwner
+    ? (resumedSessionOwner.backend ?? "opencode")
+    : null;
+
   // ---- mid-flight job guard (#153① review) ----
   // A dead driver (stale pid) may have left a phase job dispatched but not
   // finished; the record then has no phase boundary for it, and resuming
@@ -2148,6 +2193,9 @@ export async function cmdChainResume(cwd, { flags, text }) {
       reworkDispatchWithFallback: phaseDispatchFor(
         reworkBackendForResume, backendDispatch(reworkBackendForResume), resumeReworkModel),
       initialSession: position.session,
+      // The provenance of the resumed session (null when no session or no
+      // owning record) — the agy dispatch's resume gate.
+      sessionProvenance,
       flagsModel: null,
       signalReceived: () => signalReceived,
       keepServe: !!flags.keepServe,

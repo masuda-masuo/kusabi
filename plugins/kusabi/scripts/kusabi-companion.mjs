@@ -624,9 +624,15 @@ export function phaseDispatchFor(backend, dispatch, model) {
  *   2. PROVENANCE — a claude session id and an agy conversation id are BOTH
  *      bare UUIDs, so shape can never separate them.  The job store can: the
  *      record that reported this session names the backend that made it.
+ *      This check is now LOAD-BEARING for the agy backend (kusabi #316):
+ *      agyDispatch resumes a session only when the caller proves the store
+ *      attributes it to agy, and the proof is this record.
  *
- * A session with no owning record and no telling shape is left alone: the
- * operator may legitimately be resuming something kusabi never dispatched.
+ * A session with no owning record and no telling shape is left alone here:
+ * the operator may legitimately be resuming something kusabi never
+ * dispatched.  (The agy DISPATCH draws a stricter line — see
+ * assertNoAgySession in agy-dispatch.mjs, which fails closed on exactly
+ * that unknown-provenance shape rather than pass it to `--conversation`.)
  *
  * @param {object} opts
  * @param {string} opts.session
@@ -930,9 +936,10 @@ function resolveOpencodePhaseDispatch({ phase, config, modelSpec, namedBackend, 
  * predate the backend split and count as "opencode".  This is SELECTION
  * only — whether a given session may be resumed on the chosen backend is
  * decided inside the dispatch (claudeDispatch's ses_* guard,
- * agyDispatch's assertNoAgySession); whether the backend resumes AT ALL is
- * decided by the caller (`backendSupportsResume`) before it gets here, so
- * this is never reached for a fresh-dispatch-only backend.
+ * agyDispatch's assertNoAgySession).  The selection doubles as the agy
+ * dispatch's provenance proof: the selected record's backend IS the
+ * dispatch backend, so the session id the caller passes down with
+ * `sessionProvenance: "agy"` is exactly what assertNoAgySession requires.
  *
  * @param {string} stateDir
  * @param {object} opts
@@ -1014,16 +1021,21 @@ async function cmdTask(cwd, { flags, text }) {
   }
 
   // A backend that cannot continue a session must SAY so when one is asked
-  // for (kusabi #199): the agy backend is fresh-dispatch only in v1, and
-  // quietly starting a blank run for an operator who typed `--session` /
-  // `--resume-last` would hand them a job that looks like a continuation and
-  // is not.  Rejected here, at command start, before any job record exists.
+  // for; every current backend CAN (kusabi #316 lifted agy's v1
+  // fresh-dispatch-only limit), so this guard has no firing row today.  It
+  // stays as the table-driven backstop for a backend added later without a
+  // resume row: quietly starting a blank run for an operator who typed
+  // `--session` / `--resume-last` would hand them a job that looks like a
+  // continuation and is not.  agy's extra gate is PROVENANCE, applied here
+  // where the job store is in hand (assertSessionBackendCompatible above,
+  // and the sessionProvenance signal passed to the dispatch below): a bare
+  // UUID is ambiguous between agy and claude, so the agy dispatch resumes
+  // only what the store proves an agy job recorded.
   if ((flags.session || flags.resumeLast) && !backendSupportsResume(backend)) {
     const asked = flags.session ? `--session ${flags.session}` : "--resume-last";
     throw new Error(
-      `${asked} is not supported on the ${backend} backend — it is fresh-dispatch only (kusabi #199): ` +
-      "it records the CLI's conversation id on the job record but cannot continue one. " +
-      `Drop ${flags.session ? "--session" : "--resume-last"}, or run the phase on the opencode or claude backend.`
+      `${asked} is not supported on the ${backend} backend — it cannot continue a session: ` +
+      `drop ${flags.session ? "--session" : "--resume-last"}, or run the phase on a backend that resumes.`
     );
   }
 
@@ -1040,6 +1052,20 @@ async function cmdTask(cwd, { flags, text }) {
         ? `--resume-last: no previous ${phase} ${backend} session found for this directory`
         : `--resume-last: no previous ${backend} task session found for this directory`);
     }
+  }
+  // The dispatch-level agy backstop resumes a session only on POSITIVE
+  // provenance (assertNoAgySession in agy-dispatch.mjs): an agy
+  // conversation_id and a claude session id are both bare UUIDs, so the
+  // distinguishing evidence is the job store, which is in hand HERE, not in
+  // the dispatch.  The owner record of the session names its backend
+  // (records without the backend field predate the split -> opencode); no
+  // owner means the id's provenance is unknown, and the agy dispatch fails
+  // closed rather than passing an unproven id to `--conversation`.  claude
+  // and opencode dispatches ignore the signal.
+  let sessionProvenance = null;
+  if (session) {
+    const owner = latestJob(stateDir, (j) => j.sessionID === session);
+    sessionProvenance = owner ? (owner.backend ?? "opencode") : null;
   }
   if (session && phase) {
     const owner = latestJob(stateDir, (j) => j.sessionID === session);
@@ -1141,6 +1167,7 @@ async function cmdTask(cwd, { flags, text }) {
     agent,
     phase,
     session,
+    sessionProvenance,
     tools,
     timeoutS: Number(flags.timeout ?? DEFAULT_TASK_TIMEOUT_S),
     watchdogS: Number(flags.watchdog ?? DEFAULT_WATCHDOG_S),
@@ -2251,7 +2278,7 @@ function usage() {
     "  --read-only, --resume-last, --wait, --background",
     "  --base <ref> (review: branch diff base; task: diff base for --phase review --container, rejected elsewhere), --agent <id>, --phase <name> (draft|investigate|implement|review|respond|salvage|gofer)",
     "  --model <identifier> (task/chain: the identifier CARRIES its backend and decides it for the phases it pins — claude/<model> (bare alias opus|sonnet|haiku or a full model id; a :variant suffix is rejected) runs those phases on claude, provider/model[:variant] runs them on opencode, and a bare alias with no / names no backend, so the phase keeps its configured backend. The model is always validated against the backend the same identifier chose)",
-    "  --backend opencode|claude|agy (task/chain: force EVERY phase onto that backend; default opencode. Redundant when --model names a backend — a --backend that disagrees with such a --model is a contradiction and is rejected, naming both. With neither, the config chain entries decide: models.phases.<phase> (or models.chain) entries may carry a claude/ or agy/ prefix for per-phase backend mixing; one phase's chain must be single-backend. agy is fresh-dispatch only: --session/--resume-last and --read-only/--deny are rejected on it)",
+    "  --backend opencode|claude|agy (task/chain: force EVERY phase onto that backend; default opencode. Redundant when --model names a backend — a --backend that disagrees with such a --model is a contradiction and is rejected, naming both. With neither, the config chain entries decide: models.phases.<phase> (or models.chain) entries may carry a claude/ or agy/ prefix for per-phase backend mixing; one phase's chain must be single-backend. agy resumes via --conversation: --session/--resume-last are accepted when the job store proves the id an agy conversation, and --read-only/--deny are rejected on it)",
     "  --session <id>, --timeout <s>, --watchdog <s>, --deny <tools>",
     "  --brief-file <path> (task / chain: read the brief from a file; exclusive with inline text)",
     "  --container <cid> (chain/task: container to run deterministic probes in; NOT supported by review)",
