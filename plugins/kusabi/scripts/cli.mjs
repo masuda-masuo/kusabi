@@ -228,22 +228,24 @@ export const BACKEND_ENTRY_PREFIXES = [
  * Which backends can continue a previous session, as a TABLE.
  *
  * opencode and claude both resume (`opencode -s <ses_*>` /
- * `claude -p --resume <uuid>`).  The agy backend is fresh-dispatch only in
- * v1 (kusabi #199): the Antigravity CLI records a `conversation_id` that
- * kusabi stores as the job's `sessionID`, but nothing consumes it yet.
+ * `claude -p --resume <uuid>`).  The agy backend resumes too (kusabi #316):
+ * the Antigravity CLI takes `--conversation <id>` (the same
+ * `conversation_id` kusabi stores as the job's `sessionID`), so the entry
+ * flipped when the dispatch grew the flag — the CLI offered it from the
+ * start (#199's survey simply did not list it).
  *
  * The seams that carry a session across rounds consult this rather than
- * naming a backend, so a backend that cannot resume never has a session
- * manufactured for it — and an operator who ASKS for one (`--session` /
- * `--resume-last`) is told no, loudly, instead of having the request
- * silently dropped.
+ * naming a backend.  agy differs from the other two in ONE extra gate: a
+ * bare-UUID id is ambiguous between agy and claude, so `agyDispatch`
+ * resumes only what the job store proves an agy job recorded (the
+ * provenance signal) — see assertNoAgySession in agy-dispatch.mjs.
  *
  * @type {Readonly<Record<string, boolean>>}
  */
 export const BACKEND_RESUME_SUPPORT = {
   opencode: true,
   claude: true,
-  agy: false,
+  agy: true,
 };
 
 /**

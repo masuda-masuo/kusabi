@@ -200,10 +200,31 @@ describe("buildAgyArgs", () => {
     );
   });
 
+  it("appends --conversation <id> only when a conversation id is given (resume, kusabi #316)", () => {
+    const args = buildAgyArgs({
+      model: "m", promptText: "p", jsonSchema: null,
+      conversationId: "6f5f0f1e-0000-4a1b-9c2d-1122334455aa",
+    });
+    assert.deepEqual(
+      args,
+      ["-p", "p", "--output-format", "json", "--model", "m", "--conversation", "6f5f0f1e-0000-4a1b-9c2d-1122334455aa"],
+    );
+    // Absent / empty / null ids leave a fresh-dispatch argv byte-identical.
+    for (const conversationId of [undefined, null, ""]) {
+      assert.deepEqual(
+        buildAgyArgs({ model: "m", promptText: "p", jsonSchema: null, conversationId }),
+        ["-p", "p", "--output-format", "json", "--model", "m"],
+      );
+    }
+  });
+
   it("never passes --dangerously-skip-permissions, and invents no flag", () => {
-    const KNOWN = new Set(["-p", "--output-format", "json", "--model", "--json-schema"]);
+    const KNOWN = new Set(["-p", "--output-format", "json", "--model", "--json-schema", "--conversation"]);
     for (const jsonSchema of [null, '{"type":"object"}']) {
-      const args = buildAgyArgs({ model: "m", promptText: "p", jsonSchema });
+      const args = buildAgyArgs({
+        model: "m", promptText: "p", jsonSchema,
+        conversationId: jsonSchema ? undefined : "conv-1",
+      });
       assert.equal(args.includes("--dangerously-skip-permissions"), false);
       for (const arg of args) {
         if (arg.startsWith("-")) {
@@ -380,12 +401,49 @@ describe("assertNoAgySession", () => {
       assert.match(err.message, /on the agy backend/);
       return true;
     });
+    // Shape alone decides the ses_* case — provenance never rescues it.
+    assert.throws(() => assertNoAgySession("ses_abc123", { provenance: "agy" }));
   });
 
-  it("rejects a bare UUID too — v1 is fresh-dispatch only", () => {
+  it("accepts a bare UUID when the caller establishes agy provenance (kusabi #316)", () => {
+    assert.doesNotThrow(() => assertNoAgySession(
+      "6f5f0f1e-0000-4a1b-9c2d-1122334455aa",
+      { provenance: "agy" },
+    ));
+  });
+
+  it("rejects a bare UUID without provenance — the backstop fails closed", () => {
+    // An agy conversation_id and a claude session id are both bare UUIDs;
+    // the caller must PROVE which one this is.  A caller that skips the
+    // companion-level provenance check gets a refusal here, never a silent
+    // `--conversation`.
     assert.throws(
       () => assertNoAgySession("6f5f0f1e-0000-4a1b-9c2d-1122334455aa"),
-      /fresh-dispatch only/,
+      (err) => {
+        assert.match(err.message, /cannot be resumed on the agy backend/);
+        assert.match(err.message, /no kusabi job record reports it/);
+        assert.match(err.message, /both bare UUIDs/);
+        return true;
+      },
+    );
+    assert.throws(() => assertNoAgySession("u1", { provenance: null }));
+    assert.throws(() => assertNoAgySession("u1", { provenance: undefined }));
+  });
+
+  it("rejects a bare UUID whose provenance names ANOTHER backend, naming both", () => {
+    // The store proved the id belongs to claude (or opencode): resuming it
+    // on agy would hand the agy CLI a session id it does not know.
+    assert.throws(
+      () => assertNoAgySession("6f5f0f1e-0000-4a1b-9c2d-1122334455aa", { provenance: "claude" }),
+      (err) => {
+        assert.match(err.message, /attributes it to the claude backend/);
+        assert.match(err.message, /on the agy backend/);
+        return true;
+      },
+    );
+    assert.throws(
+      () => assertNoAgySession("u1", { provenance: "opencode" }),
+      /attributes it to the opencode backend/,
     );
   });
 });
@@ -465,10 +523,10 @@ describe("assertSessionBackendCompatible — the guard is SYMMETRIC", () => {
 });
 
 describe("backendSupportsResume", () => {
-  it("opencode and claude resume; agy does not", () => {
+  it("all three backends resume (agy since kusabi #316)", () => {
     assert.equal(backendSupportsResume("opencode"), true);
     assert.equal(backendSupportsResume("claude"), true);
-    assert.equal(backendSupportsResume("agy"), false);
+    assert.equal(backendSupportsResume("agy"), true);
   });
 
   it("a missing backend field is opencode, and an unknown backend defaults to resuming", () => {
@@ -1041,11 +1099,41 @@ describe("agyDispatch (fake agy binary)", () => {
   });
 
   it("rejects a session before spawning anything and before any job record exists", async () => {
-    for (const session of ["ses_opencode_1", "6f5f0f1e-0000-4a1b-9c2d-1122334455aa"]) {
-      await assert.rejects(() => agyDispatch(ctx.dispatchOptions({ session })));
-    }
+    // ses_* is refused on SHAPE alone; a bare UUID is refused when the
+    // caller has not established its provenance (the backstop fails closed).
+    await assert.rejects(() => agyDispatch(ctx.dispatchOptions({ session: "ses_opencode_1" })));
+    await assert.rejects(() => agyDispatch(ctx.dispatchOptions({
+      session: "6f5f0f1e-0000-4a1b-9c2d-1122334455aa",
+    })));
+    await assert.rejects(() => agyDispatch(ctx.dispatchOptions({
+      session: "6f5f0f1e-0000-4a1b-9c2d-1122334455aa",
+      sessionProvenance: "claude",
+    })));
     assert.deepEqual(loggedArgs(ctx.argsLog), []);
     assert.deepEqual(listJobs(ctx.stateDir), []);
+  });
+
+  it("a resuming dispatch passes the recorded id as --conversation (kusabi #316 criterion 1)", async () => {
+    const { job } = await agyDispatch(ctx.dispatchOptions({
+      session: "6f5f0f1e-0000-4a1b-9c2d-1122334455aa",
+      sessionProvenance: "agy",
+    }));
+    assert.equal(job.status, "completed");
+    const args = loggedArgs(ctx.argsLog)[0];
+    const convIdx = args.indexOf("--conversation");
+    assert.ok(convIdx > 0, `expected --conversation on argv, got: ${args.join(" ")}`);
+    assert.equal(args[convIdx + 1], "6f5f0f1e-0000-4a1b-9c2d-1122334455aa");
+    // The rest of the invocation is unchanged: the resume flag is added,
+    // nothing else moves or is invented.
+    assert.equal(args[0], "-p");
+    assert.equal(args.includes("--dangerously-skip-permissions"), false);
+    // sessionID still IS the CLI's conversation_id for the continued run.
+    assert.equal(job.sessionID, "6f5f0f1e-0000-4a1b-9c2d-1122334455aa");
+  });
+
+  it("a fresh dispatch never carries --conversation", async () => {
+    await agyDispatch(ctx.dispatchOptions());
+    assert.equal(loggedArgs(ctx.argsLog)[0].includes("--conversation"), false);
   });
 
   it("throws when no model can be resolved, before any job record exists", async () => {
@@ -1071,7 +1159,7 @@ describe("agyDispatch (fake agy binary)", () => {
 // =========================================================================
 
 describe("runImplementPhase with the agy backend", () => {
-  it("drops a rework round's session lineage — agy cannot resume", async () => {
+  it("carries a rework round's session lineage — agy resumes it (kusabi #316)", async () => {
     let seen;
     const fake = async (opts) => {
       seen = opts;
@@ -1086,13 +1174,18 @@ describe("runImplementPhase with the agy backend", () => {
       backend: "agy",
       _dispatchWithFallback: fake,
     });
-    assert.equal(seen.session, undefined);
-    assert.equal(out.session, undefined);
+    // The dispatch sees the previous record's conversation id AND its
+    // provenance — the lineage part 2 carries the agy record, so the
+    // dispatch continues that conversation instead of starting fresh.
+    assert.equal(seen.session, "agy-conv-1");
+    assert.equal(seen.sessionProvenance, "agy");
+    assert.equal(out.session, "agy-conv-1");
+    assert.equal(out.sessionProvenance, "agy");
     // The NEW conversation id is still recorded on the round record.
     assert.equal(out.roundRecord.sessionID, "agy-conv-2");
   });
 
-  it("drops an explicitly injected session too (chain-resume's initialSession)", async () => {
+  it("carries an explicitly injected session with the caller's provenance", async () => {
     let seen;
     const fake = async (opts) => {
       seen = opts;
@@ -1104,10 +1197,69 @@ describe("runImplementPhase with the agy backend", () => {
       useNewSession: false, session: "agy-conv-1",
       previousRecord: null,
       resumeMethod: { type: "continue_session" }, flagsModel: null,
+      sessionProvenance: "agy",
+      backend: "agy",
+      _dispatchWithFallback: fake,
+    });
+    assert.equal(seen.session, "agy-conv-1");
+    assert.equal(seen.sessionProvenance, "agy");
+    // Without provenance the phase forwards the id UNPROVEN — the dispatch
+    // (not this seam) is where the gate refuses it, so the fake sees the id
+    // with a null provenance, never a fabricated one.
+    await runImplementPhase({
+      cwd: "/tmp", chainId: "chain-1", round: 3, isFirstRound: false,
+      implementText: "rework it", modelChain: [["gemini-3.6-flash-high"]], tierIndex: 0,
+      useNewSession: false, session: "agy-conv-1",
+      previousRecord: null,
+      resumeMethod: { type: "continue_session" }, flagsModel: null,
+      backend: "agy",
+      _dispatchWithFallback: fake,
+    });
+    assert.equal(seen.session, "agy-conv-1");
+    assert.equal(seen.sessionProvenance, null);
+  });
+
+  it("starts fresh when the previous record belongs to another backend", async () => {
+    let seen;
+    const fake = async (opts) => {
+      seen = opts;
+      return { job: { id: "job-1", status: "completed", sessionID: "agy-conv-2" }, resultText: "" };
+    };
+    await runImplementPhase({
+      cwd: "/tmp", chainId: "chain-1", round: 2, isFirstRound: false,
+      implementText: "rework it", modelChain: [["gemini-3.6-flash-high"]], tierIndex: 0,
+      useNewSession: false, session: undefined,
+      previousRecord: { sessionID: "claude-1", backend: "claude" },
+      resumeMethod: { type: "continue_session" }, flagsModel: null,
+      backend: "agy",
+      _dispatchWithFallback: fake,
+    });
+    // #192 invariant 5: a session never crosses backends — a claude id is
+    // not passed to the agy CLI, and provenance never fabricates it.
+    assert.equal(seen.session, undefined);
+    assert.equal(seen.sessionProvenance, null);
+  });
+
+  it("useNewSession forces a fresh dispatch even with a resumable lineage", async () => {
+    let seen;
+    const fake = async (opts) => {
+      seen = opts;
+      return { job: { id: "job-1", status: "completed", sessionID: "agy-conv-3" }, resultText: "" };
+    };
+    const out = await runImplementPhase({
+      cwd: "/tmp", chainId: "chain-1", round: 2, isFirstRound: false,
+      implementText: "rework it", modelChain: [["gemini-3.6-flash-high"]], tierIndex: 0,
+      useNewSession: true, session: "agy-conv-1",
+      previousRecord: { sessionID: "agy-conv-1", backend: "agy" },
+      resumeMethod: { type: "continue_session" }, flagsModel: null,
       backend: "agy",
       _dispatchWithFallback: fake,
     });
     assert.equal(seen.session, undefined);
+    assert.equal(seen.sessionProvenance, undefined);
+    // The lineage itself is still tracked on the round record.
+    assert.equal(out.session, "agy-conv-1");
+    assert.equal(out.roundRecord.sessionID, "agy-conv-3");
   });
 
   it("is byte-identical for a claude chain — lineage is carried exactly as before", async () => {
@@ -1126,6 +1278,7 @@ describe("runImplementPhase with the agy backend", () => {
       _dispatchWithFallback: fake,
     });
     assert.equal(seen.session, "claude-1");
+    assert.equal(seen.sessionProvenance, "claude");
   });
 });
 
@@ -1147,9 +1300,13 @@ describe("renderHeader for an agy job", () => {
     assert.match(text, /session: 6f5f0f1e-0000-4a1b-9c2d-1122334455aa/);
   });
 
-  it("advertises NO resume command — v1 cannot honour one", () => {
+  it("advertises the agy resume incantation (kusabi #316)", () => {
     const text = renderHeader(job);
-    assert.match(text, /resume is not supported on this backend/);
+    assert.match(
+      text,
+      /continue in agy: `agy --conversation 6f5f0f1e-0000-4a1b-9c2d-1122334455aa`/,
+    );
+    assert.doesNotMatch(text, /resume is not supported/);
     assert.doesNotMatch(text, /opencode -s /);
     assert.doesNotMatch(text, /claude -p --resume/);
   });
@@ -1356,7 +1513,7 @@ describe("CLI agy wiring (subprocess)", () => {
     }
   });
 
-  it("--backend agy --session <agy uuid> is refused before any dispatch", () => {
+  it("--backend agy --session <agy uuid> resumes the recorded conversation (kusabi #316)", () => {
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-agy-cli3-"));
     try {
       const { env, argsLog } = setup(tmp);
@@ -1369,8 +1526,72 @@ describe("CLI agy wiring (subprocess)", () => {
         ["task", "--backend", "agy", "--session", "6f5f0f1e-0000-4a1b-9c2d-1122334455aa", "again"],
         tmp, env,
       );
+      assert.equal(result.status, 0, `expected success, got: ${result.stdout} ${result.stderr}`);
+      const args = loggedArgs(argsLog)[0];
+      const convIdx = args.indexOf("--conversation");
+      assert.ok(convIdx > 0, `expected --conversation on argv, got: ${args.join(" ")}`);
+      assert.equal(args[convIdx + 1], "6f5f0f1e-0000-4a1b-9c2d-1122334455aa");
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("--backend agy --session <unknown uuid> is refused — provenance must be proven", () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-agy-cli3b-"));
+    try {
+      const { env, argsLog } = setup(tmp);
+      const result = run(
+        ["task", "--backend", "agy", "--session", "11111111-2222-4333-8444-555566667777", "again"],
+        tmp, env,
+      );
       assert.notEqual(result.status, 0);
-      assert.match(result.stdout, /fresh-dispatch only/);
+      assert.match(result.stdout, /cannot be resumed on the agy backend/);
+      assert.deepEqual(loggedArgs(argsLog), []);
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("--backend agy --session <claude-owned uuid> is refused, naming both backends", () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-agy-cli3c-"));
+    try {
+      const { env, argsLog } = setup(tmp);
+      // Seed an agy job, then re-attribute its conversation id to claude in
+      // the store — the provenance the companion derives must come from the
+      // OWNER RECORD, not from the id's shape (both are bare UUIDs).
+      const first = run(["task", "--backend", "agy", "do the thing"], tmp, env);
+      assert.equal(first.status, 0, first.stdout);
+      const stateDir = path.join(tmp, "state");
+      // The job store sits under a per-cwd subdir of the state root; walk
+      // for the record that owns the conversation id.
+      const jobJsonPath = (function findJob(dir) {
+        for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+          const p = path.join(dir, entry.name);
+          if (entry.isDirectory()) {
+            const found = findJob(p);
+            if (found) return found;
+          } else if (entry.name === "job.json") {
+            const record = JSON.parse(fs.readFileSync(p, "utf8"));
+            if (record.sessionID === "6f5f0f1e-0000-4a1b-9c2d-1122334455aa") return p;
+          }
+        }
+        return null;
+      })(stateDir);
+      assert.ok(jobJsonPath, "expected the agy job record to carry the conversation id");
+      const record = JSON.parse(fs.readFileSync(jobJsonPath, "utf8"));
+      record.backend = "claude";
+      fs.writeFileSync(jobJsonPath, JSON.stringify(record), "utf8");
+      fs.writeFileSync(argsLog, "", "utf8");
+
+      const result = run(
+        ["task", "--backend", "agy", "--session", "6f5f0f1e-0000-4a1b-9c2d-1122334455aa", "again"],
+        tmp, env,
+      );
+      assert.notEqual(result.status, 0);
+      // Refused at the companion's own store-based gate (which runs before
+      // the dispatch), naming BOTH backends; nothing reaches the agy CLI.
+      assert.match(result.stdout, /belongs to the claude backend/);
+      assert.match(result.stdout, /cannot be resumed on the agy backend/);
       assert.deepEqual(loggedArgs(argsLog), []);
     } finally {
       fs.rmSync(tmp, { recursive: true, force: true });
@@ -1399,13 +1620,21 @@ describe("CLI agy wiring (subprocess)", () => {
     }
   });
 
-  it("--backend agy --resume-last is refused with guidance", () => {
+  it("--backend agy --resume-last resumes the last agy conversation (kusabi #316)", () => {
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-agy-cli5-"));
     try {
-      const { env } = setup(tmp);
+      const { env, argsLog } = setup(tmp);
+      // First: a real agy job, so `--resume-last` has a conversation to pick.
+      const first = run(["task", "--backend", "agy", "do the thing"], tmp, env);
+      assert.equal(first.status, 0, first.stdout);
+      fs.writeFileSync(argsLog, "", "utf8");
+
       const result = run(["task", "--backend", "agy", "--resume-last", "again"], tmp, env);
-      assert.notEqual(result.status, 0);
-      assert.match(result.stdout, /--resume-last is not supported on the agy backend/);
+      assert.equal(result.status, 0, `expected success, got: ${result.stdout} ${result.stderr}`);
+      const args = loggedArgs(argsLog)[0];
+      const convIdx = args.indexOf("--conversation");
+      assert.ok(convIdx > 0, `expected --conversation on argv, got: ${args.join(" ")}`);
+      assert.equal(args[convIdx + 1], "6f5f0f1e-0000-4a1b-9c2d-1122334455aa");
     } finally {
       fs.rmSync(tmp, { recursive: true, force: true });
     }

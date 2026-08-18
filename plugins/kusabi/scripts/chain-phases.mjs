@@ -377,18 +377,32 @@ export function buildImplementText({ round, brief, previousRecord, container, re
  */
 export async function runImplementPhase({
   cwd, chainId, round, isFirstRound, implementText, modelChain, tierIndex,
-  useNewSession, session, previousRecord, resumeMethod, flagsModel,
+  useNewSession, session, sessionProvenance, previousRecord, resumeMethod, flagsModel,
   backend = "opencode",
   _dispatchWithFallback: _dispatch = dispatchWithFallback,
 }) {
-  // Session lineage guard, part 1 (kusabi #199): a backend that cannot
-  // continue a session never has one carried into it — not from the caller
-  // (chain-resume's `initialSession`) and not from the previous round.  The
-  // agy backend records its `conversation_id` on the round record but has no
-  // resume in v1; handing it one would turn a working chain into a
-  // config-error throw at round 2.  Backends that DO resume are unaffected,
-  // so this is byte-identical for opencode and claude.
+  // Session lineage guard (kusabi #199 shape, #316 resume): a session is
+  // carried into a backend only when the backend can resume one AND the
+  // session's provenance is established.  For agy both halves matter: the
+  // dispatch itself refuses a bare UUID without the caller's provenance
+  // signal (assertNoAgySession), so a chain that forwarded an unproven
+  // session would throw at dispatch instead of running — this seam must
+  // either prove the session (from the previous round's record, below) or
+  // pass through the caller's proof (chain-resume's initialSession
+  // provenance, established at command start where the job store is in
+  // hand).  claude and opencode ignore the signal; the forwarding is
+  // byte-identical for them.
   let resolvedSession = backendSupportsResume(backend) ? session : undefined;
+  let resolvedSessionProvenance = null;
+  if (resolvedSession) {
+    // The injected session (chain-resume's `initialSession` / the driver's
+    // cross-round carry) is proven when the caller says so; when it IS the
+    // previous round's session, the record itself is the proof.
+    resolvedSessionProvenance =
+      previousRecord && previousRecord.sessionID === resolvedSession
+        ? (previousRecord.backend ?? "opencode")
+        : (sessionProvenance ?? null);
+  }
   if (!resolvedSession && !isFirstRound && previousRecord?.sessionID && backendSupportsResume(backend)) {
     // Session lineage guard, part 2 (kusabi #192 invariant 5): a rework
     // implement round may only continue a session created by the implement
@@ -397,6 +411,7 @@ export async function runImplementPhase({
     // predate the backend split and count as "opencode" (readers' convention).
     if (!useNewSession && (previousRecord.backend ?? "opencode") === backend) {
       resolvedSession = previousRecord.sessionID;
+      resolvedSessionProvenance = previousRecord.backend ?? "opencode";
     }
   }
 
@@ -408,6 +423,7 @@ export async function runImplementPhase({
     agent: "kusabi-implement",
     phase: "implement",
     session: useNewSession ? undefined : resolvedSession,
+    sessionProvenance: useNewSession ? undefined : resolvedSessionProvenance,
     tools: implementDenyTools(),
     timeoutS: 3600,
     watchdogS: 900,
@@ -469,6 +485,7 @@ export async function runImplementPhase({
     // measured yet.
     implementRefusal,
     session: resolvedSession,
+    sessionProvenance: resolvedSessionProvenance,
   };
 }
 

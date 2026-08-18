@@ -49,23 +49,23 @@ export function renderHeader(job) {
   }
 
   // Backend-aware header/session lines (kusabi #184 Job B, third backend
-  // kusabi #199): a missing `backend` field predates the backend split and
-  // means opencode, so the opencode output stays byte-identical.  A claude
-  // job shows the claude continuation shape (`claude -p --resume <id>`); the
-  // session id is the one recorded on the job (a UUID for claude and agy,
-  // ses_* for opencode).
+  // kusabi #199, agy resume #316): a missing `backend` field predates the
+  // backend split and means opencode, so the opencode output stays
+  // byte-identical.  A claude job shows the claude continuation shape
+  // (`claude -p --resume <id>`); the session id is the one recorded on the
+  // job (a UUID for claude and agy, ses_* for opencode).
   //
-  // The agy line names its id WITHOUT a continuation command on purpose: agy
-  // is fresh-dispatch only in v1, so printing a resume incantation would
-  // advertise something the backend cannot do.  The conversation id is still
-  // shown — it is how an operator finds the run in the agy UI.
+  // The agy line shows the CLI's own continuation shape (`agy --conversation
+  // <id>`): the recorded conversation_id is exactly what the CLI resumes
+  // with, so the header advertises a command the backend honours (v1
+  // printed "resume is not supported" — #316 removed that limit).
   const isClaude = job.backend === "claude";
   const isAgy = job.backend === "agy";
   const backendLabel = isClaude ? "claude" : (isAgy ? "agy" : "opencode");
 
   let sessionLine;
   if (isAgy) {
-    sessionLine = `session: ${job.sessionID} (agy conversation id; resume is not supported on this backend)`;
+    sessionLine = `session: ${job.sessionID} (continue in agy: \`agy --conversation ${job.sessionID}\`)`;
   } else if (isClaude) {
     sessionLine = `session: ${job.sessionID} (continue in claude: \`claude -p --resume ${job.sessionID}\`)`;
   } else {
