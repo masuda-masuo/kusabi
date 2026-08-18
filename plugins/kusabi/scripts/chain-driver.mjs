@@ -192,6 +192,23 @@ const SMOKE_BASELINE_UNMEASURED_HEADER =
   "unknown, not red: this is a container or infrastructure failure, not a fault in the brief. " +
   "Nothing was dispatched: no job and no round state exist. Check the container, then re-run.";
 
+// The first line of the refusal for a `baseline-red` entry that already
+// PASSES on the checkout as handed to the worker (kusabi #315).  Shared by
+// the renderer and its caller so the two cannot word the same refusal
+// differently.  Deliberately NOT the SMOKE_BASELINE_HEADER wording: there the
+// smoke is red and the author's remedy is to fix the command or the baseline
+// it measures, while here the smoke is green and the ANNOTATION is the stale
+// part — the remedy is to drop the annotation or fix the brief, and telling
+// the author their smoke is "already red" would send them hunting for a
+// failure that does not exist.
+const SMOKE_BASELINE_GREEN_ANNOTATION_HEADER =
+  "dispatch refused: a declared `baseline-red` ## Smoke entry already passes on the checkout " +
+  "as handed to the worker, before any worker change (kusabi #315). The annotation declares " +
+  "the entry targets something that does not exist yet; an annotated entry that is already " +
+  "green means the brief is stale or the deliverable is already present. Nothing was " +
+  "dispatched: no job and no round state exist. Drop the annotation, or fix the brief, then " +
+  "re-run.";
+
 // Whether an observation means the command RAN — a numeric exit code, or a
 // timeout (the command was executed and simply never finished, which is a
 // fact about the command, not about the measurement).  Everything else — a
@@ -225,6 +242,15 @@ function describeBaselineObservation(obs) {
  * along when the executor collected one, exactly as the post-round probe's
  * detail carries it.
  *
+ * A `baseline-red` entry (kusabi #315) is expected to fail on the pristine
+ * checkout, so a MEASURED numeric mismatch is the annotation doing its job —
+ * no refusal here (a matching exit code passes the ordinary check above, and
+ * the green-at-base case is the other renderer's refusal).  An annotated
+ * entry whose observation is not a number — timed out, unobservable, never
+ * executed — falls through to the ordinary handling and is refused, because
+ * the annotation licenses a measured mismatch and nothing else; such lines
+ * carry a suffix saying so.
+ *
  * The header depends on WHAT failed (kusabi #292 follow-up).  A command that
  * ran and exited wrong is the brief's or the baseline's to fix, and says so.
  * A command that was never seen to complete — the call threw, the exit code
@@ -234,7 +260,7 @@ function describeBaselineObservation(obs) {
  * both kinds are present the fix-the-brief header stands: a genuinely red
  * command IS there, and the per-entry lines still name the unmeasured ones.
  *
- * @param {{entries: Array<{command: string, expectedExit: number}>,
+ * @param {{entries: Array<{command: string, expectedExit: number, baselineRed?: true}>,
  *          observed: Array<{command: string, observed: number|string, diagnostic?: string}>}} opts
  * @returns {string|null}
  */
@@ -246,10 +272,19 @@ export function renderSmokeBaselineReport({ entries, observed }) {
   for (const entry of entriesArr) {
     const obs = observedArr.find(function (o) { return o.command === entry.command; });
     if (obs && obs.observed === entry.expectedExit) continue;
+    // kusabi #315: a `baseline-red` entry is expected to fail at base — a
+    // measured numeric mismatch is the annotation doing its job, so it is not
+    // a failure of any kind.  (A matching exit code was already continued
+    // past above; an unmeasured observation falls through, because the
+    // annotation covers a measured mismatch and nothing else.)
+    if (entry.baselineRed && obs && typeof obs.observed === "number") continue;
     if (baselineObservationRan(obs)) anyRan = true;
     lines.push(
       `  - \`${entry.command}\`: expected exit ${entry.expectedExit}, ` +
-      describeBaselineObservation(obs)
+      describeBaselineObservation(obs) +
+      (entry.baselineRed
+        ? " (declared baseline-red: the annotation covers a measured exit-code mismatch, not an unmeasurable run)"
+        : "")
     );
     if (obs?.diagnostic) {
       lines.push("    ── output tail ──");
@@ -258,6 +293,45 @@ export function renderSmokeBaselineReport({ entries, observed }) {
   }
   if (lines.length === 0) return null;
   return [anyRan ? SMOKE_BASELINE_HEADER : SMOKE_BASELINE_UNMEASURED_HEADER, ...lines].join("\n");
+}
+
+/**
+ * Render the refusal for `baseline-red` entries that PASSED on the checkout
+ * as handed to the worker, or null when no annotated entry was green at base.
+ *
+ * The annotation licenses exactly one baseline outcome: a measured exit code
+ * that misses the expectation.  Its mirror image — an annotated entry that
+ * already meets its expectation — is the one outcome the annotation must not
+ * be allowed to hide: it means the brief is stale or the deliverable already
+ * exists, and the dispatch-time baseline is the only place that is cheap to
+ * catch.  Each such entry is named with its own command.
+ *
+ * A `baseline-red` entry whose observation is not a number (timed out,
+ * unobservable, never executed) is not this renderer's business: it falls to
+ * renderSmokeBaselineReport, which refuses it the ordinary way, because the
+ * annotation covers a measured mismatch and nothing else.
+ *
+ * Pure: the caller does the running.
+ *
+ * @param {{entries: Array<{command: string, expectedExit: number, baselineRed?: true}>,
+ *          observed: Array<{command: string, observed: number|string, diagnostic?: string}>}} opts
+ * @returns {string|null}
+ */
+export function renderSmokeWrongAnnotationReport({ entries, observed }) {
+  const entriesArr = Array.isArray(entries) ? entries : [];
+  const observedArr = Array.isArray(observed) ? observed : [];
+  const lines = [];
+  for (const entry of entriesArr) {
+    if (!entry.baselineRed) continue;
+    const obs = observedArr.find(function (o) { return o.command === entry.command; });
+    // Unmeasured (including never executed): the other renderer's refusal.
+    if (!obs || typeof obs.observed !== "number") continue;
+    // Red at base as declared: the annotation's job, done — no refusal.
+    if (obs.observed !== entry.expectedExit) continue;
+    lines.push(`  - \`${entry.command}\`: declared baseline-red but already passes with exit ${obs.observed}`);
+  }
+  if (lines.length === 0) return null;
+  return [SMOKE_BASELINE_GREEN_ANNOTATION_HEADER, ...lines].join("\n");
 }
 
 // The first line of the worktree-dirt refusal (kusabi #292 follow-up): the
@@ -372,8 +446,9 @@ export function renderSmokeDirtReport({ before, after }) {
 /**
  * The dispatch refusal text for a brief whose declared `## Smoke` is ALREADY
  * red before the worker touches anything (kusabi #292), or whose declared
- * smoke, while green, changed the container it was run in (wrote to the
- * worktree, or moved HEAD); null when the baseline is green AND left the
+ * `baseline-red` entry already PASSES at base (kusabi #315), or whose
+ * declared smoke, while green, changed the container it was run in (wrote to
+ * the worktree, or moved HEAD); null when the baseline is green AND left the
  * container as it found it.
  *
  * The P4 probe runs AFTER a round, against the worker's changes.  When the
@@ -388,8 +463,21 @@ export function renderSmokeDirtReport({ before, after }) {
  *
  * The run uses runSmokeEntries and checkSmokeProbe — the post-round probe's
  * own executor and its own exit-code comparison — so a baseline green can
- * never mean something different from a P4 green.  The baseline executes in
- * the very container the worker is then handed, so `git status --porcelain`
+ * never mean something different from a P4 green.  The `baseline-red`
+ * annotation (kusabi #315) is the one deliberate exception, and it lives in
+ * the brief, not in the comparison: an entry so annotated is EXPECTED to
+ * mismatch at base (its smoke targets a deliverable that does not exist
+ * yet), so the probe's mismatch-is-fail rule would refuse exactly the case
+ * the annotation licenses.  The probe therefore judges only the unannotated
+ * entries; each annotated entry's verdict comes from the renderers — a
+ * measured mismatch passes, a measured MATCH refuses with its own message
+ * (the annotation must be wrong in one direction or it rots), and an
+ * unmeasurable run falls through to the ordinary refusal, fail-closed.  The
+ * annotation changes nothing after the round: the post-round P4 treats every
+ * entry the same way it always has.
+ *
+ * The baseline executes in the very container the worker is then handed, so
+ * `git status --porcelain`
  * AND `git rev-parse HEAD` are captured immediately before and after the run
  * (captureGitStatusPorcelain + renderSmokeDirtReport): a PASSING smoke that
  * writes — coverage output, build artifacts, a regenerated lockfile, --fix,
@@ -399,7 +487,9 @@ export function renderSmokeDirtReport({ before, after }) {
  * HEAD that the captureBaseSha call below then records as the chain's base
  * (kusabi #292 follow-up) — poisoning every later comparison against a base
  * nobody chose, with nothing reported as wrong.  A baseline that dirties or
- * moves HEAD is refused with what it changed, never dispatched.
+ * moves HEAD is refused with what it changed, never dispatched.  Neither the
+ * annotation nor a red-at-base verdict licenses any of that: the dirt and
+ * HEAD guards apply to every smoke, annotated or not.
  *
  * No declared smoke means no execution at all: an undeclared `## Smoke`
  * dispatches exactly as before, with not a single container call spent.
@@ -418,21 +508,36 @@ export async function smokeBaselineReport({ brief, callTool, container }) {
   const observed = await runSmokeEntries({ entries, callTool, container });
   const after = await captureGitStatusPorcelain(callTool, container);
 
-  const probe = checkSmokeProbe(entries, observed, true);
+  // The probe judges only the entries the annotation does not cover (kusabi
+  // #315): a `baseline-red` entry is EXPECTED to mismatch at base, so the
+  // probe's mismatch-is-fail rule would refuse exactly the case the
+  // annotation licenses.  (When every entry is annotated the probe sees an
+  // empty list and passes trivially; the renderers below carry the whole
+  // verdict for those entries.)  An unmeasurable annotated entry is refused
+  // by the ordinary renderer, fail-closed: the annotation licenses a measured
+  // mismatch and nothing else.
+  const unannotated = entries.filter((entry) => !entry.baselineRed);
+  const probe = checkSmokeProbe(unannotated, observed, unannotated.length > 0);
 
-  // The renderer names the entries that missed their expectation; should the
-  // probe ever go red for something the per-entry walk cannot see, the probe's
-  // own detail carries the failure rather than nothing.
-  const smokeReport = probe.passed
-    ? null
-    : renderSmokeBaselineReport({ entries, observed })
-      ?? `${SMOKE_BASELINE_HEADER}\n  - ${probe.detail}`;
+  // The renderer names the entries that missed their expectation — it runs
+  // whenever it has anything to say, because with an all-annotated brief the
+  // probe passes trivially while an annotated entry's unmeasurable run still
+  // has to be refused.  Should the probe ever go red for something the
+  // per-entry walk cannot see, the probe's own detail carries the failure
+  // rather than nothing.
+  const smokeReport = renderSmokeBaselineReport({ entries, observed })
+    ?? (probe.passed ? null : `${SMOKE_BASELINE_HEADER}\n  - ${probe.detail}`);
+  // An annotated entry that PASSED at base is the annotation's claim gone
+  // stale — a refusal with its own message, never the already-red one, whose
+  // remedy (fix the command or the baseline) is the opposite of the right
+  // one here (drop the annotation, or fix the brief).
+  const wrongAnnotationReport = renderSmokeWrongAnnotationReport({ entries, observed });
   const dirtReport = renderSmokeDirtReport({ before, after });
 
-  // A red smoke AND a dirtied tree are both the author's to fix: both are
-  // reported, never one hiding the other.
-  if (!smokeReport && !dirtReport) return null;
-  return [smokeReport, dirtReport].filter(Boolean).join("\n\n");
+  // A red smoke, a wrongly-annotated entry AND a dirtied tree are all the
+  // author's to fix: all are reported, never one hiding the other.
+  if (!smokeReport && !wrongAnnotationReport && !dirtReport) return null;
+  return [smokeReport, wrongAnnotationReport, dirtReport].filter(Boolean).join("\n\n");
 }
 
 // ---------------------------------------------------------------------------

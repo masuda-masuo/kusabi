@@ -333,6 +333,47 @@ describe("parseSmoke", () => {
     assert.deepEqual(parseSmoke(text), [{ command: 'bash -c "exit 1"', expectedExit: 1 }]);
   });
 
+  it("parses the baseline-red annotation after the closing backtick (kusabi #315)", () => {
+    const text = "## Smoke\n- `node --check ui/app.js` baseline-red\n";
+    const result = parseSmoke(text);
+    assert.equal(result.length, 1);
+    assert.equal(result[0].command, "node --check ui/app.js");
+    assert.equal(result[0].expectedExit, 0);
+    assert.equal(result[0].baselineRed, true);
+  });
+
+  it("composes baseline-red with exit <N> in either order (kusabi #315)", () => {
+    const text = "## Smoke\n- `cmd` baseline-red exit 2\n- `other` exit 3 baseline-red\n";
+    assert.deepEqual(parseSmoke(text), [
+      { command: "cmd", expectedExit: 2, baselineRed: true },
+      { command: "other", expectedExit: 3, baselineRed: true },
+    ]);
+  });
+
+  it("ignores baseline-red inside the command backticks (annotation must follow the command)", () => {
+    const text = "## Smoke\n- `echo baseline-red`\n";
+    const result = parseSmoke(text);
+    assert.deepEqual(result, [{ command: "echo baseline-red", expectedExit: 0 }]);
+    assert.ok(!("baselineRed" in result[0]), "an in-command occurrence must not set the flag");
+  });
+
+  it("requires a word boundary for the baseline-red annotation", () => {
+    const text = "## Smoke\n- `cmd` xbaseline-red\n- `cmd2` baseline-redx\n";
+    const result = parseSmoke(text);
+    assert.equal(result.length, 2);
+    assert.ok(!("baselineRed" in result[0]), "a token glued before must not match");
+    assert.ok(!("baselineRed" in result[1]), "a token glued after must not match");
+  });
+
+  it("code-block lines never carry the baseline-red annotation (kusabi #315)", () => {
+    // The whole code-block line is the command; there is no "after the
+    // closing backtick" position to annotate.  An occurrence stays part of
+    // the command and must not set the flag.
+    const text = "## Smoke\n```\nnpm test baseline-red\n```\n";
+    assert.deepEqual(parseSmoke(text), [{ command: "npm test baseline-red", expectedExit: 0 }]);
+    assert.ok(!("baselineRed" in parseSmoke(text)[0]));
+  });
+
   it("returns [] for text without ## Smoke section", () => {
     assert.deepEqual(parseSmoke("some brief text\n## Other section\ncontent"), []);
   });

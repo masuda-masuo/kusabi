@@ -88,6 +88,24 @@ end up re-running a doomed cheap round three times.
   bullet entries require a backtick-quoted command with an optional `exit <N>`
   annotation. The heading may carry a trailing annotation — e.g. `## Smoke (run in
   container)` — and is still recognised.
+- **Annotate `baseline-red` exactly when the smoke targets a file listed in
+  `## Deliverables` that does not exist yet** — e.g. a `node --check ui/app.js` smoke on a
+  greenfield frontend task whose deliverables include `ui/app.js`. The dispatch-time
+  baseline otherwise refuses any entry that is red on the pristine checkout — correct
+  for pre-existing debt, wrong when red-at-base is the task itself. The annotation
+  licenses exactly one baseline outcome: the entry is expected to fail before the round
+  (a measured exit code that misses its expectation), and refuses if it already passes —
+  a stale brief or an already-present deliverable. `exit <N>` and `baseline-red` compose
+  on one entry, in either order; code-block lines take no annotations.
+  **The machine can only half-check the claim, so an annotated command is the one smoke
+  line the baseline cannot vet for you.** The stale-annotation refusal compares against the
+  *declared* exit, so `baseline-red` composed with a nonzero `exit <N>` cannot notice an
+  already-present deliverable that exits 0 at base — reserve the annotation for entries
+  whose natural post-round exit is the declared one (normally 0). And an entry red at base
+  for the *wrong* reason — a typo, a wrong path, unrelated pre-existing breakage — is
+  licensed exactly like a legitimate one, then fails P4 a full round later: the cost class
+  #292 exists to remove is re-opened for anything you annotate. Read it twice before you
+  write it.
 - **If nothing is frozen, omit the `## Frozen Tests` heading — never write `(none)` under it.**
   A machine-read heading followed by prose parses to zero entries, which fails P5 (or P4 for
   `## Smoke`) with "heading present but no entries parsed" every single round: the probe's
