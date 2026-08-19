@@ -5,9 +5,11 @@ import path from "node:path";
 import fs from "node:fs";
 import http from "node:http";
 import { spawn } from "node:child_process";
+import crypto from "node:crypto";
 import { dispatchWithFallback } from "./prompt-execution.mjs";
 import { claudeDispatch } from "./claude-dispatch.mjs";
 import { createFakeCallTool, FAKE_HEAD_SHA } from "./fixtures.mjs";
+import { saveJob } from "./job-store.mjs";
 import {
   publishWarningForBrief,
   smokeBaselineReport,
@@ -16,6 +18,7 @@ import {
   renderSmokeWrongAnnotationReport,
   renderSmokeDirtReport,
   runChainDriver,
+  sessionProvenanceRefusal,
   effectiveTierCount,
   renderChainBanner,
   resolveReviewDispatch,
@@ -68,6 +71,68 @@ describe("publishWarningForBrief", () => {
   it("is exactly one line (no embedded newlines)", () => {
     const warning = publishWarningForBrief("## PUBLISH (mandatory)");
     assert.equal(warning.split("\n").length, 1);
+  });
+});
+
+// sessionProvenanceRefusal — the agy --session chain-start gate (kusabi #321)
+// ---------------------------------------------------------------------------
+// The refusal decision is pure and exported so every case is testable
+// without running a chain: an agy implement phase plus a session whose
+// provenance is not provably agy refuses, everything else passes.  The gate
+// is on the PROPERTY, never on the --session flag: an id the caller
+// resolved FROM the job store arrives with its owner record and is provable
+// by construction, so there is no flag-shaped branch for it to take — and
+// the refusal text never mentions it (asserted below).
+
+describe("sessionProvenanceRefusal (kusabi #321)", () => {
+  const AGY = "agy";
+  const OPENCODE = "opencode";
+  const CLAUDE = "claude";
+  const UUID = "123e4567-e89b-12d3-a456-426614174000";
+
+  it("passes a chain with no --session", () => {
+    assert.equal(sessionProvenanceRefusal({ session: null, provenance: null, implementBackend: AGY }), null);
+    assert.equal(sessionProvenanceRefusal({ session: undefined, provenance: null, implementBackend: AGY }), null);
+    assert.equal(sessionProvenanceRefusal({ session: "", provenance: null, implementBackend: AGY }), null);
+  });
+
+  it("passes a session the store proves agy-owned on an agy chain", () => {
+    assert.equal(sessionProvenanceRefusal({ session: UUID, provenance: AGY, implementBackend: AGY }), null);
+  });
+
+  it("refuses a session with no owner record on an agy chain, naming the id", () => {
+    const refusal = sessionProvenanceRefusal({ session: UUID, provenance: null, implementBackend: AGY });
+    assert.ok(refusal, "an unprovable id on an agy chain must refuse");
+    assert.match(refusal, new RegExp(UUID));
+    assert.match(refusal, /dispatch refused/);
+    assert.match(refusal, /owner record/);
+    assert.match(refusal, /provenance cannot be established/);
+  });
+
+  it("refuses a session owned by another backend on an agy chain, naming both backends", () => {
+    for (const owner of [OPENCODE, CLAUDE]) {
+      const refusal = sessionProvenanceRefusal({ session: UUID, provenance: owner, implementBackend: AGY });
+      assert.ok(refusal, `an ${owner}-owned id on an agy chain must refuse`);
+      assert.match(refusal, new RegExp(UUID));
+      assert.match(refusal, new RegExp(owner));
+      assert.match(refusal, new RegExp(AGY));
+      assert.match(refusal, /belongs to the /);
+    }
+  });
+
+  it("passes every session shape when the implement phase does not resolve to agy", () => {
+    assert.equal(sessionProvenanceRefusal({ session: UUID, provenance: null, implementBackend: OPENCODE }), null);
+    assert.equal(sessionProvenanceRefusal({ session: UUID, provenance: CLAUDE, implementBackend: OPENCODE }), null);
+    assert.equal(sessionProvenanceRefusal({ session: UUID, provenance: AGY, implementBackend: OPENCODE }), null);
+    assert.equal(sessionProvenanceRefusal({ session: UUID, provenance: null, implementBackend: CLAUDE }), null);
+    assert.equal(sessionProvenanceRefusal({ session: UUID, provenance: AGY, implementBackend: CLAUDE }), null);
+  });
+
+  it("never mentions --resume-last: the gate is property-shaped, with no flag-shaped branch", () => {
+    const noOwner = sessionProvenanceRefusal({ session: UUID, provenance: null, implementBackend: AGY });
+    const foreign = sessionProvenanceRefusal({ session: UUID, provenance: OPENCODE, implementBackend: AGY });
+    assert.doesNotMatch(noOwner, /resume-last/i);
+    assert.doesNotMatch(foreign, /resume-last/i);
   });
 });
 
@@ -4143,6 +4208,38 @@ describe("smoke baseline wiring (kusabi #292)", () => {
   });
 });
 
+describe("session-provenance wiring (kusabi #321)", () => {
+  const driverSource = fs.readFileSync(path.join(import.meta.dirname, "chain-driver.mjs"), "utf8");
+
+  // The body of the top-level function starting at `anchor`, i.e. up to the
+  // next top-level export (same shape as the smoke-baseline wiring block).
+  function functionSource(source, anchor) {
+    const start = source.indexOf(anchor);
+    assert.ok(start >= 0, `anchor not found: ${anchor}`);
+    const end = source.indexOf("\nexport ", start + anchor.length);
+    return source.slice(start, end === -1 ? undefined : end);
+  }
+
+  it("cmdChain refuses before any baseline measurement or chain state exists", () => {
+    const body = functionSource(driverSource, "export async function cmdChain(");
+    const gateAt = body.indexOf("sessionProvenanceRefusal({");
+    assert.ok(gateAt > 0, "cmdChain must call the session-provenance gate");
+    assert.ok(gateAt < body.indexOf("smokeBaselineReport("), "the gate precedes the smoke baseline run");
+    assert.ok(gateAt < body.indexOf("captureVerifyBaseline("), "the gate precedes the verify baseline");
+    assert.ok(gateAt < body.indexOf("createChainDir("), "the gate precedes any chain state");
+    // The refusal is thrown, not threaded: the sessionProvenance plumbing
+    // into runChainDriver stays exactly as it was.
+    assert.ok(gateAt < body.indexOf("runChainDriver({"), "the gate precedes the driver call");
+    assert.ok(body.includes("sessionProvenance,"), "sessionProvenance must still reach the driver");
+  });
+
+  it("the gate lives in cmdChain, not in the resume path (chain-resume resolves its own session)", () => {
+    const body = functionSource(driverSource, "export async function cmdChainResume(");
+    assert.ok(!body.includes("sessionProvenanceRefusal("), "resume must not run the fresh-chain gate");
+    assert.ok(driverSource.includes("sessionProvenanceRefusal("), "the gate exists in the driver");
+  });
+});
+
 describe("CLI smoke baseline (kusabi #292)", () => {
   const COMPANION_SCRIPT = path.join(import.meta.dirname, "kusabi-companion.mjs");
 
@@ -4163,6 +4260,10 @@ describe("CLI smoke baseline (kusabi #292)", () => {
   function startSunabaStub({ toolResult, gitStatus = "", gitHead = STUB_HEAD_SHA }) {
     let gitStatusCalls = 0;
     let gitHeadCalls = 0;
+    // Every tools/call the child makes, whatever the tool.  A refusal that
+    // must fire BEFORE any container work proves itself by leaving this at
+    // zero (kusabi #321).
+    let toolsCall = 0;
     const server = http.createServer((req, res) => {
       res.on("error", () => {});
       let body = "";
@@ -4174,6 +4275,7 @@ describe("CLI smoke baseline (kusabi #292)", () => {
         } catch {
           // not JSON \u2014 still answer the handshake
         }
+        if (payload?.method === "tools/call") toolsCall += 1;
         res.setHeader("mcp-session-id", "stub-session");
         res.writeHead(200, { "content-type": "text/event-stream" });
         let callResult = toolResult;
@@ -4229,7 +4331,7 @@ describe("CLI smoke baseline (kusabi #292)", () => {
       server.once("error", reject);
       server.listen(0, "127.0.0.1", () => {
         const { port } = server.address();
-        resolve({ server, url: `http://127.0.0.1:${port}/mcp` });
+        resolve({ server, url: `http://127.0.0.1:${port}/mcp`, toolsCallCount: () => toolsCall });
       });
     });
   }
@@ -4485,6 +4587,143 @@ describe("CLI smoke baseline (kusabi #292)", () => {
       server.close();
       fs.rmSync(tmp, { recursive: true, force: true });
     }
+  });
+
+  // ---- session-provenance refusal (kusabi #321) ----
+  // The whole point of the issue: the refusal must fire at command start,
+  // BEFORE any baseline measurement or container work.  The message alone
+  // cannot tell an early refusal from a late one — the agy backstop throws
+  // the same class of error AFTER the chain state exists — so these run the
+  // real CLI against the stub and count container calls: an early refusal
+  // is a chain that never touched the container and never created state.
+  // The owner record that proves (or fails to prove) the session's backend
+  // is written into the job store BEFORE the chain starts; the child hashes
+  // its own cwd to pick its state dir, exactly like the baseline tests
+  // above.
+  describe("session-provenance refusal (kusabi #321)", () => {
+    function writeOwnerRecord(stateRootDir, cwd, sessionID, backend) {
+      const hash = crypto.createHash("sha256").update(cwd).digest("hex").slice(0, 12);
+      saveJob(path.join(stateRootDir, hash), {
+        id: "job-owner-" + Date.now().toString(36),
+        sessionID,
+        backend,
+        status: "completed",
+        startedAt: new Date().toISOString(),
+      });
+    }
+
+    // No ## Smoke section: the smoke baseline runs nothing, so the only
+    // container calls a refused chain could have made are the ones this
+    // block counts.
+    const BRIEF = "# Task\n\nOrchestrator: test-model | session s-1 | 2026-08-16\n\n## Deliverables\n\n- `src/x.mjs`\n";
+    const SESSION = "123e4567-e89b-12d3-a456-426614174000";
+    const FOREIGN = "123e4567-e89b-12d3-a456-426614174001";
+    const AGY_OWNED = "123e4567-e89b-12d3-a456-426614174002";
+
+    function writeBrief(tmp) {
+      const briefPath = path.join(tmp, "brief.md");
+      fs.writeFileSync(briefPath, BRIEF);
+      return briefPath;
+    }
+
+    it("refuses an ownerless --session on an agy chain before any container call or chain state", async () => {
+      const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-session-ownerless-"));
+      const { server, url, toolsCallCount } = await startSunabaStub({ toolResult: { output: "SMOKE_EXIT=0\n" } });
+      try {
+        const stateRootDir = path.join(tmp, "state");
+        const result = await runCompanion(
+          ["chain", "--backend", "agy", "--session", SESSION, "--container", "cid-1", "--brief-file", writeBrief(tmp)],
+          { cwd: tmp, stateRootDir, url },
+        );
+
+        assert.notEqual(result.status, 0, result.stdout);
+        assert.match(result.stdout, /dispatch refused/);
+        assert.match(result.stdout, new RegExp(SESSION));
+        assert.match(result.stdout, /owner record/);
+        assert.match(result.stdout, /provenance cannot be established/);
+        assert.equal(toolsCallCount(), 0, "the refusal must fire before the first container call");
+        for (const dir of workspaceDirs(stateRootDir)) {
+          assert.ok(!fs.existsSync(path.join(dir, "chains")), "no chain state may be created");
+        }
+      } finally {
+        server.close();
+        fs.rmSync(tmp, { recursive: true, force: true });
+      }
+    });
+
+    it("refuses a foreign-backend-owned --session on an agy chain, naming both backends, before any container call", async () => {
+      const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-session-foreign-"));
+      const { server, url, toolsCallCount } = await startSunabaStub({ toolResult: { output: "SMOKE_EXIT=0\n" } });
+      try {
+        const stateRootDir = path.join(tmp, "state");
+        writeOwnerRecord(stateRootDir, tmp, FOREIGN, "opencode");
+        const result = await runCompanion(
+          ["chain", "--backend", "agy", "--session", FOREIGN, "--container", "cid-1", "--brief-file", writeBrief(tmp)],
+          { cwd: tmp, stateRootDir, url },
+        );
+
+        assert.notEqual(result.status, 0, result.stdout);
+        assert.match(result.stdout, /dispatch refused/);
+        assert.match(result.stdout, new RegExp(FOREIGN));
+        assert.match(result.stdout, /opencode/);
+        assert.match(result.stdout, /agy/);
+        assert.equal(toolsCallCount(), 0, "the refusal must fire before the first container call");
+        for (const dir of workspaceDirs(stateRootDir)) {
+          assert.ok(!fs.existsSync(path.join(dir, "chains")), "no chain state may be created");
+        }
+      } finally {
+        server.close();
+        fs.rmSync(tmp, { recursive: true, force: true });
+      }
+    });
+
+    it("an agy-owned --session proceeds past the gate on an agy chain", async () => {
+      const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-session-agy-"));
+      const { server, url } = await startSunabaStub({ toolResult: { output: "SMOKE_EXIT=0\n" } });
+      try {
+        const stateRootDir = path.join(tmp, "state");
+        writeOwnerRecord(stateRootDir, tmp, AGY_OWNED, "agy");
+        const result = await runCompanion(
+          ["chain", "--backend", "agy", "--session", AGY_OWNED, "--container", "cid-1", "--max-rounds", "1", "--brief-file", writeBrief(tmp)],
+          { cwd: tmp, stateRootDir, url },
+        );
+
+        // The dispatch itself cannot succeed (no agy binary in the child
+        // env); what matters is that the chain got PAST the gate — it
+        // printed its start banner and created its chain state, exactly as
+        // before #321.
+        assert.doesNotMatch(result.stdout, /dispatch refused/);
+        assert.match(result.stdout, /^Chain .*tiers=/m);
+        const chained = workspaceDirs(stateRootDir).some((d) => fs.existsSync(path.join(d, "chains")));
+        assert.ok(chained, `the chain must proceed to create its state: ${result.stdout}`);
+      } finally {
+        server.close();
+        fs.rmSync(tmp, { recursive: true, force: true });
+      }
+    });
+
+    it("an ownerless --session changes nothing when the implement phase does not resolve to agy", async () => {
+      const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-session-opencode-"));
+      const { server, url } = await startSunabaStub({ toolResult: { output: "SMOKE_EXIT=0\n" } });
+      try {
+        const stateRootDir = path.join(tmp, "state");
+        // No --backend: the implement phase resolves to opencode, where an
+        // unknown session id is a separate question (#321 excludes it) — the
+        // same ownerless id that refuses on agy must sail through here.
+        const result = await runCompanion(
+          ["chain", "--session", SESSION, "--container", "cid-1", "--max-rounds", "1", "--brief-file", writeBrief(tmp)],
+          { cwd: tmp, stateRootDir, url },
+        );
+
+        assert.doesNotMatch(result.stdout, /dispatch refused/);
+        assert.match(result.stdout, /^Chain .*tiers=/m);
+        const chained = workspaceDirs(stateRootDir).some((d) => fs.existsSync(path.join(d, "chains")));
+        assert.ok(chained, `the chain must proceed to create its state: ${result.stdout}`);
+      } finally {
+        server.close();
+        fs.rmSync(tmp, { recursive: true, force: true });
+      }
+    });
   });
 });
 
