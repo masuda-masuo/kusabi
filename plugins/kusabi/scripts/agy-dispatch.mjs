@@ -353,6 +353,57 @@ export function formatGoDuration(totalSeconds) {
   return `${out}${s % 60}s`;
 }
 
+// =========================================================================
+// timeoutS resolution — the ONE decision (kusabi #328)
+// =========================================================================
+
+/**
+ * The ONE usable-timeout predicate (kusabi #328): a positive finite number
+ * of seconds.  resolveAgyTimeoutS decides with this rule and nothing else,
+ * and the two bound sites — buildAgyArgs' `--print-timeout` and
+ * runAgyProcess' outer timer — re-check with THIS same named rule, so no
+ * value can be accepted by one bound and refused by another (or by the
+ * resolver), whether reached through agyDispatch or by a direct call.
+ * A hand-copied `typeof === "number" && > 0` would drift exactly as the
+ * #327 truthy guard did: it accepts Infinity, which the resolver refuses.
+ *
+ * @param {unknown} value
+ * @returns {boolean} true only for a positive finite number of seconds.
+ */
+function isUsableTimeoutS(value) {
+  return typeof value === "number" && Number.isFinite(value) && value > 0;
+}
+
+/**
+ * Resolve the OUTER timeout bound for an agy dispatch: the one place that
+ * decides whether a usable timeout was supplied and what number it is.
+ *
+ * REFUSES rather than coerces.  A string (`"3600"`), `NaN`, zero, a
+ * negative number, `Infinity`, `null`, or an absent value is not a usable
+ * positive number of seconds, and none of them arms either bound.  kusabi's
+ * own callers pass positive whole numbers (the CLI seam converts with
+ * `Number(...)`, the defaults are literals); any other shape is a caller
+ * bug, and the honest handling of a bug is to leave the timeout unset —
+ * not to guess at a number the caller never explicitly resolved.  In
+ * particular, coercing `"3600"` would arm the OUTER timer while the inner
+ * bound stayed off wherever the coercion did not propagate — the
+ * half-armed state this issue exists to remove, in a new suit.
+ *
+ * `agyDispatch` calls this ONCE and hands the SAME value to both consumers
+ * (buildAgyArgs, runAgyProcess), so the two sites consume one decision
+ * instead of re-deciding.  Each site re-checks with the same predicate on
+ * that value, so even a direct call to one site cannot reach a different
+ * conclusion from the other.
+ *
+ * @param {unknown} value — the raw `opts.timeoutS` from the dispatch options.
+ * @returns {number|null} the resolved timeout in seconds, or null when no
+ *          usable timeout was supplied.
+ */
+export function resolveAgyTimeoutS(value) {
+  if (!isUsableTimeoutS(value)) return null;
+  return value;
+}
+
 /**
  * Build the argv for an `agy -p` dispatch.
  *
@@ -388,8 +439,12 @@ export function formatGoDuration(totalSeconds) {
  * @param {string|null|undefined} [opts.conversationId] — an id the CALLER
  *        has proven to be an agy conversation (assertNoAgySession's
  *        provenance gate has already run); appends `--conversation <id>`.
- * @param {number|null|undefined} [opts.timeoutS] — the resolved outer
- *        bound; when positive, appends `--print-timeout <timeoutS +
+ * @param {number|null} [opts.timeoutS] — the value agyDispatch already
+ *        resolved (resolveAgyTimeoutS): a positive finite number, or null
+ *        when none was supplied.  The guard below is the SAME predicate
+ *        runAgyProcess arms its outer timer with, on the SAME value, so
+ *        the two bound sites cannot reach different conclusions (kusabi
+ *        #328); when it holds, appends `--print-timeout <timeoutS +
  *        AGY_PRINT_TIMEOUT_MARGIN_S>` as a Go duration string.
  * @returns {string[]}
  */
@@ -399,7 +454,13 @@ export function buildAgyArgs({ model, promptText, jsonSchema, conversationId, ti
     "--output-format", "json",
     "--model", model,
   ];
-  if (typeof timeoutS === "number" && timeoutS > 0) {
+  // The SAME predicate runAgyProcess arms its outer timer with and
+  // resolveAgyTimeoutS decides with — isUsableTimeoutS, the one rule in one
+  // place (kusabi #328).  A truthy-only check would accept "3600" and render
+  // `"3600" + 300` as "3600300" — the string half-arm, banned at the door;
+  // a hand-copied `typeof === "number" && > 0` would accept Infinity, which
+  // the resolver refuses.
+  if (isUsableTimeoutS(timeoutS)) {
     args.push("--print-timeout", formatGoDuration(timeoutS + AGY_PRINT_TIMEOUT_MARGIN_S));
   }
   if (jsonSchema) {
@@ -734,7 +795,10 @@ function killProcessGroup(child) {
  * @param {string} opts.bin
  * @param {string[]} opts.args
  * @param {string} opts.cwd
- * @param {number} [opts.timeoutS]
+ * @param {number|null} [opts.timeoutS] — the value agyDispatch already
+ *        resolved (resolveAgyTimeoutS).  Guarded by the SAME predicate
+ *        buildAgyArgs uses on the same value: a positive finite number
+ *        arms this timer, anything else arms nothing (kusabi #328).
  * @param {(info: {pid: number}) => void} [opts.onStart] — called with the
  *        child's pid the instant it exists, so `cancel` has a lever.
  * @returns {Promise<{ code: number|null, stdout: string, stderr: string,
@@ -765,7 +829,14 @@ export function runAgyProcess({ bin, args, cwd, timeoutS, onStart }) {
     child.stderr.on("data", (chunk) => { stderr += chunk; });
     child.on("error", (err) => { spawnError = err; });
 
-    const timer = timeoutS && timeoutS > 0
+    // The SAME predicate buildAgyArgs applies to the inner bound and
+    // resolveAgyTimeoutS decides with — isUsableTimeoutS, the one rule in
+    // one place (kusabi #328): a positive finite number arms this timer,
+    // anything else arms nothing.  A truthy-only check would arm THIS timer
+    // for a string that buildAgyArgs refuses, and a hand-copied
+    // `typeof === "number" && > 0` would arm it for Infinity — the #327
+    // half-armed regression, structurally impossible here.
+    const timer = isUsableTimeoutS(timeoutS)
       ? setTimeout(() => {
           timedOut = true;
           killProcessGroup(child);
@@ -819,7 +890,11 @@ export function runAgyProcess({ bin, args, cwd, timeoutS, onStart }) {
  * @param {object|null|undefined} [opts.tools] — deny map.  agy takes no
  *        permission flags, so it is RECORDED as unenforced rather than
  *        applied (see the module header).
- * @param {number} [opts.timeoutS]
+ * @param {unknown} [opts.timeoutS] — the raw timeout; resolved ONCE here
+ *        (resolveAgyTimeoutS).  A positive finite number arms both bounds
+ *        (the outer timer and `--print-timeout`); any other shape — a
+ *        string, NaN, zero, negative, Infinity, null, absent — arms
+ *        neither (kusabi #328).
  * @param {number} [opts.watchdogS] — accepted for contract parity; not
  *        applicable (no event stream to measure silence against).
  * @param {(string|string[])[]} [opts.tiers]
@@ -851,6 +926,16 @@ export async function agyDispatch(opts) {
   const jsonSchema = agyJsonSchemaFor(opts.agent);
   const promptText = buildAgyPrompt({ systemPrompt, promptText: opts.promptText });
   const bin = agyBin();
+  // ---- the ONE timeout decision (kusabi #328) ----
+  // `timeoutS` is resolved and validated ONCE here, and the SAME value
+  // feeds both consumers below: buildAgyArgs (the INNER bound,
+  // `--print-timeout`) and runAgyProcess (the OUTER timer).
+  // resolveAgyTimeoutS REFUSES every shape that is not a positive finite
+  // number (strings, NaN, zero, negatives, Infinity, null, absent) and
+  // returns null for them; null arms NEITHER bound.  Half-armed — an outer
+  // timer without `--print-timeout`, or the reverse — is impossible,
+  // because there is only one resolution and both sites consume it.
+  const timeoutS = resolveAgyTimeoutS(opts.timeoutS);
   // `session` survived assertNoAgySession, so it is either absent or a
   // provenance-proven agy conversation id — the only shape that may become
   // a `--conversation` argument.  `timeoutS` becomes agy's INNER bound
@@ -861,7 +946,7 @@ export async function agyDispatch(opts) {
     promptText,
     jsonSchema,
     conversationId: opts.session,
-    timeoutS: opts.timeoutS,
+    timeoutS,
   });
 
   // Deny maps arrive from the chain phases unconditionally; agy cannot
@@ -970,7 +1055,9 @@ export async function agyDispatch(opts) {
     bin,
     args,
     cwd: opts.cwd,
-    timeoutS: opts.timeoutS,
+    // The already-resolved value (the ONE decision above) — the same value
+    // buildAgyArgs consumed, so both bounds were decided together.
+    timeoutS,
     onStart: ({ pid }) => {
       job.process = { pid, startTime: null, recordedAt: new Date().toISOString() };
       saveJob(stateDir, job);
@@ -987,7 +1074,9 @@ export async function agyDispatch(opts) {
   } else if (timedOut) {
     // Same failure status/text the opencode and claude paths use.
     job.status = "timeout";
-    job.error = `timed out after ${opts.timeoutS}s`;
+    // The resolved value — the timer only fires when it is a positive
+    // number, so this renders the same number the timer was armed with.
+    job.error = `timed out after ${timeoutS}s`;
   } else {
     // Parse FIRST, exit code second.  The payload rule is about not throwing
     // away completed work on a signal that is not authoritative, and a
