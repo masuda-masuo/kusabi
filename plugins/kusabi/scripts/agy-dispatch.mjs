@@ -17,7 +17,8 @@
 // The CLI contract (field-verified by a hand run, 2026-08-11)
 // ---------------------------------------------------------------------------
 //
-//   agy -p <prompt> --output-format json --model <id> [--json-schema <schema>]
+//   agy -p <prompt> --output-format json --model <id> --print-timeout <duration>
+//         [--json-schema <schema>] [--conversation <id>]
 //
 // and a single JSON object on stdout:
 //
@@ -76,8 +77,19 @@
 //   - No event stream: `--output-format json` prints one object at the end,
 //     so there is nothing to measure silence against.  `job.stats` is marked
 //     `instrumented: false` (the same marker pre-#215 claude records carry,
-//     which every reader already handles) and `watchdogS` is not applicable
-//     — `timeoutS`, an absolute wall-clock bound, is the only bound.
+//     which every reader already handles) and `watchdogS` is not applicable.
+//     `timeoutS`, an absolute wall-clock bound, is the OUTER bound: the
+//     spawned process carries its own INNER bound (`--print-timeout`, kusabi
+//     #326) that kusabi sets so the outer one always expires first.  That
+//     ordering is what keeps the outer bound authoritative — a too-long job
+//     is classified through the `timedOut` path ("timed out after Ns")
+//     instead of arriving as a well-formed JSON object with an empty
+//     `response` that reads as "agy returned no payload".  The direction is
+//     deliberately REVERSED vs kusabi-companion.mjs's `DEFAULT_WATCHDOG_S =
+//     900`: there opencode's inner 600s `mcp_timeout` trips FIRST because
+//     its error is the more informative one; here agy's inner failure (an
+//     empty payload that names no cause) is the LESS informative one, so
+//     kusabi's own bound is the one that fires.
 //   - A BRIEF HAS A HARD CEILING HERE that the other backends do not have.
 //     The prompt rides argv, and Linux caps a single argv string at
 //     MAX_ARG_STRLEN (131072 bytes); past it the spawn fails with E2BIG.
@@ -297,15 +309,70 @@ export function buildAgyPrompt({ systemPrompt, promptText }) {
   return `<role>\n${systemPrompt}\n</role>\n\n${body}`;
 }
 
+// kusabi #326: the headroom given to agy's INNER bound (`--print-timeout`)
+// over kusabi's own outer `timeoutS`.
+//
+// WHY 300s: both timers start at process launch — kusabi's the instant
+// spawn() returns, agy's once its print-mode wait begins, which if
+// anything LAGS the spawn.  The ordering therefore holds whenever the
+// inner value exceeds the outer one, and the only thing the margin must
+// absorb is the skew between the two start points: sub-second in the worst
+// case.  300s is agy's OWN default print timeout — the smallest headroom
+// this module ever grants is the tool's own idea of a full wait budget,
+// two orders of magnitude above any plausible skew.
+//
+// The direction is deliberately REVERSED vs kusabi-companion.mjs's
+// `DEFAULT_WATCHDOG_S = 900`, where opencode's inner 600s `mcp_timeout` is
+// allowed to trip FIRST because the inner error is the more informative
+// one.  For agy the inner failure is the LESS informative one — a
+// well-formed JSON object with an empty `response`, which kusabi reads as
+// "returned no payload", with no mention of time.  So the inner bound is
+// set to lose the race, and the outer bound is the one that fires.
+export const AGY_PRINT_TIMEOUT_MARGIN_S = 300;
+
+/**
+ * Render a whole number of seconds the way Go's `time.Duration.String()`
+ * would — the dialect agy itself prints (`--help` shows `5m0s`).
+ *
+ * Whole seconds only by construction (timeoutS is a whole number and so is
+ * the margin), so no fractional part ever needs rendering.  The compound
+ * h/m/s form is used rather than a bare seconds count because it is the
+ * exact form the tool itself prints; whether a bare number is also
+ * accepted is not established, so the safe spelling is the tool's own.
+ *
+ * @param {number} totalSeconds
+ * @returns {string}
+ */
+export function formatGoDuration(totalSeconds) {
+  const s = Math.max(0, Math.floor(totalSeconds));
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  let out = "";
+  if (h > 0) out += `${h}h`;
+  if (h > 0 || m > 0) out += `${m}m`;
+  return `${out}${s % 60}s`;
+}
+
 /**
  * Build the argv for an `agy -p` dispatch.
  *
- * Contract (field-verified, kusabi #199; resume flag #316):
- * `agy -p <prompt> --output-format json --model <id> [--json-schema <schema>]
- * [--conversation <id>]`
+ * Contract (field-verified, kusabi #199; resume flag #316; timeout #326):
+ * `agy -p <prompt> --output-format json --model <id> --print-timeout <duration>
+ * [--json-schema <schema>] [--conversation <id>]`
  * — and NOTHING else.  Every flag here appears in that contract; no flag is
  * invented, and `--dangerously-skip-permissions` is never passed (not
  * needed, and blocked by the orchestrator-side classifier).
+ *
+ * `--print-timeout` carries agy's INNER bound: the resolved `timeoutS`
+ * plus AGY_PRINT_TIMEOUT_MARGIN_S, formatted as a Go duration.  The outer
+ * bound is kusabi's own timer (runAgyProcess); giving the inner bound
+ * strictly MORE time makes the outer one the one that fires, so a
+ * too-long job is classified through the `timedOut` path instead of
+ * arriving as an empty payload (see the margin constant for why the
+ * direction is reversed from the opencode watchdog convention).  When no
+ * positive `timeoutS` is resolved there is no outer bound to keep
+ * authoritative, so no inner bound is invented either — agy's own default
+ * is then its business, not kusabi's.
  *
  * The prompt is on argv because that is the documented transport (unlike the
  * claude backend, which was field-verified to accept stdin).  The tradeoff
@@ -321,14 +388,20 @@ export function buildAgyPrompt({ systemPrompt, promptText }) {
  * @param {string|null|undefined} [opts.conversationId] — an id the CALLER
  *        has proven to be an agy conversation (assertNoAgySession's
  *        provenance gate has already run); appends `--conversation <id>`.
+ * @param {number|null|undefined} [opts.timeoutS] — the resolved outer
+ *        bound; when positive, appends `--print-timeout <timeoutS +
+ *        AGY_PRINT_TIMEOUT_MARGIN_S>` as a Go duration string.
  * @returns {string[]}
  */
-export function buildAgyArgs({ model, promptText, jsonSchema, conversationId }) {
+export function buildAgyArgs({ model, promptText, jsonSchema, conversationId, timeoutS }) {
   const args = [
     "-p", promptText ?? "",
     "--output-format", "json",
     "--model", model,
   ];
+  if (typeof timeoutS === "number" && timeoutS > 0) {
+    args.push("--print-timeout", formatGoDuration(timeoutS + AGY_PRINT_TIMEOUT_MARGIN_S));
+  }
   if (jsonSchema) {
     args.push("--json-schema", jsonSchema);
   }
@@ -377,6 +450,7 @@ const AGY_ARG_ELEMENT_NAMES = {
   "--json-schema": "schema",
   "--model": "model",
   "--output-format": "output-format",
+  "--print-timeout": "print timeout",
   "--conversation": "conversation id",
 };
 
@@ -652,6 +726,10 @@ function killProcessGroup(child) {
  * `--output-format json` nothing arrives until the end, so any silence
  * measurement would be measuring the normal case.
  *
+ * This is the OUTER bound.  The child carries its own inner bound
+ * (`--print-timeout`, built by buildAgyArgs) set strictly larger, so THIS
+ * timer is the one that fires — see AGY_PRINT_TIMEOUT_MARGIN_S.
+ *
  * @param {object} opts
  * @param {string} opts.bin
  * @param {string[]} opts.args
@@ -775,8 +853,16 @@ export async function agyDispatch(opts) {
   const bin = agyBin();
   // `session` survived assertNoAgySession, so it is either absent or a
   // provenance-proven agy conversation id — the only shape that may become
-  // a `--conversation` argument.
-  const args = buildAgyArgs({ model: modelEntry, promptText, jsonSchema, conversationId: opts.session });
+  // a `--conversation` argument.  `timeoutS` becomes agy's INNER bound
+  // (`--print-timeout`) sized so this dispatch's OUTER bound (the timer in
+  // runAgyProcess) is the one that fires.
+  const args = buildAgyArgs({
+    model: modelEntry,
+    promptText,
+    jsonSchema,
+    conversationId: opts.session,
+    timeoutS: opts.timeoutS,
+  });
 
   // Deny maps arrive from the chain phases unconditionally; agy cannot
   // enforce them.  Record the names rather than drop them, so a record can

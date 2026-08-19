@@ -28,6 +28,8 @@ import {
   agyJsonSchemaFor,
   buildAgyPrompt,
   buildAgyArgs,
+  AGY_PRINT_TIMEOUT_MARGIN_S,
+  formatGoDuration,
   AGY_MAX_ARG_STRLEN,
   AGY_MAX_ARG_BYTES,
   checkAgyArgvSize,
@@ -184,12 +186,65 @@ describe("agy/ chain-entry prefix", () => {
 // argv + prompt construction (criterion 9)
 // =========================================================================
 
+// Parse the h/m/s form formatGoDuration emits back into whole seconds, so
+// the ordering tests can compare the inner bound against the outer one
+// numerically instead of string-compare-guessing.
+function secondsOfGoDuration(text) {
+  const m = /^(?:(\d+)h)?(?:(\d+)m)?(\d+)s$/.exec(text);
+  assert.ok(m, `not a whole-second Go duration: ${text}`);
+  return (Number(m[1] ?? 0) * 3600) + (Number(m[2] ?? 0) * 60) + Number(m[3]);
+}
+
 describe("buildAgyArgs", () => {
-  it("builds EXACTLY the field-verified invocation and nothing else", () => {
+  it("builds the base invocation with NO --print-timeout when no timeout is resolved", () => {
+    // Without a positive timeoutS there is no outer bound to keep
+    // authoritative, so no inner bound is invented either — agy's own
+    // default (5m0s) is then its business, not kusabi's.  This mirrors
+    // runAgyProcess, which arms no timer for such a dispatch.
     assert.deepEqual(
       buildAgyArgs({ model: "gemini-3.6-flash-high", promptText: "Do the thing.", jsonSchema: null }),
       ["-p", "Do the thing.", "--output-format", "json", "--model", "gemini-3.6-flash-high"],
     );
+    for (const timeoutS of [undefined, null, 0, -5]) {
+      assert.equal(
+        buildAgyArgs({ model: "m", promptText: "p", jsonSchema: null, timeoutS })
+          .includes("--print-timeout"),
+        false,
+        `timeoutS=${timeoutS} must not invent an inner bound`,
+      );
+    }
+  });
+
+  it("emits --print-timeout carrying the resolved timeout plus headroom, as a Go duration (kusabi #326)", () => {
+    // 3600s is the implement default, 1800s the review default: the inner
+    // bound is ALWAYS timeoutS + AGY_PRINT_TIMEOUT_MARGIN_S, formatted the
+    // way agy's own help prints durations (default 5m0s).
+    assert.deepEqual(
+      buildAgyArgs({ model: "m", promptText: "p", jsonSchema: null, timeoutS: 3600 }),
+      ["-p", "p", "--output-format", "json", "--model", "m", "--print-timeout", "1h5m0s"],
+    );
+    assert.deepEqual(
+      buildAgyArgs({ model: "m", promptText: "p", jsonSchema: null, timeoutS: 1800 }),
+      ["-p", "p", "--output-format", "json", "--model", "m", "--print-timeout", "35m0s"],
+    );
+  });
+
+  it("the inner bound is STRICTLY larger than the outer for every timeoutS kusabi resolves", () => {
+    // 3600 (implement) / 1800 (review) / 600 (salvage) are the resolved
+    // defaults; the operator --timeout override is an arbitrary positive
+    // number.  For each, the value passed to agy must leave kusabi's own
+    // timer expiring first, with at least the full margin of headroom.
+    for (const timeoutS of [600, 1800, 3600, 9000, 1, 30, 12345]) {
+      const args = buildAgyArgs({ model: "m", promptText: "p", jsonSchema: null, timeoutS });
+      const idx = args.indexOf("--print-timeout");
+      assert.ok(idx > 0, `missing --print-timeout for timeoutS=${timeoutS}: ${args.join(" ")}`);
+      const innerS = secondsOfGoDuration(args[idx + 1]);
+      assert.ok(
+        innerS - timeoutS >= AGY_PRINT_TIMEOUT_MARGIN_S,
+        `headroom for timeoutS=${timeoutS} is ${innerS - timeoutS}s, ` +
+        `expected >= ${AGY_PRINT_TIMEOUT_MARGIN_S}s`,
+      );
+    }
   });
 
   it("appends --json-schema only when a schema is given", () => {
@@ -202,12 +257,13 @@ describe("buildAgyArgs", () => {
 
   it("appends --conversation <id> only when a conversation id is given (resume, kusabi #316)", () => {
     const args = buildAgyArgs({
-      model: "m", promptText: "p", jsonSchema: null,
+      model: "m", promptText: "p", jsonSchema: null, timeoutS: 1800,
       conversationId: "6f5f0f1e-0000-4a1b-9c2d-1122334455aa",
     });
     assert.deepEqual(
       args,
-      ["-p", "p", "--output-format", "json", "--model", "m", "--conversation", "6f5f0f1e-0000-4a1b-9c2d-1122334455aa"],
+      ["-p", "p", "--output-format", "json", "--model", "m",
+       "--print-timeout", "35m0s", "--conversation", "6f5f0f1e-0000-4a1b-9c2d-1122334455aa"],
     );
     // Absent / empty / null ids leave a fresh-dispatch argv byte-identical.
     for (const conversationId of [undefined, null, ""]) {
@@ -219,10 +275,12 @@ describe("buildAgyArgs", () => {
   });
 
   it("never passes --dangerously-skip-permissions, and invents no flag", () => {
-    const KNOWN = new Set(["-p", "--output-format", "json", "--model", "--json-schema", "--conversation"]);
+    const KNOWN = new Set([
+      "-p", "--output-format", "json", "--model", "--print-timeout", "--json-schema", "--conversation",
+    ]);
     for (const jsonSchema of [null, '{"type":"object"}']) {
       const args = buildAgyArgs({
-        model: "m", promptText: "p", jsonSchema,
+        model: "m", promptText: "p", jsonSchema, timeoutS: 600,
         conversationId: jsonSchema ? undefined : "conv-1",
       });
       assert.equal(args.includes("--dangerously-skip-permissions"), false);
@@ -232,6 +290,19 @@ describe("buildAgyArgs", () => {
         }
       }
     }
+  });
+});
+
+describe("formatGoDuration", () => {
+  it("renders whole seconds the way Go's time.Duration.String() would — the dialect agy prints", () => {
+    assert.equal(formatGoDuration(3900), "1h5m0s");
+    assert.equal(formatGoDuration(2100), "35m0s");
+    assert.equal(formatGoDuration(900), "15m0s");
+    assert.equal(formatGoDuration(3600), "1h0m0s");
+    // agy's own default, verbatim — the value's dialect is the tool's own.
+    assert.equal(formatGoDuration(300), "5m0s");
+    assert.equal(formatGoDuration(61), "1m1s");
+    assert.equal(formatGoDuration(10), "10s");
   });
 });
 
@@ -973,10 +1044,13 @@ describe("agyDispatch (fake agy binary)", () => {
     await agyDispatch(ctx.dispatchOptions());
     const calls = loggedArgs(ctx.argsLog);
     assert.equal(calls.length, 1);
+    // dispatchOptions resolves timeoutS: 20, so the inner bound is
+    // 20 + AGY_PRINT_TIMEOUT_MARGIN_S = 320s, as a Go duration (kusabi #326).
     assert.deepEqual(calls[0], [
       "-p", "Do the thing.",
       "--output-format", "json",
       "--model", "gemini-3.6-flash-high",
+      "--print-timeout", "5m20s",
     ]);
   });
 
@@ -1095,7 +1169,7 @@ describe("agyDispatch (fake agy binary)", () => {
     assert.deepEqual(job.toolDeniesUnenforced, ["bash", "write"]);
     // And no allow/deny flag was invented to pretend otherwise.
     assert.deepEqual(loggedArgs(ctx.argsLog)[0].filter((a) => a.startsWith("--")),
-      ["--output-format", "--model"]);
+      ["--output-format", "--model", "--print-timeout"]);
   });
 
   it("rejects a session before spawning anything and before any job record exists", async () => {
@@ -1150,7 +1224,10 @@ describe("agyDispatch (fake agy binary)", () => {
       explicitModel: "claude-sonnet-4-6",
     }));
     assert.equal(job.modelEntry, "claude-sonnet-4-6");
-    assert.equal(loggedArgs(ctx.argsLog)[0].at(-1), "claude-sonnet-4-6");
+    // Index-based, not `.at(-1)`: --print-timeout now follows --model.
+    const args = loggedArgs(ctx.argsLog)[0];
+    const modelIdx = args.indexOf("--model");
+    assert.equal(args[modelIdx + 1], "claude-sonnet-4-6");
   });
 });
 
@@ -1858,6 +1935,7 @@ describe("agyDispatch — an oversized argv is refused before the spawn", () => 
       "-p", atLimit,
       "--output-format", "json",
       "--model", "gemini-3.6-flash-high",
+      "--print-timeout", "5m20s",
     ]);
 
     const events = fs.readFileSync(path.join(jobDir(stateDir, job.id), "events.ndjson"), "utf8")
