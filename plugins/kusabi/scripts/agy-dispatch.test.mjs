@@ -383,6 +383,91 @@ describe("the two timeout bound sites agree — armed together or not at all", (
   });
 });
 
+// =========================================================================
+// each bound site agrees with the RESOLVER (kusabi #330)
+// =========================================================================
+//
+// The pair test above drives both sites from the same input and asserts
+// they agree WITH EACH OTHER.  Nothing there pins resolveAgyTimeoutS: if
+// both sites drifted identically away from it — the #328 first round,
+// where both sites carried the same hand-copied `typeof === "number" &&
+// > 0` that accepted Infinity while the resolver's Number.isFinite refused
+// it — the pair would still agree with each other and that test would
+// stay green.  THIS test pins the resolver's decision per shape (measured
+// on the #329 tree) and asserts each site's arming decision, reached from
+// the SAME RAW value a caller passes, matches that decision exactly: a
+// site that arms where the resolver says null, or refuses where the
+// resolver resolves, is the identical-drift regression.
+
+describe("each bound site agrees with the resolver, on the raw input (kusabi #330)", () => {
+  let ctx;
+
+  beforeEach(() => { ctx = fakeAgyContext(); });
+  afterEach(() => { ctx.restore(); });
+
+  it("for every shape, resolveAgyTimeoutS resolves exactly when a direct site call arms its bound", async (t) => {
+    // [raw input, resolver output] — the resolver column is pinned to the
+    // decisions measured on the #329 tree, so a resolver drift fails at
+    // the first assert and a sites' drift fails at the site asserts, even
+    // when both sites moved together.
+    const cases = [
+      [3600, 3600],
+      [1800, 1800],
+      ["3600", null],
+      [0, null],
+      [-5, null],
+      [NaN, null],
+      [null, null],
+      [undefined, null],
+      [Infinity, null],
+      [-Infinity, null],
+      [1.5, 1.5],
+    ];
+    for (const [timeoutS, expected] of cases) {
+      const resolved = resolveAgyTimeoutS(timeoutS);
+      // Object.is, so the NaN input's null outcome compares correctly.
+      assert.ok(
+        Object.is(resolved, expected),
+        `timeoutS=${String(timeoutS)}: resolveAgyTimeoutS returned ${String(resolved)} but the ` +
+        `pinned decision is ${String(expected)} — the resolver drifted`,
+      );
+      const shouldArm = expected !== null;
+
+      // The INNER bound, reached directly with the raw value.
+      const innerArmed = buildAgyArgs({ model: "m", promptText: "p", jsonSchema: null, timeoutS })
+        .includes("--print-timeout");
+      assert.equal(innerArmed, shouldArm,
+        `timeoutS=${String(timeoutS)}: --print-timeout present=${innerArmed} but the resolver ` +
+        `${resolved === null ? "refuses" : "resolves"} this shape — the inner bound drifted ` +
+        `from the resolver`);
+
+      // Observe the OUTER timer's arming DECISION directly, exactly like
+      // the pair test: setTimeout is swapped for a recorder that never
+      // fires, so no real timer runs (the fake agy exits on its own, and
+      // the decision, not the firing, is what must match the resolver).
+      let outerArmed = false;
+      const mocked = t.mock.method(globalThis, "setTimeout", () => {
+        outerArmed = true;
+        return undefined; // no real handle: runAgyProcess's clearTimeout is null-guarded
+      });
+      const result = await runAgyProcess({
+        bin: ctx.binPath,
+        args: ["-p", "p"],
+        cwd: ctx.cwd,
+        timeoutS,
+      });
+      mocked.mock.restore();
+
+      assert.equal(result.spawnError, null, `timeoutS=${String(timeoutS)}: the fake agy must spawn`);
+      assert.equal(result.timedOut, false, `timeoutS=${String(timeoutS)}: no timer may fire here`);
+      assert.equal(outerArmed, shouldArm,
+        `timeoutS=${String(timeoutS)}: outer timer armed=${outerArmed} but the resolver ` +
+        `${resolved === null ? "refuses" : "resolves"} this shape — the outer bound drifted ` +
+        `from the resolver`);
+    }
+  });
+});
+
 describe("formatGoDuration", () => {
   it("renders whole seconds the way Go's time.Duration.String() would — the dialect agy prints", () => {
     assert.equal(formatGoDuration(3900), "1h5m0s");
