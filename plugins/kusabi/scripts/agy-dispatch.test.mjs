@@ -30,6 +30,8 @@ import {
   buildAgyArgs,
   AGY_PRINT_TIMEOUT_MARGIN_S,
   formatGoDuration,
+  resolveAgyTimeoutS,
+  runAgyProcess,
   AGY_MAX_ARG_STRLEN,
   AGY_MAX_ARG_BYTES,
   checkAgyArgvSize,
@@ -195,6 +197,31 @@ function secondsOfGoDuration(text) {
   return (Number(m[1] ?? 0) * 3600) + (Number(m[2] ?? 0) * 60) + Number(m[3]);
 }
 
+describe("resolveAgyTimeoutS \u2014 the ONE timeout decision (kusabi #328)", () => {
+  it("refuses every shape that is not a usable positive number of seconds", () => {
+    // The #328 case first: "3600" passed runAgyProcess's truthy guard and
+    // failed buildAgyArgs's type guard \u2014 outer timer armed, inner bound
+    // left to agy's own 5m0s default: half-armed.  The resolver REFUSES
+    // rather than coerces: a string is not a number the caller resolved,
+    // so no bound is armed from it.
+    for (const value of [
+      undefined, null, "", "3600", "1", NaN, 0, -5, -1.5,
+      Infinity, -Infinity, true, false, {}, [], () => {},
+    ]) {
+      assert.equal(resolveAgyTimeoutS(value), null, `value=${String(value)} must resolve to null`);
+    }
+  });
+
+  it("passes through every positive finite number \u2014 the shapes kusabi actually passes", () => {
+    // 20 (dispatch default), 3600 (implement default), 1800 (review
+    // default), 600 (salvage), operator overrides, and fractional positives
+    // all arrive unchanged: nothing is coerced or rounded at the door.
+    for (const value of [1, 20, 600, 1800, 3600, 9000, 12345, 0.5]) {
+      assert.equal(resolveAgyTimeoutS(value), value, `value=${value} must pass through`);
+    }
+  });
+});
+
 describe("buildAgyArgs", () => {
   it("builds the base invocation with NO --print-timeout when no timeout is resolved", () => {
     // Without a positive timeoutS there is no outer bound to keep
@@ -289,6 +316,69 @@ describe("buildAgyArgs", () => {
           assert.ok(KNOWN.has(arg), `unexpected flag on argv: ${arg}`);
         }
       }
+    }
+  });
+});
+
+// =========================================================================
+// the two bound sites agree (kusabi #328)
+// =========================================================================
+//
+// resolveAgyTimeoutS, buildAgyArgs (`--print-timeout`, the INNER bound) and
+// runAgyProcess (the OUTER timer) all decide with the SAME predicate
+// (isUsableTimeoutS).  The per-function tests above pin each one alone;
+// THIS test drives both sites from the SAME input and asserts the pair
+// agrees — a value that arms one bound and not the other is the #327
+// half-arm this issue exists to ban, whether it arrives through agyDispatch
+// or by calling a site directly.  It is written to FAIL when either site's
+// guard is loosened on its own: the other site still refuses the shape, so
+// the two decisions no longer match.
+
+describe("the two timeout bound sites agree — armed together or not at all", () => {
+  let ctx;
+
+  beforeEach(() => { ctx = fakeAgyContext(); });
+  afterEach(() => { ctx.restore(); });
+
+  it("for every shape kusabi's callers can pass, BOTH bounds arm or NEITHER does", async (t) => {
+    // The shapes that motivated this issue — a string, NaN, zero, negative,
+    // Infinity, null, absent — plus the positive numbers kusabi passes
+    // today (valid positives must keep arming BOTH, and keep rendering the
+    // same --print-timeout values, so the pair agreement cannot be bought
+    // by making the inner bound refuse everything).
+    const inputs = [
+      undefined, null, "3600", "1", NaN, 0, -5, -1.5, Infinity, -Infinity,
+      600, 1800, 3600, 1, 20, 0.5,
+    ];
+    for (const timeoutS of inputs) {
+      const args = buildAgyArgs({ model: "m", promptText: "p", jsonSchema: null, timeoutS });
+      const innerArmed = args.includes("--print-timeout");
+
+      // Observe the OUTER timer's arming DECISION directly: setTimeout is
+      // swapped for a recorder that never fires, so the test needs no real
+      // timer (and none may fire — the fake agy exits on its own, and the
+      // decision, not the firing, is what must agree with the inner bound).
+      let outerTimerArmed = false;
+      const mocked = t.mock.method(globalThis, "setTimeout", () => {
+        outerTimerArmed = true;
+        return undefined; // no real handle: runAgyProcess's clearTimeout is null-guarded
+      });
+      const result = await runAgyProcess({
+        bin: ctx.binPath,
+        args: ["-p", "p"],
+        cwd: ctx.cwd,
+        timeoutS,
+      });
+      mocked.mock.restore();
+
+      assert.equal(result.spawnError, null, `timeoutS=${String(timeoutS)}: the fake agy must spawn`);
+      assert.equal(result.timedOut, false, `timeoutS=${String(timeoutS)}: no timer may fire here`);
+      assert.equal(
+        outerTimerArmed,
+        innerArmed,
+        `timeoutS=${String(timeoutS)}: --print-timeout present=${innerArmed} but outer timer ` +
+        `armed=${outerTimerArmed} — one bound armed, the other not (the #327 half-arm)`,
+      );
     }
   });
 });
@@ -944,6 +1034,7 @@ function fakeAgyContext(mode = "ok") {
   const stateDir = stateDirFor(cwd);
   return {
     tmp,
+    binPath,
     cwd,
     stateDir,
     argsLog,
