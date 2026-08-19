@@ -1257,8 +1257,15 @@ describe("runImplementPhase with the agy backend", () => {
     });
     assert.equal(seen.session, undefined);
     assert.equal(seen.sessionProvenance, undefined);
-    // The lineage itself is still tracked on the round record.
-    assert.equal(out.session, "agy-conv-1");
+    // kusabi #323: this file is outside the issue's deliverables list, but
+    // this assertion encoded the old seam contract (runImplementPhase
+    // reporting the candidate it was told to resume) and the spec's §3
+    // explicitly licenses updating such tests; it is updated here to the new
+    // contract rather than left red.  The seam reports the session the
+    // dispatch CREATED — never the candidate it was told to abandon — and
+    // the record agrees.
+    assert.equal(out.session, "agy-conv-3");
+    assert.equal(out.sessionProvenance, "agy");
     assert.equal(out.roundRecord.sessionID, "agy-conv-3");
   });
 

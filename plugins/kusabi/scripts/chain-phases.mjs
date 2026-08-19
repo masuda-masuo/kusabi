@@ -452,25 +452,30 @@ export async function runImplementPhase({
   // reads it back); no second measurement exists.
   const implementRefusal = job.status === "completed" ? parseRefusalBlock(resultText) : null;
 
-  // ---- report the session this round RESOLVED (kusabi #320) ----
-  // The returned session is the next round's carry.  The phase reports the
-  // lineage it resolved -- the candidate it was told to resume, or the
-  // previous-record fallback -- NOT the id the dispatch actually used or
-  // created.  The two coincide for a resuming round (the backend used the
-  // candidate) and differ exactly when the dispatch ran fresh: `useNewSession`
-  // or a dropped cross-backend candidate.  Reporting the candidate there is
-  // safe ONLY because the driver clears the carry for useNewSession rounds
-  // (kusabi #320, see chain-driver.mjs): the next round then re-derives the
-  // conversation the fresh round CREATED from the round record's `sessionID`
-  // (the previousRecord fallback above) -- the natural "start fresh, then
-  // carry on from there" hand-off.  Without that clear, round N+1 would
-  // resume the very conversation round N was told to walk away from.
+  // ---- report the session this round's dispatch actually used or created ----
+  // The returned session is the next round's carry, and the invariant is
+  // that it is a conversation round N's dispatch used or created.  A
+  // resuming round USED `resolvedSession` -- the candidate it was told to
+  // resume, or the previous-record fallback -- so that is what is reported.
+  // A fresh round (`useNewSession`, or a candidate dropped for crossing
+  // backends) CREATED whatever the job carries as its session id; that is
+  // what is reported, never the abandoned candidate.  The two coincide for
+  // a resuming round and differ exactly when the dispatch ran fresh;
+  // reporting the candidate in the fresh case was the kusabi #320 defect
+  // that made the driver clear the carry after such a round -- the
+  // compensation this change removes (the driver no longer compensates;
+  // see chain-driver.mjs).  The reported provenance follows the session:
+  // the owner of a resolved session is its record or the caller's proof;
+  // the owner of a created session is the backend this round dispatched on.
   //
   // Failure path: if the dispatch ran fresh and the job died before any
   // session id was observed (dispatchWithFallback's no-route error job, a
-  // backend job that never returned an id), the record carries no sessionID,
-  // the next round's fallback finds nothing to re-derive, and it starts
+  // backend job that never returned an id), `job.sessionID` is null: there
+  // is no session to report, the carry is null, and the next round starts
   // fresh -- a dead fresh round resumes nothing, by construction.
+  const dispatchRanFresh = useNewSession || !resolvedSession;
+  const reportedSession = dispatchRanFresh ? (job.sessionID ?? null) : resolvedSession;
+  const reportedProvenance = dispatchRanFresh ? (job.sessionID ? backend : null) : resolvedSessionProvenance;
 
   return {
     roundRecord: {
@@ -504,8 +509,8 @@ export async function runImplementPhase({
     // refusal is genuine depends on the change set, which this phase has not
     // measured yet.
     implementRefusal,
-    session: resolvedSession,
-    sessionProvenance: resolvedSessionProvenance,
+    session: reportedSession,
+    sessionProvenance: reportedProvenance,
   };
 }
 
