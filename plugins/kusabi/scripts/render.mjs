@@ -985,6 +985,18 @@ export function renderChainShow(chain, rounds, unreadable = [], control = null) 
     if (round.reworkStrategyReason) {
       lines.push(`  rework strategy: ${round.reworkStrategyReason}`);
     }
+
+    // Rework scope (kusabi #60 step 2): a round deliberately narrowed to a
+    // subset of the previous findings records the scope NAME only — the
+    // scoped subset is not persisted, so re-deriving the partition here
+    // would duplicate resolveReworkScope's branch table.  Only a narrowed
+    // scope is worth printing: "full" is the default for every round
+    // (including round 1) and records written before the field existed have
+    // no scope at all — both stay silent so old digests stay byte-identical.
+    if (round.reworkScope === "mechanical" || round.reworkScope === "design") {
+      lines.push(`  rework scope: ${round.reworkScope}`);
+    }
+
     if (round.reworkCount !== undefined) {
       lines.push(`  rework count: ${round.reworkCount}`);
     }

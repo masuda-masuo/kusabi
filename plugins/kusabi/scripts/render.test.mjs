@@ -1025,6 +1025,107 @@ describe("renderChainShow", () => {
     assert.ok(result.includes("tier: 0 → 1"));
     assert.doesNotMatch(result, /escalation clamped/);
   });
+
+  // kusabi #333: a deliberately narrowed rework round must say so in the
+  // digest — the round record stores only the scope NAME, and only a
+  // narrowed scope is worth printing ("full" and absent both stay silent).
+  it("states a mechanical rework scope next to the strategy line", () => {
+    const chain = { chainId: "chain-scope-mechanical" };
+    const rounds = [
+      {
+        round: 2,
+        verdict: "approve",
+        disposition: { disposition: "accept" },
+        resumeMethod: { type: "continue_session" },
+        reworkStrategyReason: "Fix only the mechanical findings",
+        reworkScope: "mechanical",
+        reworkCount: 1,
+      },
+    ];
+    const result = renderChainShow(chain, rounds);
+    assert.match(result, /rework strategy: Fix only the mechanical findings/);
+    assert.match(result, /rework scope: mechanical/);
+  });
+
+  it("states a design rework scope next to the strategy line", () => {
+    const chain = { chainId: "chain-scope-design" };
+    const rounds = [
+      {
+        round: 3,
+        verdict: "approve",
+        disposition: { disposition: "accept" },
+        resumeMethod: { type: "continue_session" },
+        reworkStrategyReason: "Design-level findings only",
+        reworkScope: "design",
+      },
+    ];
+    const result = renderChainShow(chain, rounds);
+    assert.match(result, /rework strategy: Design-level findings only/);
+    assert.match(result, /rework scope: design/);
+  });
+
+  it("prints no scope line when the recorded scope is full", () => {
+    const chain = { chainId: "chain-scope-full" };
+    const rounds = [
+      {
+        round: 1,
+        verdict: "approve",
+        disposition: { disposition: "accept" },
+        resumeMethod: { type: "continue_session" },
+        reworkScope: "full",
+      },
+    ];
+    const result = renderChainShow(chain, rounds);
+    assert.doesNotMatch(result, /rework scope/);
+  });
+
+  it("prints no scope line and does not throw when the record predates the scope field", () => {
+    const chain = { chainId: "chain-scope-legacy" };
+    const rounds = [
+      {
+        round: 1,
+        verdict: "approve",
+        disposition: { disposition: "accept" },
+        resumeMethod: { type: "continue_session" },
+      },
+    ];
+    const result = renderChainShow(chain, rounds);
+    assert.doesNotMatch(result, /rework scope/);
+    assert.match(result, /Round 1/);
+  });
+
+  it("keeps scope adjacent to strategy without disturbing the neighbouring lines", () => {
+    const chain = { chainId: "chain-scope-order" };
+    const rounds = [
+      {
+        round: 2,
+        verdict: "needs-attention",
+        disposition: { disposition: "rework" },
+        resumeMethod: { type: "continue_session" },
+        tierBefore: 0,
+        tierAfter: 1,
+        reworkStrategyReason: "Fix only the mechanical findings",
+        reworkScope: "mechanical",
+        reworkCount: 2,
+        probeResults: [{ probe: "P1: HEAD clean", passed: true, detail: "HEAD matches base" }],
+      },
+    ];
+    const result = renderChainShow(chain, rounds);
+    const expectedOrder = [
+      "tier: 0 → 1",
+      "rework strategy: Fix only the mechanical findings",
+      "rework scope: mechanical",
+      "rework count: 2",
+      "resume: continue_session",
+      "P1: HEAD clean — PASS",
+    ];
+    let prev = -1;
+    for (const line of expectedOrder) {
+      const idx = result.indexOf(line);
+      assert.ok(idx > prev, `expected line in order, got ${line} at ${idx}`);
+      prev = idx;
+    }
+  });
 });
 
 // renderJobLine — stats display (acceptance criterion 4)
