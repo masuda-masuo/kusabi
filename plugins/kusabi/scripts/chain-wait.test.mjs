@@ -1184,13 +1184,16 @@ describe("chain-wait CLI", () => {
     assert.match(result.stdout, /no chain appeared within 1s/);
   });
 
-  it("--next skips a recordless debris dir and waits on the chain that appears after the first scan (kusabi #298)", async () => {
+  it("--next does not settle on a preexisting recordless dir: it waits on the chain that appears after the first scan (kusabi #298)", async () => {
     const chainsDir = workspaceChainsDir(path.join(tmp, "state"), tmp);
     fs.mkdirSync(path.join(chainsDir, "chain-debris"), { recursive: true });
-    // The debris dir must already be OLDER than the appear window when the
-    // wait's first scan runs.  birthtime cannot be backdated, so give it a
-    // head start before the wait starts.
-    await new Promise((resolve) => setTimeout(resolve, 5_000));
+    // No head start on purpose.  The debris classification is the wall-clock
+    // comparison `createdAt < startedAt - appearTimeoutMs`, so deciding it
+    // here would race a sleep against a timeout — the exact one-second margin
+    // the old 5s head start bought, and the flake this file used to have.
+    // The #298 suite above decides both sides of the classification with an
+    // injected clock; this test asserts only the end-to-end outcome, which is
+    // the same whichever way the first scan classifies the dir.
 
     const env = { ...process.env };
     delete env.KUSABI_WORKER_CONTEXT;
@@ -1219,7 +1222,11 @@ describe("chain-wait CLI", () => {
     });
     assert.equal(status, 0, `${stdout}${stderr}`);
     assert.match(stdout, /chain chain-real: status=completed/);
-    assert.match(stderr, /ignoring chain-debris: no control record, older than appear window/);
+    // No stderr note asserted here: whether the first scan classifies the
+    // recordless dir as debris is exactly what the injected-clock tests in
+    // the #298 suite pin down (both sides — the `ignoring …` note and the
+    // within-window dir kept eligible).  Asserting the note at this level
+    // would re-introduce the wall-clock race this test used to have.
   });
 
   it("refuses --next together with a chain id", () => {
