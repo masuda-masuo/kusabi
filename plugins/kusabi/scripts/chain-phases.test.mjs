@@ -34,6 +34,8 @@ import {
   parseReviewResult,
   normalizeFilePath,
   hasRepeatedAreas,
+  renderReviewPriorFindings,
+  inScopeFindingFiles,
   applyTierEscalation,
   recordReworkEscalation,
   persistChainState,
@@ -6705,5 +6707,231 @@ describe("runProbePhase — P5/P6 wiring (kusabi #197)", () => {
     assert.match(p5.detail, /heading present but no entries parsed/);
     assert.equal(result.probesGreen, false);
     assert.equal(result.oracleViolation, false, "a brief-syntax defect is not a violation of the oracle");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// runReviewPhase — scope-aware prior findings (kusabi #334)
+//
+// The review seam must learn the round's scope: a scoped round's prompt
+// partitions the previous round's findings into in-scope (the round was
+// asked to resolve them) and held (deliberately left for a later round,
+// still open), and the repeated-areas signal must only count areas the
+// round was asked to fix.  The full-scope path stays byte-identical to the
+// pre-scoping prompt, and old records without any scope information degrade
+// to today's behaviour instead of throwing.
+// ---------------------------------------------------------------------------
+
+describe("runReviewPhase — scope-aware prior findings (kusabi #334)", () => {
+  const designFinding = {
+    severity: "high", title: "API shape decision", file: "src/a.js", line_start: 1,
+    kind: "design", body: "needs a decision", recommendation: "decide",
+  };
+  const mechFinding = {
+    severity: "medium", title: "Rename variable", file: "src/b.js", line_start: 10,
+    kind: "mechanical", body: "bad name", recommendation: "rename it",
+  };
+
+  async function capturePromptWith(previousRecord, reworkScope, reviewFindings = []) {
+    let captured = null;
+    function stubbedDispatch(opts) {
+      captured = opts.promptText;
+      return {
+        job: { id: "job-scope", status: "completed", modelEntry: "m", modelVariant: null, fallbacks: null, usage: null, error: null },
+        resultText: JSON.stringify({ verdict: "approve", findings: reviewFindings }),
+      };
+    }
+    const roundRecord = { round: 2 };
+    const result = await runReviewPhase({
+      container: "cafe1234beef",
+      brief: "BRIEF",
+      modelChain: ["test-org/test-flash"],
+      chainId: "chain-scope",
+      cwd: process.cwd(),
+      previousRecord,
+      reworkScope,
+      baseSha: "0123456789abcdef",
+      chainStatusOutput: " M src/foo.js\n",
+      chainBaseLog: "abc1234 first\n",
+      chainUntracked: "",
+      roundRecord,
+      chainChangedPaths: ["src/foo.js"],
+      chainNewlyChanged: ["src/foo.js"],
+      chainStatusObserved: true,
+      chainDeliverables: ["src/foo.js"],
+      flagsModel: null,
+      _dispatchWithFallback: stubbedDispatch,
+    });
+    return { prompt: captured, result };
+  }
+
+  it("full-scope rework round keeps the prior-findings prompt text byte-identical", async () => {
+    // A full-scope rework is a probe-failure rework or an old record: no
+    // structured findings, so resolveReworkScope returns full.
+    const prev = {
+      findingsText: "[high] API shape decision (src/a.js:1)\n[medium] Rename variable (src/b.js:10)",
+      findings: [],
+      findingFiles: ["src/a.js", "src/b.js"],
+    };
+    const scope = resolveReworkScope(prev);
+    assert.equal(scope.scope, "full");
+    const withScope = await capturePromptWith(prev, scope);
+    const without = await capturePromptWith(prev, undefined);
+    assert.equal(withScope.prompt, without.prompt);
+    // The slot renders the previous round's findingsText verbatim, exactly
+    // as the pre-scoping code did — no scope partition on a full round.
+    assert.ok(withScope.prompt.includes("Prior findings from an earlier review round: " + prev.findingsText));
+    assert.ok(!withScope.prompt.includes("This round was scoped to"));
+  });
+
+  it("mechanical-scoped round names the in-scope findings and marks the rest held", async () => {
+    const prev = {
+      findingsText: "[high] API shape decision (src/a.js:1)\n[medium] Rename variable (src/b.js:10)",
+      findings: [designFinding, mechFinding],
+      findingFiles: ["src/a.js", "src/b.js"],
+    };
+    const scope = resolveReworkScope(prev);
+    assert.equal(scope.scope, "mechanical");
+    const { prompt } = await capturePromptWith(prev, scope);
+    const slot = prompt.slice(prompt.indexOf("This round was scoped"));
+    // The scope is stated, and the in-scope finding gets the FULL per-finding
+    // rendering (heading with severity/location, body, recommendation) —
+    // same treatment the implement prompt gives its scoped subset.
+    assert.ok(slot.includes("This round was scoped to mechanical findings"));
+    assert.ok(slot.includes("### [medium] Rename variable (src/b.js:10)"));
+    assert.ok(slot.includes("bad name"));
+    assert.ok(slot.includes("**Recommendation:** rename it"));
+    // The held finding is NAMED as held, still open, and not a failure of
+    // the round — and the reviewer is told to re-report it, not drop it.
+    assert.ok(slot.includes("DELIBERATELY HELD OUT"));
+    assert.ok(slot.includes("[high] API shape decision (src/a.js:1)"));
+    assert.ok(slot.includes("still open"));
+    assert.ok(slot.includes("never as work this round failed to do"));
+    assert.ok(slot.includes("Re-report each one"));
+    // The held finding's body stays out of the prompt (one-line rows only).
+    assert.ok(!slot.includes("needs a decision"));
+  });
+
+  it("design-scoped round names the single design finding and holds the rest", async () => {
+    // All-design set: the round is design-scoped to the FIRST design finding
+    // in array order; the remaining design findings are held.
+    const secondDesign = { ...designFinding, title: "Second design", file: "src/c.js", body: "second body" };
+    const prev = {
+      findings: [designFinding, secondDesign],
+      findingFiles: ["src/a.js", "src/c.js"],
+    };
+    const scope = resolveReworkScope(prev);
+    assert.equal(scope.scope, "design");
+    const { prompt } = await capturePromptWith(prev, scope);
+    const slot = prompt.slice(prompt.indexOf("This round was scoped"));
+    assert.ok(slot.includes("This round was scoped to design findings"));
+    assert.ok(slot.includes("### [high] API shape decision (src/a.js:1)"));
+    // The held finding is named as held; its body is not rendered.
+    assert.ok(slot.includes("[high] Second design (src/c.js:1)"));
+    assert.ok(!slot.includes("second body"));
+  });
+
+  it("repeatedAreas ignores held files and fires on in-scope files", async () => {
+    const prev = {
+      findings: [designFinding, mechFinding],
+      findingFiles: ["src/a.js", "src/b.js"],
+    };
+    const scope = resolveReworkScope(prev);
+    assert.equal(scope.scope, "mechanical");
+    // The current round repeats ONLY the held design file: not a stall.
+    const heldOnly = await capturePromptWith(prev, scope, [
+      { file: "src/a.js", severity: "high", title: "still there", line_start: 1 },
+    ]);
+    assert.equal(heldOnly.result.chainRepeatedAreas, false);
+    // The current round repeats the IN-SCOPE mechanical file: a stall.
+    const inScope = await capturePromptWith(prev, scope, [
+      { file: "src/b.js", severity: "medium", title: "still there", line_start: 10 },
+    ]);
+    assert.equal(inScope.result.chainRepeatedAreas, true);
+  });
+
+  it("full-scope rounds keep today's repeatedAreas behaviour (any prior file counts)", async () => {
+    // A probe-failure rework resolves to full scope; every prior file was in
+    // scope, so a repeat of ANY of them still fires the detector.
+    const prev = {
+      findings: [],
+      findingsText: "[high] API shape decision (src/a.js:1)",
+      findingFiles: ["src/a.js"],
+    };
+    const scope = resolveReworkScope(prev);
+    assert.equal(scope.scope, "full");
+    const result = await capturePromptWith(prev, scope, [
+      { file: "src/a.js", severity: "high", title: "still there", line_start: 1 },
+    ]);
+    assert.equal(result.result.chainRepeatedAreas, true);
+  });
+
+  it("old record without scope information reviews with today's behaviour and throws nothing", async () => {
+    // No structured findings, no findingFiles, no reworkScope — a record
+    // written before scoped reworks existed.
+    const prev = { findingsText: "[high] legacy issue (src/legacy.js:1)" };
+    const { prompt, result } = await capturePromptWith(prev, undefined, [
+      { file: "src/legacy.js", severity: "high", title: "still there", line_start: 1 },
+    ]);
+    assert.ok(prompt.includes("Prior findings from an earlier review round: [high] legacy issue (src/legacy.js:1)"));
+    assert.equal(result.chainRepeatedAreas, false);
+  });
+
+  // Seam-level, deliberately: the driver's review-resume path passes an
+  // explicitly re-derived resolveReworkScope(resumePreviousRecord), so what
+  // this pins is the OTHER guarantee — that omitting the carried value
+  // reaches the identical prompt.  The driver line itself is not exercised
+  // here (kusabi #334 review, [low]).
+  it("the seam's fallback derives the same scope-aware prompt as a carried resolution", async () => {
+    const prev = {
+      findings: [designFinding, mechFinding],
+      findingFiles: ["src/a.js", "src/b.js"],
+    };
+    // Fresh path: the driver carries its scopeResolution into the seam.
+    const fresh = await capturePromptWith(prev, resolveReworkScope(prev));
+    // Review-resume path: no fresh-round block, so the seam re-invokes the
+    // SAME decision point on the SAME previous record.  The two prompts must
+    // be byte-identical — and must actually be the scoped partition, so the
+    // equivalence is not trivially "both full".
+    const resumed = await capturePromptWith(prev, undefined);
+    assert.equal(resumed.prompt, fresh.prompt);
+    assert.ok(fresh.prompt.includes("This round was scoped to mechanical findings"));
+    assert.ok(fresh.prompt.includes("DELIBERATELY HELD OUT"));
+  });
+
+  it("renderReviewPriorFindings: full scope renders today's slot text verbatim", () => {
+    const prev = { findingsText: "TEXT", findings: [designFinding, mechFinding] };
+    assert.equal(renderReviewPriorFindings(prev, undefined), "TEXT");
+    assert.equal(renderReviewPriorFindings(prev, { scope: "full", findings: [] }), "TEXT");
+    assert.equal(renderReviewPriorFindings(prev, null), "TEXT");
+    assert.equal(renderReviewPriorFindings(null, undefined), "(none -- first review round)");
+    assert.equal(renderReviewPriorFindings(undefined, undefined), "(none -- first review round)");
+  });
+
+  it("renderReviewPriorFindings: a scoped round with nothing held says so", () => {
+    // All-mechanical set: the round is mechanical-scoped and every finding
+    // is in scope — the held list must render an explicit "nothing held"
+    // marker, never a throw.
+    const prev = { findings: [mechFinding], findingFiles: ["src/b.js"] };
+    const scope = resolveReworkScope(prev);
+    assert.equal(scope.scope, "mechanical");
+    const slot = renderReviewPriorFindings(prev, scope);
+    assert.ok(slot.includes("This round was scoped to mechanical findings"));
+    assert.ok(slot.includes("No prior findings were held out of this round's scope"));
+  });
+
+  it("inScopeFindingFiles narrows to the in-scope files only", () => {
+    const prev = {
+      findings: [designFinding, mechFinding],
+      findingFiles: ["src/a.js", "src/b.js"],
+    };
+    const scope = resolveReworkScope(prev);
+    assert.equal(scope.scope, "mechanical");
+    assert.deepEqual(inScopeFindingFiles(prev, scope), ["src/b.js"]);
+    // Full scope passes the stored findingFiles through unchanged (today's
+    // exact input to hasRepeatedAreas).
+    assert.deepEqual(inScopeFindingFiles(prev, undefined), ["src/a.js", "src/b.js"]);
+    // Old record without findingFiles: full scope degrades to undefined.
+    assert.equal(inScopeFindingFiles({ findingsText: "x" }, undefined), undefined);
   });
 });

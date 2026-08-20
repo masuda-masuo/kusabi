@@ -1302,7 +1302,7 @@ export async function runChainDriver({
   // Phases 5–13 (review → disposition → persistence → strategize), shared by
   // fresh rounds and review-resumes.  Mutates the cross-round state above in
   // place; returns { done: true, text } when the chain ended.
-  async function finishRound({ round, roundRecord, previousRecord, probeCtx, implementRefusal = null }) {
+  async function finishRound({ round, roundRecord, previousRecord, probeCtx, implementRefusal = null, reworkScope }) {
     const {
       chainChangedPaths, chainNewlyChanged, chainStatusObserved,
       chainStatusOutput, chainBaseLog, chainDeliverables, chainUntracked, chainTruncation,
@@ -1326,6 +1326,14 @@ export async function runChainDriver({
       chainStatusOutput, chainBaseLog, chainUntracked, chainTruncation, roundRecord,
       chainChangedPaths, chainNewlyChanged, chainStatusObserved, chainDeliverables,
       flagsModel, _dispatchWithFallback: reviewDispatch,
+      // The round's resolved scope (kusabi #334), carried from the driver's
+      // single decision point — the same value buildImplementText already
+      // receives — so the review prompt and the repeated-areas signal are
+      // derived from the SAME decision, never from a second copy of the
+      // branch table.  runReviewPhase falls back to resolveReworkScope on
+      // the same previousRecord when this is absent (review-resume callers
+      // without a fresh scopeResolution, older callers).
+      reworkScope,
     });
     // ---- phase 5b: qualifying refusal (kusabi #293) ----
     // `skipReview` is the empty-change-set signal the discard has always been
@@ -1830,12 +1838,15 @@ export async function runChainDriver({
           chainTruncation: reviewCtx.chainTruncation,
           worktreeChanged: reviewCtx.worktreeChanged,
         };
+        // The interrupted round is the last record in `records`; the
+        // previous COMPLETE round is the one before it.  Named once because
+        // both the review's previousRecord and the scope derivation below
+        // must see the SAME record.
+        const resumePreviousRecord = records.length >= 2 ? records[records.length - 2] : null;
         const result = await finishRound({
           round,
           roundRecord,
-          // The interrupted round is the last record in `records`; the
-          // previous COMPLETE round is the one before it.
-          previousRecord: records.length >= 2 ? records[records.length - 2] : null,
+          previousRecord: resumePreviousRecord,
           probeCtx,
           // No implement job runs on this path, so the refusal is READ from
           // the persisted record (kusabi #293): runImplementPhase stamps the
@@ -1845,6 +1856,13 @@ export async function runChainDriver({
           // discard on resume.  Records predating the stamp read as null and
           // route exactly as they did before refusals existed.
           implementRefusal: roundRecord.implementRefusal ?? null,
+          // Kusabi #334: this path has no fresh-round block, so the scope is
+          // re-derived from the SAME single decision point
+          // (resolveReworkScope) on the SAME previous record.  The function
+          // is deterministic in its input, so the resume derives exactly the
+          // scope the fresh path derived (and the interrupted record's
+          // reworkScope field records) for this round.
+          reworkScope: resolveReworkScope(resumePreviousRecord),
         });
         if (result.done) return result.text;
         continue;
@@ -2039,6 +2057,10 @@ export async function runChainDriver({
         previousRecord,
         probeCtx: probeResult,
         implementRefusal,
+        // The scope resolution computed above (kusabi #334) is carried into
+        // the review seam so the review prompt and the repeated-areas signal
+        // derive from the SAME decision that shaped the implement brief.
+        reworkScope: scopeResolution,
       });
       if (result.done) return result.text;
     }

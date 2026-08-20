@@ -176,6 +176,10 @@ prior finding is genuinely fixed. A NEW objection is justified ONLY by a
 demonstrable defect in shipped behavior. Do not raise stylistic or
 test-construction preferences the previous round implicitly accepted.
 The bar does NOT rise between rounds.
+Findings the block above marks as deliberately held out of this round's scope
+are still OPEN. Re-report each held finding you can confirm remains unfixed,
+described as still open and outside the reviewed round's scope — never as work
+the round failed to do. A held finding is not evidence of a stalled round.
 </anti_ratchet>
 
 <final_check>
