@@ -700,6 +700,62 @@ async function runHeadCompareProbe({ baseSha, callTool, container }) {
   return { probe: "P1: HEAD clean", passed, detail };
 }
 
+/**
+ * The chain-start refusal for a `--session` whose provenance cannot be
+ * established on the agy backend (kusabi #321), or null when the chain may
+ * proceed.
+ *
+ * A REFUSAL, not a note, and a property-shaped gate, not a flag-shaped one:
+ * it fires on "this id's provenance is not provably agy", never on "the
+ * operator typed --session".  The provenance is computed at command start,
+ * where the job store is in hand: the owner record of the session names its
+ * backend, and no owner means the id's provenance is unknown.  Without this
+ * gate an unprovable id sailed through the whole of setup — chain
+ * directory, verify baseline, smoke baseline, container work — and only
+ * then failed inside agyDispatch, leaving a chain record that cannot be
+ * resumed: the expensive half ran first, and the thing it was waiting to
+ * discover was knowable before any of it started.
+ *
+ * The property shape needs no flag-shaped branch: an id the caller
+ * resolved FROM the job store arrives with its owner record and is
+ * provable by construction, so the gate never fires on it — no special case
+ * and no exemption exist.  An id whose owner record names a DIFFERENT
+ * backend is the same class of problem as an id with no owner at all: it is
+ * the operator's input, it is knowable now, and running the chain cannot
+ * make it correct — both refuse here.  The module-level backstop in
+ * agy-dispatch.mjs (assertNoAgySession) stays exactly as it is; this is the
+ * early, friendly refusal in front of it, not a replacement.
+ *
+ * @param {object} opts
+ * @param {string|null|undefined} [opts.session] — the --session flag value.
+ * @param {"opencode"|"claude"|"agy"|null|undefined} [opts.provenance] — the
+ *        backend the job store established as the session's owner, or null
+ *        when no owner record exists.
+ * @param {"opencode"|"claude"|"agy"} opts.implementBackend — the resolved
+ *        implement backend of the chain about to start.
+ * @returns {string|null}
+ */
+export function sessionProvenanceRefusal({ session, provenance, implementBackend }) {
+  if (!session) return null;
+  if (implementBackend !== "agy") return null;
+  if (provenance === "agy") return null;
+  if (!provenance) {
+    return (
+      "dispatch refused: --session " + session + " — no owner record for it exists in the job store, so its " +
+      "provenance cannot be established (kusabi #321). An agy conversation_id and a claude session id are " +
+      "both bare UUIDs, so an agy chain passes an id to `--conversation` only when an agy job recorded it. " +
+      "Nothing was started: no chain state, no job and no round state exist. " +
+      "Drop --session, or pass an id that a recorded job on this directory used."
+    );
+  }
+  return (
+    "dispatch refused: --session " + session + " belongs to the " + provenance + " backend, but this chain's " +
+    "implement phase resolves to the agy backend (kusabi #321). A session id is backend-specific, and the " +
+    "agy dispatch would resume it only on positive provenance. Nothing was started: no chain state, no job " +
+    "and no round state exist. Run the chain on the " + provenance + " backend, or drop --session."
+  );
+}
+
 export async function cmdChain(cwd, { flags, text }) {
   // ---- brief-file resolution ----
   text = readBriefFile(flags, text);
@@ -737,7 +793,8 @@ export async function cmdChain(cwd, { flags, text }) {
   // store is in hand — here, exactly as cmdTask does: the owner record of
   // the session names its backend.  No owner means the id's provenance is
   // unknown and an agy chain fails closed at dispatch rather than passing
-  // the id to `--conversation`.
+  // the id to `--conversation`.  sessionProvenanceRefusal below gates it at
+  // command start (kusabi #321), before any setup runs.
   const initialSessionOwner = flags.session
     ? latestJob(stateDir, (j) => j.sessionID === flags.session)
     : null;
@@ -767,6 +824,25 @@ export async function cmdChain(cwd, { flags, text }) {
     ? resolveDispatchBackend({ flags, phase: "rework", config })
     : implementDispatch;
   const reviewDispatch = resolveDispatchBackend({ flags, phase: "review", config });
+  // ---- session-provenance refusal (kusabi #321) ----
+  // The provenance computed above is the agy dispatch's resume gate, but it
+  // was never gated HERE: an id with no owner record (or one owned by a
+  // different backend) sailed through the whole of setup — chain directory,
+  // verify baseline, smoke baseline, container work — and only then failed
+  // inside agyDispatch, leaving a chain record that cannot be resumed.
+  // Refuse at the same stage as the #250 / #292 refusals — before
+  // createChainDir and before any baseline measurement, so no chain state
+  // and no container work exist when this fires.  The gate is on the
+  // PROPERTY (an agy implement phase + a session whose provenance is not
+  // provably agy), not on the --session flag: an id the caller resolved
+  // FROM the job store arrives with its owner record and is provable by
+  // construction, so this gate never fires on it.
+  const sessionRejection = sessionProvenanceRefusal({
+    session: flags.session,
+    provenance: sessionProvenance,
+    implementBackend: implementDispatch.backend,
+  });
+  if (sessionRejection) throw new Error(sessionRejection);
   // Both checked BEFORE createChainDir (kusabi #289): a refusal must leave no
   // chain state behind, and the container requirement used to fire one line
   // after the directory it orphaned.  The message is unchanged, and it stays
