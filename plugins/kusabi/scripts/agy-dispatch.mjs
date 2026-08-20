@@ -17,10 +17,29 @@
 // The CLI contract (field-verified by a hand run, 2026-08-11)
 // ---------------------------------------------------------------------------
 //
-//   agy -p <prompt> --output-format json --model <id> --print-timeout <duration>
+//   agy -p <prompt> --output-format stream-json --model <id> --print-timeout <duration>
 //         [--json-schema <schema>] [--conversation <id>]
 //
-// and a single JSON object on stdout:
+// and an NDJSON event stream on stdout, one object per line, discriminated
+// by the `event` key (NOT `type` — that is the claude vocabulary; agy uses
+// `event`).  Three event kinds were field-verified on 2026-08-20:
+//
+//   {"event":"init","conversation_id":"<uuid>","init":{model,cwd,tools,
+//     permission_mode,json_schema}}                     — the conversation id
+//                                                         sits at the TOP level
+//   {"event":"step_update","step_update":{conversation_id,step_index,state,
+//     step_type,tool_name?,tool_info?,usage?,…}}        — repeated per step; a
+//                                                         tool step appears as
+//                                                         ACTIVE then DONE (or
+//                                                         ERROR), same index
+//   {"event":"result","result":{…}}                     — the terminal line; the
+//                                                         inner `result` object
+//                                                         is BYTE-SHAPE-IDENTICAL
+//                                                         to the whole object
+//                                                         `--output-format json`
+//                                                         used to print
+//
+// The terminal `result.result` payload therefore keeps that shape:
 //
 //   {"conversation_id":"<uuid>","status":"SUCCESS","response":"<text>",
 //    "duration_seconds":152.4,"num_turns":2,
@@ -55,7 +74,7 @@
 //     conversation); #199's survey simply did not list it, so v1 recorded
 //     the CLI's `conversation_id` as the job's `sessionID` and resumed
 //     nothing.  A resuming dispatch now passes the recorded id back:
-//     `agy -p <prompt> --output-format json --model <id> --conversation
+//     `agy -p <prompt> --output-format stream-json --model <id> --conversation
 //     <id>`.  One gate is NOT like the other backends': an agy
 //     `conversation_id` and a claude session id are BOTH bare UUIDs, so
 //     shape cannot tell them apart — this module resumes a session only
@@ -74,11 +93,21 @@
 //     kusabi validates only the SHAPE (non-empty, no `:variant`), so a model
 //     added upstream works the day it ships instead of the day kusabi is
 //     updated.
-//   - No event stream: `--output-format json` prints one object at the end,
-//     so there is nothing to measure silence against.  `job.stats` is marked
-//     `instrumented: false` (the same marker pre-#215 claude records carry,
-//     which every reader already handles) and `watchdogS` is not applicable.
-//     `timeoutS`, an absolute wall-clock bound, is the OUTER bound: the
+//   - THE EVENT STREAM IS FOLDED WHILE IT RUNS (kusabi #332).  `stream-json`
+//     prints one event per line as it happens, so `job.stats` is MEASURED, not
+//     structural: `instrumented: true` with real `events`, `steps`, `lastTool`,
+//     `lastActivity`, `models` (the marker post-#215 claude records carry,
+//     which every reader already handles).  A tool step is counted ONCE per
+//     step_index — the same index is emitted ACTIVE then DONE (or ERROR) —
+//     and `lastTool` is the tool_name of the most recent tool line, ERROR
+//     included.  `watchdogS` is LIVE: no parsed event for that long kills the
+//     child's whole process group and the job finishes `stalled`, exactly like
+//     the claude silence watchdog.  The armed interval is floored at
+//     AGY_WATCHDOG_FLOOR_S (120s): the real CLI emits NOTHING — not even
+//     `init` — for the first ~11 seconds of a healthy run (measured
+//     2026-08-20), so a short interval would kill correct runs; the floor is
+//     enforced in code, never left to callers.  `timeoutS`, an absolute
+//     wall-clock bound, is the OUTER bound: the
 //     spawned process carries its own INNER bound (`--print-timeout`, kusabi
 //     #326) that kusabi sets so the outer one always expires first.  That
 //     ordering is what keeps the outer bound authoritative — a too-long job
@@ -407,8 +436,9 @@ export function resolveAgyTimeoutS(value) {
 /**
  * Build the argv for an `agy -p` dispatch.
  *
- * Contract (field-verified, kusabi #199; resume flag #316; timeout #326):
- * `agy -p <prompt> --output-format json --model <id> --print-timeout <duration>
+ * Contract (field-verified, kusabi #199; resume flag #316; timeout #326;
+ * stream format #332):
+ * `agy -p <prompt> --output-format stream-json --model <id> --print-timeout <duration>
  * [--json-schema <schema>] [--conversation <id>]`
  * — and NOTHING else.  Every flag here appears in that contract; no flag is
  * invented, and `--dangerously-skip-permissions` is never passed (not
@@ -451,7 +481,7 @@ export function resolveAgyTimeoutS(value) {
 export function buildAgyArgs({ model, promptText, jsonSchema, conversationId, timeoutS }) {
   const args = [
     "-p", promptText ?? "",
-    "--output-format", "json",
+    "--output-format", "stream-json",
     "--model", model,
   ];
   // The SAME predicate runAgyProcess arms its outer timer with and
@@ -576,7 +606,16 @@ export function checkAgyArgvSize(args, limit = AGY_MAX_ARG_BYTES) {
 // =========================================================================
 
 /**
- * Parse the single JSON object `agy --output-format json` prints on stdout.
+ * Parse a single JSON object of the shape agy's result payload carries.
+ *
+ * Since kusabi #332 the CLI is invoked with `--output-format stream-json`,
+ * so this is no longer the primary reading — the terminal payload now
+ * arrives as the `result` event's inner object, folded by the stream
+ * accumulator.  It is kept as the LEGACY reading for a stream that never
+ * carried a terminal `result` event (a CLI build that ignores
+ * stream-json and prints the old single object still delivers work), and
+ * as the tolerant fallback that turns an unparseable stream into the
+ * established, quoted failure text instead of a bare parse error.
  *
  * Tolerant of surrounding noise in ONE narrow way: leading/trailing
  * whitespace.  Anything else (prose, NDJSON, an array) is a parse failure
@@ -600,6 +639,174 @@ export function parseAgyResult(stdout) {
     throw new Error("agy output is not a JSON object");
   }
   return parsed;
+}
+
+// =========================================================================
+// NDJSON stream parsing — pure (kusabi #332)
+// =========================================================================
+//
+// `agy -p --output-format stream-json` prints one JSON event object per
+// stdout line, discriminated by the `event` key (NOT `type` — the claude
+// vocabulary; the two backends are deliberately not unified).  These three
+// functions are the whole parse/fold contract, kept pure and separate from
+// the spawn/IO code so they are cheap to unit-test against fixture event
+// sequences — the same shape that made the claude side's tests cheap
+// (kusabi #215 Job B).
+
+/**
+ * Parse one line of the agy NDJSON stream.
+ *
+ * Returns null for anything that is not a JSON object on that line — blank
+ * lines, and non-JSON prose (the real CLI has been observed printing
+ * non-JSON warning lines, on the claude side and presumably here too).  The
+ * caller counts nulls for debugging but never treats one as fatal.
+ *
+ * @param {string} line
+ * @returns {object|null}
+ */
+export function parseAgyStreamLine(line) {
+  const trimmed = typeof line === "string" ? line.trim() : "";
+  if (!trimmed) return null;
+  let obj;
+  try {
+    obj = JSON.parse(trimmed);
+  } catch {
+    return null;
+  }
+  if (obj === null || typeof obj !== "object" || Array.isArray(obj)) return null;
+  return obj;
+}
+
+/**
+ * A fresh accumulator for folding an agy NDJSON stream into job stats.
+ *
+ * `toolStepIndexes` backs the count-once-per-step rule: the same
+ * `step_index` is emitted ACTIVE then DONE (or ERROR), so a step is counted
+ * only the first time its index is seen, while `lastTool` still follows the
+ * most recent tool line.
+ *
+ * @returns {{ events: number, steps: number, lastTool: string|null,
+ *             lastActivity: string|null, models: string[],
+ *             conversationIdFromInit: string|null, resultEvent: object|null,
+ *             toolStepIndexes: Set<number> }}
+ */
+export function initAgyStreamAccumulator() {
+  return {
+    events: 0,
+    steps: 0,
+    lastTool: null,
+    lastActivity: null,
+    models: [],
+    conversationIdFromInit: null,
+    resultEvent: null,
+    toolStepIndexes: new Set(),
+  };
+}
+
+/**
+ * Fold one parsed stream event into the accumulator (mutates and returns
+ * it).  Every recognized event kind contributes:
+ *
+ *   - `init`          — `conversation_id` at the TOP level (the field's
+ *                       observed position; measured 2026-08-20), kept in
+ *                       case the stream ends with no terminal `result`
+ *                       event so the run stays resumable; the echoed
+ *                       `init.model` joins `models` (deduped).
+ *   - `step_update`   — a `step_type: "tool"` line contributes to `steps`
+ *                       ONCE per `step_index` (the same index is re-emitted
+ *                       for every state transition: ACTIVE, then DONE or
+ *                       ERROR) and refreshes `lastTool` from `tool_name` on
+ *                       every such line — the ERROR line included, so a
+ *                       failed tool call is still the most recent tool.
+ *   - `result`        — kept as `resultEvent`; a later one replaces an
+ *                       earlier one, so a stream carrying more than one
+ *                       keeps the LAST (the terminal one).
+ *
+ * `events` and `lastActivity` update for every parsed object regardless of
+ * kind: `events` is "parsed event lines", not "recognized kinds".
+ *
+ * @param {object} acc — an accumulator from `initAgyStreamAccumulator`.
+ * @param {object} evt — one parsed stream event.
+ * @param {string} [now] — ISO timestamp; overridable for tests.
+ * @returns {object} The same accumulator, mutated.
+ */
+export function applyAgyStreamEvent(acc, evt, now = new Date().toISOString()) {
+  acc.events += 1;
+  acc.lastActivity = now;
+
+  const event = evt?.event;
+  if (event === "init") {
+    // The conversation id is a TOP-LEVEL sibling of the `init` object, not
+    // a field of it (measured 2026-08-20).
+    if (typeof evt.conversation_id === "string" && evt.conversation_id) {
+      acc.conversationIdFromInit = evt.conversation_id;
+    }
+    const init = evt.init;
+    if (init && typeof init === "object") {
+      const model = init.model;
+      if (typeof model === "string" && model && !acc.models.includes(model)) {
+        acc.models.push(model);
+      }
+    }
+  } else if (event === "step_update") {
+    const su = evt.step_update;
+    if (su && typeof su === "object" && su.step_type === "tool") {
+      // One step per step_index, not one per state transition: the observed
+      // protocol re-emits the SAME index for ACTIVE then DONE (or ERROR),
+      // so counting every line would count each tool call up to three times.
+      // A line without a numeric index cannot be deduped safely, so it is
+      // not counted — but it still refreshes lastTool below.
+      if (typeof su.step_index === "number" && !acc.toolStepIndexes.has(su.step_index)) {
+        acc.toolStepIndexes.add(su.step_index);
+        acc.steps += 1;
+      }
+      if (typeof su.tool_name === "string" && su.tool_name) {
+        acc.lastTool = su.tool_name;
+      }
+    }
+  } else if (event === "result") {
+    acc.resultEvent = evt;
+  }
+  return acc;
+}
+
+// The FLOOR of the armed silence-watchdog interval, in seconds (kusabi
+// #332).
+//
+// WHY 120s: the real agy CLI emits NOTHING for the first ~11 seconds of a
+// healthy run — even the `init` line is not flushed until then (measured
+// 2026-08-20: the output file stayed at 0 bytes for ~11s, grew at 11s,
+// 13s, 17s, finishing at 11847B).  A silence watchdog armed below that
+// would kill correct runs on every dispatch.  The floor is enforced HERE,
+// in code, and never left to callers passing a sane value.
+export const AGY_WATCHDOG_FLOOR_S = 120;
+
+/**
+ * Resolve the silence-watchdog bound for an agy dispatch: the one place
+ * that decides whether a usable interval was supplied and what number is
+ * armed.
+ *
+ * The floor is applied AFTER the refusal: a positive finite number is
+ * raised to AGY_WATCHDOG_FLOOR_S when below it, and passes through
+ * unchanged at or above it — the armed interval is NEVER less than the
+ * floor, whatever the caller passes.  Anything that is not a positive
+ * finite number (absent, null, zero, negative, NaN, Infinity, a string)
+ * arms NO watchdog at all: the same refusal discipline resolveAgyTimeoutS
+ * applies to the outer bound, so the two bound decisions cannot disagree
+ * about a shape.
+ *
+ * `agyDispatch` calls this ONCE and hands the same value to runAgyProcess
+ * (which re-checks with the same function, idempotently) and to the stall
+ * error text, so the armed interval and the interval the error names can
+ * never disagree.
+ *
+ * @param {unknown} value — the raw `opts.watchdogS` from the dispatch options.
+ * @returns {number|null} the armed interval in seconds (floored), or null
+ *          when no usable interval was supplied.
+ */
+export function agyWatchdogSeconds(value) {
+  if (!isUsableTimeoutS(value)) return null;
+  return Math.max(value, AGY_WATCHDOG_FLOOR_S);
 }
 
 /**
@@ -779,17 +986,24 @@ function killProcessGroup(child) {
 }
 
 /**
- * Spawn the agy CLI and collect its single JSON object.
+ * Spawn the agy CLI and fold its NDJSON event stream as it arrives.
  *
- * There is no stream to fold, so this is deliberately much smaller than
- * `runClaudeProcess`: one absolute `timeoutS` bound and a process-group
- * kill.  A silence watchdog is NOT implemented rather than faked — with
- * `--output-format json` nothing arrives until the end, so any silence
- * measurement would be measuring the normal case.
+ * `--output-format stream-json` (kusabi #332) makes the run observable:
+ * each complete stdout line is delivered to `onLine` the moment it arrives,
+ * the silence clock resets on every PARSED event, and the folded stream
+ * decides `job.stats` and the terminal payload while the child still runs —
+ * no more waiting for one blob at exit.
  *
- * This is the OUTER bound.  The child carries its own inner bound
+ * The OUTER bound (`timeoutS`) and the silence watchdog (`watchdogS`) are
+ * independent bounds.  The child carries its own inner bound
  * (`--print-timeout`, built by buildAgyArgs) set strictly larger, so THIS
- * timer is the one that fires — see AGY_PRINT_TIMEOUT_MARGIN_S.
+ * timer is the one that fires — see AGY_PRINT_TIMEOUT_MARGIN_S.  The
+ * watchdog measures time since the last parsed stream event and kills the
+ * group on expiry; the armed interval is never below
+ * AGY_WATCHDOG_FLOOR_S (agy emits nothing, not even `init`, for the first
+ * ~11 seconds of a healthy run — measured 2026-08-20), and the floor is
+ * applied by agyWatchdogSeconds in the CALLER so the stall error text and
+ * the armed interval cannot disagree.
  *
  * @param {object} opts
  * @param {string} opts.bin
@@ -799,19 +1013,34 @@ function killProcessGroup(child) {
  *        resolved (resolveAgyTimeoutS).  Guarded by the SAME predicate
  *        buildAgyArgs uses on the same value: a positive finite number
  *        arms this timer, anything else arms nothing (kusabi #328).
+ * @param {number|null} [opts.watchdogS] — the value agyDispatch already
+ *        resolved and FLOORED (agyWatchdogSeconds): a positive finite
+ *        number arms the silence watchdog at that value, anything else
+ *        arms none.
  * @param {(info: {pid: number}) => void} [opts.onStart] — called with the
  *        child's pid the instant it exists, so `cancel` has a lever.
+ * @param {(line: string) => void} [opts.onLine] — called with each complete
+ *        stdout line, parsed or not; the caller folds parsed lines into its
+ *        accumulator.  Wrapped: a stats-fold bug must never take down the
+ *        dispatch.
+ * @param {({kind: "fired", silenceS: number}|{kind: "kill"}) => void}
+ *        [opts.onWatchdog] — called with `{kind: "fired", silenceS}` the
+ *        moment the watchdog expires (BEFORE the group kill, so the audit
+ *        trail can never be lost to the kill) and with `{kind: "kill"}`
+ *        after the kill.  Wrapped: an audit-trail failure must never take
+ *        down the kill.
  * @returns {Promise<{ code: number|null, stdout: string, stderr: string,
- *                     timedOut: boolean, spawnError: Error|null }>}
+ *                     timedOut: boolean, stalled: boolean,
+ *                     spawnError: Error|null }>}
  */
-export function runAgyProcess({ bin, args, cwd, timeoutS, onStart }) {
+export function runAgyProcess({ bin, args, cwd, timeoutS, watchdogS, onStart, onLine, onWatchdog }) {
   return new Promise((resolve) => {
     const child = spawn(bin, args, {
       cwd,
       env: { ...process.env, KUSABI_WORKER_CONTEXT: "1" },
       stdio: ["ignore", "pipe", "pipe"],
-      // Own process group (session leader): the timeout kill targets the
-      // group, so agy's children die with it.
+      // Own process group (session leader): the timeout/watchdog kill
+      // targets the group, so agy's children die with it.
       detached: true,
     });
     if (typeof onStart === "function" && child.pid) {
@@ -821,11 +1050,41 @@ export function runAgyProcess({ bin, args, cwd, timeoutS, onStart }) {
     let stdout = "";
     let stderr = "";
     let timedOut = false;
+    let stalled = false;
     let spawnError = null;
+    let lineBuffer = "";
+    // The silence clock starts at spawn, not at the first event: a child
+    // that never prints anything at all still trips the watchdog (the same
+    // rule as the claude backend, kusabi #215 Job B item 3).
+    let lastEventAt = Date.now();
 
+    // Delivers one complete NDJSON line to the caller and resets the
+    // silence clock the watchdog measures against.  Only a PARSED event
+    // resets the clock: an unparseable prose line is stream noise, not
+    // activity — it must not masquerade as an event and hold the watchdog
+    // off.
+    function deliverLine(line) {
+      if (parseAgyStreamLine(line) !== null) lastEventAt = Date.now();
+      if (typeof onLine === "function") {
+        try { onLine(line); } catch { /* a stats-fold bug must not take down the dispatch */ }
+      }
+    }
+
+    // UTF-8 decoding must be stream-level, not chunk-level: a multibyte
+    // character split across two "data" chunks decodes to U+FFFD under
+    // per-chunk toString(), corrupting the JSON line it sits in — and a
+    // corrupted terminal result line is a lost run.  setEncoding routes
+    // chunks through a StringDecoder that holds partial byte sequences back
+    // until they complete.
     child.stdout.setEncoding("utf8");
     child.stderr.setEncoding("utf8");
-    child.stdout.on("data", (chunk) => { stdout += chunk; });
+    child.stdout.on("data", (chunk) => {
+      stdout += chunk;
+      lineBuffer += chunk;
+      const lines = lineBuffer.split("\n");
+      lineBuffer = lines.pop(); // last element: an unterminated partial line, or ""
+      for (const line of lines) deliverLine(line);
+    });
     child.stderr.on("data", (chunk) => { stderr += chunk; });
     child.on("error", (err) => { spawnError = err; });
 
@@ -843,9 +1102,44 @@ export function runAgyProcess({ bin, args, cwd, timeoutS, onStart }) {
         }, timeoutS * 1000)
       : null;
 
+    // Silence watchdog (kusabi #332): polled rather than a single deadline
+    // timer, since the bound restarts on every parsed stream event.  250ms
+    // resolution keeps a small test watchdog tight without meaningful
+    // overhead against the real multi-minute intervals.  The bound itself
+    // was already resolved and floored by agyWatchdogSeconds in the caller;
+    // re-checking here (idempotently) keeps a direct call to this function
+    // honest too.  Reports each step to the caller so the stall lands in
+    // the job's audit trail AT THE MOMENT it is detected, not after the
+    // process has closed — the "fired" notification runs BEFORE the group
+    // kill, so a failing trail can never swallow the kill.  Wrapped: an
+    // audit-trail failure must never take down the kill that is this
+    // watchdog's actual job.
+    const armedWatchdogS = agyWatchdogSeconds(watchdogS);
+    const notifyWatchdog = (event) => {
+      if (typeof onWatchdog !== "function") return;
+      try { onWatchdog(event); } catch { /* best-effort audit trail */ }
+    };
+    const watchdogTimer = armedWatchdogS !== null
+      ? setInterval(() => {
+          if (timedOut || stalled) return;
+          const silenceMs = Date.now() - lastEventAt;
+          if (silenceMs > armedWatchdogS * 1000) {
+            stalled = true;
+            clearInterval(watchdogTimer);
+            // Measured silence, rounded to seconds — the same quantity the
+            // opencode/claude watchdog reports, not the configured bound.
+            notifyWatchdog({ kind: "fired", silenceS: Math.round(silenceMs / 1000) });
+            killProcessGroup(child);
+            notifyWatchdog({ kind: "kill" });
+          }
+        }, 250)
+      : null;
+
     child.on("close", (code) => {
       if (timer) clearTimeout(timer);
-      resolve({ code, stdout, stderr, timedOut, spawnError });
+      if (watchdogTimer) clearInterval(watchdogTimer);
+      if (lineBuffer) deliverLine(lineBuffer);
+      resolve({ code, stdout, stderr, timedOut, stalled, spawnError });
     });
   });
 }
@@ -895,8 +1189,11 @@ export function runAgyProcess({ bin, args, cwd, timeoutS, onStart }) {
  *        (the outer timer and `--print-timeout`); any other shape — a
  *        string, NaN, zero, negative, Infinity, null, absent — arms
  *        neither (kusabi #328).
- * @param {number} [opts.watchdogS] — accepted for contract parity; not
- *        applicable (no event stream to measure silence against).
+ * @param {number} [opts.watchdogS] — the raw silence bound in seconds;
+ *        resolved ONCE here (agyWatchdogSeconds, which FLOORS it at
+ *        AGY_WATCHDOG_FLOOR_S).  No parsed stream event for the armed
+ *        interval kills the process group and the job finishes
+ *        `status: "stalled"` (kusabi #332).
  * @param {(string|string[])[]} [opts.tiers]
  * @param {number} [opts.round]
  * @param {number} [opts.tierIndex]
@@ -936,6 +1233,17 @@ export async function agyDispatch(opts) {
   // timer without `--print-timeout`, or the reverse — is impossible,
   // because there is only one resolution and both sites consume it.
   const timeoutS = resolveAgyTimeoutS(opts.timeoutS);
+  // ---- the ONE watchdog decision (kusabi #332) ----
+  // `watchdogS` is resolved and floored ONCE here, and the SAME value feeds
+  // runAgyProcess (the armed interval) and the stall error text, so the two
+  // can never disagree about the interval.  agyWatchdogSeconds REFUSES every
+  // shape that is not a positive finite number (null arms NO watchdog) and
+  // raises any positive value below AGY_WATCHDOG_FLOOR_S up to the floor —
+  // the real CLI emits nothing, not even `init`, for the first ~11 seconds
+  // of a healthy run (measured 2026-08-20), so a shorter interval would
+  // kill correct runs.  The floor is enforced in code, never left to
+  // callers passing a sane value.
+  const watchdogS = agyWatchdogSeconds(opts.watchdogS);
   // `session` survived assertNoAgySession, so it is either absent or a
   // provenance-proven agy conversation id — the only shape that may become
   // a `--conversation` argument.  `timeoutS` becomes agy's INNER bound
@@ -976,11 +1284,13 @@ export async function agyDispatch(opts) {
     modelVariant: null,
     startedAt: new Date().toISOString(),
     finishedAt: null,
-    // No event stream (`--output-format json`), so these counters are
-    // structural, not measured — the same marker pre-#215 claude records
-    // carry, which `kusabi status` already renders as "not instrumented".
+    // The stream is folded while the child runs (kusabi #332): the marker
+    // starts `true` because every dispatch this module makes now measures
+    // its stream, and the fold below replaces the zeros with measured
+    // values as events arrive.  `instrumented: false` keeps its meaning
+    // for records written before this change — they are never rewritten.
     stats: {
-      instrumented: false,
+      instrumented: true,
       events: 0,
       steps: 0,
       lastTool: null,
@@ -1051,16 +1361,63 @@ export async function agyDispatch(opts) {
     toolDeniesUnenforced: unenforcedDenies,
   });
 
-  const { code, stdout, stderr, timedOut, spawnError } = await runAgyProcess({
+  // ---- run: fold the NDJSON stream as it arrives (kusabi #332) ----
+  // Each complete stdout line is parsed and folded into the accumulator the
+  // moment it arrives; `job.stats` is rewritten from the accumulator on
+  // every parsed event.  Bounded cadence for the SAVE, not for the fold: a
+  // chatty stream must not turn into a write per event, but `kusabi status`
+  // still needs to see the record move while the child is running.
+  const streamAcc = initAgyStreamAccumulator();
+  let lastStatsSaveAt = 0;
+  const STATS_SAVE_INTERVAL_MS = 1000;
+  const onLine = (rawLine) => {
+    const evt = parseAgyStreamLine(rawLine);
+    if (evt === null) {
+      // Not fatal (the real CLI has been observed printing non-JSON
+      // warning lines) — just not countable as a parsed event.
+      return;
+    }
+    applyAgyStreamEvent(streamAcc, evt);
+    job.stats = {
+      instrumented: true,
+      events: streamAcc.events,
+      steps: streamAcc.steps,
+      lastTool: streamAcc.lastTool,
+      permissionsAllowed: 0,
+      permissionsRejected: 0,
+      lastActivity: streamAcc.lastActivity,
+      models: streamAcc.models,
+    };
+    const now = Date.now();
+    if (now - lastStatsSaveAt >= STATS_SAVE_INTERVAL_MS) {
+      lastStatsSaveAt = now;
+      saveJob(stateDir, job);
+    }
+  };
+
+  const { code, stdout, stderr, timedOut, stalled, spawnError } = await runAgyProcess({
     bin,
     args,
     cwd: opts.cwd,
-    // The already-resolved value (the ONE decision above) — the same value
-    // buildAgyArgs consumed, so both bounds were decided together.
+    // The already-resolved values (the TWO decisions above) — the same
+    // values buildAgyArgs and the stall text consumed, so every bound was
+    // decided together.
     timeoutS,
+    watchdogS,
     onStart: ({ pid }) => {
       job.process = { pid, startTime: null, recordedAt: new Date().toISOString() };
       saveJob(stateDir, job);
+    },
+    onLine,
+    // The SAME event types the opencode and claude watchdogs write
+    // (prompt-execution.mjs, claude-dispatch.mjs), so stall auditing over
+    // events.ndjson is backend-agnostic and finally counts agy stalls too.
+    onWatchdog: ({ kind, silenceS }) => {
+      if (kind === "fired") {
+        appendEvent(stateDir, job.id, { type: "companion.watchdog.fired", silenceS });
+      } else {
+        appendEvent(stateDir, job.id, { type: "companion.watchdog.kill" });
+      }
     },
   });
 
@@ -1071,12 +1428,28 @@ export async function agyDispatch(opts) {
   if (spawnError) {
     job.status = "error";
     job.error = `agy dispatch failed: could not start ${bin}: ${spawnError.message}`;
+  } else if (stalled) {
+    // The silence watchdog killed the group (kusabi #332).  Same `stalled`
+    // STATUS and the opencode/claude watchdog's own wording, so a chain
+    // treats a stalled agy worker exactly like a stalled opencode/claude
+    // one.  The kill always ran (runAgyProcess only sets `stalled` after
+    // killProcessGroup), so the wording always names it.  The interval the
+    // text names is the ARMED one — the floored value, never what the
+    // caller happened to pass.
+    job.status = "stalled";
+    job.error = `watchdog: no events for ${watchdogS}s (process killed)`;
+    // The run stays resumable even though no terminal `result` arrived:
+    // the conversation id seen on `init` is the session.
+    job.sessionID = streamAcc.conversationIdFromInit ?? null;
   } else if (timedOut) {
     // Same failure status/text the opencode and claude paths use.
     job.status = "timeout";
     // The resolved value — the timer only fires when it is a positive
     // number, so this renders the same number the timer was armed with.
     job.error = `timed out after ${timeoutS}s`;
+    // Same resumability rule as the stall path: the init id survives a run
+    // the outer bound cut short.
+    job.sessionID = streamAcc.conversationIdFromInit ?? null;
   } else {
     // Parse FIRST, exit code second.  The payload rule is about not throwing
     // away completed work on a signal that is not authoritative, and a
@@ -1085,10 +1458,23 @@ export async function agyDispatch(opts) {
     // fails, and its error names the exit code.
     let parsed = null;
     let parseError = null;
-    try {
-      parsed = parseAgyResult(stdout);
-    } catch (err) {
-      parseError = err;
+    // The terminal payload is the stream's LAST `result` event's inner
+    // object — byte-shape-identical to what `--output-format json` used to
+    // print (measured 2026-08-20), so every downstream consumer receives
+    // the exact object it receives today.  When no terminal `result` event
+    // arrived, fall back to the LEGACY single-object reading: a stream that
+    // collapses to the old shape (a CLI build that ignores stream-json)
+    // still delivers its work; anything else is a failed job whose error
+    // names the exit code or the parse failure.
+    const resultObj = streamAcc.resultEvent?.result ?? null;
+    if (resultObj !== null && typeof resultObj === "object" && !Array.isArray(resultObj)) {
+      parsed = resultObj;
+    } else {
+      try {
+        parsed = parseAgyResult(stdout);
+      } catch (err) {
+        parseError = err;
+      }
     }
 
     if (parsed !== null) {
@@ -1096,7 +1482,7 @@ export async function agyDispatch(opts) {
       const outcome = agyPayload(parsed);
       if (outcome.ok) {
         job.status = "completed";
-        job.sessionID = parsed.conversation_id ?? null;
+        job.sessionID = parsed.conversation_id ?? streamAcc.conversationIdFromInit ?? null;
         job.payloadSource = outcome.payloadSource;
         payload = outcome;
         job.usage = {
@@ -1109,17 +1495,19 @@ export async function agyDispatch(opts) {
         job.status = "error";
         // The session id is still worth recording: a payload-less run is the
         // one an operator most wants to open in the agy UI.
-        job.sessionID = parsed.conversation_id ?? null;
+        job.sessionID = parsed.conversation_id ?? streamAcc.conversationIdFromInit ?? null;
         job.error = `agy dispatch failed: ${outcome.error}`;
       }
     } else if (code !== 0) {
       job.status = "error";
       const detail = (stderr || stdout || "(no output)").trim();
       job.error = `agy exited with code ${code}: ${detail}`;
+      job.sessionID = streamAcc.conversationIdFromInit ?? null;
     } else {
       job.status = "error";
       const snippet = (stdout || "").trim().slice(0, 300);
       job.error = `agy dispatch failed: ${parseError.message}: ${snippet || "(empty stdout)"}`;
+      job.sessionID = streamAcc.conversationIdFromInit ?? null;
     }
   }
 
