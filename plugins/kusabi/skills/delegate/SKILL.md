@@ -150,6 +150,12 @@ end up re-running a doomed cheap round three times.
   need to, say so explicitly". A real deviation then came back documented in source
   comments and could be adjudicated; a bare prohibition is either silently worked
   around or produces a distorted implementation.
+- **Excluding the design doc from the worker's scope does not exclude it from the
+  change.** If the doc currently ASSERTS something this change makes false, add a
+  `## Docs to update at inspection` list naming the section: the worker still must not
+  touch it, and the orchestrator works that list before publish. Do not key this off the
+  Non-goals wording — the brief that motivated the rule never mentioned docs at all, it
+  said "any other module", and its section went stale at merge regardless.
 - **A "stop and report" condition is not a stop.** A brief that said "if you hit the
   aggregate byte cap, stop and report rather than raising it yourself" was ignored at
   exactly that condition, and the chain still ended in `accept` with the full suite red.
