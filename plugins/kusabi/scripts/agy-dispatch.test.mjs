@@ -36,6 +36,11 @@ import {
   AGY_MAX_ARG_BYTES,
   checkAgyArgvSize,
   parseAgyResult,
+  parseAgyStreamLine,
+  initAgyStreamAccumulator,
+  applyAgyStreamEvent,
+  AGY_WATCHDOG_FLOOR_S,
+  agyWatchdogSeconds,
   agyPayload,
   describeAgyResult,
   mapAgyUsage,
@@ -230,7 +235,7 @@ describe("buildAgyArgs", () => {
     // runAgyProcess, which arms no timer for such a dispatch.
     assert.deepEqual(
       buildAgyArgs({ model: "gemini-3.6-flash-high", promptText: "Do the thing.", jsonSchema: null }),
-      ["-p", "Do the thing.", "--output-format", "json", "--model", "gemini-3.6-flash-high"],
+      ["-p", "Do the thing.", "--output-format", "stream-json", "--model", "gemini-3.6-flash-high"],
     );
     for (const timeoutS of [undefined, null, 0, -5]) {
       assert.equal(
@@ -248,11 +253,11 @@ describe("buildAgyArgs", () => {
     // way agy's own help prints durations (default 5m0s).
     assert.deepEqual(
       buildAgyArgs({ model: "m", promptText: "p", jsonSchema: null, timeoutS: 3600 }),
-      ["-p", "p", "--output-format", "json", "--model", "m", "--print-timeout", "1h5m0s"],
+      ["-p", "p", "--output-format", "stream-json", "--model", "m", "--print-timeout", "1h5m0s"],
     );
     assert.deepEqual(
       buildAgyArgs({ model: "m", promptText: "p", jsonSchema: null, timeoutS: 1800 }),
-      ["-p", "p", "--output-format", "json", "--model", "m", "--print-timeout", "35m0s"],
+      ["-p", "p", "--output-format", "stream-json", "--model", "m", "--print-timeout", "35m0s"],
     );
   });
 
@@ -278,7 +283,7 @@ describe("buildAgyArgs", () => {
     const args = buildAgyArgs({ model: "m", promptText: "p", jsonSchema: '{"type":"object"}' });
     assert.deepEqual(
       args,
-      ["-p", "p", "--output-format", "json", "--model", "m", "--json-schema", '{"type":"object"}'],
+      ["-p", "p", "--output-format", "stream-json", "--model", "m", "--json-schema", '{"type":"object"}'],
     );
   });
 
@@ -289,14 +294,14 @@ describe("buildAgyArgs", () => {
     });
     assert.deepEqual(
       args,
-      ["-p", "p", "--output-format", "json", "--model", "m",
+      ["-p", "p", "--output-format", "stream-json", "--model", "m",
        "--print-timeout", "35m0s", "--conversation", "6f5f0f1e-0000-4a1b-9c2d-1122334455aa"],
     );
     // Absent / empty / null ids leave a fresh-dispatch argv byte-identical.
     for (const conversationId of [undefined, null, ""]) {
       assert.deepEqual(
         buildAgyArgs({ model: "m", promptText: "p", jsonSchema: null, conversationId }),
-        ["-p", "p", "--output-format", "json", "--model", "m"],
+        ["-p", "p", "--output-format", "stream-json", "--model", "m"],
       );
     }
   });
@@ -544,6 +549,174 @@ describe("parseAgyResult", () => {
     assert.throws(() => parseAgyResult("this is not json"), /agy output is not JSON/);
     assert.throws(() => parseAgyResult("   "), /agy produced no output/);
     assert.throws(() => parseAgyResult("[1,2]"), /agy output is not a JSON object/);
+  });
+});
+
+// =========================================================================
+// NDJSON stream folding — pure (kusabi #332)
+// =========================================================================
+//
+// The parse/fold contract mirrors the claude trio (kusabi #215 Job B) but
+// with agy's OWN vocabulary: the discriminator is `event`, NOT `type`, and
+// a tool step is deduped on `step_index` because the same index is
+// re-emitted for every state transition (ACTIVE, then DONE or ERROR).
+
+describe("parseAgyStreamLine", () => {
+  it("parses one NDJSON event line", () => {
+    const line = JSON.stringify({ event: "init", conversation_id: "c1", init: { model: "gemini-3.5-flash-low" } });
+    const parsed = parseAgyStreamLine(line);
+    assert.equal(parsed.event, "init");
+    assert.equal(parsed.conversation_id, "c1");
+  });
+
+  it("returns null for blank, prose, array and null lines — counted, never fatal", () => {
+    assert.equal(parseAgyStreamLine(""), null);
+    assert.equal(parseAgyStreamLine("   "), null);
+    assert.equal(parseAgyStreamLine("this is not json at all"), null);
+    assert.equal(parseAgyStreamLine("[1,2]"), null);
+    assert.equal(parseAgyStreamLine("null"), null);
+    assert.equal(parseAgyStreamLine(null), null);
+    assert.equal(parseAgyStreamLine(undefined), null);
+  });
+});
+
+describe("initAgyStreamAccumulator", () => {
+  it("starts at structural zeros with null fields and an empty tool-index set", () => {
+    const acc = initAgyStreamAccumulator();
+    assert.equal(acc.events, 0);
+    assert.equal(acc.steps, 0);
+    assert.equal(acc.lastTool, null);
+    assert.equal(acc.lastActivity, null);
+    assert.deepEqual(acc.models, []);
+    assert.equal(acc.conversationIdFromInit, null);
+    assert.equal(acc.resultEvent, null);
+    assert.equal(acc.toolStepIndexes.size, 0);
+  });
+});
+
+describe("applyAgyStreamEvent", () => {
+  function initEvent(overrides = {}) {
+    return {
+      event: "init",
+      conversation_id: "6f5f0f1e-0000-4a1b-9c2d-1122334455aa",
+      init: { model: "gemini-3.5-flash-low", cwd: "/tmp", tools: [] },
+      ...overrides,
+    };
+  }
+  function toolStep(index, state, overrides = {}) {
+    return {
+      event: "step_update",
+      step_update: {
+        conversation_id: "6f5f0f1e-0000-4a1b-9c2d-1122334455aa",
+        step_index: index,
+        state,
+        step_type: "tool",
+        tool_name: "bash",
+        ...overrides,
+      },
+    };
+  }
+  function resultEvent(payload = { status: "SUCCESS", response: "done" }) {
+    return { event: "result", result: payload };
+  }
+
+  it("init: records the TOP-LEVEL conversation id and dedupes the model into models", () => {
+    const acc = initAgyStreamAccumulator();
+    applyAgyStreamEvent(acc, initEvent());
+    assert.equal(acc.conversationIdFromInit, "6f5f0f1e-0000-4a1b-9c2d-1122334455aa");
+    assert.deepEqual(acc.models, ["gemini-3.5-flash-low"]);
+    // The same model on a later init line is not doubled.
+    applyAgyStreamEvent(acc, initEvent());
+    assert.deepEqual(acc.models, ["gemini-3.5-flash-low"]);
+    assert.equal(acc.events, 2);
+  });
+
+  it("a tool step ACTIVE then DONE with the SAME step_index counts as ONE step (kusabi #332 criterion 3)", () => {
+    const acc = initAgyStreamAccumulator();
+    applyAgyStreamEvent(acc, initEvent());
+    applyAgyStreamEvent(acc, toolStep(3, "ACTIVE"));
+    applyAgyStreamEvent(acc, toolStep(3, "DONE"));
+    assert.equal(acc.steps, 1);
+    // events counts PARSED LINES, not steps: init + 2 transitions.
+    assert.equal(acc.events, 3);
+    assert.equal(acc.lastTool, "bash");
+  });
+
+  it("a tool step ending in ERROR is still counted and still refreshes lastTool", () => {
+    const acc = initAgyStreamAccumulator();
+    applyAgyStreamEvent(acc, initEvent());
+    applyAgyStreamEvent(acc, toolStep(7, "ACTIVE"));
+    applyAgyStreamEvent(acc, toolStep(7, "ERROR", { tool_name: "read", tool_info: { error: { type: "MCPError", message: "boom" } } }));
+    assert.equal(acc.steps, 1);
+    assert.equal(acc.lastTool, "read");
+  });
+
+  it("distinct step_indexes count as distinct steps, and lastTool follows the most recent line", () => {
+    const acc = initAgyStreamAccumulator();
+    applyAgyStreamEvent(acc, toolStep(1, "ACTIVE", { tool_name: "bash" }));
+    applyAgyStreamEvent(acc, toolStep(1, "DONE", { tool_name: "bash" }));
+    applyAgyStreamEvent(acc, toolStep(2, "ACTIVE", { tool_name: "write" }));
+    applyAgyStreamEvent(acc, toolStep(2, "DONE", { tool_name: "write" }));
+    assert.equal(acc.steps, 2);
+    assert.equal(acc.lastTool, "write");
+  });
+
+  it("a tool line WITHOUT a numeric step_index refreshes lastTool but is not counted (cannot dedup safely)", () => {
+    const acc = initAgyStreamAccumulator();
+    applyAgyStreamEvent(acc, toolStep(1, "ACTIVE"));
+    applyAgyStreamEvent(acc, toolStep(1, "DONE"));
+    applyAgyStreamEvent(acc, { event: "step_update", step_update: { state: "ACTIVE", step_type: "tool", tool_name: "weird" } });
+    assert.equal(acc.steps, 1);
+    assert.equal(acc.lastTool, "weird");
+  });
+
+  it("result: keeps the LAST result event (the terminal one)", () => {
+    const acc = initAgyStreamAccumulator();
+    applyAgyStreamEvent(acc, resultEvent({ status: "SUCCESS", response: "first" }));
+    applyAgyStreamEvent(acc, resultEvent({ status: "SUCCESS", response: "second" }));
+    assert.equal(acc.resultEvent.result.response, "second");
+  });
+
+  it("every parsed object updates events and lastActivity, unknown kinds included", () => {
+    const acc = initAgyStreamAccumulator();
+    applyAgyStreamEvent(acc, { event: "something-new" }, "2026-08-20T00:00:00.000Z");
+    assert.equal(acc.events, 1);
+    assert.equal(acc.lastActivity, "2026-08-20T00:00:00.000Z");
+  });
+});
+
+// =========================================================================
+// the silence-watchdog bound — the FLOOR (kusabi #332)
+// =========================================================================
+
+describe("agyWatchdogSeconds — the floor", () => {
+  it("AGY_WATCHDOG_FLOOR_S is 120 and the comment's reason is the measured cold start", () => {
+    // The real CLI emits nothing — not even `init` — for the first ~11
+    // seconds of a healthy run (measured 2026-08-20); the floor must sit
+    // well above that so a short caller interval never kills correct runs.
+    assert.equal(AGY_WATCHDOG_FLOOR_S, 120);
+  });
+
+  it("raises every positive value below the floor up to the floor (criterion 6)", () => {
+    for (const value of [1, 30, 60, 119, 120]) {
+      assert.equal(agyWatchdogSeconds(value), 120, `value=${value}`);
+    }
+  });
+
+  it("passes values at or above the floor through unchanged", () => {
+    assert.equal(agyWatchdogSeconds(121), 121);
+    assert.equal(agyWatchdogSeconds(300), 300);
+    assert.equal(agyWatchdogSeconds(900), 900);
+    assert.equal(agyWatchdogSeconds(3600), 3600);
+  });
+
+  it("refuses every shape that is not a positive finite number — nothing armed from it", () => {
+    // Same discipline as resolveAgyTimeoutS (kusabi #328/#330): a string,
+    // NaN, zero, a negative, Infinity, absent — none of them arms a
+    // watchdog at any interval.
+    for (const value of [undefined, null, 0, -5, -120, NaN, "3600", "30", Infinity, -Infinity, true, false, {}, []]) {
+      assert.equal(agyWatchdogSeconds(value), null, `value=${String(value)}`);
+    }
   });
 });
 
@@ -1018,6 +1191,14 @@ describe("resolveDispatchBackend — agy routing (criteria 3, 4, 5)", () => {
 // integration — fake `agy` binary (AGY_BIN)
 // =========================================================================
 
+// The fake now speaks the NDJSON protocol the real CLI prints under
+// `--output-format stream-json` (field-verified 2026-08-20): one object
+// per line, discriminated by `event` — `init` (conversation_id at the TOP
+// level), `step_update` (same step_index re-emitted ACTIVE then DONE or
+// ERROR), and a terminal `result` whose inner object is byte-shape-identical
+// to what `--output-format json` used to print.  Stream writes go through
+// fs.writeSync so a line is on the pipe BEFORE process.exit runs — the
+// multi-line streams must never be truncated by exit-flush races.
 const FAKE_AGY_SOURCE = `#!/usr/bin/env node
 import fs from "node:fs";
 
@@ -1044,6 +1225,31 @@ const base = {
   num_turns: 2,
   usage,
 };
+const modelIdx = argv.indexOf("--model");
+const model = modelIdx >= 0 ? argv[modelIdx + 1] : "gemini-3.6-flash-high";
+const conv = base.conversation_id;
+
+function emit(obj) {
+  fs.writeSync(1, JSON.stringify(obj) + NL);
+}
+function emitInit() {
+  emit({ event: "init", conversation_id: conv, init: { model, cwd: process.cwd(), tools: [], permission_mode: "auto", json_schema: null } });
+}
+function emitToolStep(index, name, state, info) {
+  emit({ event: "step_update", step_update: { conversation_id: conv, step_index: index, state, step_type: "tool", tool_name: name, tool_info: info } });
+}
+function emitResult(payload) {
+  emit({ event: "result", result: payload });
+}
+// The healthy stream every payload mode shares: init, one tool step that
+// arrives ACTIVE then DONE (the count-once-per-step_index rule), then the
+// terminal result.
+function emitHealthyStream(payload) {
+  emitInit();
+  emitToolStep(1, "bash", "ACTIVE", { name: "bash", parameters: { command: "ls" } });
+  emitToolStep(1, "bash", "DONE", { name: "bash", parameters: { command: "ls" } });
+  emitResult(payload);
+}
 
 if (mode === "exit") {
   process.stderr.write("agy: model not available" + NL);
@@ -1053,38 +1259,76 @@ if (mode === "garbage") {
   process.stdout.write("this is not json at all" + NL);
   process.exit(0);
 }
+if (mode === "stall-after-init") {
+  // One parsed event, then silence forever — the watchdog must kill us.
+  emitInit();
+  setInterval(() => {}, 1000);
+}
+if (mode === "no-result") {
+  // A stream that ends with NO terminal result event: the conversation id
+  // from init must still reach job.sessionID (kusabi #332 criterion 5).
+  emitInit();
+  emitToolStep(1, "bash", "ACTIVE", { name: "bash", parameters: { command: "ls" } });
+  emitToolStep(1, "bash", "DONE", { name: "bash", parameters: { command: "ls" } });
+  process.exit(0);
+}
+if (mode === "step-error") {
+  // A tool step that ends in ERROR is still ONE step and still refreshes
+  // lastTool (the failure line carries tool_name too).
+  emitInit();
+  emitToolStep(7, "read", "ACTIVE", { name: "read", parameters: { path: "x" } });
+  emitToolStep(7, "read", "ERROR", { name: "read", parameters: { path: "x" }, error: { type: "MCPError", message: "boom" } });
+  emitResult(base);
+  process.exit(0);
+}
+if (mode === "garbage-lines") {
+  // Non-JSON prose and blank lines interleaved with a healthy stream are
+  // counted, never fatal.
+  emitInit();
+  process.stdout.write("warning: something happened" + NL);
+  process.stdout.write(NL);
+  emitToolStep(1, "bash", "ACTIVE", { name: "bash", parameters: { command: "ls" } });
+  emitToolStep(1, "bash", "DONE", { name: "bash", parameters: { command: "ls" } });
+  process.stdout.write("trailing prose, still not JSON" + NL);
+  emitResult(base);
+  process.exit(0);
+}
 if (mode === "error-status-with-payload") {
   // A failed tool call anywhere in the transcript makes the CLI report
   // ERROR even though the answer was delivered in full.
-  process.stdout.write(JSON.stringify({ ...base, status: "ERROR" }));
+  emitHealthyStream({ ...base, status: "ERROR" });
   process.exit(0);
 }
 if (mode === "success-empty-payload") {
-  process.stdout.write(JSON.stringify({ ...base, status: "SUCCESS", response: "" }));
+  emitHealthyStream({ ...base, status: "SUCCESS", response: "" });
   process.exit(0);
 }
 if (mode === "structured-only") {
   const schemaIdx = argv.indexOf("--json-schema");
-  process.stdout.write(JSON.stringify({
+  emitHealthyStream({
     ...base,
     status: "ERROR",
     response: "",
     structured_output: { verdict: "approve", summary: "looks fine", findings: [], next_steps: [] },
     json_schema: schemaIdx >= 0 ? JSON.parse(argv[schemaIdx + 1]) : null,
-  }));
+  });
   process.exit(0);
 }
 if (mode === "review-json") {
-  process.stdout.write(JSON.stringify({
+  emitHealthyStream({
     ...base,
     response: JSON.stringify({ verdict: "approve", summary: "ok", findings: [], next_steps: [] }),
-  }));
+  });
   process.exit(0);
 }
 if (mode === "slow") {
   setInterval(() => {}, 1000); // never writes, never exits — the timeout must kill us
-} else {
-  process.stdout.write(JSON.stringify(base));
+} else if (mode === "ok") {
+  // The DEFAULT mode — and only the default: every explicit mode above has
+  // already decided its own exit (or permanent silence), so the healthy
+  // stream must not ALSO run for them (a mode that fell through here would
+  // emit init + the healthy stream and exit 0, silently masking itself).
+  emitHealthyStream(base);
   process.exit(0);
 }
 `;
@@ -1224,7 +1468,7 @@ describe("agyDispatch (fake agy binary)", () => {
     // 20 + AGY_PRINT_TIMEOUT_MARGIN_S = 320s, as a Go duration (kusabi #326).
     assert.deepEqual(calls[0], [
       "-p", "Do the thing.",
-      "--output-format", "json",
+      "--output-format", "stream-json",
       "--model", "gemini-3.6-flash-high",
       "--print-timeout", "5m20s",
     ]);
@@ -1329,12 +1573,127 @@ describe("agyDispatch (fake agy binary)", () => {
     assert.equal(typeof job.process.recordedAt, "string");
   });
 
-  it("marks stats as NOT instrumented — this backend has no event stream", async () => {
+  it("marks stats INSTRUMENTED with measured values — the stream is folded as it runs (kusabi #332)", async () => {
     const { job } = await agyDispatch(ctx.dispatchOptions());
-    assert.equal(job.stats.instrumented, false);
-    // The counters are present (not absent) so existing readers keep working.
-    for (const key of ["events", "steps", "permissionsAllowed", "permissionsRejected"]) {
+    // The healthy fake stream is init + one tool step (ACTIVE then DONE,
+    // ONE step) + the terminal result: every counter is measured, not
+    // structural.  The counters stay present (not absent) so existing
+    // readers keep working.
+    assert.equal(job.stats.instrumented, true);
+    assert.equal(job.stats.events, 4);
+    // The ACTIVE/DONE pair shares step_index 1: exactly ONE step.
+    assert.equal(job.stats.steps, 1);
+    assert.equal(job.stats.lastTool, "bash");
+    assert.ok(job.stats.lastActivity, "lastActivity must be set from the stream");
+    assert.deepEqual(job.stats.models, ["gemini-3.6-flash-high"]);
+    for (const key of ["permissionsAllowed", "permissionsRejected"]) {
       assert.equal(job.stats[key], 0, key);
+    }
+    // The record on disk carries the same measured stats.
+    const persisted = loadJob(ctx.stateDir, job.id);
+    assert.equal(persisted.stats.instrumented, true);
+    assert.equal(persisted.stats.steps, 1);
+    assert.equal(persisted.stats.lastTool, "bash");
+  });
+
+  it("a tool step ending in ERROR is still ONE step and still sets lastTool (kusabi #332)", async () => {
+    ctx.setMode("step-error");
+    const { job, resultText } = await agyDispatch(ctx.dispatchOptions());
+    // The ERROR line carries tool_name too, so the failed call is the most
+    // recent tool — exactly what an operator wants to see first.
+    assert.equal(job.status, "completed");
+    assert.equal(resultText, "implemented the thing per the brief");
+    assert.equal(job.stats.steps, 1);
+    assert.equal(job.stats.lastTool, "read");
+    assert.equal(job.stats.events, 4); // init + ACTIVE + ERROR + result
+    assert.equal(job.stats.instrumented, true);
+  });
+
+  it("garbage and blank lines interleaved in the stream are counted, never fatal (criterion 4)", async () => {
+    ctx.setMode("garbage-lines");
+    const { job, resultText } = await agyDispatch(ctx.dispatchOptions());
+    assert.equal(job.status, "completed");
+    assert.equal(resultText, "implemented the thing per the brief");
+    // The three unparseable lines (two prose, one blank) did not disturb the
+    // fold: events counts only PARSED lines, and the terminal result was
+    // still the payload.
+    assert.equal(job.stats.events, 4);
+    assert.equal(job.stats.steps, 1);
+    assert.equal(job.stats.lastTool, "bash");
+    assert.equal(job.sessionID, "6f5f0f1e-0000-4a1b-9c2d-1122334455aa");
+  });
+
+  it("a stream with NO terminal result event still yields sessionID from init (criterion 5)", async () => {
+    ctx.setMode("no-result");
+    const { job } = await agyDispatch(ctx.dispatchOptions());
+    // No payload was ever delivered, so the job fails — but the run stays
+    // resumable: the conversation id from `init` is the session.
+    assert.equal(job.status, "error");
+    assert.equal(job.sessionID, "6f5f0f1e-0000-4a1b-9c2d-1122334455aa");
+    assert.equal(job.stats.events, 3); // init + ACTIVE + DONE, no result
+    assert.equal(job.stats.steps, 1);
+    assert.equal(job.stats.instrumented, true);
+  });
+
+  it("watchdog: the job finishes stalled naming the FLOORED interval, the init id survives, and the trail is written (criterion 6)", async (t) => {
+    ctx.setMode("stall-after-init");
+    // The real interval would need a 120s wait (the floor), which no test
+    // may take: capture the armed interval and drive it manually, with a
+    // controllable clock, exactly like the timeout-bound tests mock
+    // setTimeout.
+    let captured = null;
+    const baseNow = 1_800_000_000_000;
+    let elapsed = 0;
+    t.mock.method(Date, "now", () => baseNow + elapsed);
+    t.mock.method(globalThis, "setInterval", (fn, ms) => { captured = { fn, ms }; return undefined; });
+    const pending = agyDispatch(ctx.dispatchOptions({ watchdogS: 30, timeoutS: 600 }));
+
+    // Wait until the folded init event is on the record, so the fire below
+    // is measured from ACTIVITY, not from spawn (the dispatch saves stats at
+    // its bounded cadence).
+    let seenEvents = 0;
+    for (let i = 0; i < 60 && seenEvents < 1; i += 1) {
+      await new Promise((r) => setTimeout(r, 25));
+      const rec = listJobs(ctx.stateDir)[0];
+      if (rec?.stats?.events) seenEvents = rec.stats.events;
+    }
+    assert.equal(seenEvents, 1, "the init event must be folded onto the record");
+    // The watchdog is a 250ms POLL against the armed bound (the same design
+    // as runClaudeProcess, so the cadence stays tight while the bound can be
+    // minutes long) \u2014 what is captured is the poll, and what the poll
+    // compares against is the FLOORED bound.  The floor's application is
+    // proven below by the error text and the reported silence, both naming
+    // 120s for a caller that asked for 30.
+    assert.equal(captured.ms, 250, "the watchdog poll cadence");
+    elapsed = AGY_WATCHDOG_FLOOR_S * 1000 + 1000;
+    captured.fn();
+
+    const { job } = await pending;
+    assert.equal(job.status, "stalled");
+    // The error names the ARMED interval — the floored one, never the
+    // caller's 30.
+    assert.equal(job.error, `watchdog: no events for ${AGY_WATCHDOG_FLOOR_S}s (process killed)`);
+    assert.equal(job.sessionID, "6f5f0f1e-0000-4a1b-9c2d-1122334455aa");
+    assert.equal(job.stats.instrumented, true);
+    assert.equal(job.stats.events, 1);
+    assert.deepEqual(job.stats.models, ["gemini-3.6-flash-high"]);
+    assert.ok(job.stats.lastActivity, "lastActivity must reflect the init event");
+
+    // Audit trail: fired BEFORE the kill, in that order, then the finished
+    // event — the same event types the opencode/claude watchdogs write.
+    const jdir = jobDir(ctx.stateDir, job.id);
+    const events = fs.readFileSync(path.join(jdir, "events.ndjson"), "utf8")
+      .trim().split("\n").map(JSON.parse);
+    const watchdogEvents = events.filter((e) => e.type.startsWith("companion.watchdog."));
+    assert.deepEqual(watchdogEvents.map((e) => e.type), ["companion.watchdog.fired", "companion.watchdog.kill"]);
+    assert.ok(watchdogEvents[0].silenceS >= AGY_WATCHDOG_FLOOR_S);
+    assert.equal(events.at(-1).type, "companion.agy.finished");
+    assert.equal(events.at(-1).status, "stalled");
+
+    // The whole process group is dead — no orphaned fake agy survives.
+    const pids = fs.readFileSync(ctx.pidsLog, "utf8").trim().split("\n").filter(Boolean).map(Number);
+    for (const pid of pids) {
+      assert.equal(isAlive(pid), false, `pid ${pid} survived the watchdog group kill`);
     }
   });
 
@@ -2109,7 +2468,7 @@ describe("agyDispatch — an oversized argv is refused before the spawn", () => 
     assert.equal(calls.length, 1);
     assert.deepEqual(calls[0], [
       "-p", atLimit,
-      "--output-format", "json",
+      "--output-format", "stream-json",
       "--model", "gemini-3.6-flash-high",
       "--print-timeout", "5m20s",
     ]);
