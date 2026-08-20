@@ -296,6 +296,110 @@ export function resolveReworkScope(previousRecord) {
 }
 
 /**
+ * Render the {{PRIOR_FINDINGS}} slot of the review prompt for a round
+ * (kusabi #334).
+ *
+ * The review seam receives the round's resolved scope the same way
+ * buildImplementText does, and this renderer partitions the previous round's
+ * findings from that ONE value.  A full-scope round (or no reworkScope at
+ * all) renders byte-for-byte what the pre-scoping review prompt rendered:
+ * previousRecord.findingsText verbatim, or the first-review marker when
+ * there is no previous record.  A scoped round renders a partition instead:
+ * the in-scope findings in full (the same per-finding renderer the implement
+ * prompt uses for its scoped subset) followed by the deliberately-held
+ * findings as one-line rows, marked still open and NOT a failure of this
+ * round.
+ *
+ * Held findings are identified by identity: reworkScope.findings is a subset
+ * of previousRecord.findings produced by resolveReworkScope, so an element
+ * of the previous list that is not in the subset is held.  Held findings
+ * KEEP being re-reported — they are open, they just were not in this round's
+ * scope — because the re-reporting is the only thing that keeps a mechanical
+ * round from approving and ending the chain with its design findings
+ * unfixed.  The prompt never tells the reviewer to drop them.
+ *
+ * @param {object|null|undefined} previousRecord
+ * @param {{scope: string, findings: Array}|undefined|null} reworkScope
+ * @returns {string}
+ */
+export function renderReviewPriorFindings(previousRecord, reworkScope) {
+  if (!reworkScope || reworkScope.scope === "full") {
+    // Byte-identical to the pre-scoping text (kusabi #334): the reviewer
+    // sees the whole prior list, exactly as today.
+    return previousRecord?.findingsText || "(none -- first review round)";
+  }
+  const previousFindings = Array.isArray(previousRecord?.findings) ? previousRecord.findings : [];
+  const inScope = Array.isArray(reworkScope.findings) ? reworkScope.findings : [];
+  const held = previousFindings.filter((f) => !inScope.includes(f));
+  const scopeWord = reworkScope.scope === "mechanical" ? "mechanical" : "design";
+  const lines = [];
+  lines.push(
+    "This round was scoped to " + scopeWord + " findings.  The prior findings the round was asked to resolve are:"
+  );
+  lines.push("");
+  lines.push(renderPriorFindings({ findings: inScope }));
+  lines.push("");
+  if (held.length > 0) {
+    lines.push(
+      "The following prior findings were known and DELIBERATELY HELD OUT of this round's scope. " +
+      "They are still open — this round was not asked to resolve them. " +
+      "Re-report each one you can confirm is still unfixed, described as still open and outside " +
+      "this round's scope — never as work this round failed to do:"
+    );
+    lines.push("");
+    lines.push(held.map(reviewFindingRow).join("\n"));
+  } else {
+    lines.push(
+      "No prior findings were held out of this round's scope: every known finding was in scope."
+    );
+  }
+  return lines.join("\n");
+}
+
+/**
+ * One-line row for a held finding in the scoped review prompt — the same
+ * "[severity] title (file:line)" shape renderGroupedFindingsText uses, so
+ * the reviewer recognises the held items from the previous round's report.
+ * Kept local: render.mjs is shared with the task route and this shape is
+ * only used by the chain review seam.
+ *
+ * @param {object|undefined} f
+ * @returns {string}
+ */
+function reviewFindingRow(f) {
+  const severity = f && f.severity ? f.severity : "unknown";
+  const title = f && f.title ? f.title : "(untitled)";
+  const file = f && f.file ? f.file : "?";
+  const lineStart = f && f.line_start !== undefined ? f.line_start : "?";
+  return "[" + severity + "] " + title + " (" + file + ":" + lineStart + ")";
+}
+
+/**
+ * Narrow the previous round's finding files to the ones the reviewed round
+ * was actually asked to resolve (kusabi #334).
+ *
+ * hasRepeatedAreas is shared surface with chain-stats (docs/design/
+ * phase-chain.md), so its name, signature and semantics are frozen — this
+ * function narrows what is PASSED to it, it does not fork the detector.  A
+ * full-scope round passes previousRecord.findingFiles exactly as the
+ * pre-scoping code did: every prior finding was in scope, so the computed
+ * signal is identical to today's.  A scoped round passes only the in-scope
+ * findings' files — a finding the round was told to leave alone is not
+ * evidence of a stall.
+ *
+ * @param {object|null|undefined} previousRecord
+ * @param {{scope: string, findings: Array}|undefined|null} reworkScope
+ * @returns {string[]|undefined}
+ */
+export function inScopeFindingFiles(previousRecord, reworkScope) {
+  if (!reworkScope || reworkScope.scope === "full") {
+    return previousRecord?.findingFiles;
+  }
+  const inScope = Array.isArray(reworkScope.findings) ? reworkScope.findings : [];
+  return inScope.map((f) => normalizeFilePath(f.file));
+}
+
+/**
  * Prepend the workspace header naming the exact container ID, or return the
  * text unchanged when there is no container.
  *
@@ -1049,6 +1153,7 @@ export async function runReviewPhase({
   container, brief, modelChain, chainId, cwd, previousRecord, baseSha,
   chainStatusOutput, chainBaseLog, chainUntracked, chainTruncation, roundRecord,
   chainChangedPaths, chainNewlyChanged, chainStatusObserved, chainDeliverables, flagsModel,
+  reworkScope,
   _dispatchWithFallback: _dispatch = dispatchWithFallback,
 } = {}) {
   const skipReview = shouldSkipReview({ chainStatusObserved, chainChangedPaths, chainNewlyChanged, chainDeliverables });
@@ -1102,7 +1207,17 @@ export async function runReviewPhase({
       untrackedFiles: chainUntracked,
       truncation: chainTruncation,
     });
-    const priorFindings = previousRecord?.findingsText || "(none -- first review round)";
+    // Single decision point (kusabi #334): the review seam reads the round's
+    // scope from the SAME resolveReworkScope decision the driver made — the
+    // driver carries its scopeResolution here, the way buildImplementText
+    // already receives it.  When the value is absent (older callers, tests)
+    // the same function is re-invoked on the same previousRecord; it is
+    // deterministic, so the review-resume path — which has no fresh-round
+    // block to carry a scopeResolution from — derives the same answer the
+    // fresh path derived.  Old records without scope information resolve to
+    // "full" and degrade to today's behaviour rather than throwing.
+    const reviewScope = reworkScope || resolveReworkScope(previousRecord);
+    const priorFindings = renderReviewPriorFindings(previousRecord, reviewScope);
 
     const reviewPromptText = promptTemplate
       .replaceAll("{{TARGET_LABEL}}", "container " + container + " changes")
@@ -1238,7 +1353,12 @@ export async function runReviewPhase({
     // Uses the stored findingFiles array instead of re-parsing the
     // human-readable findingsText, which was fragile: it broke on
     // finding titles containing parentheses and on path-form mismatches.
-    chainRepeatedAreas = hasRepeatedAreas(previousRecord?.findingFiles, chainParsedReview?.findings);
+    // Kusabi #334: the detector's semantics are shared with chain-stats, so
+    // what is narrowed here is the INPUT — previousFindingFiles is reduced to
+    // the previous round's findings that were in THIS round's scope.  Held
+    // findings (deliberately left for a later round) are not evidence of a
+    // stall; in-scope repeats still fire exactly as before.
+    chainRepeatedAreas = hasRepeatedAreas(inScopeFindingFiles(previousRecord, reviewScope), chainParsedReview?.findings);
   }
 
   // Single conduit: record state stays on roundRecord; the return carries
