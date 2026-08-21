@@ -50,6 +50,7 @@ function round({
   reviewFirstUsage = null,
   strategistUsage = null,
   worktreeChanged = null,
+  reworkScope,
 } = {}) {
   const safeFindings = Array.isArray(findings) ? findings : (findings === null ? null : undefined);
   const safeFindingFiles = Array.isArray(findingFiles) ? findingFiles : (findingFiles === null ? null : undefined);
@@ -81,6 +82,11 @@ function round({
   // ABSENT, exercising the old-record "unknown" path; pass true/false to
   // record a measured change/no-change.
   if (worktreeChanged !== null) r.worktreeChanged = worktreeChanged;
+  // reworkScope (kusabi #334): absent by default so records predating the
+  // scoped-rework regime stay indistinguishable from pre-scoping records;
+  // pass a scope name ("full" | "mechanical" | "design") to simulate a
+  // round run under the regime.
+  if (reworkScope !== undefined) r.reworkScope = reworkScope;
   return r;
 }
 
@@ -322,6 +328,269 @@ describe("computeStats", () => {
     // One eligible pair (round 1 -> round 2)
     assert.equal(stats.eligiblePairs, 1);
     // But neither previous nor current have the required fields, so repeatedNA++
+    assert.equal(stats.repeatedNA, 1);
+    assert.equal(stats.repeatedTrue, 0);
+  });
+
+  it("a scoped round repeating only a held finding's file is not a repeated area", () => {
+    const chains = [
+      chain({
+        chainId: "c1",
+        rounds: [
+          // Round 1 ran full scope and produced a mixed finding set: one
+          // design finding and one mechanical finding.
+          round({
+            round: 1, verdict: "needs-attention", disposition: "rework",
+            reworkScope: "full",
+            findingFiles: ["design.js", "mech.js"],
+            findings: [
+              { severity: "medium", title: "design issue", file: "design.js", line_start: 1, line_end: 1, kind: "design" },
+              { severity: "low", title: "mechanical issue", file: "mech.js", line_start: 1, line_end: 1, kind: "mechanical" },
+            ],
+          }),
+          // Round 2 was scoped "mechanical": the design finding was held for
+          // a later round.  Its review repeats only the held file.
+          round({
+            round: 2, verdict: "needs-attention", disposition: "rework",
+            reworkScope: "mechanical",
+            findingFiles: ["design.js"],
+            findings: [
+              { severity: "medium", title: "design issue again", file: "design.js", line_start: 1, line_end: 1, kind: "design" },
+            ],
+          }),
+        ],
+      }),
+    ];
+
+    const stats = computeStats(chains);
+    assert.equal(stats.eligiblePairs, 1);
+    // The chain narrowed round 2's prior files to the mechanical subset, so
+    // the held design file is not evidence of a stall.
+    assert.equal(stats.repeatedTrue, 0);
+    assert.equal(stats.repeatedNA, 0);
+  });
+
+  it("a scoped round repeating an in-scope finding's file is a repeated area", () => {
+    const chains = [
+      chain({
+        chainId: "c1",
+        rounds: [
+          round({
+            round: 1, verdict: "needs-attention", disposition: "rework",
+            reworkScope: "full",
+            findingFiles: ["design.js", "mech.js"],
+            findings: [
+              { severity: "medium", title: "design issue", file: "design.js", line_start: 1, line_end: 1, kind: "design" },
+              { severity: "low", title: "mechanical issue", file: "mech.js", line_start: 1, line_end: 1, kind: "mechanical" },
+            ],
+          }),
+          // Round 2 was scoped "mechanical" and its review repeats the file
+          // of the mechanical finding that WAS in scope.
+          round({
+            round: 2, verdict: "needs-attention", disposition: "rework",
+            reworkScope: "mechanical",
+            findingFiles: ["mech.js"],
+            findings: [
+              { severity: "low", title: "mechanical issue again", file: "mech.js", line_start: 1, line_end: 1, kind: "mechanical" },
+            ],
+          }),
+        ],
+      }),
+    ];
+
+    const stats = computeStats(chains);
+    assert.equal(stats.eligiblePairs, 1);
+    assert.equal(stats.repeatedTrue, 1);
+    assert.equal(stats.repeatedNA, 0);
+  });
+
+  it("a design-scoped followup round narrows to the design finding, not the held mechanical ones", () => {
+    const chains = [
+      chain({
+        chainId: "c1",
+        rounds: [
+          // Round 1 was a mechanical round whose review still surfaced one
+          // design finding alongside the mechanical ones.  The followup rule
+          // gives round 2 the design finding only.
+          round({
+            round: 1, verdict: "needs-attention", disposition: "rework",
+            reworkScope: "mechanical",
+            findingFiles: ["design.js", "mech.js"],
+            findings: [
+              { severity: "medium", title: "design issue", file: "design.js", line_start: 1, line_end: 1, kind: "design" },
+              { severity: "low", title: "mechanical issue", file: "mech.js", line_start: 1, line_end: 1, kind: "mechanical" },
+            ],
+          }),
+          // Round 2 was scoped "design"; its review repeats the mechanical
+          // file that was held this round.
+          round({
+            round: 2, verdict: "needs-attention", disposition: "rework",
+            reworkScope: "design",
+            findingFiles: ["mech.js"],
+            findings: [
+              { severity: "low", title: "mechanical issue again", file: "mech.js", line_start: 1, line_end: 1, kind: "mechanical" },
+            ],
+          }),
+        ],
+      }),
+    ];
+
+    const stats = computeStats(chains);
+    assert.equal(stats.eligiblePairs, 1);
+    assert.equal(stats.repeatedTrue, 0);
+    assert.equal(stats.repeatedNA, 0);
+  });
+
+  it("a recorded scope that contradicts the derived scope is unmeasurable and lands in n/a", () => {
+    const chains = [
+      chain({
+        chainId: "c1",
+        rounds: [
+          // Round 1's mixed design+mechanical set derives a "mechanical"
+          // scope under the current branch table (kusabi #335 proposes
+          // flipping that branch).  Round 2 records that it actually ran
+          // with "design" -- a scope the current derivation no longer
+          // yields for this previous record.
+          round({
+            round: 1, verdict: "needs-attention", disposition: "rework",
+            reworkScope: "full",
+            findingFiles: ["design.js", "mech.js"],
+            findings: [
+              { severity: "medium", title: "design issue", file: "design.js", line_start: 1, line_end: 1, kind: "design" },
+              { severity: "low", title: "mechanical issue", file: "mech.js", line_start: 1, line_end: 1, kind: "mechanical" },
+            ],
+          }),
+          // Round 2 records a "design" scope.  The current branch table
+          // derives "mechanical" from round 1's mixed set -- the recorded
+          // and derived names disagree, so the pair cannot be measured with
+          // a re-derived narrowing.
+          round({
+            round: 2, verdict: "needs-attention", disposition: "rework",
+            reworkScope: "design",
+            findingFiles: ["mech.js"],
+            findings: [
+              { severity: "low", title: "mechanical issue again", file: "mech.js", line_start: 1, line_end: 1, kind: "mechanical" },
+            ],
+          }),
+        ],
+      }),
+    ];
+
+    const stats = computeStats(chains);
+    assert.equal(stats.eligiblePairs, 1);
+    // Narrowing with the derived "mechanical" scope would call this a
+    // repeated area, and the raw files would call it one too -- but neither
+    // input describes what the chain actually measured under "design".
+    // Unmeasurable is not false: the pair is n/a, counted in neither tally.
+    assert.equal(stats.repeatedTrue, 0);
+    assert.equal(stats.repeatedNA, 1);
+  });
+
+  it("a full-scope round is counted exactly as before this change", () => {
+    const chains = [
+      chain({
+        chainId: "c1",
+        rounds: [
+          // Round 1's record has no groupable findings, so the chain resolved
+          // a full scope for round 2: every prior file was in scope.
+          round({
+            round: 1, verdict: "needs-attention", disposition: "rework",
+            reworkScope: "full",
+            findingFiles: ["a.js"],
+            findings: [],
+          }),
+          round({
+            round: 2, verdict: "needs-attention", disposition: "rework",
+            reworkScope: "full",
+            findingFiles: ["a.js"],
+            findings: [
+              { severity: "low", title: "same area", file: "a.js", line_start: 1, line_end: 1 },
+            ],
+          }),
+        ],
+      }),
+    ];
+
+    const stats = computeStats(chains);
+    assert.equal(stats.eligiblePairs, 1);
+    // Narrowing is a no-op for a full scope: the raw findingFiles are passed,
+    // so the pre-#334 figure is unchanged.
+    assert.equal(stats.repeatedTrue, 1);
+    assert.equal(stats.repeatedNA, 0);
+  });
+
+  it("a record without a reworkScope field keeps the pre-scoping figure and does not throw", () => {
+    const chains = [
+      chain({
+        chainId: "c1",
+        rounds: [
+          // Pre-scoping records: neither round carries a reworkScope field.
+          // Round 1's mixed finding set would resolve to a "mechanical" scope
+          // under #334, but the chain at the time ran full scope -- so a
+          // repeat of the would-be-held file still counts.
+          round({
+            round: 1, verdict: "needs-attention", disposition: "rework",
+            findingFiles: ["design.js", "mech.js"],
+            findings: [
+              { severity: "medium", title: "design issue", file: "design.js", line_start: 1, line_end: 1, kind: "design" },
+              { severity: "low", title: "mechanical issue", file: "mech.js", line_start: 1, line_end: 1, kind: "mechanical" },
+            ],
+          }),
+          round({
+            round: 2, verdict: "needs-attention", disposition: "rework",
+            findingFiles: ["design.js"],
+            findings: [
+              { severity: "medium", title: "design issue again", file: "design.js", line_start: 1, line_end: 1, kind: "design" },
+            ],
+          }),
+        ],
+      }),
+    ];
+
+    const stats = computeStats(chains);
+    assert.equal(stats.eligiblePairs, 1);
+    assert.equal(stats.repeatedTrue, 1);
+    assert.equal(stats.repeatedNA, 0);
+  });
+
+  it("scoped rounds keep the repeatedAreas n/a and denominator accounting", () => {
+    const chains = [
+      chain({
+        chainId: "c1",
+        rounds: [
+          // Previous round has files, but the scoped current round carries no
+          // findings array -> n/a, not a repeated area.
+          round({
+            round: 1, verdict: "needs-attention", disposition: "rework",
+            reworkScope: "mechanical",
+            findingFiles: ["mech.js"],
+            findings: [
+              { severity: "low", title: "mechanical issue", file: "mech.js", line_start: 1, line_end: 1, kind: "mechanical" },
+            ],
+          }),
+          round({
+            round: 2, verdict: "needs-attention", disposition: "rework",
+            reworkScope: "mechanical",
+            findingFiles: null, findings: null,
+          }),
+        ],
+      }),
+      chain({
+        chainId: "c2",
+        rounds: [
+          // Single-round chain: the round carries a reworkScope but has no
+          // previous round, so it stays out of the denominator.
+          round({
+            round: 1, verdict: "approve", disposition: "accept",
+            reworkScope: "full",
+            findingFiles: ["a.js"], findings: [],
+          }),
+        ],
+      }),
+    ];
+
+    const stats = computeStats(chains);
+    assert.equal(stats.eligiblePairs, 1);
     assert.equal(stats.repeatedNA, 1);
     assert.equal(stats.repeatedTrue, 0);
   });

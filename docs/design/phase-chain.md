@@ -345,7 +345,13 @@ Evidence inputs to `deriveReworkStrategy`:
   recorded `reworkStrategyReason` names the trigger)
 - `repeatedAreas` — same file area flagged across rounds (also forces a new
   session on the 1st rework; the lever must not depend on the scheduling
-  accident that repetition normally implies a later rework)
+  accident that repetition normally implies a later rework). **On a scoped
+  rework round the previous round's files are narrowed to the findings that
+  round was asked to resolve** (kusabi #334): a deliberately held finding
+  names the same file every round by construction, so counting it would fire
+  the stall detector on a chain progressing exactly as designed. `hasRepeatedAreas`
+  itself is unchanged — the narrowing is applied to its INPUT, via
+  `inScopeFindingFiles`, and is a no-op for a full-scope round.
 
 The function returns:
 - `tierDelta` — how many tiers to advance (0 = same tier)
@@ -403,7 +409,7 @@ Launched with `chain-stats [--since <ISO>] [--until <ISO>] [--compare <ISO>]`. R
 - Final dispositions (last round of each chain): `accept`, `accept-with-followup`, `rework`, `strategize`, `escalate`, `discard`
 - Review verdict distribution across all rounds
 - Deterministic probe pass/fail counts
-- `repeatedAreas` computed via `hasRepeatedAreas` from `chain-phases.mjs` (re-imported, never reimplemented). Rounds without a previous round are excluded from the denominator. Rounds missing `findingFiles` or `findings` are counted in a separate "n/a" figure.
+- `repeatedAreas` computed via `hasRepeatedAreas` from `chain-phases.mjs` (re-imported, never reimplemented), over the **same narrowed input the live chain decides on** (kusabi #334): a round recording a `reworkScope` has its predecessor's files reduced through `inScopeFindingFiles`, so the aggregate and the disposition cannot mean different things. The scoped subset is not persisted, so the scope is re-derived with `resolveReworkScope` — and **the derivation is trusted only when its name matches the `reworkScope` the round recorded**. A disagreement means the branch table changed after the round ran, so the derivation describes a round that never executed; such a round is counted "n/a" rather than measured, which is what keeps a future scheduling change from silently rewriting historical figures. Rounds without a previous round are excluded from the denominator. Rounds missing `findingFiles` or `findings` are counted in the same "n/a" figure.
 - Prior-finding-unresolved heuristic: textual match against patterns like `(prior finding, not addressed)` and `Prior finding #N unresolved:` in `findingsText` / finding titles. **Explicitly labelled as heuristic/approximate** — there is no structured field for it.
 - Token and cost totals: per-chain from `chainTotals`, overall from per-round usage sums. Per-chain min/median/max shown for multi-chain workspaces.
 - Chains with unreadable `chain.json` are skipped and the count is reported.
