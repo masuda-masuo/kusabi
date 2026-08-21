@@ -320,8 +320,17 @@ inside `runImplementPhase`); #323 removed that compensation and fixed the
 seam instead — the phase itself reports the created session, so the carry IS
 the natural reading of "start fresh, then carry on from there" and there is
 nothing left to clear.  The round record remains the single source of truth
-for the hand-off and always agrees with the reported carry (the record's
-`sessionID` is the same `job.sessionID`).  A fresh dispatch whose job died
+for the hand-off.  The reported carry and the record's `sessionID` genuinely
+coincide whenever the dispatch observed an id — the carry IS that
+`job.sessionID` — and the one remaining divergence is the documented fallback:
+a resuming round whose job died before any id was observed reports the
+candidate while its record's `sessionID` is null (kusabi #324).  This is the
+measured rule, not an axiom: 2026-08-21 a real agy record
+(chain-msxhipgq1cef round 2, continue_session) diverged — the candidate
+`a784b853-…` was passed, the job stamped `2a177486-…` — while opencode held
+16/16 same-backend `continue_session` rounds and a claude n=1 probe held the
+id, so the phase prefers the observed id on both branches (observed beats
+told) and keeps the candidate only as the dead-round fallback.  A fresh dispatch whose job died
 before any session id was observed carries no `sessionID` on its record and
 no session in its report, so the next round starts fresh; that is the only
 safe reading — falling back to the candidate would resurrect the abandoned
@@ -625,7 +634,10 @@ implement dispatch actually used or created — so the resumed run continues
 the same conversation the interrupted run would have continued.  (The
 in-memory carry `runImplementPhase` reports is that same `job.sessionID` the
 record stores — the session the round's dispatch actually used or created —
-so the carry and the record always agree; kusabi #323, §3.5.5.) `baseSha` keeps the ORIGINAL chain base — the resumed round's diff is measured against it (P1 auto-resets HEAD to it); the worktree baseline, by contrast, is re-captured at resume time (the pre-cancel baseline is not persisted).
+so the carry and the record coincide whenever the job observed an id, and
+diverge only on the documented fallback (a resuming round whose job died
+id-less reports the candidate while its record's `sessionID` is null);
+kusabi #323, §3.5.5, extended by #324.) `baseSha` keeps the ORIGINAL chain base — the resumed round's diff is measured against it (P1 auto-resets HEAD to it); the worktree baseline, by contrast, is re-captured at resume time (the pre-cancel baseline is not persisted).
 
 **Shared lifecycle.** `chain-resume` goes through `runChainDriver` — the same round loop, stop predicate, serve stopping (unless `--keep-serve`), and terminal finalisation (including the review record, §3.5.7) as `chain`. The verify baseline is the one recorded at chain start, reused and never re-captured on the now-modified worktree (§3.5.2).
 
