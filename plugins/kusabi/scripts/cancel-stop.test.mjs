@@ -696,7 +696,35 @@ describe("a cancelled claude dispatch stays cancelled through finalize (kusabi #
     assert.equal(final.error, null);
     assert.equal(final.finishedAt, cancelled.finishedAt);
 
+    // The two assertions below read `final.overridden` directly.  When that
+    // field is absent they used to throw a TypeError inside the assertion
+    // expression (cancel-stop.test.mjs:699), leaving the CI log with no state
+    // at all — two CI occurrences produced zero diagnostic information between
+    // them.  We fail with a readable message and dump the whole record (and
+    // the record exactly as it stood right after the cancel) instead of
+    // crashing.  What the dump shows narrows the cause: demoteToCancelled
+    // only ever assigns an array to `overridden` (an attempted verdict is
+    // appended, or a preserved array is carried) — it never writes null.  So
+    // an absent field means neither demote branch assigned: the post-cancel
+    // save arrived already `cancelled`, or the dispatch never saved after the
+    // cancel.  We serialise the whole record because JSON omits absent
+    // fields — a summary would collapse absent and empty.
+    assert.ok(
+      Array.isArray(final.overridden),
+      `final.overridden must be an array after a demoted write\n` +
+        `--- final (on disk after settle) ---\n${JSON.stringify(final, null, 2)}\n` +
+        `--- cancelled (record immediately after the cancel) ---\n${JSON.stringify(cancelled, null, 2)}`
+    );
     assert.deepEqual(final.overridden.map((o) => o.status), ["error"]);
+    // Same crash-instead-of-fail shape on the next dereference: if
+    // `overridden[0].error` is missing, `assert.match` would throw on a
+    // non-string first argument.  Guard it so the failure stays legible.
+    assert.ok(
+      typeof final.overridden[0]?.error === "string",
+      `final.overridden[0].error must be a string before the regex match\n` +
+        `--- final (on disk after settle) ---\n${JSON.stringify(final, null, 2)}\n` +
+        `--- cancelled (record immediately after the cancel) ---\n${JSON.stringify(cancelled, null, 2)}`
+    );
     assert.match(final.overridden[0].error, /claude exited with code null/);
 
     // The dispatch's own return value is the record, not a contradiction of it.
