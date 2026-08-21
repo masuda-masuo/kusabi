@@ -557,30 +557,45 @@ export async function runImplementPhase({
   // reads it back); no second measurement exists.
   const implementRefusal = job.status === "completed" ? parseRefusalBlock(resultText) : null;
 
-  // ---- report the session this round's dispatch actually used or created ----
+  // ---- report the session this round's dispatch used or created ----
   // The returned session is the next round's carry, and the invariant is
-  // that it is a conversation round N's dispatch used or created.  A
-  // resuming round USED `resolvedSession` -- the candidate it was told to
-  // resume, or the previous-record fallback -- so that is what is reported.
-  // A fresh round (`useNewSession`, or a candidate dropped for crossing
-  // backends) CREATED whatever the job carries as its session id; that is
-  // what is reported, never the abandoned candidate.  The two coincide for
-  // a resuming round and differ exactly when the dispatch ran fresh;
-  // reporting the candidate in the fresh case was the kusabi #320 defect
-  // that made the driver clear the carry after such a round -- the
-  // compensation this change removes (the driver no longer compensates;
-  // see chain-driver.mjs).  The reported provenance follows the session:
-  // the owner of a resolved session is its record or the caller's proof;
-  // the owner of a created session is the backend this round dispatched on.
+  // that it is one round N's dispatch USED or CREATED -- observed beats
+  // told.  The job records the id the dispatch actually got back
+  // (`job.sessionID`); whenever that exists we report it, whether the round
+  // resumed or ran fresh.  The candidate this round was TOLD to resume
+  // (`resolvedSession`, from the carry or the previous-record fallback) is
+  // reported ONLY as a dead-round fallback: a resuming round whose job died
+  // before any id was observed -- the next round then still has a
+  // conversation worth trying.  A fresh round with a null `job.sessionID`
+  // reports null exactly as before.
   //
-  // Failure path: if the dispatch ran fresh and the job died before any
-  // session id was observed (dispatchWithFallback's no-route error job, a
-  // backend job that never returned an id), `job.sessionID` is null: there
-  // is no session to report, the carry is null, and the next round starts
-  // fresh -- a dead fresh round resumes nothing, by construction.
-  const dispatchRanFresh = useNewSession || !resolvedSession;
-  const reportedSession = dispatchRanFresh ? (job.sessionID ?? null) : resolvedSession;
-  const reportedProvenance = dispatchRanFresh ? (job.sessionID ? backend : null) : resolvedSessionProvenance;
+  // Why observed beats told (kusabi #324): measured 2026-08-21, a real agy
+  // record (chain-msxhipgq1cef round 2, continue_session) was passed the
+  // candidate `a784b853-…` yet the job stamped `2a177486-…` -- agy can mint
+  // a NEW conversation id on resume (its `job.sessionID` is stamped from the
+  // stream init event's `conversation_id`, agy-dispatch.mjs), so the
+  // candidate and the observed id CAN diverge.  opencode held 16/16 same-
+  // backend `continue_session` rounds and a claude n=1 probe held the id, so
+  // this is real divergence, not a constant rewrite.  Reporting the candidate
+  // there would be the old kusabi #320 defect's mirror: round N+1 would
+  // resume a conversation round N's dispatch never used.  Fresh-round
+  // behaviour is unchanged (kusabi #320/#323 semantics intact).
+  //
+  // Provenance follows the session: the owner of an observed id is the
+  // backend this round dispatched on (it created or re-bound the
+  // conversation); the owner of the fallback candidate is
+  // `resolvedSessionProvenance` (the previous record or the caller's proof);
+  // null when nothing is reported.
+  //
+  // Failure path: the dead-round fallback above is the resuming case.  A
+  // fresh round whose job died before any session id was observed
+  // (dispatchWithFallback's no-route error job, a backend job that never
+  // returned an id) leaves `job.sessionID` null with no candidate to fall
+  // back to: the carry is null and the next round starts fresh -- a dead
+  // fresh round resumes nothing, by construction.
+  const isResumingRound = !useNewSession && !!resolvedSession;
+  const reportedSession = job.sessionID ?? (isResumingRound ? resolvedSession : null);
+  const reportedProvenance = job.sessionID ? backend : (isResumingRound ? resolvedSessionProvenance : null);
 
   return {
     roundRecord: {

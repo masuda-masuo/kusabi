@@ -1791,7 +1791,11 @@ describe("runImplementPhase with the agy backend", () => {
     // dispatch continues that conversation instead of starting fresh.
     assert.equal(seen.session, "agy-conv-1");
     assert.equal(seen.sessionProvenance, "agy");
-    assert.equal(out.session, "agy-conv-1");
+    // The carry handed to round 3 is the id the dispatch actually used or
+    // created — agy can mint a NEW conversation id on resume (kusabi #324),
+    // so the observed `agy-conv-2` is preferred over the told candidate
+    // `agy-conv-1`; its provenance is the backend that dispatched round 2.
+    assert.equal(out.session, "agy-conv-2");
     assert.equal(out.sessionProvenance, "agy");
     // The NEW conversation id is still recorded on the round record.
     assert.equal(out.roundRecord.sessionID, "agy-conv-2");

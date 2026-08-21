@@ -2153,14 +2153,17 @@ describe("claudeDispatch (fake claude binary)", () => {
     assert.equal(calls[0].session, undefined);
 
     // Round 2 (rework): chain-phases resolves the session from the previous
-    // round's record — the claude chain must NOT start blank.
+    // round's record — the claude chain must NOT start blank.  The carry it
+    // reports is the id the dispatch actually used or created (kusabi #324):
+    // here the stub returns `claude-uuid-round2`, the observed id, which is
+    // preferred over the told candidate `claude-uuid-round1`.
     const second = await runImplementPhase({
       ...common, round: 2, isFirstRound: false,
       previousRecord: { sessionID: "claude-uuid-round1" },
       session: undefined, useNewSession: false,
     });
     assert.equal(calls[1].session, "claude-uuid-round1");
-    assert.equal(second.session, "claude-uuid-round1");
+    assert.equal(second.session, "claude-uuid-round2");
 
     // The journey's end: that same session reaches the claude CLI as
     // `--resume <id>` via the real dispatch.

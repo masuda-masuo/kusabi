@@ -4598,6 +4598,137 @@ describe("runImplementPhase round-to-round session hand-off (kusabi #320/#323)",
 });
 
 // =========================================================================
+// runImplementPhase carry prefers the OBSERVED session id on BOTH branches
+// (kusabi #324).  Measured 2026-08-21: a real agy record (chain-msxhipgq1cef
+// round 2, continue_session) was told to resume `a784b853-…` but the job
+// stamped `2a177486-…`, so the candidate and the observed id CAN diverge.
+// The phase must hand round N+1 the id round N's dispatch actually used or
+// created -- never the told candidate when an observed id exists -- and keep
+// the candidate only as the dead-round fallback for a resuming round whose
+// job died id-less.  These re-use the same stub contract as the block above.
+// =========================================================================
+
+describe("runImplementPhase carry prefers the observed session id (kusabi #324)", () => {
+  // Same realistic stub as the #320/#323 block: a resuming dispatch echoes
+  // the session it was given (job.sessionID === opts.session) unless a
+  // jobOverrides.sessionID forces the job to record a DIFFERENT id -- the
+  // divergence agy exhibits in the wild.
+  function makeStubDispatch({ idPrefix = "claude-uuid-", jobOverrides = {} } = {}) {
+    const calls = [];
+    const dispatch = async (opts) => {
+      calls.push(opts);
+      return {
+        job: {
+          id: "job-imp-" + (opts.round ?? 1), status: "completed", modelEntry: "opus",
+          modelVariant: null, fallbacks: null,
+          sessionID: opts.session ?? (idPrefix + (opts.round ?? 1)),
+          usage: { available: true, input: 1, output: 1, reasoning: 0, cacheRead: 0, cacheWrite: 0, cost: 0.01 },
+          error: null,
+          ...jobOverrides,
+        },
+        resultText: "implemented",
+      };
+    };
+    return { dispatch, calls };
+  }
+
+  const base = {
+    cwd: "/tmp", chainId: "chain-test", round: 2, isFirstRound: false,
+    implementText: "brief", modelChain: [["opus"]], tierIndex: 0,
+    useNewSession: false, session: undefined, sessionProvenance: null,
+    previousRecord: null, resumeMethod: { type: "continue_session", detail: "" },
+    flagsModel: null, backend: "agy",
+  };
+
+  it("a resuming round whose job observed a DIFFERENT id reports the observed id, not the candidate (kusabi #324)", async () => {
+    // Round N was told to resume `agy-candidate-a784b853`, but agy mints a
+    // new conversation id on resume and the job stamps `agy-observed-2a177486`.
+    // The dispatch GOT the candidate; the job RECORDED the observed id.  The
+    // carry handed to round N+1 must be the observed id, byte for byte.
+    const { dispatch, calls } = makeStubDispatch({
+      jobOverrides: { sessionID: "agy-observed-2a177486" },
+    });
+    const roundN = await runImplementPhase({
+      ...base,
+      useNewSession: false,
+      session: "agy-candidate-a784b853",
+      sessionProvenance: "agy",
+      previousRecord: { sessionID: "agy-candidate-a784b853", backend: "agy" },
+      _dispatchWithFallback: dispatch,
+    });
+    assert.equal(calls[0].session, "agy-candidate-a784b853",
+      "round N's dispatch resumed the candidate it was told to");
+    assert.equal(calls[0].sessionProvenance, "agy");
+    assert.equal(roundN.session, "agy-observed-2a177486",
+      "the carry is the OBSERVED id, not the candidate (kusabi #324)");
+    assert.notEqual(roundN.session, "agy-candidate-a784b853",
+      "the candidate is never the carry when an observed id exists");
+    assert.equal(roundN.sessionProvenance, "agy",
+      "the observed id's owner is the backend this round dispatched on");
+    assert.equal(roundN.roundRecord.sessionID, "agy-observed-2a177486",
+      "the record agrees with the report");
+  });
+
+  it("a resuming round whose job died id-less falls back to the candidate carry with its resolved provenance (kusabi #324)", async () => {
+    // Round N was told to resume `agy-candidate-a784b853` but the job died
+    // before any id was observed (`job.sessionID` null).  The carry is the
+    // candidate -- the next round still has a conversation worth trying --
+    // and its provenance is the resolved one.  The record's sessionID is
+    // null: this is the one remaining divergence between record and carry.
+    const { dispatch, calls } = makeStubDispatch({
+      jobOverrides: { status: "provider-error", sessionID: null },
+    });
+    const roundN = await runImplementPhase({
+      ...base,
+      useNewSession: false,
+      session: "agy-candidate-a784b853",
+      sessionProvenance: "agy",
+      previousRecord: { sessionID: "agy-candidate-a784b853", backend: "agy" },
+      _dispatchWithFallback: dispatch,
+    });
+    assert.equal(calls[0].session, "agy-candidate-a784b853",
+      "round N's dispatch resumed the candidate it was told to");
+    assert.equal(roundN.session, "agy-candidate-a784b853",
+      "the dead job's carry is the candidate fallback");
+    assert.equal(roundN.sessionProvenance, "agy",
+      "the fallback's owner is the resolved provenance");
+    assert.equal(roundN.roundRecord.sessionID, null,
+      "the record's sessionID is null -- the only divergence from the report");
+  });
+
+  it("a fresh round still reports the created id (kusabi #320/#323 semantics intact under #324)", async () => {
+    // Regression guard: the #324 change must NOT alter the fresh-round
+    // contract.  Round N runs fresh and creates `agy-conv-2`; the phase
+    // reports THAT, never the abandoned candidate, and round N+1 continues it.
+    const first = makeStubDispatch({ idPrefix: "agy-conv-" });
+    const roundN = await runImplementPhase({
+      ...base,
+      useNewSession: true,
+      session: "agy-conv-1",
+      sessionProvenance: "agy",
+      previousRecord: { sessionID: "agy-conv-1", backend: "agy" },
+      _dispatchWithFallback: first.dispatch,
+    });
+    assert.equal(first.calls[0].session, undefined, "round N dispatches fresh as asked");
+    assert.equal(roundN.session, "agy-conv-2", "the report is the session the dispatch CREATED");
+    assert.equal(roundN.sessionProvenance, "agy");
+    assert.equal(roundN.roundRecord.sessionID, "agy-conv-2");
+
+    const second = makeStubDispatch({ idPrefix: "agy-conv-" });
+    await runImplementPhase({
+      ...base, round: 3,
+      useNewSession: false,
+      session: roundN.session,
+      sessionProvenance: roundN.sessionProvenance,
+      previousRecord: { ...roundN.roundRecord, backend: "agy" },
+      _dispatchWithFallback: second.dispatch,
+    });
+    assert.equal(second.calls[0].session, "agy-conv-2",
+      "round N+1 continues the conversation round N CREATED");
+  });
+});
+
+// =========================================================================
 // writeReviewRecord — postable review record at a terminal disposition
 // (kusabi #52)
 // =========================================================================
