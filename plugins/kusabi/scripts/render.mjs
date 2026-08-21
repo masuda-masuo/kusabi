@@ -609,6 +609,158 @@ export function renderPriorFindings(previousRecord) {
   return text;
 }
 
+// kusabi #336: when a chain ends in `escalate`, the orchestrator must be
+// handed the DECISIONS, not a one-line task list. The reviewer already records
+// each finding's body and its recommendation (which for design findings
+// typically states two alternatives); this renderer surfaces that material so
+// the human answers one item per finding instead of re-reading the raw
+// round-<N>.json. The reader here is the host-side orchestrator, who CAN open
+// the round record, so the truncation note points there (the opposite of
+// renderPriorFindings, whose reader lives inside the container and cannot).
+const ESCALATION_DECISIONS_BUDGET = 6000;
+
+const ESCALATION_SEVERITY_ORDER = ["critical", "high", "medium", "low", "unknown"];
+
+function escalationSeverityRank(severity) {
+  const idx = ESCALATION_SEVERITY_ORDER.indexOf(severity || "unknown");
+  return idx === -1 ? ESCALATION_SEVERITY_ORDER.length - 1 : idx;
+}
+
+// Truncate a single oversized entry (the first/most severe finding) at a line
+// boundary so the decision text never ends mid-line and never leaves a dangling
+// `###` header with nothing under it. `text` is already `intro` + separator +
+// the single entry; we cut at the last newline at or before `budget`, and if
+// that leaves a `###` header as the final line we drop that header line too.
+function truncateEntryAtLineBoundary(text, budget) {
+  if (text.length <= budget) return text;
+  const cut = text.lastIndexOf("\n", budget - 1);
+  if (cut <= 0) {
+    // No line boundary before the budget: nothing safe to keep.
+    return "";
+  }
+  let result = text.slice(0, cut);
+  const lastNl = result.lastIndexOf("\n");
+  const lastLine = lastNl === -1 ? result : result.slice(lastNl + 1);
+  if (lastLine.startsWith("### ")) {
+    const prevNl = lastNl === -1 ? -1 : result.lastIndexOf("\n", lastNl - 1);
+    result = prevNl === -1 ? "" : result.slice(0, prevNl);
+  }
+  return result;
+}
+
+/**
+ * Render the decision block for an escalated terminal round.
+ *
+ * Each structured finding is presented as a decision the orchestrator answers:
+ * severity (and kind when present), title, `file:line`, the finding `body`, and
+ * its `recommendation` rendered in full — the recommendation is the part that
+ * holds the alternatives, so it is never truncated per entry. Findings are
+ * ordered by severity (critical → high → medium → low → unknown), stable within
+ * a severity. The block opens with an explicit instruction that each item needs
+ * one decided outcome and that a one-line answer per item is enough.
+ *
+ * The block is bounded by `ESCALATION_DECISIONS_BUDGET` characters; on
+ * truncation a note says where the rest lives — the host-side round record,
+ * which the orchestrator can open — never that it is unretrievable.
+ *
+ * Degrades like `renderPriorFindings`: an empty/missing `findings` array yields
+ * a single plain line, so a renderer never presents an empty list as a fact.
+ *
+ * @param {Array|null|undefined} findings
+ * @param {{ roundNumber?: number }} [opts]
+ * @returns {string}
+ */
+export function renderEscalationDecisions(findings, opts = {}) {
+  // Keep only entries that are actually structured findings; a renderer must
+  // never present an empty list as a fact, so a degenerate (missing, empty, or
+  // all-junk) array yields a single plain line.
+  const ranked = Array.isArray(findings)
+    ? findings.filter((f) => f && typeof f === "object")
+    : [];
+  if (ranked.length === 0) {
+    return "(no structured findings to decide)";
+  }
+
+  // Severity-ordered; items of equal severity keep their input order.
+  const ordered = ranked
+    .map((f, i) => ({ f, i }))
+    .sort((a, b) => {
+      const ra = escalationSeverityRank(a.f.severity);
+      const rb = escalationSeverityRank(b.f.severity);
+      return ra !== rb ? ra - rb : a.i - b.i;
+    })
+    .map((x) => x.f);
+
+  const intro =
+    "Decisions for the orchestrator (answer each; a one-line answer per item " +
+    "is enough — the material to decide is here, no re-investigation needed):";
+
+  const items = [];
+  for (const f of ordered) {
+    const severity = f.severity || "unknown";
+    const kind = f.kind ? ` [${f.kind}]` : "";
+    const title = f.title || "(untitled)";
+    const file = f.file || "?";
+    const lineStart = f.line_start !== undefined ? f.line_start : "?";
+    const block = [];
+    block.push(`### [${severity}]${kind} ${title} (${file}:${lineStart})`);
+    block.push("");
+    if (f.body) {
+      block.push(f.body);
+      block.push("");
+    }
+    if (f.recommendation) {
+      block.push(`**Recommendation:** ${f.recommendation}`);
+      block.push("");
+    }
+    items.push(block.join("\n").replace(/\n+$/, ""));
+  }
+
+  // Assemble within the budget at whole-finding boundaries: keep the intro,
+  // then append findings (already severity-ordered) only while the assembled
+  // text stays within ESCALATION_DECISIONS_BUDGET; drop whole entries from the
+  // end rather than cutting one mid-body or mid-recommendation.
+  const joinSep = "\n\n";
+  let text = intro;
+  let shown = 0;
+  let truncatedEntry = false;
+
+  for (let i = 0; i < items.length; i++) {
+    const candidate = text + joinSep + items[i];
+    if (candidate.length <= ESCALATION_DECISIONS_BUDGET) {
+      text = candidate;
+      shown++;
+      continue;
+    }
+    // This entry does not fit. If nothing has been shown yet it is the most
+    // severe finding and is itself oversized: truncate that one entry at a
+    // line boundary (never mid-line, never a dangling ### header). Remaining
+    // entries are dropped whole.
+    if (shown === 0) {
+      text = truncateEntryAtLineBoundary(candidate, ESCALATION_DECISIONS_BUDGET);
+      shown = 1;
+      truncatedEntry = true;
+    }
+    break;
+  }
+
+  // Emit the note only when something was dropped or truncated, and state how
+  // many of how many findings are shown, keeping the pointer to the host-side
+  // round record the orchestrator can open.
+  if (truncatedEntry || shown < items.length) {
+    const where =
+      opts && opts.roundNumber !== undefined
+        ? `the chain's round-${opts.roundNumber}.json on the host`
+        : "the chain's round record on the host";
+    text +=
+      `\n\n**(Decisions truncated: ${shown} of ${items.length} findings shown ` +
+      `(budget ${ESCALATION_DECISIONS_BUDGET} characters). ` +
+      `The remaining findings are in ${where} — open that record to decide the rest.)**`;
+  }
+
+  return text;
+}
+
 export function renderStrategistPrompt({ brief, rounds } = {}) {
   const lines = [];
 
@@ -1090,6 +1242,34 @@ export function renderChainShow(chain, rounds, unreadable = [], control = null) 
     }
 
     lines.push("");
+  }
+
+  // kusabi #336: an escalated terminal round carries the decisions, not just
+  // the one-line findingsText rendered per round above. Surface the structured
+  // findings (severity-ordered, budget-bounded) so the orchestrator answers
+  // one item per finding instead of re-reading the round record. Old records
+  // without a structured `findings` array render only the per-round findings
+  // already shown, and a round with no findings states that plainly.
+  const terminalRound = safeRounds.length > 0 ? safeRounds[safeRounds.length - 1] : null;
+  const terminalDisposition = terminalRound?.disposition?.disposition;
+  if (terminalDisposition === "escalate") {
+    const terminalFindings = Array.isArray(terminalRound.findings) ? terminalRound.findings : [];
+    const terminalFindingsText = terminalRound.findingsText;
+    if (terminalFindings.length > 0) {
+      lines.push("");
+      lines.push("Escalation decisions (structured findings):");
+      lines.push("");
+      lines.push(renderEscalationDecisions(terminalFindings, { roundNumber: terminalRound.round }));
+    } else if (typeof terminalFindingsText !== "string" || terminalFindingsText.trim() === "") {
+      // Neither a structured findings array nor a non-empty findingsText:
+      // state the fact plainly, identically to renderEscalateOutcome.
+      lines.push("");
+      lines.push("Escalation decisions (structured findings):");
+      lines.push("");
+      lines.push("(no findings recorded for this round)");
+    }
+    // Old records with a non-empty findingsText keep the per-round findings
+    // lines already rendered above; nothing extra is added here.
   }
 
   // Chain-wide totals

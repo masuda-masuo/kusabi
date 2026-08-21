@@ -22,6 +22,7 @@ import {
 import {
   renderContainerReviewInput,
   renderPriorFindings,
+  renderEscalationDecisions,
   renderStrategistPrompt,
   renderReview,
   renderFollowupDraft,
@@ -1680,10 +1681,28 @@ export function renderEscalateOutcome({ chainId, round, disposition, orchestrato
     "Chain " + chainId + " escalated at round " + round + ": " + reason,
     orchLine,
     "",
-    "Remaining findings:",
-    roundRecord.findingsText,
-    "",
   ];
+
+  // kusabi #336: carry the decisions, not just a task list. When the terminal
+  // round record carries a structured `findings` array, render each finding's
+  // body and recommendation as a decision for the orchestrator (severity-
+  // ordered, budget-bounded). Old records without `findings` keep the current
+  // one-line `findingsText` rendering, and a round with no findings at all
+  // states that plainly (the first line's reason already says why).
+  const findings = roundRecord?.findings;
+  if (Array.isArray(findings) && findings.length > 0) {
+    lines.push(renderEscalationDecisions(findings, { roundNumber: round }));
+  } else {
+    const ft = roundRecord?.findingsText;
+    if (ft && typeof ft === "string" && ft.length > 0) {
+      lines.push("Remaining findings:");
+      lines.push(ft);
+    } else {
+      lines.push("(no findings recorded for this round)");
+    }
+  }
+  lines.push("");
+
   for (let ri = 0; ri < records.length; ri++) {
     const r = records[ri];
     const detail = r.resumeMethod.detail ? ": " + r.resumeMethod.detail : "";

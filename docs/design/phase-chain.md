@@ -433,7 +433,7 @@ Launched with `chain-stats [--since <ISO>] [--until <ISO>] [--compare <ISO>]`. R
 
 **Chain-start output** (B7): the chain emits a line showing `tiers=N`, `maxRounds=M`, and whether the budget can reach the top tier.
 
-On escalate, include remaining findings + history (each round's verdict/probes/disposition/tier/resume method) in the final output. publish is never called from the chain (not on the allow list).
+On escalate, include remaining findings + history (each round's verdict/probes/disposition/tier/resume method) in the final output. publish is never called from the chain (not on the allow list). When the terminal round carries a structured `findings` array (kusabi #336), the escalate terminal output — both the `renderEscalateOutcome` handover and `chain-show` for the escalated chain — renders each finding's body and its recommendation as a decision for the orchestrator: severity-ordered (critical → high → medium → low → unknown, stable within a severity), budget-bounded by `ESCALATION_DECISIONS_BUDGET`, with an explicit instruction that a one-line answer per item is enough. Pre-#336 records without a structured `findings` array degrade to the one-line `findingsText` list; a round with no findings at all states that plainly.
 
 The chain now defaults to 4 max rounds (was 3). With the default ladder, rework 1 stays on the cheapest tier, so a 4-round chain reaches the same top tier as the old 3-round chain while spending the same number of paid rounds.
 
