@@ -1646,6 +1646,56 @@ describe("renderEscalateOutcome", () => {
     assert.ok(result.includes("Chain chain-esc789 escalated at round 1: reviewer discarded the work"));
     assert.ok(result.includes("changed=NO, resume=continue_session"));
   });
+
+  // ---- kusabi #336: the escalate handover carries the decisions, not just a
+  // one-line task list. When the terminal round record carries a structured
+  // `findings` array, each finding's body and recommendation are rendered as a
+  // severity-ordered decision block; old records without `findings` keep the
+  // one-line findingsText list.
+
+  it("renders structured findings as severity-ordered decisions with recommendations", () => {
+    const roundRecord = {
+      findings: [
+        { severity: "low", title: "minor", file: "src/x.js", line_start: 5, body: "minor body", recommendation: "fix later" },
+        { severity: "critical", title: "data loss", file: "src/y.js", line_start: 9, body: "DATA-LOSS-BODY", recommendation: "RECOVER-NOW-REC" },
+        { severity: "high", title: "perf", file: "src/z.js", line_start: 2, body: "perf body", recommendation: "cache it" },
+      ],
+    };
+    const records = [{ resumeMethod: { type: "continue_session" }, modelEntry: "test/gpt-4", verdict: "needs-attention", probesGreen: false }];
+    const disposition = { disposition: "escalate", reason: "oracle violation" };
+    const result = renderEscalateOutcome({ chainId, round: 2, disposition, orchestrator: null, roundRecord, records });
+    assert.ok(result.includes("Chain chain-esc789 escalated at round 2: oracle violation"));
+    // Decision block header, framed as answers, not re-investigation.
+    assert.ok(result.includes("Decisions for the orchestrator (answer each; a one-line answer per item is enough"));
+    // Severity ordering: critical before high before low.
+    assert.ok(result.indexOf("DATA-LOSS-BODY") < result.indexOf("cache it"));
+    assert.ok(result.indexOf("cache it") < result.indexOf("minor body"));
+    // Recommendation survives in full.
+    assert.ok(result.includes("RECOVER-NOW-REC"));
+    // The bare one-line list header must NOT appear when structured findings exist.
+    assert.doesNotMatch(result, /Remaining findings:/);
+    assert.ok(result.includes("Hand over to orchestrator for final judgement."));
+  });
+
+  it("degrades to the one-line findingsText list for an old record without findings", () => {
+    const roundRecord = { findingsText: "critical issue in src/main.js" };
+    const records = [{ resumeMethod: { type: "continue_session" }, modelEntry: "test/gpt-4", verdict: "needs-attention", probesGreen: true }];
+    const disposition = { disposition: "escalate", reason: "max rounds reached" };
+    const result = renderEscalateOutcome({ chainId, round: 3, disposition, orchestrator: null, roundRecord, records });
+    assert.ok(result.includes("Remaining findings:"));
+    assert.ok(result.includes("critical issue in src/main.js"));
+    assert.doesNotMatch(result, /Decisions for the orchestrator/);
+  });
+
+  it("states plainly when the round recorded no findings at all", () => {
+    const roundRecord = { verdict: "discard", verdictSource: "probe", worktreeDirtyVsBase: true };
+    const records = [{ resumeMethod: { type: "continue_session" }, modelEntry: "test/gpt-4", verdict: "discard", verdictSource: "probe", worktreeDirtyVsBase: true, worktreeChanged: false, probesGreen: true }];
+    const disposition = { disposition: "escalate", reason: "reviewer discarded the work" };
+    const result = renderEscalateOutcome({ chainId, round: 1, disposition, orchestrator: null, roundRecord, records });
+    assert.ok(result.includes("empty round discarded by probe; worktree still DIRTY vs the chain base"));
+    assert.ok(result.includes("(no findings recorded for this round)"));
+    assert.doesNotMatch(result, /Remaining findings:/);
+  });
 });
 
 // renderMaxRoundsOutcome  —  pure

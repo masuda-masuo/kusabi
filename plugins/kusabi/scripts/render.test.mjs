@@ -11,6 +11,7 @@ import {
   renderFollowupDraft,
   renderStrategistPrompt,
   renderReviewRecord,
+  renderEscalationDecisions,
   recoverVerdictFromText,
   roundDiscardReason,
   roundChangedColumn,
@@ -1128,6 +1129,74 @@ describe("renderChainShow", () => {
   });
 });
 
+// kusabi #336: an escalated terminal chain shows the structured-finding
+// decision block (the same renderer renderEscalateOutcome uses), while the
+// per-round one-line findingsText stays as it is.
+describe("renderChainShow escalated decision block", () => {
+  it("renders the structured decision block for an escalated terminal round", () => {
+    const chain = { chainId: "chain-esc-decisions" };
+    const rounds = [
+      {
+        round: 1,
+        verdict: "needs-attention",
+        disposition: { disposition: "escalate", reason: "oracle violation" },
+        resumeMethod: { type: "continue_session" },
+        findingsText: "[critical] data loss (src/y.js:9)\n[medium] minor (src/x.js:5)",
+        findings: [
+          { severity: "medium", title: "minor", file: "src/x.js", line_start: 5, body: "MINOR-BODY", recommendation: "MINOR-REC" },
+          { severity: "critical", title: "data loss", file: "src/y.js", line_start: 9, body: "CRIT-BODY-336", recommendation: "CRIT-REC-336" },
+        ],
+      },
+    ];
+    const result = renderChainShow(chain, rounds);
+    // The per-round one-line list is still shown.
+    assert.match(result, /findings:/);
+    assert.ok(result.includes("[critical] data loss (src/y.js:9)"));
+    // The structured decision block is appended, framed as answers.
+    assert.ok(result.includes("Escalation decisions (structured findings):"));
+    assert.ok(result.includes("Decisions for the orchestrator (answer each; a one-line answer per item is enough"));
+    // Severity ordering: critical before medium.
+    assert.ok(result.indexOf("CRIT-BODY-336") < result.indexOf("MINOR-BODY"));
+    // Recommendation survives.
+    assert.ok(result.includes("CRIT-REC-336"));
+    // The truncation note wording (host-side, retrievable) is exercised.
+    assert.doesNotMatch(result, /not retrievable/);
+  });
+
+  it("does not render the decision block for an escalated round without structured findings", () => {
+    const chain = { chainId: "chain-esc-legacy" };
+    const rounds = [
+      {
+        round: 1,
+        verdict: "discard",
+        disposition: { disposition: "escalate", reason: "reviewer discarded the work" },
+        resumeMethod: { type: "continue_session" },
+        findingsText: "[high] something (src/a.js:1)",
+      },
+    ];
+    const result = renderChainShow(chain, rounds);
+    assert.doesNotMatch(result, /Escalation decisions/);
+    assert.doesNotMatch(result, /Decisions for the orchestrator/);
+    assert.ok(result.includes("[high] something (src/a.js:1)"));
+  });
+
+  it("states plainly when an escalated terminal round has no findings and no findingsText", () => {
+    const chain = { chainId: "chain-esc-none" };
+    const rounds = [
+      {
+        round: 1,
+        verdict: "discard",
+        disposition: { disposition: "escalate", reason: "reviewer discarded the work" },
+        resumeMethod: { type: "continue_session" },
+      },
+    ];
+    const result = renderChainShow(chain, rounds);
+    assert.ok(result.includes("Escalation decisions (structured findings):"));
+    assert.ok(result.includes("(no findings recorded for this round)"));
+    assert.doesNotMatch(result, /Decisions for the orchestrator/);
+  });
+});
+
 // renderJobLine — stats display (acceptance criterion 4)
 // ---------------------------------------------------------------------------
 
@@ -2033,5 +2102,211 @@ describe("renderContainerReviewInput", () => {
     assert.ok(out.includes("## Review target"));
     assert.ok(out.includes("- Base commit: (unavailable)"));
     assert.ok(out.includes("Fetching the diff is YOUR job"));
+  });
+});
+
+// renderEscalationDecisions  —  kusabi #336 pure decision renderer
+// ===========================================================================
+
+describe("renderEscalationDecisions", () => {
+  it("returns a plain line for missing findings", () => {
+    assert.equal(renderEscalationDecisions(undefined), "(no structured findings to decide)");
+  });
+
+  it("returns a plain line for an empty findings array", () => {
+    assert.equal(renderEscalationDecisions([]), "(no structured findings to decide)");
+  });
+
+  it("returns a plain line when no entry is a structured finding", () => {
+    assert.equal(
+      renderEscalationDecisions([null, "not-an-object", 42]),
+      "(no structured findings to decide)",
+    );
+  });
+
+  it("opens with an explicit 'one answer per item' instruction", () => {
+    const out = renderEscalationDecisions([
+      { severity: "medium", title: "t", file: "f.js", line_start: 1 },
+    ]);
+    assert.ok(out.startsWith(
+      "Decisions for the orchestrator (answer each; a one-line answer per item",
+    ));
+  });
+
+  it("renders each finding's body and recommendation in full", () => {
+    const out = renderEscalationDecisions([
+      {
+        severity: "medium",
+        kind: "design",
+        title: "consider two approaches",
+        file: "src/app.js",
+        line_start: 10,
+        body: "The current approach BODY does not scale.",
+        recommendation: "Recommendation text with TWO alternatives: A or B.",
+      },
+    ]);
+    assert.ok(out.includes("### [medium] [design] consider two approaches (src/app.js:10)"));
+    assert.ok(out.includes("The current approach BODY does not scale."));
+    assert.ok(out.includes("**Recommendation:** Recommendation text with TWO alternatives: A or B."));
+  });
+
+  it("survives the recommendation text into the output", () => {
+    const out = renderEscalationDecisions([
+      {
+        severity: "high",
+        title: "t",
+        file: "f.js",
+        line_start: 2,
+        body: "b",
+        recommendation: "UNIQUE-RECOMMENDATION-TEXT-336",
+      },
+    ]);
+    assert.ok(out.includes("UNIQUE-RECOMMENDATION-TEXT-336"));
+  });
+
+  it("omits the kind bracket when kind is missing", () => {
+    const out = renderEscalationDecisions([
+      { severity: "low", title: "no kind here", file: "g.js", line_start: 3 },
+    ]);
+    assert.ok(out.includes("### [low] no kind here (g.js:3)"));
+    assert.doesNotMatch(out, /\[low\] \[/);
+  });
+
+  it("renders a finding with no body/recommendation without throwing", () => {
+    const out = renderEscalationDecisions([
+      { severity: "low", title: "bare", file: "g.js", line_start: 3 },
+    ]);
+    assert.ok(out.includes("### [low] bare (g.js:3)"));
+  });
+
+  it("orders findings by severity critical -> high -> medium -> low -> unknown", () => {
+    const out = renderEscalationDecisions([
+      { severity: "low", title: "LOW", file: "f.js", line_start: 1 },
+      { severity: "critical", title: "CRIT", file: "f.js", line_start: 1 },
+      { severity: "medium", title: "MED", file: "f.js", line_start: 1 },
+      { severity: "high", title: "HIGH", file: "f.js", line_start: 1 },
+      { severity: "unknown", title: "UNK", file: "f.js", line_start: 1 },
+    ]);
+    const iCrit = out.indexOf("CRIT");
+    const iHigh = out.indexOf("HIGH");
+    const iMed = out.indexOf("MED");
+    const iLow = out.indexOf("LOW");
+    const iUnk = out.indexOf("UNK");
+    assert.ok(iCrit < iHigh && iHigh < iMed && iMed < iLow && iLow < iUnk);
+  });
+
+  it("keeps input order within a severity (stable sort)", () => {
+    const out = renderEscalationDecisions([
+      { severity: "medium", title: "MED-FIRST", file: "f.js", line_start: 1 },
+      { severity: "medium", title: "MED-SECOND", file: "f.js", line_start: 1 },
+    ]);
+    assert.ok(out.indexOf("MED-FIRST") < out.indexOf("MED-SECOND"));
+  });
+
+  it("treats a missing severity as 'unknown' at the end", () => {
+    const out = renderEscalationDecisions([
+      { severity: "critical", title: "CRIT", file: "f.js", line_start: 1 },
+      { title: "NOSEV", file: "f.js", line_start: 1 },
+    ]);
+    assert.ok(out.indexOf("CRIT") < out.indexOf("NOSEV"));
+  });
+
+  it("truncates at the budget and points to the host-side round record", () => {
+    const mk = (sev, tag) => ({
+      severity: sev,
+      title: tag,
+      file: "f.js",
+      line_start: 1,
+      body: tag + "-BODY-" + "x".repeat(2500),
+      recommendation: tag + "-REC-" + "y".repeat(500),
+    });
+    const out = renderEscalationDecisions(
+      [mk("critical", "CRIT"), mk("high", "HIGH"), mk("medium", "MED"), mk("low", "LOW")],
+      { roundNumber: 4 },
+    );
+    assert.ok(out.length <= 6000 + 400); // budget + truncation note slack
+    assert.ok(out.includes("remaining findings are in"));
+    assert.ok(out.includes("round-4.json"));
+    assert.ok(out.includes("open that record to decide the rest"));
+    // The lowest-severity finding was truncated away.
+    assert.doesNotMatch(out, /LOW-BODY/);
+    // Higher-severity material survives.
+    assert.ok(out.includes("CRIT-REC"));
+  });
+
+  it("truncation note omits the round file when no round number is given", () => {
+    const mk = (sev, tag) => ({
+      severity: sev,
+      title: tag,
+      file: "f.js",
+      line_start: 1,
+      body: tag + "-BODY-" + "x".repeat(3500),
+    });
+    const out = renderEscalationDecisions([mk("critical", "CRIT"), mk("low", "LOW")]);
+    assert.ok(out.includes("the chain's round record on the host"));
+    assert.doesNotMatch(out, /round-.*\.json/);
+  });
+
+  it("drops whole entries at the budget and reports N of M in the note", () => {
+    const mk = (sev, tag) => ({
+      severity: sev,
+      title: tag,
+      file: "f.js",
+      line_start: 1,
+      body: tag + "-BODY-" + "x".repeat(2500),
+      recommendation: tag + "-REC-" + "y".repeat(500),
+    });
+    const out = renderEscalationDecisions(
+      [mk("critical", "CRIT"), mk("high", "HIGH"), mk("medium", "MED"), mk("low", "LOW")],
+      { roundNumber: 4 },
+    );
+    // The least severe finding is dropped whole — never partially.
+    assert.doesNotMatch(out, /LOW-BODY/);
+    assert.doesNotMatch(out, /LOW-REC/);
+    // The note states how many of how many are shown.
+    assert.ok(out.includes("1 of 4 findings shown"));
+    assert.ok(out.includes("round-4.json"));
+  });
+
+  it("emits no truncation note when every finding fits within the budget", () => {
+    const out = renderEscalationDecisions([
+      { severity: "critical", title: "CRIT", file: "f.js", line_start: 1, body: "short body", recommendation: "short rec" },
+      { severity: "low", title: "LOW", file: "f.js", line_start: 2, body: "another short body" },
+    ]);
+    assert.doesNotMatch(out, /findings shown/);
+    assert.doesNotMatch(out, /truncated/);
+    assert.ok(out.includes("CRIT"));
+    assert.ok(out.includes("LOW"));
+  });
+
+  it("truncates a single oversized finding at a line boundary (never mid-line)", () => {
+    const bigBody = [
+      "LINE-ONE-UNIQUE-336",
+      "LINE-TWO-UNIQUE-336",
+      "x".repeat(7000),
+      "LINE-FOUR-UNIQUE-336",
+    ].join("\n");
+    const out = renderEscalationDecisions([
+      {
+        severity: "critical",
+        title: "BIG",
+        file: "f.js",
+        line_start: 1,
+        body: bigBody,
+        recommendation: "REC-UNIQUE-336",
+      },
+    ], { roundNumber: 7 });
+    // The entry was truncated (not dropped): note reports 1 of 1 shown.
+    assert.ok(out.includes("1 of 1 findings shown"));
+    assert.ok(out.includes("round-7.json"));
+    // Early lines are kept whole; later lines are dropped whole; the body's
+    // long middle line and the recommendation are past the cut.
+    assert.ok(out.includes("LINE-ONE-UNIQUE-336"));
+    assert.ok(out.includes("LINE-TWO-UNIQUE-336"));
+    assert.doesNotMatch(out, /LINE-FOUR-UNIQUE-336/);
+    assert.doesNotMatch(out, /REC-UNIQUE-336/);
+    // No dangling ### header is ever left as the final content line.
+    const lastContent = [...out.split("\n")].reverse().find((l) => l.length > 0);
+    assert.ok(lastContent && !lastContent.startsWith("### "));
   });
 });
