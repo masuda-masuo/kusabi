@@ -9,7 +9,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { readJson } from "./state-paths.mjs";
-import { hasRepeatedAreas } from "./chain-phases.mjs";
+import { hasRepeatedAreas, inScopeFindingFiles, resolveReworkScope } from "./chain-phases.mjs";
 import { classifyEscalate } from "./chain-substance.mjs";
 
 // =========================================================================
@@ -380,7 +380,35 @@ export function computeStats(chains, opts = {}) {
       continue;
     }
 
-    const result = hasRepeatedAreas(previousRound.findingFiles, round.findings);
+    // Kusabi #334: the live chain narrows the previous round's files to the
+    // ones THIS round was asked to resolve before calling hasRepeatedAreas,
+    // so the aggregate must measure the same input the chain decided on.
+    // The scoped subset is not persisted (records store only the scope name),
+    // so it is re-derived from the same deterministic resolveReworkScope the
+    // chain used -- given the stored previous record it returns exactly the
+    // scope the driver resolved for this round.  The derivation is a no-op
+    // for every record that predates scoping: those rounds carry no
+    // reworkScope field, the chain resolved a full scope for the round that
+    // followed them, and passing no scope keeps the raw files -- historical
+    // figures over such records stay exactly what they were before #334.
+    let previousFindingFiles = previousRound.findingFiles;
+    if (typeof round.reworkScope === "string") {
+      // The record stores the scope name the round was RUN with, so the
+      // re-derived scope is only trusted when its name agrees with the
+      // record.  A disagreement means the branch table changed after the
+      // round ran: the derivation describes a round the chain never
+      // executed, and narrowing with it would silently rewrite the
+      // historical figure.  Such a round is unmeasurable -- not false --
+      // and goes to the same n/a bucket as a pair with missing fields.
+      const derivedScope = resolveReworkScope(previousRound);
+      if (derivedScope.scope !== round.reworkScope) {
+        repeatedNA += 1;
+        continue;
+      }
+      previousFindingFiles = inScopeFindingFiles(previousRound, derivedScope);
+    }
+
+    const result = hasRepeatedAreas(previousFindingFiles, round.findings);
     if (result) {
       repeatedTrue += 1;
     }
