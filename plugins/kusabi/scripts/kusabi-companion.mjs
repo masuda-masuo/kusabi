@@ -17,7 +17,7 @@ import { flushAndExit } from "./flush-and-exit.mjs";
 // The chain driver (kusabi #264 PR 2/2).  chain-driver.mjs imports helpers
 // back from this module; see its header for why that cycle is safe and why
 // nothing moved is re-exported from here.
-import { cmdChain, cmdChainResume, smokeBaselineReport } from "./chain-driver.mjs";
+import { cmdChain, cmdChainResume, smokeBaselineReport, publishWarningForBrief, smokeViolationReport, sessionProvenanceRefusal } from "./chain-driver.mjs";
 import { cursorUsageDir, resolveLatestCursorSession } from "./cursor-statusline-sink.mjs";
 import { parseReviewJsonl } from "./review-jsonl.mjs";
 import { countUnfilledReviewRecords } from "./review-record-scan.mjs";
@@ -25,7 +25,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import process from "node:process";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 import { stateRoot, stateDirFor, readJson } from "./state-paths.mjs";
@@ -2132,6 +2132,151 @@ function cmdChainWait(cwd, { flags, text }) {
 }
 
 // ---------------------------------------------------------------------------
+// chain-detach
+// ---------------------------------------------------------------------------
+
+export function extractChainAndWaitArgs(flags, text) {
+  const chainArgs = [];
+  const waitFlags = {};
+
+  const waitFlagNames = new Set([
+    "next",
+    "since",
+    "poll-interval",
+    "pollInterval",
+    "appear-timeout",
+    "appearTimeout",
+    "progress-timeout",
+    "progressTimeout",
+  ]);
+
+  for (const [key, value] of Object.entries(flags)) {
+    const kebab = key.replace(/([A-Z])/g, "-$1").toLowerCase();
+    if (waitFlagNames.has(key) || waitFlagNames.has(kebab)) {
+      waitFlags[kebab] = value;
+      continue;
+    }
+    if (value === true) {
+      chainArgs.push(`--${kebab}`);
+    } else if (typeof value === "string" || typeof value === "number") {
+      chainArgs.push(`--${kebab}`, String(value));
+    }
+  }
+
+  if (!flags["brief-file"] && typeof text === "string" && text.trim()) {
+    chainArgs.push(text.trim());
+  }
+
+  return { chainArgs, waitFlags };
+}
+
+/**
+ * chain-detach — launch a chain in a detached background process and print
+ * the exact chain-wait command line to run for tracking.
+ *
+ * Performs pre-flight checks up front so invalid dispatches exit non-zero
+ * without launching a child process or printing a wait command line.
+ */
+export async function cmdChainDetach(cwd, { flags, text }, opts = {}) {
+  const startedAtIso = (opts.now ? new Date(opts.now) : new Date()).toISOString();
+
+  // ---- brief-file resolution ----
+  const briefText = readBriefFile(flags, text);
+  if (!briefText) {
+    throw new Error("chain-detach requires a brief description (inline or via --brief-file)");
+  }
+
+  // ---- runtime publish guard ----
+  const publishWarning = publishWarningForBrief(briefText);
+  if (publishWarning) {
+    process.stdout.write(publishWarning + "\n");
+  }
+
+  // ---- lossy-smoke refusal ----
+  const smokeRejection = smokeViolationReport(briefText);
+  if (smokeRejection) throw new Error(smokeRejection);
+
+  // ---- setup ----
+  const stateRootDir = opts.stateRoot || stateRoot();
+  const stateDir = stateDirFor(cwd);
+  const config = loadConfig(stateRootDir);
+
+  const initialSessionOwner = flags.session
+    ? latestJob(stateDir, (j) => j.sessionID === flags.session)
+    : null;
+  const sessionProvenance = initialSessionOwner
+    ? (initialSessionOwner.backend ?? "opencode")
+    : null;
+
+  const implementDispatch = resolveDispatchBackend({ flags, phase: "implement", config });
+  if (config?.models?.phases?.rework) {
+    resolveDispatchBackend({ flags, phase: "rework", config });
+  }
+  resolveDispatchBackend({ flags, phase: "review", config });
+
+  // ---- session-provenance refusal ----
+  const sessionRejection = sessionProvenanceRefusal({
+    session: flags.session,
+    provenance: sessionProvenance,
+    implementBackend: implementDispatch.backend,
+  });
+  if (sessionRejection) throw new Error(sessionRejection);
+
+  // ---- container check ----
+  const container = flags.container;
+  if (!container) throw new Error("chain requires --container <cid>");
+
+  // ---- dispatch-time brief lint ----
+  const lintRejection = briefLintReport({ brief: briefText, container, chain: true });
+  if (lintRejection) throw new Error(lintRejection);
+
+  // Pre-flight checks passed! Create log file in stateDir
+  fs.mkdirSync(stateDir, { recursive: true });
+  const logFile = path.join(stateDir, `chain-detach-${Date.now()}.log`);
+  const logFd = fs.openSync(logFile, "a");
+
+  const { chainArgs, waitFlags } = extractChainAndWaitArgs(flags, text);
+
+  const standin = opts.standin || process.env.KUSABI_TEST_CHAIN_STANDIN;
+  const spawnCmd = process.execPath;
+  const spawnArgs = standin
+    ? [standin, ...chainArgs]
+    : [COMPANION_SCRIPT, "chain", ...chainArgs];
+
+  const child = (opts.spawn || spawn)(spawnCmd, spawnArgs, {
+    cwd,
+    detached: true,
+    stdio: ["ignore", logFd, logFd],
+    env: { ...process.env },
+  });
+
+  if (child.unref) child.unref();
+  fs.closeSync(logFd);
+
+  const since = flags.since || startedAtIso;
+  let waitCmd = `kusabi-companion chain-wait --next --since ${since}`;
+  if (waitFlags["appear-timeout"]) {
+    waitCmd += ` --appear-timeout ${waitFlags["appear-timeout"]}`;
+  }
+  if (waitFlags["poll-interval"]) {
+    waitCmd += ` --poll-interval ${waitFlags["poll-interval"]}`;
+  }
+  if (waitFlags["progress-timeout"]) {
+    waitCmd += ` --progress-timeout ${waitFlags["progress-timeout"]}`;
+  }
+
+  const lines = [
+    `Detached chain launched (pid ${child.pid ?? "unknown"}).`,
+    `Log: ${logFile}`,
+    "",
+    "To wait for completion, run:",
+    `  ${waitCmd}`,
+  ];
+
+  return lines.join("\n");
+}
+
+// ---------------------------------------------------------------------------
 // chain-stats
 // ---------------------------------------------------------------------------
 
@@ -2376,6 +2521,7 @@ function usage() {
     "  task       Run an opencode task",
     "  review     Run an adversarial review of working-tree changes (host worktree only; --container is rejected \u2014 use task --phase review for container reviews)",
     "  chain      Run implement→review→rework chain until acceptance or escalate",
+    "  chain-detach Launch a chain in a detached background process and print a runnable chain-wait command line (no LLM in launcher)",
     "  chain-resume  Resume a cancelled chain from its last recorded phase boundary, or buy a replacement review seat for a chain that escalated on a dead review seat over green probes (reads chain.json / control.json; same chain lifecycle as chain)",
     "  chain-show Print a compact plain-text digest of a chain (read-only, no LLM)",
     "  chain-wait Block until a chain reaches a terminal state, print a one-line digest, exit 0 (read-only, no LLM, no serve; safe to SIGTERM at any moment). Non-zero means the WAIT itself failed — unknown chain id, nothing appeared under --next, or the chain stalled — never a disposition you dislike",
@@ -2450,7 +2596,7 @@ function usage() {
 //   salvage      -> runPrompt            (cmdSalvage)
 //   chain        -> dispatchWithFallback via runImplementPhase, per round (cmdChain)
 //   chain-resume -> same as chain, from a saved position (cmdChainResume)
-const JOB_CREATING_SUBCOMMANDS = new Set(["task", "review", "salvage", "chain", "chain-resume"]);
+const JOB_CREATING_SUBCOMMANDS = new Set(["task", "review", "salvage", "chain", "chain-resume", "chain-detach", "chainDetach"]);
 
 async function main() {
   const [subcommand, ...argv] = process.argv.slice(2);
@@ -2507,7 +2653,7 @@ async function main() {
 
   // --backend is a task/chain dispatch decision (kusabi #184); on any other
   // subcommand it would be silently ignored — reject it out loud instead.
-  if (parsed.flags.backend && subcommand !== "task" && subcommand !== "chain") {
+  if (parsed.flags.backend && subcommand !== "task" && subcommand !== "chain" && subcommand !== "chain-detach" && subcommand !== "chainDetach") {
     throw new Error(`--backend is only supported by task and chain (got subcommand ${subcommand ?? "(none)"})`);
   }
 
@@ -2521,10 +2667,10 @@ async function main() {
   // would be silently ignored, and a wait flag that did nothing is exactly
   // the silent-failure class chain-wait exists to remove.  (--since is shared
   // with chain-stats / metrics, so it is checked inside cmdChainWait instead.)
-  if (subcommand !== "chain-wait" && subcommand !== "chainWait") {
+  if (subcommand !== "chain-wait" && subcommand !== "chainWait" && subcommand !== "chain-detach" && subcommand !== "chainDetach") {
     for (const flag of ["next", "poll-interval", "appear-timeout", "progress-timeout"]) {
       if (parsed.flags[flag] !== undefined) {
-        throw new Error(`--${flag} is only supported by chain-wait (got subcommand ${subcommand ?? "(none)"})`);
+        throw new Error(`--${flag} is only supported by chain-wait and chain-detach (got subcommand ${subcommand ?? "(none)"})`);
       }
     }
   }
@@ -2570,6 +2716,9 @@ async function main() {
       return cmdBaseline(cwd, parsed);
     case "chain":
       return cmdChain(cwd, parsed);
+    case "chain-detach":
+    case "chainDetach":
+      return cmdChainDetach(cwd, parsed);
     case "chain-resume":
     case "chainResume":
       return cmdChainResume(cwd, parsed);
@@ -2591,7 +2740,7 @@ async function main() {
     case "dashboard":
       return cmdDashboard(cwd, parsed);
     default:
-      throw new Error(`unknown subcommand: ${subcommand ?? "(none)"}. Use setup|task|review|chain|baseline|chain-resume|chain-show|chain-wait|chain-stats|metrics-ingest|metrics-report|dashboard|chain-cancel|status|result|cancel|serve-stop|install-agents|install-cli|salvage`);
+      throw new Error(`unknown subcommand: ${subcommand ?? "(none)"}. Use setup|task|review|chain|baseline|chain-detach|chain-resume|chain-show|chain-wait|chain-stats|metrics-ingest|metrics-report|dashboard|chain-cancel|status|result|cancel|serve-stop|install-agents|install-cli|salvage`);
   }
 }
 
