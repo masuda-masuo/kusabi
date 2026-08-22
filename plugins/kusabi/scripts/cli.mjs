@@ -104,7 +104,12 @@ export const BUILTIN_DEFAULT_CHAIN = [
  */
 export function selectRoutes({ tiers, round, tierIndex, explicitModel, failedRoutes }) {
   const failed = failedRoutes ?? new Set();
-  // Normalise: string → [string]; array → its own copy.
+
+  if (explicitModel) {
+    return failed.has(explicitModel) ? [] : [explicitModel];
+  }
+
+  // Normalise: string -> [string]; array -> its own copy.
   const normalized = tiers.map(function (t) {
     return typeof t === "string" ? [t] : [...t];
   });
@@ -118,15 +123,10 @@ export function selectRoutes({ tiers, round, tierIndex, explicitModel, failedRou
   /** @type {string[]} */
   const candidates = [];
 
-  // --model override prepended when present and not dead.
-  if (explicitModel && !failed.has(explicitModel)) {
-    candidates.push(explicitModel);
-  }
-
   // Current tier first, then latent tiers.
   for (let i = effectiveTierIndex; i < normalized.length; i++) {
     for (const route of normalized[i]) {
-      if (route !== explicitModel && !failed.has(route) && !candidates.includes(route)) {
+      if (!failed.has(route) && !candidates.includes(route)) {
         candidates.push(route);
       }
     }

@@ -821,15 +821,17 @@ export async function dispatchWithFallback(opts) {
   const candidates = selectRoutes({ tiers, round, tierIndex, explicitModel, failedRoutes });
 
   if (candidates.length === 0) {
-    // Should only occur if the chain is empty AND no explicit model.
+    const errorMsg = explicitModel && failedRoutes.has(explicitModel)
+      ? `Pinned model "${explicitModel}" has already failed terminally in this process.`
+      : "No available routes: all routes have failed or the chain is empty.";
     const errorJob = {
       id: "no-route-" + Date.now(),
       kind: runPromptOpts.kind || "task",
       status: "provider-error",
-      error: "No available routes: all routes have failed or the chain is empty.",
+      error: errorMsg,
       fallbacks: [],
       retry: null,
-      modelEntry: null,
+      modelEntry: explicitModel || null,
       modelVariant: null,
       usage: null,
       startedAt: new Date().toISOString(),
