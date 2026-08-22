@@ -4,6 +4,44 @@ import path from "node:path";
 import { stateRoot } from "./state-paths.mjs";
 
 const UNADJUDICATED_ROW_PATTERN = /\|\s*_fill_\s*\|\s*_fill_\s*\|/;
+const FINDINGS_SECTION_HEADER_PATTERN = /^\s*##\s+Findings adjudication\b/i;
+const ANY_HEADER_PATTERN = /^\s*#+\s+/;
+
+/**
+ * Check if a review record's content has an unadjudicated table row
+ * inside its findings adjudication section.
+ *
+ * @param {string} content
+ * @returns {boolean}
+ */
+export function isUnadjudicatedRecord(content) {
+  if (!content || typeof content !== "string") return false;
+
+  const lines = content.split(/\r?\n/);
+  let inFindingsSection = false;
+
+  for (const line of lines) {
+    if (ANY_HEADER_PATTERN.test(line)) {
+      if (FINDINGS_SECTION_HEADER_PATTERN.test(line)) {
+        inFindingsSection = true;
+        continue;
+      } else if (inFindingsSection) {
+        inFindingsSection = false;
+      }
+    }
+
+    if (inFindingsSection) {
+      const trimmed = line.trim();
+      if (trimmed.startsWith("|") && trimmed.endsWith("|")) {
+        if (UNADJUDICATED_ROW_PATTERN.test(trimmed)) {
+          return true;
+        }
+      }
+    }
+  }
+
+  return false;
+}
 
 /**
  * Scan review records under the state root and count those that had findings
@@ -43,7 +81,7 @@ export function countUnfilledReviewRecords(stateRootDir) {
           try {
             if (!fs.existsSync(recordPath)) continue;
             const content = fs.readFileSync(recordPath, "utf8");
-            if (UNADJUDICATED_ROW_PATTERN.test(content)) {
+            if (isUnadjudicatedRecord(content)) {
               count++;
             }
           } catch {
