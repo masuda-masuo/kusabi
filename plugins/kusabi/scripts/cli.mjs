@@ -35,7 +35,7 @@ export function parseArgs(argv) {
         ? arg.slice(2).replace(/-([a-z])/g, (_, c) => c.toUpperCase())
         : arg.slice(1);
       flags[key] = true;
-    } else if (arg === "--base" || arg === "--model" || arg === "--agent" || arg === "--session" || arg === "--timeout" || arg === "--deny" || arg === "--watchdog" || arg === "--phase" || arg === "--container" || arg === "--prior" || arg === "--max-rounds" || arg === "--brief-file" || arg === "--since" || arg === "--until" || arg === "--compare" || arg === "--transcript-dir" || arg === "--cursor-usage-dir" || arg === "--state-root" || arg === "--db" || arg === "--backend" || arg === "--poll-interval" || arg === "--appear-timeout" || arg === "--progress-timeout") {
+    } else if (arg === "--base" || arg === "--model" || arg === "--agent" || arg === "--session" || arg === "--timeout" || arg === "--deny" || arg === "--watchdog" || arg === "--phase" || arg === "--container" || arg === "--prior" || arg === "--max-rounds" || arg === "--brief-file" || arg === "--since" || arg === "--until" || arg === "--compare" || arg === "--transcript-dir" || arg === "--cursor-usage-dir" || arg === "--state-root" || arg === "--db" || arg === "--backend" || arg === "--poll-interval" || arg === "--appear-timeout" || arg === "--progress-timeout" || arg === "--port") {
       const flagName = arg.slice(2);
       const val = argv[++i];
       if (val === undefined || (typeof val === "string" && val.startsWith("--"))) {

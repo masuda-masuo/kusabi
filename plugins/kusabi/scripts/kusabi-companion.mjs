@@ -29,6 +29,7 @@ import { fileURLToPath } from "node:url";
 
 import { stateRoot, stateDirFor, readJson } from "./state-paths.mjs";
 import { collectChainRecords, computeStats, renderChainStats, renderComparison } from "./chain-stats.mjs";
+import { startDashboard } from "./dashboard.mjs";
 import {
   readChainControl,
   requestChainStop,
@@ -2245,6 +2246,35 @@ function cmdMetricsReport(cwd, { flags }) {
   }
 }
 
+function dashboardPortFlag(flags, fallback = 8752) {
+  const raw = flags.port;
+  if (raw === undefined) return fallback;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || !Number.isInteger(n) || n < 0 || n > 65535) {
+    throw new Error(`--port expects a TCP port number, got: ${raw}`);
+  }
+  return n;
+}
+
+async function cmdDashboard(_cwd, { flags }) {
+  const root = flags["state-root"] || stateRoot();
+  const dbPath = flags.db || path.join(root, "metrics.db");
+  const port = dashboardPortFlag(flags);
+  const { server, port: bound } = await startDashboard({
+    stateRoot: root,
+    dbPath,
+    port,
+  });
+  const dbLabel = fs.existsSync(dbPath) ? dbPath : "missing";
+  process.stdout.write(
+    `dashboard: listening on http://127.0.0.1:${bound} (state root ${root}, db ${dbLabel})\n`,
+  );
+  await new Promise((resolve) => {
+    server.on("close", resolve);
+  });
+  return "";
+}
+
 // ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
@@ -2264,6 +2294,7 @@ function usage() {
     "  chain-stats Aggregate every chain record and print a summary (read-only, no LLM)",
     "  metrics-ingest  Ingest transcripts + chain records + delegated-job records into a durable SQLite store (read-only source, no LLM)",
     "  metrics-report  Query/report over the SQLite metrics store (read-only, no LLM, never ingests)",
+    "  dashboard  Serve a read-only local JSON API over the state root and metrics.db (no LLM, no writes)",
     "  chain-cancel  Request a running chain to stop (file-based, works across processes)",
     "  status     List recent jobs or show one by ID",
     "  result     Show completed job result (latest, or by ID)",
@@ -2305,6 +2336,9 @@ function usage() {
     "  --since <ISO> (metrics-report: window start, inclusive)",
     "  --until <ISO> (metrics-report: window end, exclusive)",
     "  --json (metrics-report: emit the report as one JSON document instead of text)",
+    "  --port <N> (dashboard: listen port, default 8752; 0 binds an ephemeral port)",
+    "  --state-root <path> (dashboard: default the kusabi state root, ~/.kusabi)",
+    "  --db <path> (dashboard: default <state-root>/metrics.db)",
     "  -h, --help",
     "",
     "Unknown flags cause an error. Use -- to treat subsequent tokens as literal text.",
@@ -2406,6 +2440,19 @@ async function main() {
     }
   }
 
+  if (parsed.flags.port !== undefined && subcommand !== "dashboard") {
+    throw new Error(`--port is only supported by dashboard (got subcommand ${subcommand ?? "(none)"})`);
+  }
+
+  if (parsed.flags["state-root"] !== undefined) {
+    const stateRootOk = new Set([
+      "metrics-ingest", "metricsIngest", "metrics-report", "metricsReport", "dashboard",
+    ]);
+    if (!stateRootOk.has(subcommand)) {
+      throw new Error(`--state-root is only supported by metrics-ingest, metrics-report and dashboard (got subcommand ${subcommand ?? "(none)"})`);
+    }
+  }
+
   switch (subcommand) {
     case "setup":
       return cmdSetup(cwd);
@@ -2450,8 +2497,10 @@ async function main() {
     case "metrics-report":
     case "metricsReport":
       return cmdMetricsReport(cwd, parsed);
+    case "dashboard":
+      return cmdDashboard(cwd, parsed);
     default:
-      throw new Error(`unknown subcommand: ${subcommand ?? "(none)"}. Use setup|task|review|chain|chain-resume|chain-show|chain-wait|chain-stats|metrics-ingest|metrics-report|chain-cancel|status|result|cancel|serve-stop|install-agents|install-cli|salvage`);
+      throw new Error(`unknown subcommand: ${subcommand ?? "(none)"}. Use setup|task|review|chain|chain-resume|chain-show|chain-wait|chain-stats|metrics-ingest|metrics-report|dashboard|chain-cancel|status|result|cancel|serve-stop|install-agents|install-cli|salvage`);
   }
 }
 
