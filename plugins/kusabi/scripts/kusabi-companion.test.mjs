@@ -4742,3 +4742,105 @@ describe("brief lint and container delivery (kusabi #289)", () => {
     });
   });
 });
+describe("help flags validation (kusabi #360)", () => {
+  const COMPANION_SCRIPT = path.join(import.meta.dirname, "kusabi-companion.mjs");
+
+  function getCompanionCodeAndUsage() {
+    const companionSource = fs.readFileSync(COMPANION_SCRIPT, "utf8");
+
+    const usageStart = companionSource.indexOf("function usage()");
+    assert.ok(usageStart >= 0, "usage function found");
+    const usageEnd = companionSource.indexOf("\n}\n", usageStart);
+    assert.ok(usageEnd > usageStart, "usage function end found");
+    const usageText = companionSource.slice(usageStart, usageEnd);
+
+    const scriptDir = import.meta.dirname;
+    let allCode = companionSource.slice(0, usageStart) + companionSource.slice(usageEnd);
+    for (const file of fs.readdirSync(scriptDir)) {
+      if (file.endsWith(".mjs") && !file.endsWith(".test.mjs") && file !== "kusabi-companion.mjs") {
+        allCode += "\n" + fs.readFileSync(path.join(scriptDir, file), "utf8");
+      }
+    }
+    return { usageText, allCode };
+  }
+
+  function extractAdvertisedFlags(flagsText) {
+    const rawFlags = [];
+    for (const line of flagsText.split("\n")) {
+      const matches = line.matchAll(/(?:^\s*"*\s*|,\s*)--([a-z0-9-]+)/g);
+      for (const m of matches) {
+        rawFlags.push(m[1]);
+      }
+    }
+    return [...new Set(rawFlags)].filter((f) => f !== "help" && f !== "h");
+  }
+
+  function findUnconsumedFlags(advertisedFlags, allCode) {
+    const unconsumed = [];
+    for (const flag of advertisedFlags) {
+      const kebab = flag;
+      const camel = flag.replace(/-([a-z])/g, (_, c) => c.toUpperCase());
+
+      // Check property access on flags, parsed.flags, or opts.flags (e.g., flags.readOnly, parsed.flags.base)
+      const hasPropAccess =
+        new RegExp(`\\b(?:parsed\\??\\.|opts\\??\\.)?flags\\??\\.(?:${camel}|${kebab})\\b`).test(allCode);
+
+      // Check bracket indexing on flags, parsed.flags, or opts.flags with string literal (e.g., flags["brief-file"], parsed.flags["max-rounds"])
+      const hasBracketAccess =
+        new RegExp(`\\b(?:parsed\\??\\.|opts\\??\\.)?flags\\??\\[\\s*["'](?:${kebab}|${camel})["']\\s*\\]`).test(allCode);
+
+      // Check helper indexing passing string literal to waitDurationFlag (e.g., waitDurationFlag(flags, "poll-interval", ...))
+      const hasWaitDurationAccess =
+        new RegExp(`\\bwaitDurationFlag\\(\\s*flags\\s*,\\s*["'](?:${kebab}|${camel})["']`).test(allCode);
+
+      if (!hasPropAccess && !hasBracketAccess && !hasWaitDurationAccess) {
+        unconsumed.push(`--${flag}`);
+      }
+    }
+    return unconsumed;
+  }
+
+  it("every flag advertised in --help is consumed in the companion source", () => {
+    const { usageText, allCode } = getCompanionCodeAndUsage();
+
+    const flagsSectionMatch = usageText.match(/Flags:([\s\S]*?)(?:Unknown flags|Serve lifecycle|$)/);
+    assert.ok(flagsSectionMatch, "Flags section found in usage()");
+    const flagsText = flagsSectionMatch[1];
+
+    const advertisedFlags = extractAdvertisedFlags(flagsText);
+    assert.ok(advertisedFlags.length > 0, "advertised flags extracted");
+
+    const unconsumed = findUnconsumedFlags(advertisedFlags, allCode);
+    assert.deepStrictEqual(
+      unconsumed,
+      [],
+      `Advertised flags [${unconsumed.join(", ")}] are listed in --help but not consumed in companion source`
+    );
+  });
+
+  it("rejects help text with flags that exist in code as non-flag string literals (--review, --salvage)", () => {
+    const { allCode } = getCompanionCodeAndUsage();
+    const syntheticFlagsText = "\n  --read-only, --resume-last, --review, --salvage\n";
+    const advertisedFlags = extractAdvertisedFlags(syntheticFlagsText);
+
+    const unconsumed = findUnconsumedFlags(advertisedFlags, allCode);
+    assert.deepStrictEqual(
+      unconsumed,
+      ["--review", "--salvage"],
+      "expected --review and --salvage to be detected as unconsumed flags"
+    );
+  });
+
+  it("rejects help text with flags whose name appears nowhere in the codebase", () => {
+    const { allCode } = getCompanionCodeAndUsage();
+    const syntheticFlagsText = "\n  --nonexistent-flag-xyz\n";
+    const advertisedFlags = extractAdvertisedFlags(syntheticFlagsText);
+
+    const unconsumed = findUnconsumedFlags(advertisedFlags, allCode);
+    assert.deepStrictEqual(
+      unconsumed,
+      ["--nonexistent-flag-xyz"],
+      "expected --nonexistent-flag-xyz to be detected as unconsumed flag"
+    );
+  });
+});
