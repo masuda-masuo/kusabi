@@ -192,6 +192,7 @@ function buildState(root) {
   });
   const unp2 = acceptRound(2, {
     worktreeChanged: true,
+    reviewJobId: "job-unp-review",
     verdict: "unparseable",
     reviewParseable: false,
     disposition: { disposition: "escalate", reason: "review unreadable" },
@@ -246,9 +247,10 @@ function buildState(root) {
   const emptyRound = acceptRound(1, {
     worktreeChanged: false,
     implementRefusal: null,
-    reviewParseable: true,
-    verdict: "approve",
-    disposition: { disposition: "escalate", reason: "empty worktree" },
+    reviewJobId: null,
+    reviewParseable: false,
+    verdict: "discard",
+    disposition: { disposition: "discard", reason: "empty worktree" },
   });
   writeChain(root, WS_B, "chain-empty", {
     control: baseControl("chain-empty", {
@@ -336,6 +338,15 @@ describe("dashboard collectors", () => {
     const limited = collectEnded(tmp, { limit: 2 });
     assert.equal(limited.chains.length, 2);
     assert.deepEqual(limited.chains.map((c) => c.chainId), ["chain-accept", "chain-refusal"]);
+  });
+
+  it("empty worktree without a review job is empty-round; unparseable requires reviewJobId", () => {
+    const result = collectEnded(tmp, { limit: 50 });
+    const byId = Object.fromEntries(result.chains.map((c) => [c.chainId, c]));
+    assert.equal(byId["chain-empty"].failureClass, "empty-round");
+    assert.equal(byId["chain-empty"].failureDetail, null);
+    assert.equal(byId["chain-unparseable"].failureClass, "review-unparseable");
+    assert.equal(byId["chain-unparseable"].failureDetail, "unparseable");
   });
 
   it("chainDetail digest matches renderChainShow and includes referenced jobs; missing chain returns {error}", () => {
@@ -490,6 +501,42 @@ describe("dashboard HTTP server", () => {
     const nope = await get("/nope");
     assert.equal(nope.status, 404);
     assert.ok(nope.body.error);
+  });
+
+  it("GET / is HTML with four sections; GET /api is the route list; JSON APIs unchanged; POST / is 405", async () => {
+    const index = await get("/");
+    assert.equal(index.status, 200);
+    assert.match(index.headers.get("content-type"), /text\/html/);
+    assert.equal(index.headers.get("cache-control"), "no-store");
+    const indexBody = String(index.body);
+    assert.match(indexBody, /<h2>Running<\/h2>/);
+    assert.match(indexBody, /<h2>Ended/);
+    assert.match(indexBody, /<h2>Cost<\/h2>/);
+    assert.match(indexBody, /<h2>Workspaces<\/h2>/);
+
+    const api = await get("/api");
+    assert.equal(api.status, 200);
+    assert.match(api.headers.get("content-type"), /text\/plain/);
+    assert.match(String(api.body), /GET \/api\/workspaces\.json/);
+    assert.match(String(api.body), /GET \/api\/running\.json/);
+
+    const running = await get("/api/running.json");
+    assert.equal(running.status, 200);
+    assert.match(running.headers.get("content-type"), /application\/json/);
+    assert.ok(Array.isArray(running.body.chains));
+
+    const post = await fetch(`http://127.0.0.1:${port}/`, { method: "POST" });
+    assert.equal(post.status, 405);
+
+    const chainPage = await get(`/chain/${WS_A}/chain-accept`);
+    assert.equal(chainPage.status, 200);
+    assert.match(chainPage.headers.get("content-type"), /text\/html/);
+    assert.match(String(chainPage.body), /<pre>/);
+
+    const missing = await get(`/chain/${WS_A}/chain-nope`);
+    assert.equal(missing.status, 404);
+    assert.match(missing.headers.get("content-type"), /text\/html/);
+    assert.match(String(missing.body), /not found/i);
   });
 });
 
