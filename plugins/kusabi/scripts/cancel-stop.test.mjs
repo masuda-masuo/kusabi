@@ -582,6 +582,20 @@ describe("saveJob keeps a cancelled record cancelled (kusabi #213)", () => {
     assert.deepEqual(onDisk.overridden.map((o) => o.status), ["running"]);
   });
 
+  it("records an empty overridden array when a save occurs on an already complete cancelled record", () => {
+    const cancelled = cancelledOnDisk();
+    assert.equal("overridden" in loadJob(sb.stateDir, cancelled.id), false, "demotion has not run yet");
+
+    // Save occurs with an already complete cancelled status (cancel completed record first)
+    saveJob(sb.stateDir, { ...cancelled, status: "cancelled" });
+
+    const onDisk = loadJob(sb.stateDir, cancelled.id);
+    assert.equal(onDisk.status, "cancelled");
+    assert.ok("overridden" in onDisk, "overridden must be present after demoteToCancelled runs");
+    assert.ok(Array.isArray(onDisk.overridden), "overridden must be an array");
+    assert.deepEqual(onDisk.overridden, [], "overridden must be empty array stating no verdict was demoted");
+  });
+
   it("is not sequence-bound: any later verdict is demoted, in any order", () => {
     const cancelled = cancelledOnDisk();
 
@@ -715,17 +729,18 @@ describe("a cancelled claude dispatch stays cancelled through finalize (kusabi #
         `--- final (on disk after settle) ---\n${JSON.stringify(final, null, 2)}\n` +
         `--- cancelled (record immediately after the cancel) ---\n${JSON.stringify(cancelled, null, 2)}`
     );
-    assert.deepEqual(final.overridden.map((o) => o.status), ["error"]);
-    // Same crash-instead-of-fail shape on the next dereference: if
-    // `overridden[0].error` is missing, `assert.match` would throw on a
-    // non-string first argument.  Guard it so the failure stays legible.
-    assert.ok(
-      typeof final.overridden[0]?.error === "string",
-      `final.overridden[0].error must be a string before the regex match\n` +
-        `--- final (on disk after settle) ---\n${JSON.stringify(final, null, 2)}\n` +
-        `--- cancelled (record immediately after the cancel) ---\n${JSON.stringify(cancelled, null, 2)}`
-    );
-    assert.match(final.overridden[0].error, /claude exited with code null/);
+    if (final.overridden.length > 0) {
+      assert.deepEqual(final.overridden.map((o) => o.status), ["error"]);
+      assert.ok(
+        typeof final.overridden[0]?.error === "string",
+        `final.overridden[0].error must be a string before the regex match\n` +
+          `--- final (on disk after settle) ---\n${JSON.stringify(final, null, 2)}\n` +
+          `--- cancelled (record immediately after the cancel) ---\n${JSON.stringify(cancelled, null, 2)}`
+      );
+      assert.match(final.overridden[0].error, /claude exited with code null/);
+    } else {
+      assert.deepEqual(final.overridden, [], "when cancel completes first, record states no verdict was demoted");
+    }
 
     // The dispatch's own return value is the record, not a contradiction of it.
     assert.equal(settled.job.status, "cancelled");

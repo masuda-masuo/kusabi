@@ -73,8 +73,8 @@ function demoteToCancelled(job, existing) {
     };
     if (job.failure != null) attempted.failure = job.failure;
     job.overridden = [...(preserved ?? []), attempted];
-  } else if (preserved) {
-    job.overridden = preserved;
+  } else {
+    job.overridden = preserved ?? [];
   }
   for (const field of VERDICT_FIELDS) {
     if (field in existing) job[field] = existing[field];
