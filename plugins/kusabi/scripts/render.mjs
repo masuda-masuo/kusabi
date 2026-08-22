@@ -941,7 +941,7 @@ function roundDerivedStatus(rounds) {
   return null;
 }
 
-function resolveChainStatus(control, rounds) {
+export function resolveChainStatus(control, rounds) {
   // The control record is authoritative about the chain's *lifecycle* —
   // whether the process is alive, stopping, gone (stale), cancelled or failed.
   // effectiveStatus detects stale records (running status with dead pid) and
