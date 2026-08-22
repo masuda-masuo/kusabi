@@ -550,10 +550,9 @@ describe("runChainDriver resume", () => {
     assert.equal(chainJson.records.length, 1);
     assert.equal(chainJson.records[0].interrupted, true);
 
-    // A cancelled chain produces no review record (kusabi #52) — the record
-    // exists only when a terminal disposition is reached.
-    assert.equal(fs.existsSync(path.join(chainDir, "review-record.md")), false);
-    assert.doesNotMatch(text, /review record:/);
+    // A cancelled chain post-probe produces a provisional review record (issue #357)
+    assert.equal(fs.existsSync(path.join(chainDir, "review-record.md")), true);
+    assert.match(text, /review record: .*review-record\.md/);
 
     // The persisted partial record is resumable
     const resolution = resolveChainResume({
@@ -5507,7 +5506,7 @@ describe("runChainDriver brief-syntax defect (kusabi #303)", () => {
     return dispatch;
   }
 
-  async function runFresh({ brief, statusOutput }) {
+  async function runFresh({ brief, statusOutput, dispatchWithFallback: customDispatch, reviewJobStatus, reviewJobError }) {
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-briefsyntax-"));
     const chainDir = path.join(tmp, "chains", "chain-bsd");
     fs.mkdirSync(chainDir, { recursive: true });
@@ -5515,7 +5514,12 @@ describe("runChainDriver brief-syntax defect (kusabi #303)", () => {
       chainId: "chain-bsd", container: "cid-1", pid: process.pid,
       status: "running", round: 0, startedAt: new Date().toISOString(),
     });
-    const dispatch = approvingDispatch();
+    const dispatch = customDispatch || (reviewJobStatus ? async (opts) => {
+      if (opts.kind === "review") {
+        return { job: { id: "job-rev-1", status: reviewJobStatus, error: reviewJobError || "quota limit" }, resultText: "" };
+      }
+      return { job: { id: "job-1", status: "completed" }, resultText: "verdict: approve" };
+    } : approvingDispatch());
     const text = await runChainDriver({
       cwd: tmp, stateDir: tmp, chainDir, chainId: "chain-bsd", container: "cid-1",
       model: "fake/model", modelChain: [["fake/model"], ["fake/pro"]], maxRounds: 4,
@@ -5614,5 +5618,101 @@ describe("runChainDriver brief-syntax defect (kusabi #303)", () => {
     } finally {
       fs.rmSync(tmp, { recursive: true, force: true });
     }
+  });
+
+  describe("provisional review records (issue #357)", () => {
+    it("writes a provisional review record on review provider error exit when probes were run", async () => {
+      const { tmp, chainDir, text } = await runFresh({
+        brief: "Implement X.\n## Deliverables\n- src/x.js\n",
+        statusOutput: " M src/x.js\n",
+        reviewJobStatus: "provider-error",
+        reviewJobError: "quota exceeded",
+      });
+      try {
+        const recordPath = path.join(chainDir, "review-record.md");
+        assert.equal(fs.existsSync(recordPath), true, "provisional review-record.md must be written");
+        assert.match(text, /review record: .*review-record\.md/);
+
+        const content = fs.readFileSync(recordPath, "utf8");
+        assert.match(content, /Note: PROVISIONAL RECORD — chain did not reach a disposition and may be superseded by chain-resume\./);
+        assert.match(content, /Final disposition: failed at round 1 of 4/);
+        assert.match(content, /_No review verdict was delivered for this chain — implementation remains unadjudicated\._/);
+        assert.match(content, /\| 1 \| unknown \| _No review verdict delivered — unadjudicated implementation_ \| _fill_ \| _fill_ \|/);
+
+        const control = readChainControl(chainDir);
+        assert.equal(control.status, "failed");
+      } finally {
+        fs.rmSync(tmp, { recursive: true, force: true });
+      }
+    });
+
+    it("does not write a review record when cancelled before any round's probes run", async () => {
+      const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-test-stop-preround-"));
+      try {
+        const chainDir = path.join(tmp, "chains", "chain-stop-pre");
+        fs.mkdirSync(chainDir, { recursive: true });
+        writeChainControl(chainDir, {
+          chainId: "chain-stop-pre", container: "cid-1", pid: process.pid,
+          status: "running", round: 0, startedAt: new Date().toISOString(),
+          stopRequestedAt: new Date().toISOString(),
+        });
+
+        const outcome = await runChainDriver({
+          cwd: tmp, stateDir: tmp, chainDir, chainId: "chain-stop-pre", container: "cid-1",
+          model: "fake/model", modelChain: [["fake/model"]], maxRounds: 3,
+          brief: "Implement X.\n", orchestrator: null, baseSha: "abc123", worktreeBaseline: null,
+          verifyBaseline: null,
+          callTool: createFakeCallTool(),
+          dispatchWithFallback: approvingDispatch(),
+          keepServe: true,
+          signalReceived: () => false,
+          resume: null,
+        });
+
+        assert.match(outcome, /Chain chain-stop-pre cancelled at round 1 \(stop requested\)\./);
+        assert.doesNotMatch(outcome, /review record:/);
+        assert.equal(fs.existsSync(path.join(chainDir, "review-record.md")), false);
+      } finally {
+        fs.rmSync(tmp, { recursive: true, force: true });
+      }
+    });
+
+    it("rethrows the original exception if an error occurs mid-round without being swallowed", async () => {
+      const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-test-throw-"));
+      try {
+        const chainDir = path.join(tmp, "chains", "chain-err");
+        fs.mkdirSync(chainDir, { recursive: true });
+        writeChainControl(chainDir, {
+          chainId: "chain-err", container: "cid-1", pid: process.pid,
+          status: "running", round: 0, startedAt: new Date().toISOString(),
+        });
+
+        const customDispatch = async () => {
+          throw new Error("unexpected internal crash");
+        };
+
+        await assert.rejects(
+          async () => {
+            await runChainDriver({
+              cwd: tmp, stateDir: tmp, chainDir, chainId: "chain-err", container: "cid-1",
+              model: "fake/model", modelChain: [["fake/model"]], maxRounds: 3,
+              brief: "Implement X.\n", orchestrator: null, baseSha: "abc123", worktreeBaseline: null,
+              verifyBaseline: null,
+              callTool: createFakeCallTool(),
+              dispatchWithFallback: customDispatch,
+              keepServe: true,
+              signalReceived: () => false,
+              resume: null,
+            });
+          },
+          {
+            name: "Error",
+            message: "unexpected internal crash",
+          }
+        );
+      } finally {
+        fs.rmSync(tmp, { recursive: true, force: true });
+      }
+    });
   });
 });

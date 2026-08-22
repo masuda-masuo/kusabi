@@ -1299,6 +1299,51 @@ export async function runChainDriver({
     return baseText + unfilledNote;
   }
 
+  // ---- provisional finalisation: write a provisional review record at non-completed exits
+  // when the predicate holds (records >= 1 and last round has probeResults).
+  function finaliseProvisionalChain(text, disposition, round) {
+    const last = records.length >= 1 ? records[records.length - 1] : null;
+    const predicateHolds = Boolean(
+      records.length >= 1 &&
+      last &&
+      Array.isArray(last.probeResults) &&
+      last.probeResults.length > 0
+    );
+    if (!predicateHolds) {
+      return text;
+    }
+
+    let recordPath = null;
+    let writeError = null;
+    try {
+      const dispObj = typeof disposition === "string" ? { disposition } : (disposition ?? { disposition: "unknown" });
+      const recRound = round ?? (last ? last.round : records.length);
+      recordPath = writeReviewRecord({
+        chainDir, chainId, container, modelChain, maxRounds, brief, orchestrator,
+        records, chainTotals: computeChainTotals(records),
+        disposition: dispObj, round: recRound,
+        label: path.basename(cwd) || null,
+        provisional: true,
+      });
+    } catch (err) {
+      writeError = err;
+    }
+    const baseText = recordPath
+      ? text + "\n\n" + "review record: " + recordPath
+      : text + "\n\n" + "review record: (write failed: " + (writeError?.message || "unknown error") + " — chain state dir " + chainDir + ")";
+
+    let unfilledNote = "";
+    try {
+      const unfilled = countUnfilledReviewRecords(stateRoot());
+      if (unfilled > 0) {
+        unfilledNote = `\nunadjudicated review records: ${unfilled}`;
+      }
+    } catch {
+      // Best-effort — non-fatal scan failure degrades to silence
+    }
+    return baseText + unfilledNote;
+  }
+
   // Existence predicate for refusal anchors (kusabi #293, #351):
   //   - when `container` is set, finishRound queries the container filesystem
   //     at /workspace via `sandbox_exec` (`test -e`);
@@ -1504,7 +1549,7 @@ export async function runChainDriver({
       writeJson(path.join(chainDir, "round-" + round + ".json"), roundRecord);
       writeJson(path.join(chainDir, "chain.json"), chainState);
       finalizeChainControl({ chainDir, status: "failed", round });
-      return { done: true, text: outcome };
+      return { done: true, text: finaliseProvisionalChain(outcome, "failed", round) };
     }
 
     // ---- phase 6: derive disposition ----
@@ -1785,7 +1830,7 @@ export async function runChainDriver({
         writeJson(path.join(chainDir, "round-" + round + ".json"), roundRecord);
         writeJson(path.join(chainDir, "chain.json"), chainState);
         finalizeChainControl({ chainDir, status: "failed", round });
-        return { done: true, text: outcome };
+        return { done: true, text: finaliseProvisionalChain(outcome, "failed", round) };
       }
 
       strategized = true;
@@ -1823,7 +1868,8 @@ export async function runChainDriver({
       // ---- stop check: honour file-based stop request or signal ----
       if (shouldStopNow({ chainDir, signalReceived: signalReceived() })) {
         finalizeChainControl({ chainDir, status: "cancelled", round: round - 1 });
-        return `Chain ${chainId} cancelled at round ${round} (stop requested).`;
+        const text = `Chain ${chainId} cancelled at round ${round} (stop requested).`;
+        return finaliseProvisionalChain(text, "cancelled", round - 1);
       }
 
       const isFirstRound = !resume && round === 1;
@@ -2078,7 +2124,7 @@ export async function runChainDriver({
         writeJson(path.join(chainDir, "round-" + round + ".json"), roundRecord);
         writeJson(path.join(chainDir, "chain.json"), chainState);
         finalizeChainControl({ chainDir, status: "failed", round });
-        return outcome;
+        return finaliseProvisionalChain(outcome, "failed", round);
       }
 
       // ---- phase 4: deterministic probes (P1–P6) ----
@@ -2113,7 +2159,8 @@ export async function runChainDriver({
           verifyBaseline: effectiveVerifyBaseline,
         });
         finalizeChainControl({ chainDir, status: "cancelled", round });
-        return `Chain ${chainId} cancelled during round ${round} (stop requested after probes, before review). Progress preserved — resume with chain-resume ${chainId}.`;
+        const text = `Chain ${chainId} cancelled during round ${round} (stop requested after probes, before review). Progress preserved — resume with chain-resume ${chainId}.`;
+        return finaliseProvisionalChain(text, "cancelled", round);
       }
 
       const result = await finishRound({
@@ -2146,6 +2193,7 @@ export async function runChainDriver({
   } catch (err) {
     // Exception thrown mid-round — record failure and rethrow
     finalizeChainControl({ chainDir, status: "failed", round: records.length });
+    finaliseProvisionalChain("", "failed", records.length);
     throw err;
   } finally {
     // Stop the serve for this cwd unless --keep-serve or another job is running
