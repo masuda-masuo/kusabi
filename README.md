@@ -119,6 +119,7 @@ Everything else is a companion subcommand, invoked directly as
 | `chain-cancel <chainId>` | Request a running chain to stop (file-based, works across processes) |
 | `metrics-ingest` | Ingest transcripts + chain records + delegated-job records into a durable SQLite store (read-only source, no LLM) |
 | `metrics-report` | Query/report over the SQLite metrics store (read-only, no LLM, never ingests) |
+| `dashboard` | Read-only local HTML + JSON over the state root and metrics.db (default http://127.0.0.1:8752). How to read each signal: `docs/design/dashboard.md`. |
 | `serve-stop` | Stop the background opencode server and remove its state file; declines with running jobs unless `--force` |
 | `install-agents` | Copy phase agent definitions to `OPENCODE_AGENT_DIR` and opencode skills to `OPENCODE_SKILL_DIR` |
 | `salvage <job-id>` | Recover a dead/stalled job: reads its prompt + events, launches a salvage agent to produce a structured report |
