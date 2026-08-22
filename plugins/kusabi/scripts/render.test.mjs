@@ -1,5 +1,9 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { countUnfilledReviewRecords } from "./review-record-scan.mjs";
 import {
   extractJson,
   renderReview,
@@ -2043,6 +2047,79 @@ describe("renderReviewRecord", () => {
     });
     assert.match(text, /Round 3 — model: \?, verdict: \? \(parsed\), disposition: \?, changed: unknown/);
     assert.match(text, /_No findings were produced by this chain — nothing to adjudicate\._/);
+  });
+
+  it("marks record as provisional in header when provisional flag is set", () => {
+    const text = renderReviewRecord({
+      chainId: "chain-prov",
+      provisional: true,
+      records: [{ round: 1, probeResults: [{ probe: "P1: HEAD clean", passed: true }] }],
+      disposition: { disposition: "failed", round: 1 },
+    });
+    assert.match(text, /Note: PROVISIONAL RECORD — chain did not reach a disposition and may be superseded by chain-resume\./);
+    assert.match(text, /Final disposition: failed at round 1 of \?/);
+  });
+
+  it("renders zero-findings dead review record with the alternative marker and a fill placeholder row counted by countUnfilledReviewRecords", () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-test-scan-"));
+    try {
+      const recordData = {
+        chainId: "chain-dead",
+        records: [
+          {
+            round: 1,
+            verdict: "unparseable",
+            reviewParseable: false,
+            verdictSource: "recovered-from-token",
+            probeResults: [{ probe: "P1: HEAD clean", passed: true }],
+            findings: [],
+          },
+        ],
+        disposition: { disposition: "failed", round: 1 },
+      };
+      const text = renderReviewRecord(recordData);
+      assert.match(text, /_No review verdict was delivered for this chain — implementation remains unadjudicated\._/);
+      assert.match(text, /\| 1 \| unknown \| _No review verdict delivered — unadjudicated implementation_ \| _fill_ \| _fill_ \|/);
+
+      const chainDir = path.join(tmpDir, "ws", "chains", "chain-dead");
+      fs.mkdirSync(chainDir, { recursive: true });
+      fs.writeFileSync(path.join(chainDir, "review-record.md"), text, "utf8");
+
+      assert.equal(countUnfilledReviewRecords(tmpDir), 1);
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it("renders post-probe cancelled record (missing verdict) with alternative marker and fill placeholder row counted by countUnfilledReviewRecords", () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-test-postprobe-"));
+    try {
+      const recordData = {
+        chainId: "chain-postprobe-cancelled",
+        provisional: true,
+        records: [
+          {
+            round: 1,
+            interrupted: true,
+            interruptedAfter: "probes",
+            probeResults: [{ probe: "P1: HEAD clean", passed: true }],
+            findings: [],
+          },
+        ],
+        disposition: { disposition: "cancelled", round: 1 },
+      };
+      const text = renderReviewRecord(recordData);
+      assert.match(text, /_No review verdict was delivered for this chain — implementation remains unadjudicated\._/);
+      assert.match(text, /\| 1 \| unknown \| _No review verdict delivered — unadjudicated implementation_ \| _fill_ \| _fill_ \|/);
+
+      const chainDir = path.join(tmpDir, "ws", "chains", "chain-postprobe-cancelled");
+      fs.mkdirSync(chainDir, { recursive: true });
+      fs.writeFileSync(path.join(chainDir, "review-record.md"), text, "utf8");
+
+      assert.equal(countUnfilledReviewRecords(tmpDir), 1);
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
   });
 });
 

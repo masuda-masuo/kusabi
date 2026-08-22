@@ -1540,12 +1540,12 @@ export function persistChainState({
  * Write the chain's postable review record (kusabi #52).
  *
  * Rendered by the pure `renderReviewRecord` (render.mjs) and written to the
- * chain's state directory as `review-record.md`.  Called only when the chain
- * reaches a terminal disposition (accept / accept-with-followup / escalate /
- * max-rounds); cancelled and failed chains never get one.  Regeneration
- * overwrites the previous record.  The companion only writes the local file
- * and returns its path — posting it to the archive repository is
- * orchestrator-exclusive.
+ * chain's state directory as `review-record.md`. Written on terminal
+ * dispositions (accept / accept-with-followup / escalate / max-rounds) and
+ * as a provisional record on non-completed exits (cancelled / failed) when the
+ * last round has probe results. Regeneration overwrites the previous record.
+ * The companion only writes the local file and returns its path — posting it
+ * to the archive repository is orchestrator-exclusive.
  *
  * @param {object} opts
  * @param {string} opts.chainDir
@@ -1562,11 +1562,12 @@ export function persistChainState({
  *                                       — the FINAL disposition.
  * @param {string} [opts.label]         — repo/cwd label for the header.
  * @param {string} [opts.finishedAt]    — ISO timestamp; defaults to now.
+ * @param {boolean} [opts.provisional]  — true when chain ended at a non-completed exit.
  * @returns {string} The absolute path of the written record file.
  */
 export function writeReviewRecord({
   chainDir, chainId, container, modelChain, maxRounds, brief, orchestrator,
-  records, chainTotals, disposition, round, label, finishedAt,
+  records, chainTotals, disposition, round, label, finishedAt, provisional,
 }) {
   const safeRecords = Array.isArray(records) ? records : [];
   const markdown = renderReviewRecord({
@@ -1580,11 +1581,12 @@ export function writeReviewRecord({
     records: safeRecords,
     chainTotals: chainTotals ?? computeChainTotals(safeRecords),
     disposition: {
-      disposition: disposition?.disposition ?? "unknown",
+      disposition: typeof disposition === "string" ? disposition : (disposition?.disposition ?? "unknown"),
       round,
       reason: disposition?.reason ?? null,
     },
     finishedAt,
+    provisional,
   });
   const recordPath = path.join(chainDir, "review-record.md");
   fs.mkdirSync(chainDir, { recursive: true });

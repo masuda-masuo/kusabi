@@ -1489,6 +1489,17 @@ function reviewRecordRoundFindings(round) {
  *   - finishedAt (ISO, optional; defaults to now)
  * @returns {string} The rendered markdown.
  */
+function isReviewUndelivered(r) {
+  if (!r || typeof r !== "object") return false;
+  if (r.verdictSource === "probe") return false;
+  if (Array.isArray(r.probeResults) && r.probeResults.length > 0 && !r.verdict) return true;
+  if (r.reviewParseable === false) return true;
+  if (r.verdict === "unparseable") return true;
+  if (r.verdictSource === "recovered-from-token") return true;
+  if (Boolean(r.reviewJobFailure)) return true;
+  return false;
+}
+
 export function renderReviewRecord(record) {
   const rec = record ?? {};
   const chainId = rec.chainId || "(unknown)";
@@ -1499,6 +1510,9 @@ export function renderReviewRecord(record) {
   lines.push("");
   lines.push(`Orchestrator: ${reviewRecordOrchestratorLine(rec)} | finished: ${reviewRecordFinishedAt(rec)}`);
   lines.push(`Model chain: ${reviewRecordModelChain(rec)} | container: ${rec.container || "(unknown)"}`);
+  if (rec.provisional) {
+    lines.push("Note: PROVISIONAL RECORD — chain did not reach a disposition and may be superseded by chain-resume.");
+  }
   const disp = rec.disposition || {};
   lines.push(`Final disposition: ${disp.disposition || "unknown"} at round ${disp.round ?? "?"} of ${rec.maxRounds ?? "?"}`);
   lines.push("");
@@ -1555,7 +1569,16 @@ export function renderReviewRecord(record) {
     allFindings.push(...reviewRecordRoundFindings(r ?? {}));
   }
   if (allFindings.length === 0) {
-    lines.push("_No findings were produced by this chain — nothing to adjudicate._");
+    const hasUndeliveredReview = rounds.length > 0 && rounds.some(isReviewUndelivered);
+    if (hasUndeliveredReview) {
+      lines.push("_No review verdict was delivered for this chain — implementation remains unadjudicated._");
+      lines.push("");
+      lines.push("| # | severity | finding | 採否 | 理由 |");
+      lines.push("|---|---|---|---|---|");
+      lines.push("| 1 | unknown | _No review verdict delivered — unadjudicated implementation_ | _fill_ | _fill_ |");
+    } else {
+      lines.push("_No findings were produced by this chain — nothing to adjudicate._");
+    }
   } else {
     lines.push("| # | severity | finding | 採否 | 理由 |");
     lines.push("|---|---|---|---|---|");
