@@ -961,7 +961,7 @@ export function resolveChainStatus(control, rounds) {
   return roundDerivedStatus(rounds) || "incomplete";
 }
 
-export function renderChainShow(chain, rounds, unreadable = [], control = null) {
+export function renderChainShow(chain, rounds, unreadable = [], control = null, opts = {}) {
   const lines = [];
   // Tolerate null/undefined rounds — treat as empty
   const safeRounds = rounds ?? [];
@@ -993,6 +993,11 @@ export function renderChainShow(chain, rounds, unreadable = [], control = null) 
   // Container if recorded
   if (chain?.container) {
     lines.push(`container: ${chain.container}`);
+  }
+
+  const unfilled = typeof opts?.unfilledCount === "number" ? opts.unfilledCount : 0;
+  if (unfilled > 0) {
+    lines.push(`unadjudicated review records: ${unfilled}`);
   }
 
   lines.push("");

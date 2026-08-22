@@ -920,6 +920,29 @@ describe("renderChainShow", () => {
     assert.doesNotMatch(result, /strategist recommendation:/);
   });
 
+  it("surfaces unadjudicated review record count in renderChainShow when unfilledCount > 0", () => {
+    const chain = { chainId: "chain-unadjudicated" };
+    const rounds = [{ round: 1, verdict: "approve", disposition: { disposition: "accept" } }];
+    const result = renderChainShow(chain, rounds, [], null, { unfilledCount: 3 });
+    assert.match(result, /unadjudicated review records: 3/);
+  });
+
+  it("omits unadjudicated review record line in renderChainShow when unfilledCount is 0", () => {
+    const chain = { chainId: "chain-clean" };
+    const rounds = [{ round: 1, verdict: "approve", disposition: { disposition: "accept" } }];
+    const result = renderChainShow(chain, rounds, [], null, { unfilledCount: 0 });
+    assert.doesNotMatch(result, /unadjudicated review records/);
+  });
+
+  it("omits unadjudicated review record line and is pure without opts (no I/O)", () => {
+    const chain = { chainId: "chain-no-opts" };
+    const rounds = [{ round: 1, verdict: "approve", disposition: { disposition: "accept" } }];
+    const withNoOpts = renderChainShow(chain, rounds);
+    const withEmptyOpts = renderChainShow(chain, rounds, [], null, {});
+    assert.equal(withNoOpts, withEmptyOpts);
+    assert.doesNotMatch(withNoOpts, /unadjudicated review records/);
+  });
+
   // AC4: an unparseable review must be distinguishable from a genuine
   // needs-attention in the chain-show rendering, not only on the round record.
   it("marks an unparseable review distinctly in the rendered verdict line", () => {

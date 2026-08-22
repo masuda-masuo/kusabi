@@ -20,6 +20,7 @@ import { flushAndExit } from "./flush-and-exit.mjs";
 import { cmdChain, cmdChainResume, smokeBaselineReport } from "./chain-driver.mjs";
 import { cursorUsageDir, resolveLatestCursorSession } from "./cursor-statusline-sink.mjs";
 import { parseReviewJsonl } from "./review-jsonl.mjs";
+import { countUnfilledReviewRecords } from "./review-record-scan.mjs";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -1977,7 +1978,13 @@ function cmdChainShow(cwd, { text }) {
   }
 
   // The control record carries the status (absent for old chains — treated as unknown)
-  return renderChainShow(chainJson, rounds, unreadable, chainControlEarly);
+  let unfilled = 0;
+  try {
+    unfilled = countUnfilledReviewRecords(stateRoot());
+  } catch {
+    unfilled = 0;
+  }
+  return renderChainShow(chainJson, rounds, unreadable, chainControlEarly, { unfilledCount: unfilled });
 }
 
 // ---------------------------------------------------------------------------

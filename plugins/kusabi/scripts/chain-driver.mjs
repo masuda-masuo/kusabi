@@ -43,6 +43,7 @@ import {
 import { checkSmokeProbe, classifyRefusalOutcome, verifyRefusalAnchors, refusalRepoPaths } from "./probe-decisions.mjs";
 import { deriveDisposition } from "./disposition.mjs";
 import { stateRoot, stateDirFor, readJson, writeJson } from "./state-paths.mjs";
+import { countUnfilledReviewRecords } from "./review-record-scan.mjs";
 import {
   readChainControl,
   writeChainControl,
@@ -1282,9 +1283,20 @@ export async function runChainDriver({
       // observable or renderer defects hide behind a silently absent record.
       writeError = err;
     }
-    return recordPath
+    const baseText = recordPath
       ? text + "\n\n" + "review record: " + recordPath
       : text + "\n\n" + "review record: (write failed: " + (writeError?.message || "unknown error") + " — chain state dir " + chainDir + ")";
+
+    let unfilledNote = "";
+    try {
+      const unfilled = countUnfilledReviewRecords(stateRoot());
+      if (unfilled > 0) {
+        unfilledNote = `\nunadjudicated review records: ${unfilled}`;
+      }
+    } catch {
+      // Best-effort — non-fatal scan failure degrades to silence
+    }
+    return baseText + unfilledNote;
   }
 
   // Existence predicate for refusal anchors (kusabi #293, #351):
