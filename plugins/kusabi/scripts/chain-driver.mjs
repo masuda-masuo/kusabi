@@ -40,7 +40,7 @@ import {
   findSmokeViolations,
   SMOKE_VIOLATION_NO_ENTRIES,
 } from "./brief-parsing.mjs";
-import { checkSmokeProbe, classifyRefusalOutcome, verifyRefusalAnchors } from "./probe-decisions.mjs";
+import { checkSmokeProbe, classifyRefusalOutcome, verifyRefusalAnchors, refusalRepoPaths } from "./probe-decisions.mjs";
 import { deriveDisposition } from "./disposition.mjs";
 import { stateRoot, stateDirFor, readJson, writeJson } from "./state-paths.mjs";
 import {
@@ -1287,8 +1287,11 @@ export async function runChainDriver({
       : text + "\n\n" + "review record: (write failed: " + (writeError?.message || "unknown error") + " — chain state dir " + chainDir + ")";
   }
 
-  // Existence predicate for refusal anchors (kusabi #293): the worktree is
-  // `cwd`, and the driver process runs inside the container that holds it.
+  // Existence predicate for refusal anchors (kusabi #293, #351):
+  //   - when `container` is set, finishRound queries the container filesystem
+  //     at /workspace via `sandbox_exec` (`test -e`);
+  //   - when `container` is not set (host worktree), `repoPathExists` inspects
+  //     the host filesystem at `cwd` via `fs.existsSync`.
   // `verifyRefusalAnchors` rejects `..` and `.git` paths before asking, so
   // the join cannot escape the worktree; a miss is `false`, never a throw.
   function repoPathExists(name) {
@@ -1353,12 +1356,62 @@ export async function runChainDriver({
     // therefore derive the same verdict.  The verified descriptor replaces
     // the parse-time stamp on the record, so the record never keeps a
     // shape-only verdict that classification has already rejected.
-    const verifiedRefusal = implementRefusal
+    let refusalPathExists = repoPathExists;
+    let containerCheckWarning = null;
+
+    if (implementRefusal && container) {
+      const repoPaths = refusalRepoPaths(implementRefusal);
+      if (repoPaths.length > 0) {
+        const cmdParts = repoPaths.map((p) => {
+          const q = "'" + p.replace(/'/g, "'\\''") + "'";
+          return `test -e ${q} && echo 'OK ${p.replace(/'/g, "'\\''")}' || echo 'NO ${p.replace(/'/g, "'\\''")}'`;
+        });
+        const command = cmdParts.join(" && ");
+        try {
+          const execRes = await callTool("sandbox_exec", {
+            container_id: container,
+            commands: [command],
+          });
+          const output = execRes?.output;
+          if (typeof output !== "string") {
+            containerCheckWarning = "container path existence check failed: unparseable sandbox_exec output";
+            refusalPathExists = () => false;
+          } else {
+            const okSet = new Set();
+            for (const line of output.split(/\r?\n/)) {
+              const trimmed = line.trim();
+              if (trimmed.startsWith("OK ")) {
+                okSet.add(trimmed.slice(3).trim());
+              }
+            }
+            refusalPathExists = (p) => okSet.has(p);
+          }
+        } catch (err) {
+          containerCheckWarning = "container path existence check failed: " + (err?.message || String(err));
+          refusalPathExists = () => false;
+        }
+      }
+    }
+
+    let verifiedRefusal = implementRefusal
       ? verifyRefusalAnchors(implementRefusal, {
           brief,
-          pathExists: repoPathExists,
+          pathExists: refusalPathExists,
         })
       : null;
+
+    if (containerCheckWarning && verifiedRefusal) {
+      verifiedRefusal = {
+        ...verifiedRefusal,
+        qualifies: false,
+        disqualification: verifiedRefusal.disqualification
+          ? verifiedRefusal.disqualification + "; " + containerCheckWarning
+          : containerCheckWarning,
+      };
+      roundRecord.warnings = Array.isArray(roundRecord.warnings)
+        ? [...roundRecord.warnings, containerCheckWarning]
+        : [containerCheckWarning];
+    }
     if (implementRefusal) roundRecord.implementRefusal = verifiedRefusal;
     const refusalOutcome = classifyRefusalOutcome({
       changeSetEmpty: skipReview,
