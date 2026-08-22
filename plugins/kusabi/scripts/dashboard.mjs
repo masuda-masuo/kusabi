@@ -11,6 +11,7 @@ import { openMetricsDbReadOnly } from "./metrics-db.mjs";
 import { computeReport } from "./metrics-report.mjs";
 import { renderChainShow, resolveChainStatus } from "./render.mjs";
 import { readJson } from "./state-paths.mjs";
+import { renderChainHtml, renderIndexHtml } from "./dashboard-html.mjs";
 
 const RUNNING_EFFECTIVE = new Set(["running", "stopping", "stale"]);
 const TERMINAL_CONTROL = new Set(["completed", "failed", "cancelled"]);
@@ -180,11 +181,11 @@ function classifyFailure(control, rounds, wsDir, warnings) {
       failureDetail: typeof refusal.disqualification === "string" ? refusal.disqualification : null,
     };
   }
-  if (last && (last.verdict === "unparseable" || last.reviewParseable === false)) {
-    return { failureClass: "review-unparseable", failureDetail: last.verdict ?? null };
-  }
   if (last && last.worktreeChanged === false) {
     return { failureClass: "empty-round", failureDetail: null };
+  }
+  if (last && last.reviewJobId && (last.verdict === "unparseable" || last.reviewParseable === false)) {
+    return { failureClass: "review-unparseable", failureDetail: last.verdict ?? null };
   }
   if (control?.status === "cancelled") {
     return { failureClass: "cancelled", failureDetail: null };
@@ -486,6 +487,26 @@ function handleRequest(req, res, { root, dbPath }) {
   const p = url.pathname;
   try {
     if (p === "/") {
+      const raw = url.searchParams.get("limit");
+      const parsed = raw == null || raw === "" ? 30 : Number(raw);
+      const limit = Number.isInteger(parsed) && parsed > 0 ? parsed : 30;
+      const since = url.searchParams.get("since") || undefined;
+      const until = url.searchParams.get("until") || undefined;
+      const html = renderIndexHtml({
+        running: collectRunning(root),
+        ended: collectEnded(root, { limit }),
+        cost: costSummary({
+          dbPath,
+          since,
+          until,
+        }),
+        workspaces: listWorkspaces(root),
+        query: { limit, since, until },
+      });
+      sendText(res, 200, html, "text/html; charset=utf-8");
+      return;
+    }
+    if (p === "/api") {
       sendText(res, 200, `${INDEX_TEXT}\n`, "text/plain; charset=utf-8");
       return;
     }
@@ -523,6 +544,17 @@ function handleRequest(req, res, { root, dbPath }) {
         since: url.searchParams.get("since") || undefined,
         until: url.searchParams.get("until") || undefined,
       }));
+      return;
+    }
+    const htmlChainMatch = p.match(/^\/chain\/([^/]+)\/([^/]+)$/);
+    if (htmlChainMatch) {
+      const body = chainDetail(
+        root,
+        decodeURIComponent(htmlChainMatch[1]),
+        decodeURIComponent(htmlChainMatch[2]),
+      );
+      const html = renderChainHtml(body);
+      sendText(res, body.error && !body.chain ? 404 : 200, html, "text/html; charset=utf-8");
       return;
     }
     sendJson(res, 404, { error: "not found" });
