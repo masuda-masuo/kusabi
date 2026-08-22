@@ -4336,24 +4336,58 @@ describe("claudeDispatch — write-tool watchdog (kusabi #215 item 3)", () => {
   // never-terminating fakes).
   const withWatchdog = (writeWatchdog) => ({ claude: { sessionGuardPercent: false, writeWatchdog } });
 
+  // Diagnostic context for write-watchdog test failures (kusabi #288).
+  // Carries enough information to diagnose without reproducing: the full
+  // event list, the on-disk record (distinguishing absent from null),
+  // wall time, fixture configuration, and terminal job state.
+  function writeWatchdogDiag({ events, stateDir, jobId, job, wallMs, ticks, intervalMs }) {
+    let onDiskInfo;
+    try {
+      const onDisk = loadJob(stateDir, jobId);
+      if (!onDisk || typeof onDisk !== "object") {
+        onDiskInfo = "writeWatchdog=<record unreadable: not an object>";
+      } else if (!("writeWatchdog" in onDisk)) {
+        onDiskInfo = "writeWatchdog=undefined (key absent)";
+      } else if (onDisk.writeWatchdog === null) {
+        onDiskInfo = "writeWatchdog=null (key present)";
+      } else {
+        onDiskInfo = `writeWatchdog=${JSON.stringify(onDisk.writeWatchdog)} (key present)`;
+      }
+    } catch (err) {
+      onDiskInfo = `writeWatchdog=<record unreadable: ${err?.message || err}>`;
+    }
+    return [
+      `events=${JSON.stringify(events)}`,
+      onDiskInfo,
+      `wallMs=${wallMs} ticks=${ticks} intervalMs=${intervalMs}`,
+      `status=${job?.status} error=${JSON.stringify(job?.error)}`,
+    ].join(", ");
+  }
+
   it("criterion 3: warn then kill on an implement phase whose stream never writes", async () => {
+    const TICKS = 12;
+    const INTERVAL_MS = 200;
+    const start = Date.now();
     ctx = fakeClaudeContext("no-write", { config: withWatchdog({ warnS: 1, killS: 2 }) });
     const { job } = await claudeDispatch(ctx.dispatchOptions({ phase: "implement", timeoutS: 30, watchdogS: 900 }));
+    const wallMs = Date.now() - start;
 
     assert.equal(job.status, "stalled");
     assert.equal(job.error, "write-watchdog: no write-tool call for 2s on an implement phase (process killed)");
 
     const events = writeWatchdogEvents(ctx.stateDir, job.id);
+    const diag = writeWatchdogDiag({ events, stateDir: ctx.stateDir, jobId: job.id, job, wallMs, ticks: TICKS, intervalMs: INTERVAL_MS });
+    assert.ok(events.length >= 2, `warn-then-kill expects 2+ events — got ${events.length}; ${diag}`);
     assert.deepEqual(events.map((e) => e.type), [
       "companion.write-watchdog.warned",
       "companion.write-watchdog.fired",
       "companion.write-watchdog.kill",
-    ]);
-    assert.ok(events[0].idleS >= 1, `warned event must carry the measured idle seconds, got ${events[0].idleS}`);
+    ], diag);
+    assert.ok(events[0].idleS >= 1, `warned event must carry the measured idle seconds, got ${events[0].idleS}; ${diag}`);
     assert.equal(events[0].warnS, 1);
     assert.equal(events[0].killS, 2);
     assert.equal(events[0].phase, "implement");
-    assert.ok(events[1].idleS >= 2, `fired event must carry the measured idle seconds, got ${events[1].idleS}`);
+    assert.ok(events[1].idleS >= 2, `fired event must carry the measured idle seconds, got ${events[1].idleS}; ${diag}`);
 
     // The SILENCE watchdog must not claim this stall: its clock was being
     // reset by the read events the whole time.
@@ -4398,24 +4432,39 @@ describe("claudeDispatch — write-tool watchdog (kusabi #215 item 3)", () => {
   });
 
   it("criterion 6: warn-only mode warns once and never kills", async () => {
-    ctx = fakeClaudeContext("no-write-then-finish", { config: withWatchdog({ warnS: 1 }) });
-    const { job } = await claudeDispatch(ctx.dispatchOptions({ phase: "implement", timeoutS: 30, watchdogS: 900 }));
+    // Widen the margin: 40 ticks × 200ms = ~8s against warnS: 1 — the warn
+    // window is ~7s (7× the threshold, clearing the 4× minimum).
+    const savedTicks = process.env.FAKE_CLAUDE_TICKS;
+    process.env.FAKE_CLAUDE_TICKS = "40";
+    try {
+      const TICKS = 40;
+      const INTERVAL_MS = 200;
+      const start = Date.now();
+      ctx = fakeClaudeContext("no-write-then-finish", { config: withWatchdog({ warnS: 1 }) });
+      const { job } = await claudeDispatch(ctx.dispatchOptions({ phase: "implement", timeoutS: 30, watchdogS: 900 }));
+      const wallMs = Date.now() - start;
 
-    // The run's own outcome, untouched by the warning.
-    assert.equal(job.status, "completed");
-    assert.equal(job.error, null);
-    assert.equal(job.sessionID, "claude-cadence-1");
+      // The run's own outcome, untouched by the warning.
+      assert.equal(job.status, "completed");
+      assert.equal(job.error, null);
+      assert.equal(job.sessionID, "claude-cadence-1");
 
-    const events = writeWatchdogEvents(ctx.stateDir, job.id);
-    assert.deepEqual(events.map((e) => e.type), ["companion.write-watchdog.warned"], "warn-only warns EXACTLY once");
-    assert.equal(events[0].killS, null);
-    assert.equal(job.writeWatchdog.warned, true);
-    assert.equal(job.writeWatchdog.killed, false);
-    assert.ok(job.writeWatchdog.warnedAt, "the warning is timestamped on the record");
-    assert.ok(job.writeWatchdog.idleS >= 1);
-    for (const pid of spawnedPids(ctx.pidsLog)) {
-      // The fake exits on its own; nothing here killed it.
-      assert.equal(isAlive(pid), false);
+      const events = writeWatchdogEvents(ctx.stateDir, job.id);
+      const diag = writeWatchdogDiag({ events, stateDir: ctx.stateDir, jobId: job.id, job, wallMs, ticks: TICKS, intervalMs: INTERVAL_MS });
+      assert.ok(events.length >= 1, `warn-only warns EXACTLY once — got 0 events; ${diag}`);
+      assert.deepEqual(events.map((e) => e.type), ["companion.write-watchdog.warned"], `warn-only warns EXACTLY once; ${diag}`);
+      assert.equal(events[0].killS, null, diag);
+      assert.equal(job.writeWatchdog.warned, true);
+      assert.equal(job.writeWatchdog.killed, false);
+      assert.ok(job.writeWatchdog.warnedAt, "the warning is timestamped on the record");
+      assert.ok(job.writeWatchdog.idleS >= 1, diag);
+      for (const pid of spawnedPids(ctx.pidsLog)) {
+        // The fake exits on its own; nothing here killed it.
+        assert.equal(isAlive(pid), false);
+      }
+    } finally {
+      if (savedTicks === undefined) delete process.env.FAKE_CLAUDE_TICKS;
+      else process.env.FAKE_CLAUDE_TICKS = savedTicks;
     }
   });
 
