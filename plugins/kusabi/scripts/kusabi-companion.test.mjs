@@ -4458,4 +4458,287 @@ describe("brief lint and container delivery (kusabi #289)", () => {
       }
     });
   });
+
+  describe("cmdBaseline subcommand", () => {
+    function startSunabaStub({ toolResultText }) {
+      const server = http.createServer((req, res) => {
+        res.on("error", () => {});
+        let body = "";
+        req.on("data", (chunk) => { body += chunk; });
+        req.on("end", () => {
+          let payload = null;
+          try {
+            payload = JSON.parse(body);
+          } catch {
+            // not JSON — still answer the handshake
+          }
+          res.setHeader("mcp-session-id", "stub-session");
+          res.writeHead(200, { "content-type": "text/event-stream" });
+          let envelope;
+          if (payload?.method === "tools/call") {
+            envelope = {
+              jsonrpc: "2.0",
+              id: payload.id ?? 1,
+              result: { content: [{ type: "text", text: JSON.stringify(toolResultText) }] },
+            };
+          } else {
+            envelope = {
+              jsonrpc: "2.0",
+              id: payload?.id ?? 1,
+              result: {
+                protocolVersion: "2024-11-05",
+                capabilities: {},
+                serverInfo: { name: "kusabi-stub", version: "0.0.0" },
+              },
+            };
+          }
+          res.end(`data: ${JSON.stringify(envelope)}\n\n`);
+        });
+      });
+      return new Promise((resolve) => {
+        server.listen(0, "127.0.0.1", () => {
+          const addr = server.address();
+          resolve({ server, url: `http://127.0.0.1:${addr.port}/mcp` });
+        });
+      });
+    }
+
+    function run(args, tmp) {
+      const env = { ...process.env };
+      delete env.KUSABI_WORKER_CONTEXT;
+      env.KUSABI_STATE_DIR = path.join(tmp, "state");
+      env.KUSABI_SUNABA_URL = "http://127.0.0.1:9/mcp";
+      return spawnSync(process.execPath, [COMPANION_SCRIPT, ...args], {
+        encoding: "utf8", cwd: tmp, env, timeout: 20_000,
+      });
+    }
+
+    function runBaselineAsync(args, tmp, extraEnv = {}) {
+      return new Promise((resolve) => {
+        const env = { ...process.env, ...extraEnv };
+        delete env.KUSABI_WORKER_CONTEXT;
+        env.KUSABI_STATE_DIR = path.join(tmp, "state");
+        if (!extraEnv.KUSABI_SUNABA_URL) {
+          env.KUSABI_SUNABA_URL = "http://127.0.0.1:9/mcp";
+        }
+        const child = spawn(process.execPath, [COMPANION_SCRIPT, "baseline", ...args], {
+          cwd: tmp,
+          env,
+        });
+        let stdout = "";
+        let stderr = "";
+        child.stdout.on("data", (chunk) => { stdout += chunk; });
+        child.stderr.on("data", (chunk) => { stderr += chunk; });
+        const timer = setTimeout(() => child.kill("SIGTERM"), 10_000);
+        child.on("close", (code) => {
+          clearTimeout(timer);
+          resolve({ status: code, stdout, stderr });
+        });
+      });
+    }
+
+    it("lists baseline in --help", () => {
+      const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-baseline-help-"));
+      try {
+        const result = run(["--help"], tmp);
+        assert.equal(result.status, 0);
+        assert.match(result.stdout, /baseline\s+Report collected test count/);
+      } finally {
+        fs.rmSync(tmp, { recursive: true, force: true });
+      }
+    });
+
+    it("requires a container id", () => {
+      const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-baseline-nocid-"));
+      try {
+        const result = run(["baseline"], tmp);
+        assert.notEqual(result.status, 0);
+        assert.match(result.stdout, /baseline requires a container id/);
+      } finally {
+        fs.rmSync(tmp, { recursive: true, force: true });
+      }
+    });
+
+    it("rejects unsupported flags passed to baseline", () => {
+      const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-baseline-flags-"));
+      try {
+        const resultPort = run(["baseline", "cid-1", "--port", "8080"], tmp);
+        assert.notEqual(resultPort.status, 0);
+        assert.match(resultPort.stdout, /--port is only supported by dashboard/);
+
+        const resultBackend = run(["baseline", "cid-1", "--backend", "claude"], tmp);
+        assert.notEqual(resultBackend.status, 0);
+        assert.match(resultBackend.stdout, /--backend is only supported by task and chain/);
+      } finally {
+        fs.rmSync(tmp, { recursive: true, force: true });
+      }
+    });
+
+    it("handles unreachable container with readable error line and non-zero exit code (no stack trace)", () => {
+      const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-baseline-unreachable-"));
+      try {
+        const result = run(["baseline", "unreachable-container-id"], tmp);
+        assert.equal(result.status, 1);
+        assert.match(result.stdout, /^baseline error:/);
+        assert.doesNotMatch(result.stdout, /at Object\./);
+      } finally {
+        fs.rmSync(tmp, { recursive: true, force: true });
+      }
+    });
+
+    it("runs brief ## Smoke entries with baseline --container <cid> <brief-path>", async () => {
+      const { server, url } = await startSunabaStub({
+        toolResultText: {
+          captured: true,
+          collected: 2547,
+          gate_passed: true,
+          lint: 0,
+          types: 0,
+          status: "ok",
+          output: "ok 1 - test\n",
+          exit_code: 0,
+        },
+      });
+      const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-baseline-smoke-1-"));
+      try {
+        const briefPath = path.join(tmp, "brief.md");
+        fs.writeFileSync(briefPath, "## Smoke\n\n- `node -v`\n", "utf8");
+        const result = await runBaselineAsync(["--container", "cid-123", briefPath], tmp, { KUSABI_SUNABA_URL: url });
+        assert.equal(result.status, 0);
+        assert.match(result.stdout, /Baseline for container cid-123:/);
+        assert.match(result.stdout, /Smoke baseline:/);
+      } finally {
+        server.close();
+        fs.rmSync(tmp, { recursive: true, force: true });
+      }
+    });
+
+    it("behaves identically with baseline <cid> <brief-path> and baseline --container <cid> <brief-path>", async () => {
+      const { server, url } = await startSunabaStub({
+        toolResultText: {
+          captured: true,
+          collected: 2547,
+          gate_passed: true,
+          lint: 0,
+          types: 0,
+          status: "ok",
+          output: "ok 1 - test\n",
+          exit_code: 0,
+        },
+      });
+      const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-baseline-smoke-2-"));
+      try {
+        const briefPath = path.join(tmp, "brief.md");
+        fs.writeFileSync(briefPath, "## Smoke\n\n- `node -v`\n", "utf8");
+        const res1 = await runBaselineAsync(["--container", "cid-123", briefPath], tmp, { KUSABI_SUNABA_URL: url });
+        const res2 = await runBaselineAsync(["cid-123", briefPath], tmp, { KUSABI_SUNABA_URL: url });
+        assert.equal(res1.status, 0);
+        assert.equal(res2.status, 0);
+        assert.equal(res1.stdout, res2.stdout);
+      } finally {
+        server.close();
+        fs.rmSync(tmp, { recursive: true, force: true });
+      }
+    });
+
+    it("runs brief ## Smoke entries with --brief-file <path> for both container forms", async () => {
+      const { server, url } = await startSunabaStub({
+        toolResultText: {
+          captured: true,
+          collected: 2547,
+          gate_passed: true,
+          lint: 0,
+          types: 0,
+          status: "ok",
+          output: "ok 1 - test\n",
+          exit_code: 0,
+        },
+      });
+      const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-baseline-smoke-3-"));
+      try {
+        const flagBrief = path.join(tmp, "flag-brief.md");
+        fs.writeFileSync(flagBrief, "## Smoke\n\n- `echo flag`\n", "utf8");
+
+        const res1 = await runBaselineAsync(["--container", "cid-123", "--brief-file", flagBrief], tmp, { KUSABI_SUNABA_URL: url });
+        const res2 = await runBaselineAsync(["cid-123", "--brief-file", flagBrief], tmp, { KUSABI_SUNABA_URL: url });
+        assert.equal(res1.status, 0);
+        assert.equal(res2.status, 0);
+        assert.equal(res1.stdout, res2.stdout);
+        assert.match(res1.stdout, /Smoke baseline:/);
+      } finally {
+        server.close();
+        fs.rmSync(tmp, { recursive: true, force: true });
+      }
+    });
+
+    it("rejects stray positional argument with --container <cid> and --brief-file <path> (Criterion 1)", () => {
+      const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-baseline-reject-c1-"));
+      try {
+        const briefPath = path.join(tmp, "brief.md");
+        fs.writeFileSync(briefPath, "## Smoke\n\n- `echo test`\n", "utf8");
+
+        const res = run(["baseline", "--container", "cid-123", "--brief-file", briefPath, "STRAYTOKEN"], tmp);
+        assert.notEqual(res.status, 0);
+        assert.match(res.stdout, /unexpected positional argument: STRAYTOKEN/);
+        assert.doesNotMatch(res.stdout, /^baseline error:/);
+      } finally {
+        fs.rmSync(tmp, { recursive: true, force: true });
+      }
+    });
+
+    it("rejects stray positional argument with positional <cid> and --brief-file <path> (Criterion 2)", () => {
+      const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-baseline-reject-c2-"));
+      try {
+        const briefPath = path.join(tmp, "brief.md");
+        fs.writeFileSync(briefPath, "## Smoke\n\n- `echo test`\n", "utf8");
+
+        const res = run(["baseline", "cid-123", "--brief-file", briefPath, "STRAYTOKEN"], tmp);
+        assert.notEqual(res.status, 0);
+        assert.match(res.stdout, /unexpected positional argument: STRAYTOKEN/);
+        assert.doesNotMatch(res.stdout, /^baseline error:/);
+      } finally {
+        fs.rmSync(tmp, { recursive: true, force: true });
+      }
+    });
+
+    it("rejects positional argument that can be neither container nor brief with non-zero exit", () => {
+      const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-baseline-reject-"));
+      try {
+        const briefPath = path.join(tmp, "brief.md");
+        fs.writeFileSync(briefPath, "## Smoke\n\n- `echo test`\n", "utf8");
+
+        const res1 = run(["baseline", "cid-123", briefPath, "extra-token"], tmp);
+        assert.notEqual(res1.status, 0);
+        assert.match(res1.stdout, /unexpected positional argument: extra-token/);
+
+        const res2 = run(["baseline", "--container", "cid-123", briefPath, "extra-token"], tmp);
+        assert.notEqual(res2.status, 0);
+        assert.match(res2.stdout, /unexpected positional argument: extra-token/);
+      } finally {
+        fs.rmSync(tmp, { recursive: true, force: true });
+      }
+    });
+
+    it("baseline <cid> with no brief omits smoke section", async () => {
+      const { server, url } = await startSunabaStub({
+        toolResultText: {
+          captured: true,
+          collected: 2547,
+          gate_passed: true,
+          lint: 0,
+          types: 0,
+        },
+      });
+      const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-baseline-nobrief-"));
+      try {
+        const res = await runBaselineAsync(["cid-123"], tmp, { KUSABI_SUNABA_URL: url });
+        assert.equal(res.status, 0);
+        assert.match(res.stdout, /Baseline for container cid-123:/);
+        assert.doesNotMatch(res.stdout, /Smoke baseline:/);
+      } finally {
+        server.close();
+        fs.rmSync(tmp, { recursive: true, force: true });
+      }
+    });
+  });
 });

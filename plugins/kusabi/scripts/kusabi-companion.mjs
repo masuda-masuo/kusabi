@@ -65,6 +65,7 @@ import {
   collectContainerReviewInput,
   // The chain's container header, shared with `task --container` (kusabi #289).
   withContainerWorkspace,
+  captureVerifyBaseline,
 } from "./chain-phases.mjs";
 
 // Import the probe functions locally so cmdTask can call them directly.
@@ -1892,6 +1893,86 @@ async function cmdSalvage(cwd, { flags, text }) {
   return `${renderHeader(job)}${resultText || "(empty report)"}`;
 }
 
+/**
+ * Read-only baseline subcommand.
+ * Reports collected test count, gate pass status, lint/type violation counts,
+ * and optionally runs declared ## Smoke entries against pristine checkout.
+ *
+ * @param {string} cwd
+ * @param {object} opts
+ * @param {object} opts.flags
+ * @param {string} opts.text
+ * @returns {Promise<string|{text: string, exitCode: number}>}
+ */
+export async function cmdBaseline(cwd, { flags, text }) {
+  const tokens = text ? text.split(/\s+/).filter(Boolean) : [];
+  let consumedIndex = 0;
+
+  let container = null;
+  if (flags.container) {
+    container = flags.container;
+  } else if (tokens.length > 0) {
+    container = tokens[0];
+    consumedIndex++;
+  } else {
+    throw new Error("baseline requires a container id");
+  }
+
+  let briefText = null;
+  if (flags["brief-file"]) {
+    briefText = readBriefFile(flags, "");
+  } else if (consumedIndex < tokens.length) {
+    const briefArg = tokens[consumedIndex];
+    consumedIndex++;
+    try {
+      if (fs.existsSync(briefArg)) {
+        briefText = fs.readFileSync(briefArg, "utf8").trim();
+      } else {
+        briefText = briefArg;
+      }
+    } catch {
+      briefText = briefArg;
+    }
+  }
+
+  const unusedTokens = tokens.slice(consumedIndex);
+  if (unusedTokens.length > 0) {
+    throw new Error(`unexpected positional argument: ${unusedTokens.join(" ")}`);
+  }
+
+  const { callTool } = await import("./sunaba-rpc.mjs");
+
+  const verifyRes = await captureVerifyBaseline(callTool, container);
+  if (!verifyRes || verifyRes.captured !== true) {
+    return {
+      text: `baseline error: ${verifyRes?.error ?? "unknown error"}`,
+      exitCode: 1,
+    };
+  }
+
+  const lines = [
+    `Baseline for container ${container}:`,
+    `  Collected tests: ${verifyRes.collected ?? "unavailable"}`,
+    `  Verify gate: ${verifyRes.gate_passed ? "passed" : "failed"}`,
+    `  Lint violations: ${verifyRes.lint ?? "unavailable"}`,
+    `  Type violations: ${verifyRes.types ?? "unavailable"}`,
+  ];
+
+  if (briefText) {
+    const smokeEntries = parseSmoke(briefText);
+    if (smokeEntries.length > 0) {
+      const smokeReport = await smokeBaselineReport({ brief: briefText, callTool, container });
+      if (smokeReport) {
+        lines.push("", "Smoke baseline:", smokeReport);
+      } else {
+        lines.push("", `Smoke baseline: all ${smokeEntries.length} declared entries matched expected exit codes`);
+      }
+    }
+  }
+
+  return lines.join("\n");
+}
+
 // ---------------------------------------------------------------------------
 // chain-show
 // ---------------------------------------------------------------------------
@@ -2310,6 +2391,7 @@ function usage() {
     "  install-agents  Copy phase agent definitions to OPENCODE_AGENT_DIR and skills to OPENCODE_SKILL_DIR",
     "  install-cli  Write a kusabi-companion shim to $KUSABI_BIN_DIR (default ~/.local/bin), and symlink the delegate / kusabi-result-handling skills into $KUSABI_CURSOR_DIR/skills (default ~/.cursor/skills) when that directory exists",
     "  salvage    Salvage a dead job (inspect progress and produce structured report)",
+    "  baseline   Report collected test count, gate states, and optional smoke baseline for a container (read-only, no LLM)",
     "  help       Show this help message",
     "",
     "Flags:",
@@ -2484,6 +2566,8 @@ async function main() {
       return cmdInstallCli({ ...parsed, selfPath: COMPANION_SCRIPT });
     case "salvage":
       return cmdSalvage(cwd, parsed);
+    case "baseline":
+      return cmdBaseline(cwd, parsed);
     case "chain":
       return cmdChain(cwd, parsed);
     case "chain-resume":
@@ -2507,7 +2591,7 @@ async function main() {
     case "dashboard":
       return cmdDashboard(cwd, parsed);
     default:
-      throw new Error(`unknown subcommand: ${subcommand ?? "(none)"}. Use setup|task|review|chain|chain-resume|chain-show|chain-wait|chain-stats|metrics-ingest|metrics-report|dashboard|chain-cancel|status|result|cancel|serve-stop|install-agents|install-cli|salvage`);
+      throw new Error(`unknown subcommand: ${subcommand ?? "(none)"}. Use setup|task|review|chain|baseline|chain-resume|chain-show|chain-wait|chain-stats|metrics-ingest|metrics-report|dashboard|chain-cancel|status|result|cancel|serve-stop|install-agents|install-cli|salvage`);
   }
 }
 
