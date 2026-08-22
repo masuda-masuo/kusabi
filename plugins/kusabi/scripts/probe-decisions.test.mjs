@@ -8,6 +8,7 @@ import {
   parseRefusalBlock,
   classifyRefusalOutcome,
   verifyRefusalAnchors,
+  refusalRepoPaths,
 } from "./probe-decisions.mjs";
 
 // checkDeliverablesProbe — P3 probe decision logic
@@ -409,6 +410,27 @@ describe("parseRefusalBlock", () => {
       "why: they contradict.",
     ].join("\n");
     assert.equal(parseRefusalBlock(text), null);
+  });
+});
+
+describe("refusalRepoPaths", () => {
+  it("returns usable repo paths in anchor order, excluding invalid/brief-section anchors and deduplicating", () => {
+    const block = parseRefusalBlock(refusalReport([
+      "anchor: ## Spec",
+      "anchor: tests/a.py",
+      "anchor: ../outside.py",
+      "anchor: tests/b.py:10-20",
+      "anchor: tests/a.py",
+    ].join("\n")));
+    const paths = refusalRepoPaths(block);
+    assert.deepEqual(paths, ["tests/a.py", "tests/b.py"]);
+  });
+
+  it("returns [] for null or shape-less input", () => {
+    assert.deepEqual(refusalRepoPaths(null), []);
+    assert.deepEqual(refusalRepoPaths(undefined), []);
+    assert.deepEqual(refusalRepoPaths({}), []);
+    assert.deepEqual(refusalRepoPaths("not a block"), []);
   });
 });
 

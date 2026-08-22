@@ -404,6 +404,31 @@ function isUsableRepoPath(p) {
 }
 
 /**
+ * Usable repo paths referenced by a refusal block, in anchor order.
+ *
+ * Extracts `anchor.name` for every `repo-path` anchor, strips any `:line`
+ * suffix via `repoPathOf`, filters with `isUsableRepoPath`, and de-duplicates
+ * while preserving appearance order.
+ *
+ * @param {object|null} block  `parseRefusalBlock` output
+ * @returns {string[]} usable repo paths; `[]` when `block` is missing,
+ *   malformed, or carries no usable repo paths.
+ */
+export function refusalRepoPaths(block) {
+  if (!block || typeof block !== "object" || !Array.isArray(block.anchors)) return [];
+  const paths = [];
+  for (const anchor of block.anchors) {
+    if (anchor && anchor.kind === "repo-path") {
+      const p = repoPathOf(anchor.name);
+      if (isUsableRepoPath(p) && !paths.includes(p)) {
+        paths.push(p);
+      }
+    }
+  }
+  return paths;
+}
+
+/**
  * Verify that every anchor in a parsed refusal block NAMES A REAL ITEM.
  *
  * Shape-only parsing accepts `src/nonexistent.mjs` and `## No Such Section`;

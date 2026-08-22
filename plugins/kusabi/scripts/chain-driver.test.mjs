@@ -4771,7 +4771,7 @@ describe("runChainDriver qualifying refusal (kusabi #293)", () => {
     "```",
   ].join("\n");
 
-  function refusalCallTool({ statusOutput }) {
+  function refusalCallTool({ statusOutput, cwd } = {}) {
     return async (toolName, params) => {
       if (toolName === "verify_in_container") {
         return {
@@ -4781,6 +4781,17 @@ describe("runChainDriver qualifying refusal (kusabi #293)", () => {
       }
       if (toolName !== "sandbox_exec") return { output: "" };
       const cmd = params.commands[0];
+      if (cmd.includes("test -e ")) {
+        const lines = [];
+        const matches = cmd.matchAll(/test -e '([^']+)'/g);
+        for (const m of matches) {
+          const p = m[1];
+          const fullPath = cwd ? path.join(cwd, p) : p;
+          const exists = fs.existsSync(fullPath);
+          lines.push(exists ? `OK ${p}` : `NO ${p}`);
+        }
+        return { output: lines.join("\n") + "\n" };
+      }
       if (cmd.startsWith("cd /workspace &&") && cmd.includes("TMPIDX=")) {
         return { output: "ERROR_NO_INDEX\n" };
       }
@@ -4841,7 +4852,7 @@ describe("runChainDriver qualifying refusal (kusabi #293)", () => {
       model: "fake/model", modelChain: [["fake/model"], ["fake/pro"]], maxRounds: 4,
       brief: gate ? GATE_BRIEF : BRIEF, orchestrator: null, baseSha: "abc123", worktreeBaseline: null,
       verifyBaseline: { captured: true, gate_passed: true, lint: 0, types: 0, collected: 10, raw: {} },
-      callTool: refusalCallTool({ statusOutput }),
+      callTool: refusalCallTool({ statusOutput, cwd: tmp }),
       dispatchWithFallback: dispatch,
       keepServe: true,
       signalReceived: () => false,
@@ -4953,7 +4964,7 @@ describe("runChainDriver qualifying refusal (kusabi #293)", () => {
         model: "fake/model", modelChain: [["fake/model"], ["fake/pro"]], maxRounds: 4,
         brief: GATE_BRIEF, orchestrator: null, baseSha: "abc123", worktreeBaseline: null,
         verifyBaseline: { captured: true, gate_passed: true, lint: 0, types: 0, collected: 10, raw: {} },
-        callTool: refusalCallTool({ statusOutput: "" }),
+        callTool: refusalCallTool({ statusOutput: "", cwd: tmp }),
         dispatchWithFallback: dispatchWithStop,
         keepServe: true,
         signalReceived: () => false,
@@ -4991,7 +5002,7 @@ describe("runChainDriver qualifying refusal (kusabi #293)", () => {
         // Mirror cmdChainResume: reuse the verify baseline recorded in
         // chain.json; never re-capture on the modified worktree (kusabi #173).
         verifyBaseline: readJson(path.join(chainDir, "chain.json")).verifyBaseline ?? null,
-        callTool: refusalCallTool({ statusOutput: "" }),
+        callTool: refusalCallTool({ statusOutput: "", cwd: tmp }),
         dispatchWithFallback: dispatch,
         keepServe: true,
         signalReceived: () => false,
@@ -5124,7 +5135,7 @@ describe("runChainDriver qualifying refusal (kusabi #293)", () => {
         model: "fake/model", modelChain: [["fake/model"], ["fake/pro"]], maxRounds: 4,
         brief: gateBrief, orchestrator: null, baseSha: "abc123", worktreeBaseline: null,
         verifyBaseline: { captured: true, gate_passed: true, lint: 0, types: 0, collected: 10, raw: {} },
-        callTool: refusalCallTool({ statusOutput: "" }),
+        callTool: refusalCallTool({ statusOutput: "", cwd: tmp }),
         dispatchWithFallback: dispatch,
         keepServe: true,
         signalReceived: () => false,
@@ -5169,7 +5180,7 @@ describe("runChainDriver qualifying refusal (kusabi #293)", () => {
         brief: "Implement X.\n\n## Deliverables\n- src/foo.js\n", orchestrator: null,
         baseSha: "abc123", worktreeBaseline: null,
         verifyBaseline: { captured: true, gate_passed: true, lint: 0, types: 0, collected: 10, raw: {} },
-        callTool: refusalCallTool({ statusOutput: "" }),
+        callTool: refusalCallTool({ statusOutput: "", cwd: tmp }),
         dispatchWithFallback: dispatch,
         keepServe: true,
         signalReceived: () => false,
@@ -5193,6 +5204,209 @@ describe("runChainDriver qualifying refusal (kusabi #293)", () => {
       // No rework budget consumed by the forgery: same as any discard.
       assert.equal(round1.reworkCount, 0);
       assert.equal(round1.pendingReworkStrategy, null);
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("container refusal anchor verification: inspects container filesystem, single-quotes paths, and bypasses host cwd (kusabi #351)", async () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-container-refusal-"));
+    const chainDir = path.join(tmp, "chains", "chain-refusal");
+    fs.mkdirSync(chainDir, { recursive: true });
+    writeChainControl(chainDir, {
+      chainId: "chain-refusal", container: "cid-1", pid: process.pid,
+      status: "running", round: 0, startedAt: new Date().toISOString(),
+    });
+
+    const brief = "Implement X.\n\n## Spec\n\nContradiction.\n\n## Deliverables\n- src/foo.js\n";
+    const reportText = [
+      "```kusabi-refusal",
+      "anchor: ## Spec",
+      "anchor: tests/a.py",
+      "anchor: tests/missing.py",
+      "why: spec contradicts test.",
+      "```",
+    ].join("\n");
+
+    const execCalls = [];
+    const callTool = async (toolName, params) => {
+      if (toolName === "verify_in_container") {
+        return {
+          gate_passed: true, lint: [], types: [],
+          tests: { full: { status: "ok", passed: 10, total: 10 } },
+        };
+      }
+      if (toolName !== "sandbox_exec") return { output: "" };
+      const cmd = params.commands[0];
+      execCalls.push(cmd);
+      if (cmd.includes("test -e ")) {
+        return { output: "OK tests/a.py\nNO tests/missing.py\n" };
+      }
+      if (cmd === "git rev-parse HEAD") return { output: "abc123\n" };
+      if (cmd === "git status --porcelain") return { output: "" };
+      return { output: "" };
+    };
+
+    const dispatch = reportingDispatch(reportText);
+
+    // tests/a.py DOES NOT exist in host tmp directory!
+    const text = await runChainDriver({
+      cwd: tmp, stateDir: tmp, chainDir, chainId: "chain-refusal", container: "cid-1",
+      model: "fake/model", modelChain: [["fake/model"]], maxRounds: 4,
+      brief, orchestrator: null, baseSha: "abc123", worktreeBaseline: null,
+      verifyBaseline: { captured: true, gate_passed: true, lint: 0, types: 0, collected: 10, raw: {} },
+      callTool,
+      dispatchWithFallback: dispatch,
+      keepServe: true,
+      signalReceived: () => false,
+      resume: null,
+    });
+
+    try {
+      assert.match(text, /refused at round 1/);
+
+      const round1 = readJson(path.join(chainDir, "round-1.json"));
+      assert.equal(round1.disposition.disposition, "refused-brief-defect");
+      assert.equal(round1.roundOutcome, "refusal");
+      assert.equal(round1.implementRefusal.qualifies, true);
+
+      // tests/a.py is named and verified
+      assert.ok(round1.implementRefusal.anchors.some((a) => a.name === "tests/a.py"));
+      assert.ok(!round1.implementRefusal.unnamedAnchors.some((u) => u.startsWith("tests/a.py")));
+
+      // tests/missing.py is listed under unnamed with exact wording
+      assert.ok(round1.implementRefusal.unnamedAnchors.some((u) => u === "tests/missing.py (no such file or directory in the repo)"));
+
+      // Exactly one sandbox_exec call for anchor checking
+      const anchorExecs = execCalls.filter((c) => c.includes("test -e "));
+      assert.equal(anchorExecs.length, 1);
+
+      // Both paths are single-quoted in the command string sent to sandbox_exec
+      const anchorCmd = anchorExecs[0];
+      assert.ok(anchorCmd.includes("'tests/a.py'"));
+      assert.ok(anchorCmd.includes("'tests/missing.py'"));
+      assert.equal(
+        anchorCmd,
+        "test -e 'tests/a.py' && echo 'OK tests/a.py' || echo 'NO tests/a.py' && test -e 'tests/missing.py' && echo 'OK tests/missing.py' || echo 'NO tests/missing.py'"
+      );
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("container refusal anchor verification: container sandbox_exec failure disqualifies refusal with warning without crashing (kusabi #351)", async () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-container-err-refusal-"));
+    const chainDir = path.join(tmp, "chains", "chain-refusal");
+    fs.mkdirSync(chainDir, { recursive: true });
+    writeChainControl(chainDir, {
+      chainId: "chain-refusal", container: "cid-1", pid: process.pid,
+      status: "running", round: 0, startedAt: new Date().toISOString(),
+    });
+
+    const brief = "Implement X.\n\n## Spec\n\nContradiction.\n\n## Deliverables\n- src/foo.js\n";
+    const reportText = [
+      "```kusabi-refusal",
+      "anchor: ## Spec",
+      "anchor: tests/a.py",
+      "why: spec contradicts test.",
+      "```",
+    ].join("\n");
+
+    const callTool = async (toolName, params) => {
+      if (toolName === "verify_in_container") {
+        return {
+          gate_passed: true, lint: [], types: [],
+          tests: { full: { status: "ok", passed: 10, total: 10 } },
+        };
+      }
+      if (toolName !== "sandbox_exec") return { output: "" };
+      const cmd = params.commands[0];
+      if (cmd.includes("test -e ")) {
+        throw new Error("container RPC dead");
+      }
+      if (cmd === "git rev-parse HEAD") return { output: "abc123\n" };
+      if (cmd === "git status --porcelain") return { output: "" };
+      return { output: "" };
+    };
+
+    const dispatch = reportingDispatch(reportText);
+
+    const text = await runChainDriver({
+      cwd: tmp, stateDir: tmp, chainDir, chainId: "chain-refusal", container: "cid-1",
+      model: "fake/model", modelChain: [["fake/model"]], maxRounds: 4,
+      brief, orchestrator: null, baseSha: "abc123", worktreeBaseline: null,
+      verifyBaseline: { captured: true, gate_passed: true, lint: 0, types: 0, collected: 10, raw: {} },
+      callTool,
+      dispatchWithFallback: dispatch,
+      keepServe: true,
+      signalReceived: () => false,
+      resume: null,
+    });
+
+    try {
+      assert.match(text, /escalated at round 1/);
+
+      const round1 = readJson(path.join(chainDir, "round-1.json"));
+      assert.equal(round1.implementRefusal.qualifies, false);
+      assert.match(round1.implementRefusal.disqualification, /container path existence check failed/);
+      assert.match(round1.implementRefusal.disqualification, /container RPC dead/);
+      assert.ok(round1.warnings.some((w) => w.includes("container path existence check failed")));
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("container refusal anchor verification: when container is not set, inspects host cwd and never calls sandbox_exec for anchors (kusabi #351)", async () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-host-refusal-"));
+    const chainDir = path.join(tmp, "chains", "chain-refusal");
+    fs.mkdirSync(chainDir, { recursive: true });
+    fs.mkdirSync(path.join(tmp, "tests"), { recursive: true });
+    fs.writeFileSync(path.join(tmp, "tests", "a.py"), "# test");
+
+    writeChainControl(chainDir, {
+      chainId: "chain-refusal", container: null, pid: process.pid,
+      status: "running", round: 0, startedAt: new Date().toISOString(),
+    });
+
+    const brief = "Implement X.\n\n## Spec\n\nContradiction.\n\n## Deliverables\n- src/foo.js\n";
+    const reportText = [
+      "```kusabi-refusal",
+      "anchor: ## Spec",
+      "anchor: tests/a.py",
+      "why: spec contradicts test.",
+      "```",
+    ].join("\n");
+
+    const execCalls = [];
+    const callTool = async (toolName, params) => {
+      if (toolName === "sandbox_exec") {
+        execCalls.push(params.commands[0]);
+      }
+      return { output: "" };
+    };
+
+    const dispatch = reportingDispatch(reportText);
+
+    const text = await runChainDriver({
+      cwd: tmp, stateDir: tmp, chainDir, chainId: "chain-refusal", container: null,
+      model: "fake/model", modelChain: [["fake/model"]], maxRounds: 4,
+      brief, orchestrator: null, baseSha: "abc123", worktreeBaseline: null,
+      verifyBaseline: { captured: true, gate_passed: true, lint: 0, types: 0, collected: 10, raw: {} },
+      callTool,
+      dispatchWithFallback: dispatch,
+      keepServe: true,
+      signalReceived: () => false,
+      resume: null,
+    });
+
+    try {
+      assert.match(text, /refused at round 1/);
+
+      const round1 = readJson(path.join(chainDir, "round-1.json"));
+      assert.equal(round1.implementRefusal.qualifies, true);
+
+      const anchorExecs = execCalls.filter((c) => c.includes("test -e "));
+      assert.equal(anchorExecs.length, 0);
     } finally {
       fs.rmSync(tmp, { recursive: true, force: true });
     }
