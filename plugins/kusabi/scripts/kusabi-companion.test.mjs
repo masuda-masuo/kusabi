@@ -17,6 +17,8 @@ import {
   resolveOrchestratorRecord,
   ORCH_SESSION_ENV,
   briefLintReport,
+  cmdChainDetach,
+  extractChainAndWaitArgs,
 } from "./kusabi-companion.mjs";
 // The container header the chain injects into its implement prompt, and the
 // builder that injects it: the #289 suite at the end of this file asserts the
@@ -4844,3 +4846,242 @@ describe("help flags validation (kusabi #360)", () => {
     );
   });
 });
+
+describe("chain-detach CLI", () => {
+  const COMPANION_SCRIPT = path.join(import.meta.dirname, "kusabi-companion.mjs");
+
+  const VALID_BRIEF =
+    "# Task\n\nOrchestrator: test-model | session s-1 | 2026-08-23\n\n" +
+    "## Deliverables\n\n- `plugins/kusabi/scripts/x.mjs`\n\n" +
+    "## Smoke\n\n- `npm test`\n";
+
+  it("extractChainAndWaitArgs separates wait flags from chain flags", () => {
+    assert.equal(typeof cmdChainDetach, "function");
+    const flags = {
+      "brief-file": "brief.md",
+      container: "cid-1",
+      model: "claude/opus",
+      keepServe: true,
+      "appear-timeout": "180",
+      "poll-interval": "5",
+    };
+    const { chainArgs, waitFlags } = extractChainAndWaitArgs(flags, "");
+    assert.deepStrictEqual(chainArgs, [
+      "--brief-file",
+      "brief.md",
+      "--container",
+      "cid-1",
+      "--model",
+      "claude/opus",
+      "--keep-serve",
+    ]);
+    assert.deepStrictEqual(waitFlags, {
+      "appear-timeout": "180",
+      "poll-interval": "5",
+    });
+  });
+
+  it("refuses to launch when pre-flight checks fail (missing container, invalid brief)", async () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-test-detach-refuse-"));
+    try {
+      const briefPath = path.join(tmp, "brief.md");
+      fs.writeFileSync(briefPath, "Invalid brief with no deliverables");
+      const env = { ...process.env };
+      delete env.KUSABI_WORKER_CONTEXT;
+      env.KUSABI_STATE_DIR = path.join(tmp, "state");
+
+      // 1. Missing container
+      const resNoContainer = spawnSync(
+        process.execPath,
+        [COMPANION_SCRIPT, "chain-detach", "--brief-file", briefPath],
+        { encoding: "utf8", cwd: tmp, env },
+      );
+      assert.notEqual(resNoContainer.status, 0);
+      assert.match(resNoContainer.stdout, /chain requires --container/);
+      assert.doesNotMatch(resNoContainer.stdout, /chain-wait/);
+
+      // 2. Invalid brief (missing deliverables)
+      const resBadBrief = spawnSync(
+        process.execPath,
+        [COMPANION_SCRIPT, "chain-detach", "--container", "cid-1", "--brief-file", briefPath],
+        { encoding: "utf8", cwd: tmp, env },
+      );
+      assert.notEqual(resBadBrief.status, 0);
+      assert.match(resBadBrief.stdout, /brief rejected before dispatch/);
+      assert.doesNotMatch(resBadBrief.stdout, /chain-wait/);
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses dispatch when KUSABI_WORKER_CONTEXT is set", () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-test-detach-worker-"));
+    try {
+      const briefPath = path.join(tmp, "brief.md");
+      fs.writeFileSync(briefPath, VALID_BRIEF);
+      const env = { ...process.env, KUSABI_WORKER_CONTEXT: "1" };
+      const res = spawnSync(
+        process.execPath,
+        [COMPANION_SCRIPT, "chain-detach", "--container", "cid-1", "--brief-file", briefPath],
+        { encoding: "utf8", cwd: tmp, env },
+      );
+      assert.notEqual(res.status, 0);
+      assert.match(res.stdout, /refusing to dispatch from inside a kusabi worker context/);
+      assert.doesNotMatch(res.stdout, /chain-wait/);
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("launches a detached chain stand-in, prints log path and runnable chain-wait command line", async () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-test-detach-success-"));
+    try {
+      const briefPath = path.join(tmp, "brief.md");
+      fs.writeFileSync(briefPath, VALID_BRIEF);
+      const stateRootDir = path.join(tmp, "state");
+
+      const standinScript = path.join(tmp, "standin.mjs");
+      fs.writeFileSync(
+        standinScript,
+        `import fs from "node:fs";
+import path from "node:path";
+import crypto from "node:crypto";
+
+const stateDir = process.env.KUSABI_TEST_STATE_DIR;
+const chainId = "chain-" + Date.now().toString(36) + crypto.randomBytes(2).toString("hex");
+const chainDir = path.join(stateDir, "chains", chainId);
+fs.mkdirSync(chainDir, { recursive: true });
+
+fs.writeFileSync(path.join(chainDir, "control.json"), JSON.stringify({
+  chainId, container: "cid-1", pid: process.pid, status: "running", round: 1
+}));
+
+setTimeout(() => {
+  fs.writeFileSync(path.join(chainDir, "chain.json"), JSON.stringify({
+    chainId, container: "cid-1", records: [{ round: 1, disposition: "accept" }]
+  }));
+  fs.writeFileSync(path.join(chainDir, "control.json"), JSON.stringify({
+    chainId, container: "cid-1", pid: process.pid, status: "completed", round: 1
+  }));
+}, 200);
+`,
+        "utf8",
+      );
+
+      const env = { ...process.env };
+      delete env.KUSABI_WORKER_CONTEXT;
+      env.KUSABI_STATE_DIR = stateRootDir;
+
+      const hash = crypto.createHash("sha256").update(tmp).digest("hex").slice(0, 12);
+      const workspaceStateDir = path.join(stateRootDir, hash);
+      env.KUSABI_TEST_STATE_DIR = workspaceStateDir;
+      env.KUSABI_TEST_CHAIN_STANDIN = standinScript;
+
+      const res = spawnSync(
+        process.execPath,
+        [COMPANION_SCRIPT, "chain-detach", "--container", "cid-1", "--brief-file", briefPath, "--appear-timeout", "10"],
+        { encoding: "utf8", cwd: tmp, env },
+      );
+
+      assert.equal(res.status, 0, res.stdout);
+      assert.match(res.stdout, /Detached chain launched \(pid \d+\)/);
+      assert.match(res.stdout, /Log: .*chain-detach-\d+\.log/);
+      assert.match(res.stdout, /kusabi-companion chain-wait --next --since \d{4}-\d{2}-\d{2}T.* --appear-timeout 10/);
+
+      const waitCmdMatch = res.stdout.match(/kusabi-companion (chain-wait --next --since \S+ --appear-timeout \d+)/);
+      assert.ok(waitCmdMatch, "wait command found in stdout");
+      const waitArgs = waitCmdMatch[1].split(/\s+/);
+
+      const waitRes = spawnSync(
+        process.execPath,
+        [COMPANION_SCRIPT, ...waitArgs],
+        { encoding: "utf8", cwd: tmp, env, timeout: 5000 },
+      );
+
+      assert.equal(waitRes.status, 0, waitRes.stdout);
+      assert.match(waitRes.stdout, /^chain chain-[a-z0-9]+: status=completed disposition=accept/m);
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("unambiguously selects the new chain when another chain pre-exists in the same workspace", async () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-test-detach-concurrent-"));
+    try {
+      const briefPath = path.join(tmp, "brief.md");
+      fs.writeFileSync(briefPath, VALID_BRIEF);
+      const stateRootDir = path.join(tmp, "state");
+      const hash = crypto.createHash("sha256").update(tmp).digest("hex").slice(0, 12);
+      const workspaceStateDir = path.join(stateRootDir, hash);
+
+      const olderChainDir = path.join(workspaceStateDir, "chains", "chain-older-001");
+      fs.mkdirSync(olderChainDir, { recursive: true });
+      fs.writeFileSync(path.join(olderChainDir, "control.json"), JSON.stringify({
+        chainId: "chain-older-001", container: "cid-1", pid: 99999, status: "running", round: 1
+      }));
+
+      const oldTime = new Date(Date.now() - 60000);
+      fs.utimesSync(olderChainDir, oldTime, oldTime);
+
+      const standinScript = path.join(tmp, "standin2.mjs");
+      fs.writeFileSync(
+        standinScript,
+        `import fs from "node:fs";
+import path from "node:path";
+import crypto from "node:crypto";
+
+const stateDir = process.env.KUSABI_TEST_STATE_DIR;
+const chainId = "chain-newer-002";
+const chainDir = path.join(stateDir, "chains", chainId);
+fs.mkdirSync(chainDir, { recursive: true });
+
+fs.writeFileSync(path.join(chainDir, "control.json"), JSON.stringify({
+  chainId, container: "cid-1", pid: process.pid, status: "running", round: 1
+}));
+
+setTimeout(() => {
+  fs.writeFileSync(path.join(chainDir, "chain.json"), JSON.stringify({
+    chainId, container: "cid-1", records: [{ round: 1, disposition: "accept" }]
+  }));
+  fs.writeFileSync(path.join(chainDir, "control.json"), JSON.stringify({
+    chainId, container: "cid-1", pid: process.pid, status: "completed", round: 1
+  }));
+}, 200);
+`,
+        "utf8",
+      );
+
+      const env = { ...process.env };
+      delete env.KUSABI_WORKER_CONTEXT;
+      env.KUSABI_STATE_DIR = stateRootDir;
+      env.KUSABI_TEST_STATE_DIR = workspaceStateDir;
+      env.KUSABI_TEST_CHAIN_STANDIN = standinScript;
+
+      const res = spawnSync(
+        process.execPath,
+        [COMPANION_SCRIPT, "chain-detach", "--container", "cid-1", "--brief-file", briefPath, "--appear-timeout", "10"],
+        { encoding: "utf8", cwd: tmp, env },
+      );
+
+      assert.equal(res.status, 0, res.stdout);
+      assert.match(res.stdout, /kusabi-companion chain-wait --next --since/);
+
+      const waitCmdMatch = res.stdout.match(/kusabi-companion (chain-wait --next --since \S+ --appear-timeout \d+)/);
+      assert.ok(waitCmdMatch);
+      const waitArgs = waitCmdMatch[1].split(/\s+/);
+
+      const waitRes = spawnSync(
+        process.execPath,
+        [COMPANION_SCRIPT, ...waitArgs],
+        { encoding: "utf8", cwd: tmp, env, timeout: 5000 },
+      );
+
+      assert.equal(waitRes.status, 0, waitRes.stdout);
+      assert.match(waitRes.stdout, /^chain chain-newer-002: status=completed/m);
+      assert.doesNotMatch(waitRes.stdout, /chain-older-001/);
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+});
+
