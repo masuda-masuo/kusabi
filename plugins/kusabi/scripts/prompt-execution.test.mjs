@@ -457,17 +457,13 @@ describe("dispatchWithFallback", () => {
     assert.equal(job.status, "provider-error");
   });
 
-  it("--model override producing provider-error falls back to tier routes", async () => {
+  it("--model override producing provider-error does NOT fall back to tier routes", async () => {
     let callCount = 0;
     const fakeRunner = async () => {
       callCount++;
-      if (callCount === 1) {
-        // The explicit model fails.
-        return fakeResult("provider-error", {
-          retry: { reason: "rate_limit", message: "overloaded", attempt: 3, count: 3, terminal: false },
-        });
-      }
-      return fakeResult("completed", { resultText: "ok" });
+      return fakeResult("provider-error", {
+        retry: { reason: "free_tier_limit", message: "quota exceeded", attempt: 1, count: 1, terminal: true },
+      });
     };
 
     const { job } = await dispatchWithFallback({
@@ -479,13 +475,39 @@ describe("dispatchWithFallback", () => {
       promptText: "test",
     });
 
-    assert.equal(job.status, "completed");
-    // The explicit model should have been tried first, then tier routes.
-    assert.ok(Array.isArray(job.fallbacks));
-    assert.equal(job.fallbacks[0].from, "custom/override-model");
-    // The succeeded route is from the tier.
-    assert.equal(job.modelEntry, "route/default");
-    assert.equal(callCount, 2);
+    assert.equal(job.status, "provider-error");
+    assert.equal(callCount, 1);
+    assert.ok(job.error.includes("custom/override-model"));
+    assert.ok(job.error.includes("quota exceeded"));
+  });
+
+  it("pinned route in failedRoutes reports distinct error message", async () => {
+    // First dispatch: terminal failure on pinned route.
+    await dispatchWithFallback({
+      _runPrompt: async () => fakeResult("provider-error", {
+        retry: { reason: "free_tier_limit", message: "quota", attempt: 1, count: 1, terminal: true },
+      }),
+      tiers: [["route/default"]],
+      round: 1,
+      explicitModel: "custom/pinned-model",
+      kind: "task",
+      promptText: "test",
+    });
+
+    assert.ok(failedRoutes.has("custom/pinned-model"));
+
+    // Second dispatch with same pinned route: should report pinned model is dead.
+    const { job } = await dispatchWithFallback({
+      _runPrompt: async () => fakeResult("completed", { resultText: "ok" }),
+      tiers: [["route/default"]],
+      round: 1,
+      explicitModel: "custom/pinned-model",
+      kind: "task",
+      promptText: "test",
+    });
+
+    assert.equal(job.status, "provider-error");
+    assert.equal(job.error, 'Pinned model "custom/pinned-model" has already failed terminally in this process.');
   });
 
   it("non-terminal failure is NOT added to failedRoutes", async () => {

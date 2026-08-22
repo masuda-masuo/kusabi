@@ -458,15 +458,15 @@ describe("selectRoutes", () => {
     assert.deepEqual(result, ["p/pro:max"]);
   });
 
-  it("explicitModel is prepended when not failed", () => {
+  it("explicitModel pins selection to exactly that model when not failed", () => {
     const result = selectRoutes({ tiers, round: 1, explicitModel: "p/custom" });
-    assert.deepEqual(result, ["p/custom", "p/flash-free:max", "p/flash:max", "p/pro:max"]);
+    assert.deepEqual(result, ["p/custom"]);
   });
 
-  it("explicitModel is skipped when in failedRoutes", () => {
+  it("explicitModel returns empty array when in failedRoutes", () => {
     const failed = new Set(["p/custom"]);
     const result = selectRoutes({ tiers, round: 1, explicitModel: "p/custom", failedRoutes: failed });
-    assert.deepEqual(result, ["p/flash-free:max", "p/flash:max", "p/pro:max"]);
+    assert.deepEqual(result, []);
   });
 
   it("failedRoutes skips dead routes", () => {
@@ -501,10 +501,10 @@ describe("selectRoutes", () => {
     assert.deepEqual(selectRoutes({ tiers: flatTiers, round: 5 }), ["p/c"]);
   });
 
-  it("explicitModel is not duplicated in candidates", () => {
+  it("explicitModel pins selection even when present in tier 0", () => {
     // explicitModel already appears in tier 0
     const result = selectRoutes({ tiers, round: 1, explicitModel: "p/flash-free:max" });
-    assert.deepEqual(result, ["p/flash-free:max", "p/flash:max", "p/pro:max"]);
+    assert.deepEqual(result, ["p/flash-free:max"]);
   });
 
   it("empty tiers returns empty array", () => {
