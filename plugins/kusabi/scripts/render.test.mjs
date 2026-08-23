@@ -2000,7 +2000,7 @@ describe("renderReviewRecord", () => {
     // Header: label, chain id, truncated brief first line.
     assert.match(text, /# \[review-record\] kusabi chain-abc — Implement X\./);
     assert.match(text, /Orchestrator: claude-fable-5 \| session abc123 \| 2026-08-08 \| finished: 2026-08-08T12:00:00\.000Z/);
-    assert.match(text, /Model chain: flash\/quick → pro\/deep \| container: cid-123/);
+    assert.match(text, /Model chain: flash\/quick \(configured: flash\/quick → pro\/deep\) \| container: cid-123/);
     assert.match(text, /Final disposition: escalated at round 2 of 4/);
 
     // Per-round verdict/disposition lines.
@@ -2163,6 +2163,74 @@ describe("renderReviewRecord", () => {
     } finally {
       fs.rmSync(tmpDir, { recursive: true, force: true });
     }
+  });
+
+  it("header names the per-round model when a configured chain was pinned over", () => {
+    const text = renderReviewRecord({
+      chainId: "chain-pin",
+      container: "e3b7eca3db7d",
+      modelChain: [["opencode/hy3-free:high"], ["opencode/mimo-v2.5-free"]],
+      records: [
+        { round: 1, modelEntry: "gemini-3.6-flash-high", verdict: "approve" },
+      ],
+      disposition: { disposition: "accepted", round: 1 },
+    });
+    assert.match(text, /Model chain: gemini-3\.6-flash-high \(configured: opencode\/hy3-free:high → opencode\/mimo-v2\.5-free\) \| container: e3b7eca3db7d/);
+    assert.doesNotMatch(text, /Model chain: opencode\/hy3-free:high → opencode\/mimo-v2\.5-free \|/);
+  });
+
+  it("header lists distinct per-round models in round order without duplicates", () => {
+    const text = renderReviewRecord({
+      chainId: "chain-mixed",
+      container: "cid-mix",
+      modelChain: [["p/flash"], ["p/pro"]],
+      records: [
+        { round: 1, modelEntry: "p/flash" },
+        { round: 2, modelEntry: "p/pro" },
+        { round: 3, modelEntry: "p/flash" },
+      ],
+    });
+    assert.match(text, /Model chain: p\/flash → p\/pro \| container: cid-mix/);
+    assert.doesNotMatch(text, /p\/flash → p\/pro → p\/flash/);
+    assert.doesNotMatch(text, /\(configured:/);
+  });
+
+  it("header does not invent a model when rounds carry none, and labels the configured ladder", () => {
+    const text = renderReviewRecord({
+      chainId: "chain-old",
+      container: "cid-old",
+      modelChain: [["flash/quick"], ["pro/deep"]],
+      records: [{ round: 1, verdict: "approve" }],
+    });
+    assert.match(text, /Model chain: \(unknown\) \(configured: flash\/quick → pro\/deep\) \| container: cid-old/);
+  });
+
+  it("header is (unknown) when neither per-round models nor a configured chain exist", () => {
+    const text = renderReviewRecord({
+      chainId: "chain-empty",
+      records: [{ round: 1 }],
+    });
+    assert.match(text, /Model chain: \(unknown\) \| container: \(unknown\)/);
+  });
+
+  it("header falls back to per-round model when modelEntry is absent", () => {
+    const text = renderReviewRecord({
+      chainId: "chain-legacy",
+      container: "cid-leg",
+      modelChain: [["configured/never-ran"]],
+      records: [{ round: 1, model: "legacy/ran" }],
+    });
+    assert.match(text, /Model chain: legacy\/ran \(configured: configured\/never-ran\) \| container: cid-leg/);
+  });
+
+  it("header does not crash on null records or a non-array modelChain", () => {
+    const text = renderReviewRecord({
+      chainId: "chain-garbage",
+      modelChain: "not-an-array",
+      records: null,
+    });
+    assert.equal(typeof text, "string");
+    assert.match(text, /Model chain: \(unknown\) \| container: \(unknown\)/);
   });
 });
 

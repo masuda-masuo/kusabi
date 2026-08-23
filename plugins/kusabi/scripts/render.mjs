@@ -1383,26 +1383,53 @@ function reviewRecordOrchestratorLine(record) {
 }
 
 /**
- * Model-chain label: the configured ladder (tiers joined with " → ", routes
- * within a tier with ", "), falling back to the models actually used per
- * round when no ladder was recorded.
+ * Format the configured ladder: tiers joined with " → ", routes within a
+ * tier with ", ". Empty when nothing was recorded.
  *
- * @param {object} record
+ * @param {*} modelChain
  * @returns {string}
  */
-function reviewRecordModelChain(record) {
-  if (Array.isArray(record.modelChain) && record.modelChain.length > 0) {
-    return record.modelChain.map(function (tier) {
-      return Array.isArray(tier) ? tier.map(String).join(", ") : String(tier);
-    }).join(" → ");
-  }
+function formatConfiguredModelChain(modelChain) {
+  if (!Array.isArray(modelChain) || modelChain.length === 0) return "";
+  return modelChain.map(function (tier) {
+    return Array.isArray(tier) ? tier.map(String).join(", ") : String(tier);
+  }).join(" → ");
+}
+
+/**
+ * Models that actually ran, in round order, first occurrence of each.
+ * Prefers per-round `modelEntry`, then `model`.
+ *
+ * @param {object} record
+ * @returns {string[]}
+ */
+function reviewRecordRanModels(record) {
   const seen = [];
   const rounds = Array.isArray(record.records) ? record.records : [];
   for (const r of rounds) {
     const m = r?.modelEntry || r?.model;
     if (m && !seen.includes(m)) seen.push(m);
   }
-  return seen.join(" → ") || "(unknown)";
+  return seen;
+}
+
+/**
+ * Model-chain label: what ran (per-round models, unique, round order).
+ * When a configured ladder is present and differs from what ran, it is
+ * appended labelled as configured so it cannot be mistaken for the models
+ * that did the work. Records with neither source render "(unknown)".
+ *
+ * @param {object} record
+ * @returns {string}
+ */
+function reviewRecordModelChain(record) {
+  const ran = reviewRecordRanModels(record);
+  const ranLabel = ran.length > 0 ? ran.join(" → ") : "(unknown)";
+  const configured = formatConfiguredModelChain(record.modelChain);
+  if (configured && configured !== ranLabel) {
+    return ranLabel + " (configured: " + configured + ")";
+  }
+  return ranLabel;
 }
 
 /**
