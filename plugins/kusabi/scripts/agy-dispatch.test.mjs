@@ -960,7 +960,7 @@ describe("backendSupportsResume", () => {
 
 describe("backend registry", () => {
   it("agy is a known --backend value", () => {
-    assert.deepEqual(BACKENDS, ["opencode", "claude", "agy"]);
+    assert.deepEqual(BACKENDS, ["opencode", "claude", "agy", "cursor"]);
     assert.equal(resolveBackend({ backend: "agy" }), "agy");
   });
 

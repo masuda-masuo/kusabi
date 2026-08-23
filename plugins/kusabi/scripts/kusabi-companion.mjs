@@ -50,6 +50,7 @@ import { opencodeBin, serverHealthy, ensureServer, reapIdleServes, reapOrphanedS
 import { runPrompt, dispatchWithFallback } from "./prompt-execution.mjs";
 import { claudeDispatch, resolveClaudeModel, validateClaudeModel, validateClaudeChain, translateDenyTools, clampModelDispatch, stopRecordedProcess, CLAUDE_BACKEND } from "./claude-dispatch.mjs";
 import { agyDispatch, resolveAgyModel, validateAgyModel, validateAgyChain, AGY_BACKEND } from "./agy-dispatch.mjs";
+import { cursorDispatch, resolveCursorModel, validateCursorModel, validateCursorChain, CURSOR_BACKEND } from "./cursor-dispatch.mjs";
 import { openMetricsDb, openMetricsDbReadOnly } from "./metrics-db.mjs";
 import { ingestTranscriptDirectory } from "./transcript-ingest.mjs";
 import { ingestCursorUsageDirectory } from "./cursor-usage-ingest.mjs";
@@ -539,7 +540,7 @@ export function briefLintReport({ brief, phase = null, container = null, chain =
 // dispatch backend selection (kusabi #184)
 // ---------------------------------------------------------------------------
 
-export const BACKENDS = ["opencode", "claude", "agy"];
+export const BACKENDS = ["opencode", "claude", "agy", "cursor"];
 
 /**
  * Resolve the dispatch backend from the `--backend` flag.  Resolved ONCE at
@@ -548,7 +549,7 @@ export const BACKENDS = ["opencode", "claude", "agy"];
  * without the field are treated as `"opencode"` by readers.
  *
  * @param {object} flags — parsed flags (may carry `backend`).
- * @returns {"opencode"|"claude"|"agy"}
+ * @returns {"opencode"|"claude"|"agy"|"cursor"}
  * @throws {Error} For any unknown backend value.
  */
 export function resolveBackend(flags) {
@@ -575,6 +576,7 @@ export function resolveBackend(flags) {
 export function backendDispatch(backend) {
   if (backend === CLAUDE_BACKEND) return claudeDispatch;
   if (backend === AGY_BACKEND) return agyDispatch;
+  if (backend === CURSOR_BACKEND) return cursorDispatch;
   return dispatchWithFallback;
 }
 
@@ -592,7 +594,7 @@ export function backendDispatch(backend) {
  * @returns {boolean}
  */
 export function backendPinsModel(backend) {
-  return backend === CLAUDE_BACKEND || backend === AGY_BACKEND;
+  return backend === CLAUDE_BACKEND || backend === AGY_BACKEND || backend === CURSOR_BACKEND;
 }
 
 /**
@@ -779,6 +781,7 @@ function resolveDispatchBackendForPhase({ flags, phase, config, backendFlag }) {
 
   if (backend === "claude") return resolveClaudePhaseDispatch({ flags, phase, config, modelSpec });
   if (backend === "agy") return resolveAgyPhaseDispatch({ flags, phase, config, modelSpec });
+  if (backend === "cursor") return resolveCursorPhaseDispatch({ flags, phase, config, modelSpec });
   return resolveOpencodePhaseDispatch({ phase, config, modelSpec, namedBackend, flagBackend });
 }
 
@@ -877,6 +880,35 @@ function resolveAgyPhaseDispatch({ flags, phase, config, modelSpec }) {
 }
 
 /**
+ * The cursor branch of the decision (kusabi #374) — the same shape as the
+ * agy branch, one backend over.  Reached whether the identifier named
+ * cursor, `--backend cursor` forced it, or the phase's chain entries carry
+ * the `cursor/` prefix.
+ */
+function resolveCursorPhaseDispatch({ flags, phase, config, modelSpec }) {
+  const resolved = resolveCursorModel({ flag: undefined, phase, config });
+  const chain = stripBackendPrefixChain(resolved.chain);
+
+  if (!modelSpec) {
+    resolveChainBackend(resolved.chain);
+    validateCursorChain(chain);
+    const model = resolved.model == null ? undefined : splitRouteBackend(String(resolved.model)).route;
+    if (model != null) validateCursorModel(model);
+    return { dispatch: cursorDispatch, backend: "cursor", model, explicitModel: null, chain };
+  }
+
+  const model = modelSpec.model;
+  try {
+    validateCursorModel(model);
+  } catch (err) {
+    throw flagError(
+      `--model "${flags.model}" ${modelSpec.backend ? "names" : "resolves on"} the cursor backend: ${err.message}`
+    );
+  }
+  return { dispatch: cursorDispatch, backend: "cursor", model, explicitModel: model, chain };
+}
+
+/**
  * The opencode branch of the decision: `--model` is provider/model syntax
  * (parseModel), chain entries pass through byte-identical.
  */
@@ -911,7 +943,7 @@ function resolveOpencodePhaseDispatch({ phase, config, modelSpec, namedBackend, 
   const resolved = resolveModel({ flag: modelSpec?.model, phase, config });
   let chain = resolved.chain;
   if (namedBackend === "opencode"
-    && (chainNamesBackend(chain, "claude") || chainNamesBackend(chain, "agy"))) {
+    && (chainNamesBackend(chain, "claude") || chainNamesBackend(chain, "agy") || chainNamesBackend(chain, "cursor"))) {
     // Only reachable when the identifier chose opencode over a chain native
     // to another backend: those entries are that backend's model ids and
     // must never be walked as opencode routes by the fallback ladder.
@@ -1102,6 +1134,13 @@ async function cmdTask(cwd, { flags, text }) {
     throw new Error(
       `${flags.readOnly ? "--read-only" : "--deny"} is not supported on the agy backend — ` +
       "the agy CLI has no per-job tool permission flags, so the restriction cannot be applied. " +
+      "Run the task on the opencode or claude backend, which enforce it."
+    );
+  }
+  if (tools && backend === CURSOR_BACKEND) {
+    throw new Error(
+      `${flags.readOnly ? "--read-only" : "--deny"} is not supported on the cursor backend — ` +
+      "the Cursor CLI has no per-job tool permission flags, so the restriction cannot be applied. " +
       "Run the task on the opencode or claude backend, which enforce it."
     );
   }
@@ -1426,14 +1465,14 @@ async function stopRunningJob(stateDir, job) {
   // Records written before the backend split carry no `backend` field and
   // are opencode by definition (same rule every other reader uses).
   const backend = job.backend ?? "opencode";
-  // Both spawned-CLI backends (claude, agy) are stopped the same way and for
+  // Spawned-CLI backends (claude, agy, cursor) are stopped the same way and for
   // the same reason: their job records have no session to abort, so the
   // recorded process is the only lever.  Keyed on the recorded-process shape
   // rather than on one backend's name — routing an agy job to the opencode
   // path would try to abort a session that does not exist and then report
   // success, which is precisely the false confirmation kusabi #209 exists to
   // prevent.
-  if (backend === CLAUDE_BACKEND || backend === AGY_BACKEND) {
+  if (backend === CLAUDE_BACKEND || backend === AGY_BACKEND || backend === CURSOR_BACKEND) {
     return stopSpawnedCliJob(job, backend);
   }
   return stopOpencodeJob(stateDir, job);

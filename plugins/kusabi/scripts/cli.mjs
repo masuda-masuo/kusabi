@@ -208,6 +208,7 @@ export function firstRoute(chain) {
 
 export const CLAUDE_ENTRY_PREFIX = "claude/";
 export const AGY_ENTRY_PREFIX = "agy/";
+export const CURSOR_ENTRY_PREFIX = "cursor/";
 
 /**
  * The backend-naming prefixes, as a TABLE: a further backend is one row
@@ -217,11 +218,12 @@ export const AGY_ENTRY_PREFIX = "agy/";
  * `provider/model[:variant]` route), which is what keeps every pre-prefix
  * config byte-identical.
  *
- * @type {ReadonlyArray<{ prefix: string, backend: "claude"|"agy" }>}
+ * @type {ReadonlyArray<{ prefix: string, backend: "claude"|"agy"|"cursor" }>}
  */
 export const BACKEND_ENTRY_PREFIXES = [
   { prefix: CLAUDE_ENTRY_PREFIX, backend: "claude" },
   { prefix: AGY_ENTRY_PREFIX, backend: "agy" },
+  { prefix: CURSOR_ENTRY_PREFIX, backend: "cursor" },
 ];
 
 /**
@@ -246,6 +248,7 @@ export const BACKEND_RESUME_SUPPORT = {
   opencode: true,
   claude: true,
   agy: true,
+  cursor: true, // MEASURED 2026-08-23: --resume <session_id> carries context
 };
 
 /**
