@@ -651,7 +651,209 @@ describe("saveJob keeps a cancelled record cancelled (kusabi #213)", () => {
 // ---------------------------------------------------------------------------
 // #213 end to end, through the real dispatch: cancelled while the child is
 // killed, and still cancelled after the dispatch has had its say.
+//
+// `overridden` is a derived trace that demoteToCancelled writes on every
+// post-cancel saveJob — it is not a proxy for "a save was attempted", it
+// IS that save.  Asserting it unconditionally assumes the dispatch reached
+// the save before `await pending` resolved; under CI load it sometimes has
+// not (kusabi #318).  Two legitimate endings, distinguished by the records
+// themselves rather than by waiting for a write that may never come:
+//   - no post-cancel save: `final` is the cancel's record, no `overridden`.
+//     The dispatch return may still be the SIGKILL `error` classification.
+//   - post-cancel save: `overridden` is an array (attempted verdict or []),
+//     and the return is cancelled (demote mutates the caller in place).
+// A post-cancel save that did not demote is the third case and must fail:
+// the verdict fields change, other fields change with no `overridden`, or
+// demote ran and the return is still `error`.
 // ---------------------------------------------------------------------------
+
+function dumpCancelPair(cancelled, final, returned) {
+  let text =
+    `--- final (on disk after settle) ---\n${JSON.stringify(final, null, 2)}\n` +
+    `--- cancelled (record immediately after the cancel) ---\n${JSON.stringify(cancelled, null, 2)}`;
+  if (returned !== undefined) {
+    text += `\n--- returned (dispatch return value) ---\n${JSON.stringify(returned, null, 2)}`;
+  }
+  return text;
+}
+
+function assertCancelledThroughFinalize(cancelled, final, returned) {
+  const dump = dumpCancelPair(cancelled, final, returned);
+  assert.equal(final.status, "cancelled", `the dispatch must not rewrite a cancel as \`error\`\n${dump}`);
+  assert.equal(final.error, null, dump);
+  assert.equal(final.finishedAt, cancelled.finishedAt, dump);
+
+  if ("overridden" in final) {
+    assert.ok(
+      Array.isArray(final.overridden),
+      `final.overridden must be an array after a demoted write\n${dump}`,
+    );
+    if (final.overridden.length > 0) {
+      assert.deepEqual(final.overridden.map((o) => o.status), ["error"], dump);
+      assert.ok(
+        typeof final.overridden[0]?.error === "string",
+        `final.overridden[0].error must be a string before the regex match\n${dump}`,
+      );
+      assert.match(final.overridden[0].error, /claude exited with code null/, dump);
+    } else {
+      assert.deepEqual(final.overridden, [], "when cancel completes first, record states no verdict was demoted");
+    }
+    // Demote mutates the caller's object in place.  A return left as
+    // `error` after a post-cancel save is still the #213 bug, even when
+    // disk was demoted.  When `returned` is omitted this check is skipped
+    // so disk-only fixtures stay disk-only.
+    if (returned !== undefined) {
+      assert.equal(
+        returned.status,
+        "cancelled",
+        `dispatch return must stay cancelled after a demoted write\n${dump}`,
+      );
+      assert.equal(returned.error, null, dump);
+    }
+  } else {
+    assert.deepEqual(
+      final,
+      cancelled,
+      `dispatch never saved after the cancel; the record must still be the cancel's\n${dump}`,
+    );
+    // No post-cancel save: `await pending` resolved on the SIGKILL
+    // classification.  Spec §1 is disk.  Do not require the return to be
+    // cancelled.
+  }
+}
+
+describe("assertCancelledThroughFinalize (kusabi #318)", () => {
+  function cancelSnapshot(overrides = {}) {
+    return {
+      id: "job-318",
+      kind: "task",
+      status: "cancelled",
+      error: null,
+      finishedAt: "2026-08-23T00:00:22.298Z",
+      startedAt: "2026-08-23T00:00:22.233Z",
+      stats: { events: 0, steps: 0, lastTool: null, lastActivity: null, models: [] },
+      ...overrides,
+    };
+  }
+
+  it("passes when the dispatch never saved after the cancel", () => {
+    const cancelled = cancelSnapshot();
+    assertCancelledThroughFinalize(cancelled, { ...cancelled });
+  });
+
+  it("passes when a demoted error write is recorded on overridden", () => {
+    const cancelled = cancelSnapshot();
+    assertCancelledThroughFinalize(cancelled, {
+      ...cancelled,
+      overridden: [{
+        status: "error",
+        error: "claude exited with code null: (no output)",
+        at: "2026-08-23T00:00:22.400Z",
+      }],
+    });
+  });
+
+  it("passes when a post-cancel save agreed with cancelled (empty overridden)", () => {
+    const cancelled = cancelSnapshot();
+    assertCancelledThroughFinalize(cancelled, { ...cancelled, overridden: [] });
+  });
+
+  it("fails when a post-cancel save rewrites cancelled as error without demoting", () => {
+    const cancelled = cancelSnapshot();
+    const final = {
+      ...cancelled,
+      status: "error",
+      error: "claude exited with code null: (no output)",
+      finishedAt: "2026-08-23T00:00:22.400Z",
+    };
+    assert.throws(
+      () => assertCancelledThroughFinalize(cancelled, final),
+      (err) => {
+        assert.match(err.message, /must not rewrite a cancel as `error`/);
+        assert.ok(err.message.includes(JSON.stringify(final, null, 2)), "failure must print the final record in full");
+        assert.ok(err.message.includes(JSON.stringify(cancelled, null, 2)), "failure must print the cancelled record in full");
+        return true;
+      },
+    );
+  });
+
+  it("fails when a post-cancel save writes non-verdict fields without demoting", () => {
+    const cancelled = cancelSnapshot();
+    const final = { ...cancelled, stats: { ...cancelled.stats, events: 3 } };
+    assert.throws(
+      () => assertCancelledThroughFinalize(cancelled, final),
+      (err) => {
+        assert.match(err.message, /dispatch never saved after the cancel/);
+        assert.ok(err.message.includes(JSON.stringify(final, null, 2)), "failure must print the final record in full");
+        assert.ok(err.message.includes(JSON.stringify(cancelled, null, 2)), "failure must print the cancelled record in full");
+        return true;
+      },
+    );
+  });
+
+  it("fails when overridden is present but not an array", () => {
+    const cancelled = cancelSnapshot();
+    const final = { ...cancelled, overridden: null };
+    assert.throws(
+      () => assertCancelledThroughFinalize(cancelled, final),
+      (err) => {
+        assert.match(err.message, /final\.overridden must be an array after a demoted write/);
+        assert.ok(err.message.includes(JSON.stringify(final, null, 2)), "failure must print the final record in full");
+        assert.ok(err.message.includes(JSON.stringify(cancelled, null, 2)), "failure must print the cancelled record in full");
+        return true;
+      },
+    );
+  });
+
+  it("passes when there was no post-cancel save and the return is still the SIGKILL error", () => {
+    const cancelled = cancelSnapshot();
+    const returned = {
+      ...cancelled,
+      status: "error",
+      error: "claude exited with code null: (no output)",
+    };
+    assertCancelledThroughFinalize(cancelled, { ...cancelled }, returned);
+  });
+
+  it("passes when demote ran and the dispatch return was mutated to cancelled", () => {
+    const cancelled = cancelSnapshot();
+    const final = {
+      ...cancelled,
+      overridden: [{
+        status: "error",
+        error: "claude exited with code null: (no output)",
+        at: "2026-08-23T00:00:22.400Z",
+      }],
+    };
+    assertCancelledThroughFinalize(cancelled, final, { ...final, status: "cancelled", error: null });
+  });
+
+  it("fails when demote ran and the dispatch return is still error", () => {
+    const cancelled = cancelSnapshot();
+    const final = {
+      ...cancelled,
+      overridden: [{
+        status: "error",
+        error: "claude exited with code null: (no output)",
+        at: "2026-08-23T00:00:22.400Z",
+      }],
+    };
+    const returned = {
+      ...final,
+      status: "error",
+      error: "claude exited with code null: (no output)",
+    };
+    assert.throws(
+      () => assertCancelledThroughFinalize(cancelled, final, returned),
+      (err) => {
+        assert.match(err.message, /dispatch return must stay cancelled after a demoted write/);
+        assert.ok(err.message.includes(JSON.stringify(final, null, 2)), "failure must print the final record in full");
+        assert.ok(err.message.includes(JSON.stringify(cancelled, null, 2)), "failure must print the cancelled record in full");
+        return true;
+      },
+    );
+  });
+});
 
 describe("a cancelled claude dispatch stays cancelled through finalize (kusabi #213)", () => {
   let sb;
@@ -702,48 +904,16 @@ describe("a cancelled claude dispatch stays cancelled through finalize (kusabi #
 
     // The dispatch process is still alive at this point.  It now sees its
     // child close with no exit code (SIGKILL), classifies that as a failure
-    // and finalises — the write this whole change exists to demote.
+    // and finalises — the write this whole change exists to demote.  Under
+    // CI load the child can die so fast that `await pending` resolves before
+    // that save is attempted (kusabi #318); the helper treats that as a
+    // legitimate path instead of waiting for a write that may never come.
     const settled = await pending;
 
     const final = loadJob(sb.stateDir, job.id);
     assert.equal(final.status, "cancelled", "the dispatch must not rewrite a cancel as `error`");
     assert.equal(final.error, null);
     assert.equal(final.finishedAt, cancelled.finishedAt);
-
-    // The two assertions below read `final.overridden` directly.  When that
-    // field is absent they used to throw a TypeError inside the assertion
-    // expression (cancel-stop.test.mjs:699), leaving the CI log with no state
-    // at all — two CI occurrences produced zero diagnostic information between
-    // them.  We fail with a readable message and dump the whole record (and
-    // the record exactly as it stood right after the cancel) instead of
-    // crashing.  What the dump shows narrows the cause: demoteToCancelled
-    // only ever assigns an array to `overridden` (an attempted verdict is
-    // appended, or a preserved array is carried) — it never writes null.  So
-    // an absent field means neither demote branch assigned: the post-cancel
-    // save arrived already `cancelled`, or the dispatch never saved after the
-    // cancel.  We serialise the whole record because JSON omits absent
-    // fields — a summary would collapse absent and empty.
-    assert.ok(
-      Array.isArray(final.overridden),
-      `final.overridden must be an array after a demoted write\n` +
-        `--- final (on disk after settle) ---\n${JSON.stringify(final, null, 2)}\n` +
-        `--- cancelled (record immediately after the cancel) ---\n${JSON.stringify(cancelled, null, 2)}`
-    );
-    if (final.overridden.length > 0) {
-      assert.deepEqual(final.overridden.map((o) => o.status), ["error"]);
-      assert.ok(
-        typeof final.overridden[0]?.error === "string",
-        `final.overridden[0].error must be a string before the regex match\n` +
-          `--- final (on disk after settle) ---\n${JSON.stringify(final, null, 2)}\n` +
-          `--- cancelled (record immediately after the cancel) ---\n${JSON.stringify(cancelled, null, 2)}`
-      );
-      assert.match(final.overridden[0].error, /claude exited with code null/);
-    } else {
-      assert.deepEqual(final.overridden, [], "when cancel completes first, record states no verdict was demoted");
-    }
-
-    // The dispatch's own return value is the record, not a contradiction of it.
-    assert.equal(settled.job.status, "cancelled");
-    assert.equal(settled.job.error, null);
+    assertCancelledThroughFinalize(cancelled, final, settled.job);
   });
 });
