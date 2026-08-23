@@ -982,6 +982,13 @@ describe("metrics-ingest — cursor-usage and missing-dir warnings (#237)", () =
     assert.match(result.stdout, /--cursor-usage-dir <path> \(metrics-ingest: default ~\/\.kusabi\/cursor-usage\)/);
   });
 
+  it("--help enumerates all four backends including cursor", () => {
+    const result = runCompanion(["--help"]);
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stdout, /--backend opencode\|claude\|agy\|cursor/);
+    assert.match(result.stdout, /cursor\/ prefix/);
+  });
+
   it("warns when transcript-dir and cursor-usage-dir do not exist, and reports cursor files/sessions/turns", () => {
     const missingTranscript = path.join(tmpDir, "no-claude");
     const cursorDir = path.join(tmpDir, "cu237");
@@ -2180,6 +2187,90 @@ describe("chain-resume CLI", () => {
       else process.env.KUSABI_CLAUDE_MCP_SOURCE = savedMcpSource;
       server.close();
       server.closeAllConnections?.();
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  function quotaExhaustedChainJson() {
+    return {
+      ...validChainJson(),
+      records: [{
+        round: 1,
+        implementJobId: "job-imp-1",
+        reviewJobId: "job-rev-1",
+        probesGreen: true,
+        probeResults: [
+          { probe: "P1: HEAD clean", passed: true, detail: "ok" },
+          { probe: "P2: verify gate", passed: true, detail: "{}" },
+          { probe: "P3: deliverables", passed: true, detail: "ok" },
+          { probe: "P4: smoke", passed: true, detail: "ok" },
+        ],
+        verdict: "unparseable",
+        reviewParseable: false,
+        backend: "agy",
+        reviewBackend: "agy",
+        reviewJobError: "agy dispatch failed: Individual quota reached. Resets in 1h1m21s.",
+        reviewJobFailure: {
+          kind: "quota-exhaustion",
+          backend: "agy",
+          quota: "individual",
+          backendBlocked: true,
+          reset: "1h1m21s",
+        },
+        disposition: {
+          disposition: "escalate",
+          reason: "quota exhausted (agy individual pool); resets in 1h1m21s",
+        },
+      }],
+    };
+  }
+
+  it("refuses a replacement seat when the recorded failure was quota exhaustion", () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-resume-quota-"));
+    try {
+      const stateDir = hashedWorkspaceDir(path.join(tmp, "state"), tmp);
+      makeChain(stateDir, "chain-quota", {
+        control: {
+          chainId: "chain-quota", container: "cid-1", pid: 0,
+          status: "completed", round: 1, finishedAt: new Date().toISOString(),
+        },
+        chainJson: quotaExhaustedChainJson(),
+      });
+      const result = runResume(["chain-quota"], { stateDir: path.join(tmp, "state"), cwd: tmp });
+      assert.notEqual(result.status, 0);
+      assert.match(result.stdout, /quota exhaustion/);
+      assert.match(result.stdout, /--backend opencode\|claude\|agy\|cursor/);
+      assert.doesNotMatch(result.stdout, /does not support --backend/);
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses the same-backend replacement and lets an explicit different backend past the quota gate", () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-resume-quota-route-"));
+    try {
+      const stateDir = hashedWorkspaceDir(path.join(tmp, "state"), tmp);
+      makeChain(stateDir, "chain-quota", {
+        control: {
+          chainId: "chain-quota", container: "cid-1", pid: 0,
+          status: "completed", round: 1, finishedAt: new Date().toISOString(),
+        },
+        chainJson: quotaExhaustedChainJson(),
+      });
+      const same = runResume(["--backend", "agy", "chain-quota"], {
+        stateDir: path.join(tmp, "state"), cwd: tmp,
+      });
+      assert.notEqual(same.status, 0);
+      assert.match(same.stdout, /quota exhaustion/);
+
+      const reroute = runResume(["--backend", "cursor", "chain-quota"], {
+        stateDir: path.join(tmp, "state"), cwd: tmp,
+      });
+      assert.notEqual(reroute.status, 0);
+      assert.match(reroute.stdout, /not reachable/);
+      assert.doesNotMatch(reroute.stdout, /quota exhaustion/);
+      assert.doesNotMatch(reroute.stdout, /does not support --backend/);
+    } finally {
       fs.rmSync(tmp, { recursive: true, force: true });
     }
   });

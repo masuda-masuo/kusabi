@@ -48,6 +48,11 @@ import {
   resolveChainResume,
   classifyReviewSeatReplacement,
   archiveFailedReviewSeat,
+  classifyDispatchQuotaExhaustion,
+  quotaExhaustionReason,
+  quotaReplacementRefusal,
+  recordQuotaExhaustion,
+  explicitRouteDiffersFromRecord,
 } from "./chain-phases.mjs";
 import {
   createFakeCallTool,
@@ -2313,6 +2318,42 @@ describe("handleProviderExhaustion", () => {
 });
 
 // =========================================================================
+// classifyDispatchQuotaExhaustion (kusabi #373)
+// =========================================================================
+
+describe("classifyDispatchQuotaExhaustion", () => {
+  it("classifies the observed agy individual-quota phrase and extracts the reset", () => {
+    const text = "agy dispatch failed: agy returned no payload {\"status\":\"ERROR\",\"response\":\"\",\"error\":\"Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 1h1m21s.\"}";
+    const failure = classifyDispatchQuotaExhaustion(text);
+    assert.equal(failure.kind, "quota-exhaustion");
+    assert.equal(failure.backend, "agy");
+    assert.equal(failure.quota, "individual");
+    assert.equal(failure.backendBlocked, true);
+    assert.equal(failure.reset, "1h1m21s");
+    assert.match(quotaExhaustionReason(failure), /quota exhausted \(agy individual pool\)/);
+    assert.match(quotaExhaustionReason(failure), /resets in 1h1m21s/);
+    assert.doesNotMatch(quotaExhaustionReason(failure), /unparseable/);
+  });
+
+  it("classifies the observed opencode free-tier phrase", () => {
+    const failure = classifyDispatchQuotaExhaustion("Free usage exceeded, subscribe to Go");
+    assert.equal(failure.kind, "quota-exhaustion");
+    assert.equal(failure.backend, "opencode");
+    assert.equal(failure.quota, "free-tier");
+    assert.equal(failure.reset, null);
+    assert.match(quotaExhaustionReason(failure), /opencode free-tier pool/);
+  });
+
+  it("does not classify unrelated dispatch failures, including a claude session-limit string", () => {
+    assert.equal(classifyDispatchQuotaExhaustion(null), null);
+    assert.equal(classifyDispatchQuotaExhaustion(""), null);
+    assert.equal(classifyDispatchQuotaExhaustion("claude dispatch failed: session limit"), null);
+    assert.equal(classifyDispatchQuotaExhaustion("All routes exhausted"), null);
+    assert.equal(classifyDispatchQuotaExhaustion("quota reached"), null);
+  });
+});
+
+// =========================================================================
 // phase functions carry the failure classification (kusabi #215)
 // =========================================================================
 
@@ -2386,6 +2427,115 @@ describe("phase functions carry the failure classification (kusabi #215)", () =>
     });
     assert.equal(result.reviewJobStatus, "provider-error");
     assert.deepEqual(roundRecord.reviewJobFailure, QUOTA_FAILURE);
+  });
+
+  it("runReviewPhase classifies an agy quota error onto the round record (kusabi #373)", async () => {
+    const roundRecord = { round: 1 };
+    const agyError = "agy dispatch failed: agy returned no payload {\"status\":\"ERROR\",\"response\":\"\",\"error\":\"Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 1h1m21s.\"}";
+    const dispatch = async () => ({
+      job: {
+        id: "job-rev-agy-quota", status: "error", modelEntry: "gemini-3.6-flash-high",
+        modelVariant: null, fallbacks: null, sessionID: null,
+        usage: null, error: agyError, failure: null,
+      },
+      resultText: "",
+    });
+    const result = await runReviewPhase({
+      container: "cid-1", brief: "brief", modelChain: [["gemini-3.6-flash-high"]], chainId: "chain-test",
+      cwd: "/tmp", previousRecord: null, baseSha: "abc123",
+      chainStatusOutput: "", chainBaseLog: "", chainUntracked: "", chainTruncation: null,
+      roundRecord,
+      chainChangedPaths: ["src/a.js"], chainNewlyChanged: ["src/a.js"],
+      chainStatusObserved: true, chainDeliverables: [],
+      flagsModel: null,
+      _dispatchWithFallback: dispatch,
+    });
+    assert.equal(result.reviewJobStatus, "error");
+    assert.equal(result.reviewJobError, agyError);
+    assert.equal(roundRecord.reviewJobError, agyError);
+    assert.equal(roundRecord.reviewJobFailure.kind, "quota-exhaustion");
+    assert.equal(roundRecord.reviewJobFailure.backend, "agy");
+    assert.equal(roundRecord.reviewJobFailure.quota, "individual");
+    assert.equal(roundRecord.reviewJobFailure.reset, "1h1m21s");
+    assert.equal(roundRecord.verdict, "unparseable");
+  });
+
+  it("runReviewPhase carries a stalled review's watchdog text onto the record, without a quota fact (kusabi #373)", async () => {
+    // The third terminal state, from a real incident (chain-mt5jul99b21a,
+    // 2026-08-23): not "error", not quota — the watchdog killed a seat that
+    // had gone silent.  Its reason must still reach the round record, and it
+    // must NOT be classified as an exhausted pool.
+    const roundRecord = { round: 1 };
+    const stalledError = "watchdog: no events for 900s (process killed)";
+    const dispatch = async () => ({
+      job: {
+        id: "job-rev-stalled", status: "stalled", modelEntry: "default",
+        modelVariant: null, fallbacks: null, sessionID: null,
+        usage: null, error: stalledError, failure: null,
+      },
+      resultText: "",
+    });
+    const result = await runReviewPhase({
+      container: "cid-1", brief: "brief", modelChain: [["default"]], chainId: "chain-test",
+      cwd: "/tmp", previousRecord: null, baseSha: "abc123",
+      chainStatusOutput: "", chainBaseLog: "", chainUntracked: "", chainTruncation: null,
+      roundRecord,
+      chainChangedPaths: ["src/a.js"], chainNewlyChanged: ["src/a.js"],
+      chainStatusObserved: true, chainDeliverables: [],
+      flagsModel: null,
+      _dispatchWithFallback: dispatch,
+    });
+    assert.equal(result.reviewJobStatus, "stalled");
+    assert.equal(roundRecord.reviewJobError, stalledError);
+    assert.equal(roundRecord.reviewJobFailure, null);
+    assert.equal(roundRecord.verdict, "unparseable");
+  });
+
+  it("runReviewPhase leaves a completed unreadable payload as unparseable with no quota fact", async () => {
+    const roundRecord = { round: 1 };
+    const dispatch = async () => ({
+      job: {
+        id: "job-rev-garbage", status: "completed", modelEntry: "opus",
+        modelVariant: null, fallbacks: null, sessionID: null,
+        usage: null, error: null, failure: null,
+      },
+      resultText: "definitely not JSON and no VERDICT token here at all",
+    });
+    await runReviewPhase({
+      container: "cid-1", brief: "brief", modelChain: [["opus"]], chainId: "chain-test",
+      cwd: "/tmp", previousRecord: null, baseSha: "abc123",
+      chainStatusOutput: "", chainBaseLog: "", chainUntracked: "", chainTruncation: null,
+      roundRecord,
+      chainChangedPaths: ["src/a.js"], chainNewlyChanged: ["src/a.js"],
+      chainStatusObserved: true, chainDeliverables: [],
+      flagsModel: null,
+      _dispatchWithFallback: dispatch,
+    });
+    assert.equal(roundRecord.verdict, "unparseable");
+    assert.equal(roundRecord.reviewJobFailure, null);
+    assert.equal(Object.prototype.hasOwnProperty.call(roundRecord, "reviewJobError"), false);
+  });
+
+  it("runImplementPhase classifies an agy quota error as implementJobFailure", async () => {
+    const agyError = "agy dispatch failed: Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 1h1m21s.";
+    const result = await runImplementPhase({
+      cwd: "/tmp", chainId: "chain-test", round: 1, isFirstRound: true,
+      implementText: "brief", modelChain: [["gemini-3.6-flash-high"]], tierIndex: 0,
+      useNewSession: false, session: undefined, resumeMethod: { type: "fresh_session" },
+      flagsModel: null, backend: "agy",
+      _dispatchWithFallback: async () => ({
+        job: {
+          id: "job-fail", status: "error", modelEntry: "gemini-3.6-flash-high",
+          modelVariant: null, fallbacks: null, sessionID: null,
+          usage: null, error: agyError, failure: null,
+        },
+        resultText: "",
+      }),
+    });
+    assert.equal(result.implementJobStatus, "error");
+    assert.equal(result.implementJobFailure.kind, "quota-exhaustion");
+    assert.equal(result.implementJobFailure.backend, "agy");
+    assert.equal(result.roundRecord.implementJobError, agyError);
   });
 
   it("runStrategizePhase returns strategistJobFailure from the failed job's record", async () => {
@@ -5539,6 +5689,70 @@ describe("resolveChainResume", () => {
     assert.equal(result.position.phase, "review");
     assert.equal(result.position.reviewSeatReplacement, true);
   });
+
+  it("refuses chain-resume for a quota-exhausted review seat (kusabi #373)", () => {
+    const failure = {
+      kind: "quota-exhaustion",
+      backend: "agy",
+      quota: "individual",
+      backendBlocked: true,
+      reset: "1h1m21s",
+    };
+    const result = resolveChainResume({
+      control: seatControl,
+      chainJson: baseChainJson({
+        records: [deadSeatRound({
+          reviewBackend: "agy",
+          backend: "agy",
+          verdict: "unparseable",
+          reviewParseable: false,
+          reviewPartial: undefined,
+          reviewFindingCount: undefined,
+          reviewJobFailure: failure,
+          disposition: {
+            disposition: "escalate",
+            reason: quotaExhaustionReason(failure),
+          },
+        })],
+      }),
+    });
+    assert.equal(result.ok, false);
+    assert.match(result.error, /already finished/);
+    assert.match(result.error, /quota exhaustion/);
+    assert.match(result.error, /--backend opencode\|claude\|agy\|cursor/);
+  });
+
+  it("allows chain-resume for a quota-exhausted seat when --backend names a different route", () => {
+    const failure = {
+      kind: "quota-exhaustion",
+      backend: "agy",
+      quota: "individual",
+      backendBlocked: true,
+      reset: "1h1m21s",
+    };
+    const result = resolveChainResume({
+      control: seatControl,
+      chainJson: baseChainJson({
+        records: [deadSeatRound({
+          reviewBackend: "agy",
+          backend: "agy",
+          verdict: "unparseable",
+          reviewParseable: false,
+          reviewPartial: undefined,
+          reviewFindingCount: undefined,
+          reviewJobFailure: failure,
+          disposition: {
+            disposition: "escalate",
+            reason: quotaExhaustionReason(failure),
+          },
+        })],
+      }),
+      explicitRoute: { backend: "cursor" },
+    });
+    assert.equal(result.ok, true, result.error);
+    assert.equal(result.position.phase, "review");
+    assert.equal(result.position.reviewSeatReplacement, true);
+  });
 });
 
 // =========================================================================
@@ -5696,6 +5910,87 @@ describe("classifyReviewSeatReplacement", () => {
       assert.equal(result.eligible, false);
       assert.equal(result.detail, null);
     }
+  });
+
+  it("refuses a quota-exhausted seat as not replaceable on the same route (kusabi #373)", () => {
+    const failure = {
+      kind: "quota-exhaustion",
+      backend: "agy",
+      quota: "individual",
+      backendBlocked: true,
+      reset: "1h1m21s",
+    };
+    const result = classifyReviewSeatReplacement({
+      records: [seatEligibleRecord({
+        reviewBackend: "agy",
+        backend: "agy",
+        verdict: "unparseable",
+        reviewJobFailure: failure,
+        reviewJobError: "agy dispatch failed: Individual quota reached. Resets in 1h1m21s.",
+        disposition: {
+          disposition: "escalate",
+          reason: quotaExhaustionReason(failure),
+        },
+      })],
+    });
+    assert.equal(result.eligible, false);
+    assert.match(result.detail, /quota exhaustion/);
+    assert.match(result.detail, /--backend opencode\|claude\|agy\|cursor/);
+    assert.match(result.detail, /--model/);
+  });
+
+  it("allows a quota-exhausted seat when the operator names a different backend", () => {
+    const failure = {
+      kind: "quota-exhaustion",
+      backend: "agy",
+      quota: "individual",
+      backendBlocked: true,
+      reset: "1h1m21s",
+    };
+    const record = seatEligibleRecord({
+      reviewBackend: "agy",
+      backend: "agy",
+      verdict: "unparseable",
+      reviewJobFailure: failure,
+      disposition: {
+        disposition: "escalate",
+        reason: quotaExhaustionReason(failure),
+      },
+    });
+    const refused = classifyReviewSeatReplacement({ records: [record] }, { explicitRoute: { backend: "agy" } });
+    assert.equal(refused.eligible, false);
+    const allowed = classifyReviewSeatReplacement({ records: [record] }, { explicitRoute: { backend: "cursor" } });
+    assert.equal(allowed.eligible, true);
+    assert.equal(allowed.detail, null);
+  });
+
+  it("allows a quota-exhausted seat when --model names a different backend", () => {
+    const failure = {
+      kind: "quota-exhaustion",
+      backend: "agy",
+      quota: "individual",
+      backendBlocked: true,
+      reset: "1h1m21s",
+    };
+    const record = seatEligibleRecord({
+      reviewBackend: "agy",
+      backend: "agy",
+      verdict: "unparseable",
+      reviewJobFailure: failure,
+      disposition: {
+        disposition: "escalate",
+        reason: quotaExhaustionReason(failure),
+      },
+    });
+    const allowed = classifyReviewSeatReplacement(
+      { records: [record] },
+      { explicitRoute: { model: "cursor/default" } },
+    );
+    assert.equal(allowed.eligible, true);
+    assert.equal(explicitRouteDiffersFromRecord(record, { model: "cursor/default" }), true);
+    assert.equal(explicitRouteDiffersFromRecord(record, { backend: "agy" }), false);
+    assert.equal(recordQuotaExhaustion(record), failure);
+    assert.match(quotaReplacementRefusal(failure), /--backend opencode\|claude\|agy\|cursor/);
   });
 });
 

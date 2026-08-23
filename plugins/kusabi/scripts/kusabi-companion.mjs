@@ -2583,7 +2583,7 @@ function usage() {
     "  --read-only, --resume-last",
     "  --base <ref> (review: branch diff base; task: diff base for --phase review --container, rejected elsewhere), --agent <id>, --phase <name> (draft|investigate|implement|review|respond|salvage|gofer)",
     "  --model <identifier> (task/chain: the identifier CARRIES its backend and decides it for the phases it pins — claude/<model> (bare alias opus|sonnet|haiku or a full model id; a :variant suffix is rejected) runs those phases on claude, provider/model[:variant] runs them on opencode, and a bare alias with no / names no backend, so the phase keeps its configured backend. The model is always validated against the backend the same identifier chose. A pinned model is the ONLY candidate: no fallback to the configured chain is attempted, so a pinned route that fails terminally ends the dispatch instead of silently running a different model)",
-    "  --backend opencode|claude|agy (task/chain: force EVERY phase onto that backend; default opencode. Redundant when --model names a backend — a --backend that disagrees with such a --model is a contradiction and is rejected, naming both. With neither, the config chain entries decide: models.phases.<phase> (or models.chain) entries may carry a claude/ or agy/ prefix for per-phase backend mixing; one phase's chain must be single-backend. agy resumes via --conversation: --session/--resume-last are accepted when the job store proves the id an agy conversation, and --read-only/--deny are rejected on it)",
+    "  --backend opencode|claude|agy|cursor (task/chain: force EVERY phase onto that backend; default opencode. Redundant when --model names a backend — a --backend that disagrees with such a --model is a contradiction and is rejected, naming both. With neither, the config chain entries decide: models.phases.<phase> (or models.chain) entries may carry a claude/, agy/, or cursor/ prefix for per-phase backend mixing; one phase's chain must be single-backend. agy resumes via --conversation: --session/--resume-last are accepted when the job store proves the id an agy conversation, and --read-only/--deny are rejected on it. chain-resume accepts --backend/--model only to route a quota-exhausted review seat onto a different backend or model)",
     "  --session <id>, --timeout <s>, --watchdog <s>, --deny <tools>",
     "  --brief-file <path> (task / chain: read the brief from a file; exclusive with inline text)",
     "  --container <cid> (chain/task: container to run deterministic probes in; NOT supported by review)",
@@ -2692,7 +2692,7 @@ async function main() {
 
   // --backend is a task/chain dispatch decision (kusabi #184); on any other
   // subcommand it would be silently ignored — reject it out loud instead.
-  if (parsed.flags.backend && subcommand !== "task" && subcommand !== "chain" && subcommand !== "chain-detach" && subcommand !== "chainDetach") {
+  if (parsed.flags.backend && subcommand !== "task" && subcommand !== "chain" && subcommand !== "chain-detach" && subcommand !== "chainDetach" && subcommand !== "chain-resume" && subcommand !== "chainResume") {
     throw new Error(`--backend is only supported by task and chain (got subcommand ${subcommand ?? "(none)"})`);
   }
 
