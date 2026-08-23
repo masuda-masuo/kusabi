@@ -784,6 +784,65 @@ On-disk format (the companion's reader contract): one JSON object per line under
 
 `cursor-usage-ingest.mjs` keeps the same split as `transcript-ingest.mjs`: `parseCursorUsageContent` is pure (string in, turns out, unit-testable with inline fixtures), and `ingestCursorUsageDirectory` is the only piece that touches the filesystem or the database, delegating every row write to `metrics-db.mjs`'s helpers rather than opening a database itself.
 
+#### 3.5.16 cursor backend — implemented, resume via `--resume` (kusabi #374)
+
+`chain` and `task` accept `--backend cursor`, config chain entries accept a `cursor/<model>` prefix,
+and `--model cursor/<model>` pins a phase to it. **Why a fourth backend:** the Cursor CLI draws on a
+subscription pool separate from all three existing ones, and on 2026-08-23 the opencode free tier and
+the agy quota ran out within an hour of each other while Cursor stayed available. It was already in
+daily use as a HAND seat (implement and independent review); the adapter is what puts those jobs
+inside a chain — probes, review seat, records, `chain-wait` — instead of beside it. Note the
+difference from §3.5.15: that section is the Cursor-facing ORCHESTRATOR surface (shim, statusline);
+this one is Cursor as a WORKER.
+
+**Dispatch.** `plugins/kusabi/scripts/cursor-dispatch.mjs` exports `cursorDispatch` with the same
+call/return contract as `dispatchWithFallback` / `claudeDispatch` / `agyDispatch`
+(`{ job, resultText, stateDir }`), selected per phase by `resolveDispatchBackend`. Field-verified
+invocation, and nothing else:
+
+```
+cursor-agent -p --approve-mcps --force --output-format stream-json [--model <id>] [--resume <sessionId>]
+```
+
+**The prompt is on stdin**, so this backend has no argv-size ceiling (contrast agy's 128KiB limit).
+Binary via `CURSOR_BIN` (default `cursor-agent`).
+
+**`--model` is passed only when a model was explicitly pinned.** Passing it writes the choice into
+`~/.cursor/cli-config.json` and changes every later invocation on that machine, including interactive
+ones — so the default chain entry is the literal `default`, meaning "whatever the CLI is configured
+to use", recorded as the model so the job record stays honest. The adapter never writes under
+`~/.cursor/`; a pinned run instead records `modelResidueHazard` on the job, so the residue is visible
+after the fact rather than repaired behind the operator's back.
+
+**Stream vocabulary (measured 2026-08-23).** NDJSON on stdout, discriminated by `type` — the claude
+vocabulary, not agy's `event`: `thinking` (`subtype: delta|completed`), `assistant`
+(`message.content[]`), `tool_call` (`subtype: started|completed`), `system`(`init`), `user`,
+`connection`(`reconnecting|reconnected`), `retry`(`starting|resuming`), and the terminal
+`{"type":"result","subtype":"success","is_error":false,"result":"<text>","session_id":"…",
+"usage":{inputTokens,outputTokens,cacheReadTokens,cacheWriteTokens}}`. Success is decided by
+**payload presence** (a non-empty terminal `result`), the same rule agy needed; `is_error` is
+recorded as advisory on `cursorIsError`.
+
+**Step accounting is by `call_id`, and the tool name is not the wrapper key.** Both facts are
+measured over a real 33-minute run, not assumed: every `tool_call` line carries a top-level
+`call_id`, and the run held **162 distinct ids against 156 `started` lines** — counting `started`
+under-counts, counting distinct `call_id` is exact (a `completed` whose `started` never arrived
+still counts). Inside `tool_call` the wrapper key distribution was `mcpToolCall` 290 /
+`getMcpToolsToolCall` 14 / `readToolCall` 14, so for the dominant case the real tool name is
+`tool_call.mcpToolCall.args.name` (`sunaba-edit_file`); taking the wrapper key would label 91% of
+calls `mcp` and destroy exactly the diagnostic value `lastTool` exists for. Other keys drop the
+`ToolCall` suffix (`readToolCall` → `read`). Replaying the two real streams through the accumulator
+yields `steps: 162 / lastTool: sunaba-edit_file` and `steps: 249 / lastTool: sunaba-diff_in_container`.
+
+**Resume is real and carries context.** `backendSupportsResume("cursor")` is true because it was
+measured, not inferred: a fresh call answered a token, a second call with `--resume <session_id>`
+recalled it with `inputTokens` 143 instead of 10,543 — the transcript lives server-side and is not
+re-sent. This is what agy cannot do (`--conversation` aside, its rework rounds rebuild the whole
+prompt), so a cursor chain's rework rounds continue the same conversation.
+
+**Denies are not enforceable from our side**, exactly as with agy: a job routed here records
+`toolDeniesUnenforced` rather than pretending the constraint holds.
+
 ### 3.6 sunaba-rpc (raw JSON-RPC client) — implemented
 
 `plugins/kusabi/scripts/sunaba-rpc.mjs`. A **raw HTTP+SSE client** for the companion's non-LLM pipeline (deterministic probes, etc.) to call sunaba's MCP tools. **Not an MCP client.**
