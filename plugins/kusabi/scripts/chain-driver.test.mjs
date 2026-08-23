@@ -5716,3 +5716,80 @@ describe("runChainDriver brief-syntax defect (kusabi #303)", () => {
     });
   });
 });
+
+describe("runChainDriver quota-exhausted review (kusabi #373)", () => {
+  const BRIEF = "Implement X.\n\n## Deliverables\n- src/foo.js\n";
+  const AGY_ERR = "agy dispatch failed: agy returned no payload {\"status\":\"ERROR\",\"response\":\"\",\"error\":\"Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 1h1m21s.\"}";
+
+  function fakeCallTool() {
+    return async (toolName, params) => {
+      if (toolName === "verify_in_container") return { gate_passed: true };
+      if (toolName !== "sandbox_exec") return { output: "" };
+      const cmd = params.commands[0];
+      if (cmd.startsWith("cd /workspace &&") && cmd.includes("TMPIDX=")) {
+        return { output: "ERROR_NO_INDEX\n" };
+      }
+      if (cmd === "git rev-parse HEAD") return { output: "abc123\n" };
+      if (cmd === "git status --porcelain") return { output: " M src/foo.js\n" };
+      if (cmd === "git log --oneline -5") return { output: "abc123 latest change\n" };
+      if (cmd === "git diff") return { output: "diff --git a/src/foo.js b/src/foo.js\n" };
+      if (cmd === "git ls-files --others --exclude-standard") return { output: "" };
+      return { output: "" };
+    };
+  }
+
+  it("escalates naming the exhausted pool instead of unexpected verdict: unparseable", async () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-quota-round-"));
+    try {
+      const chainDir = path.join(tmp, "chains", "chain-test");
+      fs.mkdirSync(chainDir, { recursive: true });
+      writeChainControl(chainDir, {
+        chainId: "chain-test", container: "cid-1", pid: process.pid,
+        status: "running", round: 0, startedAt: new Date().toISOString(),
+      });
+      const dispatch = async (opts) => {
+        if (opts.kind === "review") {
+          return {
+            job: {
+              id: "job-rev-1", status: "error", modelEntry: "gemini-3.6-flash-high",
+              modelVariant: null, fallbacks: null, sessionID: null,
+              usage: null, error: AGY_ERR, failure: null,
+            },
+            resultText: "",
+          };
+        }
+        return {
+          job: {
+            id: "job-imp-1", status: "completed", modelEntry: "gemini-3.6-flash-high",
+            modelVariant: null, fallbacks: null, sessionID: "sess-1",
+            usage: { available: true, input: 1, output: 1, reasoning: 0, cacheRead: 0, cacheWrite: 0, cost: 0.01 },
+            error: null,
+          },
+          resultText: "implemented",
+        };
+      };
+      const text = await runChainDriver({
+        cwd: tmp, stateDir: tmp, chainDir, chainId: "chain-test", container: "cid-1",
+        model: "gemini-3.6-flash-high", modelChain: [["gemini-3.6-flash-high"]], maxRounds: 4,
+        brief: BRIEF, orchestrator: null, baseSha: "abc123", worktreeBaseline: null,
+        callTool: fakeCallTool(),
+        backend: "agy", reviewBackend: "agy",
+        dispatchWithFallback: dispatch,
+        keepServe: true,
+        signalReceived: () => false,
+        resume: null,
+      });
+      assert.match(text, /quota exhausted \(agy individual pool\)/);
+      assert.doesNotMatch(text, /unexpected verdict: unparseable/);
+      const round1 = readJson(path.join(chainDir, "round-1.json"));
+      assert.equal(round1.reviewJobFailure.kind, "quota-exhaustion");
+      assert.equal(round1.reviewJobFailure.backend, "agy");
+      assert.equal(round1.reviewJobError, AGY_ERR);
+      assert.equal(round1.disposition.disposition, "escalate");
+      assert.match(round1.disposition.reason, /quota exhausted \(agy individual pool\)/);
+      assert.doesNotMatch(round1.disposition.reason, /unparseable/);
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+});

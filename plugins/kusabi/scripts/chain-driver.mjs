@@ -82,6 +82,9 @@ import {
   shouldSkipReview,
   archiveFailedReviewSeat,
   collectReviewContext,
+  quotaExhaustionReason,
+  recordQuotaExhaustion,
+  explicitRouteDiffersFromRecord,
   runSmokeProbe,
   runSmokeEntries,
   captureGitStatusPorcelain,
@@ -93,6 +96,10 @@ import {
 } from "./chain-phases.mjs";
 import { captureWorktreeState } from "./worktree-baseline.mjs";
 import { roundDiscardReason } from "./render.mjs";
+import { resolveModelBackend, BUILTIN_DEFAULT_CHAIN } from "./cli.mjs";
+import { CLAUDE_DEFAULT_CHAIN } from "./claude-dispatch.mjs";
+import { AGY_DEFAULT_CHAIN } from "./agy-dispatch.mjs";
+import { CURSOR_DEFAULT_CHAIN, DEFAULT_CURSOR_MODEL } from "./cursor-dispatch.mjs";
 
 // The companion side of the cycle documented above.
 import {
@@ -106,6 +113,7 @@ import {
   phaseDispatchFor,
   liveRunningJobs,
   cmdServeStop,
+  BACKENDS,
 } from "./kusabi-companion.mjs";
 
 // ---------------------------------------------------------------------------
@@ -1210,7 +1218,7 @@ export async function runChainDriver({
   reworkModel = null,
   reworkBackend = null,
   reworkDispatchWithFallback = null,
-  initialSession, flagsModel = null, signalReceived = () => false,
+  initialSession, flagsModel = null, reviewFlagsModel = null, signalReceived = () => false,
   keepServe = false, resume = null, sessionProvenance = null,
 }) {
   // Per-phase dispatch (kusabi #192): the review phase dispatches through its
@@ -1385,7 +1393,7 @@ export async function runChainDriver({
       container, brief, modelChain: effectiveReviewChain, chainId, cwd, previousRecord, baseSha: effectiveBaseSha,
       chainStatusOutput, chainBaseLog, chainUntracked, chainTruncation, roundRecord,
       chainChangedPaths, chainNewlyChanged, chainStatusObserved, chainDeliverables,
-      flagsModel, _dispatchWithFallback: reviewDispatch,
+      flagsModel: reviewFlagsModel ?? flagsModel, _dispatchWithFallback: reviewDispatch,
       // The round's resolved scope (kusabi #334), carried from the driver's
       // single decision point — the same value buildImplementText already
       // receives — so the review prompt and the repeated-areas signal are
@@ -1668,6 +1676,12 @@ export async function runChainDriver({
       // escalates the resumed round the same way it escalates a normal one
       // (kusabi #197 follow-up), so the marker handed over is the fresh one.
       disposition = deriveWith(probesGreen, fresh.oracleViolation);
+    }
+    if (roundRecord.reviewJobFailure?.kind === "quota-exhaustion") {
+      disposition = {
+        disposition: "escalate",
+        reason: quotaExhaustionReason(roundRecord.reviewJobFailure),
+      };
     }
     roundRecord.disposition = disposition;
 
@@ -2215,16 +2229,75 @@ export async function runChainDriver({
 // chain-resume (kusabi #153①)
 // ---------------------------------------------------------------------------
 
+/**
+ * Default review model/chain for a backend when the operator named only
+ * `--backend` to leave a quota-exhausted pool (kusabi #373).
+ *
+ * @param {string} backend
+ * @returns {{ model: string|null, chain: Array }}
+ */
+function defaultReviewResolution(backend) {
+  if (backend === "cursor") {
+    return { model: DEFAULT_CURSOR_MODEL, chain: CURSOR_DEFAULT_CHAIN };
+  }
+  if (backend === "claude") {
+    return { model: CLAUDE_DEFAULT_CHAIN[0][0], chain: CLAUDE_DEFAULT_CHAIN };
+  }
+  if (backend === "agy") {
+    return { model: AGY_DEFAULT_CHAIN[0][0], chain: AGY_DEFAULT_CHAIN };
+  }
+  return { model: null, chain: BUILTIN_DEFAULT_CHAIN };
+}
+
+/**
+ * Review-seat route for a quota-exhausted replacement that the operator
+ * explicitly sent elsewhere.  Implement stays on the recorded backend.
+ *
+ * @param {object} record
+ * @param {{ backend?: string|null, model?: string|null }} explicitRoute
+ * @returns {{ backend: string, model: string|null, chain: Array, flagsModel: string|null }}
+ */
+function resolveQuotaReviewReroute(record, explicitRoute) {
+  let backend = explicitRoute.backend || (record.reviewBackend ?? record.backend ?? "opencode");
+  let model = null;
+  let chain = null;
+  let flagsModel = null;
+  if (explicitRoute.model) {
+    let spec;
+    try {
+      spec = resolveModelBackend(explicitRoute.model);
+    } catch {
+      spec = null;
+    }
+    if (spec?.backend) backend = spec.backend;
+    model = spec?.model ?? explicitRoute.model;
+    chain = [[explicitRoute.model]];
+    flagsModel = model;
+  } else {
+    const fallback = defaultReviewResolution(backend);
+    model = fallback.model;
+    chain = fallback.chain;
+  }
+  return { backend, model, chain, flagsModel };
+}
+
 export async function cmdChainResume(cwd, { flags, text }) {
   // Resumption context comes entirely from the saved chain state (chain.json
   // brief, records, ladder; control.json container).  Accepting another flag
   // and ignoring it would answer a different question than the one asked.
-  const unsupported = Object.keys(flags).filter(function (k) { return k !== "keepServe"; });
+  // kusabi #373: `--backend` / `--model` are the one exception — they name a
+  // DIFFERENT review seat after quota exhaustion, and are still refused on
+  // every other chain (including an unknown id, so the existing unsupported-
+  // flag error keeps its wording).
+  const unsupported = Object.keys(flags).filter(function (k) {
+    return k !== "keepServe" && k !== "backend" && k !== "model";
+  });
   if (unsupported.length > 0) {
     throw new Error(
       `chain-resume does not support --${unsupported[0]}: resumption context comes from the saved chain state (chain.json / control.json)`
     );
   }
+  const routeFlag = flags.model ? "model" : flags.backend ? "backend" : null;
 
   const stateDir = stateDirFor(cwd);
   const chainId = text.split(/\s+/).filter(Boolean)[0];
@@ -2232,6 +2305,11 @@ export async function cmdChainResume(cwd, { flags, text }) {
 
   const chainDir = path.join(stateDir, "chains", chainId);
   if (!fs.existsSync(chainDir)) {
+    if (routeFlag) {
+      throw new Error(
+        `chain-resume does not support --${routeFlag}: resumption context comes from the saved chain state (chain.json / control.json)`
+      );
+    }
     throw new Error(`chain not found: ${chainId}`);
   }
 
@@ -2252,8 +2330,22 @@ export async function cmdChainResume(cwd, { flags, text }) {
     throw new Error(`cannot resume chain ${chainId}: ${resumeSmokeRejection}`);
   }
 
+  const lastResumeRecord = chainJson.records?.[chainJson.records.length - 1] ?? null;
+  const quota = recordQuotaExhaustion(lastResumeRecord);
+  if (routeFlag && !quota) {
+    throw new Error(
+      `chain-resume does not support --${routeFlag}: resumption context comes from the saved chain state (chain.json / control.json)`
+    );
+  }
+  if (flags.backend && !BACKENDS.includes(flags.backend)) {
+    throw new Error(`unknown backend: ${flags.backend}. Use --backend ${BACKENDS.join("|")}`);
+  }
+  const explicitRoute = (flags.backend || flags.model)
+    ? { backend: flags.backend || null, model: flags.model || null }
+    : null;
+
   // ---- resume-position decision, from the records alone ----
-  const resolution = resolveChainResume({ control, chainJson });
+  const resolution = resolveChainResume({ control, chainJson, explicitRoute });
   if (!resolution.ok) {
     throw new Error(`cannot resume chain ${chainId}: ${resolution.error}`);
   }
@@ -2336,15 +2428,15 @@ export async function cmdChainResume(cwd, { flags, text }) {
   process.on("SIGINT", onSignal);
 
   // ---- dispatch backends (kusabi #184 / #192) ----
-  // The backends are not flags here: resumption context comes from the saved
-  // chain state, and the chain record's backend fields are part of it.  The
-  // implement backend is the last record's `backend`; the review backend is
-  // the last record's `reviewBackend`, falling back to the record's
-  // implement backend on records predating the per-phase split.  A missing
-  // `backend` field means the chain predates the backend split → opencode.
-  const lastResumeRecord = chainJson.records?.[chainJson.records.length - 1] ?? null;
+  // The backends are not flags here except the kusabi #373 quota reroute:
+  // resumption context comes from the saved chain state, and the chain
+  // record's backend fields are part of it.  The implement backend is the
+  // last record's `backend`; the review backend is the last record's
+  // `reviewBackend`, falling back to the record's implement backend on
+  // records predating the per-phase split.  A missing `backend` field means
+  // the chain predates the backend split → opencode.
   const resumeBackend = lastResumeRecord?.backend || "opencode";
-  const resumeReviewBackend = lastResumeRecord?.reviewBackend ?? resumeBackend;
+  let resumeReviewBackend = lastResumeRecord?.reviewBackend ?? resumeBackend;
 
   // The dispatch seams for the resumed run.  The REVIEW seam is always
   // explicit (resolveResumeDispatches): an opencode review gets the plain
@@ -2353,13 +2445,24 @@ export async function cmdChainResume(cwd, { flags, text }) {
   // (kusabi #192 finding).  Each claude phase clamps to ITS OWN recorded
   // model — no tier ladder, no mid-chain model switch (kusabi #184 finding 1).
   // Per-phase review dispatch context (kusabi #192): a #192-era chain.json
-  // persists reviewModel/reviewModelChain \u2014 persisted null on a mixed chain
+  // persists reviewModel/reviewModelChain — persisted null on a mixed chain
   // (opencode review) must stay null, never silently borrow the implement
   // chain; a pre-#192 chain.json has neither key, and key ABSENCE is the
-  // legacy marker \u2014 fall back to the implement model/chain (pre-#192
+  // legacy marker — fall back to the implement model/chain (pre-#192
   // clamped the whole chain to chainJson.model).
-  const { reviewModel: resumeReviewModel, reviewModelChain: resumeReviewModelChain } =
+  let { reviewModel: resumeReviewModel, reviewModelChain: resumeReviewModelChain } =
     resolveResumeReviewContext(chainJson);
+  let resumeReviewFlagsModel = null;
+  // Quota-exhausted seat + an operator-named different route: do not reuse
+  // the dead pool's review backend/chain.  Implement stays on the recorded
+  // backend; only the replacement REVIEW seat is rerouted.
+  if (quota && explicitRouteDiffersFromRecord(lastResumeRecord, explicitRoute)) {
+    const reroute = resolveQuotaReviewReroute(lastResumeRecord, explicitRoute);
+    resumeReviewBackend = reroute.backend;
+    resumeReviewModel = reroute.model;
+    resumeReviewModelChain = reroute.chain;
+    resumeReviewFlagsModel = reroute.flagsModel;
+  }
   const resumeDispatches = resolveResumeDispatches({
     resumeBackend,
     resumeReviewBackend,
@@ -2417,6 +2520,7 @@ export async function cmdChainResume(cwd, { flags, text }) {
       // owning record) — the agy dispatch's resume gate.
       sessionProvenance,
       flagsModel: null,
+      reviewFlagsModel: resumeReviewFlagsModel,
       signalReceived: () => signalReceived,
       keepServe: !!flags.keepServe,
       resume: position,

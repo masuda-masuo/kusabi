@@ -1092,6 +1092,26 @@ export function renderChainShow(chain, rounds, unreadable = [], control = null, 
       lines.push(`  disposition: ${disp}${reasonNote}`);
     }
 
+    // Quota exhaustion is a job fact, not an unreadable verdict (kusabi #373).
+    // chain-show must name the empty pool without opening job.json.
+    if (round.reviewJobFailure && round.reviewJobFailure.kind === "quota-exhaustion") {
+      const failure = round.reviewJobFailure;
+      const pool = failure.quota === "free-tier"
+        ? "free-tier pool"
+        : failure.quota === "individual"
+          ? "individual pool"
+          : failure.quota
+            ? failure.quota + " pool"
+            : "pool";
+      const reset = failure.reset
+        ? (/^\d/.test(String(failure.reset)) ? "; resets in " + failure.reset : "; resets " + failure.reset)
+        : "";
+      lines.push(`  quota: ${failure.backend || "provider"} ${pool} exhausted${reset}`);
+    }
+    if (round.reviewJobError) {
+      lines.push(`  review job error: ${round.reviewJobError}`);
+    }
+
     // Refusal (kusabi #293): the disposition line above says a refusal
     // happened; these lines say WHAT was refused.  The two named items and
     // the one-line why are the whole payload the orchestrator acts on, so

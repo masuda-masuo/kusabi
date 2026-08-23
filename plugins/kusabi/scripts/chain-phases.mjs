@@ -18,6 +18,7 @@ import {
   implementDenyTools,
   reviewDenyTools,
   backendSupportsResume,
+  resolveModelBackend,
 } from "./cli.mjs";
 import {
   renderContainerReviewInput,
@@ -473,6 +474,145 @@ export function buildImplementText({ round, brief, previousRecord, container, re
   return withContainerWorkspace(text, container);
 }
 
+// =========================================================================
+// Dispatch-failure quota classification (kusabi #373)
+//
+// A review (or implement) job that produced NO payload is not an unreadable
+// verdict: `verdict: unparseable` means a payload arrived and could not be
+// read.  When the backend named a quota-exhausted pool in the failure text,
+// the round record must carry that as its own field so chain-show and
+// chain-resume can tell the two failures apart without opening job.json.
+//
+// Classify ONLY phrases that have been observed.  A false positive here
+// hard-stops a chain that could have continued (agy-dispatch.mjs documents
+// the same principle for its own quota handling).
+// Observed:
+//   agy:      "Individual quota reached. Please upgrade your subscription
+//              to increase your limits. Resets in 1h1m21s."
+//   opencode: "Free usage exceeded, subscribe to Go"
+// Claude already classifies from the structured payload (kusabi #215) and
+// writes job.failure; this layer fills in when the adapter left failure null.
+// =========================================================================
+
+const AGY_QUOTA_MARKER = "Individual quota reached";
+const OPENCODE_QUOTA_MARKER = "Free usage exceeded";
+
+/**
+ * Classify a dispatch-failure text as quota exhaustion of a named backend.
+ * Returns null when the text does not contain an observed phrase.
+ *
+ * @param {string|null|undefined} errorText
+ * @returns {null | {
+ *   kind: "quota-exhaustion",
+ *   backend: "agy" | "opencode",
+ *   quota: "individual" | "free-tier",
+ *   backendBlocked: boolean,
+ *   reset: string | null,
+ * }}
+ */
+export function classifyDispatchQuotaExhaustion(errorText) {
+  if (typeof errorText !== "string" || errorText.length === 0) return null;
+  if (errorText.includes(AGY_QUOTA_MARKER)) {
+    const resetMatch = errorText.match(/Resets in ([^\s.]+)/);
+    return {
+      kind: "quota-exhaustion",
+      backend: "agy",
+      quota: "individual",
+      backendBlocked: true,
+      reset: resetMatch ? resetMatch[1] : null,
+    };
+  }
+  if (errorText.includes(OPENCODE_QUOTA_MARKER)) {
+    return {
+      kind: "quota-exhaustion",
+      backend: "opencode",
+      quota: "free-tier",
+      backendBlocked: true,
+      reset: null,
+    };
+  }
+  return null;
+}
+
+/**
+ * The escalate reason chain-show prints for a quota-exhausted review seat.
+ * Named so the digest never reads as `unexpected verdict: unparseable`.
+ *
+ * @param {object} failure — `{ kind: "quota-exhaustion", ... }`
+ * @returns {string}
+ */
+export function quotaExhaustionReason(failure) {
+  const backend = failure?.backend || "provider";
+  const pool = failure?.quota === "free-tier"
+    ? "free-tier pool"
+    : failure?.quota === "individual"
+      ? "individual pool"
+      : failure?.quota
+        ? failure.quota + " pool"
+        : "pool";
+  const reset = failure?.reset
+    ? (/^\d/.test(String(failure.reset)) ? "; resets in " + failure.reset : "; resets " + failure.reset)
+    : "";
+  return "quota exhausted (" + backend + " " + pool + ")" + reset;
+}
+
+/**
+ * chain-resume refusal when the recorded failure was quota exhaustion and
+ * the operator did not name a different route.
+ *
+ * @param {object} failure
+ * @returns {string}
+ */
+export function quotaReplacementRefusal(failure) {
+  const backend = failure?.backend || "the current backend";
+  const quota = failure?.quota ? " (" + failure.quota + ")" : "";
+  return (
+    "review seat died of quota exhaustion on " + backend + quota +
+    ". Buying the same seat cannot work. Route the replacement with " +
+    "--backend opencode|claude|agy|cursor or --model <id> (a different backend or model)."
+  );
+}
+
+/**
+ * The structured quota-exhaustion fact on a round record, or null.
+ *
+ * @param {object|null|undefined} record
+ * @returns {object|null}
+ */
+export function recordQuotaExhaustion(record) {
+  const failure = record?.reviewJobFailure;
+  if (failure && failure.kind === "quota-exhaustion") return failure;
+  return null;
+}
+
+/**
+ * True when the operator named a model or backend that is not the recorded
+ * review seat's route — the one case where buying a replacement after quota
+ * exhaustion can work.
+ *
+ * @param {object} record
+ * @param {{ backend?: string|null, model?: string|null }|null|undefined} explicitRoute
+ * @returns {boolean}
+ */
+export function explicitRouteDiffersFromRecord(record, explicitRoute) {
+  if (!explicitRoute || typeof explicitRoute !== "object") return false;
+  const recordedBackend = record.reviewBackend ?? record.backend ?? "opencode";
+  if (explicitRoute.backend && explicitRoute.backend !== recordedBackend) return true;
+  if (explicitRoute.model) {
+    let spec;
+    try {
+      spec = resolveModelBackend(explicitRoute.model);
+    } catch {
+      spec = null;
+    }
+    if (spec?.backend && spec.backend !== recordedBackend) return true;
+    const recordedModel = record.reviewModelEntry ?? "";
+    const wanted = spec?.model ?? explicitRoute.model;
+    if (wanted && wanted !== recordedModel && explicitRoute.model !== recordedModel) return true;
+  }
+  return false;
+}
+
 /**
  * Run the implement phase: dispatch the implement job via dispatchWithFallback
  * and return the initial round record with implement-related fields.
@@ -610,6 +750,10 @@ export async function runImplementPhase({
       implementJobId: job.id,
       sessionID: job.sessionID,
       implementUsage: job.usage || null,
+      // Failure TEXT on the round record (kusabi #373): a job that ended in
+      // status error must be distinguishable without opening job.json.  Written
+      // only when present so a healthy round's record is unchanged.
+      ...(job.error ? { implementJobError: job.error } : {}),
       // The parsed refusal descriptor, stamped at parse time (see above);
       // null when the report carried no block -- the ordinary case.  The
       // caller still decides what it means: whether a refusal is genuine
@@ -623,7 +767,7 @@ export async function runImplementPhase({
     // classified the terminal payload.  The chain's provider-exhaustion
     // renderer uses it to show the classification instead of the generic
     // capacity advice.
-    implementJobFailure: job.failure || null,
+    implementJobFailure: job.failure || classifyDispatchQuotaExhaustion(job.error) || null,
     // The parsed refusal block (kusabi #293), or null when the report carried
     // none -- the ordinary case.  The caller decides what it means; whether a
     // refusal is genuine depends on the change set, which this phase has not
@@ -1326,10 +1470,18 @@ export async function runReviewPhase({
     roundRecord.reviewFallbacks = reviewJob.fallbacks || null;
     reviewJobStatus = reviewJob.status;
     reviewJobError = reviewJob.error || null;
-    // Structured terminal-failure classification (kusabi #215), carried on
-    // the record (single conduit) so the caller's provider-exhaustion
-    // branch can render the classification instead of the generic advice.
-    roundRecord.reviewJobFailure = reviewJob.failure || null;
+    // Structured terminal-failure classification (kusabi #215 / #373), carried
+    // on the record (single conduit).  Adapter-supplied `job.failure` wins;
+    // when the adapter left it null (agy v1, opencode), classify from the
+    // observed quota phrases in the error text so a no-payload job is not
+    // recorded as `reviewJobFailure: null`.
+    roundRecord.reviewJobFailure = reviewJob.failure
+      || classifyDispatchQuotaExhaustion(reviewJob.error)
+      || null;
+    // Failure TEXT, distinct from the structured classification: a job that
+    // produced no payload at all must be readable from the round record.
+    // Written only when present so a healthy review's record is unchanged.
+    if (reviewJob.error) roundRecord.reviewJobError = reviewJob.error;
 
     chainParsedReview = _parsed;
     chainVerdict = _verdict;
@@ -1399,7 +1551,7 @@ const REVIEW_SEAT_RECORD_FIELDS = [
   "verdict", "verdictSource", "reviewParseable", "salvagedVerdict",
   "reviewPartial", "reviewFindingCount", "reviewPartialDiagnosis",
   "reviewJobId", "reviewUsage", "reviewModelEntry", "reviewModelVariant",
-  "reviewFallbacks", "reviewJobFailure",
+  "reviewFallbacks", "reviewJobFailure", "reviewJobError",
   "reviewUnparseableRetried", "reviewFirstJobId", "reviewFirstUsage", "reviewFirstFallbacks",
   "findingsText", "findings", "findingFiles",
   "disposition",
@@ -2938,15 +3090,41 @@ function withSeatDetail(error, detail) {
  * "seat-failure shaped, but undecidable", and it is appended to that refusal.
  *
  * @param {object|null} chainJson — chain.json record.
+ * @param {object} [opts]
+ * @param {{ backend?: string|null, model?: string|null }|null} [opts.explicitRoute]
+ *        — operator-named replacement route (chain-resume `--backend` /
+ *        `--model`).  A quota-exhausted seat is never eligible on the SAME
+ *        route (kusabi #373); an explicit different route may buy a new seat.
  * @returns {{ eligible: boolean, detail: string|null }}
  */
-export function classifyReviewSeatReplacement(chainJson) {
+export function classifyReviewSeatReplacement(chainJson, { explicitRoute } = {}) {
   const records = Array.isArray(chainJson?.records) ? chainJson.records : [];
   const last = records.length > 0 ? records[records.length - 1] : null;
   if (!last || typeof last !== "object") return NOT_A_SEAT_FAILURE;
   if (last.disposition?.disposition !== "escalate") return NOT_A_SEAT_FAILURE;
 
+  // Quota exhaustion is not an unreadable payload (kusabi #373): buying the
+  // same seat cannot work.  An explicit different route is the one exception.
+  const quota = recordQuotaExhaustion(last);
+  const reroutingQuota = quota && explicitRouteDiffersFromRecord(last, explicitRoute);
+  if (quota && !reroutingQuota) {
+    return seatRecordsUndecidable(quotaReplacementRefusal(quota));
+  }
+
+  // The round number addresses the phase the driver re-dispatches; a record
+  // that cannot name its own round has no position to resume at.
+  if (!Number.isInteger(last.round) || last.round < 1) {
+    return seatRecordsUndecidable(
+      "the final round record has no usable `round` number — there is no position to resume at"
+    );
+  }
+  const where = `round ${last.round}`;
+
   // ---- condition 2: a dead SEAT, not a review judgement ----
+  // Skipped when rerouting a quota-dead seat: the disposition reason names
+  // the exhausted pool, not `unexpected verdict: unparseable`, so the
+  // verdict/reason pairing below would refuse a route the operator just named.
+  if (!reroutingQuota) {
   const verdict = last.verdict;
   if (typeof verdict !== "string" || verdict === "") {
     return seatRecordsUndecidable(
@@ -2959,15 +3137,6 @@ export function classifyReviewSeatReplacement(chainJson) {
   // approve / approve-partial / needs-attention / discard and anything else:
   // a completed review, so this escalate is not a spent seat.
   if (!expectedReason) return NOT_A_SEAT_FAILURE;
-
-  // The round number addresses the phase the driver re-dispatches; a record
-  // that cannot name its own round has no position to resume at.
-  if (!Number.isInteger(last.round) || last.round < 1) {
-    return seatRecordsUndecidable(
-      "the final round record has no usable `round` number — there is no position to resume at"
-    );
-  }
-  const where = `round ${last.round}`;
 
   // ---- condition 3: the escalate came from THAT seat failure ----
   const reason = last.disposition?.reason;
@@ -2989,6 +3158,7 @@ export function classifyReviewSeatReplacement(chainJson) {
       )
       : NOT_A_SEAT_FAILURE;
   }
+  } // !reroutingQuota: verdict/reason pairing
 
   // A replacement review judges an implementation; there must be one.
   if (typeof last.implementJobId !== "string" || !last.implementJobId) {
@@ -3088,7 +3258,7 @@ export function classifyReviewSeatReplacement(chainJson) {
  *     before dispatching the replacement review
  *   - `reworkCount`, `currentTierIndex`, `strategized`, `session`, `baseSha`
  */
-export function resolveChainResume({ control, chainJson }) {
+export function resolveChainResume({ control, chainJson, explicitRoute = null }) {
   if (!control) {
     return { ok: false, error: "no control record (control.json missing)" };
   }
@@ -3110,7 +3280,7 @@ export function resolveChainResume({ control, chainJson }) {
   // would refuse it before the disposition branch ever ran.  `detail` is the
   // fail-closed field name for a seat-shaped escalate whose records cannot
   // decide it; it is null for every other chain, leaving the refusals verbatim.
-  const seat = classifyReviewSeatReplacement(chainJson);
+  const seat = classifyReviewSeatReplacement(chainJson, { explicitRoute });
 
   if (status !== "cancelled" && !stale && !seat.eligible) {
     return {

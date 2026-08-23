@@ -1154,6 +1154,49 @@ describe("renderChainShow", () => {
       prev = idx;
     }
   });
+
+  it("names an exhausted quota pool instead of unexpected verdict: unparseable (kusabi #373)", () => {
+    const chain = { chainId: "chain-quota" };
+    const rounds = [{
+      round: 1,
+      verdict: "unparseable",
+      reviewParseable: false,
+      reviewJobError: "agy dispatch failed: Individual quota reached. Resets in 1h1m21s.",
+      reviewJobFailure: {
+        kind: "quota-exhaustion",
+        backend: "agy",
+        quota: "individual",
+        backendBlocked: true,
+        reset: "1h1m21s",
+      },
+      disposition: {
+        disposition: "escalate",
+        reason: "quota exhausted (agy individual pool); resets in 1h1m21s",
+      },
+    }];
+    const result = renderChainShow(chain, rounds, [], { status: "completed", pid: 0 });
+    assert.match(result, /escalated at round 1 \(quota exhausted \(agy individual pool\); resets in 1h1m21s\)/);
+    assert.doesNotMatch(result, /unexpected verdict: unparseable/);
+    assert.match(result, /quota: agy individual pool exhausted; resets in 1h1m21s/);
+    assert.match(result, /review job error: agy dispatch failed: Individual quota reached/);
+  });
+
+  it("keeps unparseable wording when a payload arrived and could not be read", () => {
+    const chain = { chainId: "chain-unparseable" };
+    const rounds = [{
+      round: 1,
+      verdict: "unparseable",
+      reviewParseable: false,
+      disposition: {
+        disposition: "escalate",
+        reason: "unexpected verdict: unparseable",
+      },
+    }];
+    const result = renderChainShow(chain, rounds, [], { status: "completed", pid: 0 });
+    assert.match(result, /unexpected verdict: unparseable/);
+    assert.doesNotMatch(result, /quota:/);
+    assert.doesNotMatch(result, /review job error:/);
+  });
 });
 
 // kusabi #336: an escalated terminal chain shows the structured-finding

@@ -843,6 +843,43 @@ prompt), so a cursor chain's rework rounds continue the same conversation.
 **Denies are not enforceable from our side**, exactly as with agy: a job routed here records
 `toolDeniesUnenforced` rather than pretending the constraint holds.
 
+#### 3.5.17 a dead seat is not an unreadable verdict (kusabi #373)
+
+`verdict: "unparseable"` means **a payload arrived and could not be read**. A seat that produced no
+payload at all — the pool was empty, the process was killed, the adapter threw — is a different
+state, and conflating the two costs real rounds: on 2026-08-23 a review seat died on
+`Individual quota reached … Resets in 1h1m21s`, was recorded as `unparseable` with
+`reviewJobFailure: null`, and `chain-resume` bought an identical replacement seat that died 33
+seconds later into the same dead quota.
+
+Three fields carry the distinction, and they are separate on purpose:
+
+| field | meaning |
+|---|---|
+| `verdict` | unchanged — `unparseable` still means an unreadable payload |
+| `reviewJobError` | the failure TEXT, written **only when the job carried one**, so a healthy round's record is byte-identical to before |
+| `reviewJobFailure` | the STRUCTURED fact: the adapter's own `job.failure` when it set one (claude, since #215), otherwise classified from the error text |
+
+**Classification matches observed phrases only** (`classifyDispatchQuotaExhaustion`): `Individual
+quota reached` (agy) and `Free usage exceeded` (opencode), by substring so a variable
+`Resets in <duration>` cannot defeat it, with the duration captured when present. A generic
+`quota reached`, a claude `session limit`, or `All routes exhausted` deliberately do NOT classify —
+the same rule agy's own quota handling states: **a false positive hard-stops a chain that could have
+continued**, so an unobserved wording waits for its first real sighting rather than being guessed.
+
+A third terminal state exists and is neither of the above: a **stalled** job
+(`watchdog: no events for 900s (process killed)`, seen on the very chain that implemented this
+section). Its text reaches `reviewJobError` through the same conduit, and it must not classify as an
+exhausted pool — the pool is fine, the seat went quiet. What tells a stall from a hang is the job's
+own instrumentation (`steps`, `lastTool`, `lastActivity`), which is why those fields being real
+matters for every backend (§3.5.16).
+
+**`chain-resume` refuses to re-buy a quota-dead seat.** The replacement-seat path exists for an
+unreadable payload; when the recorded failure is quota exhaustion, an identical seat cannot work, so
+the resume refuses and names the escape hatch. An explicitly different route
+(`--backend`/`--model` naming another backend) still goes through — the refusal is about repeating a
+known-dead route, not about locking the chain.
+
 ### 3.6 sunaba-rpc (raw JSON-RPC client) — implemented
 
 `plugins/kusabi/scripts/sunaba-rpc.mjs`. A **raw HTTP+SSE client** for the companion's non-LLM pipeline (deterministic probes, etc.) to call sunaba's MCP tools. **Not an MCP client.**
