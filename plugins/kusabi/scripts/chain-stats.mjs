@@ -310,6 +310,12 @@ export function computeStats(chains, opts = {}) {
       if (disp === "escalate") {
         // Classify over the SAME in-range rounds that produced the
         // disposition, so the split never disagrees with the count.
+        // kusabi #380: classifyEscalate (chain-substance.mjs) now derives the
+        // substantive/no-work verdict from a round's closed stopReason when the
+        // record carries one; records without the field keep the original
+        // worktreeChanged heuristic unchanged (criterion #3).  The unknown
+        // sentinel and every non-completed reason fail closed into no-work,
+        // never into substantive.
         const label = classifyEscalate(chainRounds);
         if (label === "substantive") escalateSplit.substantive += 1;
         else if (label === "no-work") escalateSplit.noWork += 1;

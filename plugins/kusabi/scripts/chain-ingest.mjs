@@ -269,6 +269,10 @@ export function parseChainRecord(chainJson, ctx = {}) {
       // split needs the absent case kept distinct — NULL is "unknown",
       // never "no-work".
       worktreeChanged: toBoolInt(rec.worktreeChanged),
+      // Closed terminal reason for the round's implement job (kusabi #380).
+      // Stored verbatim — NULL for records written before the field existed.
+      // Consumers fail closed on any value outside the closed set / "unknown".
+      stopReason: typeof rec.stopReason === "string" ? rec.stopReason : null,
       disposition: (rec.disposition && typeof rec.disposition.disposition === "string")
         ? rec.disposition.disposition
         : null,
@@ -582,6 +586,10 @@ export function parseJobRecord(jobJson, usageJson, ctx = {}) {
       durationSeconds,
       steps: typeof stats.steps === "number" ? stats.steps : null,
       error: typeof jobJson.error === "string" ? jobJson.error : null,
+      // Closed terminal reason (kusabi #380): stored verbatim; NULL when the
+      // job record predates the field.  Consumers fail closed on any value
+      // outside the closed set / "unknown".
+      stopReason: typeof jobJson.stopReason === "string" ? jobJson.stopReason : null,
       usageAvailable,
       usageModel,
       usageInput,

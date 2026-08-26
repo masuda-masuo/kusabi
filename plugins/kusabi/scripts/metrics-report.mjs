@@ -23,6 +23,7 @@
 // currency.
 
 import { classifyEscalate } from "./chain-substance.mjs";
+import { STOP_REASONS, UNKNOWN_STOP_REASON } from "./stop-reason.mjs";
 
 const WEIGHT_INPUT = 1;
 const WEIGHT_OUTPUT = 5;
@@ -254,12 +255,17 @@ function fetchRounds(db) {
   const hasWorktreeChanged = tableHasColumn(db, "round", "worktree_changed");
   const hasBackend = tableHasColumn(db, "round", "backend");
   const hasVerdictSource = tableHasColumn(db, "round", "verdict_source");
+  // kusabi #380 — closed terminal reason.  Absent from stores written before
+  // the column existed; this read-only surface cannot migrate, so it degrades
+  // to omitting the column and rows read as "absent" (never as completed).
+  const hasStopReason = tableHasColumn(db, "round", "stop_reason");
   // verdict / probes_green have been in the schema since the first metrics
   // store, so they are always selected.
   const cols = ["chain_id", "round", "started_at", "started_ms", "disposition", "verdict", "probes_green"];
   if (hasBackend) cols.push("backend");
   if (hasWorktreeChanged) cols.push("worktree_changed");
   if (hasVerdictSource) cols.push("verdict_source");
+  if (hasStopReason) cols.push("stop_reason");
   return db.prepare(`SELECT ${cols.join(", ")} FROM round`).all();
 }
 
@@ -275,6 +281,10 @@ function fetchJobs(db) {
   // `backend` (kusabi #184) may be absent from stores written before the
   // split — degrade to omitting the column; rows then read as "opencode".
   const hasBackend = tableHasColumn(db, "job", "backend");
+  // kusabi #380 — closed terminal reason.  Absent from stores written before
+  // the column existed; this read-only surface cannot migrate, so it degrades
+  // to omitting the column and rows read as "absent" (never as completed).
+  const hasStopReason = tableHasColumn(db, "job", "stop_reason");
   const cols = [
     "job_id", "workspace_slug", "kind", "status", "phase", "model_entry",
     "started_at", "started_ms", "finished_at", "finished_ms",
@@ -282,6 +292,7 @@ function fetchJobs(db) {
     "usage_available", "usage_input", "usage_output", "usage_reasoning", "usage_cost",
   ];
   if (hasBackend) cols.push("backend");
+  if (hasStopReason) cols.push("stop_reason");
   return db.prepare(`SELECT ${cols.join(", ")} FROM job`).all();
 }
 
@@ -920,6 +931,60 @@ function computeDelegatedJobs(inWindowJobs) {
 }
 
 // ---------------------------------------------------------------------------
+// stop-reason breakdown (kusabi #380) — closed terminal-reason union
+// ---------------------------------------------------------------------------
+
+/** Empty bucket for one surface (jobs or rounds). */
+function emptyStopReasonBucket() {
+  const byReason = {};
+  for (const r of STOP_REASONS) byReason[r] = 0;
+  byReason[UNKNOWN_STOP_REASON] = 0;
+  return { total: 0, byReason, absent: 0 };
+}
+
+/**
+ * Tally a surface's rows by their closed terminal reason.  A NULL reason is
+ * "absent" (a record written before #380 — never counted as completed).  A
+ * value outside the closed set and not "unknown" is a future/unforeseen
+ * status: it FAILS CLOSED into the "unknown" bucket, so it can never be
+ * silently read as success.
+ *
+ * @param {Array<object>} rows
+ * @param {string} key  — the column/field name carrying the reason.
+ */
+function tallyStopReason(rows, key) {
+  const out = emptyStopReasonBucket();
+  for (const row of rows) {
+    out.total += 1;
+    const v = (row[key] ?? row.stopReason) ?? null;
+    if (v === null || v === undefined) {
+      out.absent += 1;
+    } else if (v === UNKNOWN_STOP_REASON || STOP_REASONS.includes(v)) {
+      out.byReason[v] = (out.byReason[v] || 0) + 1;
+    } else {
+      // Future / unforeseen status — fail closed (never completed).
+      out.byReason[UNKNOWN_STOP_REASON] = (out.byReason[UNKNOWN_STOP_REASON] || 0) + 1;
+    }
+  }
+  return out;
+}
+
+/**
+ * Count worker terminal reasons over the in-window jobs and rounds.  Legacy
+ * rows (no `stop_reason` field) appear as "absent", never folded into
+ * "completed".
+ *
+ * @param {Array<object>} inWindowJobs
+ * @param {Array<object>} inWindowRounds
+ */
+function computeStopReasonBreakdown(inWindowJobs, inWindowRounds) {
+  return {
+    jobs: tallyStopReason(inWindowJobs, "stop_reason"),
+    rounds: tallyStopReason(inWindowRounds, "stop_reason"),
+  };
+}
+
+// ---------------------------------------------------------------------------
 // by-backend split (kusabi #184 Job C, per-phase attribution kusabi #195)
 // ---------------------------------------------------------------------------
 
@@ -1144,6 +1209,7 @@ export function computeReport(db, opts = {}) {
       escalateReviewAxis: emptyEscalateReviewAxis(),
       dispositionSeverity: [],
       reviewPathology: emptyReviewPathology(),
+      stopReasonBreakdown: { jobs: emptyStopReasonBucket(), rounds: emptyStopReasonBucket() },
     };
   }
 
@@ -1198,6 +1264,7 @@ export function computeReport(db, opts = {}) {
   const delegatedJobs = computeDelegatedJobs(inWindowJobs);
   const byBackend = computeBackendSplit(inWindowChains, inWindowJobs, roundsByChain);
   const cursorSampledOutput = computeCursorSampledOutput(db);
+  const stopReasonBreakdown = computeStopReasonBreakdown(inWindowJobs, inWindowRounds);
 
   const status = (inWindowTurns.length === 0 && inWindowChains.length === 0 && inWindowJobs.length === 0)
     ? "empty_window"
@@ -1227,8 +1294,39 @@ export function computeReport(db, opts = {}) {
     reviewPathology,
     delegatedJobs,
     byBackend,
+    stopReasonBreakdown,
     ...(cursorSampledOutput ? { cursorSampledOutput } : {}),
   };
+}
+
+// ---------------------------------------------------------------------------
+// stop-reason breakdown (kusabi #380) — render
+// ---------------------------------------------------------------------------
+
+function renderStopReasonBucket(bucket) {
+  const lines = [];
+  // Closed set first (in declared order), then the unknown sentinel, then
+  // the absent bucket — each on its own line so counts never collapse into
+  // a completed-looking total.
+  const order = [...STOP_REASONS, UNKNOWN_STOP_REASON];
+  for (const reason of order) {
+    const n = (bucket.byReason && bucket.byReason[reason]) || 0;
+    lines.push(`  ${reason}: ${fmtCount(n)}`);
+  }
+  lines.push(`  (absent / pre-#380): ${fmtCount(bucket.absent || 0)}`);
+  return lines;
+}
+
+function renderStopReasonBreakdown(section) {
+  const lines = [];
+  lines.push("Stop-reason breakdown (kusabi #380)");
+  lines.push("  worker terminal reasons, closed set + unknown; legacy rows with no field");
+  lines.push("  are shown as (absent) and are NEVER folded into completed.");
+  lines.push("  jobs:");
+  lines.push(...renderStopReasonBucket(section.jobs));
+  lines.push("  rounds:");
+  lines.push(...renderStopReasonBucket(section.rounds));
+  return lines;
 }
 
 // ---------------------------------------------------------------------------
@@ -1653,6 +1751,8 @@ export function renderReportText(report) {
   lines.push(...renderReviewPathology(report.reviewPathology));
   lines.push("");
   lines.push(...renderDelegatedJobs(report.delegatedJobs));
+  lines.push("");
+  lines.push(...renderStopReasonBreakdown(report.stopReasonBreakdown));
   const cursorLines = renderCursorSampledOutput(report.cursorSampledOutput);
   if (cursorLines.length > 0) {
     lines.push("");
