@@ -199,6 +199,21 @@ CREATE TABLE IF NOT EXISTS job (
 );
 CREATE INDEX IF NOT EXISTS idx_job_started_ms ON job(started_ms);
 
+-- Per-tool usage folded from a job's events.ndjson (kusabi #381).
+-- One row per (job, tool).  Re-ingest deletes then replaces the job's rows
+-- (same delete-then-insert contract as findings).  Jobs with no readable
+-- events store nothing here.  Fold logic lives in tool-stats.mjs; this
+-- table stores that module's output as-is (not zero-filled — the report
+-- zero-fills over KNOWN_TOOLS at query time).
+CREATE TABLE IF NOT EXISTS tool_stat (
+  job_id TEXT,
+  tool TEXT,
+  count INTEGER,
+  success INTEGER,
+  failure INTEGER,
+  PRIMARY KEY (job_id, tool)
+);
+
 -- Cursor statusline sink's context_window.total_output_tokens, stored
 -- separately because the session table is shared with Claude transcript rows
 -- and must not grow Cursor-only columns.  Value is the latest-ts non-null
@@ -350,6 +365,21 @@ export function upsertSourceFile(db, row) {
     mtimeMs: row.mtimeMs ?? null,
     ingestedAt: row.ingestedAt ?? null,
   });
+}
+
+/**
+ * Drop one `source_file` skip-cache row.  Used when a previously ingested
+ * side file (events.ndjson) has vanished or become unreadable: leaving the
+ * row would keep the skip key from converging (eventsUnchanged stays false
+ * forever) while stale tool_stat rows would also survive.
+ *
+ * @param {import("node:sqlite").DatabaseSync} db
+ * @param {string} filePath
+ * @returns {number} rows deleted
+ */
+export function deleteSourceFile(db, filePath) {
+  const result = db.prepare("DELETE FROM source_file WHERE path = $path").run({ path: filePath });
+  return Number(result.changes ?? 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -665,6 +695,38 @@ export function upsertJob(db, row) {
     // outside the closed set / "unknown".
     stopReason: row.stopReason ?? null,
   });
+}
+
+/**
+ * Replace every tool_stat row of one job with `stats` (the folded output of
+ * `extractToolStats`).  Delete-then-insert so a re-ingest converges instead
+ * of accumulating: INSERT OR REPLACE can only overwrite (job_id, tool)
+ * pairs the new parse still produces, and a job whose tool mix changed
+ * would otherwise leave stale tools behind.
+ *
+ * An empty / missing `stats` object stores nothing for this job (zero rows).
+ *
+ * @param {import("node:sqlite").DatabaseSync} db
+ * @param {string} jobId
+ * @param {Record<string, { count?: number, success?: number, failure?: number }>|null|undefined} stats
+ */
+export function replaceToolStatsForJob(db, jobId, stats) {
+  db.prepare("DELETE FROM tool_stat WHERE job_id = $jobId").run({ jobId });
+  if (!stats || typeof stats !== "object") return;
+  const ins = db.prepare(`
+    INSERT INTO tool_stat (job_id, tool, count, success, failure)
+    VALUES ($jobId, $tool, $count, $success, $failure)
+  `);
+  for (const [tool, s] of Object.entries(stats)) {
+    if (!tool) continue;
+    ins.run({
+      jobId,
+      tool,
+      count: s?.count ?? 0,
+      success: s?.success ?? 0,
+      failure: s?.failure ?? 0,
+    });
+  }
 }
 
 // ---------------------------------------------------------------------------
