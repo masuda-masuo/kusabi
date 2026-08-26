@@ -60,6 +60,7 @@ import { writeJson } from "./state-paths.mjs";
 // there is no cycle.
 import { effectiveStatus } from "./chain-control.mjs";
 import { dispatchWithFallback } from "./prompt-execution.mjs";
+import { deriveStopReason } from "./stop-reason.mjs";
 import {
   captureWorktreeState,
   computeNewlyChanged,
@@ -759,8 +760,20 @@ export async function runImplementPhase({
       // caller still decides what it means: whether a refusal is genuine
       // depends on the change set, which this phase has not measured yet.
       implementRefusal,
+      // Closed terminal reason (kusabi #380): at this point the implement job
+      // is folded into the round record but the chain layer has not yet
+      // measured substance (worktreeChanged is unmeasured here, so a
+      // completed job records "completed").  finishRound re-derives this with
+      // the measured substance signal so empty rounds land as infra-death /
+      // empty-completion.
+      stopReason: deriveStopReason({
+        status: job.status,
+        stats: job.stats,
+        worktreeChanged: null,
+      }),
     },
     implementJobStatus: job.status,
+    implementJobSteps: (job.stats && typeof job.stats.steps === "number") ? job.stats.steps : 0,
     implementJobError: job.error || null,
     // Structured terminal-failure classification (kusabi #215): null for
     // generic failures; { kind: "quota-exhaustion", ... } when the dispatch

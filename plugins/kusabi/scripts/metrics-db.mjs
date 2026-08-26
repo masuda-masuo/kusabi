@@ -123,6 +123,10 @@ CREATE TABLE IF NOT EXISTS round (
   probes_green INTEGER,
   worktree_changed INTEGER,
   disposition TEXT,
+  -- Closed terminal reason for the round's implement job (kusabi #380).  One
+  -- of STOP_REASONS or "unknown"; NULL for records written before the field
+  -- existed.  Never validated against the enum, so a future reason survives.
+  stop_reason TEXT,
   rework_count INTEGER,
   -- review_seat_failures: how many review seats died on this round and were
   -- archived by chain-resume's replacement seat (kusabi #248).  NULL when
@@ -179,6 +183,10 @@ CREATE TABLE IF NOT EXISTS job (
   finished_ms INTEGER,
   duration_seconds REAL,
   steps INTEGER,
+  -- Closed terminal reason (kusabi #380): one of STOP_REASONS or "unknown";
+  -- NULL for records written before the field existed.  Never validated
+  -- against the enum, so a future reason survives to the report.
+  stop_reason TEXT,
   error TEXT,
   usage_available INTEGER,
   usage_model TEXT,
@@ -271,6 +279,11 @@ export function openMetricsDb(dbPath) {
   // worth seeing (the usage_available discipline), never backfilled with 0
   // or "review".
   ensureColumn(db, "round", "verdict_source", "TEXT");
+  // Migration for databases created before `round.stop_reason` / `job.stop_reason`
+  // existed (kusabi #380 — the closed terminal-reason union).  Old rows keep
+  // NULL, which the report surfaces as "unknown" / absent, never as completed.
+  ensureColumn(db, "round", "stop_reason", "TEXT");
+  ensureColumn(db, "job", "stop_reason", "TEXT");
   return db;
 }
 
@@ -485,11 +498,11 @@ export function upsertRound(db, row) {
     INSERT OR REPLACE INTO round
       (chain_id, round, started_at, started_ms, backend, review_backend, model_entry, tier_before, tier_after,
        verdict, verdict_source, probes_green, worktree_changed, disposition, rework_count, review_seat_failures, findings_text,
-       implement_in, implement_out, implement_cost, review_in, review_out, review_cost)
+       implement_in, implement_out, implement_cost, review_in, review_out, review_cost, stop_reason)
     VALUES
       ($chainId, $round, $startedAt, $startedMs, $backend, $reviewBackend, $modelEntry, $tierBefore, $tierAfter,
        $verdict, $verdictSource, $probesGreen, $worktreeChanged, $disposition, $reworkCount, $reviewSeatFailures, $findingsText,
-       $implementIn, $implementOut, $implementCost, $reviewIn, $reviewOut, $reviewCost)
+       $implementIn, $implementOut, $implementCost, $reviewIn, $reviewOut, $reviewCost, $stopReason)
   `).run({
     chainId: row.chainId,
     round: row.round,
@@ -534,6 +547,10 @@ export function upsertRound(db, row) {
     reviewIn: row.reviewIn ?? null,
     reviewOut: row.reviewOut ?? null,
     reviewCost: row.reviewCost ?? null,
+    // Closed terminal reason (kusabi #380): stored verbatim, NULL when the
+    // record predates the field.  Consumers fail closed on any value outside
+    // the closed set / "unknown".
+    stopReason: row.stopReason ?? null,
   });
 }
 
@@ -610,13 +627,13 @@ export function upsertJob(db, row) {
        started_at, started_ms, finished_at, finished_ms, duration_seconds,
        steps, error, usage_available, usage_model,
        usage_input, usage_output, usage_reasoning,
-       usage_cache_read, usage_cache_write, usage_cost)
+       usage_cache_read, usage_cache_write, usage_cost, stop_reason)
     VALUES
       ($jobId, $workspaceSlug, $kind, $title, $status, $phase, $backend, $modelEntry,
        $startedAt, $startedMs, $finishedAt, $finishedMs, $durationSeconds,
        $steps, $error, $usageAvailable, $usageModel,
        $usageInput, $usageOutput, $usageReasoning,
-       $usageCacheRead, $usageCacheWrite, $usageCost)
+       $usageCacheRead, $usageCacheWrite, $usageCost, $stopReason)
   `).run({
     jobId: row.jobId,
     workspaceSlug: row.workspaceSlug ?? null,
@@ -643,6 +660,10 @@ export function upsertJob(db, row) {
     usageCacheRead: row.usageCacheRead ?? null,
     usageCacheWrite: row.usageCacheWrite ?? null,
     usageCost: row.usageCost === undefined ? null : row.usageCost,
+    // Closed terminal reason (kusabi #380): stored verbatim, NULL when the
+    // job record predates the field.  Consumers fail closed on any value
+    // outside the closed set / "unknown".
+    stopReason: row.stopReason ?? null,
   });
 }
 

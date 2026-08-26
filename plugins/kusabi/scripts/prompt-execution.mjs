@@ -10,10 +10,20 @@ import { writeJson, stateRoot } from "./state-paths.mjs";
 import { durationS } from "./render.mjs";
 import { parseModel, selectRoutes } from "./cli.mjs";
 import { resolveCompletedResult } from "./result-recovery.mjs";
+import { deriveStopReason } from "./stop-reason.mjs";
 
 // =========================================================================
 // fail-fast retry decision — pure, exported, unit-testable
 // =========================================================================
+
+// The set of fail-fast reasons that mean capacity / quota is permanently
+// exhausted for this route — retrying on any other route in the tier cannot
+// help.  Hoisted to module scope (kusabi #380) so the writer that classifies
+// capacity and the fail-fast decision share ONE source of truth, and so
+// future members are added in exactly one place.  `deriveStopReason` does NOT
+// know this list: the caller passes `capacityReason` non-null iff the reason
+// is a member here.
+export const capacityReasons = ["free_tier_limit"];
 
 /**
  * Decide whether a provider-retry loop should be stopped immediately.
@@ -35,7 +45,6 @@ import { resolveCompletedResult } from "./result-recovery.mjs";
 export function shouldFailFast({ reason, attempt, steps, retryCount }) {
   // Capacity / quota reasons: the provider has stated retrying will never succeed.
   // Fire on the FIRST occurrence — no threshold.
-  const capacityReasons = ["free_tier_limit"];
   if (reason && capacityReasons.includes(reason)) {
     return { stop: true, terminal: true };
   }
@@ -742,6 +751,23 @@ export async function runPrompt({ cwd, kind, title, promptText, agent, model, se
   job.status = outcome.status;
   job.error = outcome.error;
 
+  // Record the closed terminal reason (kusabi #380).  The caller classifies
+  // capacity: a terminal provider error whose reason is a known capacity
+  // reason is a quota exhaustion, not a generic provider error.  The chain
+  // layer re-derives the per-round reason with the substance signal; here at
+  // the job level worktreeChanged is unmeasured (null) so a completed job
+  // records "completed".
+  const capacityReason =
+    (providerError && providerError.terminal && capacityReasons.includes(providerError.reason))
+      ? providerError.reason
+      : null;
+  job.stopReason = deriveStopReason({
+    capacityReason,
+    providerError,
+    status: job.status,
+    stats: job.stats,
+  });
+
   if (outcome.status === "provider-error") {
     job.retry = providerError;
   } else if (outcome.status === "timeout") {
@@ -829,6 +855,9 @@ export async function dispatchWithFallback(opts) {
       kind: runPromptOpts.kind || "task",
       status: "provider-error",
       error: errorMsg,
+      // Closed terminal reason (kusabi #380): a no-route / all-routes-dead
+      // synthetic job is a provider-side failure, never a worker success.
+      stopReason: deriveStopReason({ status: "provider-error" }),
       fallbacks: [],
       retry: null,
       modelEntry: explicitModel || null,
@@ -903,6 +932,9 @@ export async function dispatchWithFallback(opts) {
   lastJob.fallbacks = fallbacks;
   lastJob.status = "provider-error";
   lastJob.error = renderAllExhaustedError({ candidates, fallbacks });
+  // Closed terminal reason (kusabi #380): every route dead is a provider-side
+  // failure regardless of how the last route happened to die.
+  lastJob.stopReason = deriveStopReason({ status: "provider-error" });
   if (lastStateDir) saveJob(lastStateDir, lastJob);
   return { job: lastJob, resultText: lastResultText, stateDir: lastStateDir };
 }

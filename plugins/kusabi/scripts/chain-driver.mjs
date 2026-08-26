@@ -56,6 +56,7 @@ import {
 } from "./chain-control.mjs";
 import { listJobs, latestJob } from "./job-store.mjs";
 import { dispatchWithFallback, resetFailedRoutes } from "./prompt-execution.mjs";
+import { deriveStopReason } from "./stop-reason.mjs";
 import {
   createChainDir,
   captureBaseSha,
@@ -2068,6 +2069,7 @@ export async function runChainDriver({
         session: resolvedSession,
         sessionProvenance,
         implementJobStatus,
+        implementJobSteps,
         implementJobError,
         implementJobFailure,
         implementRefusal,
@@ -2149,6 +2151,18 @@ export async function runChainDriver({
       roundRecord.probesGreen = probeResult.probesGreen;
       roundRecord.probeResults = probeResult.probeResults;
       roundRecord.worktreeChanged = probeResult.worktreeChanged;
+      // Closed terminal reason (kusabi #380): re-derive now that the chain
+      // layer has measured substance.  A completed round whose worktree did
+      // not change records infra-death (steps 0) or empty-completion
+      // (steps > 0); a completed round that changed the worktree, or any
+      // non-completed status, keeps the job-level reason runImplementPhase
+      // already stamped.  Unknown/future values fail closed (deriveStopReason
+      // returns "unknown") — never silently read as success.
+      roundRecord.stopReason = deriveStopReason({
+        status: implementJobStatus,
+        stats: { steps: implementJobSteps ?? 0 },
+        worktreeChanged: roundRecord.worktreeChanged ?? null,
+      });
       // The P5/P6 oracle marker (kusabi #197) is persisted like any other
       // probe truth: a review-resume of this round reads it back, so a frozen
       // edit cannot be forgotten by the round that carried it.

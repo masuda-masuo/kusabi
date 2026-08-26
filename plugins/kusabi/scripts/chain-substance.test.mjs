@@ -8,7 +8,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 
-import { classifyEscalate, roundWorktreeChanged } from "./chain-substance.mjs";
+import { classifyEscalate, roundWorktreeChanged, roundWorkerProducedChange } from "./chain-substance.mjs";
 
 // ---------------------------------------------------------------------------
 // roundWorktreeChanged — three-valued field reader
@@ -135,5 +135,44 @@ describe("classifyEscalate", () => {
       { round: 1, worktreeChanged: true, disposition: { disposition: "accept" } },
     ];
     assert.equal(classifyEscalate(rounds), "substantive");
+  });
+
+  it("kusabi #380 — a record WITHOUT stopReason keeps the worktreeChanged heuristic", () => {
+    // Legacy records (all history before the stop-reason field) must produce
+    // byte-identical classification to before the feature.
+    assert.equal(classifyEscalate([{ round: 1, worktreeChanged: true }]), "substantive");
+    assert.equal(classifyEscalate([{ round: 1, worktreeChanged: false }]), "no-work");
+    assert.equal(classifyEscalate([{ round: 1 }]), "unknown");
+  });
+
+  it("kusabi #380 — a closed stopReason overrides worktreeChanged for the split", () => {
+    // Every non-completed reason fails closed into no-work.
+    assert.equal(classifyEscalate([{ round: 1, stopReason: "infra-death" }]), "no-work");
+    assert.equal(classifyEscalate([{ round: 1, stopReason: "empty-completion" }]), "no-work");
+    assert.equal(classifyEscalate([{ round: 1, stopReason: "provider-error" }]), "no-work");
+    assert.equal(classifyEscalate([{ round: 1, stopReason: "quota-exhausted" }]), "no-work");
+    assert.equal(classifyEscalate([{ round: 1, stopReason: "cancelled" }]), "no-work");
+  });
+
+  it("kusabi #380 — unknown stopReason fails closed (never substantive)", () => {
+    assert.equal(classifyEscalate([{ round: 1, stopReason: "unknown" }]), "no-work");
+    // A future/unforeseen value is not in the closed set and not 'unknown'.
+    assert.equal(classifyEscalate([{ round: 1, stopReason: "some-future-status" }]), "no-work");
+  });
+
+  it("kusabi #380 — completed defers to the measured substance signal", () => {
+    assert.equal(classifyEscalate([{ round: 1, stopReason: "completed", worktreeChanged: true }]), "substantive");
+    assert.equal(classifyEscalate([{ round: 1, stopReason: "completed", worktreeChanged: false }]), "no-work");
+    // unmeasured at round level → unknown, not no-work, so it is never
+    // silently read as substantive.
+    assert.equal(classifyEscalate([{ round: 1, stopReason: "completed" }]), "unknown");
+  });
+
+  it("kusabi #380 — roundWorkerProducedChange returns the three-valued verdict", () => {
+    assert.equal(roundWorkerProducedChange({ stopReason: "completed", worktreeChanged: true }), true);
+    assert.equal(roundWorkerProducedChange({ stopReason: "completed", worktreeChanged: false }), false);
+    assert.equal(roundWorkerProducedChange({ stopReason: "provider-error" }), false);
+    assert.equal(roundWorkerProducedChange({ worktreeChanged: true }), true);
+    assert.equal(roundWorkerProducedChange({}), null);
   });
 });

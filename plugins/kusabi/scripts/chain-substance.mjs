@@ -72,9 +72,42 @@ export function classifyEscalate(rounds) {
   if (list.length === 0) return "no-work";
   let anyUnknown = false;
   for (const r of list) {
-    const c = roundWorktreeChanged(r);
+    const c = roundWorkerProducedChange(r);
     if (c === true) return "substantive";
     if (c === null) anyUnknown = true;
   }
   return anyUnknown ? "unknown" : "no-work";
+}
+
+/**
+ * Did the worker on a single round produce a change set?  Three-valued:
+ *   - true   — yes
+ *   - false  — no (measured, or a classified failure)
+ *   - null   — not measured / unknown data
+ *
+ * kusabi #380: when a round record carries a closed `stopReason`, the verdict
+ * derives from it.  A "completed" round still defers to the worktree
+ * measurement (the substance signal the chain layer supplies); every OTHER
+ * closed reason — and the `unknown` sentinel — means the worker produced no
+ * accepted change, so it is `false` (fail closed).  A record WITHOUT
+ * `stopReason` (all history before this feature) keeps the original
+ * `worktreeChanged` heuristic unchanged.
+ *
+ * @param {*} r  — one round record
+ * @returns {boolean|null}
+ */
+export function roundWorkerProducedChange(r) {
+  if (r === null || r === undefined) return null;
+  if (typeof r.stopReason === "string") {
+    if (r.stopReason === "completed") {
+      return roundWorktreeChanged(r);
+    }
+    // provider-error / quota-exhausted / empty-completion / infra-death /
+    // cancelled / unknown — none of these is substantive worker output.
+    // "unknown" fails closed: an unmappable status is a failure, not
+    // evidence of work.
+    return false;
+  }
+  // Legacy record: no stopReason field — use the worktreeChanged heuristic.
+  return roundWorktreeChanged(r);
 }
