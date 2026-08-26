@@ -232,6 +232,30 @@ export function deriveDisposition({ verdict, probesGreen, round, maxRounds, repe
     };
   }
 
+  // ---- high/critical severity escalation gate (kusabi #336) ----
+  // A needs-attention round carrying any high or critical finding escalates
+  // directly to the orchestrator: consequential findings require an
+  // orchestrator decision rather than an implementer rework.
+  // Placed after refusal / briefSyntaxDefect / oracleViolation blocks (which keep
+  // precedence) and before Decision 5, zero-findings row (#299), max-rounds, and verdict switch.
+  // Deliberately ignores probesGreen, repeatedAreas, round, and strategizeEligible.
+  const hasHighOrCritical =
+    verdict === "needs-attention" &&
+    Array.isArray(findingSeverities) &&
+    findingSeverities.some(function (s) { return s === "high" || s === "critical"; });
+
+  if (hasHighOrCritical) {
+    const highCount = findingSeverities.filter(function (s) { return s === "high"; }).length;
+    const criticalCount = findingSeverities.filter(function (s) { return s === "critical"; }).length;
+    return {
+      disposition: "escalate",
+      reason:
+        `needs-attention with consequential findings (carried ${highCount} high and ${criticalCount} critical finding(s)): ` +
+        `a consequential finding is a decision for the orchestrator, not a rework the implementer decides; ` +
+        `note that the terminal decision block does not include a same-pattern sweep (checking the rest of the tree for other occurrences stays the orchestrator's job)`,
+    };
+  }
+
   // strategize only pays off if there is a next round to spend its output on —
   // on the final round the strategist job would be produced and then discarded
   // (the chain loop's post-strategize `continue` just exits the loop). Gate

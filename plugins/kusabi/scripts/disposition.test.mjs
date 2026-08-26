@@ -24,12 +24,10 @@ describe("deriveDisposition", () => {
     assert.deepEqual(result, { disposition: "escalate", reason: "approve-partial: unverified items remain" });
   });
 
-  it("rework: needs-attention without repeated areas", () => {
-    // A named high finding is what makes this a rework: since kusabi #299 a
-    // needs-attention that names NOTHING over green probes escalates instead
-    // (there would be no work list to hand the implement).
+  it("escalate: needs-attention with high finding escalates to orchestrator (kusabi #336)", () => {
     const result = deriveDisposition({ verdict: "needs-attention", probesGreen: true, round: 1, maxRounds: 3, repeatedAreas: false, findingSeverities: ["high"] });
-    assert.deepEqual(result, { disposition: "rework", reason: "needs-attention" });
+    assert.equal(result.disposition, "escalate");
+    assert.match(result.reason, /consequential findings/);
   });
 
   it("escalate: needs-attention with repeated areas (same file 2 rounds)", () => {
@@ -116,9 +114,10 @@ describe("deriveDisposition", () => {
     assert.deepEqual(result, { disposition: "accept-with-followup", reason: "probes green; remaining findings all minor" });
   });
 
-  it("rework (unchanged): one high among lows → not eligible for accept-with-followup", () => {
+  it("escalate: one high among lows → escalates to orchestrator (kusabi #336)", () => {
     const result = deriveDisposition({ verdict: "needs-attention", probesGreen: true, round: 1, maxRounds: 3, repeatedAreas: false, findingSeverities: ["low", "high", "low"] });
-    assert.deepEqual(result, { disposition: "rework", reason: "needs-attention" });
+    assert.equal(result.disposition, "escalate");
+    assert.match(result.reason, /consequential findings/);
   });
 
   it("rework (unchanged): probes red + minors → not eligible for accept-with-followup", () => {
@@ -210,9 +209,10 @@ describe("deriveDisposition", () => {
     assert.match(oracle.reason, /oracle violation/);
   });
 
-  it("rework (unchanged): critical severity among lows", () => {
+  it("escalate: critical severity among lows (kusabi #336)", () => {
     const result = deriveDisposition({ verdict: "needs-attention", probesGreen: true, round: 1, maxRounds: 3, repeatedAreas: false, findingSeverities: ["critical", "low"] });
-    assert.deepEqual(result, { disposition: "rework", reason: "needs-attention" });
+    assert.equal(result.disposition, "escalate");
+    assert.match(result.reason, /consequential findings/);
   });
 
   it("rework (unchanged): unknown severity string", () => {
@@ -278,14 +278,101 @@ describe("deriveDisposition", () => {
 
   // ---- kusabi#117: max-rounds escalate reason surfaces the stagnation signal ----
 
-  it("escalate: needs-attention + repeatedAreas + a high finding + round === maxRounds → reason mentions same file area", () => {
+  it("escalate: needs-attention + repeatedAreas + a high finding + round === maxRounds → high/critical gate wins over maxRounds reason (kusabi #336)", () => {
     const result = deriveDisposition({ verdict: "needs-attention", probesGreen: true, round: 3, maxRounds: 3, repeatedAreas: true, findingSeverities: ["high", "low"] });
     assert.equal(result.disposition, "escalate");
-    assert.match(result.reason, /same file area flagged/);
+    assert.match(result.reason, /consequential findings/);
   });
 
   // Regression guard: repeats + eligible + round < maxRounds still strategizes
   // (already covered above by "strategize: repeatedAreas + strategizeEligible true", round 2 of 3).
+});
+
+// deriveDisposition — high/critical severity escalation gate (kusabi #336)
+// ---------------------------------------------------------------------------
+
+describe("deriveDisposition — high/critical severity escalation gate (kusabi #336)", () => {
+  it("needs-attention + green probes + ['high'] → escalate with all 3 contract facts in reason", () => {
+    const result = deriveDisposition({
+      verdict: "needs-attention", probesGreen: true, round: 1, maxRounds: 3,
+      repeatedAreas: false, findingSeverities: ["high"],
+    });
+    assert.equal(result.disposition, "escalate");
+    assert.match(result.reason, /1 high and 0 critical/);
+    assert.match(result.reason, /decision for the orchestrator, not a rework the implementer decides/);
+    assert.match(result.reason, /does not include a same-pattern sweep/);
+  });
+
+  it("same with ['critical'] and mix ['low','critical','medium']", () => {
+    const criticalRes = deriveDisposition({
+      verdict: "needs-attention", probesGreen: true, round: 1, maxRounds: 3,
+      repeatedAreas: false, findingSeverities: ["critical"],
+    });
+    assert.equal(criticalRes.disposition, "escalate");
+    assert.match(criticalRes.reason, /0 high and 1 critical/);
+    assert.match(criticalRes.reason, /decision for the orchestrator/);
+    assert.match(criticalRes.reason, /same-pattern sweep/);
+
+    const mixRes = deriveDisposition({
+      verdict: "needs-attention", probesGreen: true, round: 1, maxRounds: 3,
+      repeatedAreas: false, findingSeverities: ["low", "critical", "medium"],
+    });
+    assert.equal(mixRes.disposition, "escalate");
+    assert.match(mixRes.reason, /0 high and 1 critical/);
+  });
+
+  it("needs-attention + red probes + ['high'] → escalate (gate ignores probesGreen)", () => {
+    const result = deriveDisposition({
+      verdict: "needs-attention", probesGreen: false, round: 1, maxRounds: 3,
+      repeatedAreas: false, findingSeverities: ["high"],
+    });
+    assert.equal(result.disposition, "escalate");
+    assert.match(result.reason, /consequential findings/);
+  });
+
+  it("needs-attention + repeatedAreas: true + strategizeEligible: true + round < maxRounds + ['high'] → escalate, not strategize", () => {
+    const result = deriveDisposition({
+      verdict: "needs-attention", probesGreen: true, round: 1, maxRounds: 3,
+      repeatedAreas: true, strategizeEligible: true, findingSeverities: ["high"],
+    });
+    assert.equal(result.disposition, "escalate");
+    assert.match(result.reason, /consequential findings/);
+  });
+
+  it("oracleViolation set + needs-attention + ['high'] → oracle reason wins (order guard)", () => {
+    const result = deriveDisposition({
+      verdict: "needs-attention", probesGreen: true, round: 1, maxRounds: 3,
+      repeatedAreas: false, findingSeverities: ["high"], oracleViolation: "P5: frozen tests changed",
+    });
+    assert.equal(result.disposition, "escalate");
+    assert.match(result.reason, /oracle violation/);
+    assert.doesNotMatch(result.reason, /consequential findings/);
+  });
+
+  it("discard verdict + ['critical'] → still reviewer discarded the work", () => {
+    const result = deriveDisposition({
+      verdict: "discard", probesGreen: true, round: 1, maxRounds: 3,
+      repeatedAreas: false, findingSeverities: ["critical"],
+    });
+    assert.equal(result.disposition, "escalate");
+    assert.equal(result.reason, "reviewer discarded the work");
+  });
+
+  it("approve + green + ['high'] → still accept", () => {
+    const result = deriveDisposition({
+      verdict: "approve", probesGreen: true, round: 1, maxRounds: 3,
+      repeatedAreas: false, findingSeverities: ["high"],
+    });
+    assert.deepEqual(result, { disposition: "accept" });
+  });
+
+  it("['low','medium'] still → accept-with-followup (Decision 5 untouched)", () => {
+    const result = deriveDisposition({
+      verdict: "needs-attention", probesGreen: true, round: 1, maxRounds: 3,
+      repeatedAreas: false, findingSeverities: ["low", "medium"],
+    });
+    assert.deepEqual(result, { disposition: "accept-with-followup", reason: "probes green; remaining findings all minor" });
+  });
 });
 
 // deriveReworkStrategy — default ladder and strategize rule
@@ -561,7 +648,7 @@ describe("deriveDisposition — oracle violation routing (kusabi #197)", () => {
       // The named finding is what keeps this a rework row: a needs-attention
       // naming nothing over green probes escalates on its own (kusabi #299),
       // which would make this row test that rule instead of the marker.
-      { input: { verdict: "needs-attention", probesGreen: true, findingSeverities: ["high"] }, expected: { disposition: "rework", reason: "needs-attention" } },
+      { input: { verdict: "needs-attention", probesGreen: false, findingSeverities: ["low"] }, expected: { disposition: "rework", reason: "needs-attention" } },
       { input: { verdict: "discard", probesGreen: true }, expected: { disposition: "escalate", reason: "reviewer discarded the work" } },
       { input: { verdict: "approve-partial", probesGreen: true }, expected: { disposition: "escalate", reason: "approve-partial: unverified items remain" } },
     ];
@@ -667,7 +754,7 @@ describe("deriveDisposition brief-syntax defect (kusabi #303)", () => {
     // Same inputs, marker removed: this is the rework #303 stops buying.
     const withoutMarker = deriveDisposition({
       verdict: "needs-attention", probesGreen: false, round: 1, maxRounds: 4,
-      repeatedAreas: false, findingSeverities: ["high"],
+      repeatedAreas: false, findingSeverities: ["low"],
     });
     assert.equal(withoutMarker.disposition, "rework");
   });

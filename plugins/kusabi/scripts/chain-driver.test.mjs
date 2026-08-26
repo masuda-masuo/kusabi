@@ -367,7 +367,7 @@ describe("runChainDriver resume", () => {
       resumeMethod: { type: "continue_session" },
       startedAt: "2026-08-01T00:00:00.000Z",
       verdict: null,
-      probesGreen: true,
+      probesGreen: false,
       modelEntry: "fake/model",
       modelVariant: null,
       fallbacks: null,
@@ -391,7 +391,7 @@ describe("runChainDriver resume", () => {
     const dispatch = makeFakeDispatch({
       reviewResult: JSON.stringify({
         verdict: "needs-attention",
-        findings: [{ severity: "high", title: "Still broken", file: "src/foo.js", line_start: 1 }],
+        findings: [{ severity: "medium", title: "Still broken", file: "src/foo.js", line_start: 1 }],
       }),
       implementStatus: "provider-error",
     });
@@ -1087,12 +1087,12 @@ describe("runChainDriver resume", () => {
     };
     const { chainDir } = makeChainState({ records: [partial] });
     const callTool = probeCountingCallTool();
-    // The resumed review finds a high-severity problem => rework; the next
+    // The resumed review finds a problem => rework; the next
     // round's implement hits provider exhaustion so the chain stops there.
     const dispatch = makeFakeDispatch({
       reviewResult: JSON.stringify({
         verdict: "needs-attention",
-        findings: [{ severity: "high", file: "src/foo.js", description: "fix the parser" }],
+        findings: [{ severity: "normal", file: "src/foo.js", description: "fix the parser" }],
       }),
       implementStatus: "provider-error",
     });
@@ -1161,13 +1161,18 @@ describe("runChainDriver per-phase backends (kusabi #192)", () => {
   const APPROVE = JSON.stringify({ verdict: "approve", findings: [], summary: "ok" });
   const REWORK = JSON.stringify({
     verdict: "needs-attention",
-    findings: [{ severity: "high", file: "src/foo.js", description: "fix the parser" }],
+    findings: [{ severity: "medium", file: "src/foo.js", description: "fix the parser" }],
   });
 
-  function fakeCallTool({ statusOutput = " M src/foo.js\n" } = {}) {
+  function fakeCallTool({ statusOutput = " M src/foo.js\n", gatePassedSequence } = {}) {
+    let verifyCount = 0;
     return async (toolName, params) => {
       if (toolName === "verify_in_container") {
-        return { gate_passed: true };
+        verifyCount += 1;
+        if (Array.isArray(gatePassedSequence)) {
+          return { gate_passed: gatePassedSequence[verifyCount - 1] ?? true };
+        }
+        return { gate_passed: false };
       }
       if (toolName !== "sandbox_exec") return { output: "" };
       const scope = fakeChangeScopeResult(params);
@@ -1268,7 +1273,7 @@ describe("runChainDriver per-phase backends (kusabi #192)", () => {
       reviewModelChain: [["opencode/deepseek-v4-flash-free:max"]],
       maxRounds: 1,
       brief: BRIEF, orchestrator: null, baseSha: "abc123", worktreeBaseline: null,
-      callTool: fakeCallTool(),
+      callTool: fakeCallTool({ gatePassedSequence: [true] }),
       backend: "claude", reviewBackend: "opencode",
       dispatchWithFallback: implement.dispatch,
       reviewDispatchWithFallback: review.dispatch,
@@ -1330,7 +1335,7 @@ describe("runChainDriver per-phase backends (kusabi #192)", () => {
       reviewModelChain: [["opencode/deepseek-v4-flash-free:max"]],
       maxRounds: 2,
       brief: BRIEF, orchestrator: null, baseSha: "abc123", worktreeBaseline: null,
-      callTool: fakeCallTool(),
+      callTool: fakeCallTool({ gatePassedSequence: [false, true] }),
       backend: "claude", reviewBackend: "opencode",
       dispatchWithFallback: implement.dispatch,
       reviewDispatchWithFallback: review,
@@ -1403,7 +1408,7 @@ describe("runChainDriver per-phase backends (kusabi #192)", () => {
         cwd: tmp, stateDir: tmp, chainDir, chainId: "chain-test", container: "cid-1",
         model: "opus", modelChain: [["opus"]], maxRounds: 4,
         brief: BRIEF, orchestrator: null, baseSha: "abc123", worktreeBaseline: null,
-        callTool: fakeCallTool(),
+        callTool: fakeCallTool({ gatePassedSequence: [true] }),
         backend: driverBackend, reviewBackend: "opencode",
         dispatchWithFallback: implement.dispatch,
         reviewDispatchWithFallback: review.dispatch,
@@ -1450,13 +1455,18 @@ describe("runChainDriver per-round rework tiering (kusabi #192 axis 2)", () => {
   const APPROVE = JSON.stringify({ verdict: "approve", findings: [], summary: "ok" });
   const REWORK = JSON.stringify({
     verdict: "needs-attention",
-    findings: [{ severity: "high", file: "src/foo.js", description: "fix the parser" }],
+    findings: [{ severity: "medium", file: "src/foo.js", description: "fix the parser" }],
   });
 
-  function fakeCallTool({ statusOutput = " M src/foo.js\n" } = {}) {
+  function fakeCallTool({ statusOutput = " M src/foo.js\n", gatePassedSequence } = {}) {
+    let verifyCount = 0;
     return async (toolName, params) => {
       if (toolName === "verify_in_container") {
-        return { gate_passed: true };
+        verifyCount += 1;
+        if (Array.isArray(gatePassedSequence)) {
+          return { gate_passed: gatePassedSequence[verifyCount - 1] ?? true };
+        }
+        return { gate_passed: false };
       }
       if (toolName !== "sandbox_exec") return { output: "" };
       const scope = fakeChangeScopeResult(params);
@@ -1564,7 +1574,7 @@ describe("runChainDriver per-round rework tiering (kusabi #192 axis 2)", () => {
       reviewModelChain: [["opencode-go/deepseek-v4-flash"]],
       maxRounds: 2,
       brief: BRIEF, orchestrator: null, baseSha: "abc123", worktreeBaseline: null,
-      callTool: fakeCallTool(),
+      callTool: fakeCallTool({ gatePassedSequence: [false, true] }),
       backend: "claude", reviewBackend: "opencode",
       dispatchWithFallback: implement.dispatch,
       reworkDispatchWithFallback: rework.dispatch,
@@ -1623,7 +1633,7 @@ describe("runChainDriver per-round rework tiering (kusabi #192 axis 2)", () => {
       reviewModelChain: [["opencode-go/deepseek-v4-flash"]],
       maxRounds: 2,
       brief: BRIEF, orchestrator: null, baseSha: "abc123", worktreeBaseline: null,
-      callTool: fakeCallTool(),
+      callTool: fakeCallTool({ gatePassedSequence: [false, true] }),
       backend: "opencode", reviewBackend: "opencode",
       dispatchWithFallback: implement.dispatch,
       reworkDispatchWithFallback: rework.dispatch,
@@ -1661,11 +1671,11 @@ describe("runChainDriver per-round rework tiering (kusabi #192 axis 2)", () => {
     // strategize lever instead of the plain rework this test exercises.
     const reworkA = JSON.stringify({
       verdict: "needs-attention",
-      findings: [{ severity: "high", file: "src/a.js", description: "fix the parser" }],
+      findings: [{ severity: "medium", file: "src/a.js", description: "fix the parser" }],
     });
     const reworkB = JSON.stringify({
       verdict: "needs-attention",
-      findings: [{ severity: "high", file: "src/b.js", description: "fix the parser" }],
+      findings: [{ severity: "medium", file: "src/b.js", description: "fix the parser" }],
     });
     const review = makeReviewDispatch({ reviewResults: [reworkA, reworkB, APPROVE] });
 
@@ -1678,7 +1688,7 @@ describe("runChainDriver per-round rework tiering (kusabi #192 axis 2)", () => {
       reviewModelChain: [["opencode-go/deepseek-v4-flash"]],
       maxRounds: 3,
       brief: BRIEF, orchestrator: null, baseSha: "abc123", worktreeBaseline: null,
-      callTool: fakeCallTool(),
+      callTool: fakeCallTool({ gatePassedSequence: [false, false, true] }),
       backend: "opencode", reviewBackend: "opencode",
       dispatchWithFallback: implement.dispatch,
       reworkDispatchWithFallback: rework.dispatch,
@@ -1718,11 +1728,11 @@ describe("runChainDriver per-round rework tiering (kusabi #192 axis 2)", () => {
     const rework = makePhaseDispatch({ kind: "task", modelEntry: "opencode-go/deepseek-v4-flash", sessionPrefix: "ses_rework_", resultText: "implemented" });
     const reworkA = JSON.stringify({
       verdict: "needs-attention",
-      findings: [{ severity: "high", file: "src/a.js", description: "fix the parser" }],
+      findings: [{ severity: "medium", file: "src/a.js", description: "fix the parser" }],
     });
     const reworkB = JSON.stringify({
       verdict: "needs-attention",
-      findings: [{ severity: "high", file: "src/b.js", description: "fix the parser" }],
+      findings: [{ severity: "medium", file: "src/b.js", description: "fix the parser" }],
     });
     const review = makeReviewDispatch({ reviewResults: [reworkA, reworkB, APPROVE] });
 
@@ -1734,7 +1744,7 @@ describe("runChainDriver per-round rework tiering (kusabi #192 axis 2)", () => {
       reviewModelChain: [["opencode-go/deepseek-v4-flash"]],
       maxRounds: 3,
       brief: BRIEF, orchestrator: null, baseSha: "abc123", worktreeBaseline: null,
-      callTool: fakeCallTool(),
+      callTool: fakeCallTool({ gatePassedSequence: [false, false, true] }),
       backend: "opencode", reviewBackend: "opencode",
       dispatchWithFallback: implement.dispatch,
       reworkDispatchWithFallback: rework.dispatch,
@@ -1795,7 +1805,7 @@ describe("runChainDriver per-round rework tiering (kusabi #192 axis 2)", () => {
         reworkBackend,
         maxRounds: 2,
         brief: BRIEF, orchestrator: null, baseSha: "abc123", worktreeBaseline: null,
-        callTool: fakeCallTool(),
+        callTool: fakeCallTool({ gatePassedSequence: [true] }),
         backend: "opencode", reviewBackend: "opencode",
         dispatchWithFallback: implement.dispatch,
         // A rework seam only exists when the chain.json carried rework keys
@@ -1874,11 +1884,11 @@ describe("runChainDriver per-round rework tiering (kusabi #192 axis 2)", () => {
     const rework = makePhaseDispatch({ kind: "task", modelEntry: "sonnet", sessionPrefix: "claude-uuid-rw-", resultText: "implemented" });
     const reworkA = JSON.stringify({
       verdict: "needs-attention",
-      findings: [{ severity: "high", file: "src/a.js", description: "fix the parser" }],
+      findings: [{ severity: "medium", file: "src/a.js", description: "fix the parser" }],
     });
     const reworkB = JSON.stringify({
       verdict: "needs-attention",
-      findings: [{ severity: "high", file: "src/b.js", description: "fix the parser" }],
+      findings: [{ severity: "medium", file: "src/b.js", description: "fix the parser" }],
     });
     const review = makeReviewDispatch({ reviewResults: [reworkA, reworkB, APPROVE] });
 
@@ -1894,7 +1904,7 @@ describe("runChainDriver per-round rework tiering (kusabi #192 axis 2)", () => {
       reviewModelChain: [["opencode-go/deepseek-v4-flash"]],
       maxRounds: 3,
       brief: BRIEF, orchestrator: null, baseSha: "abc123", worktreeBaseline: null,
-      callTool: fakeCallTool(),
+      callTool: fakeCallTool({ gatePassedSequence: [false, false, true] }),
       backend: "claude", reviewBackend: "opencode",
       dispatchWithFallback: implement.dispatch,
       reworkDispatchWithFallback: rework.dispatch,
@@ -1935,11 +1945,11 @@ describe("runChainDriver per-round rework tiering (kusabi #192 axis 2)", () => {
     const implement = makePhaseDispatch({ kind: "task", modelEntry: "opus", sessionPrefix: "claude-uuid-", resultText: "implemented" });
     const reworkA = JSON.stringify({
       verdict: "needs-attention",
-      findings: [{ severity: "high", file: "src/a.js", description: "fix the parser" }],
+      findings: [{ severity: "medium", file: "src/a.js", description: "fix the parser" }],
     });
     const reworkB = JSON.stringify({
       verdict: "needs-attention",
-      findings: [{ severity: "high", file: "src/b.js", description: "fix the parser" }],
+      findings: [{ severity: "medium", file: "src/b.js", description: "fix the parser" }],
     });
     const review = makeReviewDispatch({ reviewResults: [reworkA, reworkB, APPROVE] });
 
@@ -1953,7 +1963,7 @@ describe("runChainDriver per-round rework tiering (kusabi #192 axis 2)", () => {
       reviewModelChain: [["opencode-go/deepseek-v4-flash"]],
       maxRounds: 3,
       brief: BRIEF, orchestrator: null, baseSha: "abc123", worktreeBaseline: null,
-      callTool: fakeCallTool(),
+      callTool: fakeCallTool({ gatePassedSequence: [false, false, true] }),
       backend: "claude", reviewBackend: "opencode",
       dispatchWithFallback: implement.dispatch,
       reworkDispatchWithFallback: null,
@@ -2382,7 +2392,7 @@ describe("runChainDriver rework scheduling", () => {
   const DESIGN_SENTENCE = "This round resolves ONLY the following design finding; other known findings are deliberately out of scope this round.";
 
   function designFinding(n, file) {
-    return { severity: "high", title: "Design decision " + n, file, line_start: 1, kind: "design", body: "b", recommendation: "r" };
+    return { severity: "medium", title: "Design decision " + n, file, line_start: 1, kind: "design", body: "b", recommendation: "r" };
   }
   function mechFinding(n, file) {
     return { severity: "medium", title: "Mechanical fix " + n, file, line_start: 10, kind: "mechanical", body: "b", recommendation: "r" };
@@ -2393,9 +2403,16 @@ describe("runChainDriver rework scheduling", () => {
 
   // `gatePassed: false` makes P2 red, which is what a probe-failure rework
   // (the "full" scope, per resolveReworkScope) actually looks like.
-  function makeCallTool({ gatePassed = true } = {}) {
+  function makeCallTool({ gatePassed = false, gatePassedSequence } = {}) {
+    let verifyCount = 0;
     return async (toolName, params) => {
-      if (toolName === "verify_in_container") return { gate_passed: gatePassed };
+      if (toolName === "verify_in_container") {
+        verifyCount += 1;
+        if (Array.isArray(gatePassedSequence)) {
+          return { gate_passed: gatePassedSequence[verifyCount - 1] ?? true };
+        }
+        return { gate_passed: gatePassed };
+      }
       if (toolName !== "sandbox_exec") return { output: "" };
       const scope = fakeChangeScopeResult(params);
       if (scope) return scope;
@@ -2447,7 +2464,7 @@ describe("runChainDriver rework scheduling", () => {
     return { dispatch, calls };
   }
 
-  function runFresh({ maxRounds, reviewResults, callTool = makeCallTool() }) {
+  function runFresh({ maxRounds, reviewResults, callTool = makeCallTool({ gatePassedSequence: [false, false, false, true] }) }) {
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-sched-"));
     const chainDir = path.join(tmp, "chains", "chain-test");
     fs.mkdirSync(chainDir, { recursive: true });
@@ -2491,7 +2508,7 @@ describe("runChainDriver rework scheduling", () => {
     return { tmp, chainDir };
   }
 
-  async function runResume({ chainDir, maxRounds, reviewResults }) {
+  async function runResume({ chainDir, maxRounds, reviewResults, callTool = makeCallTool({ gatePassedSequence: [true] }) }) {
     const resolution = resolveChainResume({
       control: readChainControl(chainDir),
       chainJson: readJson(path.join(chainDir, "chain.json")),
@@ -2508,7 +2525,7 @@ describe("runChainDriver rework scheduling", () => {
       chainId: "chain-test", container: "cid-1",
       model: "fake/model", modelChain: [["fake/model"]], maxRounds,
       brief: BRIEF, orchestrator: null, baseSha: "abc123", worktreeBaseline: null,
-      callTool: makeCallTool(), dispatchWithFallback: dispatch,
+      callTool, dispatchWithFallback: dispatch,
       keepServe: true, signalReceived: () => false,
       resume: resolution.position,
     });
@@ -2518,9 +2535,10 @@ describe("runChainDriver rework scheduling", () => {
   it("runs a mechanical scope round after mixed findings without consuming the design budget", async () => {
     const fx = runFresh({
       maxRounds: 2,
+      callTool: makeCallTool({ gatePassedSequence: [false, false, true] }),
       reviewResults: [
         reviewResult("needs-attention", [designFinding(1, "src/a.js"), mechFinding(1, "src/b.js")]),
-        reviewResult("needs-attention", [{ ...mechFinding(2, "src/c.js"), severity: "high" }]),
+        reviewResult("needs-attention", [{ ...mechFinding(2, "src/c.js"), severity: "medium" }]),
         reviewResult("approve", []),
       ],
     });
@@ -2597,7 +2615,7 @@ describe("runChainDriver rework scheduling", () => {
       const imp3 = fx.calls.find((c) => c.kind === "task" && c.round === 3);
       assert.ok(imp3, "round 3 implement must be dispatched");
       assert.ok(imp3.promptText.includes(DESIGN_SENTENCE));
-      assert.ok(imp3.promptText.includes("### [high] Design decision 2 (src/c.js:1)"));
+      assert.ok(imp3.promptText.includes("### [medium] Design decision 2 (src/c.js:1)"));
       assert.ok(imp3.promptText.includes("Design decision 2"));
       assert.ok(!imp3.promptText.includes("Mechanical fix 2"));
 
@@ -2616,6 +2634,7 @@ describe("runChainDriver rework scheduling", () => {
     // 6, with round 6 never started.
     const fx = runFresh({
       maxRounds: 3,
+      callTool: makeCallTool({ gatePassed: false }),
       reviewResults: [
         reviewResult("needs-attention", [designFinding(1, "src/a.js"), mechFinding(1, "src/b.js")]),
         reviewResult("needs-attention", [designFinding(2, "src/c.js"), mechFinding(2, "src/d.js")]),
@@ -2699,11 +2718,12 @@ describe("runChainDriver rework scheduling", () => {
   it("the 2 × maxRounds hard cap terminates a mechanical-only tail via the max-rounds path", async () => {
     const fx = runFresh({
       maxRounds: 2,
+      callTool: makeCallTool({ gatePassed: false }),
       reviewResults: [
         reviewResult("needs-attention", [designFinding(1, "src/a.js"), mechFinding(1, "src/b.js")]),
-        reviewResult("needs-attention", [{ ...mechFinding(2, "src/c.js"), severity: "high" }]),
-        reviewResult("needs-attention", [{ ...mechFinding(3, "src/d.js"), severity: "high" }]),
-        reviewResult("needs-attention", [{ ...mechFinding(4, "src/e.js"), severity: "high" }]),
+        reviewResult("needs-attention", [{ ...mechFinding(2, "src/c.js"), severity: "medium" }]),
+        reviewResult("needs-attention", [{ ...mechFinding(3, "src/d.js"), severity: "medium" }]),
+        reviewResult("needs-attention", [{ ...mechFinding(4, "src/e.js"), severity: "medium" }]),
       ],
     });
     try {
@@ -2818,7 +2838,7 @@ describe("runChainDriver rework scheduling", () => {
       implementUsage: null, reviewUsage: null, tierBefore: 0, tierAfter: 0, reworkCount: 1,
       pendingReworkStrategy: { tierDelta: 0, newSession: false, reason: "1st rework: same tier, continue session, keep artifacts" },
       disposition: { disposition: "rework", reason: "needs-attention" },
-      findings: [{ ...mechFinding(2, "src/c.js"), severity: "high" }],
+      findings: [{ ...mechFinding(2, "src/c.js"), severity: "medium" }],
       findingFiles: ["src/c.js"],
       findingsText: "mechanical findings",
     };
@@ -2826,8 +2846,9 @@ describe("runChainDriver rework scheduling", () => {
     try {
       const { text, calls } = await runResume({
         chainDir, maxRounds: 2,
+        callTool: makeCallTool({ gatePassedSequence: [false, true] }),
         reviewResults: [
-          reviewResult("needs-attention", [{ ...mechFinding(3, "src/d.js"), severity: "high" }]),
+          reviewResult("needs-attention", [{ ...mechFinding(3, "src/d.js"), severity: "medium" }]),
           reviewResult("approve", []),
         ],
       });
