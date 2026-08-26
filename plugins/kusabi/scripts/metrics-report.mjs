@@ -24,6 +24,7 @@
 
 import { classifyEscalate } from "./chain-substance.mjs";
 import { STOP_REASONS, UNKNOWN_STOP_REASON } from "./stop-reason.mjs";
+import { normalizeToolStats, listToolStats } from "./tool-stats.mjs";
 
 const WEIGHT_INPUT = 1;
 const WEIGHT_OUTPUT = 5;
@@ -294,6 +295,12 @@ function fetchJobs(db) {
   if (hasBackend) cols.push("backend");
   if (hasStopReason) cols.push("stop_reason");
   return db.prepare(`SELECT ${cols.join(", ")} FROM job`).all();
+}
+
+/** Pre-#381 stores have no `tool_stat` table; treated as zero rows. */
+function fetchToolStats(db) {
+  if (!tableExists(db, "tool_stat")) return [];
+  return db.prepare("SELECT job_id, tool, count, success, failure FROM tool_stat").all();
 }
 
 /** A job's window key: started_ms, else finished_ms, else null (undated). */
@@ -985,6 +992,62 @@ function computeStopReasonBreakdown(inWindowJobs, inWindowRounds) {
 }
 
 // ---------------------------------------------------------------------------
+// per-tool usage (kusabi #381) — zero-filled over KNOWN_TOOLS
+// ---------------------------------------------------------------------------
+
+function emptyToolCounts() {
+  return { count: 0, success: 0, failure: 0 };
+}
+
+function emptyToolStatsSection() {
+  return {
+    all: normalizeToolStats({}),
+    failedJobs: normalizeToolStats({}),
+  };
+}
+
+/**
+ * Failed-job filter for the second breakdown.
+ *
+ * A job is failed when `stop_reason` is present and != 'completed', or when
+ * the wrapper status is non-completed.  Jobs with NULL stop_reason (legacy,
+ * pre-#380) are excluded, never guessed.  `unknown` is a present failure
+ * sentinel and is never counted as success.
+ */
+function isFailedJob(job) {
+  const reason = job.stop_reason;
+  if (reason == null) return false;
+  if (reason !== "completed") return true;
+  const status = job.status;
+  if (status != null && status !== "completed") return true;
+  return false;
+}
+
+function sumToolStatRows(rows) {
+  const stats = {};
+  for (const r of rows) {
+    const tool = r.tool;
+    if (typeof tool !== "string" || !tool) continue;
+    if (!stats[tool]) stats[tool] = emptyToolCounts();
+    stats[tool].count += Number(r.count) || 0;
+    stats[tool].success += Number(r.success) || 0;
+    stats[tool].failure += Number(r.failure) || 0;
+  }
+  return stats;
+}
+
+function computeToolStatsSection(inWindowJobs, toolStatRows) {
+  const inWindowIds = new Set(inWindowJobs.map((j) => j.job_id));
+  const failedIds = new Set(inWindowJobs.filter(isFailedJob).map((j) => j.job_id));
+  const allRows = toolStatRows.filter((r) => inWindowIds.has(r.job_id));
+  const failedRows = toolStatRows.filter((r) => failedIds.has(r.job_id));
+  return {
+    all: normalizeToolStats(sumToolStatRows(allRows)),
+    failedJobs: normalizeToolStats(sumToolStatRows(failedRows)),
+  };
+}
+
+// ---------------------------------------------------------------------------
 // by-backend split (kusabi #184 Job C, per-phase attribution kusabi #195)
 // ---------------------------------------------------------------------------
 
@@ -1210,6 +1273,7 @@ export function computeReport(db, opts = {}) {
       dispositionSeverity: [],
       reviewPathology: emptyReviewPathology(),
       stopReasonBreakdown: { jobs: emptyStopReasonBucket(), rounds: emptyStopReasonBucket() },
+      toolStats: emptyToolStatsSection(),
     };
   }
 
@@ -1265,6 +1329,7 @@ export function computeReport(db, opts = {}) {
   const byBackend = computeBackendSplit(inWindowChains, inWindowJobs, roundsByChain);
   const cursorSampledOutput = computeCursorSampledOutput(db);
   const stopReasonBreakdown = computeStopReasonBreakdown(inWindowJobs, inWindowRounds);
+  const toolStats = computeToolStatsSection(inWindowJobs, fetchToolStats(db));
 
   const status = (inWindowTurns.length === 0 && inWindowChains.length === 0 && inWindowJobs.length === 0)
     ? "empty_window"
@@ -1295,6 +1360,7 @@ export function computeReport(db, opts = {}) {
     delegatedJobs,
     byBackend,
     stopReasonBreakdown,
+    toolStats,
     ...(cursorSampledOutput ? { cursorSampledOutput } : {}),
   };
 }
@@ -1326,6 +1392,31 @@ function renderStopReasonBreakdown(section) {
   lines.push(...renderStopReasonBucket(section.jobs));
   lines.push("  rounds:");
   lines.push(...renderStopReasonBucket(section.rounds));
+  return lines;
+}
+
+function renderOneToolStatsMap(map) {
+  const lines = [];
+  for (const row of listToolStats(map)) {
+    lines.push(
+      `  ${row.tool}  count ${fmtCount(row.count)}  success ${fmtCount(row.success)}  failure ${fmtCount(row.failure)}`,
+    );
+  }
+  return lines;
+}
+
+function renderToolStats(section) {
+  if (!section) return [];
+  const lines = [];
+  lines.push("Tool usage (all jobs in window):");
+  lines.push("  per-tool counts folded per part.id; zero-filled over the known-tool table;");
+  lines.push("  unknown-but-observed tools listed after the known ones.");
+  lines.push(...renderOneToolStatsMap(section.all));
+  lines.push("Tool usage (failed jobs only):");
+  lines.push("  failed = stop_reason present and != completed, or wrapper status non-completed;");
+  lines.push("  jobs with NULL stop_reason (legacy) are excluded, never guessed.");
+  lines.push("  an unknown stop_reason is never counted as success.");
+  lines.push(...renderOneToolStatsMap(section.failedJobs));
   return lines;
 }
 
@@ -1753,6 +1844,11 @@ export function renderReportText(report) {
   lines.push(...renderDelegatedJobs(report.delegatedJobs));
   lines.push("");
   lines.push(...renderStopReasonBreakdown(report.stopReasonBreakdown));
+  const toolLines = renderToolStats(report.toolStats);
+  if (toolLines.length > 0) {
+    lines.push("");
+    lines.push(...toolLines);
+  }
   const cursorLines = renderCursorSampledOutput(report.cursorSampledOutput);
   if (cursorLines.length > 0) {
     lines.push("");

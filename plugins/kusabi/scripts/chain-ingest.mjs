@@ -49,7 +49,10 @@ import {
   isSourceFileUnchanged,
   getSourceFile,
   deleteFindingsForRound,
+  replaceToolStatsForJob,
+  deleteSourceFile,
 } from "./metrics-db.mjs";
+import { extractToolStats } from "./tool-stats.mjs";
 
 function toBoolInt(v) {
   if (v === true) return 1;
@@ -670,6 +673,7 @@ export function ingestJobDirectory(db, stateRoot) {
       if (!jdirent.name.startsWith("job-")) continue;
       const jobJsonPath = path.join(jobsDir, jdirent.name, "job.json");
       const usageJsonPath = path.join(jobsDir, jdirent.name, "usage.json");
+      const eventsNdjsonPath = path.join(jobsDir, jdirent.name, "events.ndjson");
       if (!fs.existsSync(jobJsonPath)) continue; // nothing usable persisted — not a failure
 
       summary.jobsScanned += 1;
@@ -692,16 +696,33 @@ export function ingestJobDirectory(db, stateRoot) {
         }
       }
 
+      // events.ndjson is optional (kusabi #381).  Missing or unreadable
+      // events must not abort the job ingest — we simply store nothing in
+      // tool_stat for this job.  A directory (or other non-file) at this
+      // path is treated as absent, not as an I/O failure of the job.
+      let eventsStat = null;
+      try {
+        if (fs.existsSync(eventsNdjsonPath)) {
+          const st = fs.statSync(eventsNdjsonPath);
+          if (st.isFile()) eventsStat = st;
+        }
+      } catch {
+        eventsStat = null;
+      }
+
       // Composite skip key (see the header comment): job.json unchanged AND
-      // usage.json unchanged-or-consistently-absent.  When usage.json does
-      // not exist, "unchanged" means no source_file row for it either — a
-      // usage.json that appears (or vanishes) since the last run always
-      // forces a re-read.
+      // usage.json unchanged-or-consistently-absent AND events.ndjson
+      // unchanged-or-consistently-absent.  When a side file does not exist,
+      // "unchanged" means no source_file row for it either — a file that
+      // appears (or vanishes) since the last run always forces a re-read.
       const jobUnchanged = isSourceFileUnchanged(db, jobJsonPath, jobStat.size, jobStat.mtimeMs);
       const usageUnchanged = usageStat
         ? isSourceFileUnchanged(db, usageJsonPath, usageStat.size, usageStat.mtimeMs)
         : getSourceFile(db, usageJsonPath) === undefined;
-      if (jobUnchanged && usageUnchanged) {
+      const eventsUnchanged = eventsStat
+        ? isSourceFileUnchanged(db, eventsNdjsonPath, eventsStat.size, eventsStat.mtimeMs)
+        : getSourceFile(db, eventsNdjsonPath) === undefined;
+      if (jobUnchanged && usageUnchanged && eventsUnchanged) {
         summary.jobsSkippedUnchanged += 1;
         continue;
       }
@@ -750,6 +771,31 @@ export function ingestJobDirectory(db, stateRoot) {
           mtimeMs: usageStat.mtimeMs,
           ingestedAt,
         });
+      }
+
+      // Fold per-tool stats from events.ndjson.  Missing / unreadable
+      // events store nothing in tool_stat and must not fail the job ingest.
+      // A vanished or unreadable file must also clear previously stored
+      // rows and drop the source_file skip-cache entry — otherwise stale
+      // counts survive and every later ingest re-parses forever because
+      // eventsUnchanged stays false.
+      try {
+        if (eventsStat) {
+          const raw = fs.readFileSync(eventsNdjsonPath, "utf8");
+          replaceToolStatsForJob(db, parsed.jobRow.jobId, extractToolStats(raw));
+          upsertSourceFile(db, {
+            path: eventsNdjsonPath,
+            size: eventsStat.size,
+            mtimeMs: eventsStat.mtimeMs,
+            ingestedAt,
+          });
+        } else {
+          replaceToolStatsForJob(db, parsed.jobRow.jobId, {});
+          deleteSourceFile(db, eventsNdjsonPath);
+        }
+      } catch {
+        replaceToolStatsForJob(db, parsed.jobRow.jobId, {});
+        deleteSourceFile(db, eventsNdjsonPath);
       }
     }
   }
