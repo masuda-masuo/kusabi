@@ -992,18 +992,37 @@ function computeStopReasonBreakdown(inWindowJobs, inWindowRounds) {
 }
 
 // ---------------------------------------------------------------------------
-// per-tool usage (kusabi #381) — zero-filled over KNOWN_TOOLS
+// per-tool usage (kusabi #381) — zero-filled over KNOWN_TOOLS.
+// kusabi #384: the counts cover opencode SSE events only.  Coverage is the
+// job's `backend` column (`"opencode"` only).  NULL/absent is excluded —
+// this section does NOT apply the #184 reader contract that treats NULL as
+// opencode — and is never inferred from the presence of tool_stat rows.
 // ---------------------------------------------------------------------------
 
 function emptyToolCounts() {
   return { count: 0, success: 0, failure: 0 };
 }
 
+const TOOL_STATS_COVERED_BACKEND = "opencode";
+
+function emptyToolStatsCoverage(excludedJobCount, coveredJobCount) {
+  return {
+    backend: TOOL_STATS_COVERED_BACKEND,
+    excludedJobCount,
+    coveredJobCount,
+  };
+}
+
 function emptyToolStatsSection() {
   return {
     all: normalizeToolStats({}),
     failedJobs: normalizeToolStats({}),
+    coverage: emptyToolStatsCoverage(0, 0),
   };
+}
+
+function isToolStatsCoveredJob(job) {
+  return job.backend === TOOL_STATS_COVERED_BACKEND;
 }
 
 /**
@@ -1037,13 +1056,16 @@ function sumToolStatRows(rows) {
 }
 
 function computeToolStatsSection(inWindowJobs, toolStatRows) {
-  const inWindowIds = new Set(inWindowJobs.map((j) => j.job_id));
-  const failedIds = new Set(inWindowJobs.filter(isFailedJob).map((j) => j.job_id));
-  const allRows = toolStatRows.filter((r) => inWindowIds.has(r.job_id));
+  const coveredJobs = inWindowJobs.filter(isToolStatsCoveredJob);
+  const excludedJobCount = inWindowJobs.length - coveredJobs.length;
+  const coveredIds = new Set(coveredJobs.map((j) => j.job_id));
+  const failedIds = new Set(coveredJobs.filter(isFailedJob).map((j) => j.job_id));
+  const allRows = toolStatRows.filter((r) => coveredIds.has(r.job_id));
   const failedRows = toolStatRows.filter((r) => failedIds.has(r.job_id));
   return {
     all: normalizeToolStats(sumToolStatRows(allRows)),
     failedJobs: normalizeToolStats(sumToolStatRows(failedRows)),
+    coverage: emptyToolStatsCoverage(excludedJobCount, coveredJobs.length),
   };
 }
 
@@ -1405,18 +1427,37 @@ function renderOneToolStatsMap(map) {
   return lines;
 }
 
+function renderToolStatsCoverageLine(coverage) {
+  const n = coverage?.excludedJobCount ?? 0;
+  const jobWord = n === 1 ? "job" : "jobs";
+  return `  coverage: opencode jobs only; ${n} ${jobWord} on other backends excluded`;
+}
+
 function renderToolStats(section) {
   if (!section) return [];
+  const hideTable = section.coverage?.coveredJobCount === 0;
+  const coverageLine = renderToolStatsCoverageLine(section.coverage);
+  const emptyBody = "  no covered jobs in this window";
   const lines = [];
-  lines.push("Tool usage (all jobs in window):");
+  lines.push("Tool usage (all jobs in window): opencode (SSE events) only");
   lines.push("  per-tool counts folded per part.id; zero-filled over the known-tool table;");
   lines.push("  unknown-but-observed tools listed after the known ones.");
-  lines.push(...renderOneToolStatsMap(section.all));
-  lines.push("Tool usage (failed jobs only):");
+  lines.push(coverageLine);
+  if (hideTable) {
+    lines.push(emptyBody);
+  } else {
+    lines.push(...renderOneToolStatsMap(section.all));
+  }
+  lines.push("Tool usage (failed jobs only): opencode (SSE events) only");
   lines.push("  failed = stop_reason present and != completed, or wrapper status non-completed;");
   lines.push("  jobs with NULL stop_reason (legacy) are excluded, never guessed.");
   lines.push("  an unknown stop_reason is never counted as success.");
-  lines.push(...renderOneToolStatsMap(section.failedJobs));
+  lines.push(coverageLine);
+  if (hideTable) {
+    lines.push(emptyBody);
+  } else {
+    lines.push(...renderOneToolStatsMap(section.failedJobs));
+  }
   return lines;
 }
 

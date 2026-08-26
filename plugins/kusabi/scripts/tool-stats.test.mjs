@@ -275,7 +275,7 @@ describe("ingest — tool_stat table", () => {
 
 describe("report — per-tool section and failed-jobs breakdown", () => {
   function seedJob(db, row) {
-    upsertJob(db, row);
+    upsertJob(db, { backend: "opencode", ...row });
   }
 
   it("zero-fills KNOWN_TOOLS in both all-jobs and failed-jobs maps", () => {

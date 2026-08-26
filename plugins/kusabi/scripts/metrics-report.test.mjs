@@ -18,6 +18,7 @@ import {
   upsertRound,
   upsertJob,
   upsertCursorSessionCounter,
+  replaceToolStatsForJob,
 } from "./metrics-db.mjs";
 
 import {
@@ -1771,5 +1772,168 @@ describe("unrecognized verdict_source values (kusabi #235 follow-up)", () => {
     assert.equal(path.denominator, 11); // 12 rounds - 1 NULL-verdict accept
     assert.equal(path.pathologyCount, 2);
     assert.equal(path.verdictSourceAvailable, false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Tool-stats coverage: opencode SSE only (kusabi #384)
+// ---------------------------------------------------------------------------
+
+const TOOL_JOB_TS = "2026-08-01T10:00:00.000Z";
+const TOOL_JOB_MS = Date.parse(TOOL_JOB_TS);
+
+function seedTimedJob(db, row) {
+  upsertJob(db, {
+    startedAt: TOOL_JOB_TS,
+    startedMs: TOOL_JOB_MS,
+    ...row,
+  });
+}
+
+describe("tool-stats coverage — opencode SSE only (kusabi #384)", () => {
+  it("a mixed window reports the opencode job's tools only and excludes the cursor failed job", () => {
+    const db = openMetricsDb(":memory:");
+    seedTimedJob(db, {
+      jobId: "job-opencode",
+      backend: "opencode",
+      status: "completed",
+      stopReason: "completed",
+    });
+    replaceToolStatsForJob(db, "job-opencode", {
+      bash: { count: 4, success: 4, failure: 0 },
+    });
+    seedTimedJob(db, {
+      jobId: "job-cursor",
+      backend: "cursor",
+      status: "error",
+      stopReason: "error",
+      startedAt: "2026-08-01T11:00:00.000Z",
+      startedMs: Date.parse("2026-08-01T11:00:00.000Z"),
+    });
+    // Coverage is job.backend, never inferred from tool_stat: leftover rows
+    // on a cursor job must not enter either total.
+    replaceToolStatsForJob(db, "job-cursor", {
+      bash: { count: 9, success: 0, failure: 9 },
+      edit: { count: 1, success: 0, failure: 1 },
+    });
+
+    const report = computeReport(db, { dbPath: ":memory:" });
+    assert.equal(report.toolStats.coverage.backend, "opencode");
+    assert.equal(report.toolStats.coverage.excludedJobCount, 1);
+    assert.equal(report.toolStats.coverage.coveredJobCount, 1);
+    assert.equal(report.toolStats.all.bash.count, 4);
+    assert.equal(report.toolStats.all.edit.count, 0);
+    // Cursor failed job is absent from failed-jobs totals (its 9 bash / 1 edit
+    // do not appear; the opencode job did not fail).
+    assert.equal(report.toolStats.failedJobs.bash.count, 0);
+    assert.equal(report.toolStats.failedJobs.edit.count, 0);
+
+    const text = renderReportText(report);
+    assert.match(text, /Tool usage \(all jobs in window\): opencode \(SSE events\) only/);
+    assert.match(text, /Tool usage \(failed jobs only\): opencode \(SSE events\) only/);
+    assert.match(text, /coverage: opencode jobs only; 1 job on other backends excluded/);
+    assert.match(text, /bash  count 4  success 4  failure 0/);
+    assert.doesNotMatch(text, /no covered jobs in this window/);
+  });
+
+  it("an all-cursor window prints the coverage line and no covered jobs, not a zero-filled table", () => {
+    const db = openMetricsDb(":memory:");
+    seedTimedJob(db, {
+      jobId: "job-cursor",
+      backend: "cursor",
+      status: "error",
+      stopReason: "error",
+    });
+    const report = computeReport(db, { dbPath: ":memory:" });
+    assert.equal(report.toolStats.coverage.backend, "opencode");
+    assert.equal(report.toolStats.coverage.excludedJobCount, 1);
+    assert.equal(report.toolStats.coverage.coveredJobCount, 0);
+    assert.equal(report.toolStats.all.bash.count, 0);
+
+    const text = renderReportText(report);
+    assert.match(text, /coverage: opencode jobs only; 1 job on other backends excluded/);
+    assert.match(text, /no covered jobs in this window/);
+    assert.doesNotMatch(text, /  count 0  success 0  failure 0/);
+  });
+
+  it("NULL-backend rows are excluded and counted as excluded, never shown as no tools used", () => {
+    const db = openMetricsDb(":memory:");
+    seedTimedJob(db, {
+      jobId: "job-opencode",
+      backend: "opencode",
+      status: "completed",
+      stopReason: "completed",
+    });
+    replaceToolStatsForJob(db, "job-opencode", {
+      bash: { count: 2, success: 2, failure: 0 },
+    });
+    seedTimedJob(db, {
+      jobId: "job-null",
+      backend: null,
+      status: "error",
+      stopReason: "error",
+      startedAt: "2026-08-01T11:00:00.000Z",
+      startedMs: Date.parse("2026-08-01T11:00:00.000Z"),
+    });
+    replaceToolStatsForJob(db, "job-null", {
+      bash: { count: 7, success: 0, failure: 7 },
+    });
+
+    const report = computeReport(db, { dbPath: ":memory:" });
+    assert.equal(report.toolStats.coverage.excludedJobCount, 1);
+    assert.equal(report.toolStats.coverage.coveredJobCount, 1);
+    assert.equal(report.toolStats.all.bash.count, 2);
+    assert.equal(report.toolStats.failedJobs.bash.count, 0);
+
+    const text = renderReportText(report);
+    assert.match(text, /coverage: opencode jobs only; 1 job on other backends excluded/);
+    assert.match(text, /bash  count 2  success 2  failure 0/);
+    assert.doesNotMatch(text, /bash  count 7/);
+  });
+
+  it("an omitted backend (upsert default NULL) is excluded the same as an explicit NULL", () => {
+    const db = openMetricsDb(":memory:");
+    seedTimedJob(db, {
+      jobId: "job-omitted",
+      status: "error",
+      stopReason: "error",
+    });
+    replaceToolStatsForJob(db, "job-omitted", {
+      bash: { count: 3, success: 0, failure: 3 },
+    });
+    const report = computeReport(db, { dbPath: ":memory:" });
+    assert.equal(report.toolStats.coverage.excludedJobCount, 1);
+    assert.equal(report.toolStats.coverage.coveredJobCount, 0);
+    assert.equal(report.toolStats.all.bash.count, 0);
+    assert.equal(report.toolStats.failedJobs.bash.count, 0);
+    const text = renderReportText(report);
+    assert.match(text, /no covered jobs in this window/);
+    assert.doesNotMatch(text, /  count 0  success 0  failure 0/);
+  });
+
+  it("--json carries the same coverage facts", () => {
+    const db = openMetricsDb(":memory:");
+    seedTimedJob(db, {
+      jobId: "job-opencode",
+      backend: "opencode",
+      status: "completed",
+      stopReason: "completed",
+    });
+    replaceToolStatsForJob(db, "job-opencode", {
+      bash: { count: 1, success: 1, failure: 0 },
+    });
+    seedTimedJob(db, {
+      jobId: "job-agy",
+      backend: "agy",
+      status: "error",
+      stopReason: "error",
+      startedAt: "2026-08-01T11:00:00.000Z",
+      startedMs: Date.parse("2026-08-01T11:00:00.000Z"),
+    });
+    const parsed = JSON.parse(renderReportJson(computeReport(db, { dbPath: ":memory:" })));
+    assert.equal(parsed.toolStats.coverage.backend, "opencode");
+    assert.equal(parsed.toolStats.coverage.excludedJobCount, 1);
+    assert.equal(parsed.toolStats.coverage.coveredJobCount, 1);
+    assert.equal(parsed.toolStats.all.bash.count, 1);
   });
 });
