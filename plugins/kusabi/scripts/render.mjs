@@ -369,12 +369,13 @@ function pushCapture(parts, { title, label, text, placeholder, truncation, hint 
  *        `captureCutNote`.
  * @returns {string}
  */
-export function renderBaseFacts({ baseSha, baseLog, statusOutput, untrackedFiles, truncation } = {}) {
+export function renderBaseFacts({ baseSha, baseLog, statusOutput, untrackedFiles, truncation, changeScope } = {}) {
   const parts = [];
   parts.push("### Base change-set context (machine-recorded)");
   parts.push("");
-  if (baseSha) {
-    parts.push("- Base commit: `" + baseSha + "`");
+  const effectiveBaseSha = changeScope?.resolved?.baseSha ?? baseSha;
+  if (effectiveBaseSha) {
+    parts.push("- Base commit: `" + effectiveBaseSha + "`");
   } else {
     parts.push("- Base commit: (unavailable)");
   }
@@ -386,28 +387,39 @@ export function renderBaseFacts({ baseSha, baseLog, statusOutput, untrackedFiles
     placeholder: "(unavailable)",
     truncation: truncation?.baseLog,
   });
-  pushCapture(parts, {
-    title: "Actual change set (`git status --porcelain`)",
-    label: "Change set",
-    text: statusOutput,
-    placeholder: "(empty change set)",
-    truncation: truncation?.status,
-    hint: " More files changed than are listed above; `diff_in_container` reports the complete file list.",
-  });
+
+  if (changeScope) {
+    parts.push("Authoritative change set (`change-scope`):");
+    parts.push("```json");
+    parts.push(JSON.stringify(changeScope, null, 2));
+    parts.push("```");
+    parts.push("");
+    parts.push("This machine-resolved change set is authoritative (porcelain is not the range). Review ONLY the paths listed in `paths.*` above: do not interpret a path outside `paths.*` as this round's change; do not flag base-history files as scope creep.");
+    parts.push("");
+  } else {
+    pushCapture(parts, {
+      title: "Actual change set (`git status --porcelain`)",
+      label: "Change set",
+      text: statusOutput,
+      placeholder: "(empty change set)",
+      truncation: truncation?.status,
+      hint: " More files changed than are listed above; `diff_in_container` reports the complete file list.",
+    });
+  }
 
   // The diff body is deliberately absent, so the input says so in the words a
   // reviewer cannot misread as "the file list is the change".
   parts.push("**The diff itself is NOT included in this input.** The change set above names WHICH files changed, not WHAT changed inside them -- do not review the file list as if it were the change.");
   parts.push("");
-  if (baseSha) {
-    parts.push("Fetching the diff is YOUR job: call `diff_in_container` with `base` set to `" + baseSha + "` (that covers committed AND uncommitted work since that commit), and page through it with `offset` / `limit` until `has_more` is false.");
+  if (effectiveBaseSha) {
+    parts.push("Fetching the diff is YOUR job: call `diff_in_container` with `base` set to `" + effectiveBaseSha + "` (that covers committed AND uncommitted work since that commit), and page through it with `offset` / `limit` until `has_more` is false.");
   } else {
     parts.push("Fetching the diff is YOUR job: call `diff_in_container` -- the base commit could not be read here, so pass `worktree: true` for the uncommitted change set -- and page through it with `offset` / `limit` until `has_more` is false.");
   }
   parts.push("");
 
-  // Untracked files
-  if (untrackedFiles && untrackedFiles.trim()) {
+  // Untracked files (only when changeScope is absent; changeScope includes paths.untracked)
+  if (!changeScope && untrackedFiles && untrackedFiles.trim()) {
     const overBudget = untrackedFiles.length > DIFF_BUDGET;
     const body = overBudget ? untrackedFiles.slice(0, DIFF_BUDGET) : untrackedFiles;
     const untrackedList = body.split("\n").filter(function (l) { return l.trim(); }).map(function (l) { return l.trim(); });
@@ -458,9 +470,10 @@ export function renderBaseFacts({ baseSha, baseLog, statusOutput, untrackedFiles
  * @param {string} [opts.statusOutput]   `git status --porcelain` output.
  * @param {string} [opts.untrackedFiles] Newline-separated untracked paths.
  * @param {object} [opts.truncation]     Per-capture paging facts; see renderBaseFacts.
+ * @param {object} [opts.changeScope]    Parsed change-scope JSON (formatVersion: 1).
  * @returns {string}
  */
-export function renderContainerReviewInput({ container, baseSha, baseLog, statusOutput, untrackedFiles, truncation } = {}) {
+export function renderContainerReviewInput({ container, baseSha, baseLog, statusOutput, untrackedFiles, truncation, changeScope } = {}) {
   const parts = [
     "## Review target",
     "",
@@ -473,7 +486,7 @@ export function renderContainerReviewInput({ container, baseSha, baseLog, status
     "",
     "Do NOT rely on host cwd git state; the actual changes are in the container.",
   ];
-  parts.push("", renderBaseFacts({ baseSha, baseLog, statusOutput, untrackedFiles, truncation }));
+  parts.push("", renderBaseFacts({ baseSha, baseLog, statusOutput, untrackedFiles, truncation, changeScope }));
   return parts.join("\n");
 }
 

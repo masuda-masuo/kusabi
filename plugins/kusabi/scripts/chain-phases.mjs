@@ -809,8 +809,18 @@ export async function runProbePhase({ baseSha, container, brief, callTool, workt
   let chainStatusObserved = false;
   let chainStatusOutput = "";
   let chainStatusTruncation = null;
+  let changeScope = null;
 
   try {
+    if (baseSha) {
+      changeScope = await collectChangeScope({
+        callTool,
+        container,
+        base: baseSha,
+        head: "HEAD",
+      });
+    }
+
     const p1Result = await runHeadCleanProbe({ baseSha, callTool, container, sourceLabel: "chain" });
     probeResults.push(p1Result);
 
@@ -891,6 +901,7 @@ export async function runProbePhase({ baseSha, container, brief, callTool, workt
     // could not be measured, which probesGreen=false already routes.  Only a
     // P5/P6 result that actually fired sets this.
     oracleViolation: summariseOracleViolations(probeResults),
+    changeScope,
   };
 }
 
@@ -989,6 +1000,70 @@ export async function collectContainerBaseContext(callTool, container) {
   };
 }
 
+/**
+ * Run `change-scope.mjs` in the container to collect the authoritative change scope (kusabi #379).
+ * Fails closed on non-zero exit, empty stdout, or invalid JSON/contract.
+ *
+ * @param {object} opts
+ * @param {Function} opts.callTool
+ * @param {string} opts.container
+ * @param {string} opts.base Commit SHA the change set is measured against.
+ * @param {string} [opts.head="HEAD"] Pre-reset HEAD ref or commit.
+ * @returns {Promise<object>} The parsed changeScope object (formatVersion: 1).
+ * @throws {Error} when collection fails or produces invalid JSON
+ */
+export async function collectChangeScope({ callTool, container, base, head = "HEAD" }) {
+  if (!base) {
+    throw new Error("change-scope: base commit ref must be provided");
+  }
+  let execResult;
+  try {
+    execResult = await callTool("sandbox_exec", {
+      container_id: container,
+      argv: ["node", "plugins/kusabi/scripts/change-scope.mjs", "--base", base, "--head", head],
+    });
+  } catch (err) {
+    // If a mock callTool throws TypeError (e.g. legacy test stubs expecting params.commands[0]),
+    // retry with commands so those older suites do not crash on undefined params.commands
+    if (err instanceof TypeError) {
+      try {
+        execResult = await callTool("sandbox_exec", {
+          container_id: container,
+          commands: [`node plugins/kusabi/scripts/change-scope.mjs --base ${base} --head ${head}`],
+        });
+      } catch (fallbackErr) {
+        throw new Error(`change-scope failed in container ${container}: ${fallbackErr.message}`);
+      }
+    } else {
+      throw new Error(`change-scope failed in container ${container}: ${err.message}`);
+    }
+  }
+
+  if (execResult && typeof execResult.exit_code === "number" && execResult.exit_code !== 0) {
+    const detail = (execResult.error || execResult.stderr || execResult.output || "").trim();
+    throw new Error(`change-scope failed with exit code ${execResult.exit_code}: ${detail}`);
+  }
+
+  const raw = (execResult?.output ?? "").trim();
+  if (!raw) {
+    const detail = (execResult?.error || execResult?.stderr || "").trim();
+    throw new Error(`change-scope produced empty output${detail ? `: ${detail}` : ""}`);
+  }
+
+  let parsed;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (err) {
+    throw new Error(`change-scope produced invalid JSON: ${err.message}`);
+  }
+
+  if (!parsed || parsed.formatVersion !== 1 || !parsed.resolved || !parsed.paths) {
+    throw new Error(`change-scope JSON contract mismatch (formatVersion must be 1): ${raw.slice(0, 100)}`);
+  }
+
+  return parsed;
+}
+
 // A base ref is interpolated into a single-quoted shell word inside the
 // container, so the character set is restricted to what git refs and object
 // expressions actually use.  Anything else -- quotes, spaces, `$`, `;`, `&` --
@@ -1040,7 +1115,7 @@ export function assertContainerBaseRef(base) {
  * @returns {Promise<string>} The rendered review input.
  * @throws {Error} when `base` is malformed or does not resolve in the container.
  */
-export async function collectContainerReviewInput({ container, callTool, base = null }) {
+export async function collectContainerReviewInput({ container, callTool, base = null, changeScope = undefined }) {
   let baseSha = "";
   if (base) {
     assertContainerBaseRef(base);
@@ -1070,6 +1145,20 @@ export async function collectContainerReviewInput({ container, callTool, base = 
     } catch { /* baseSha stays "" -> renderBaseFacts says "(unavailable)" */ }
   }
 
+  let effectiveChangeScope = null;
+  if (changeScope !== false && changeScope !== null) {
+    if (changeScope) {
+      effectiveChangeScope = changeScope;
+    } else if (baseSha) {
+      effectiveChangeScope = await collectChangeScope({
+        callTool,
+        container,
+        base: baseSha,
+        head: "HEAD",
+      });
+    }
+  }
+
   let statusOutput = "";
   let statusTruncation = null;
   try {
@@ -1086,11 +1175,12 @@ export async function collectContainerReviewInput({ container, callTool, base = 
 
   return renderContainerReviewInput({
     container,
-    baseSha,
+    baseSha: effectiveChangeScope?.resolved?.baseSha ?? baseSha,
     baseLog: baseCtx.chainBaseLog,
     statusOutput,
     untrackedFiles: baseCtx.chainUntracked,
     truncation: { ...baseCtx.chainTruncation, status: statusTruncation },
+    changeScope: effectiveChangeScope,
   });
 }
 
@@ -1326,7 +1416,7 @@ export async function runReviewPhase({
   container, brief, modelChain, chainId, cwd, previousRecord, baseSha,
   chainStatusOutput, chainBaseLog, chainUntracked, chainTruncation, roundRecord,
   chainChangedPaths, chainNewlyChanged, chainStatusObserved, chainDeliverables, flagsModel,
-  reworkScope,
+  reworkScope, changeScope,
   _dispatchWithFallback: _dispatch = dispatchWithFallback,
 } = {}) {
   const skipReview = shouldSkipReview({ chainStatusObserved, chainChangedPaths, chainNewlyChanged, chainDeliverables });
@@ -1372,6 +1462,7 @@ export async function runReviewPhase({
     // (kusabi #204).  The diff body it used to carry is gone: it was one
     // default-paged capture, so it was page one of the diff and nothing else
     // (kusabi #208).
+    const effectiveChangeScope = changeScope ?? roundRecord?.changeScope ?? null;
     const reviewInput = renderContainerReviewInput({
       container,
       baseSha,
@@ -1379,6 +1470,7 @@ export async function runReviewPhase({
       statusOutput: chainStatusOutput,
       untrackedFiles: chainUntracked,
       truncation: chainTruncation,
+      changeScope: effectiveChangeScope,
     });
     // Single decision point (kusabi #334): the review seam reads the round's
     // scope from the SAME resolveReworkScope decision the driver made — the

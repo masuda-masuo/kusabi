@@ -3344,9 +3344,20 @@ describe("runProbePhase return value", () => {
       commands,
       callTool: async (toolName, params) => {
         if (toolName !== "sandbox_exec") return { output: "" };
-        const cmd = params.commands[0];
+        const cmd = params.commands?.[0] ?? params.argv?.join(" ") ?? "";
         commands.push(cmd);
         if (throwOn && cmd.startsWith(throwOn)) throw new Error("container is gone");
+        if (cmd.includes("change-scope.mjs")) {
+          return {
+            output: JSON.stringify({
+              formatVersion: 1,
+              repositoryRoot: "/workspace",
+              input: { base: "abc1234", head: "HEAD" },
+              resolved: { baseSha: "abc1234", headSha: "abc1234", mergeBaseSha: "abc1234" },
+              paths: { committed: [], staged: [], unstaged: [], untracked: [] },
+            }),
+          };
+        }
         if (cmd === "git status --porcelain") return statusEnvelope ?? { output: status };
         if (cmd.startsWith("git ls-files --others")) return { output: untracked };
         return { output: "" };
@@ -3449,7 +3460,18 @@ describe("runProbePhase return value", () => {
         return { gate_passed: true, lint: [], types: [], tests: { full: { status: "ok", passed: 1, total: 1 } } };
       }
       if (toolName !== "sandbox_exec") return { output: "" };
-      const cmd = params.commands[0];
+      const cmd = params.commands?.[0] ?? params.argv?.join(" ") ?? "";
+      if (cmd.includes("change-scope.mjs")) {
+        return {
+          output: JSON.stringify({
+            formatVersion: 1,
+            repositoryRoot: "/workspace",
+            input: { base: "abc1234", head: "HEAD" },
+            resolved: { baseSha: "abc1234", headSha: "abc1234", mergeBaseSha: "abc1234" },
+            paths: { committed: [], staged: [], unstaged: ["src/a.js"], untracked: [] },
+          }),
+        };
+      }
       if (cmd === "git status --porcelain") return { output: " M src/a.js\n" };
       if (cmd === "git diff") return { output: "" };
       if (cmd.startsWith("git ls-files --others")) return { output: "" };
@@ -3489,7 +3511,18 @@ describe("runProbePhase return value", () => {
         };
       }
       if (toolName !== "sandbox_exec") return { output: "" };
-      const cmd = params.commands[0];
+      const cmd = params.commands?.[0] ?? params.argv?.join(" ") ?? "";
+      if (cmd.includes("change-scope.mjs")) {
+        return {
+          output: JSON.stringify({
+            formatVersion: 1,
+            repositoryRoot: "/workspace",
+            input: { base: "abc1234", head: "HEAD" },
+            resolved: { baseSha: "abc1234", headSha: "abc1234", mergeBaseSha: "abc1234" },
+            paths: { committed: [], staged: [], unstaged: ["src/a.js"], untracked: [] },
+          }),
+        };
+      }
       if (cmd === "git diff") return { output: "" };
       if (cmd.startsWith("git ls-files --others")) return { output: "" };
       return { output: "" };
@@ -6380,6 +6413,7 @@ describe("chain review prompt byte-identity", () => {
         if (cmd === "git ls-files --others --exclude-standard") return { output: "src/new.js\n" };
         return { output: "" };
       },
+      changeScope: false,
     });
     assert.equal(taskInput, GOLDEN_CHAIN_REVIEW_INPUT);
     assert.ok(prompt.includes(taskInput));
@@ -6520,18 +6554,30 @@ describe("collectContainerReviewInput", () => {
     return {
       commands,
       callTool: async (tool, params) => {
-        const cmd = params.commands?.[0] ?? "";
+        const cmd = params.commands?.[0] ?? params.argv?.join(" ") ?? "";
         commands.push(cmd);
-        return handler(cmd);
+        return handler(cmd, params);
       },
     };
   }
 
-  function defaultHandler(cmd) {
-    if (cmd === "git rev-parse HEAD") return { output: "deadbeefcafe\n" };
-    if (cmd === "git status --porcelain") return { output: " M src/foo.js\n" };
-    if (cmd === "git log --oneline -5") return { output: "deadbee latest\n" };
-    if (cmd === "git ls-files --others --exclude-standard") return { output: "src/new.js\n" };
+  const DUMMY_SCOPE = {
+    formatVersion: 1,
+    repositoryRoot: "/workspace",
+    input: { base: "deadbeefcafe", head: "HEAD" },
+    resolved: { baseSha: "deadbeefcafe", headSha: "deadbeefcafe", mergeBaseSha: "deadbeefcafe" },
+    paths: { committed: [], staged: [], unstaged: ["src/foo.js"], untracked: ["src/new.js"] },
+  };
+
+  function defaultHandler(cmd, params) {
+    const fullCmd = params?.commands?.[0] ?? params?.argv?.join(" ") ?? (typeof cmd === "string" ? cmd : "");
+    if (fullCmd.includes("change-scope.mjs")) {
+      return { output: JSON.stringify(DUMMY_SCOPE) };
+    }
+    if (fullCmd === "git rev-parse HEAD") return { output: "deadbeefcafe\n" };
+    if (fullCmd === "git status --porcelain") return { output: " M src/foo.js\n" };
+    if (fullCmd === "git log --oneline -5") return { output: "deadbee latest\n" };
+    if (fullCmd === "git ls-files --others --exclude-standard") return { output: "src/new.js\n" };
     return { output: "" };
   }
 
@@ -6543,8 +6589,9 @@ describe("collectContainerReviewInput", () => {
     assert.ok(input.includes("container `cid123`"));
     assert.ok(input.includes("`diff_in_container`"));
     assert.ok(input.includes("- Base commit: `deadbeefcafe`"));
-    assert.ok(input.includes(" M src/foo.js"));
-    assert.ok(input.includes("- `src/new.js`"));
+    assert.ok(input.includes('"formatVersion": 1'));
+    assert.ok(input.includes('"src/foo.js"'));
+    assert.ok(input.includes('"src/new.js"'));
     // The base is what the reviewer cannot derive, so it is named as the ref
     // to fetch against; the diff body is not captured at all (kusabi #208).
     assert.ok(input.includes("Fetching the diff is YOUR job"));
@@ -6552,6 +6599,7 @@ describe("collectContainerReviewInput", () => {
     assert.ok(!input.includes("diff --git"));
     // Same default the chain uses: HEAD.
     assert.ok(commands.includes("git rev-parse HEAD"));
+    assert.ok(commands.some((c) => c.includes("change-scope.mjs")));
     assert.ok(
       !commands.some((c) => c.startsWith("git diff")),
       `no git diff may be issued, got: ${JSON.stringify(commands)}`,
@@ -6559,21 +6607,35 @@ describe("collectContainerReviewInput", () => {
   });
 
   it("with --base, resolves that ref and names it as the ref to diff against", async () => {
-    const { commands, callTool } = recordingTool((cmd) => {
-      if (cmd.startsWith("git rev-parse --verify")) return { output: "c355fa61a7fee5402ed7ba999bd2fe2eeb46a842\n" };
-      if (cmd === "git status --porcelain") return { output: " M src/foo.js\n" };
-      if (cmd === "git log --oneline -5") return { output: "c355fa6 base\n" };
+    const { commands, callTool } = recordingTool((cmd, params) => {
+      const fullCmd = params?.commands?.[0] ?? params?.argv?.join(" ") ?? (typeof cmd === "string" ? cmd : "");
+      if (fullCmd.includes("change-scope.mjs")) {
+        return {
+          output: JSON.stringify({
+            formatVersion: 1,
+            repositoryRoot: "/workspace",
+            input: { base: "c355fa61a7fee5402ed7ba999bd2fe2eeb46a842", head: "HEAD" },
+            resolved: { baseSha: "c355fa61a7fee5402ed7ba999bd2fe2eeb46a842", headSha: "deadbeefcafe", mergeBaseSha: "c355fa61a7fee5402ed7ba999bd2fe2eeb46a842" },
+            paths: { committed: [], staged: [], unstaged: ["src/foo.js"], untracked: [] },
+          }),
+        };
+      }
+      if (fullCmd.startsWith("git rev-parse --verify")) return { output: "c355fa61a7fee5402ed7ba999bd2fe2eeb46a842\n" };
+      if (fullCmd === "git status --porcelain") return { output: " M src/foo.js\n" };
+      if (fullCmd === "git log --oneline -5") return { output: "c355fa6 base\n" };
       return { output: "" };
     });
     const input = await collectContainerReviewInput({ container: "cid123", callTool, base: "c355fa6" });
 
     assert.ok(commands.some((c) => c.startsWith("git rev-parse --verify --quiet 'c355fa6^{commit}'")));
+    assert.ok(commands.some((c) => c.includes("change-scope.mjs")));
     assert.ok(
       !commands.some((c) => c.startsWith("git diff")),
       `--base must reach the reviewer as an instruction, not a capture, got: ${JSON.stringify(commands)}`,
     );
     assert.ok(input.includes("- Base commit: `c355fa61a7fee5402ed7ba999bd2fe2eeb46a842`"));
     assert.ok(input.includes("`base` set to `c355fa61a7fee5402ed7ba999bd2fe2eeb46a842`"));
+    assert.ok(input.includes('"formatVersion": 1'));
   });
 
   it("labels a change-set list the container paged, counting the lines it actually shows", async () => {
@@ -6600,7 +6662,7 @@ describe("collectContainerReviewInput", () => {
       }
       return { output: "" };
     });
-    const input = await collectContainerReviewInput({ container: "cid123", callTool });
+    const input = await collectContainerReviewInput({ container: "cid123", callTool, changeScope: false });
     assert.ok(input.includes("**Change set truncated (showing 50 of 137 lines).**"));
     assert.ok(!input.includes("showing 137 of 137"), "the response's own shown-count must never be rendered");
     assert.ok(input.includes("`diff_in_container` reports the complete file list"));
@@ -6631,7 +6693,7 @@ describe("collectContainerReviewInput", () => {
       }
       return { output: "" };
     });
-    const input = await collectContainerReviewInput({ container: "cid123", callTool });
+    const input = await collectContainerReviewInput({ container: "cid123", callTool, changeScope: false });
     assert.ok(input.includes("**Change set truncated (showing 25 of 61 lines).**"));
   });
 
@@ -6644,7 +6706,7 @@ describe("collectContainerReviewInput", () => {
       if (cmd === "git ls-files --others --exclude-standard") return complete("src/new.js\n");
       return complete("");
     });
-    const input = await collectContainerReviewInput({ container: "cid123", callTool });
+    const input = await collectContainerReviewInput({ container: "cid123", callTool, changeScope: false });
     assert.ok(!input.includes("truncated"), "a complete capture must not be labelled as cut");
   });
 
@@ -6693,7 +6755,7 @@ describe("collectContainerReviewInput", () => {
       if (cmd === "git log --oneline -5") return { output: "deadbee latest\n" };
       return { output: "" };
     });
-    const input = await collectContainerReviewInput({ container: "cid123", callTool });
+    const input = await collectContainerReviewInput({ container: "cid123", callTool, changeScope: false });
     assert.ok(input.includes("(empty change set)"));
     assert.ok(input.includes("`base` set to `deadbeefcafe`"));
     assert.ok(!input.includes("```diff"));
@@ -6728,8 +6790,20 @@ describe("base ref reaches the reviewer as an instruction, not a capture", () =>
     return {
       commands,
       callTool: async (tool, params) => {
-        const cmd = params.commands?.[0] ?? "";
+        const cmd = params.commands?.[0] ?? params.argv?.join(" ") ?? "";
         commands.push(cmd);
+        if (cmd.includes("change-scope.mjs")) {
+          const base = cmd.includes("c355fa61a7fee5402ed7ba999bd2fe2eeb46a842") ? "c355fa61a7fee5402ed7ba999bd2fe2eeb46a842" : "deadbeefcafe";
+          return {
+            output: JSON.stringify({
+              formatVersion: 1,
+              repositoryRoot: "/workspace",
+              input: { base, head: "HEAD" },
+              resolved: { baseSha: base, headSha: "deadbeefcafe", mergeBaseSha: base },
+              paths: { committed: [], staged: [], unstaged: [], untracked: [] },
+            }),
+          };
+        }
         if (cmd.startsWith("git rev-parse --verify")) return { output: "c355fa61a7fee5402ed7ba999bd2fe2eeb46a842\n" };
         if (cmd === "git rev-parse HEAD") return { output: "deadbeefcafe\n" };
         return { output: "" };
@@ -7061,7 +7135,18 @@ describe("runProbePhase — P5/P6 wiring (kusabi #197)", () => {
         return results[Math.min(verifyCalls.length - 1, results.length - 1)];
       }
       if (toolName !== "sandbox_exec") return { output: "" };
-      const cmd = params.commands[0];
+      const cmd = params.commands?.[0] ?? params.argv?.join(" ") ?? "";
+      if (cmd.includes("change-scope.mjs")) {
+        return {
+          output: JSON.stringify({
+            formatVersion: 1,
+            repositoryRoot: "/workspace",
+            input: { base: "abc1234", head: "HEAD" },
+            resolved: { baseSha: "abc1234", headSha: "abc1234", mergeBaseSha: "abc1234" },
+            paths: { committed: [], staged: [], unstaged: [], untracked: [] },
+          }),
+        };
+      }
       if (cmd === "git status --porcelain") return { output: status };
       return { output: "" };
     };
@@ -7409,5 +7494,264 @@ describe("runReviewPhase — scope-aware prior findings (kusabi #334)", () => {
     assert.deepEqual(inScopeFindingFiles(prev, undefined), ["src/a.js", "src/b.js"]);
     // Old record without findingFiles: full scope degrades to undefined.
     assert.equal(inScopeFindingFiles({ findingsText: "x" }, undefined), undefined);
+  });
+});
+
+
+// ---------------------------------------------------------------------------
+// change-scope wiring into review and probe phases (kusabi #379)
+// ---------------------------------------------------------------------------
+
+describe("change-scope wiring into review and probe phases (kusabi #379)", () => {
+  const FIXTURE_CHANGE_SCOPE = {
+    formatVersion: 1,
+    repositoryRoot: "/workspace",
+    input: { base: "base-sha-123", head: "HEAD" },
+    resolved: {
+      baseSha: "base-sha-123",
+      headSha: "head-sha-456",
+      mergeBaseSha: "base-sha-123",
+    },
+    paths: {
+      committed: ["src/committed.js"],
+      staged: ["src/staged.js"],
+      unstaged: ["src/unstaged.js"],
+      untracked: ["src/untracked.js"],
+    },
+  };
+
+  it("runProbePhase issues change-scope before git reset --mixed and resets when HEAD != base", async () => {
+    const executed = [];
+    const callTool = async (toolName, params) => {
+      if (toolName === "verify_in_container") {
+        return { gate_passed: true, lint: [], types: [], tests: { full: { status: "ok", passed: 10, total: 10 } } };
+      }
+      if (toolName !== "sandbox_exec") return { output: "" };
+      const cmd = params.commands?.[0] ?? params.argv?.join(" ") ?? "";
+      executed.push({ cmd, argv: params.argv, commands: params.commands });
+      if (cmd.includes("change-scope.mjs")) {
+        return { output: JSON.stringify(FIXTURE_CHANGE_SCOPE) };
+      }
+      if (cmd === "git rev-parse HEAD") {
+        return { output: "head-sha-456\n" }; // HEAD != baseSha ("base-sha-123")
+      }
+      if (cmd.startsWith("git reset --mixed")) {
+        return { output: "Unstaged changes after reset:\n" };
+      }
+      if (cmd === "git status --porcelain") {
+        return { output: " M src/unstaged.js\n" };
+      }
+      return { output: "" };
+    };
+
+    const result = await runProbePhase({
+      baseSha: "base-sha-123",
+      container: "cid-probe-order",
+      brief: "## Deliverables\n\n- `src/unstaged.js`\n",
+      callTool,
+      verifyBaseline: { captured: true, gate_passed: true, lint: 0, types: 0, collected: 10, raw: {} },
+    });
+
+    // 1. Assert change-scope was executed with argv and BEFORE git reset --mixed
+    const changeScopeIdx = executed.findIndex((e) => e.cmd.includes("change-scope.mjs"));
+    const resetIdx = executed.findIndex((e) => e.cmd.startsWith("git reset --mixed"));
+    assert.ok(changeScopeIdx >= 0, "change-scope must be invoked");
+    assert.ok(executed[changeScopeIdx].argv, "change-scope must be invoked with argv");
+    assert.equal(executed[changeScopeIdx].commands, undefined, "change-scope must not pass commands when argv is provided");
+    assert.deepEqual(executed[changeScopeIdx].argv, ["node", "plugins/kusabi/scripts/change-scope.mjs", "--base", "base-sha-123", "--head", "HEAD"]);
+    assert.ok(resetIdx >= 0, "git reset --mixed must be invoked when HEAD != base");
+    assert.ok(changeScopeIdx < resetIdx, "change-scope must run before git reset --mixed");
+
+    // 2. Assert changeScope is returned on probeResult
+    assert.deepEqual(result.changeScope, FIXTURE_CHANGE_SCOPE);
+
+    // 3. Assert P1 still ran and passed with auto-reset detail
+    const p1 = result.probeResults.find((p) => p.probe === "P1: HEAD clean");
+    assert.ok(p1 && p1.passed);
+    assert.match(p1.detail, /auto reset - reset OK/);
+  });
+
+  it("change-scope non-zero exit fails closed in runProbePhase (probes fail, no review range)", async () => {
+    const callTool = async (toolName, params) => {
+      if (toolName !== "sandbox_exec") return { output: "" };
+      const cmd = params.commands?.[0] ?? params.argv?.join(" ") ?? "";
+      if (cmd.includes("change-scope.mjs")) {
+        return { exit_code: 1, stderr: "change-scope: base ref not found\n", output: "change-scope: base ref not found\n" };
+      }
+      return { output: "" };
+    };
+
+    const result = await runProbePhase({
+      baseSha: "bad-base",
+      container: "cid-fail-closed",
+      brief: "## Deliverables\n\n- `src/foo.js`\n",
+      callTool,
+    });
+
+    // Fails closed: probesGreen is false, failed probe recorded
+    assert.equal(result.probesGreen, false);
+    assert.equal(result.changeScope, null);
+    const rpcProbe = result.probeResults.find((p) => p.passed === false);
+    assert.ok(rpcProbe, "must record failed probe");
+    assert.match(rpcProbe.detail, /change-scope failed with exit code 1/);
+  });
+
+  it("change-scope empty stdout fails closed in runProbePhase (probes fail, no review range)", async () => {
+    const callTool = async (toolName, params) => {
+      if (toolName !== "sandbox_exec") return { output: "" };
+      const cmd = params.commands?.[0] ?? params.argv?.join(" ") ?? "";
+      if (cmd.includes("change-scope.mjs")) {
+        return { output: "" };
+      }
+      return { output: "" };
+    };
+
+    const result = await runProbePhase({
+      baseSha: "empty-base",
+      container: "cid-fail-empty",
+      brief: "## Deliverables\n\n- `src/foo.js`\n",
+      callTool,
+    });
+
+    assert.equal(result.probesGreen, false);
+    assert.equal(result.changeScope, null);
+    const rpcProbe = result.probeResults.find((p) => p.passed === false);
+    assert.ok(rpcProbe, "must record failed probe");
+    assert.match(rpcProbe.detail, /change-scope produced empty output/);
+  });
+
+  it("change-scope invalid JSON fails closed in collectContainerReviewInput (throws, does not substitute porcelain)", async () => {
+    const callTool = async (toolName, params) => {
+      if (toolName !== "sandbox_exec") return { output: "" };
+      const cmd = params.commands?.[0] ?? params.argv?.join(" ") ?? "";
+      if (cmd.includes("change-scope.mjs")) {
+        return { output: "not valid json {{" };
+      }
+      if (cmd.startsWith("git rev-parse --verify") || cmd === "git rev-parse HEAD") return { output: "base123\n" };
+      if (cmd === "git status --porcelain") return { output: " M porcelain-file.js\n" };
+      return { output: "" };
+    };
+
+    await assert.rejects(
+      () => collectContainerReviewInput({ container: "cid-fail-json", callTool, base: "base123" }),
+      /change-scope produced invalid JSON/,
+    );
+  });
+
+  it("change-scope empty stdout fails closed in collectContainerReviewInput (throws, does not substitute porcelain)", async () => {
+    const callTool = async (toolName, params) => {
+      if (toolName !== "sandbox_exec") return { output: "" };
+      const cmd = params.commands?.[0] ?? params.argv?.join(" ") ?? "";
+      if (cmd.includes("change-scope.mjs")) {
+        return { output: "" };
+      }
+      if (cmd.startsWith("git rev-parse --verify") || cmd === "git rev-parse HEAD") return { output: "base123\n" };
+      if (cmd === "git status --porcelain") return { output: " M porcelain-file.js\n" };
+      return { output: "" };
+    };
+
+    await assert.rejects(
+      () => collectContainerReviewInput({ container: "cid-fail-empty-task", callTool, base: "base123" }),
+      /change-scope produced empty output/,
+    );
+  });
+
+  it("change-scope empty stdout fails closed for container cid123 (no production special-case)", async () => {
+    const callTool = async (toolName, params) => {
+      if (toolName !== "sandbox_exec") return { output: "" };
+      const cmd = params.commands?.[0] ?? params.argv?.join(" ") ?? "";
+      if (cmd.includes("change-scope.mjs")) {
+        return { output: "" };
+      }
+      if (cmd.startsWith("git rev-parse --verify") || cmd === "git rev-parse HEAD") return { output: "base123\n" };
+      if (cmd === "git status --porcelain") return { output: " M porcelain-file.js\n" };
+      return { output: "" };
+    };
+
+    await assert.rejects(
+      () => collectContainerReviewInput({ container: "cid123", callTool, base: "base123" }),
+      /change-scope produced empty output/,
+    );
+  });
+
+
+
+  it("change-scope formatVersion contract mismatch fails closed in collectContainerReviewInput", async () => {
+    const callTool = async (toolName, params) => {
+      if (toolName !== "sandbox_exec") return { output: "" };
+      const cmd = params.commands?.[0] ?? params.argv?.join(" ") ?? "";
+      if (cmd.includes("change-scope.mjs")) {
+        return { output: JSON.stringify({ formatVersion: 2, resolved: {}, paths: {} }) };
+      }
+      if (cmd.startsWith("git rev-parse --verify") || cmd === "git rev-parse HEAD") return { output: "base123\n" };
+      return { output: "" };
+    };
+
+    await assert.rejects(
+      () => collectContainerReviewInput({ container: "cid-fail-contract", callTool, base: "base123" }),
+      /change-scope JSON contract mismatch/,
+    );
+  });
+
+  it("collectContainerReviewInput records change-scope invocation, contains JSON, and runs no git diff", async () => {
+    const invocations = [];
+    const commands = [];
+    const callTool = async (toolName, params) => {
+      const cmd = params.commands?.[0] ?? params.argv?.join(" ") ?? "";
+      commands.push(cmd);
+      invocations.push({ toolName, params });
+      if (cmd.includes("change-scope.mjs")) {
+        return { output: JSON.stringify(FIXTURE_CHANGE_SCOPE) };
+      }
+      if (cmd.startsWith("git rev-parse --verify")) {
+        return { output: "base-sha-123\n" };
+      }
+      return { output: "" };
+    };
+
+    const input = await collectContainerReviewInput({ container: "cid-scope-test", callTool, base: "base-sha-123" });
+
+    // Records change-scope invocation with argv and without commands
+    const scopeCall = invocations.find((i) => i.params?.argv?.some((a) => a.includes("change-scope.mjs")));
+    assert.ok(scopeCall, "must invoke change-scope.mjs with argv");
+    assert.equal(scopeCall.params.commands, undefined, "must not pass commands when argv is used");
+    assert.deepEqual(scopeCall.params.argv, ["node", "plugins/kusabi/scripts/change-scope.mjs", "--base", "base-sha-123", "--head", "HEAD"]);
+    // Existing assertion: no git diff may be issued
+    assert.ok(!commands.some((c) => c.startsWith("git diff")), "no git diff may be issued");
+    // Rendered input contains the JSON
+    assert.ok(input.includes("Authoritative change set (`change-scope`):"));
+    assert.ok(input.includes('"formatVersion": 1'));
+    assert.ok(input.includes('"src/committed.js"'));
+    assert.ok(input.includes('"src/staged.js"'));
+    assert.ok(input.includes('"src/unstaged.js"'));
+    assert.ok(input.includes('"src/untracked.js"'));
+    // Diff instruction names base
+    assert.ok(input.includes("Fetching the diff is YOUR job"));
+    assert.ok(input.includes("`base` set to `base-sha-123`"));
+  });
+
+  it("collectReviewContext does not invoke change-scope.mjs", async () => {
+    const commands = [];
+    const callTool = async (toolName, params) => {
+      const cmd = params.commands?.[0] ?? params.argv?.join(" ") ?? "";
+      commands.push(cmd);
+      if (cmd === "git status --porcelain") return { output: "" };
+      if (cmd === "git log --oneline -5") return { output: "base commit\n" };
+      if (cmd.startsWith("git ls-files --others")) return { output: "" };
+      return { output: "" };
+    };
+
+    const reviewCtx = await collectReviewContext({
+      container: "cid-resume",
+      brief: "## Deliverables\n\n- `src/foo.js`\n",
+      callTool,
+      worktreeBaseline: null,
+      roundRecord: { changeScope: FIXTURE_CHANGE_SCOPE },
+    });
+
+    // Crucial check: change-scope was NOT executed
+    assert.ok(!commands.some((c) => c.includes("change-scope.mjs")), "collectReviewContext must not invoke change-scope.mjs");
+    // roundRecord is untouched and context is collected
+    assert.equal(reviewCtx.chainStatusObserved, true);
   });
 });
