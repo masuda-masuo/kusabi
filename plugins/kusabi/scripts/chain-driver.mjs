@@ -1375,6 +1375,7 @@ export async function runChainDriver({
     const {
       chainChangedPaths, chainNewlyChanged, chainStatusObserved,
       chainStatusOutput, chainBaseLog, chainDeliverables, chainUntracked, chainTruncation,
+      changeScope,
     } = probeCtx;
     // NOT const: an accept finalising on RECORDED probe truth re-measures it
     // first (kusabi #262), and everything downstream of the disposition —
@@ -1403,6 +1404,7 @@ export async function runChainDriver({
       // the same previousRecord when this is absent (review-resume callers
       // without a fresh scopeResolution, older callers).
       reworkScope,
+      changeScope: changeScope ?? roundRecord.changeScope ?? null,
     });
     // ---- phase 5b: qualifying refusal (kusabi #293) ----
     // `skipReview` is the empty-change-set signal the discard has always been
@@ -1963,6 +1965,7 @@ export async function runChainDriver({
           chainUntracked: reviewCtx.chainUntracked,
           chainTruncation: reviewCtx.chainTruncation,
           worktreeChanged: reviewCtx.worktreeChanged,
+          changeScope: roundRecord.changeScope ?? null,
         };
         // The interrupted round is the last record in `records`; the
         // previous COMPLETE round is the one before it.  Named once because
@@ -2151,6 +2154,7 @@ export async function runChainDriver({
       roundRecord.probesGreen = probeResult.probesGreen;
       roundRecord.probeResults = probeResult.probeResults;
       roundRecord.worktreeChanged = probeResult.worktreeChanged;
+      roundRecord.changeScope = probeResult.changeScope ?? null;
       // Closed terminal reason (kusabi #380): re-derive now that the chain
       // layer has measured substance.  A completed round whose worktree did
       // not change records infra-death (steps 0) or empty-completion

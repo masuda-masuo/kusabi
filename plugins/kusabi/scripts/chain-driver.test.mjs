@@ -41,6 +41,25 @@ import { parseSmoke } from "./brief-parsing.mjs";
 import { renderChainShow } from "./render.mjs";
 import { TERMINAL_DISPOSITIONS } from "./chain-wait.mjs";
 
+
+/** Valid change-scope JSON for driver mocks (kusabi #379). Production must not fabricate this. */
+function fakeChangeScopeResult(params) {
+  const cmd = params?.commands?.[0] ?? params?.argv?.join(" ") ?? "";
+  if (typeof cmd === "string" && cmd.includes("change-scope.mjs")) {
+    return {
+      output: JSON.stringify({
+        formatVersion: 1,
+        repositoryRoot: "/workspace",
+        input: { base: "abc123", head: "HEAD" },
+        resolved: { baseSha: "abc123", headSha: "abc123", mergeBaseSha: "abc123" },
+        paths: { committed: [], staged: [], unstaged: [], untracked: [] },
+      }),
+    };
+  }
+  return null;
+}
+
+
 // publishWarningForBrief — chain-start publish guard (kusabi #153)
 // ---------------------------------------------------------------------------
 // publish is orchestrator-exclusive; a brief that demands it cannot be
@@ -153,6 +172,8 @@ describe("runChainDriver resume", () => {
         return { gate_passed: true };
       }
       if (toolName !== "sandbox_exec") return { output: "" };
+      const scope = fakeChangeScopeResult(params);
+      if (scope) return scope;
       const cmd = params.commands[0];
       // captureWorktreeState: capture failure → baseline null (graceful)
       if (cmd.startsWith("cd /workspace &&") && cmd.includes("TMPIDX=")) {
@@ -644,6 +665,8 @@ describe("runChainDriver resume", () => {
         return { gate_passed: true, lint: [], types: [], tests: { full: { status: "ok", passed: 1, total: 1 } } };
       }
       if (toolName !== "sandbox_exec") return { output: "" };
+      const scope = fakeChangeScopeResult(params);
+      if (scope) return scope;
       const cmd = params.commands[0];
       if (cmd.startsWith("cd /workspace &&") && cmd.includes("TMPIDX=")) {
         return { output: "ERROR_NO_INDEX\n" };
@@ -898,7 +921,9 @@ describe("runChainDriver resume", () => {
         return verifyResult;
       }
       if (toolName === "sandbox_exec") {
-        execCalls.push(params.commands[0]);
+        const scope = fakeChangeScopeResult(params);
+        if (scope) return scope;
+        execCalls.push(params.commands?.[0] ?? params.argv?.join(" ") ?? "");
       }
       return base(toolName, params);
     };
@@ -1145,6 +1170,8 @@ describe("runChainDriver per-phase backends (kusabi #192)", () => {
         return { gate_passed: true };
       }
       if (toolName !== "sandbox_exec") return { output: "" };
+      const scope = fakeChangeScopeResult(params);
+      if (scope) return scope;
       const cmd = params.commands[0];
       if (cmd.startsWith("cd /workspace &&") && cmd.includes("TMPIDX=")) {
         return { output: "ERROR_NO_INDEX\n" };
@@ -1432,6 +1459,8 @@ describe("runChainDriver per-round rework tiering (kusabi #192 axis 2)", () => {
         return { gate_passed: true };
       }
       if (toolName !== "sandbox_exec") return { output: "" };
+      const scope = fakeChangeScopeResult(params);
+      if (scope) return scope;
       const cmd = params.commands[0];
       if (cmd.startsWith("cd /workspace &&") && cmd.includes("TMPIDX=")) {
         return { output: "ERROR_NO_INDEX\n" };
@@ -2053,6 +2082,8 @@ describe("chain-resume review dispatch fallback (kusabi #192 finding)", () => {
         return { gate_passed: true };
       }
       if (toolName !== "sandbox_exec") return { output: "" };
+      const scope = fakeChangeScopeResult(params);
+      if (scope) return scope;
       const cmd = params.commands[0];
       if (cmd.startsWith("cd /workspace &&") && cmd.includes("TMPIDX=")) {
         return { output: "ERROR_NO_INDEX\n" };
@@ -2366,6 +2397,8 @@ describe("runChainDriver rework scheduling", () => {
     return async (toolName, params) => {
       if (toolName === "verify_in_container") return { gate_passed: gatePassed };
       if (toolName !== "sandbox_exec") return { output: "" };
+      const scope = fakeChangeScopeResult(params);
+      if (scope) return scope;
       const cmd = params.commands[0];
       if (cmd.startsWith("cd /workspace &&") && cmd.includes("TMPIDX=")) return { output: "ERROR_NO_INDEX\n" };
       if (cmd === "git rev-parse HEAD") return { output: "abc123\n" };
@@ -2892,6 +2925,8 @@ describe("runChainDriver oracle routing", () => {
     return async (toolName, params) => {
       if (toolName === "verify_in_container") return verifyResult;
       if (toolName !== "sandbox_exec") return { output: "" };
+      const scope = fakeChangeScopeResult(params);
+      if (scope) return scope;
       const cmd = params.commands[0];
       // captureWorktreeState: capture failure → baseline null (graceful)
       if (cmd.startsWith("cd /workspace &&") && cmd.includes("TMPIDX=")) {
@@ -3137,6 +3172,8 @@ describe("runChainDriver resumed-accept oracle re-validation (kusabi #197 follow
         return verifyResult;
       }
       if (toolName !== "sandbox_exec") return { output: "" };
+      const scope = fakeChangeScopeResult(params);
+      if (scope) return scope;
       const cmd = params.commands[0];
       // captureWorktreeState: capture failure → baseline null (graceful)
       if (cmd.startsWith("cd /workspace &&") && cmd.includes("TMPIDX=")) {
@@ -3594,6 +3631,8 @@ describe("smokeBaselineReport baseline-red (kusabi #315)", () => {
     let statusCalls = 0;
     return async (toolName, params) => {
       if (toolName !== "sandbox_exec") return { output: "" };
+      const scope = fakeChangeScopeResult(params);
+      if (scope) return scope;
       const cmd = params.commands[0];
       if (cmd === "git status --porcelain") {
         const scripted = statuses[statusCalls] ?? "";
@@ -3945,6 +3984,8 @@ describe("smokeBaselineReport HEAD guard (kusabi #292 follow-up)", () => {
     let headCalls = 0;
     return async (toolName, params) => {
       if (toolName !== "sandbox_exec") return { output: "" };
+      const scope = fakeChangeScopeResult(params);
+      if (scope) return scope;
       const cmd = params.commands[0];
       if (cmd === "git status --porcelain") {
         const scripted = statuses[statusCalls] ?? "";
@@ -4779,6 +4820,8 @@ describe("runChainDriver qualifying refusal (kusabi #293)", () => {
         };
       }
       if (toolName !== "sandbox_exec") return { output: "" };
+      const scope = fakeChangeScopeResult(params);
+      if (scope) return scope;
       const cmd = params.commands[0];
       if (cmd.includes("test -e ")) {
         const lines = [];
@@ -5236,6 +5279,8 @@ describe("runChainDriver qualifying refusal (kusabi #293)", () => {
         };
       }
       if (toolName !== "sandbox_exec") return { output: "" };
+      const scope = fakeChangeScopeResult(params);
+      if (scope) return scope;
       const cmd = params.commands[0];
       execCalls.push(cmd);
       if (cmd.includes("test -e ")) {
@@ -5319,6 +5364,8 @@ describe("runChainDriver qualifying refusal (kusabi #293)", () => {
         };
       }
       if (toolName !== "sandbox_exec") return { output: "" };
+      const scope = fakeChangeScopeResult(params);
+      if (scope) return scope;
       const cmd = params.commands[0];
       if (cmd.includes("test -e ")) {
         throw new Error("container RPC dead");
@@ -5379,7 +5426,9 @@ describe("runChainDriver qualifying refusal (kusabi #293)", () => {
     const execCalls = [];
     const callTool = async (toolName, params) => {
       if (toolName === "sandbox_exec") {
-        execCalls.push(params.commands[0]);
+        const scope = fakeChangeScopeResult(params);
+        if (scope) return scope;
+        execCalls.push(params.commands?.[0] ?? params.argv?.join(" ") ?? "");
       }
       return { output: "" };
     };
@@ -5466,6 +5515,8 @@ describe("runChainDriver brief-syntax defect (kusabi #303)", () => {
         };
       }
       if (toolName !== "sandbox_exec") return { output: "" };
+      const scope = fakeChangeScopeResult(params);
+      if (scope) return scope;
       const cmd = params.commands[0];
       if (cmd.startsWith("cd /workspace &&") && cmd.includes("TMPIDX=")) {
         return { output: "ERROR_NO_INDEX\n" };
@@ -5662,7 +5713,7 @@ describe("runChainDriver brief-syntax defect (kusabi #303)", () => {
           model: "fake/model", modelChain: [["fake/model"]], maxRounds: 3,
           brief: "Implement X.\n", orchestrator: null, baseSha: "abc123", worktreeBaseline: null,
           verifyBaseline: null,
-          callTool: createFakeCallTool(),
+          callTool: async (toolName, params) => fakeChangeScopeResult(params) ?? createFakeCallTool()(toolName, params),
           dispatchWithFallback: approvingDispatch(),
           keepServe: true,
           signalReceived: () => false,
@@ -5698,7 +5749,7 @@ describe("runChainDriver brief-syntax defect (kusabi #303)", () => {
               model: "fake/model", modelChain: [["fake/model"]], maxRounds: 3,
               brief: "Implement X.\n", orchestrator: null, baseSha: "abc123", worktreeBaseline: null,
               verifyBaseline: null,
-              callTool: createFakeCallTool(),
+              callTool: async (toolName, params) => fakeChangeScopeResult(params) ?? createFakeCallTool()(toolName, params),
               dispatchWithFallback: customDispatch,
               keepServe: true,
               signalReceived: () => false,
@@ -5725,6 +5776,8 @@ describe("runChainDriver quota-exhausted review (kusabi #373)", () => {
     return async (toolName, params) => {
       if (toolName === "verify_in_container") return { gate_passed: true };
       if (toolName !== "sandbox_exec") return { output: "" };
+      const scope = fakeChangeScopeResult(params);
+      if (scope) return scope;
       const cmd = params.commands[0];
       if (cmd.startsWith("cd /workspace &&") && cmd.includes("TMPIDX=")) {
         return { output: "ERROR_NO_INDEX\n" };
@@ -5788,6 +5841,141 @@ describe("runChainDriver quota-exhausted review (kusabi #373)", () => {
       assert.equal(round1.disposition.disposition, "escalate");
       assert.match(round1.disposition.reason, /quota exhausted \(agy individual pool\)/);
       assert.doesNotMatch(round1.disposition.reason, /unparseable/);
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+});
+
+
+// ---------------------------------------------------------------------------
+// runChainDriver — change-scope fail-closed through the real driver path (kusabi #379)
+// ---------------------------------------------------------------------------
+// Empty stdout / non-zero exit from change-scope.mjs must fail the probe phase
+// closed: no changeScope is persisted, and the review prompt is not given a
+// fabricated authoritative scope. These go through runChainDriver (not an
+// isolated runProbePhase mock).
+
+describe("runChainDriver change-scope fail-closed (kusabi #379)", () => {
+  const BRIEF = "Implement X.\n\n## Deliverables\n- src/real.js\n";
+
+  function callToolForDriver(changeScopeResult) {
+    return async (toolName, params) => {
+      if (toolName === "verify_in_container") {
+        return {
+          gate_passed: true, lint: [], types: [],
+          tests: { full: { status: "ok", passed: 10, total: 10 } },
+        };
+      }
+      if (toolName !== "sandbox_exec") return { output: "" };
+      const cmd = params.commands?.[0] ?? params.argv?.join(" ") ?? "";
+      if (cmd.includes("change-scope.mjs")) {
+        return changeScopeResult;
+      }
+      if (cmd.startsWith("cd /workspace &&") && cmd.includes("TMPIDX=")) {
+        return { output: "ERROR_NO_INDEX\n" };
+      }
+      if (cmd === "git rev-parse HEAD") return { output: "abc123\n" };
+      if (cmd === "git status --porcelain") return { output: " M src/real.js\n" };
+      if (cmd === "git log --oneline -5") return { output: "abc123 latest\n" };
+      if (cmd === "git ls-files --others --exclude-standard") return { output: "" };
+      return { output: "" };
+    };
+  }
+
+  function recordingDispatch() {
+    const calls = [];
+    const dispatch = async (opts) => {
+      calls.push(opts);
+      if (opts.kind === "review") {
+        return {
+          job: {
+            id: "job-rev-1", status: "completed", modelEntry: "fake/review",
+            modelVariant: null, fallbacks: null, sessionID: "sess-rev",
+            usage: null, error: null,
+          },
+          resultText: JSON.stringify({ verdict: "approve", findings: [], summary: "ok" }),
+        };
+      }
+      return {
+        job: {
+          id: "job-imp-1", status: "completed", modelEntry: "fake/model",
+          modelVariant: null, fallbacks: null, sessionID: "sess-imp-1",
+          usage: null, error: null,
+        },
+        resultText: "implemented",
+      };
+    };
+    dispatch.calls = calls;
+    return dispatch;
+  }
+
+  async function runWith(changeScopeResult) {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-scope-fail-"));
+    const chainDir = path.join(tmp, "chains", "chain-scope");
+    fs.mkdirSync(chainDir, { recursive: true });
+    writeChainControl(chainDir, {
+      chainId: "chain-scope", container: "cid-1", pid: process.pid,
+      status: "running", round: 0, startedAt: new Date().toISOString(),
+    });
+    const dispatch = recordingDispatch();
+    const text = await runChainDriver({
+      cwd: tmp, stateDir: tmp, chainDir, chainId: "chain-scope", container: "cid-1",
+      model: "fake/model", modelChain: [["fake/model"]], maxRounds: 4,
+      brief: BRIEF, orchestrator: null, baseSha: "abc123", worktreeBaseline: null,
+      verifyBaseline: { captured: true, gate_passed: true, lint: 0, types: 0, collected: 10, raw: {} },
+      callTool: callToolForDriver(changeScopeResult),
+      dispatchWithFallback: dispatch,
+      keepServe: true,
+      signalReceived: () => false,
+      resume: null,
+    });
+    return { tmp, chainDir, text, dispatch };
+  }
+
+  it("empty change-scope stdout fails the round closed: no changeScope persisted, review has no fabricated scope", async () => {
+    const { tmp, chainDir, dispatch } = await runWith({ output: "" });
+    try {
+      const round1 = readJson(path.join(chainDir, "round-1.json"));
+      assert.equal(round1.changeScope, null);
+      assert.equal(round1.probesGreen, false);
+      const rpc = round1.probeResults.find((p) => p.passed === false);
+      assert.ok(rpc, "must record a failed probe");
+      assert.match(String(rpc.detail), /change-scope produced empty output/);
+      const reviewCalls = dispatch.calls.filter((c) => c.kind === "review");
+      for (const call of reviewCalls) {
+        assert.doesNotMatch(
+          call.promptText ?? "",
+          /Authoritative change set \(`change-scope`\):/,
+          "review must not be given a fabricated change-scope",
+        );
+      }
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("non-zero change-scope exit fails the round closed: no changeScope persisted, review has no fabricated scope", async () => {
+    const { tmp, chainDir, dispatch } = await runWith({
+      exit_code: 1,
+      stderr: "change-scope: base ref not found\n",
+      output: "change-scope: base ref not found\n",
+    });
+    try {
+      const round1 = readJson(path.join(chainDir, "round-1.json"));
+      assert.equal(round1.changeScope, null);
+      assert.equal(round1.probesGreen, false);
+      const rpc = round1.probeResults.find((p) => p.passed === false);
+      assert.ok(rpc, "must record a failed probe");
+      assert.match(String(rpc.detail), /change-scope failed with exit code 1/);
+      const reviewCalls = dispatch.calls.filter((c) => c.kind === "review");
+      for (const call of reviewCalls) {
+        assert.doesNotMatch(
+          call.promptText ?? "",
+          /Authoritative change set \(`change-scope`\):/,
+          "review must not be given a fabricated change-scope",
+        );
+      }
     } finally {
       fs.rmSync(tmp, { recursive: true, force: true });
     }

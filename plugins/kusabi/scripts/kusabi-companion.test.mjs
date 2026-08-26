@@ -2644,7 +2644,18 @@ describe("chain finally serve-stop fossil guard", () => {
     return async (toolName, params) => {
       if (toolName === "verify_in_container") return { gate_passed: true };
       if (toolName !== "sandbox_exec") return { output: "" };
-      const cmd = params.commands[0];
+      const cmd = params.commands?.[0] ?? params.argv?.join(" ") ?? "";
+      if (cmd.includes("change-scope.mjs")) {
+        return {
+          output: JSON.stringify({
+            formatVersion: 1,
+            repositoryRoot: "/workspace",
+            input: { base: "abc123", head: "HEAD" },
+            resolved: { baseSha: "abc123", headSha: "abc123", mergeBaseSha: "abc123" },
+            paths: { committed: [], staged: [], unstaged: ["src/foo.js"], untracked: [] },
+          }),
+        };
+      }
       if (cmd.startsWith("cd /workspace &&") && cmd.includes("TMPIDX=")) return { output: "ERROR_NO_INDEX\n" };
       if (cmd === "git rev-parse HEAD") return { output: "abc123\n" };
       if (cmd === "git status --porcelain") return { output: " M src/foo.js\n" };
@@ -3040,8 +3051,22 @@ describe("buildTaskReviewInput", () => {
   function containerTool(overrides = {}) {
     const commands = [];
     const callTool = async (tool, params) => {
-      const cmd = params.commands?.[0] ?? "";
+      const cmd = params.commands?.[0] ?? params.argv?.join(" ") ?? "";
       commands.push(cmd);
+      if (cmd.includes("change-scope.mjs")) {
+        const base = cmd.includes("c355fa61a7fee5402ed7ba999bd2fe2eeb46a842")
+          ? "c355fa61a7fee5402ed7ba999bd2fe2eeb46a842"
+          : "deadbeefcafe";
+        return {
+          output: JSON.stringify({
+            formatVersion: 1,
+            repositoryRoot: "/workspace",
+            input: { base, head: "HEAD" },
+            resolved: { baseSha: base, headSha: "deadbeefcafe", mergeBaseSha: base },
+            paths: { committed: [], staged: [], unstaged: ["src/foo.js"], untracked: [] },
+          }),
+        };
+      }
       if (Object.prototype.hasOwnProperty.call(overrides, cmd)) return { output: overrides[cmd] };
       if (cmd === "git rev-parse HEAD") return { output: "deadbeefcafe\n" };
       if (cmd === "git status --porcelain") return { output: " M src/foo.js\n" };

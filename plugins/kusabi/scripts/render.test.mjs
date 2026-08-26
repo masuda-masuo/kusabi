@@ -2521,3 +2521,105 @@ describe("renderEscalationDecisions", () => {
     assert.ok(lastContent && !lastContent.startsWith("### "));
   });
 });
+
+
+// ---------------------------------------------------------------------------
+// renderBaseFacts / renderContainerReviewInput with changeScope (kusabi #379)
+// ---------------------------------------------------------------------------
+
+describe("renderBaseFacts and renderContainerReviewInput with changeScope (kusabi #379)", () => {
+  const FIXTURE_CHANGE_SCOPE = {
+    formatVersion: 1,
+    repositoryRoot: "/workspace",
+    input: { base: "base-sha-1234567890", head: "HEAD" },
+    resolved: {
+      baseSha: "base-sha-1234567890",
+      headSha: "head-sha-abcdef1234",
+      mergeBaseSha: "base-sha-1234567890",
+    },
+    paths: {
+      committed: ["src/committed.js"],
+      staged: ["src/staged.js"],
+      unstaged: ["src/unstaged.js"],
+      untracked: ["src/untracked.js"],
+    },
+  };
+
+  it("renderBaseFacts with changeScope renders pretty-printed JSON as authoritative change set", () => {
+    const out = renderBaseFacts({
+      baseSha: "base-sha-1234567890",
+      baseLog: "base-sha-123 first commit\n",
+      statusOutput: " M src/unstaged.js\n",
+      untrackedFiles: "src/untracked.js\n",
+      changeScope: FIXTURE_CHANGE_SCOPE,
+    });
+
+    // Authoritative change set JSON is rendered
+    assert.ok(out.includes("Authoritative change set (`change-scope`):"));
+    assert.ok(out.includes('"formatVersion": 1'));
+    assert.ok(out.includes('"baseSha": "base-sha-1234567890"'));
+    assert.ok(out.includes('"headSha": "head-sha-abcdef1234"'));
+    assert.ok(out.includes('"mergeBaseSha": "base-sha-1234567890"'));
+    assert.ok(out.includes('"src/committed.js"'));
+    assert.ok(out.includes('"src/staged.js"'));
+    assert.ok(out.includes('"src/unstaged.js"'));
+    assert.ok(out.includes('"src/untracked.js"'));
+
+    // Boundary instruction states JSON is given, not guessed
+    assert.ok(out.includes("porcelain is not the range"));
+    assert.ok(out.includes("Review ONLY the paths listed in `paths.*` above"));
+    assert.ok(out.includes("do not interpret a path outside `paths.*` as this round's change"));
+    assert.ok(out.includes("do not flag base-history files as scope creep"));
+
+    // Diff instruction names diff_in_container against base SHA
+    assert.ok(out.includes("Fetching the diff is YOUR job"));
+    assert.ok(out.includes("`base` set to `base-sha-1234567890`"));
+
+    // No diff body is inlined
+    assert.doesNotMatch(out, /diff --git/);
+    assert.ok(!out.includes("```diff"));
+
+    // Porcelain buckets are NOT presented as competing facts
+    assert.doesNotMatch(out, /Actual change set \(`git status --porcelain`\)/);
+  });
+
+  it("renderContainerReviewInput with changeScope includes target block, JSON, and diff instruction", () => {
+    const out = renderContainerReviewInput({
+      container: "cid-test-123",
+      baseSha: "base-sha-1234567890",
+      baseLog: "base-sha-123 first commit\n",
+      statusOutput: " M src/unstaged.js\n",
+      changeScope: FIXTURE_CHANGE_SCOPE,
+    });
+
+    assert.ok(out.startsWith("## Review target"));
+    assert.ok(out.includes("container `cid-test-123`"));
+    assert.ok(out.includes("`read_file_range`"));
+    assert.ok(out.includes("`diff_in_container`"));
+
+    // Carries the JSON
+    assert.ok(out.includes("Authoritative change set (`change-scope`):"));
+    assert.ok(out.includes('"formatVersion": 1'));
+    assert.ok(out.includes('"src/committed.js"'));
+    assert.ok(out.includes('"src/staged.js"'));
+    assert.ok(out.includes('"src/unstaged.js"'));
+    assert.ok(out.includes('"src/untracked.js"'));
+
+    // Base facts & instruction
+    assert.ok(out.includes("- Base commit: `base-sha-1234567890`"));
+    assert.ok(out.includes("Fetching the diff is YOUR job"));
+    assert.ok(out.includes("`base` set to `base-sha-1234567890`"));
+
+    // No diff body
+    assert.doesNotMatch(out, /diff --git/);
+    assert.ok(!out.includes("```diff"));
+  });
+
+  it("prefers changeScope.resolved.baseSha when baseSha argument is absent or differs", () => {
+    const out = renderBaseFacts({
+      changeScope: FIXTURE_CHANGE_SCOPE,
+    });
+    assert.ok(out.includes("- Base commit: `base-sha-1234567890`"));
+    assert.ok(out.includes("`base` set to `base-sha-1234567890`"));
+  });
+});
