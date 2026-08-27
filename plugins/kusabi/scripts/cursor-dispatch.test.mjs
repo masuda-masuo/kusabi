@@ -512,10 +512,13 @@ describe("cursorDispatch (fake cursor-agent)", () => {
     assert.equal(job.usage.cacheWrite, 0);
     assert.equal(job.cursorIsError, false);
     assert.equal(job.modelResidueHazard, null);
+    // (kusabi #388) terminal reason stamped at the job-level write.
+    assert.equal(job.stopReason, "completed");
     assert.equal(stateDir, ctx.stateDir);
 
     const persisted = loadJob(stateDir, job.id);
     assert.equal(persisted.sessionID, SESSION_ID);
+    assert.equal(persisted.stopReason, "completed");
     assert.equal(fs.readFileSync(path.join(jobDir(stateDir, job.id), "result.md"), "utf8"), "ALPHA-7");
   });
 
@@ -559,6 +562,11 @@ describe("cursorDispatch (fake cursor-agent)", () => {
     const missing = await cursorDispatch(ctx.dispatchOptions());
     assert.equal(missing.job.status, "error");
     assert.match(missing.job.error, /no terminal result line/);
+    // (kusabi #388) an unmappable status records the "unknown" sentinel, both
+    // on the returned job and the persisted record.
+    assert.equal(missing.job.stopReason, "unknown");
+    const persistedMissing = loadJob(ctx.stateDir, missing.job.id);
+    assert.equal(persistedMissing.stopReason, "unknown");
 
     ctx.setMode("empty-result");
     const empty = await cursorDispatch(ctx.dispatchOptions());

@@ -83,6 +83,7 @@ import { newJobId, saveJob, jobDir, appendEvent } from "./job-store.mjs";
 import { stateDirFor, writeJson } from "./state-paths.mjs";
 import { durationS } from "./render.mjs";
 import { resolveCompletedResult } from "./result-recovery.mjs";
+import { deriveStopReason } from "./stop-reason.mjs";
 
 export const CURSOR_BACKEND = "cursor";
 
@@ -816,6 +817,13 @@ export async function cursorDispatch(opts) {
     exitCode: code,
     assistantChars: assistantText.length,
   });
+
+  // Record the closed terminal reason (kusabi #388).  Cursor finalizes its
+  // job.json on this path and never calls deriveStopReason via the opencode
+  // SSE fold, so stamp here at the terminal write.  worktreeChanged is left
+  // unmeasured at job level, matching the opencode path: a completed wrapper
+  // records "completed"; error/timeout/stalled fall through to "unknown".
+  job.stopReason = deriveStopReason({ status: job.status, stats: job.stats });
   saveJob(stateDir, job);
 
   return { job, resultText, stateDir };

@@ -1422,6 +1422,8 @@ describe("agyDispatch (fake agy binary)", () => {
     const { job, resultText, stateDir } = await agyDispatch(ctx.dispatchOptions());
 
     assert.equal(job.status, "completed");
+    // (kusabi #388) terminal reason stamped at the job-level write.
+    assert.equal(job.stopReason, "completed");
     assert.equal(job.backend, "agy");
     assert.equal(job.modelEntry, "gemini-3.6-flash-high");
     assert.equal(job.modelVariant, null);
@@ -1442,6 +1444,7 @@ describe("agyDispatch (fake agy binary)", () => {
     // Persisted with the same record shape the other backends use.
     const persisted = loadJob(stateDir, job.id);
     assert.equal(persisted.status, "completed");
+    assert.equal(persisted.stopReason, "completed");
     assert.equal(persisted.backend, "agy");
     assert.equal(persisted.sessionID, "6f5f0f1e-0000-4a1b-9c2d-1122334455aa");
 
@@ -1517,10 +1520,13 @@ describe("agyDispatch (fake agy binary)", () => {
     assert.match(job.error, /no payload/);
     assert.match(job.error, /"status":"SUCCESS"/);
     assert.equal(resultText, "");
+    // (kusabi #388) an unmappable error status records the "unknown" sentinel.
+    assert.equal(job.stopReason, "unknown");
     // The conversation id is still recorded — it is how the run is found.
     assert.equal(job.sessionID, "6f5f0f1e-0000-4a1b-9c2d-1122334455aa");
-    // Never a stuck "running" record.
+    // Never a stuck "running" record; the reason is persisted too.
     assert.equal(loadJob(ctx.stateDir, job.id).status, "error");
+    assert.equal(loadJob(ctx.stateDir, job.id).stopReason, "unknown");
   });
 
   it("a schema run that fills structured_output but prints nothing still completes", async () => {
@@ -1561,6 +1567,8 @@ describe("agyDispatch (fake agy binary)", () => {
     const { job } = await agyDispatch(ctx.dispatchOptions({ timeoutS: 1 }));
     assert.equal(job.status, "timeout");
     assert.match(job.error, /timed out after 1s/);
+    // (kusabi #388) a timeout is unmappable → the "unknown" sentinel.
+    assert.equal(job.stopReason, "unknown");
     const pids = fs.readFileSync(ctx.pidsLog, "utf8").trim().split("\n").filter(Boolean).map(Number);
     for (const pid of pids) {
       assert.equal(isAlive(pid), false, `pid ${pid} survived the timeout kill`);
@@ -2435,6 +2443,10 @@ describe("agyDispatch — an oversized argv is refused before the spawn", () => 
 
     // Persisted the same way every other failure on this backend is.
     assert.equal(loadJob(stateDir, job.id).status, "error");
+    // kusabi #388: the closed terminal reason is stamped on the argv-too-large
+    // refusal (caller error -> "unknown").
+    assert.equal(job.stopReason, "unknown");
+    assert.equal(loadJob(stateDir, job.id).stopReason, "unknown");
 
     const jdir = jobDir(stateDir, job.id);
     // prompt.md is written even though nothing ran: the operator of a

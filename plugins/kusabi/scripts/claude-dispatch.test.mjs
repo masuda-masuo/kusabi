@@ -1737,6 +1737,8 @@ describe("claudeDispatch (fake claude binary)", () => {
     const { job, resultText, stateDir } = await claudeDispatch(ctx.dispatchOptions());
 
     assert.equal(job.status, "completed");
+    // (kusabi #388) terminal reason stamped at the job-level write.
+    assert.equal(job.stopReason, "completed");
     assert.equal(job.backend, "claude");
     assert.equal(job.sessionID, "claude-session-abc123");
     assert.equal(job.modelEntry, "opus");
@@ -1756,6 +1758,7 @@ describe("claudeDispatch (fake claude binary)", () => {
     // The record is persisted with the same shape the opencode path uses.
     const persisted = loadJob(stateDir, job.id);
     assert.equal(persisted.status, "completed");
+    assert.equal(persisted.stopReason, "completed");
     assert.equal(persisted.backend, "claude");
     assert.equal(persisted.sessionID, "claude-session-abc123");
     assert.equal(persisted.phase, null);
@@ -2264,6 +2267,10 @@ describe("claudeDispatch (fake claude binary)", () => {
     // No quota markers in this payload → no classification, no
     // provider-error: it fails exactly as before the classification.
     assert.equal(job.failure, null);
+    // (kusabi #388) an unmappable error status records the "unknown" sentinel.
+    assert.equal(job.stopReason, "unknown");
+    const persisted = loadJob(ctx.stateDir, job.id);
+    assert.equal(persisted.stopReason, "unknown");
   });
 
   it("classifies the real session-limit 429 payload as quota exhaustion (provider-error)", async () => {
@@ -2274,6 +2281,9 @@ describe("claudeDispatch (fake claude binary)", () => {
     // Failed job, machine-readable classification on the record (never by
     // grepping `error` prose).
     assert.equal(job.status, "provider-error");
+    // (kusabi #388) a classified quota exhaustion stamps "quota-exhausted" —
+    // never "completed" and never a generic "provider-error".
+    assert.equal(job.stopReason, "quota-exhausted");
     assert.deepEqual(job.failure, {
       kind: "quota-exhaustion",
       quota: "session",
@@ -2294,6 +2304,7 @@ describe("claudeDispatch (fake claude binary)", () => {
     // The failure record is persisted with the classification.
     const persisted = loadJob(ctx.stateDir, job.id);
     assert.equal(persisted.status, "provider-error");
+    assert.equal(persisted.stopReason, "quota-exhausted");
     assert.deepEqual(persisted.failure, job.failure);
   });
 
@@ -2469,6 +2480,9 @@ describe("claudeDispatch (fake claude binary)", () => {
     // The same outcome the exit-0 case produces: the payload says what
     // failed, the exit code adds nothing it does not already state.
     assert.equal(job.status, "provider-error");
+    // (kusabi #388) a classified quota exhaustion stamps "quota-exhausted" —
+    // never "completed" and never a generic "provider-error".
+    assert.equal(job.stopReason, "quota-exhausted");
     assert.deepEqual(job.failure, {
       kind: "quota-exhaustion",
       quota: "session",
@@ -2485,6 +2499,7 @@ describe("claudeDispatch (fake claude binary)", () => {
 
     const persisted = loadJob(ctx.stateDir, job.id);
     assert.equal(persisted.status, "provider-error");
+    assert.equal(persisted.stopReason, "quota-exhausted");
     assert.deepEqual(persisted.failure, job.failure);
 
     // Nothing is lost: the nonzero exit is still on the audit trail.
@@ -3839,6 +3854,10 @@ describe("claudeDispatch — pre-dispatch session-quota guard (kusabi #215)", ()
     assert.deepEqual(persisted.failure, job.failure);
     assert.equal(typeof persisted.finishedAt, "string");
     assert.equal(persisted.stats.events, 0);
+    // kusabi #388: the closed terminal reason is stamped on the session-quota
+    // guard refusal (capacity exhaustion -> "quota-exhausted").
+    assert.equal(job.stopReason, "quota-exhausted");
+    assert.equal(persisted.stopReason, "quota-exhausted");
     // No result.md: nothing produced a result.
     assert.equal(fs.existsSync(path.join(jobDir(stateDir, job.id), "result.md")), false);
     // The prompt is still on disk — a refused dispatch is auditable.
