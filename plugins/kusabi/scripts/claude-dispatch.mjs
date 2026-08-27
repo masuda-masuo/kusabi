@@ -117,6 +117,7 @@ import { newJobId, saveJob, jobDir, appendEvent } from "./job-store.mjs";
 import { stateDirFor, stateRoot, readJson, writeJson } from "./state-paths.mjs";
 import { durationS } from "./render.mjs";
 import { resolveCompletedResult } from "./result-recovery.mjs";
+import { deriveStopReason } from "./stop-reason.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const PLUGIN_ROOT = path.resolve(HERE, "..");
@@ -2970,6 +2971,18 @@ export async function claudeDispatch(opts) {
         malformedLines: 0,
         spawned: false,
       });
+      // Record the closed terminal reason (kusabi #388).  Same capacityReason
+      // rule as the main claude finalize: a terminal refusal the classifier
+      // named a quota exhaustion becomes "quota-exhausted".
+      const capacityReason =
+        (job.status === "provider-error" && job.failure?.kind === "quota-exhaustion")
+          ? (job.failure?.quota ?? "quota-exhaustion")
+          : null;
+      job.stopReason = deriveStopReason({
+        status: job.status,
+        stats: job.stats,
+        capacityReason,
+      });
       saveJob(stateDir, job);
       return { job, resultText: "", stateDir };
     }
@@ -3307,6 +3320,23 @@ export async function claudeDispatch(opts) {
     exitCode: code,
     streamEvents: streamAcc.events,
     malformedLines,
+  });
+
+  // Record the closed terminal reason (kusabi #388).  Claude finalizes its
+  // job.json on this path and never calls deriveStopReason via the opencode
+  // SSE fold, so stamp here at the terminal write.  A terminal failure the
+  // classifier already named a quota exhaustion becomes "quota-exhausted";
+  // any other provider-error stays "provider-error"; error/timeout/stalled
+  // fall through to "unknown".  worktreeChanged is left unmeasured at job
+  // level, matching the opencode path.
+  const capacityReason =
+    (job.status === "provider-error" && job.failure?.kind === "quota-exhaustion")
+      ? (job.failure?.quota ?? "quota-exhaustion")
+      : null;
+  job.stopReason = deriveStopReason({
+    status: job.status,
+    stats: job.stats,
+    capacityReason,
   });
   saveJob(stateDir, job);
 
