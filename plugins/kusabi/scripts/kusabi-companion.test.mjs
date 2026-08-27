@@ -4387,12 +4387,13 @@ describe("brief lint and container delivery (kusabi #289)", () => {
       assert.match(report, /1 required brief item is missing/);
     });
 
-    // ---- Frozen Tests qualifier: leftover prose after the path (kusabi #386) ----
+    // ---- Frozen Tests qualifier: leftover prose outside the path token (kusabi #386) ----
     // The live incident (henshusha chain-mtaa2btyd78c, 2026-08-27) wrote a
     // `## Frozen Tests` bullet with `you may append; do not weaken`.  parsePathSection
-    // keeps only the path token, so P5 froze `tests/test_style.py` and escalated
-    // when the worker obeyed the prose (append-only).  The defence is dispatch-time:
-    // refuse and name both remedies.  P5 stays path-intersection; no append-ok.
+    // keeps only the path token and drops everything outside it, so P5 froze
+    // `tests/test_style.py` and escalated when the worker obeyed the prose
+    // (append-only).  The defence is dispatch-time: refuse and name both remedies.
+    // P5 stays path-intersection; no append-ok.
     it("refuses the live-incident Frozen line, naming the section, path, leftover, and both remedies", () => {
       const brief = [
         "# Task", "", SIGNATURE, "", DELIVERABLES,
@@ -4417,6 +4418,25 @@ describe("brief lint and container delivery (kusabi #289)", () => {
       assert.ok(report.includes("但し書き"), "remedy 2: names the 但し書き");
       // Nothing in the report blames a worker — it is the brief's defect.
       assert.doesNotMatch(report, /worker failure|escalated the chain because the worker|violated the oracle because the worker/i);
+    });
+
+    it("refuses a pre-path Frozen line (prose before the path token), naming both remedies", () => {
+      const brief = [
+        "# Task", "", SIGNATURE, "", DELIVERABLES,
+        "## Frozen Tests", "",
+        "- do not weaken `tests/test_style.py`", "",
+      ].join("\n");
+      const report = briefLintReport({ brief, phase: "implement", container: "cid-1" });
+      assert.ok(report, "a pre-path qualifier must be refused");
+      assert.match(report, /brief rejected before dispatch/);
+      assert.match(report, /## Frozen Tests/);
+      assert.match(report, /tests\/test_style\.py/);
+      assert.ok(
+        report.includes("do not weaken"),
+        `the refusal must quote the leftover text, got: ${report}`,
+      );
+      assert.ok(report.includes("do not weaken existing tests"), "remedy 1: move to Acceptance criteria");
+      assert.ok(report.includes("the entry is the path alone"), "remedy 2: path alone");
     });
 
     it("returns null for the same bullet reduced to a path alone", () => {

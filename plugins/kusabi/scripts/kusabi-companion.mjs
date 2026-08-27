@@ -519,9 +519,9 @@ export function briefLintReport({ brief, phase = null, container = null, chain =
   }
 
   // ---- Frozen Tests qualifier (kusabi #386) ----
-  // A `## Frozen Tests` bullet whose path is followed by leftover prose (`you
-  // may append; do not weaken`, `do not weaken`, a Japanese 但し書き) is a
-  // contract P5 cannot enforce.  P5 freezes by PATH and discards the brief
+  // A `## Frozen Tests` bullet whose path token is surrounded by leftover prose
+  // outside the backtick pair — before (`do not weaken`), after (`you may
+  // append; do not weaken`), or both — is a contract P5 cannot enforce.  P5 freezes by PATH and discards the brief
   // author's own words, so a worker that obeys the prose (append-only) is
   // flagged as an oracle violation and the chain escalates — the worker cannot
   // win because the probe's input is the brief (henshusha chain-mtaa2btyd78c,
