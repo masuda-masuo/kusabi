@@ -1000,9 +1000,13 @@ export async function collectContainerBaseContext(callTool, container) {
   };
 }
 
+export const CHANGE_SCOPE_CONTAINER_PATH = "/tmp/kusabi-change-scope.mjs";
+export const CHANGE_SCOPE_HOST_PATH = fileURLToPath(new URL("change-scope.mjs", import.meta.url));
+
 /**
- * Run `change-scope.mjs` in the container to collect the authoritative change scope (kusabi #379).
- * Fails closed on non-zero exit, empty stdout, or invalid JSON/contract.
+ * Run `change-scope.mjs` in the container to collect the authoritative change scope (kusabi #379, #400).
+ * Injects the companion script to /tmp/kusabi-change-scope.mjs outside /workspace and executes it with argv.
+ * Fails closed on inject failure, non-zero exit, empty stdout, or invalid JSON/contract.
  *
  * @param {object} opts
  * @param {Function} opts.callTool
@@ -1010,17 +1014,36 @@ export async function collectContainerBaseContext(callTool, container) {
  * @param {string} opts.base Commit SHA the change set is measured against.
  * @param {string} [opts.head="HEAD"] Pre-reset HEAD ref or commit.
  * @returns {Promise<object>} The parsed changeScope object (formatVersion: 1).
- * @throws {Error} when collection fails or produces invalid JSON
+ * @throws {Error} when injection or collection fails or produces invalid JSON
  */
 export async function collectChangeScope({ callTool, container, base, head = "HEAD" }) {
   if (!base) {
     throw new Error("change-scope: base commit ref must be provided");
   }
+
+  if (!fs.existsSync(CHANGE_SCOPE_HOST_PATH)) {
+    throw new Error(`change-scope companion script missing at ${CHANGE_SCOPE_HOST_PATH}`);
+  }
+
+  try {
+    const injectResult = await callTool("copy_file", {
+      container_id: container,
+      local_src_file: CHANGE_SCOPE_HOST_PATH,
+      dest_path: CHANGE_SCOPE_CONTAINER_PATH,
+    });
+    if (injectResult && (injectResult.error || injectResult.status === "error" || (typeof injectResult.exit_code === "number" && injectResult.exit_code !== 0))) {
+      const detail = (injectResult.error || injectResult.stderr || injectResult.output || "").trim();
+      throw new Error(detail || "copy_file returned error");
+    }
+  } catch (err) {
+    throw new Error(`change-scope inject failed in container ${container}: ${err.message}`);
+  }
+
   let execResult;
   try {
     execResult = await callTool("sandbox_exec", {
       container_id: container,
-      argv: ["node", "plugins/kusabi/scripts/change-scope.mjs", "--base", base, "--head", head],
+      argv: ["node", CHANGE_SCOPE_CONTAINER_PATH, "--base", base, "--head", head],
     });
   } catch (err) {
     // If a mock callTool throws TypeError (e.g. legacy test stubs expecting params.commands[0]),
@@ -1029,7 +1052,7 @@ export async function collectChangeScope({ callTool, container, base, head = "HE
       try {
         execResult = await callTool("sandbox_exec", {
           container_id: container,
-          commands: [`node plugins/kusabi/scripts/change-scope.mjs --base ${base} --head ${head}`],
+          commands: [`node ${CHANGE_SCOPE_CONTAINER_PATH} --base ${base} --head ${head}`],
         });
       } catch (fallbackErr) {
         throw new Error(`change-scope failed in container ${container}: ${fallbackErr.message}`);

@@ -43,6 +43,7 @@ import {
   collectContainerBaseContext,
   readExecCapture,
   collectContainerReviewInput,
+  collectChangeScope,
   assertContainerBaseRef,
   collectReviewContext,
   resolveChainResume,
@@ -7558,7 +7559,7 @@ describe("change-scope wiring into review and probe phases (kusabi #379)", () =>
     assert.ok(changeScopeIdx >= 0, "change-scope must be invoked");
     assert.ok(executed[changeScopeIdx].argv, "change-scope must be invoked with argv");
     assert.equal(executed[changeScopeIdx].commands, undefined, "change-scope must not pass commands when argv is provided");
-    assert.deepEqual(executed[changeScopeIdx].argv, ["node", "plugins/kusabi/scripts/change-scope.mjs", "--base", "base-sha-123", "--head", "HEAD"]);
+    assert.deepEqual(executed[changeScopeIdx].argv, ["node", "/tmp/kusabi-change-scope.mjs", "--base", "base-sha-123", "--head", "HEAD"]);
     assert.ok(resetIdx >= 0, "git reset --mixed must be invoked when HEAD != base");
     assert.ok(changeScopeIdx < resetIdx, "change-scope must run before git reset --mixed");
 
@@ -7711,11 +7712,20 @@ describe("change-scope wiring into review and probe phases (kusabi #379)", () =>
 
     const input = await collectContainerReviewInput({ container: "cid-scope-test", callTool, base: "base-sha-123" });
 
+    // Injects change-scope.mjs into the container before exec
+    const injectCall = invocations.find((i) => i.toolName === "copy_file");
+    assert.ok(injectCall, "must invoke copy_file to inject change-scope.mjs");
+    assert.equal(injectCall.params.container_id, "cid-scope-test");
+    assert.equal(injectCall.params.dest_path, "/tmp/kusabi-change-scope.mjs");
+    assert.ok(injectCall.params.local_src_file.endsWith("change-scope.mjs"));
+
     // Records change-scope invocation with argv and without commands
     const scopeCall = invocations.find((i) => i.params?.argv?.some((a) => a.includes("change-scope.mjs")));
     assert.ok(scopeCall, "must invoke change-scope.mjs with argv");
     assert.equal(scopeCall.params.commands, undefined, "must not pass commands when argv is used");
-    assert.deepEqual(scopeCall.params.argv, ["node", "plugins/kusabi/scripts/change-scope.mjs", "--base", "base-sha-123", "--head", "HEAD"]);
+    assert.deepEqual(scopeCall.params.argv, ["node", "/tmp/kusabi-change-scope.mjs", "--base", "base-sha-123", "--head", "HEAD"]);
+    assert.ok(invocations.indexOf(injectCall) < invocations.indexOf(scopeCall), "inject must precede sandbox_exec");
+
     // Existing assertion: no git diff may be issued
     assert.ok(!commands.some((c) => c.startsWith("git diff")), "no git diff may be issued");
     // Rendered input contains the JSON
@@ -7728,6 +7738,69 @@ describe("change-scope wiring into review and probe phases (kusabi #379)", () =>
     // Diff instruction names base
     assert.ok(input.includes("Fetching the diff is YOUR job"));
     assert.ok(input.includes("`base` set to `base-sha-123`"));
+  });
+
+  it("change-scope inject failure in collectChangeScope throws and does not exec fallback", async () => {
+    const executed = [];
+    const callTool = async (toolName, params) => {
+      if (toolName === "copy_file") {
+        throw new Error("copy_file failed: disk full");
+      }
+      executed.push({ toolName, params });
+      return { output: "" };
+    };
+
+    await assert.rejects(
+      () => collectChangeScope({ container: "cid-fail-inject", callTool, base: "base-sha-123" }),
+      /change-scope inject failed in container cid-fail-inject: copy_file failed: disk full/,
+    );
+    assert.equal(executed.length, 0, "sandbox_exec must not be invoked when inject fails");
+  });
+
+  it("change-scope inject failure in runProbePhase fails closed without fallback exec", async () => {
+    const executed = [];
+    const callTool = async (toolName, params) => {
+      if (toolName === "copy_file") {
+        throw new Error("copy_file failed: connection refused");
+      }
+      const cmd = params.commands?.[0] ?? params.argv?.join(" ") ?? "";
+      executed.push({ toolName, cmd, params });
+      return { output: "" };
+    };
+
+    const result = await runProbePhase({
+      baseSha: "base-sha-123",
+      container: "cid-fail-inject-probe",
+      brief: "## Deliverables\n\n- `src/foo.js`\n",
+      callTool,
+    });
+
+    assert.equal(result.probesGreen, false);
+    assert.equal(result.changeScope, null);
+    const rpcProbe = result.probeResults.find((p) => p.passed === false);
+    assert.ok(rpcProbe, "must record failed probe");
+    assert.match(rpcProbe.detail, /change-scope inject failed in container cid-fail-inject-probe/);
+    assert.ok(
+      !executed.some((e) => e.cmd.includes("plugins/kusabi/scripts/change-scope.mjs")),
+      "must not exec old relative path as a fallback",
+    );
+  });
+
+  it("change-scope inject returning error object fails closed", async () => {
+    const executed = [];
+    const callTool = async (toolName, params) => {
+      if (toolName === "copy_file") {
+        return { error: "failed to write to /tmp" };
+      }
+      executed.push({ toolName, params });
+      return { output: "" };
+    };
+
+    await assert.rejects(
+      () => collectChangeScope({ container: "cid-fail-inject-obj", callTool, base: "base-sha-123" }),
+      /change-scope inject failed in container cid-fail-inject-obj: failed to write to \/tmp/,
+    );
+    assert.equal(executed.length, 0, "sandbox_exec must not be invoked when inject returns error");
   });
 
   it("collectReviewContext does not invoke change-scope.mjs", async () => {
