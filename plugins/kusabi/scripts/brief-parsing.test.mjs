@@ -9,6 +9,7 @@ import {
   parseChangedPaths,
   briefRequestsPublish,
   findSmokeViolations,
+  findFrozenQualifierItems,
   SMOKE_VIOLATION_LOSSY,
   SMOKE_VIOLATION_NO_ENTRIES,
   PARSED_BRIEF_SECTIONS,
@@ -957,5 +958,86 @@ describe("briefSyntaxDefectSummary", () => {
     assert.match(summary, /P4: smoke: ## Smoke heading present but no entries parsed/);
     assert.match(summary, /P5: frozen: ## Frozen Tests heading present but no entries parsed/);
     assert.match(summary, /; /);
+  });
+});
+
+// findFrozenQualifierItems — Frozen Tests bullets whose path is followed by
+// leftover prose the frozen oracle cannot enforce (kusabi #386)
+// ---------------------------------------------------------------------------
+
+describe("findFrozenQualifierItems", () => {
+  it("qualifies the live-incident bullet, returning its path and leftover", () => {
+    const brief = "## Frozen Tests\n\n- `tests/test_style.py` tests that already exist (you may append; do not weaken)\n";
+    const qual = findFrozenQualifierItems(brief);
+    assert.deepEqual(qual, [
+      {
+        path: "tests/test_style.py",
+        remainder: "tests that already exist (you may append; do not weaken)",
+        line: "- `tests/test_style.py` tests that already exist (you may append; do not weaken)",
+        lineNumber: 3,
+      },
+    ]);
+  });
+
+  it("returns [] for a path-only bullet", () => {
+    assert.deepEqual(
+      findFrozenQualifierItems("## Frozen Tests\n\n- `tests/test_style.py`\n"),
+      [],
+    );
+  });
+
+  it("returns [] for a path-only bullet with trailing punctuation only (lone punctuation is not a qualifier)", () => {
+    // parsePathSection strips trailing punctuation from the PATH; anything left
+    // after the path token that is only punctuation is not a contract.
+    assert.deepEqual(
+      findFrozenQualifierItems("## Frozen Tests\n\n- `tests/test_style.py`.\n"),
+      [],
+    );
+  });
+
+  it("returns [] for an annotated heading `## Frozen Tests (do not touch)` with a path-only bullet", () => {
+    // Heading annotations stay legal (kusabi #167); the rule walks items.
+    assert.deepEqual(
+      findFrozenQualifierItems("## Frozen Tests (do not touch)\n\n- `tests/test_style.py`\n"),
+      [],
+    );
+  });
+
+  it("returns [] when the `## Frozen Tests` heading is absent", () => {
+    assert.deepEqual(findFrozenQualifierItems("## Deliverables\n- `a.js`\n"), []);
+  });
+
+  it("does NOT qualify a Deliverables bullet with leftover prose (scope is Frozen Tests only)", () => {
+    assert.deepEqual(
+      findFrozenQualifierItems("## Deliverables\n\n- `src/foo.js` the store layer\n"),
+      [],
+    );
+  });
+
+  it("qualifies a code-block line with path + extra words", () => {
+    const brief = "## Frozen Tests\n\n```\ntests/test_style.py you may append new tests here\n```\n";
+    const qual = findFrozenQualifierItems(brief);
+    assert.equal(qual.length, 1);
+    assert.equal(qual[0].path, "tests/test_style.py");
+    assert.equal(qual[0].remainder, "you may append new tests here");
+  });
+
+  it("does NOT qualify a code-block line that is the path alone", () => {
+    assert.deepEqual(
+      findFrozenQualifierItems("## Frozen Tests\n\n```\ntests/test_style.py\n```\n"),
+      [],
+    );
+  });
+
+  it("returns [] for empty / null / undefined / non-string brief", () => {
+    assert.deepEqual(findFrozenQualifierItems(""), []);
+    assert.deepEqual(findFrozenQualifierItems(null), []);
+    assert.deepEqual(findFrozenQualifierItems(undefined), []);
+    assert.deepEqual(findFrozenQualifierItems(42), []);
+  });
+
+  it("does not change what parseFrozenTests reads (lint, not a parser change)", () => {
+    const brief = "## Frozen Tests\n\n- `tests/test_style.py` tests that already exist (you may append; do not weaken)\n";
+    assert.deepEqual(parseFrozenTests(brief), ["tests/test_style.py"]);
   });
 });
