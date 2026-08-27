@@ -394,21 +394,22 @@ export function findSmokeViolations(briefText) {
 }
 
 // ---------------------------------------------------------------------------
-// findFrozenQualifierItems — Frozen Tests bullets whose path is followed by
-// leftover prose the frozen oracle cannot enforce (kusabi #386)
+// findFrozenQualifierItems — Frozen Tests bullets whose leftover prose is
+// outside the path token, before or after (kusabi #386)
 // ---------------------------------------------------------------------------
 
 /**
- * Frozen Tests bullets/items whose path token is followed by leftover text.
+ * Frozen Tests bullets/items whose leftover prose sits outside the path token,
+ * before or after (or both).
  *
  * `parsePathSection` (behind `parseFrozenTests`) takes only the path token —
  * first backtick-quoted token, else first whitespace-delimited token, then a
- * trailing-punctuation and trailing-slash strip — and drops everything after
- * it.  So any words the brief author writes AFTER the path (`you may append`,
- * `do not weaken`, a Japanese 但し書き) never reach P5, which freezes by path
- * and would flag a worker that obeys that prose (e.g. appending) as an oracle
- * violation.  The worker cannot win because the probe's input is the brief
- * (henshusha chain-mtaa2btyd78c, 2026-08-27).
+ * trailing-punctuation and trailing-slash strip — and drops everything outside
+ * it.  So any words the brief author writes outside the path token (`you may
+ * append`, `do not weaken`, a Japanese 但し書き) never reach P5, which freezes
+ * by path and would flag a worker that obeys that prose (e.g. appending) as an
+ * oracle violation.  The worker cannot win because the probe's input is the
+ * brief (henshusha chain-mtaa2btyd78c, 2026-08-27).
  *
  * This helper re-derives the SAME path token `parsePathSection` would take,
  * then inspects whatever remains of the item.  The item qualifies when the
@@ -418,8 +419,18 @@ export function findSmokeViolations(briefText) {
  *
  *   - A path-only bullet (`` - `tests/test_style.py` ``) has an empty remainder
  *     → not returned.
- *   - A bullet with prose (`` - `tests/test_style.py` tests that already exist
- *     (you may append; do not weaken) ``) → returned with that remainder.
+ *   Qualifier means any non-empty leftover **outside** the path token, before
+ *   or after (or both).  Re-derives the path the same way `parsePathSection`
+ *   does (first backtick-quoted token, else first whitespace-delimited token,
+ *   then the same trailing-punct / trailing-slash strip).  Remainder is
+ *   `content` with that token removed, then trim whitespace and lone
+ *   punctuation — same `hasContent` rule as today.
+ *
+ *   - A bullet with prose after the path (`` - `tests/test_style.py` tests
+ *     that already exist (you may append; do not weaken) ``) → returned with
+ *     that remainder.
+ *   - A bullet with prose before the path (`` - do not weaken
+ *     `tests/test_style.py` ``) → returned with that remainder.
  *   - A code-block line is the path alone → not returned; a code-block line
  *     with path + extra words → returned (the spec treats the two alike).
  *   - A `## Frozen Tests (do not touch)` HEADING is unaffected — heading
@@ -447,8 +458,12 @@ export function findFrozenQualifierItems(briefText) {
     const backtickMatch = content.match(/`([^`]+)`/);
     if (backtickMatch) {
       path = backtickMatch[1];
-      // Everything after the closing backtick is what P5 would drop.
-      remainder = content.slice(content.indexOf(backtickMatch[0]) + backtickMatch[0].length);
+      // Everything outside the path token (before or after the backtick pair).
+      const tokenStart = content.indexOf(backtickMatch[0]);
+      const tokenEnd = tokenStart + backtickMatch[0].length;
+      const before = content.slice(0, tokenStart).trimEnd();
+      const after = content.slice(tokenEnd).trimStart();
+      remainder = (before + " " + after).trim();
     } else {
       const tokens = content.split(/\s+/);
       path = tokens[0];

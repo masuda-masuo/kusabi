@@ -961,8 +961,8 @@ describe("briefSyntaxDefectSummary", () => {
   });
 });
 
-// findFrozenQualifierItems — Frozen Tests bullets whose path is followed by
-// leftover prose the frozen oracle cannot enforce (kusabi #386)
+// findFrozenQualifierItems — Frozen Tests bullets whose leftover prose is
+// outside the path token, before or after (kusabi #386)
 // ---------------------------------------------------------------------------
 
 describe("findFrozenQualifierItems", () => {
@@ -977,6 +977,27 @@ describe("findFrozenQualifierItems", () => {
         lineNumber: 3,
       },
     ]);
+  });
+
+  it("qualifies the pre-path bullet, returning its path and leftover before the token", () => {
+    const brief = "## Frozen Tests\n\n- do not weaken `tests/test_style.py`\n";
+    const qual = findFrozenQualifierItems(brief);
+    assert.deepEqual(qual, [
+      {
+        path: "tests/test_style.py",
+        remainder: "do not weaken",
+        line: "- do not weaken `tests/test_style.py`",
+        lineNumber: 3,
+      },
+    ]);
+  });
+
+  it("qualifies a bullet with prose both before and after the path token", () => {
+    const brief = "## Frozen Tests\n\n- do not weaken `tests/test_style.py` you may append\n";
+    const qual = findFrozenQualifierItems(brief);
+    assert.equal(qual.length, 1);
+    assert.equal(qual[0].path, "tests/test_style.py");
+    assert.equal(qual[0].remainder, "do not weaken you may append");
   });
 
   it("returns [] for a path-only bullet", () => {
@@ -1038,6 +1059,11 @@ describe("findFrozenQualifierItems", () => {
 
   it("does not change what parseFrozenTests reads (lint, not a parser change)", () => {
     const brief = "## Frozen Tests\n\n- `tests/test_style.py` tests that already exist (you may append; do not weaken)\n";
+    assert.deepEqual(parseFrozenTests(brief), ["tests/test_style.py"]);
+  });
+
+  it("parseFrozenTests on a pre-path bullet still returns the path array (lint only)", () => {
+    const brief = "## Frozen Tests\n\n- do not weaken `tests/test_style.py`\n";
     assert.deepEqual(parseFrozenTests(brief), ["tests/test_style.py"]);
   });
 });
