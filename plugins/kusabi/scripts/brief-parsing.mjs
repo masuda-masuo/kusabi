@@ -394,6 +394,87 @@ export function findSmokeViolations(briefText) {
 }
 
 // ---------------------------------------------------------------------------
+// findFrozenQualifierItems — Frozen Tests bullets whose path is followed by
+// leftover prose the frozen oracle cannot enforce (kusabi #386)
+// ---------------------------------------------------------------------------
+
+/**
+ * Frozen Tests bullets/items whose path token is followed by leftover text.
+ *
+ * `parsePathSection` (behind `parseFrozenTests`) takes only the path token —
+ * first backtick-quoted token, else first whitespace-delimited token, then a
+ * trailing-punctuation and trailing-slash strip — and drops everything after
+ * it.  So any words the brief author writes AFTER the path (`you may append`,
+ * `do not weaken`, a Japanese 但し書き) never reach P5, which freezes by path
+ * and would flag a worker that obeys that prose (e.g. appending) as an oracle
+ * violation.  The worker cannot win because the probe's input is the brief
+ * (henshusha chain-mtaa2btyd78c, 2026-08-27).
+ *
+ * This helper re-derives the SAME path token `parsePathSection` would take,
+ * then inspects whatever remains of the item.  The item qualifies when the
+ * remainder — after trimming whitespace and lone punctuation — still holds a
+ * non-punctuation character: a keyword list would miss `do not weaken` with no
+ * word "append", and Japanese 但し書き, so the rule is purely structural.
+ *
+ *   - A path-only bullet (`` - `tests/test_style.py` ``) has an empty remainder
+ *     → not returned.
+ *   - A bullet with prose (`` - `tests/test_style.py` tests that already exist
+ *     (you may append; do not weaken) ``) → returned with that remainder.
+ *   - A code-block line is the path alone → not returned; a code-block line
+ *     with path + extra words → returned (the spec treats the two alike).
+ *   - A `## Frozen Tests (do not touch)` HEADING is unaffected — heading
+ *     annotations are a different layer (kusabi #167); this walks items, not
+ *     the heading line.
+ *
+ * Purely additive: `parseFrozenTests` is untouched, so P5 still sees only the
+ * path array.  Returns `[]` when the `## Frozen Tests` heading is absent.
+ *
+ * @param {string|null|undefined} briefText
+ * @returns {Array<{path: string, remainder: string, line: string,
+ *                  lineNumber: number}>}
+ *   One entry per qualifying item, in brief order; `[]` when clean. Never throws.
+ */
+export function findFrozenQualifierItems(briefText) {
+  const { items, headingFound } = parseSectionItems(briefText, "Frozen Tests");
+  if (!headingFound) return [];
+
+  const qualifiers = [];
+  for (const item of items) {
+    const content = item.content;
+    // Re-derive the path token EXACTLY as parsePathSection does.
+    let path = null;
+    let remainder = "";
+    const backtickMatch = content.match(/`([^`]+)`/);
+    if (backtickMatch) {
+      path = backtickMatch[1];
+      // Everything after the closing backtick is what P5 would drop.
+      remainder = content.slice(content.indexOf(backtickMatch[0]) + backtickMatch[0].length);
+    } else {
+      const tokens = content.split(/\s+/);
+      path = tokens[0];
+      // Everything after the first whitespace-delimited token.
+      remainder = content.slice(content.indexOf(tokens[0]) + tokens[0].length);
+    }
+    if (!path) continue;
+
+    // Same trailing-punctuation / trailing-slash strip as parsePathSection, so
+    // the path this reports is byte-for-byte the one P5 reads.
+    path = path.replace(/[,;.:!?]+$/, "").replace(/\/+$/, "").trim();
+    if (!path) continue; // the item carries no usable path at all
+
+    const trimmed = remainder.trim();
+    if (trimmed === "") continue; // path alone — no contract P5 cannot see
+    // Lone punctuation (a trailing "." or "---") is not a contract either;
+    // anything left after stripping punctuation+whitespace is prose.
+    const hasContent = trimmed.replace(/[\s\p{P}]+/gu, "") !== "";
+    if (!hasContent) continue;
+
+    qualifiers.push({ path, remainder: trimmed, line: item.raw, lineNumber: item.lineNumber });
+  }
+  return qualifiers;
+}
+
+// ---------------------------------------------------------------------------
 // briefRequestsPublish — detect a brief that asks the worker to publish
 // ---------------------------------------------------------------------------
 

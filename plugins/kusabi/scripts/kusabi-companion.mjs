@@ -9,7 +9,7 @@
 
 import { parseArgs, parseModel, resolveModel, reviewDenyTools, WRITE_TOOL_NAMES, validateChainEntries, splitRouteBackend, resolveChainBackend, stripBackendPrefixChain, resolveModelBackend, chainNamesBackend, backendSupportsResume } from "./cli.mjs";
 import { renderReview, renderChainShow, renderJobLine, renderHeader, extractJson } from "./render.mjs";
-import { hasSectionHeading, parseDeliverables, parseFrozenTests, parseSmoke, parseOrchestratorSignature, zeroEntrySections } from "./brief-parsing.mjs";
+import { hasSectionHeading, parseDeliverables, parseFrozenTests, parseSmoke, parseOrchestratorSignature, zeroEntrySections, findFrozenQualifierItems } from "./brief-parsing.mjs";
 import { cmdInstallCli, diagnoseCompanionShim, formatShimSetupLine } from "./install-cli.mjs";
 // Exit path only (kusabi #243); its own module since kusabi #277 so that the
 // test children exercising it do not import everything above.
@@ -514,6 +514,36 @@ export function briefLintReport({ brief, phase = null, container = null, chain =
         " probe reads that section from the BRIEF, so it would fail on syntax every round and no " +
         "worker edit could turn it green (kusabi #302). Add entries, or delete the heading entirely " +
         "— an empty section must omit its heading."
+      );
+    }
+  }
+
+  // ---- Frozen Tests qualifier (kusabi #386) ----
+  // A `## Frozen Tests` bullet whose path is followed by leftover prose (`you
+  // may append; do not weaken`, `do not weaken`, a Japanese 但し書き) is a
+  // contract P5 cannot enforce.  P5 freezes by PATH and discards the brief
+  // author's own words, so a worker that obeys the prose (append-only) is
+  // flagged as an oracle violation and the chain escalates — the worker cannot
+  // win because the probe's input is the brief (henshusha chain-mtaa2btyd78c,
+  // 2026-08-27).  The fix is dispatch-time, like #302: refuse the brief and
+  // name both remedies.  P5 itself stays path-intersection; we do NOT teach the
+  // probe to read diffs and add no `append-ok` annotation — the new check is
+  // lint, not a change to the path parser.  `parseFrozenTests` is untouched, so
+  // a qualifying bullet still parses to the same path array as today, and a
+  // clean Frozen section (path-only bullets / code-block) returns nothing here.
+  // Ad-hoc `/kusabi:task` text (no --phase, no chain: true) stays untouched,
+  // matching #302.
+  if (chain || phase) {
+    for (const q of findFrozenQualifierItems(brief)) {
+      problems.push(
+        "  - `## Frozen Tests` entry `" + q.path + "` carries leftover text the frozen-oracle " +
+        "cannot see: \"" + q.remainder + "\". P5 freezes by path and drops that text, so a worker " +
+        "that obeys it (for example by appending) is flagged as an oracle violation and the chain " +
+        "escalates — neither the worker nor the probe can fix it (kusabi #386, henshusha " +
+        "chain-mtaa2btyd78c). Two remedies: if append is allowed, do not freeze that path — put " +
+        "\"do not weaken existing tests\" in the Acceptance criteria and put new tests in a " +
+        "different file if they must be frozen; if the path must stay frozen, the entry is the " +
+        "path alone, with no 但し書き."
       );
     }
   }

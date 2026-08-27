@@ -33,6 +33,8 @@ import { withContainerWorkspace, buildImplementText } from "./chain-phases.mjs";
 import { runChainDriver, smokeViolationReport } from "./chain-driver.mjs";
 import {
   parseOrchestratorSignature,
+  parseFrozenTests,
+  findFrozenQualifierItems,
 } from "./brief-parsing.mjs";
 import {
   readChainControl,
@@ -4383,6 +4385,143 @@ describe("brief lint and container delivery (kusabi #289)", () => {
         container: "cid-1",
       });
       assert.match(report, /1 required brief item is missing/);
+    });
+
+    // ---- Frozen Tests qualifier: leftover prose after the path (kusabi #386) ----
+    // The live incident (henshusha chain-mtaa2btyd78c, 2026-08-27) wrote a
+    // `## Frozen Tests` bullet with `you may append; do not weaken`.  parsePathSection
+    // keeps only the path token, so P5 froze `tests/test_style.py` and escalated
+    // when the worker obeyed the prose (append-only).  The defence is dispatch-time:
+    // refuse and name both remedies.  P5 stays path-intersection; no append-ok.
+    it("refuses the live-incident Frozen line, naming the section, path, leftover, and both remedies", () => {
+      const brief = [
+        "# Task", "", SIGNATURE, "", DELIVERABLES,
+        "## Frozen Tests", "",
+        "- `tests/test_style.py` tests that already exist (you may append; do not weaken)", "",
+      ].join("\n");
+      const report = briefLintReport({ brief, phase: "implement", container: "cid-1" });
+      assert.ok(report, "the live incident brief must be refused");
+      assert.match(report, /brief rejected before dispatch/);
+      assert.match(report, /## Frozen Tests/);
+      assert.match(report, /tests\/test_style\.py/);
+      // The leftover the machine dropped must be quoted back at the author.
+      assert.ok(
+        report.includes("tests that already exist (you may append; do not weaken)"),
+        `the refusal must quote the leftover text, got: ${report}`,
+      );
+      // Both remedies, verbatim voice from the issue:
+      assert.ok(report.includes("do not freeze that path"), "remedy 1: do not freeze the path");
+      assert.ok(report.includes("do not weaken existing tests"), "remedy 1: move to Acceptance criteria");
+      assert.ok(report.includes("different file"), "remedy 1: new tests in a different file");
+      assert.ok(report.includes("the entry is the path alone"), "remedy 2: path alone");
+      assert.ok(report.includes("但し書き"), "remedy 2: names the 但し書き");
+      // Nothing in the report blames a worker — it is the brief's defect.
+      assert.doesNotMatch(report, /worker failure|escalated the chain because the worker|violated the oracle because the worker/i);
+    });
+
+    it("returns null for the same bullet reduced to a path alone", () => {
+      const brief = [
+        "# Task", "", SIGNATURE, "", DELIVERABLES,
+        "## Frozen Tests", "",
+        "- `tests/test_style.py`", "",
+      ].join("\n");
+      assert.equal(
+        briefLintReport({ brief, phase: "implement", container: "cid-1" }),
+        null,
+        "a path-only Frozen bullet is exactly what P5 can enforce",
+      );
+    });
+
+    it("returns null for an annotated heading `## Frozen Tests (do not touch)` with a path-only bullet", () => {
+      // Heading annotations stay legal (kusabi #167); the qualifier rule walks
+      // ITEMS, not the heading line.
+      const brief = [
+        "# Task", "", SIGNATURE, "", DELIVERABLES,
+        "## Frozen Tests (do not touch)", "",
+        "- `tests/test_style.py`", "",
+      ].join("\n");
+      assert.equal(briefLintReport({ brief, phase: "implement", container: "cid-1" }), null);
+    });
+
+    it("does NOT refuse a qualifying Frozen line that lives in an ABSENT section", () => {
+      // Absence is not emptiness: with no `## Frozen Tests` heading at all there
+      // is nothing to qualify, so the rule is silent (#302 non-goal).
+      const brief = `# Task\n\n${SIGNATURE}\n\n${DELIVERABLES}`;
+      assert.equal(briefLintReport({ brief, phase: "implement", container: "cid-1" }), null);
+    });
+
+    it("does NOT refuse a Deliverables bullet whose path is followed by prose", () => {
+      // Descriptions after the path are NORMAL in Deliverables; the qualifier
+      // rule is scoped to `## Frozen Tests` only.
+      const brief = [
+        "# Task", "", SIGNATURE, "",
+        "## Deliverables", "",
+        "- `src/foo.js` the store layer", "",
+      ].join("\n");
+      assert.equal(
+        briefLintReport({ brief, phase: "implement", container: "cid-1" }),
+        null,
+        "Deliverables prose must not trigger the Frozen qualifier rule",
+      );
+    });
+
+    it("leaves an ad-hoc task (no --phase, no chain) with a qualifying Frozen line alone", () => {
+      // Matches #302: the lint covers phase dispatches and chains, not the
+      // `/kusabi:task <free text>` surface.
+      const brief = "fix the flaky test\n\n## Frozen Tests\n\n- `tests/test_style.py` you may append; do not weaken\n";
+      assert.equal(briefLintReport({ brief }), null);
+    });
+
+    it("refuses the qualifier on a chain dispatch too", () => {
+      const brief = [
+        "# Task", "", SIGNATURE, "", DELIVERABLES,
+        "## Frozen Tests", "",
+        "- `tests/test_style.py` you may append; do not weaken", "",
+      ].join("\n");
+      const report = briefLintReport({ brief, container: "cid-1", chain: true });
+      assert.ok(report, "the chain path runs the same lint");
+      assert.match(report, /## Frozen Tests/);
+      assert.match(report, /tests\/test_style\.py/);
+      assert.ok(report.includes("you may append; do not weaken"));
+    });
+
+    it("does not change what parseFrozenTests / P5 read for a qualifying bullet", () => {
+      // The new check is lint, not a change to the path parser's return value.
+      const brief = [
+        "# Task", "", SIGNATURE, "", DELIVERABLES,
+        "## Frozen Tests", "",
+        "- `tests/test_style.py` tests that already exist (you may append; do not weaken)", "",
+      ].join("\n");
+      assert.deepEqual(parseFrozenTests(brief), ["tests/test_style.py"]);
+      const qual = findFrozenQualifierItems(brief);
+      assert.equal(qual.length, 1);
+      assert.equal(qual[0].path, "tests/test_style.py");
+      assert.equal(qual[0].remainder, "tests that already exist (you may append; do not weaken)");
+    });
+
+    it("treats a code-block Frozen line with path + extra words as a qualifier", () => {
+      const brief = [
+        "# Task", "", SIGNATURE, "", DELIVERABLES,
+        "## Frozen Tests", "",
+        "```",
+        "tests/test_style.py you may append new tests here",
+        "```", "",
+      ].join("\n");
+      const report = briefLintReport({ brief, phase: "implement", container: "cid-1" });
+      assert.ok(report, "a code-block path+prose line qualifies");
+      assert.match(report, /tests\/test_style\.py/);
+      assert.ok(report.includes("you may append new tests here"));
+    });
+
+    it("does NOT qualify a code-block line that is the path alone", () => {
+      const brief = [
+        "# Task", "", SIGNATURE, "", DELIVERABLES,
+        "## Frozen Tests", "",
+        "```",
+        "tests/test_style.py",
+        "```", "",
+      ].join("\n");
+      assert.equal(briefLintReport({ brief, phase: "implement", container: "cid-1" }), null);
     });
   });
 
