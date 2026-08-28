@@ -89,16 +89,19 @@ export function checkAgentPermissions(permission, roleName) {
     violations.push(`"sunaba_sandbox_issue_write" granted to "${roleName}", but only draft/investigate may have it`);
   }
 
-  // 8. kaiba is READ-ONLY for every worker phase: `kaiba_recall` is the only
-  //    grant that may appear under the kaiba prefix.  Write permission
-  //    follows the inspection hierarchy — an agent whose output is inspected
-  //    reads the shared conclusion store, and the inspecting side (the
-  //    orchestrator) is the only writer; a worker that discovers a durable
-  //    fact reports it instead of filing it.  A `kaiba*` glob would re-allow
+  // 8. kaiba permissions (kusabi #279, #391): `kaiba_recall` and
+  //    `kaiba_progress` are the only grants that may appear under the
+  //    kaiba prefix.  Write permission for conclusions (`remember`) follows
+  //    the inspection hierarchy — an agent whose output is inspected reads
+  //    the shared conclusion store and records in-flight progress notes,
+  //    and the inspecting side (the orchestrator) is the only writer of
+  //    durable conclusions; a worker that discovers a durable fact reports
+  //    it instead of filing it.  A `kaiba*` glob would re-allow
   //    `kaiba_remember` under findLast, so the wildcard is a violation too.
+  const allowedKaibaTools = new Set(["kaiba_recall", "kaiba_progress"]);
   for (const [tool, value] of entries) {
-    if (value === "allow" && tool.startsWith("kaiba") && tool !== "kaiba_recall") {
-      violations.push(`Non-recall kaiba grant "${tool}" is allowed (role: ${roleName})`);
+    if (value === "allow" && tool.startsWith("kaiba") && !allowedKaibaTools.has(tool)) {
+      violations.push(`Forbidden kaiba grant "${tool}" is allowed (role: ${roleName})`);
     }
   }
 
@@ -239,13 +242,18 @@ describe("agent permission allowlists", () => {
         `${roleName}: Permission violations:\n  ${violations.join("\n  ")}`,
       );
 
-      // Read access is the other half of the read-only contract: rule 8
-      // rejects any kaiba grant beyond recall, but only this assertion
-      // notices recall going missing entirely.
+      // Read and progress access: rule 8 rejects any kaiba grant beyond
+      // recall and progress, but only these assertions notice them going
+      // missing entirely.
       assert.equal(
         permission["kaiba_recall"],
         "allow",
         `${roleName}: kaiba_recall must be granted — every worker phase reads the shared conclusion store`,
+      );
+      assert.equal(
+        permission["kaiba_progress"],
+        "allow",
+        `${roleName}: kaiba_progress must be granted — every worker phase records in-flight progress notes`,
       );
     });
   }
@@ -414,7 +422,7 @@ describe("agent permission allowlists", () => {
 
     it('"kaiba_remember" granted to any role', () => {
       const violations = checkAgentPermissions(
-        { ...READ_CORE, "kaiba_recall": "allow", "kaiba_remember": "allow" },
+        { ...READ_CORE, "kaiba_recall": "allow", "kaiba_progress": "allow", "kaiba_remember": "allow" },
         "review",
       );
       assert.ok(violations.some(v => v.includes("kaiba_remember")));
@@ -423,6 +431,14 @@ describe("agent permission allowlists", () => {
     it('a "kaiba*" glob is a violation — it re-allows remember by pattern', () => {
       const violations = checkAgentPermissions({ ...READ_CORE, "kaiba*": "allow" }, "review");
       assert.ok(violations.some(v => v.includes("kaiba*")));
+    });
+
+    it('"kaiba_recall" and "kaiba_progress" pass', () => {
+      const violations = checkAgentPermissions(
+        { ...READ_CORE, "kaiba_recall": "allow", "kaiba_progress": "allow" },
+        "review",
+      );
+      assert.deepEqual(violations, []);
     });
 
     it('"kaiba_recall" alone passes', () => {
