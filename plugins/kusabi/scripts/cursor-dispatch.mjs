@@ -84,6 +84,7 @@ import { stateDirFor, writeJson } from "./state-paths.mjs";
 import { durationS } from "./render.mjs";
 import { resolveCompletedResult } from "./result-recovery.mjs";
 import { deriveStopReason } from "./stop-reason.mjs";
+import { startKaibaProgressWatch } from "./kaiba-progress-watch.mjs";
 
 export const CURSOR_BACKEND = "cursor";
 
@@ -691,7 +692,10 @@ export async function cursorDispatch(opts) {
   saveJob(stateDir, job);
   fs.writeFileSync(path.join(jobDir(stateDir, job.id), "prompt.md"), promptText, "utf8");
 
-  appendEvent(stateDir, job.id, {
+  const progressWatch = startKaibaProgressWatch({ stateDir, jobId: job.id });
+
+  try {
+    appendEvent(stateDir, job.id, {
     type: "companion.cursor.dispatch",
     backend: CURSOR_BACKEND,
     model: modelEntry,
@@ -827,4 +831,7 @@ export async function cursorDispatch(opts) {
   saveJob(stateDir, job);
 
   return { job, resultText, stateDir };
+  } finally {
+    progressWatch.stop();
+  }
 }

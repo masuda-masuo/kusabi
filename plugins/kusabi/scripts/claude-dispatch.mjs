@@ -118,6 +118,7 @@ import { stateDirFor, stateRoot, readJson, writeJson } from "./state-paths.mjs";
 import { durationS } from "./render.mjs";
 import { resolveCompletedResult } from "./result-recovery.mjs";
 import { deriveStopReason } from "./stop-reason.mjs";
+import { startKaibaProgressWatch } from "./kaiba-progress-watch.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const PLUGIN_ROOT = path.resolve(HERE, "..");
@@ -2931,6 +2932,8 @@ export async function claudeDispatch(opts) {
     bin,
   });
 
+  const progressWatch = startKaibaProgressWatch({ stateDir, jobId: job.id });
+
   // ---- pre-dispatch session-quota guard (kusabi #215) ----
   // Runs AFTER the record exists (so a refusal is a finalised job record with
   // a prompt and an audit trail, not a silent nothing) and BEFORE any worker
@@ -3005,11 +3008,13 @@ export async function claudeDispatch(opts) {
         capacityReason,
       });
       saveJob(stateDir, job);
+      progressWatch.stop();
       return { job, resultText: "", stateDir };
     }
   }
 
-  // ---- write-tool watchdog (kusabi #215 item 3) ----
+  try {
+    // ---- write-tool watchdog (kusabi #215 item 3) ----
   // Resolved independently of the session guard above (its own config read,
   // its own try/catch): the two guards must not be able to break each other,
   // and this one is the destructive one.  Off unless BOTH the config asks
@@ -3389,4 +3394,7 @@ export async function claudeDispatch(opts) {
   }
 
   return { job, resultText, stateDir };
+  } finally {
+    progressWatch.stop();
+  }
 }

@@ -11,6 +11,7 @@ import { durationS } from "./render.mjs";
 import { parseModel, selectRoutes } from "./cli.mjs";
 import { resolveCompletedResult } from "./result-recovery.mjs";
 import { deriveStopReason } from "./stop-reason.mjs";
+import { startKaibaProgressWatch } from "./kaiba-progress-watch.mjs";
 
 // =========================================================================
 // fail-fast retry decision — pure, exported, unit-testable
@@ -475,6 +476,8 @@ export async function runPrompt({ cwd, kind, title, promptText, agent, model, se
   saveJob(stateDir, job);
   fs.writeFileSync(path.join(jobDir(stateDir, job.id), "prompt.md"), promptText, "utf8");
 
+  const progressWatch = startKaibaProgressWatch({ stateDir, jobId: job.id });
+
   const abort = new AbortController();
   const timeout = setTimeout(() => abort.abort(), timeoutS * 1000);
   const replied = new Set();
@@ -731,6 +734,7 @@ export async function runPrompt({ cwd, kind, title, promptText, agent, model, se
     });
     await watcher;
   } finally {
+    progressWatch.stop();
     clearTimeout(timeout);
     clearInterval(livenessInterval);
     clearInterval(watchdogInterval);

@@ -5360,3 +5360,105 @@ setTimeout(() => {
   });
 });
 
+// =========================================================================
+// status command with kaiba progress (kusabi #391)
+// =========================================================================
+
+describe("status command kaiba progress rendering (kusabi #391)", () => {
+  const COMPANION_SCRIPT = path.join(import.meta.dirname, "kusabi-companion.mjs");
+  let tmpDir;
+  let stateRootDir;
+  let workspaceStateDir;
+
+  beforeEach(() => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-status-progress-"));
+    stateRootDir = path.join(tmpDir, "state");
+    const hash = crypto.createHash("sha256").update(tmpDir).digest("hex").slice(0, 12);
+    workspaceStateDir = path.join(stateRootDir, hash);
+    fs.mkdirSync(workspaceStateDir, { recursive: true });
+  });
+
+  afterEach(() => {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  function runCompanion(args) {
+    const env = { ...process.env };
+    delete env.KUSABI_WORKER_CONTEXT;
+    env.KUSABI_STATE_DIR = stateRootDir;
+    return spawnSync(process.execPath, [COMPANION_SCRIPT, ...args], {
+      encoding: "utf8",
+      cwd: tmpDir,
+      env,
+      timeout: 15_000,
+    });
+  }
+
+  it("status without progress events matches expected shape without progress section", () => {
+    const jobId = "job-no-progress";
+    const jobDir = path.join(workspaceStateDir, "jobs", jobId);
+    fs.mkdirSync(jobDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(jobDir, "job.json"),
+      JSON.stringify({
+        id: jobId,
+        kind: "task",
+        status: "completed",
+        startedAt: "2026-08-29T00:00:00.000Z",
+        finishedAt: "2026-08-29T00:05:00.000Z",
+        stats: { events: 10, steps: 5, lastTool: "verify", permissionsAllowed: 0, permissionsRejected: 0, lastActivity: "2026-08-29T00:05:00.000Z" },
+      }),
+      "utf8",
+    );
+
+    const res = runCompanion(["status", jobId]);
+    assert.equal(res.status, 0, res.stderr);
+    assert.match(res.stdout, /events: 10, steps: 5, last tool: verify/);
+    assert.doesNotMatch(res.stdout, /progress:/);
+  });
+
+  it("status with progress events in events.ndjson renders progress block", () => {
+    const jobId = "job-with-progress";
+    const jobDir = path.join(workspaceStateDir, "jobs", jobId);
+    fs.mkdirSync(jobDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(jobDir, "job.json"),
+      JSON.stringify({
+        id: jobId,
+        kind: "task",
+        status: "running",
+        startedAt: "2026-08-29T00:00:00.000Z",
+        stats: { events: 12, steps: 6, lastTool: "edit", permissionsAllowed: 0, permissionsRejected: 0, lastActivity: "2026-08-29T00:02:00.000Z" },
+      }),
+      "utf8",
+    );
+    fs.writeFileSync(
+      path.join(jobDir, "events.ndjson"),
+      [
+        JSON.stringify({
+          type: "companion.kaiba.progress",
+          id: 1,
+          created_at: "2026-08-29T00:01:00Z",
+          agent: "worker",
+          job: jobId,
+          content: "analyzing problem statement",
+        }),
+        JSON.stringify({
+          type: "companion.kaiba.progress",
+          id: 2,
+          created_at: "2026-08-29T00:02:00Z",
+          agent: "worker",
+          job: jobId,
+          content: "editing implementation files",
+        }),
+      ].join("\n") + "\n",
+      "utf8",
+    );
+
+    const res = runCompanion(["status", jobId]);
+    assert.equal(res.status, 0, res.stderr);
+    assert.match(res.stdout, /events: 12, steps: 6, last tool: edit/);
+    assert.match(res.stdout, /progress:\n\s+- analyzing problem statement\n\s+- editing implementation files/);
+  });
+});
+
