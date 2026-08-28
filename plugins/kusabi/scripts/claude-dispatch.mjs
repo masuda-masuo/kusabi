@@ -297,14 +297,14 @@ const IMPLEMENT_ALLOWED_TOOLS = [
   "mcp__sunaba__verify_in_container",
   "mcp__sunaba__lint_in_container",
   "mcp__sunaba__type_check_in_container",
-  // kaiba (kusabi #279): the shared conclusion store, readable from every
-  // worker phase — `recall` only.  `remember` is deliberately absent: the
-  // implementer's output is inspected, so it reads the store and reports
-  // durable facts in its final report for the orchestrator to file.  Both
-  // tool definitions ride in every turn's context regardless —
-  // --allowedTools is a runtime guard, not a context filter — and that cost
-  // is accepted deliberately.
+  // kaiba (kusabi #279, #391): the shared conclusion store: recall +
+  // progress; remember never.  The implementer reads conclusions, records
+  // in-flight progress notes, and reports durable facts in its final
+  // report for the orchestrator to file.  Both tool definitions ride in
+  // every turn's context regardless — --allowedTools is a runtime guard,
+  // not a context filter — and that cost is accepted deliberately.
   "mcp__kaiba__recall",
+  "mcp__kaiba__progress",
   "Skill", // mirrors `skill: kusabi-*: allow` in kusabi-implement.md
 ];
 
@@ -320,11 +320,12 @@ const REVIEW_ALLOWED_TOOLS = [
   "mcp__sunaba__lint_in_container",
   "mcp__sunaba__type_check_in_container",
   "mcp__sunaba__sandbox_exec",
-  // kaiba (kusabi #279): the shared conclusion store — read-only, as for
-  // implement; INVESTIGATE inherits the grant via the spread below.  The
-  // reviewer is an inspected phase too: what it concludes goes in the
-  // review, and filing stays with the orchestrator.
+  // kaiba (kusabi #279, #391): the shared conclusion store: recall +
+  // progress; remember never.  The reviewer is an inspected phase too:
+  // it reads conclusions, records in-flight progress notes, and durable
+  // facts go in the review output for the orchestrator to file.
   "mcp__kaiba__recall",
+  "mcp__kaiba__progress",
 ];
 
 // kusabi-investigate.md grants issue write: the standalone investigate
@@ -699,8 +700,8 @@ function describeKaibaEntry(value) {
 }
 
 /**
- * Force a kaiba MCP entry to file conclusions under the kusabi worker
- * identity.
+ * Force a kaiba MCP entry to file conclusions and write progress under the
+ * kusabi worker identity and optional job id (kusabi #279, #391).
  *
  * The host entry is the OPERATOR's own registration — its own Claude Code
  * session files conclusions under `KAIBA_AGENT=claude`.  A dispatched
@@ -712,6 +713,11 @@ function describeKaibaEntry(value) {
  * (command, args, the remaining env such as KAIBA_WORKSPACE) passes
  * through untouched.
  *
+ * When `jobId` is a non-empty string matching `^[a-zA-Z0-9_-]+$`,
+ * `env.KAIBA_JOB` is set to that string.  When `jobId` is omitted, null, or
+ * `""`, `env.KAIBA_JOB` is not set.  When `jobId` is present but does not
+ * match the pattern, this function throws, naming the value.
+ *
  * The source entry is never mutated — the changed env comes back on a copy
  * (the same rule applySunabaProfile follows).  An absent entry stays
  * absent, and a non-object entry passes through unchanged (as a pure
@@ -719,16 +725,28 @@ function describeKaibaEntry(value) {
  * anything that could not be a server entry before this transform runs).
  *
  * @param {object|null|undefined} kaibaEntry
+ * @param {string|null|undefined} [jobId]
  * @returns {object|null|undefined} The entry to write, or null/undefined
  *         when there is none.
  */
-export function applyWorkerKaibaIdentity(kaibaEntry) {
+export function applyWorkerKaibaIdentity(kaibaEntry, jobId) {
   if (!kaibaEntry || typeof kaibaEntry !== "object" || Array.isArray(kaibaEntry)) return kaibaEntry;
+  let jobVal;
+  if (jobId !== undefined && jobId !== null && jobId !== "") {
+    if (typeof jobId !== "string" || !/^[a-zA-Z0-9_-]+$/.test(jobId)) {
+      throw new Error(`invalid KAIBA_JOB id: ${JSON.stringify(jobId)}`);
+    }
+    jobVal = jobId;
+  }
   const srcEnv =
     kaibaEntry.env && typeof kaibaEntry.env === "object" && !Array.isArray(kaibaEntry.env)
       ? kaibaEntry.env
       : {};
-  return { ...kaibaEntry, env: { ...srcEnv, KAIBA_AGENT: "worker" } };
+  const env = { ...srcEnv, KAIBA_AGENT: "worker" };
+  if (jobVal !== undefined) {
+    env.KAIBA_JOB = jobVal;
+  }
+  return { ...kaibaEntry, env };
 }
 
 /**
@@ -2800,29 +2818,32 @@ export async function claudeDispatch(opts) {
     extractSunabaMcp(claudeMcpSourcePath()),
     sunabaProfileForAgent(opts.agent),
   );
-  // kaiba is OPTIONAL (kusabi #279) — deliberately the opposite of sunaba:
-  // a host config without an `mcpServers.kaiba` entry keeps dispatching
-  // exactly as it does today (no kaiba in the generated config, no error),
-  // while a present entry is rewritten so the worker files conclusions
-  // under `worker` — never the operator's own registration, whatever
-  // KAIBA_AGENT the host entry said.  The rewrite comes back on a copy; the
-  // source entry is never touched.  Absence is silent, but a present entry
-  // that could not be a server entry throws HERE, in pre-flight, before any
+  // kaiba is OPTIONAL (kusabi #279, #391) — deliberately the opposite of
+  // sunaba: a host config without an `mcpServers.kaiba` entry keeps
+  // dispatching exactly as it does today (no kaiba in the generated config,
+  // no error), while a present entry is rewritten so the worker files
+  // conclusions and writes progress under `worker` — never the operator's
+  // own registration, whatever KAIBA_AGENT the host entry said — and stamps
+  // the minted KAIBA_JOB.  The rewrite comes back on a copy; the source
+  // entry is never touched.  Absence is silent, but a present entry that
+  // could not be a server entry throws HERE, in pre-flight, before any
   // job record exists — the same fail-loud posture as the sunaba entry
   // (kusabi #279 follow-up).
-  const kaibaEntry = applyWorkerKaibaIdentity(extractKaibaMcp(claudeMcpSourcePath()));
+  const rawKaibaEntry = extractKaibaMcp(claudeMcpSourcePath());
   const systemPrompt = readAgentSystemPrompt(opts.agent);
   const allowedTools = applyToolDenies(allowedToolsForAgent(opts.agent), opts.tools);
   const disallowedTools = disallowedToolsForAgent(opts.agent);
   const bin = claudeBin();
   // The job id is minted here, in pre-flight, so the generated MCP config
-  // can be named after its job (kusabi #276): the file lives in the job's
-  // OWN directory, so two dispatches in the same cwd whose spawn windows
-  // overlap each hand their claude process a config file only they write —
-  // one dispatch's profile can never overwrite another's.  The write is
-  // deliberately the LAST pre-flight step, after every throw-capable check
-  // above has passed, so a loud failure never leaves a stray config behind.
+  // can be named after its job (kusabi #276) and stamp KAIBA_JOB on the
+  // kaiba entry (kusabi #391): the file lives in the job's OWN directory,
+  // so two dispatches in the same cwd whose spawn windows overlap each hand
+  // their claude process a config file only they write — one dispatch's
+  // profile can never overwrite another's.  The write is deliberately the
+  // LAST pre-flight step, after every throw-capable check above has passed,
+  // so a loud failure never leaves a stray config behind.
   const jobId = newJobId();
+  const kaibaEntry = applyWorkerKaibaIdentity(rawKaibaEntry, jobId);
   const mcpConfigPath = writeClaudeMcpConfig(jobDir(stateDir, jobId), sunabaEntry, kaibaEntry);
   const args = buildClaudeArgs({
     model: modelEntry,

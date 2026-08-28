@@ -811,16 +811,17 @@ describe("allowedToolsForAgent", () => {
     assert.throws(() => allowedToolsForAgent("custom-agent"), /no permission allowlist/);
   });
 
-  it("grants kaiba READ-ONLY to all three supported agents — recall, never remember (kusabi #279)", () => {
+  it("grants kaiba recall and progress to all three supported agents — never remember (kusabi #279, #391)", () => {
     // Write permission follows the inspection hierarchy: every agent
-    // dispatched here has its output inspected, so it reads the store and
-    // reports durable facts for the orchestrator to file.  On the store's
-    // first day workers filed review summaries and completion reports, which
-    // the prompt-level contract failed to prevent — so the grant itself is
-    // the guard now.
+    // dispatched here has its output inspected, so it reads the store,
+    // records in-flight progress notes, and reports durable facts for the
+    // orchestrator to file.  On the store's first day workers filed review
+    // summaries and completion reports, which the prompt-level contract
+    // failed to prevent — so the grant itself is the guard now.
     for (const agent of ["kusabi-implement", "kusabi-review", "kusabi-investigate"]) {
       const csv = allowedToolsForAgent(agent);
       assert.ok(csv.includes("mcp__kaiba__recall"), `${agent} must allow mcp__kaiba__recall`);
+      assert.ok(csv.includes("mcp__kaiba__progress"), `${agent} must allow mcp__kaiba__progress`);
       assert.ok(!csv.includes("mcp__kaiba__remember"), `${agent} must NOT allow mcp__kaiba__remember`);
     }
   });
@@ -832,7 +833,7 @@ describe("allowedToolsForAgent", () => {
     // only acceptable kaiba entry is the exact recall tool.
     for (const [phase, csv] of Object.entries(ALLOWED_TOOLS)) {
       const kaibaTools = csv.split(",").filter(t => t.startsWith("mcp__kaiba__"));
-      assert.deepEqual(kaibaTools, ["mcp__kaiba__recall"], `${phase}: kaiba must be recall-only`);
+      assert.deepEqual(kaibaTools, ["mcp__kaiba__recall", "mcp__kaiba__progress"], `${phase}: kaiba must be recall and progress only`);
     }
   });
 });
@@ -1108,6 +1109,48 @@ describe("applyWorkerKaibaIdentity", () => {
       args: ["--stdio"],
       env: { KAIBA_WORKSPACE: "dev", KAIBA_AGENT: "worker" },
     });
+  });
+
+  it("stamps env.KAIBA_JOB when jobId is provided", () => {
+    const entry = {
+      command: "/usr/local/bin/kaiba",
+      args: ["--stdio"],
+      env: { KAIBA_WORKSPACE: "dev", KAIBA_AGENT: "claude" },
+    };
+    assert.deepEqual(applyWorkerKaibaIdentity(entry, "job-abc"), {
+      command: "/usr/local/bin/kaiba",
+      args: ["--stdio"],
+      env: { KAIBA_WORKSPACE: "dev", KAIBA_AGENT: "worker", KAIBA_JOB: "job-abc" },
+    });
+    // source is not mutated
+    assert.deepEqual(entry, {
+      command: "/usr/local/bin/kaiba",
+      args: ["--stdio"],
+      env: { KAIBA_WORKSPACE: "dev", KAIBA_AGENT: "claude" },
+    });
+  });
+
+  it("does not stamp KAIBA_JOB when jobId is omitted, null, or empty string", () => {
+    const entry = { command: "/usr/local/bin/kaiba" };
+    assert.deepEqual(applyWorkerKaibaIdentity(entry), {
+      command: "/usr/local/bin/kaiba",
+      env: { KAIBA_AGENT: "worker" },
+    });
+    assert.deepEqual(applyWorkerKaibaIdentity(entry, null), {
+      command: "/usr/local/bin/kaiba",
+      env: { KAIBA_AGENT: "worker" },
+    });
+    assert.deepEqual(applyWorkerKaibaIdentity(entry, ""), {
+      command: "/usr/local/bin/kaiba",
+      env: { KAIBA_AGENT: "worker" },
+    });
+  });
+
+  it("throws when jobId is invalid", () => {
+    const entry = { command: "/usr/local/bin/kaiba" };
+    assert.throws(() => applyWorkerKaibaIdentity(entry, "bad id"), /invalid KAIBA_JOB id.*bad id/);
+    assert.throws(() => applyWorkerKaibaIdentity(entry, "job@123"), /invalid KAIBA_JOB id.*job@123/);
+    assert.throws(() => applyWorkerKaibaIdentity(entry, 123), /invalid KAIBA_JOB id/);
   });
 
   it("adds the env block when the source entry has none", () => {
@@ -1832,11 +1875,12 @@ describe("claudeDispatch (fake claude binary)", () => {
   // `{ mcpServers: { sunaba } }`.  These drive the kaiba-present and
   // error cases end to end.
 
-  it("a source kaiba entry reaches the generated config, filed under worker — never the operator's identity", async () => {
+  it("a source kaiba entry reaches the generated config, filed under worker with KAIBA_JOB — never the operator's identity", async () => {
     // The host entry is the OPERATOR's own registration (KAIBA_AGENT=claude).
     // A dispatched worker is not that session: conclusions it writes must
     // not be attributed to it — authorship exists precisely to tell them
-    // apart — so the generated config always carries KAIBA_AGENT=worker.
+    // apart — so the generated config always carries KAIBA_AGENT=worker and
+    // KAIBA_JOB=<job.id>.
     const sourceKaiba = {
       command: "/usr/local/bin/kaiba",
       env: { KAIBA_WORKSPACE: "dev", KAIBA_AGENT: "claude" },
@@ -1846,14 +1890,14 @@ describe("claudeDispatch (fake claude binary)", () => {
       JSON.stringify({ mcpServers: { sunaba: SUNABA_MCP, kaiba: sourceKaiba, other: { command: "echo" } } }),
       "utf8",
     );
-    await claudeDispatch(ctx.dispatchOptions());
+    const { job } = await claudeDispatch(ctx.dispatchOptions());
 
     const args = JSON.parse(fs.readFileSync(ctx.argsLog, "utf8").trim());
     const mcpConfig = readJson(args[args.indexOf("--mcp-config") + 1]);
     assert.deepEqual(mcpConfig.mcpServers.sunaba, SUNABA_MCP);
     assert.deepEqual(mcpConfig.mcpServers.kaiba, {
       command: "/usr/local/bin/kaiba",
-      env: { KAIBA_WORKSPACE: "dev", KAIBA_AGENT: "worker" },
+      env: { KAIBA_WORKSPACE: "dev", KAIBA_AGENT: "worker", KAIBA_JOB: job.id },
     });
     // The operator's registration on disk is untouched — the rewrite came
     // back on a copy.
