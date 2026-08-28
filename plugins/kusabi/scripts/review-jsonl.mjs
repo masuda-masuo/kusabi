@@ -1,4 +1,4 @@
-// review-jsonl.mjs — the JSONL review wire format (kusabi #202).
+// review-jsonl.mjs — the JSONL review wire format (kusabi #202, #392).
 //
 // The reviewer emits one JSON object per line, each written when that piece
 // of the review is decided:
@@ -7,7 +7,7 @@
 //    "line_start":12,"line_end":18,"confidence":0.8,"recommendation":"…"}
 //   {"type":"unverified","text":"could not exercise the timeout path"}
 //   {"type":"next_step","text":"…"}
-//   {"type":"verdict","verdict":"needs-attention","summary":"…"}
+//   {"type":"verdict","schema_version":1,"verdict":"needs-attention","summary":"…"}
 //
 // Two properties make this worth having over one large object at the end:
 // a truncated stream still carries every finding it managed to emit, and a
@@ -20,8 +20,8 @@
 //
 // This module is a WIRE FORMAT parser and nothing else.  It assembles the
 // records into the same in-memory review object the single-blob path
-// produces (`{ verdict, summary, findings, next_steps, unverified? }`, field
-// names exactly as `schemas/review-output.schema.json` defines them) so that
+// produces (`{ schema_version, verdict, summary, findings, next_steps, unverified? }`,
+// field names exactly as `schemas/review-output.schema.json` defines them) so that
 // JSONL never becomes a second domain model.  It has no imports on purpose.
 
 /**
@@ -79,16 +79,7 @@ const SALVAGE_MARKER = " [salvaged from an unterminated verdict line]";
  *
  * @param {string} text — the reviewer's raw output.
  * @returns {null|{
- *   review: object,          // assembled single-object shape (see module note);
- *                            // `salvagedVerdict: true` marks a verdict
- *                            // recovered from an unterminated verdict line
- *   verdict: string|null,    // the closing verdict (record or salvaged)
- *   partial: boolean,        // true when no verdict arrived, salvaged or not
- *   partialDiagnosis: string|null, // why the stream is partial, when it is
- *   findingCount: number,
- *   recordCount: number,     // records recognised (all types)
- *   ignoredLines: number,    // non-record lines skipped (prose, fences, junk)
- * }}
+ *   review: object,          // assembled single-object shape (see module note);\n *                            // `salvagedVerdict: true` marks a verdict\n *                            // recovered from an unterminated verdict line\n *   verdict: string|null,    // the closing verdict (record or salvaged)\n *   partial: boolean,        // true when no verdict arrived, salvaged or not\n *   partialDiagnosis: string|null, // why the stream is partial, when it is\n *   findingCount: number,\n *   recordCount: number,     // records recognised (all types)\n *   ignoredLines: number,    // non-record lines skipped (prose, fences, junk)\n * }}
  *   `null` means "this is not JSONL" — no line was a recognisable record.
  *   The caller must then fall back to the single-object `extractJson` path.
  *   An empty or whitespace-only stream is also `null`: unreadable output is
@@ -201,8 +192,20 @@ export function parseReviewJsonl(text) {
   // carried some, so the assembled object matches what the single-object
   // path produces for the same review.
   if (unverified.length > 0) review.unverified = unverified;
+  if (verdictRecord && verdictRecord.schema_version !== undefined) {
+    review.schema_version = verdictRecord.schema_version;
+  }
   if (verdictRecord && typeof verdictRecord.discard_reason === "string") {
     review.discard_reason = verdictRecord.discard_reason;
+  }
+  // Carry any extra keys from the verdict record onto the assembled review
+  // so downstream schema validation can refuse unknown fields (kusabi #392).
+  if (verdictRecord) {
+    for (const key of Object.keys(verdictRecord)) {
+      if (key !== "type" && !(key in review)) {
+        review[key] = verdictRecord[key];
+      }
+    }
   }
   // A salvaged verdict is marked, never silent: the operator must be able to
   // tell a recovered decision from one the reviewer actually completed.
@@ -270,11 +273,8 @@ const LEGACY_BLOB = Symbol("legacy-blob");
  * loss by a different route.  `LEGACY_BLOB` makes the caller abandon JSONL
  * for the whole output so the legacy parser sees the blob intact.
  *
- * Note what this does NOT do: it is not `additionalProperties: false`.  An
- * unknown extra key on an otherwise well-formed record is still accepted.
- * The check targets exactly the confusion that has been observed, and saying
- * more than that in this comment is the mistake that produced the bug it
- * fixes.
+ * Note: An unknown extra key on a record is preserved on the record object,
+ * and refused by post-parse schema validation (kusabi #392).
  */
 function parseRecordLine(line) {
   // A record is a JSON object, so anything not starting with `{` is prose —

@@ -2624,7 +2624,7 @@ describe("chain finally serve-stop fossil guard", () => {
             usage: { available: true, input: 2, output: 2, reasoning: 0, cacheRead: 0, cacheWrite: 0, cost: 0.01 },
             error: null,
           },
-          resultText: JSON.stringify({ verdict: "approve", findings: [], summary: "ok" }),
+          resultText: JSON.stringify({ schema_version: 1, verdict: "approve", findings: [], summary: "ok", next_steps: [] }),
         };
       }
       if (opts.kind === "task") {

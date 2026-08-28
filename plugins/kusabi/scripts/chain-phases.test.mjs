@@ -2560,11 +2560,13 @@ describe("parseReviewResult", () => {
     const payload = [
       "```json",
       "{",
+      '  "schema_version": 1,',
       '  "verdict": "needs-attention",',
       '  "summary": "All five prior findings are genuinely fixed. The gate passes (451/451, zero lint/type issues). However, one function is dead code.",',
       '  "findings": [',
-      '    { "severity": "low", "title": "Dead code in helper", "file": "src/utils.js", "line_start": 42 }',
-      "  ]",
+      '    { "severity": "low", "title": "Dead code in helper", "body": "Helper is unused.", "file": "src/utils.js", "line_start": 42, "line_end": 45, "confidence": 0.9, "recommendation": "Remove helper." }',
+      "  ],",
+      '  "next_steps": []',
       "}",
       "```",
       "",
@@ -2588,11 +2590,13 @@ describe("parseReviewResult", () => {
       "",
       "```json",
       "{",
+      '  "schema_version": 1,',
       '  "verdict": "needs-attention",',
       '  "summary": "Looks ok",',
       '  "findings": [',
-      '    { "severity": "medium", "title": "Magic number", "file": "src/calc.js", "line_start": 7 }',
-      "  ]",
+      '    { "severity": "medium", "title": "Magic number", "body": "Hardcoded const.", "file": "src/calc.js", "line_start": 7, "line_end": 7, "confidence": 0.8, "recommendation": "Use named const." }',
+      "  ],",
+      '  "next_steps": []',
       "}",
       "```",
       "```",
@@ -2609,7 +2613,7 @@ describe("parseReviewResult", () => {
   });
 
   it("recovers approve verdict with empty findings", () => {
-    const payload = "```json\n{\n  \"verdict\": \"approve\",\n  \"summary\": \"LGTM\",\n  \"findings\": []\n}\n```";
+    const payload = "```json\n{\n  \"schema_version\": 1,\n  \"verdict\": \"approve\",\n  \"summary\": \"LGTM\",\n  \"findings\": [],\n  \"next_steps\": []\n}\n```";
     const result = parseReviewResult(payload);
 
     assert.equal(result.reviewParseable, true);
@@ -2650,7 +2654,7 @@ describe("parseReviewResult", () => {
 
   it("unparseable review is distinguishable from genuine needs-attention", () => {
     // A genuine needs-attention review is parseable but has that verdict
-    const genuinePayload = "```json\n{\n  \"verdict\": \"needs-attention\",\n  \"summary\": \"Issues found\",\n  \"findings\": [\n    { \"severity\": \"high\", \"title\": \"Bug\", \"file\": \"src/main.js\", \"line_start\": 1 }\n  ]\n}\n```\nVERDICT: needs-attention";
+    const genuinePayload = "```json\n{\n  \"schema_version\": 1,\n  \"verdict\": \"needs-attention\",\n  \"summary\": \"Issues found\",\n  \"findings\": [\n    { \"severity\": \"high\", \"title\": \"Bug\", \"body\": \"b\", \"file\": \"src/main.js\", \"line_start\": 1, \"line_end\": 2, \"confidence\": 0.9, \"recommendation\": \"r\" }\n  ],\n  \"next_steps\": []\n}\n```\nVERDICT: needs-attention";
     const genuine = parseReviewResult(genuinePayload);
 
     assert.equal(genuine.reviewParseable, true);
@@ -2669,26 +2673,27 @@ describe("parseReviewResult", () => {
     // despite having the same verdict string.
   });
 
-  // kusabi #153: a parseable review whose `findings` is a non-array (string /
-  // object — e.g. a model responding to a broken review input) must not crash
-  // with ".map is not a function"; it degrades to "(no structured findings)".
-  it("tolerates a string findings field without crashing", () => {
-    const payload = "```json\n{\n  \"verdict\": \"needs-attention\",\n  \"summary\": \"s\",\n  \"findings\": \"not an array\"\n}\n```";
+  // kusabi #392: strict validation rejects non-array findings instead of absorbing
+  it("rejects a string findings field as unparseable with schemaErrors (kusabi #392)", () => {
+    const payload = "```json\n{\n  \"schema_version\": 1,\n  \"verdict\": \"needs-attention\",\n  \"summary\": \"s\",\n  \"findings\": \"not an array\",\n  \"next_steps\": []\n}\n```";
     const result = parseReviewResult(payload);
 
-    assert.equal(result.reviewParseable, true);
-    assert.equal(result.chainVerdict, "needs-attention");
-    assert.equal(result.chainFindingsText, "(no structured findings)");
-    assert.deepEqual(result.chainParsedReview.findings, "not an array");
+    assert.equal(result.reviewParseable, false);
+    assert.equal(result.chainVerdict, "unparseable");
+    assert.equal(result.chainFindingsText, "(review output could not be parsed)");
+    assert.equal(result.chainParsedReview, null);
+    assert.ok(result.schemaErrors.some((e) => e.path === "/findings"));
   });
 
-  it("tolerates an object findings field without crashing", () => {
-    const payload = "```json\n{\n  \"verdict\": \"approve\",\n  \"summary\": \"s\",\n  \"findings\": { \"file\": \"x.js\" }\n}\n```";
+  it("rejects an object findings field as unparseable with schemaErrors (kusabi #392)", () => {
+    const payload = "```json\n{\n  \"schema_version\": 1,\n  \"verdict\": \"approve\",\n  \"summary\": \"s\",\n  \"findings\": { \"file\": \"x.js\" },\n  \"next_steps\": []\n}\n```";
     const result = parseReviewResult(payload);
 
-    assert.equal(result.reviewParseable, true);
-    assert.equal(result.chainVerdict, "approve");
-    assert.equal(result.chainFindingsText, "(no structured findings)");
+    assert.equal(result.reviewParseable, false);
+    assert.equal(result.chainVerdict, "unparseable");
+    assert.equal(result.chainFindingsText, "(review output could not be parsed)");
+    assert.equal(result.chainParsedReview, null);
+    assert.ok(result.schemaErrors.some((e) => e.path === "/findings"));
   });
 
   // ---- kusabi #60 step 1: `kind` tagging ----
@@ -2697,7 +2702,7 @@ describe("parseReviewResult", () => {
   // missing/invalid kind defaulting to design at the consumption point.
 
   it("carries kind through to the parsed findings and groups the findingsText", () => {
-    const payload = "```json\n{\n  \"verdict\": \"needs-attention\",\n  \"summary\": \"s\",\n  \"findings\": [\n    { \"severity\": \"high\", \"title\": \"Design call\", \"file\": \"src/a.js\", \"line_start\": 1, \"kind\": \"design\" },\n    { \"severity\": \"low\", \"title\": \"Rename var\", \"file\": \"src/b.js\", \"line_start\": 2, \"kind\": \"mechanical\" }\n  ]\n}\n```";
+    const payload = "```json\n{\n  \"schema_version\": 1,\n  \"verdict\": \"needs-attention\",\n  \"summary\": \"s\",\n  \"findings\": [\n    { \"severity\": \"high\", \"title\": \"Design call\", \"body\": \"b\", \"file\": \"src/a.js\", \"line_start\": 1, \"line_end\": 2, \"confidence\": 0.8, \"recommendation\": \"r\", \"kind\": \"design\" },\n    { \"severity\": \"low\", \"title\": \"Rename var\", \"body\": \"b\", \"file\": \"src/b.js\", \"line_start\": 2, \"line_end\": 3, \"confidence\": 0.9, \"recommendation\": \"r\", \"kind\": \"mechanical\" }\n  ],\n  \"next_steps\": []\n}\n```";
     const result = parseReviewResult(payload);
 
     assert.equal(result.reviewParseable, true);
@@ -2717,7 +2722,7 @@ describe("parseReviewResult", () => {
   });
 
   it("treats a missing kind as design (safe side) in the grouped findingsText", () => {
-    const payload = "```json\n{\n  \"verdict\": \"needs-attention\",\n  \"summary\": \"s\",\n  \"findings\": [\n    { \"severity\": \"medium\", \"title\": \"No kind tag\", \"file\": \"src/c.js\", \"line_start\": 3 }\n  ]\n}\n```";
+    const payload = "```json\n{\n  \"schema_version\": 1,\n  \"verdict\": \"needs-attention\",\n  \"summary\": \"s\",\n  \"findings\": [\n    { \"severity\": \"medium\", \"title\": \"No kind tag\", \"body\": \"b\", \"file\": \"src/c.js\", \"line_start\": 3, \"line_end\": 4, \"confidence\": 0.7, \"recommendation\": \"r\" }\n  ],\n  \"next_steps\": []\n}\n```";
     const result = parseReviewResult(payload);
 
     assert.equal(result.reviewParseable, true);
@@ -2728,16 +2733,13 @@ describe("parseReviewResult", () => {
     assert.ok(text.includes("[medium] No kind tag (src/c.js:3)"));
   });
 
-  it("treats an invalid kind as design (safe side) in the grouped findingsText", () => {
-    const payload = "```json\n{\n  \"verdict\": \"needs-attention\",\n  \"summary\": \"s\",\n  \"findings\": [\n    { \"severity\": \"low\", \"title\": \"Weird kind\", \"file\": \"src/d.js\", \"line_start\": 4, \"kind\": \"cosmetic\" }\n  ]\n}\n```";
+  it("rejects an invalid kind as unparseable with schemaErrors (kusabi #392)", () => {
+    const payload = "```json\n{\n  \"schema_version\": 1,\n  \"verdict\": \"needs-attention\",\n  \"summary\": \"s\",\n  \"findings\": [\n    { \"severity\": \"low\", \"title\": \"Weird kind\", \"body\": \"b\", \"file\": \"src/d.js\", \"line_start\": 4, \"line_end\": 5, \"confidence\": 0.8, \"recommendation\": \"r\", \"kind\": \"cosmetic\" }\n  ],\n  \"next_steps\": []\n}\n```";
     const result = parseReviewResult(payload);
 
-    assert.equal(result.reviewParseable, true);
-    const text = result.chainFindingsText;
-    assert.ok(text.includes("Design findings (require deliberate individual treatment)"), text);
-    assert.ok(!text.includes("Mechanical findings (checklist)"), text);
-    // The raw invalid value is not rewritten on the stored finding.
-    assert.equal(result.chainParsedReview.findings[0].kind, "cosmetic");
+    assert.equal(result.reviewParseable, false);
+    assert.equal(result.chainVerdict, "unparseable");
+    assert.ok(result.schemaErrors.some((e) => e.path === "/findings/0/kind"));
   });
 
   it("keeps kind through the VERDICT-token recovery (extractJson) path", () => {
@@ -2746,11 +2748,13 @@ describe("parseReviewResult", () => {
     const payload = [
       "```json",
       "{",
-      "  \"verdict\": \"needs-attention\",",
-      "  \"summary\": \"s\",",
-      "  \"findings\": [",
-      "    { \"severity\": \"high\", \"title\": \"Recovered\", \"file\": \"src/e.js\", \"line_start\": 5, \"kind\": \"mechanical\" }",
-      "  ]",
+      '  "schema_version": 1,',
+      '  "verdict": "needs-attention",',
+      '  "summary": "s",',
+      '  "findings": [',
+      '    { "severity": "high", "title": "Recovered", "body": "b", "file": "src/e.js", "line_start": 5, "line_end": 6, "confidence": 0.9, "recommendation": "r", "kind": "mechanical" }',
+      '  ],',
+      '  "next_steps": []',
       "}",
       "```",
       "",
@@ -2763,6 +2767,37 @@ describe("parseReviewResult", () => {
     assert.equal(result.chainParsedReview.findings[0].kind, "mechanical");
     assert.ok(result.chainFindingsText.includes("Mechanical findings (checklist)"));
     assert.ok(result.chainFindingsText.includes("[high] Recovered (src/e.js:5)"));
+  });
+
+  it("legacy object with schema_version: 2 or omitted is unparseable (AC1, kusabi #392)", () => {
+    const withoutVersion = JSON.stringify({
+      verdict: "needs-attention",
+      summary: "One defect",
+      findings: [
+        { severity: "high", title: "Bug", body: "b", file: "src/a.js", line_start: 1, line_end: 2, confidence: 0.9, recommendation: "r" },
+      ],
+      next_steps: [],
+    });
+    const resWithout = parseReviewResult(withoutVersion);
+    assert.equal(resWithout.reviewParseable, false);
+    assert.equal(resWithout.chainVerdict, "unparseable");
+    assert.equal(resWithout.chainParsedReview, null);
+    assert.ok(resWithout.schemaErrors.some((e) => e.path === "/schema_version"));
+
+    const withVersion2 = JSON.stringify({
+      schema_version: 2,
+      verdict: "needs-attention",
+      summary: "One defect",
+      findings: [
+        { severity: "high", title: "Bug", body: "b", file: "src/a.js", line_start: 1, line_end: 2, confidence: 0.9, recommendation: "r" },
+      ],
+      next_steps: [],
+    });
+    const resV2 = parseReviewResult(withVersion2);
+    assert.equal(resV2.reviewParseable, false);
+    assert.equal(resV2.chainVerdict, "unparseable");
+    assert.equal(resV2.chainParsedReview, null);
+    assert.ok(resV2.schemaErrors.some((e) => e.path === "/schema_version"));
   });
 });
 
@@ -2801,6 +2836,7 @@ describe("parseReviewResult — JSONL review stream (kusabi #202)", () => {
   };
   const SUMMARY = "One real defect and one nit; do not ship as is.";
   const REVIEW_OBJECT = {
+    schema_version: 1,
     verdict: "needs-attention",
     summary: SUMMARY,
     findings: [DESIGN_FINDING, MECHANICAL_FINDING],
@@ -2823,7 +2859,7 @@ describe("parseReviewResult — JSONL review stream (kusabi #202)", () => {
     JSON.stringify({ type: "finding", ...MECHANICAL_FINDING }),
     JSON.stringify({ type: "unverified", text: "could not exercise the timeout path" }),
     JSON.stringify({ type: "next_step", text: "add a truncation test" }),
-    JSON.stringify({ type: "verdict", verdict: "needs-attention", summary: SUMMARY }),
+    JSON.stringify({ type: "verdict", schema_version: 1, verdict: "needs-attention", summary: SUMMARY }),
   ].join("\n");
 
   // The exact findingsText the single-object path produces today, spelled out
@@ -2869,7 +2905,7 @@ describe("parseReviewResult — JSONL review stream (kusabi #202)", () => {
     const reversed = [
       JSON.stringify({ type: "finding", ...MECHANICAL_FINDING }),
       JSON.stringify({ type: "finding", ...DESIGN_FINDING }),
-      JSON.stringify({ type: "verdict", verdict: "needs-attention", summary: SUMMARY }),
+      JSON.stringify({ type: "verdict", schema_version: 1, verdict: "needs-attention", summary: SUMMARY }),
     ].join("\n");
 
     const result = parseReviewResult(reversed);
@@ -2889,7 +2925,7 @@ describe("parseReviewResult — JSONL review stream (kusabi #202)", () => {
       JSON.stringify({ type: "unverified", text: "could not exercise the timeout path" }),
       "Nothing else I can defend from the diff.",
       JSON.stringify({ type: "next_step", text: "add a truncation test" }),
-      JSON.stringify({ type: "verdict", verdict: "needs-attention", summary: SUMMARY }),
+      JSON.stringify({ type: "verdict", schema_version: 1, verdict: "needs-attention", summary: SUMMARY }),
     ].join("\n");
 
     const result = parseReviewResult(narrated);
@@ -2927,7 +2963,13 @@ describe("parseReviewResult — JSONL review stream (kusabi #202)", () => {
     for (const verdict of ["approve", "approve-partial", "needs-attention", "discard"]) {
       const stream = [
         JSON.stringify({ type: "finding", ...MECHANICAL_FINDING }),
-        JSON.stringify({ type: "verdict", verdict, summary: "s" }),
+        JSON.stringify({
+          type: "verdict",
+          schema_version: 1,
+          verdict,
+          summary: "s",
+          ...(verdict === "discard" ? { discard_reason: "wrong_premise" } : {}),
+        }),
       ].join("\n");
 
       const result = parseReviewResult(stream);
@@ -2945,7 +2987,7 @@ describe("parseReviewResult — JSONL review stream (kusabi #202)", () => {
       JSON.stringify({ type: "finding", ...MECHANICAL_FINDING }),
       JSON.stringify({ type: "unverified", text: "could not exercise the timeout path" }),
       JSON.stringify({ type: "next_step", text: "add a truncation test" }),
-      JSON.stringify({ type: "verdict", verdict: "needs-attention", summary: SUMMARY }),
+      JSON.stringify({ type: "verdict", schema_version: 1, verdict: "needs-attention", summary: SUMMARY }),
     ].join("\n");
 
     const result = parseReviewResult(stream);
@@ -2969,7 +3011,7 @@ describe("parseReviewResult — JSONL review stream (kusabi #202)", () => {
   });
 
   it("a JSONL stream with no findings and a verdict is an ordinary review", () => {
-    const stream = JSON.stringify({ type: "verdict", verdict: "approve", summary: "Nothing to block on." });
+    const stream = JSON.stringify({ type: "verdict", schema_version: 1, verdict: "approve", summary: "Nothing to block on." });
 
     const result = parseReviewResult(stream);
 
@@ -2979,7 +3021,7 @@ describe("parseReviewResult — JSONL review stream (kusabi #202)", () => {
     assert.equal(result.partialDiagnosis, null);
     assert.equal(result.chainFindingsText, "(no structured findings)");
     assert.deepEqual(result.chainParsedReview, {
-      verdict: "approve", summary: "Nothing to block on.", findings: [], next_steps: [],
+      schema_version: 1, verdict: "approve", summary: "Nothing to block on.", findings: [], next_steps: [],
     });
   });
 
@@ -3014,6 +3056,48 @@ describe("parseReviewResult — JSONL review stream (kusabi #202)", () => {
       result.partialDiagnosis,
       "format: records present but no verdict record arrived",
     );
+  });
+
+  it("rejects JSONL stream with schema_version: 2 or omitted on verdict record (AC1, kusabi #392)", () => {
+    const streamWithout = [
+      JSON.stringify({ type: "finding", ...DESIGN_FINDING }),
+      JSON.stringify({ type: "verdict", verdict: "approve", summary: "LGTM" }),
+    ].join("\n");
+    const resWithout = parseReviewResult(streamWithout);
+    assert.equal(resWithout.reviewParseable, false);
+    assert.equal(resWithout.chainVerdict, "unparseable");
+    assert.equal(resWithout.chainParsedReview, null);
+    assert.ok(resWithout.schemaErrors.some((e) => e.path === "/schema_version"));
+
+    const streamV2 = [
+      JSON.stringify({ type: "finding", ...DESIGN_FINDING }),
+      JSON.stringify({ type: "verdict", schema_version: 2, verdict: "approve", summary: "LGTM" }),
+    ].join("\n");
+    const resV2 = parseReviewResult(streamV2);
+    assert.equal(resV2.reviewParseable, false);
+    assert.equal(resV2.chainVerdict, "unparseable");
+    assert.equal(resV2.chainParsedReview, null);
+    assert.ok(resV2.schemaErrors.some((e) => e.path === "/schema_version"));
+  });
+
+  it("rejects JSONL stream with extra unknown keys on finding or verdict (AC2, kusabi #392)", () => {
+    const streamExtraFinding = [
+      JSON.stringify({ type: "finding", ...DESIGN_FINDING, unknown_field: "bad" }),
+      JSON.stringify({ type: "verdict", schema_version: 1, verdict: "approve", summary: "LGTM" }),
+    ].join("\n");
+    const resFinding = parseReviewResult(streamExtraFinding);
+    assert.equal(resFinding.reviewParseable, false);
+    assert.equal(resFinding.chainVerdict, "unparseable");
+    assert.ok(resFinding.schemaErrors.some((e) => e.path === "/findings/0/unknown_field"));
+
+    const streamExtraVerdict = [
+      JSON.stringify({ type: "finding", ...DESIGN_FINDING }),
+      JSON.stringify({ type: "verdict", schema_version: 1, verdict: "approve", summary: "LGTM", extra_verdict_key: 123 }),
+    ].join("\n");
+    const resVerdict = parseReviewResult(streamExtraVerdict);
+    assert.equal(resVerdict.reviewParseable, false);
+    assert.equal(resVerdict.chainVerdict, "unparseable");
+    assert.ok(resVerdict.schemaErrors.some((e) => e.path === "/extra_verdict_key"));
   });
 });
 
@@ -3789,12 +3873,14 @@ describe("runReviewPhase \u2014 single result conduit (kusabi #100)", () => {
         error: null,
       },
       resultText: JSON.stringify({
+        schema_version: 1,
         verdict: "needs-attention",
         summary: "s",
         findings: [
-          { severity: "high", title: "Design call", file: "src/a.js", line_start: 1, kind: "design" },
-          { severity: "low", title: "Rename", file: "src/b.js", line_start: 2, kind: "mechanical" },
+          { severity: "high", title: "Design call", body: "b", file: "src/a.js", line_start: 1, line_end: 2, confidence: 0.8, recommendation: "r", kind: "design" },
+          { severity: "low", title: "Rename", body: "b", file: "src/b.js", line_start: 2, line_end: 3, confidence: 0.9, recommendation: "r", kind: "mechanical" },
         ],
+        next_steps: [],
       }),
     };
   }
@@ -3908,11 +3994,13 @@ describe("runReviewPhase — unparseable-output retry (issue #145)", () => {
   const GARBAGE = "definitely not JSON and no VERDICT token here at all";
   const GARBAGE_WITH_TOKEN = "not JSON either\nVERDICT: needs-attention";
   const VALID = JSON.stringify({
+    schema_version: 1,
     verdict: "needs-attention",
     summary: "One real finding.",
     findings: [
-      { severity: "medium", title: "Off-by-one", file: "src/calc.js", line_start: 7 },
+      { severity: "medium", title: "Off-by-one", body: "b", file: "src/calc.js", line_start: 7, line_end: 7, confidence: 0.8, recommendation: "r" },
     ],
+    next_steps: [],
   });
 
   async function runWith(results, extra = {}) {
@@ -4156,7 +4244,7 @@ describe("runReviewPhase — partial JSONL review (kusabi #202)", () => {
 
   const COMPLETE = [
     JSON.stringify(FINDING_1),
-    JSON.stringify({ type: "verdict", verdict: "needs-attention", summary: "One defect." }),
+    JSON.stringify({ type: "verdict", schema_version: 1, verdict: "needs-attention", summary: "One defect." }),
   ].join("\n");
 
   async function runWith(results, extra = {}) {
@@ -7296,11 +7384,21 @@ describe("runReviewPhase — scope-aware prior findings (kusabi #334)", () => {
 
   async function capturePromptWith(previousRecord, reworkScope, reviewFindings = []) {
     let captured = null;
+    const fullFindings = reviewFindings.map((f) => ({
+      severity: "medium",
+      title: "finding",
+      body: "body",
+      line_start: 1,
+      line_end: 1,
+      confidence: 0.8,
+      recommendation: "rec",
+      ...f,
+    }));
     function stubbedDispatch(opts) {
       captured = opts.promptText;
       return {
         job: { id: "job-scope", status: "completed", modelEntry: "m", modelVariant: null, fallbacks: null, usage: null, error: null },
-        resultText: JSON.stringify({ verdict: "approve", findings: reviewFindings }),
+        resultText: JSON.stringify({ schema_version: 1, verdict: "approve", summary: "ok", findings: fullFindings, next_steps: [] }),
       };
     }
     const roundRecord = { round: 2 };

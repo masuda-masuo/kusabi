@@ -189,7 +189,7 @@ describe("runChainDriver resume", () => {
   }
 
   function makeFakeDispatch({
-    reviewResult = JSON.stringify({ verdict: "approve", findings: [], summary: "ok" }),
+    reviewResult = JSON.stringify({ schema_version: 1, verdict: "approve", findings: [], summary: "ok", next_steps: [] }),
     implementStatus = "completed",
     implementFailure = null,
   } = {}) {
@@ -390,8 +390,11 @@ describe("runChainDriver resume", () => {
     // this test is about the rework ladder, not about that row.
     const dispatch = makeFakeDispatch({
       reviewResult: JSON.stringify({
+        schema_version: 1,
         verdict: "needs-attention",
-        findings: [{ severity: "medium", title: "Still broken", file: "src/foo.js", line_start: 1 }],
+        summary: "s",
+        findings: [{ severity: "medium", title: "Still broken", body: "b", recommendation: "r", confidence: 0.8, line_start: 1, line_end: 1, file: "src/foo.js" }],
+        next_steps: [],
       }),
       implementStatus: "provider-error",
     });
@@ -1070,7 +1073,7 @@ describe("runChainDriver resume", () => {
       resumeMethod: { type: "continue_session" },
       startedAt: "2026-08-01T00:00:00.000Z",
       verdict: null,
-      probesGreen: true,
+      probesGreen: false,
       modelEntry: "fake/model",
       modelVariant: null,
       fallbacks: null,
@@ -1080,7 +1083,7 @@ describe("runChainDriver resume", () => {
       tierBefore: 0,
       reworkStrategyReason: null,
       reworkCount: 0,
-      probeResults: [{ probe: "P1: HEAD clean", passed: true, detail: "recorded before the stop" }],
+      probeResults: [{ probe: "P1: HEAD clean", passed: false, detail: "recorded before the stop" }],
       worktreeChanged: true,
       interrupted: true,
       interruptedAfter: "probes",
@@ -1091,8 +1094,11 @@ describe("runChainDriver resume", () => {
     // round's implement hits provider exhaustion so the chain stops there.
     const dispatch = makeFakeDispatch({
       reviewResult: JSON.stringify({
+        schema_version: 1,
         verdict: "needs-attention",
-        findings: [{ severity: "normal", file: "src/foo.js", description: "fix the parser" }],
+        summary: "s",
+        findings: [{ severity: "medium", title: "t", body: "fix the parser", recommendation: "r", confidence: 0.8, line_start: 1, line_end: 1, file: "src/foo.js" }],
+        next_steps: [],
       }),
       implementStatus: "provider-error",
     });
@@ -1106,9 +1112,9 @@ describe("runChainDriver resume", () => {
     assert.equal(round3.disposition.disposition, "rework");
     assert.equal(round3.probesRevalidated, undefined);
     // The recorded probe truth is left exactly as the stop wrote it.
-    assert.equal(round3.probesGreen, true);
+    assert.equal(round3.probesGreen, false);
     assert.deepEqual(round3.probeResults, [
-      { probe: "P1: HEAD clean", passed: true, detail: "recorded before the stop" },
+      { probe: "P1: HEAD clean", passed: false, detail: "recorded before the stop" },
     ]);
   });
 
@@ -1158,10 +1164,13 @@ describe("runChainDriver resume", () => {
 
 describe("runChainDriver per-phase backends (kusabi #192)", () => {
   const BRIEF = "Implement X.\n\n## Deliverables\n- src/foo.js\n";
-  const APPROVE = JSON.stringify({ verdict: "approve", findings: [], summary: "ok" });
+  const APPROVE = JSON.stringify({ schema_version: 1, verdict: "approve", findings: [], summary: "ok", next_steps: [] });
   const REWORK = JSON.stringify({
+    schema_version: 1,
     verdict: "needs-attention",
-    findings: [{ severity: "medium", file: "src/foo.js", description: "fix the parser" }],
+    summary: "s",
+    findings: [{ severity: "medium", title: "t", body: "fix the parser", recommendation: "fix", confidence: 0.8, line_start: 1, line_end: 1, file: "src/foo.js" }],
+    next_steps: [],
   });
 
   function fakeCallTool({ statusOutput = " M src/foo.js\n", gatePassedSequence } = {}) {
@@ -1452,10 +1461,13 @@ describe("runChainDriver per-phase backends (kusabi #192)", () => {
 
 describe("runChainDriver per-round rework tiering (kusabi #192 axis 2)", () => {
   const BRIEF = "Implement X.\n\n## Deliverables\n- src/foo.js\n";
-  const APPROVE = JSON.stringify({ verdict: "approve", findings: [], summary: "ok" });
+  const APPROVE = JSON.stringify({ schema_version: 1, verdict: "approve", findings: [], summary: "ok", next_steps: [] });
   const REWORK = JSON.stringify({
+    schema_version: 1,
     verdict: "needs-attention",
-    findings: [{ severity: "medium", file: "src/foo.js", description: "fix the parser" }],
+    summary: "s",
+    findings: [{ severity: "medium", title: "t", body: "fix the parser", recommendation: "fix", confidence: 0.8, line_start: 1, line_end: 1, file: "src/foo.js" }],
+    next_steps: [],
   });
 
   function fakeCallTool({ statusOutput = " M src/foo.js\n", gatePassedSequence } = {}) {
@@ -1670,12 +1682,18 @@ describe("runChainDriver per-round rework tiering (kusabi #192 axis 2)", () => {
     // Distinct finding files per round: same-file repeats would trigger the
     // strategize lever instead of the plain rework this test exercises.
     const reworkA = JSON.stringify({
+      schema_version: 1,
       verdict: "needs-attention",
-      findings: [{ severity: "medium", file: "src/a.js", description: "fix the parser" }],
+      summary: "s",
+      findings: [{ severity: "medium", title: "t", body: "fix the parser", recommendation: "r", confidence: 0.8, line_start: 1, line_end: 1, file: "src/a.js" }],
+      next_steps: [],
     });
     const reworkB = JSON.stringify({
+      schema_version: 1,
       verdict: "needs-attention",
-      findings: [{ severity: "medium", file: "src/b.js", description: "fix the parser" }],
+      summary: "s",
+      findings: [{ severity: "medium", title: "t", body: "fix the parser", recommendation: "r", confidence: 0.8, line_start: 1, line_end: 1, file: "src/b.js" }],
+      next_steps: [],
     });
     const review = makeReviewDispatch({ reviewResults: [reworkA, reworkB, APPROVE] });
 
@@ -1727,12 +1745,18 @@ describe("runChainDriver per-round rework tiering (kusabi #192 axis 2)", () => {
     const implement = makePhaseDispatch({ kind: "task", modelEntry: "opencode-go/deepseek-v4-pro", sessionPrefix: "ses_imp_", resultText: "implemented" });
     const rework = makePhaseDispatch({ kind: "task", modelEntry: "opencode-go/deepseek-v4-flash", sessionPrefix: "ses_rework_", resultText: "implemented" });
     const reworkA = JSON.stringify({
+      schema_version: 1,
       verdict: "needs-attention",
-      findings: [{ severity: "medium", file: "src/a.js", description: "fix the parser" }],
+      summary: "s",
+      findings: [{ severity: "medium", title: "t", body: "fix the parser", recommendation: "r", confidence: 0.8, line_start: 1, line_end: 1, file: "src/a.js" }],
+      next_steps: [],
     });
     const reworkB = JSON.stringify({
+      schema_version: 1,
       verdict: "needs-attention",
-      findings: [{ severity: "medium", file: "src/b.js", description: "fix the parser" }],
+      summary: "s",
+      findings: [{ severity: "medium", title: "t", body: "fix the parser", recommendation: "r", confidence: 0.8, line_start: 1, line_end: 1, file: "src/b.js" }],
+      next_steps: [],
     });
     const review = makeReviewDispatch({ reviewResults: [reworkA, reworkB, APPROVE] });
 
@@ -1883,12 +1907,18 @@ describe("runChainDriver per-round rework tiering (kusabi #192 axis 2)", () => {
     const implement = makePhaseDispatch({ kind: "task", modelEntry: "opus", sessionPrefix: "claude-uuid-", resultText: "implemented" });
     const rework = makePhaseDispatch({ kind: "task", modelEntry: "sonnet", sessionPrefix: "claude-uuid-rw-", resultText: "implemented" });
     const reworkA = JSON.stringify({
+      schema_version: 1,
       verdict: "needs-attention",
-      findings: [{ severity: "medium", file: "src/a.js", description: "fix the parser" }],
+      summary: "s",
+      findings: [{ severity: "medium", title: "t", body: "fix the parser", recommendation: "r", confidence: 0.8, line_start: 1, line_end: 1, file: "src/a.js" }],
+      next_steps: [],
     });
     const reworkB = JSON.stringify({
+      schema_version: 1,
       verdict: "needs-attention",
-      findings: [{ severity: "medium", file: "src/b.js", description: "fix the parser" }],
+      summary: "s",
+      findings: [{ severity: "medium", title: "t", body: "fix the parser", recommendation: "r", confidence: 0.8, line_start: 1, line_end: 1, file: "src/b.js" }],
+      next_steps: [],
     });
     const review = makeReviewDispatch({ reviewResults: [reworkA, reworkB, APPROVE] });
 
@@ -1944,12 +1974,18 @@ describe("runChainDriver per-round rework tiering (kusabi #192 axis 2)", () => {
     const { tmp, chainDir } = makeChainDir();
     const implement = makePhaseDispatch({ kind: "task", modelEntry: "opus", sessionPrefix: "claude-uuid-", resultText: "implemented" });
     const reworkA = JSON.stringify({
+      schema_version: 1,
       verdict: "needs-attention",
-      findings: [{ severity: "medium", file: "src/a.js", description: "fix the parser" }],
+      summary: "s",
+      findings: [{ severity: "medium", title: "t", body: "fix the parser", recommendation: "r", confidence: 0.8, line_start: 1, line_end: 1, file: "src/a.js" }],
+      next_steps: [],
     });
     const reworkB = JSON.stringify({
+      schema_version: 1,
       verdict: "needs-attention",
-      findings: [{ severity: "medium", file: "src/b.js", description: "fix the parser" }],
+      summary: "s",
+      findings: [{ severity: "medium", title: "t", body: "fix the parser", recommendation: "r", confidence: 0.8, line_start: 1, line_end: 1, file: "src/b.js" }],
+      next_steps: [],
     });
     const review = makeReviewDispatch({ reviewResults: [reworkA, reworkB, APPROVE] });
 
@@ -2392,13 +2428,13 @@ describe("runChainDriver rework scheduling", () => {
   const DESIGN_SENTENCE = "This round resolves ONLY the following design finding; other known findings are deliberately out of scope this round.";
 
   function designFinding(n, file) {
-    return { severity: "medium", title: "Design decision " + n, file, line_start: 1, kind: "design", body: "b", recommendation: "r" };
+    return { severity: "medium", title: "Design decision " + n, file, line_start: 1, line_end: 1, confidence: 0.8, kind: "design", body: "b", recommendation: "r" };
   }
   function mechFinding(n, file) {
-    return { severity: "medium", title: "Mechanical fix " + n, file, line_start: 10, kind: "mechanical", body: "b", recommendation: "r" };
+    return { severity: "medium", title: "Mechanical fix " + n, file, line_start: 10, line_end: 10, confidence: 0.8, kind: "mechanical", body: "b", recommendation: "r" };
   }
   function reviewResult(verdict, findings) {
-    return JSON.stringify({ verdict, findings, summary: "s" });
+    return JSON.stringify({ schema_version: 1, verdict, findings, summary: "s", next_steps: [] });
   }
 
   // `gatePassed: false` makes P2 red, which is what a probe-failure rework
@@ -2970,7 +3006,7 @@ describe("runChainDriver oracle routing", () => {
             id: "job-rev-1", status: "completed", modelEntry: "fake/review", modelVariant: null,
             fallbacks: null, sessionID: "sess-rev", usage: null, error: null,
           },
-          resultText: JSON.stringify({ verdict: "approve", findings: [], summary: "ok" }),
+          resultText: JSON.stringify({ schema_version: 1, verdict: "approve", findings: [], summary: "ok", next_steps: [] }),
         };
       }
       return {
@@ -3221,7 +3257,7 @@ describe("runChainDriver resumed-accept oracle re-validation (kusabi #197 follow
             id: "job-rev-2", status: "completed", modelEntry: "fake/review", modelVariant: null,
             fallbacks: null, sessionID: "sess-rev-2", usage: null, error: null,
           },
-          resultText: JSON.stringify({ verdict: "approve", findings: [], summary: "ok" }),
+          resultText: JSON.stringify({ schema_version: 1, verdict: "approve", findings: [], summary: "ok", next_steps: [] }),
         };
       }
       return {
@@ -4877,7 +4913,7 @@ describe("runChainDriver qualifying refusal (kusabi #293)", () => {
             id: "job-rev-1", status: "completed", modelEntry: "fake/review", modelVariant: null,
             fallbacks: null, sessionID: "sess-rev", usage: null, error: null,
           },
-          resultText: JSON.stringify({ verdict: "approve", findings: [], summary: "ok" }),
+          resultText: JSON.stringify({ schema_version: 1, verdict: "approve", findings: [], summary: "ok", next_steps: [] }),
         };
       }
       return {
@@ -5563,7 +5599,7 @@ describe("runChainDriver brief-syntax defect (kusabi #303)", () => {
             id: "job-rev-" + calls.length, status: "completed", modelEntry: "fake/review",
             modelVariant: null, fallbacks: null, sessionID: "sess-rev", usage: null, error: null,
           },
-          resultText: JSON.stringify({ verdict: "approve", findings: [], summary: "ok" }),
+          resultText: JSON.stringify({ schema_version: 1, verdict: "approve", findings: [], summary: "ok", next_steps: [] }),
         };
       }
       return {
@@ -5915,7 +5951,7 @@ describe("runChainDriver change-scope fail-closed (kusabi #379)", () => {
             modelVariant: null, fallbacks: null, sessionID: "sess-rev",
             usage: null, error: null,
           },
-          resultText: JSON.stringify({ verdict: "approve", findings: [], summary: "ok" }),
+          resultText: JSON.stringify({ schema_version: 1, verdict: "approve", findings: [], summary: "ok", next_steps: [] }),
         };
       }
       return {

@@ -101,5 +101,7 @@ export function latestJob(stateDir, predicate = () => true) {
 }
 
 export function appendEvent(stateDir, jobId, event) {
-  fs.appendFileSync(path.join(jobDir(stateDir, jobId), "events.ndjson"), `${JSON.stringify(event)}\n`, "utf8");
+  const dir = jobDir(stateDir, jobId);
+  fs.mkdirSync(dir, { recursive: true });
+  fs.appendFileSync(path.join(dir, "events.ndjson"), `${JSON.stringify(event)}\n`, "utf8");
 }

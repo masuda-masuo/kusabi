@@ -99,7 +99,7 @@ record must never span lines):
 {"type":"finding","severity":"high","kind":"design","title":"...","body":"...","file":"src/a.mjs","line_start":12,"line_end":18,"confidence":0.8,"recommendation":"..."}
 {"type":"unverified","text":"could not exercise the timeout path"}
 {"type":"next_step","text":"..."}
-{"type":"verdict","verdict":"needs-attention","summary":"..."}
+{"type":"verdict","schema_version":1,"verdict":"needs-attention","summary":"..."}
 
 - A `finding` record carries exactly the finding fields the schema in
   <output_schema> defines — `severity`, `kind`, `title`, `body`, `file`,
@@ -108,8 +108,8 @@ record must never span lines):
   pieces arrive, not what a finding contains.
 - Write each finding as soon as you have concluded it. Do not batch them.
 - The `verdict` record comes LAST, because it genuinely depends on the
-  findings. It carries `verdict` and `summary` (plus `discard_reason` when
-  the verdict is `discard`).
+  findings. It carries `schema_version: 1`, `verdict` and `summary` (plus `discard_reason` when
+  the verdict is `discard`). (If emitted as a single JSON object instead of JSONL, `schema_version: 1` is also required).
 - `summary` must be at most 500 characters. Your analysis belongs in
   `finding` records, emitted as you conclude them — never in the verdict
   summary. A long summary is the main way the final line breaks: a verdict

@@ -136,6 +136,32 @@ describe("parseReviewJsonl — assembled shape", () => {
     assert.equal(result.review.verdict, "needs-attention");
     assert.equal(result.review.summary, "second, after re-reading");
   });
+
+  it("carries schema_version from the verdict record (kusabi #392)", () => {
+    const stream = line({
+      type: "verdict",
+      schema_version: 1,
+      verdict: "approve",
+      summary: "looks good",
+    });
+
+    const result = parseReviewJsonl(stream);
+
+    assert.equal(result.review.schema_version, 1);
+    assert.equal(result.review.verdict, "approve");
+  });
+
+  it("preserves unknown extra keys on verdict and finding records (kusabi #392)", () => {
+    const stream = [
+      line({ type: "finding", ...FINDING_A, unknown_finding_key: "present" }),
+      line({ type: "verdict", schema_version: 1, verdict: "approve", summary: "ok", unknown_verdict_key: "also_present" }),
+    ].join("\n");
+
+    const result = parseReviewJsonl(stream);
+
+    assert.equal(result.review.findings[0].unknown_finding_key, "present");
+    assert.equal(result.review.unknown_verdict_key, "also_present");
+  });
 });
 
 describe("parseReviewJsonl — prose between records", () => {

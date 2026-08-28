@@ -495,7 +495,7 @@ describe("agyJsonSchemaFor", () => {
       path.join(PLUGIN_ROOT, "schemas", "review-output.schema.json"), "utf8"));
     // Same contract, not a second copy of it.
     assert.deepEqual(parsed, onDisk);
-    assert.deepEqual(parsed.required, ["verdict", "summary", "findings", "next_steps"]);
+    assert.deepEqual(parsed.required, ["schema_version", "verdict", "summary", "findings", "next_steps"]);
   });
 
   it("returns null for every other agent — free-text phases are not schema-forced", () => {

@@ -8,7 +8,7 @@
 
 
 import { parseArgs, parseModel, resolveModel, reviewDenyTools, WRITE_TOOL_NAMES, validateChainEntries, splitRouteBackend, resolveChainBackend, stripBackendPrefixChain, resolveModelBackend, chainNamesBackend, backendSupportsResume } from "./cli.mjs";
-import { renderReview, renderChainShow, renderJobLine, renderHeader, extractJson } from "./render.mjs";
+import { renderReview, renderChainShow, renderJobLine, renderHeader } from "./render.mjs";
 import { hasSectionHeading, parseDeliverables, parseFrozenTests, parseSmoke, parseOrchestratorSignature, zeroEntrySections, findFrozenQualifierItems } from "./brief-parsing.mjs";
 import { cmdInstallCli, diagnoseCompanionShim, formatShimSetupLine } from "./install-cli.mjs";
 // Exit path only (kusabi #243); its own module since kusabi #277 so that the
@@ -19,7 +19,6 @@ import { flushAndExit } from "./flush-and-exit.mjs";
 // nothing moved is re-exported from here.
 import { cmdChain, cmdChainResume, smokeBaselineReport, publishWarningForBrief, smokeViolationReport, sessionProvenanceRefusal } from "./chain-driver.mjs";
 import { cursorUsageDir, resolveLatestCursorSession } from "./cursor-statusline-sink.mjs";
-import { parseReviewJsonl } from "./review-jsonl.mjs";
 import { countUnfilledReviewRecords } from "./review-record-scan.mjs";
 import fs from "node:fs";
 import os from "node:os";
@@ -45,7 +44,7 @@ import {
   DEFAULT_APPEAR_TIMEOUT_MS,
   DEFAULT_PROGRESS_TIMEOUT_MS,
 } from "./chain-wait.mjs";
-import { jobDir, saveJob, loadJob, listJobs, latestJob } from "./job-store.mjs";
+import { jobDir, saveJob, loadJob, listJobs, latestJob, appendEvent } from "./job-store.mjs";
 import { opencodeBin, serverHealthy, ensureServer, reapIdleServes, reapOrphanedServes, runningRecordIsStale, isOurServe, api } from "./serve-lifecycle.mjs";
 import { runPrompt, dispatchWithFallback } from "./prompt-execution.mjs";
 import { claudeDispatch, resolveClaudeModel, validateClaudeModel, validateClaudeChain, translateDenyTools, clampModelDispatch, stopRecordedProcess, CLAUDE_BACKEND } from "./claude-dispatch.mjs";
@@ -68,6 +67,7 @@ import {
   // The chain's container header, shared with `task --container` (kusabi #289).
   withContainerWorkspace,
   captureVerifyBaseline,
+  parseReviewResult,
 } from "./chain-phases.mjs";
 
 // Import the probe functions locally so cmdTask can call them directly.
@@ -1381,15 +1381,17 @@ async function cmdReview(cwd, { flags, text }) {
   if (job.status !== "completed") {
     return `${renderHeader(job)}${job.error ?? ""}\nRun kusabi-companion status ${job.id} for details.`;
   }
-  // Strip trailing VERDICT token line before JSON parsing so the token
-  // does not make extractJson fail on well-formed JSON.
-  const stripped = resultText.replace(/\s*VERDICT:\s*(approve-partial|approve|needs-attention|discard)\s*$/i, "");
-  // Same two input formats as the chain (kusabi #202): JSONL first, the
-  // single JSON object when the output is not JSONL.  This surface shares the
-  // reviewer prompt with the chain, so it has to read what that prompt now
-  // asks for; a reviewer still emitting one object renders as it did before.
-  const jsonl = parseReviewJsonl(resultText);
-  const rendered = renderReview(jsonl ? jsonl.review : extractJson(stripped), resultText);
+  // Same two input formats and strict validation as the chain (kusabi #202, #392):
+  // JSONL first, then single JSON object. If validation fails, log schema_invalid event
+  // and render the unvalidated fallback.
+  const parsedResult = parseReviewResult(resultText);
+  if (parsedResult.schemaErrors && parsedResult.schemaErrors.length > 0) {
+    appendEvent(stateDirFor(cwd), job.id, {
+      type: "companion.review.schema_invalid",
+      errors: parsedResult.schemaErrors,
+    });
+  }
+  const rendered = renderReview(parsedResult.chainParsedReview, resultText);
   fs.writeFileSync(path.join(jobDir(stateDirFor(cwd), job.id), "result.md"), rendered, "utf8");
   return `${renderHeader(job)}${rendered}`;
 }

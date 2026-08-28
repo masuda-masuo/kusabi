@@ -3,12 +3,17 @@
   "type": "object",
   "additionalProperties": false,
   "required": [
+    "schema_version",
     "verdict",
     "summary",
     "findings",
     "next_steps"
   ],
   "properties": {
+    "schema_version": {
+      "type": "integer",
+      "const": 1
+    },
     "verdict": {
       "type": "string",
       "enum": [
