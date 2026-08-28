@@ -56,6 +56,7 @@ import { ingestTranscriptDirectory } from "./transcript-ingest.mjs";
 import { ingestCursorUsageDirectory } from "./cursor-usage-ingest.mjs";
 import { ingestChainDirectory, ingestJobDirectory } from "./chain-ingest.mjs";
 import { computeReport, renderReportText, renderReportJson, missingStoreReport, renderMissingText } from "./metrics-report.mjs";
+import { renderJobProgress } from "./kaiba-progress-watch.mjs";
 
 // Chain round-phases module — the round loop itself moved to chain-driver.mjs
 // (kusabi #264 PR 2/2), so all that is left here is the container review input
@@ -1417,9 +1418,11 @@ function cmdStatus(cwd, { text }) {
           `permissions: ${s.permissionsAllowed ?? 0} allowed, ${s.permissionsRejected ?? 0} rejected`,
           `last activity: ${s.lastActivity ?? "-"}`,
         ];
+    const progressLines = renderJobProgress(stateDir, job.id);
     const lines = [
       renderHeader(job).trimEnd(),
       ...statsLines,
+      ...progressLines,
       ...(job.error ? [`error: ${job.error}`] : []),
     ];
     const jobChain = chainIdForJob(job);

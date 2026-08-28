@@ -157,6 +157,7 @@ import { stateDirFor, writeJson } from "./state-paths.mjs";
 import { durationS } from "./render.mjs";
 import { resolveCompletedResult } from "./result-recovery.mjs";
 import { deriveStopReason } from "./stop-reason.mjs";
+import { startKaibaProgressWatch } from "./kaiba-progress-watch.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const PLUGIN_ROOT = path.resolve(HERE, "..");
@@ -1324,6 +1325,8 @@ export async function agyDispatch(opts) {
   // of a refused dispatch is the one who most needs to see what was too big.
   fs.writeFileSync(path.join(jobDir(stateDir, job.id), "prompt.md"), promptText, "utf8");
 
+  const progressWatch = startKaibaProgressWatch({ stateDir, jobId: job.id });
+
   // ---- argv size guard (kusabi #221 residual) ----
   // The last thing before the spawn.  An oversized argument would fail with a
   // raw E2BIG that says nothing about which string was too long or what to do
@@ -1353,8 +1356,11 @@ export async function agyDispatch(opts) {
     // refusal finalises the record here, error -> "unknown".
     job.stopReason = deriveStopReason({ status: job.status, stats: job.stats });
     saveJob(stateDir, job);
+    progressWatch.stop();
     return { job, resultText: "", stateDir };
   }
+
+  try {
 
   appendEvent(stateDir, job.id, {
     type: "companion.agy.dispatch",
@@ -1555,4 +1561,7 @@ export async function agyDispatch(opts) {
   }
 
   return { job, resultText, stateDir };
+  } finally {
+    progressWatch.stop();
+  }
 }
