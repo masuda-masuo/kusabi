@@ -1418,6 +1418,42 @@ export function parseReviewResult(reviewResultText) {
 }
 
 /**
+ * Build the short repair prompt to correct schema-invalid review output (kusabi #395).
+ *
+ * When `hasSession` is true, the reviewer session already holds the review context
+ * and diff, so only the machine-readable errors and instruction are needed.
+ * When `hasSession` is false (no sessionID available), a truncated copy of the
+ * original output is appended so a fresh worker has context to correct.
+ *
+ * @param {object} opts
+ * @param {Array<{path: string, expected: string, actual: any}>} opts.schemaErrors
+ * @param {string|null} [opts.originalOutput]
+ * @param {boolean} [opts.hasSession=true]
+ * @returns {string}
+ */
+export function buildReviewRepairPrompt({ schemaErrors, originalOutput = null, hasSession = true } = {}) {
+  const errorsJson = JSON.stringify(schemaErrors || [], null, 2);
+  let prompt =
+    "The previous review output failed schema validation against plugins/kusabi/schemas/review-output.schema.json.\n\n" +
+    "Schema validation errors:\n```json\n" +
+    errorsJson +
+    "\n```\n\n";
+
+  if (!hasSession && originalOutput) {
+    const truncated = originalOutput.length > 4000
+      ? originalOutput.slice(0, 4000) + "\n...(truncated)"
+      : originalOutput;
+    prompt += "Previous review output:\n```\n" + truncated + "\n```\n\n";
+  }
+
+  prompt +=
+    "Please emit ONE corrected JSON object that satisfies plugins/kusabi/schemas/review-output.schema.json " +
+    "(schema_version: 1, required keys: schema_version, verdict, summary, findings, next_steps, and no extra properties).";
+
+  return prompt;
+}
+
+/**
  * Determine whether the review should be skipped (probe-driven discard).
  */
 export function shouldSkipReview({ chainStatusObserved, chainChangedPaths, chainNewlyChanged, chainDeliverables }) {
@@ -1594,29 +1630,75 @@ export async function runReviewPhase({
       });
     }
 
-    // ---- retry once on unparseable output ----
-    // A job that completes with garbage — no JSON and no recoverable
-    // VERDICT token — is usually a transient provider hiccup rather than a
-    // genuine verdict (real incident: a 132-token broken review response
-    // that re-dispatched cleanly).  Re-dispatch exactly once within this
-    // round with identical options and treat the second attempt as final;
-    // two consecutive unparseable results escalate exactly as before.  The
-    // retry lives entirely inside this phase and never consumes a round.
-    //
-    // The retry is gated on the first job having COMPLETED: a job that
-    // failed outright (serve-dead / stalled / timeout / error) returns
-    // empty or garbage resultText, and re-dispatching would double
-    // worst-case latency (2 × watchdog 900s / timeout 1800s) in exactly the
-    // degraded environments where it is known-futile.  Only a completed job
-    // whose output was garbage gets a second attempt; a hard failure
-    // escalates after a single attempt, exactly as before the retry existed.
-    //
-    // A PARTIAL review (kusabi #202) is deliberately NOT a retry case: the
-    // JSONL stream was read fine (`_parseable` is true and `_verdict` is
-    // "partial", so both guards below already exclude it), the model simply
-    // ran out of room.  Re-dispatching spends the budget that just proved
-    // insufficient; the partial review escalates with its findings instead.
-    if (!_parseable && _verdict === "unparseable" && reviewJob.status === "completed") {
+    // ---- schema-invalid repair loop (kusabi #395) ----
+    // If the review output failed schema validation but the job completed,
+    // repair once by injecting the machine-readable schema errors into the
+    // same worker session (or fresh with truncated output if sessionID is missing).
+    // This is distinct from the unparseable identical-prompt garbage retry.
+    if (_schemaErrors && _schemaErrors.length > 0 && reviewJob.status === "completed") {
+      if (cwd && reviewJob?.id) {
+        appendEvent(stateDirFor(cwd), reviewJob.id, {
+          type: "companion.review.schema_repair",
+          attempt: 1,
+          errors: _schemaErrors,
+        });
+      }
+      roundRecord.reviewSchemaRepaired = true;
+      roundRecord.reviewFirstJobId = reviewJob.id;
+      // First-attempt spend and fallback trail, so retried/repaired rounds report
+      // their true cost in chain totals (same shapes as the final-attempt
+      // reviewUsage / reviewFallbacks fields recorded below).
+      roundRecord.reviewFirstUsage = reviewJob.usage || null;
+      roundRecord.reviewFirstFallbacks = reviewJob.fallbacks || null;
+
+      const hasSession = Boolean(reviewJob.sessionID);
+      const repairPromptText = buildReviewRepairPrompt({
+        schemaErrors: _schemaErrors,
+        originalOutput: reviewResultText,
+        hasSession,
+      });
+
+      const repairDispatchOptions = {
+        ...reviewDispatchOptions,
+        promptText: repairPromptText,
+        ...(hasSession ? { session: reviewJob.sessionID } : {}),
+      };
+
+      ({ job: reviewJob, resultText: reviewResultText } = await _dispatch(repairDispatchOptions));
+      ({ chainParsedReview: _parsed, chainVerdict: _verdict,
+         chainFindingsText: _findings, reviewParseable: _parseable,
+         reviewPartial: _partial, reviewFindingCount: _findingCount,
+         partialDiagnosis: _partialDiagnosis, salvagedVerdict: _salvagedVerdict,
+         schemaErrors: _schemaErrors } = parseReviewResult(reviewResultText));
+      if (_schemaErrors && _schemaErrors.length > 0 && cwd && reviewJob?.id) {
+        appendEvent(stateDirFor(cwd), reviewJob.id, {
+          type: "companion.review.schema_invalid",
+          errors: _schemaErrors,
+        });
+      }
+    } else if (!_parseable && _verdict === "unparseable" && reviewJob.status === "completed") {
+      // ---- retry once on unparseable output (issue #145) ----
+      // A job that completes with garbage — no JSON and no recoverable
+      // VERDICT token (and empty schemaErrors) — is usually a transient provider hiccup
+      // rather than a genuine verdict (real incident: a 132-token broken review response
+      // that re-dispatched cleanly).  Re-dispatch exactly once within this
+      // round with identical options and treat the second attempt as final;
+      // two consecutive unparseable results escalate exactly as before.  The
+      // retry lives entirely inside this phase and never consumes a round.
+      //
+      // The retry is gated on the first job having COMPLETED: a job that
+      // failed outright (serve-dead / stalled / timeout / error) returns
+      // empty or garbage resultText, and re-dispatching would double
+      // worst-case latency (2 × watchdog 900s / timeout 1800s) in exactly the
+      // degraded environments where it is known-futile.  Only a completed job
+      // whose output was garbage gets a second attempt; a hard failure
+      // escalates after a single attempt, exactly as before the retry existed.
+      //
+      // A PARTIAL review (kusabi #202) is deliberately NOT a retry case: the
+      // JSONL stream was read fine (`_parseable` is true and `_verdict` is
+      // "partial", so both guards below already exclude it), the model simply
+      // ran out of room.  Re-dispatching spends the budget that just proved
+      // insufficient; the partial review escalates with its findings instead.
       roundRecord.reviewUnparseableRetried = true;
       roundRecord.reviewFirstJobId = reviewJob.id;
       // First-attempt spend and fallback trail, so retried rounds report
@@ -1727,7 +1809,7 @@ const REVIEW_SEAT_RECORD_FIELDS = [
   "reviewPartial", "reviewFindingCount", "reviewPartialDiagnosis",
   "reviewJobId", "reviewUsage", "reviewModelEntry", "reviewModelVariant",
   "reviewFallbacks", "reviewJobFailure", "reviewJobError",
-  "reviewUnparseableRetried", "reviewFirstJobId", "reviewFirstUsage", "reviewFirstFallbacks",
+  "reviewUnparseableRetried", "reviewSchemaRepaired", "reviewFirstJobId", "reviewFirstUsage", "reviewFirstFallbacks",
   "findingsText", "findings", "findingFiles",
   "disposition",
 ];

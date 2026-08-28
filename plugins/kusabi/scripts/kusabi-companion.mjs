@@ -68,6 +68,7 @@ import {
   withContainerWorkspace,
   captureVerifyBaseline,
   parseReviewResult,
+  buildReviewRepairPrompt,
 } from "./chain-phases.mjs";
 
 // Import the probe functions locally so cmdTask can call them directly.
@@ -1338,14 +1339,14 @@ async function cmdTask(cwd, { flags, text }) {
   return taskOutput;
 }
 
-async function cmdReview(cwd, { flags, text }) {
+async function cmdReview(cwd, { flags, text, _runPrompt = runPrompt } = {}) {
   // kusabi #153: `review --container <cid>` was silently ignored — the review
   // read the HOST worktree's git state, failed on the container-only --base,
   // and then crashed with "findings.forEach is not a function".  The
   // standalone review has no container path; the sanctioned container review
   // route is `task --phase review --container <cid>`.  Reject early and
   // loudly instead of pretending the flag works (silent ignore is forbidden).
-  if (flags.container) {
+  if (flags?.container) {
     throw new Error(
       "review does not support --container (it inspects the host worktree via git). " +
       "For a container review use: task --phase review --container " + flags.container + " --brief-file <path>"
@@ -1353,44 +1354,109 @@ async function cmdReview(cwd, { flags, text }) {
   }
   const promptTemplate = fs.readFileSync(path.join(PLUGIN_ROOT, "prompts", "adversarial-review.md"), "utf8");
   const schema = JSON.parse(fs.readFileSync(path.join(PLUGIN_ROOT, "schemas", "review-output.schema.json"), "utf8"));
-  const { label, input } = buildReviewInput(cwd, flags.base);
+  const { label, input } = buildReviewInput(cwd, flags?.base);
   const promptText = promptTemplate
     .replaceAll("{{TARGET_LABEL}}", label)
     .replaceAll("{{USER_FOCUS}}", text || "(none — general adversarial review)")
     .replaceAll("{{OUTPUT_SCHEMA}}", JSON.stringify(schema))
     .replaceAll("{{REVIEW_INPUT}}", input)
-    .replaceAll("{{PRIOR_FINDINGS}}", flags.prior || "(none — first review round)")
+    .replaceAll("{{PRIOR_FINDINGS}}", flags?.prior || "(none — first review round)")
     // kusabi #236: the standalone review route never runs the chain probes,
     // so {{PROBE_REPORT}} renders the explicit absence marker rather than
     // leaking the raw placeholder into the prompt.
     .replaceAll("{{PROBE_REPORT}}", "(no probe results recorded)");
-  const { job, resultText } = await runPrompt({
+  const doPrompt = _runPrompt || runPrompt;
+  let { job, resultText } = await doPrompt({
     cwd,
     kind: "review",
     title: `review: ${label}`,
     promptText,
-    model: parseModel(flags.model),
-    agent: flags.agent,
+    model: parseModel(flags?.model),
+    agent: flags?.agent,
     tools: reviewDenyTools(),
     // NOTE: opencode's `format: json_schema` is not used — some providers 400
     // on it, and sessions created with it break GET /session/:id/message in
     // opencode 1.17.x. The schema is embedded in the prompt instead.
-    timeoutS: Number(flags.timeout ?? DEFAULT_REVIEW_TIMEOUT_S),
-    watchdogS: Number(flags.watchdog ?? DEFAULT_WATCHDOG_S),
+    timeoutS: Number(flags?.timeout ?? DEFAULT_REVIEW_TIMEOUT_S),
+    watchdogS: Number(flags?.watchdog ?? DEFAULT_WATCHDOG_S),
   });
   if (job.status !== "completed") {
     return `${renderHeader(job)}${job.error ?? ""}\nRun kusabi-companion status ${job.id} for details.`;
   }
   // Same two input formats and strict validation as the chain (kusabi #202, #392):
   // JSONL first, then single JSON object. If validation fails, log schema_invalid event
-  // and render the unvalidated fallback.
-  const parsedResult = parseReviewResult(resultText);
+  // and attempt schema repair (kusabi #395).
+  let parsedResult = parseReviewResult(resultText);
   if (parsedResult.schemaErrors && parsedResult.schemaErrors.length > 0) {
     appendEvent(stateDirFor(cwd), job.id, {
       type: "companion.review.schema_invalid",
       errors: parsedResult.schemaErrors,
     });
   }
+
+  // Schema-invalid repair loop (kusabi #395) or unparseable retry
+  if (parsedResult.schemaErrors && parsedResult.schemaErrors.length > 0 && job.status === "completed") {
+    appendEvent(stateDirFor(cwd), job.id, {
+      type: "companion.review.schema_repair",
+      attempt: 1,
+      errors: parsedResult.schemaErrors,
+    });
+    const hasSession = Boolean(job.sessionID);
+    const repairPromptText = buildReviewRepairPrompt({
+      schemaErrors: parsedResult.schemaErrors,
+      originalOutput: resultText,
+      hasSession,
+    });
+    const repairResult = await doPrompt({
+      cwd,
+      kind: "review",
+      title: `review: ${label}`,
+      promptText: repairPromptText,
+      model: parseModel(flags?.model),
+      agent: flags?.agent,
+      tools: reviewDenyTools(),
+      timeoutS: Number(flags?.timeout ?? DEFAULT_REVIEW_TIMEOUT_S),
+      watchdogS: Number(flags?.watchdog ?? DEFAULT_WATCHDOG_S),
+      ...(hasSession ? { session: job.sessionID } : {}),
+    });
+    job = repairResult.job;
+    resultText = repairResult.resultText;
+    if (job.status !== "completed") {
+      return `${renderHeader(job)}${job.error ?? ""}\nRun kusabi-companion status ${job.id} for details.`;
+    }
+    parsedResult = parseReviewResult(resultText);
+    if (parsedResult.schemaErrors && parsedResult.schemaErrors.length > 0) {
+      appendEvent(stateDirFor(cwd), job.id, {
+        type: "companion.review.schema_invalid",
+        errors: parsedResult.schemaErrors,
+      });
+    }
+  } else if (!parsedResult.reviewParseable && parsedResult.chainVerdict === "unparseable" && job.status === "completed") {
+    const retryResult = await doPrompt({
+      cwd,
+      kind: "review",
+      title: `review: ${label}`,
+      promptText,
+      model: parseModel(flags?.model),
+      agent: flags?.agent,
+      tools: reviewDenyTools(),
+      timeoutS: Number(flags?.timeout ?? DEFAULT_REVIEW_TIMEOUT_S),
+      watchdogS: Number(flags?.watchdog ?? DEFAULT_WATCHDOG_S),
+    });
+    job = retryResult.job;
+    resultText = retryResult.resultText;
+    if (job.status !== "completed") {
+      return `${renderHeader(job)}${job.error ?? ""}\nRun kusabi-companion status ${job.id} for details.`;
+    }
+    parsedResult = parseReviewResult(resultText);
+    if (parsedResult.schemaErrors && parsedResult.schemaErrors.length > 0) {
+      appendEvent(stateDirFor(cwd), job.id, {
+        type: "companion.review.schema_invalid",
+        errors: parsedResult.schemaErrors,
+      });
+    }
+  }
+
   const rendered = renderReview(parsedResult.chainParsedReview, resultText);
   fs.writeFileSync(path.join(jobDir(stateDirFor(cwd), job.id), "result.md"), rendered, "utf8");
   return `${renderHeader(job)}${rendered}`;
@@ -2839,6 +2905,8 @@ export function commandOutcome(output) {
   }
   return { text: typeof output === "string" ? output : "", exitCode: 0 };
 }
+
+export { cmdReview };
 
 // flushAndExit (kusabi #243) lives in ./flush-and-exit.mjs since kusabi #277.
 // Its behaviour is unchanged and this file is still one of its callers — the
