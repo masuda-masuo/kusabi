@@ -49,11 +49,13 @@ import {
 // The JSONL review wire format (kusabi #202).  Tried before extractJson;
 // a reviewer that still emits one JSON object takes the path below unchanged.
 import { parseReviewJsonl } from "./review-jsonl.mjs";
+import { validateReview } from "./review-validate.mjs";
 import { deriveReworkStrategy } from "./disposition.mjs";
 // resolveRoundResume is defined below and is the only resume-resolution
 // mechanism.  checkpoint_restore was removed in issue #114 — the chain
 // never rolls the worktree back.
-import { writeJson } from "./state-paths.mjs";
+import { writeJson, stateDirFor } from "./state-paths.mjs";
+import { appendEvent } from "./job-store.mjs";
 // effectiveStatus powers resolveChainResume (kusabi #153①): a chain whose
 // pid is gone is an abnormal stop that may be resumed; a live process or a
 // finished status is not.  chain-control has no imports from this module, so
@@ -1304,72 +1306,101 @@ export async function collectReviewContext({ container, brief, callTool, worktre
  *             reviewPartial: boolean, reviewFindingCount: number }}
  */
 export function parseReviewResult(reviewResultText) {
-  // ---- JSONL first (kusabi #202) ----
+  // ---- JSONL first (kusabi #202, #392) ----
   // Returns null for anything that is not JSONL (including an empty stream),
   // which falls through to the single-object path below untouched.
   const jsonl = parseReviewJsonl(reviewResultText);
   if (jsonl) {
+    // Partial review (no closing verdict): skip schema validation (verdict "partial"
+    // is not in the schema enum). Retain findings and mark partial.
+    if (jsonl.partial && !jsonl.review?.salvagedVerdict) {
+      return {
+        chainParsedReview: jsonl.review,
+        chainVerdict: "partial",
+        chainFindingsText: renderGroupedFindingsText(jsonl.review.findings),
+        reviewParseable: true,
+        reviewPartial: true,
+        reviewFindingCount: jsonl.findingCount,
+        partialDiagnosis: jsonl.partialDiagnosis || null,
+        salvagedVerdict: false,
+        schemaErrors: [],
+      };
+    }
+
+    // Salvaged review (#312): validate all fields except schema_version;
+    // salvagedVerdict annotation is stripped during validation.
+    const isSalvaged = jsonl.review?.salvagedVerdict === true;
+    const validation = validateReview(jsonl.review, { salvaged: isSalvaged });
+    if (validation.valid) {
+      return {
+        chainParsedReview: jsonl.review,
+        chainVerdict: jsonl.review.verdict,
+        chainFindingsText: renderGroupedFindingsText(jsonl.review.findings),
+        reviewParseable: true,
+        reviewPartial: false,
+        reviewFindingCount: jsonl.findingCount,
+        partialDiagnosis: null,
+        salvagedVerdict: isSalvaged,
+        schemaErrors: [],
+      };
+    }
+
     return {
-      chainParsedReview: jsonl.review,
-      chainVerdict: jsonl.review.verdict,
-      chainFindingsText: renderGroupedFindingsText(jsonl.review.findings),
-      reviewParseable: true,
-      reviewPartial: jsonl.partial,
-      reviewFindingCount: jsonl.findingCount,
-      partialDiagnosis: jsonl.partialDiagnosis || null,
-      salvagedVerdict: jsonl.review?.salvagedVerdict === true,
+      chainParsedReview: null,
+      chainVerdict: "unparseable",
+      chainFindingsText: "(review output could not be parsed)",
+      reviewParseable: false,
+      reviewPartial: false,
+      reviewFindingCount: 0,
+      partialDiagnosis: null,
+      salvagedVerdict: false,
+      schemaErrors: validation.errors,
     };
   }
 
-  // ---- parse review result ----
-  // Part A: handle VERDICT token inside the JSON fence.
-  // First try stripping a trailing VERDICT token, then try extractJson.
-  // If that fails, try recovering the verdict from anywhere in the text
-  // and re-extract JSON after stripping the token from anywhere.
+  // ---- parse single JSON object (legacy path, kusabi #392 strict validate) ----
   const trailingStripped = reviewResultText.replace(/\s*VERDICT:\s*(approve-partial|approve|needs-attention|discard)\s*$/i, "");
   let parsed = extractJson(trailingStripped);
 
   if (!parsed) {
-    // The trailing-strip didn't work (token may be inside the fence).
-    // Try recovering the verdict from anywhere in the text.
     const recovered = recoverVerdictFromText(reviewResultText);
     if (recovered) {
-      // Strip the token from everywhere and re-parse.
-      // Safety: if the global strip joins lines in a way that breaks JSON,
-      // extractJson returns null and we fall through to unparseable —
-      // no malformed JSON is ever accepted.
       const anywhereStripped = reviewResultText.replace(/\s*VERDICT:\s*(approve-partial|approve|needs-attention|discard)\s*/gi, "");
       parsed = extractJson(anywhereStripped);
     }
   }
 
-  const reviewParseable = parsed !== null;
-
-  if (reviewParseable) {
-    const chainVerdict = parsed.verdict || "needs-attention";
-    // Malformed-review guard (kusabi #153): `findings` may arrive as a
-    // string/object instead of an array; never call .map on a non-array.
-    const findingsArray = Array.isArray(parsed.findings) ? parsed.findings : [];
-    // Grouped one-line rendering (kusabi #60 step 1): design findings first,
-    // mechanical after, single section when all findings share one kind.
-    // The raw findings (including any `kind` tags) still flow through to
-    // roundRecord.findings untouched — this is consumption-point rendering.
-    const chainFindingsText = renderGroupedFindingsText(findingsArray);
-    // The single-object path is never partial: the object either carries a
-    // verdict or it is not this path at all.
+  if (parsed !== null) {
+    const validation = validateReview(parsed);
+    if (validation.valid) {
+      const findingsArray = Array.isArray(parsed.findings) ? parsed.findings : [];
+      const chainFindingsText = renderGroupedFindingsText(findingsArray);
+      return {
+        chainParsedReview: parsed,
+        chainVerdict: parsed.verdict,
+        chainFindingsText,
+        reviewParseable: true,
+        reviewPartial: false,
+        reviewFindingCount: findingsArray.length,
+        partialDiagnosis: null,
+        salvagedVerdict: false,
+        schemaErrors: [],
+      };
+    }
     return {
-      chainParsedReview: parsed,
-      chainVerdict,
-      chainFindingsText,
-      reviewParseable,
+      chainParsedReview: null,
+      chainVerdict: "unparseable",
+      chainFindingsText: "(review output could not be parsed)",
+      reviewParseable: false,
       reviewPartial: false,
-      reviewFindingCount: findingsArray.length,
+      reviewFindingCount: 0,
       partialDiagnosis: null,
       salvagedVerdict: false,
+      schemaErrors: validation.errors,
     };
   }
 
-  // A2: unparseable review is recorded as a distinct state
+  // Unparseable review: no JSON object found. Recover verdict token if present.
   const recoveredV = recoverVerdictFromText(reviewResultText);
   const chainVerdict = recoveredV ? recoveredV.verdict : "unparseable";
   const chainFindingsText = "(review output could not be parsed)";
@@ -1377,11 +1408,12 @@ export function parseReviewResult(reviewResultText) {
     chainParsedReview: null,
     chainVerdict,
     chainFindingsText,
-    reviewParseable,
+    reviewParseable: false,
     reviewPartial: false,
     reviewFindingCount: 0,
     partialDiagnosis: null,
     salvagedVerdict: false,
+    schemaErrors: [],
   };
 }
 
@@ -1552,7 +1584,15 @@ export async function runReviewPhase({
       chainFindingsText: _findings, reviewParseable: _parseable,
       reviewPartial: _partial, reviewFindingCount: _findingCount,
       partialDiagnosis: _partialDiagnosis, salvagedVerdict: _salvagedVerdict,
+      schemaErrors: _schemaErrors,
     } = parseReviewResult(reviewResultText);
+
+    if (_schemaErrors && _schemaErrors.length > 0 && cwd && reviewJob?.id) {
+      appendEvent(stateDirFor(cwd), reviewJob.id, {
+        type: "companion.review.schema_invalid",
+        errors: _schemaErrors,
+      });
+    }
 
     // ---- retry once on unparseable output ----
     // A job that completes with garbage — no JSON and no recoverable
@@ -1588,7 +1628,14 @@ export async function runReviewPhase({
       ({ chainParsedReview: _parsed, chainVerdict: _verdict,
          chainFindingsText: _findings, reviewParseable: _parseable,
          reviewPartial: _partial, reviewFindingCount: _findingCount,
-         partialDiagnosis: _partialDiagnosis, salvagedVerdict: _salvagedVerdict } = parseReviewResult(reviewResultText));
+         partialDiagnosis: _partialDiagnosis, salvagedVerdict: _salvagedVerdict,
+         schemaErrors: _schemaErrors } = parseReviewResult(reviewResultText));
+      if (_schemaErrors && _schemaErrors.length > 0 && cwd && reviewJob?.id) {
+        appendEvent(stateDirFor(cwd), reviewJob.id, {
+          type: "companion.review.schema_invalid",
+          errors: _schemaErrors,
+        });
+      }
     }
 
     roundRecord.reviewJobId = reviewJob.id;
