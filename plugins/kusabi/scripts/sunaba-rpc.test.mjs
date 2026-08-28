@@ -40,9 +40,9 @@ describe("sunaba-rpc allowlist", () => {
     }
   });
 
-  it("allows all 4 tools in the allowlist", async () => {
+  it("allows all tools in the allowlist", async () => {
     const { callTool } = await import("./sunaba-rpc.mjs");
-    for (const tool of ["verify_in_container", "sandbox_exec", "checkpoint", "checkpoint_list"]) {
+    for (const tool of ["verify_in_container", "sandbox_exec", "checkpoint", "checkpoint_list", "copy_file"]) {
       try {
         await callTool(tool, {});
       } catch (err) {
