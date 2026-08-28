@@ -4,7 +4,7 @@
 // This module is NOT an MCP client — it speaks plain HTTP POST + SSE
 // to the Sunaba MCP endpoint so the companion's non-LLM pipeline can
 // invoke a limited set of tools (verify_in_container, sandbox_exec,
-// checkpoint, checkpoint_list) without going through the LLM layer.
+// checkpoint, checkpoint_list, copy_file) without going through the LLM layer.
 //
 // The tool allowlist is hardcoded — no configuration can widen it.
 // This is a deliberate design invariant: publish and issue write are
@@ -23,6 +23,7 @@ const ALLOWED_TOOLS = new Set([
   "sandbox_exec",
   "checkpoint",
   "checkpoint_list",
+  "copy_file",
 ]);
 
 // 127.0.0.1 (not "localhost"): node fetch may resolve localhost to ::1 while

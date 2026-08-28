@@ -891,11 +891,15 @@ known-dead route, not about locking the chain.
 - **Endpoint**: env `KUSABI_SUNABA_URL`, default `http://127.0.0.1:8750/mcp`. 127.0.0.1 (fixed, avoids IPv6 name resolution issues with localhost)
 - **Protocol**: Streamable HTTP. `initialize` POST → save `mcp-session-id` from response header → `notifications/initialized` → `tools/call`
 - **Response format**: SSE (`data:` lines). The last line's JSON is the result. Auto-unwraps MCP's `content[0].text` wrapper (`unwrapResult`)
-- **Tool allow list (hardcoded)** — only the following 4 tools. Calling anything outside the list throws a pre-call validation error:
+- **Tool allow list (hardcoded)** — only the following tools. Calling anything outside the list throws a pre-call validation error:
   - `verify_in_container`
   - `sandbox_exec`
   - `checkpoint`
   - `checkpoint_list`
+  - `copy_file`
+
+  `copy_file` is the companion inject path for change-scope (#400/#401), not a
+  worker grant.
 
   `checkpoint_restore` was removed in issue #114 — the chain never rolls the
   worktree back, so the tool is structurally uncallable from here.
