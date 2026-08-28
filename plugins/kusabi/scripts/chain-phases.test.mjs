@@ -54,7 +54,9 @@ import {
   quotaReplacementRefusal,
   recordQuotaExhaustion,
   explicitRouteDiffersFromRecord,
+  buildReviewRepairPrompt,
 } from "./chain-phases.mjs";
+import { cmdReview } from "./kusabi-companion.mjs";
 import {
   createFakeCallTool,
   fakeCallToolForP1,
@@ -63,7 +65,7 @@ import {
   fakeCallToolForP3WithBaseline,
 } from "./fixtures.mjs";
 import { renderPriorFindings } from "./render.mjs";
-import { readJson } from "./state-paths.mjs";
+import { readJson, stateDirFor } from "./state-paths.mjs";
 
 describe("runSmokeProbe", () => {
   it("observes exit 0 for a command whose output far exceeds page size", async () => {
@@ -6448,7 +6450,7 @@ describe("chain review prompt byte-identity", () => {
       captured = opts.promptText;
       return {
         job: { id: "review-golden", status: "completed", modelEntry: "m", modelVariant: null, fallbacks: null, usage: null, error: null },
-        resultText: JSON.stringify({ verdict: "approve", findings: [] }),
+        resultText: JSON.stringify({ schema_version: 1, verdict: "approve", summary: "ok", findings: [], next_steps: [] }),
       };
     }
     await runReviewPhase({
@@ -6552,7 +6554,7 @@ describe("runReviewPhase \u2014 {{PROBE_REPORT}} slot (kusabi #236)", () => {
       captured = opts.promptText;
       return {
         job: { id: "job-probes", status: "completed", modelEntry: "m", modelVariant: null, fallbacks: null, usage: null, error: null },
-        resultText: JSON.stringify({ verdict: "approve", findings: [] }),
+        resultText: JSON.stringify({ schema_version: 1, verdict: "approve", summary: "ok", findings: [], next_steps: [] }),
       };
     }
     await runReviewPhase({
@@ -7924,5 +7926,364 @@ describe("change-scope wiring into review and probe phases (kusabi #379)", () =>
     assert.ok(!commands.some((c) => c.includes("change-scope.mjs")), "collectReviewContext must not invoke change-scope.mjs");
     // roundRecord is untouched and context is collected
     assert.equal(reviewCtx.chainStatusObserved, true);
+  });
+});
+
+
+// =========================================================================
+// schema-invalid review repair loop (kusabi #395)
+// =========================================================================
+
+describe("buildReviewRepairPrompt (kusabi #395)", () => {
+  it("formats schema validation errors as JSON without original output when hasSession is true", () => {
+    const schemaErrors = [
+      { path: "/schema_version", expected: "const: 1", actual: "undefined" },
+      { path: "/summary", expected: "type: string", actual: "undefined" },
+    ];
+    const prompt = buildReviewRepairPrompt({ schemaErrors, originalOutput: "raw output", hasSession: true });
+    assert.ok(prompt.includes("Schema validation errors:"));
+    assert.ok(prompt.includes('"/schema_version"'));
+    assert.ok(prompt.includes('"const: 1"'));
+    assert.ok(prompt.includes("Please emit ONE corrected JSON object"));
+    assert.ok(!prompt.includes("raw output"), "must not include original output when hasSession is true");
+  });
+
+  it("includes truncated original output when hasSession is false", () => {
+    const schemaErrors = [
+      { path: "/findings", expected: "type: array", actual: "null" },
+    ];
+    const prompt = buildReviewRepairPrompt({
+      schemaErrors,
+      originalOutput: "previous malformed json",
+      hasSession: false,
+    });
+    assert.ok(prompt.includes("Schema validation errors:"));
+    assert.ok(prompt.includes("Previous review output:"));
+    assert.ok(prompt.includes("previous malformed json"));
+  });
+
+  it("truncates original output exceeding 4000 characters when hasSession is false", () => {
+    const longOutput = "a".repeat(5000);
+    const prompt = buildReviewRepairPrompt({
+      schemaErrors: [],
+      originalOutput: longOutput,
+      hasSession: false,
+    });
+    assert.ok(prompt.includes("...(truncated)"));
+    assert.ok(!prompt.includes("a".repeat(5000)));
+  });
+
+  it("formats prompt with real linefeeds around markdown fences instead of escaped backslash-n", () => {
+    const schemaErrors = [
+      { path: "/schema_version", expected: "const: 1", actual: "undefined" },
+    ];
+    const prompt = buildReviewRepairPrompt({ schemaErrors, originalOutput: "raw output", hasSession: true });
+    assert.ok(prompt.includes("\n```json\n"), "must include real newlines around ```json fence");
+    assert.ok(!prompt.includes("\\n```json"), "must not include literal \\n before ```json fence");
+    assert.ok(!prompt.includes("\\n"), "must not contain literal backslash-n sequences");
+
+    const promptNoSession = buildReviewRepairPrompt({
+      schemaErrors,
+      originalOutput: "raw output",
+      hasSession: false,
+    });
+    assert.ok(promptNoSession.includes("\n```\n"), "must include real newlines around markdown fence");
+    assert.ok(!promptNoSession.includes("\\n```"), "must not include literal \\n before ``` fence");
+    assert.ok(!promptNoSession.includes("\\n"), "must not contain literal backslash-n sequences");
+  });
+});
+
+describe("runReviewPhase — schema-invalid repair loop (kusabi #395)", () => {
+  function makeDispatch(results) {
+    const calls = [];
+    function stubbedDispatch(options) {
+      calls.push(options);
+      return results.shift();
+    }
+    return { stubbedDispatch, calls };
+  }
+
+  function fakeJob(id, resultText, extra = {}) {
+    return {
+      job: {
+        id,
+        status: "completed",
+        sessionID: "session-" + id,
+        modelEntry: "test-org/test-review-model",
+        modelVariant: null,
+        fallbacks: null,
+        usage: null,
+        error: null,
+        ...extra,
+      },
+      resultText,
+    };
+  }
+
+  const SCHEMA_INVALID_MISSING_VERSION = JSON.stringify({
+    verdict: "needs-attention",
+    summary: "One defect found.",
+    findings: [
+      { severity: "medium", title: "Off-by-one", body: "b", file: "src/calc.js", line_start: 7, line_end: 7, confidence: 0.8, recommendation: "r" },
+    ],
+    next_steps: [],
+  });
+
+  const SCHEMA_INVALID_EXTRA_KEY = JSON.stringify({
+    schema_version: 1,
+    unrecognized_key: "forbidden",
+    verdict: "needs-attention",
+    summary: "Has extra field.",
+    findings: [],
+    next_steps: [],
+  });
+
+  const VALID_REVIEW = JSON.stringify({
+    schema_version: 1,
+    verdict: "needs-attention",
+    summary: "One real finding.",
+    findings: [
+      { severity: "medium", title: "Off-by-one", body: "b", file: "src/calc.js", line_start: 7, line_end: 7, confidence: 0.8, recommendation: "r" },
+    ],
+    next_steps: [],
+  });
+
+  const GARBAGE = "definitely not JSON and no VERDICT token here at all";
+
+  async function runWith(results, extra = {}, customStateDir = null) {
+    const { stubbedDispatch, calls } = makeDispatch(results);
+    const roundRecord = { round: 1 };
+    const tempDir = customStateDir || fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-repair-test-"));
+    const result = await runReviewPhase({
+      container: "test",
+      brief: "test brief",
+      modelChain: ["test-org/test-flash", "test-org/test-pro"],
+      chainId: "test-chain",
+      cwd: tempDir,
+      previousRecord: null,
+      baseSha: "abc123",
+      chainStatusOutput: "",
+      chainBaseLog: "",
+      chainUntracked: "",
+      roundRecord,
+      chainChangedPaths: [],
+      chainStatusObserved: false,
+      chainDeliverables: [],
+      flagsModel: null,
+      _dispatchWithFallback: stubbedDispatch,
+      ...extra,
+    });
+    return { result, roundRecord, calls, tempDir };
+  }
+
+  it("schema-invalid first result with sessionID: repairs in same session, parses corrected output", async () => {
+    const { roundRecord, calls, tempDir } = await runWith([
+      fakeJob("job-inv-1", SCHEMA_INVALID_MISSING_VERSION, {
+        sessionID: "sess-123",
+        usage: { available: true, input: 10, output: 5, cost: 0.01 },
+        fallbacks: ["fallback-1"],
+      }),
+      fakeJob("job-rep-2", VALID_REVIEW, {
+        sessionID: "sess-123",
+        usage: { available: true, input: 15, output: 8, cost: 0.02 },
+        modelEntry: "test-org/test-fixed-model",
+      }),
+    ]);
+
+    assert.equal(calls.length, 2);
+    // First call: initial review prompt, no session
+    assert.equal(calls[0].session, undefined);
+    assert.ok(calls[0].promptText.includes("test brief"));
+
+    // Second call: repair prompt with same session
+    assert.equal(calls[1].session, "sess-123");
+    assert.ok(calls[1].promptText.includes("Schema validation errors:"));
+    assert.ok(calls[1].promptText.includes("/schema_version"));
+    assert.ok(!calls[1].promptText.includes("test brief"), "repair prompt should be short without full brief");
+
+    // roundRecord fields
+    assert.equal(roundRecord.reviewSchemaRepaired, true);
+    assert.equal(roundRecord.reviewFirstJobId, "job-inv-1");
+    assert.deepEqual(roundRecord.reviewFirstUsage, { available: true, input: 10, output: 5, cost: 0.01 });
+    assert.deepEqual(roundRecord.reviewFirstFallbacks, ["fallback-1"]);
+    assert.equal(roundRecord.reviewJobId, "job-rep-2");
+    assert.equal(roundRecord.verdict, "needs-attention");
+    assert.equal(roundRecord.reviewParseable, true);
+    assert.ok(roundRecord.findingsText.includes("Off-by-one"));
+
+    // Totals include both attempts
+    const totals = computeChainTotals([roundRecord]);
+    assert.equal(totals.input, 25);
+    assert.equal(totals.output, 13);
+    assert.equal(totals.cost, 0.03);
+
+    // Events written
+    const eventsFile = path.join(tempDir, ".kusabi", "jobs", "job-inv-1", "events.ndjson");
+    if (fs.existsSync(eventsFile)) {
+      const lines = fs.readFileSync(eventsFile, "utf8").trim().split("\n").map(JSON.parse);
+      assert.ok(lines.some((e) => e.type === "companion.review.schema_invalid"));
+      assert.ok(lines.some((e) => e.type === "companion.review.schema_repair" && e.attempt === 1));
+    }
+  });
+
+  it("schema-invalid first result without sessionID: dispatches fresh repair with truncated output", async () => {
+    const { roundRecord, calls } = await runWith([
+      fakeJob("job-nosess-1", SCHEMA_INVALID_EXTRA_KEY, { sessionID: null }),
+      fakeJob("job-rep-2", VALID_REVIEW),
+    ]);
+
+    assert.equal(calls.length, 2);
+    assert.equal(calls[1].session, undefined);
+    assert.ok(calls[1].promptText.includes("Schema validation errors:"));
+    assert.ok(calls[1].promptText.includes("Previous review output:"));
+    assert.ok(calls[1].promptText.includes("unrecognized_key"));
+
+    assert.equal(roundRecord.reviewSchemaRepaired, true);
+    assert.equal(roundRecord.reviewJobId, "job-rep-2");
+    assert.equal(roundRecord.verdict, "needs-attention");
+    assert.equal(roundRecord.reviewParseable, true);
+  });
+
+  it("schema-invalid then still schema-invalid: exactly 2 dispatches, verdict unparseable, no double retry", async () => {
+    const { roundRecord, calls } = await runWith([
+      fakeJob("job-inv-1", SCHEMA_INVALID_MISSING_VERSION),
+      fakeJob("job-inv-2", SCHEMA_INVALID_EXTRA_KEY),
+    ]);
+
+    assert.equal(calls.length, 2);
+    assert.equal(roundRecord.reviewSchemaRepaired, true);
+    assert.equal(roundRecord.reviewFirstJobId, "job-inv-1");
+    assert.equal(roundRecord.reviewJobId, "job-inv-2");
+    assert.equal(roundRecord.verdict, "unparseable");
+    assert.equal(roundRecord.reviewParseable, false);
+    assert.equal(roundRecord.findingsText, "(review output could not be parsed)");
+  });
+
+  it("schema-invalid then unparseable garbage: exactly 2 dispatches, verdict unparseable", async () => {
+    const { roundRecord, calls } = await runWith([
+      fakeJob("job-inv-1", SCHEMA_INVALID_MISSING_VERSION),
+      fakeJob("job-garbage-2", GARBAGE),
+    ]);
+
+    assert.equal(calls.length, 2);
+    assert.equal(roundRecord.reviewSchemaRepaired, true);
+    assert.equal(roundRecord.reviewJobId, "job-garbage-2");
+    assert.equal(roundRecord.verdict, "unparseable");
+    assert.equal(roundRecord.reviewParseable, false);
+  });
+
+  it("garbage with empty schemaErrors still gets identical-prompt retry (issue #145)", async () => {
+    const { roundRecord, calls } = await runWith([
+      fakeJob("job-g1", GARBAGE),
+      fakeJob("job-ok", VALID_REVIEW),
+    ]);
+
+    assert.equal(calls.length, 2);
+    assert.equal(roundRecord.reviewUnparseableRetried, true);
+    assert.equal(roundRecord.reviewSchemaRepaired, undefined);
+    assert.deepEqual(calls[0].promptText, calls[1].promptText);
+    assert.equal(roundRecord.verdict, "needs-attention");
+    assert.equal(roundRecord.reviewParseable, true);
+  });
+
+  it("hard failure with schema-invalid text: exactly 1 dispatch call, no repair", async () => {
+    const { roundRecord, calls } = await runWith([
+      fakeJob("job-timeout", SCHEMA_INVALID_MISSING_VERSION, { status: "timeout" }),
+    ]);
+
+    assert.equal(calls.length, 1);
+    assert.equal(roundRecord.reviewSchemaRepaired, undefined);
+    assert.equal(roundRecord.verdict, "unparseable");
+  });
+});
+
+describe("cmdReview — schema-invalid repair loop (kusabi #395)", () => {
+  const SCHEMA_INVALID_MISSING_VERSION = JSON.stringify({
+    verdict: "needs-attention",
+    summary: "One defect found.",
+    findings: [
+      { severity: "medium", title: "Off-by-one", body: "b", file: "src/calc.js", line_start: 7, line_end: 7, confidence: 0.8, recommendation: "r" },
+    ],
+    next_steps: [],
+  });
+
+  const VALID_REVIEW = JSON.stringify({
+    schema_version: 1,
+    verdict: "needs-attention",
+    summary: "One real finding.",
+    findings: [
+      { severity: "medium", title: "Off-by-one", body: "b", file: "src/calc.js", line_start: 7, line_end: 7, confidence: 0.8, recommendation: "r" },
+    ],
+    next_steps: [],
+  });
+
+  const GARBAGE = "definitely not JSON and no VERDICT token here at all";
+
+  it("repairs schema-invalid review output in the same session", async () => {
+    const calls = [];
+    const jobs = [
+      {
+        job: { id: "job-r1", status: "completed", sessionID: "sess-rev-1" },
+        resultText: SCHEMA_INVALID_MISSING_VERSION,
+      },
+      {
+        job: { id: "job-r2", status: "completed", sessionID: "sess-rev-1" },
+        resultText: VALID_REVIEW,
+      },
+    ];
+
+    async function stubPrompt(opts) {
+      calls.push(opts);
+      const next = jobs.shift();
+      if (next?.job?.id) {
+        fs.mkdirSync(path.join(stateDirFor(process.cwd()), "jobs", next.job.id), { recursive: true });
+      }
+      return next;
+    }
+
+    const output = await cmdReview(process.cwd(), {
+      flags: { model: "test/model" },
+      text: "test focus",
+      _runPrompt: stubPrompt,
+    });
+
+    assert.equal(calls.length, 2);
+    assert.equal(calls[1].session, "sess-rev-1");
+    assert.ok(calls[1].promptText.includes("Schema validation errors:"));
+    assert.ok(output.includes("needs-attention"));
+    assert.ok(output.includes("Off-by-one"));
+  });
+
+  it("retries garbage output with identical prompt in cmdReview", async () => {
+    const calls = [];
+    const jobs = [
+      {
+        job: { id: "job-g1", status: "completed" },
+        resultText: GARBAGE,
+      },
+      {
+        job: { id: "job-g2", status: "completed" },
+        resultText: VALID_REVIEW,
+      },
+    ];
+
+    async function stubPrompt(opts) {
+      calls.push(opts);
+      const next = jobs.shift();
+      if (next?.job?.id) {
+        fs.mkdirSync(path.join(stateDirFor(process.cwd()), "jobs", next.job.id), { recursive: true });
+      }
+      return next;
+    }
+
+    const output = await cmdReview(process.cwd(), {
+      flags: { model: "test/model" },
+      text: "test focus",
+      _runPrompt: stubPrompt,
+    });
+
+    assert.equal(calls.length, 2);
+    assert.equal(calls[0].promptText, calls[1].promptText);
+    assert.ok(output.includes("needs-attention"));
   });
 });
