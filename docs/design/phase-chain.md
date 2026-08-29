@@ -63,7 +63,7 @@ rounds are always carried forward.
 
 ### 3.5 Auto-chain (chain subcommand) — implemented
 
-Launched with `chain --container <cid> --model <m> [--max-rounds N] "<brief>"`. Implementation is `cmdChain` in `plugins/kusabi/scripts/kusabi-companion.mjs`.
+Launched in foreground with `chain --container <cid> --model <m> [--max-rounds N] "<brief>"` or in background with `chain-detach --container <cid> --model <m> [--max-rounds N] "<brief>"`. Implementation is `cmdChain` / `cmdChainDetach` in `plugins/kusabi/scripts/kusabi-companion.mjs`.
 
 #### 3.5.1 Round structure
 
@@ -530,6 +530,8 @@ The one place the disposition set lies is **after a `chain-resume`**: `rearmChai
 
 **`--next`** waits for a chain to APPEAR instead of naming one — the mode a dispatch-then-watch script uses, since the chain id does not exist yet when the watcher starts. It selects the newest chain that is either new since the wait started or was already there and unfinished, so a chain created in the moment before the wait started still counts while one that finished earlier never does. A pre-existing empty directory with no control record, older than `--appear-timeout`, is debris from a dispatch that died before writing anything and is skipped with a stderr note; while the selected chain is still recordless a newer or same-stamped chain that appears wins, so the wait cannot stall on an empty directory (a directory once traded away is never revisited). `--since <ISO>` is the precise tool when several chains run in one workspace at once and newest-unfinished selection would be ambiguous.
 
+**`chain-detach` — background launch and wait handoff.** Launches a chain in a detached background process and prints a runnable `chain-wait` command line (`kusabi-companion chain-wait --next --since <ISO> ...`), eliminating hand-rolled backgrounding and PID tracking. Pre-flight checks (brief-file resolution, publish warning, lossy-smoke refusal, session provenance, container requirement, and dispatch-time brief lint) run before child spawn so invalid dispatches exit non-zero immediately without spawning a background child or printing a wait command line. It accepts the same flags as `chain` (`--container <cid>`, `--model <identifier>`, `--backend opencode|claude|agy|cursor`, `--brief-file <path>`, `--max-rounds <N>`, `--session <id>`, `--timeout <s>`, `--watchdog <s>`, `--deny <tools>`, `--keep-serve`) and forwards tracking flags (`--appear-timeout <s>`, `--poll-interval <s>`, `--progress-timeout <s>`, `--since <ISO>`) into the generated `chain-wait` invocation. The operator (or orchestrator harness) waits on the **chain id** via `chain-wait`, not on a hand-rolled process watcher.
+
 ### 3.5.8 metrics store (ingest) — implemented
 
 `metrics-db.mjs`, `transcript-ingest.mjs`, `chain-ingest.mjs`. A durable SQLite digest of two perishable/durable data sources, feeding the token-efficiency work (#83) and brief/outcome correlation work (#81). **Ingest + store only** — the write side lives here; the query/report surface it was built to feed is delivered and documented in §3.5.9.
@@ -655,7 +657,7 @@ kusabi #323, §3.5.5, extended by #324.) `baseSha` keeps the ORIGINAL chain base
 
 #### 3.5.11 claude backend — implemented (kusabi #184)
 
-`chain` and `task` accept `--backend opencode|claude` (default `opencode`); an unknown value is a clear error with a nonzero exit. The backend is resolved ONCE at command start and recorded as `backend` on every job record and chain round record (round-N.json and the `records` array in chain.json); records without the field are treated as `"opencode"` by readers. `chain-resume` takes the backend from the last chain record — it is not a flag.
+`chain` and `task` accept `--backend opencode|claude|agy|cursor` (default `opencode`); an unknown value is a clear error with a nonzero exit. The backend is resolved ONCE at command start and recorded as `backend` on every job record and chain round record (round-N.json and the `records` array in chain.json); records without the field are treated as `"opencode"` by readers. `chain-resume` takes the backend from the last chain record — it is not a flag.
 
 **Dispatch.** `plugins/kusabi/scripts/claude-dispatch.mjs` exports `claudeDispatch` with the same call/return contract as `dispatchWithFallback` (`{ job, resultText, stateDir }`); kusabi-companion.mjs substitutes it for the opencode dispatch when `--backend claude` (the single decision point — the chain phases stay backend-blind). It spawns the official Claude Code CLI headlessly: `claude -p --strict-mcp-config --setting-sources "" --output-format stream-json --verbose --model <m> --allowedTools <csv> --disallowedTools <csv> --mcp-config <path> [--append-system-prompt <agent-body>] [--resume <session-id>]` (binary via `CLAUDE_BIN`, default `claude`; arg construction and stream parsing are pure functions so a contract fix stays cheap). `--verbose` is mandatory alongside `--output-format stream-json` — the real CLI refuses to start without it (`Error: When using --print, --output-format=stream-json requires --verbose`, field-verified 2026-08-11). `--resume <session-id>` is appended when the dispatch receives a `session` option — a resumed session gets the SAME isolation flags (strict MCP config, allow/deny lists) as a fresh one, because resume is a transport detail, not a permission change. The **prompt is written to the child's stdin**, never argv (field-verified: `echo <prompt> | claude -p` works) — it cannot leak into `ps` output or argv-logged transcripts and is not capped by the argv limit.
 
@@ -738,7 +740,7 @@ Measured motivation (2026-08-09): a strong model's round-1 skeleton was one-shot
 
 #### 3.5.14 agy backend — implemented, resume via `--conversation` (kusabi #199 / #316)
 
-`chain` and `task` accept `--backend opencode|claude|agy`, config chain entries accept an `agy/<model>` prefix, and `--model agy/<model>` pins a phase to it. **Why a third backend:** agy (the Antigravity CLI) draws on a separate quota pool — Gemini, metered apart from both existing pools — and adds a third model family, which is what cross-family review needs. Unlike a read-only-tool backend there is **no phase restriction**: any phase may route to agy.
+`chain` and `task` accept `--backend opencode|claude|agy|cursor`, config chain entries accept an `agy/<model>` prefix, and `--model agy/<model>` pins a phase to it. **Why a third backend:** agy (the Antigravity CLI) draws on a separate quota pool — Gemini, metered apart from both existing pools — and adds a third model family, which is what cross-family review needs. Unlike a read-only-tool backend there is **no phase restriction**: any phase may route to agy.
 
 **Dispatch.** `plugins/kusabi/scripts/agy-dispatch.mjs` exports `agyDispatch` with the same call/return contract as `dispatchWithFallback` / `claudeDispatch` (`{ job, resultText, stateDir }`), selected per phase by `resolveDispatchBackend` exactly like the other two. It spawns the Antigravity CLI headlessly with the field-verified invocation and **nothing else**:
 
@@ -892,6 +894,19 @@ the resume refuses and names the escape hatch. An explicitly different route
 (`--backend`/`--model` naming another backend) still goes through — the refusal is about repeating a
 known-dead route, not about locking the chain.
 
+#### 3.5.18 stopReason — closed terminal-reason union (kusabi #380)
+
+A dispatched worker job (or a chain round's implement job) ends in exactly one of a closed set of terminal reasons. `deriveStopReason` (`plugins/kusabi/scripts/stop-reason.mjs`) is the pure derivation function and single source of truth for the closed set:
+
+- `completed`: Normal completion with changes made (`worktreeChanged: true`) or unmeasured substance (`worktreeChanged: null`).
+- `empty-completion`: Completed session that executed steps (`stats.steps > 0`) but produced no worktree changes (`worktreeChanged: false`).
+- `infra-death`: Completed session that executed 0 steps (`stats.steps === 0`) and produced no worktree changes (`worktreeChanged: false`).
+- `quota-exhausted`: Dispatch failed with a non-null `capacityReason` (e.g. `free_tier_limit`).
+- `provider-error`: Terminal provider error (`providerError.terminal === true` or status `provider-error`).
+- `cancelled`: Explicitly cancelled session or status `cancelled`.
+
+`unknown` is the failure sentinel for unmappable or unforeseen statuses (such as `serve-dead`, `timeout`, `stalled`, `error`). It is deliberately excluded from `STOP_REASONS`; consumers must treat `unknown` as a failure and never silently fold it into `completed`.
+
 ### 3.6 sunaba-rpc (raw JSON-RPC client) — implemented
 
 `plugins/kusabi/scripts/sunaba-rpc.mjs`. A **raw HTTP+SSE client** for the companion's non-LLM pipeline (deterministic probes, etc.) to call sunaba's MCP tools. **Not an MCP client.**
@@ -977,11 +992,11 @@ bash included — is a descendant of that serve and inherits the marker. The
 companion's CLI entry (`main()` in `kusabi-companion.mjs`) checks the marker
 before dispatch: if set and the subcommand is **job-creating** — reaches
 `runPrompt`/`dispatchWithFallback`, or starts a chain, which dispatches
-rounds through the same path — it exits non-zero instead of running. The
-job-creating set, enumerated from the dispatch table rather than guessed:
-`task`, `review`, `salvage`, `chain`. Everything else (`status`,
-`result`, `cancel`, `serve-stop`, `chain-cancel`, `chain-show`,
-`chain-stats`, `metrics-ingest`, `metrics-report`, `install-agents`,
+rounds through the same path — it exits non-zero instead of running. The job-creating set, enumerated from the dispatch table rather than guessed:
+`task`, `review`, `salvage`, `chain`, `chain-resume`, `chain-detach` (and alias
+`chainDetach`). Everything else (`status`, `result`, `cancel`, `serve-stop`,
+`chain-cancel`, `chain-show`, `chain-wait`, `chain-stats`, `metrics-ingest`,
+`metrics-report`, `dashboard`, `install-agents`, `install-cli`, `baseline`,
 `setup`, `help`) stays allowed — the guard is against *spawning* a job, not
 against reading or stopping one. The refusal message states both the reason
 and the alternative (a denial without an alternative pushes a confused

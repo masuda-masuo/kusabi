@@ -1,12 +1,12 @@
 # kusabi Design Document
 
-Last updated: 2026-08-10
+Last updated: 2026-08-29
 Status: Design finalized + field-verified up to the phase chain, auto-chain (chain subcommand + sunaba-rpc) **implemented / reflected in main**. The phase chain (§3) now lives in `docs/design/phase-chain.md`; the §3.x numbers named below are unchanged. Decision 5 (accept-with-followup, §9.2) **implemented**. Decision 4 (strategist, §9.1) **implemented**. Fail-fast retry detection, tiered chain entries, and capacity fallback (issue #50) **implemented**. chain-stats (issue #124) **implemented**. The metrics store — ingest (§3.5.8) and query/report (§3.5.9) — **implemented**. chain-resume (§3.5.10) **implemented**. The review record (§3.5.7) and the P2 verify-gate baseline (§3.5.2) **implemented**. The claude dispatch backend (§3.5.11) **implemented** (fresh dispatch, session resume, and the metrics-DB backend columns with the report by-backend split). Per-phase backend mixing via `claude/` entry prefixes (kusabi #192, §3.5.12) **implemented** (implement and review resolve their backends independently from `models.phases.<phase>`; one phase's chain must be single-backend; round records gain `reviewBackend`). Per-round rework tiering (kusabi #192 axis 2, §3.5.13) **implemented** (`models.phases.rework` sends implement rounds after round 1 onto their own chain/backend — a strong round-1 model with cheap rework; the tier ladder climbs over the rework chain; chain.json persists `reworkModel` / `reworkModelChain` / `reworkBackend` for chain-resume). Rework scheduling by finding kind (kusabi #60 step 2, §3.5.5a) **implemented** (mechanical findings cleaned up first in free rounds; design findings one per budget round; budget derived from records, never persisted). JSONL review output (kusabi #202, §3.5.3) **implemented** (the reviewer emits one record per line as each piece is decided; the single-object path is still read; a stream without a verdict line is a `partial` review that escalates). Stages C/D remain future work (§9.3).
 
 ## 1. Purpose and positioning
 
-A plugin for using opencode (anomalyco/opencode) as a delegatable worker from Claude Code.
-Establishes a division of labor where Claude Code serves as the **orchestrator** (planning, inspection/acceptance by the orchestrator, publish decisions) while opencode + deepseek serves as the **worker** (investigation, implementation, review).
+A plugin for delegating tasks from an orchestrator (Claude Code, Cursor) to background worker models (opencode, claude, agy, cursor).
+Establishes a division of labor where Claude Code or Cursor serves as the **orchestrator** (planning, inspection/acceptance by the orchestrator, publish decisions) while worker backends serve as the **worker** (investigation, implementation, review).
 
 The motivation is cost structure: deepseek v4 Flash is cheap (zen's free-tier deepseek-v4-flash-free is also available) and empirically does better work than Haiku. This creates a structure where investigation and first-pass implementation run at essentially no cost, and only finishing work pays a small amount to Pro.
 
@@ -15,13 +15,11 @@ Derived from: openai/codex-plugin-cc (Apache-2.0). Prompt assets (adversarial-re
 ## 2. Architecture
 
 ```
-Claude Code (orchestrator)
-  └─ /kusabi:task etc. commands → dedicated transfer subagent (agents/opencode-worker.md)
-       └─ scripts/kusabi-companion.mjs (context firewall)
-            └─ opencode serve (HTTP API, 127.0.0.1 + OPENCODE_SERVER_PASSWORD, on-demand start)
-                 └─ deepseek worker
-                      └─ MCP: sunaba / shiori (configured in opencode.json on the opencode side)
-                           └─ sunaba container (merges into existing container via sandbox_attach)
+Claude Code / Cursor (orchestrator)
+  └─ /kusabi:task / skill / CLI shim → kusabi-companion (context firewall)
+       └─ worker backends (opencode serve, claude -p, agy, cursor-agent)
+            └─ MCP: sunaba / shiori (configured in opencode.json or CLI configs)
+                 └─ sunaba container (orchestrator passes --container; worker receives container_id)
 ```
 
 ### Adopted and rejected approaches
@@ -33,7 +31,7 @@ Claude Code (orchestrator)
 
 ### Execution environment prerequisites
 
-- Development style without a local git repository. All work happens inside the sunaba container; the worker receives a `container_id` and merges in via `sandbox_attach`. opencode itself stays on the host side.
+- Development style without a local git repository. All work happens inside the sunaba container; the orchestrator prepares the container and passes `--container`, and the companion injects the `container_id` into the worker prompt. The worker executes operations by passing `container_id` to sunaba tools (no `sandbox_attach`). opencode itself stays on the host side.
 - Aligned with sunaba's design tenets (sunaba#478): **sessions are disposable, state is external** (agreement = issue/PR, artifact = container, audit trail = journal).
 
 ## 3. Phase chain (core of this design)
@@ -98,7 +96,7 @@ Transplant the two-layer structure from dev-workflow-orchestrator (prototype): *
 Since workers hold no intrinsic state, even if opencode dies silently, recovery from sunaba-side traces is possible:
 
 - How far they got = `checkpoint_list` + `diff_in_container`
-- What they were doing = journal (sandbox_attach's session_label is replaced, recording the worker's operations)
+- What they were doing = journal (records the worker's operations inside the container)
 - What they were thinking = brief on the issue
 
 The recovery path is **the same path as quality-failure retries** (diff inspection → accept or restore → re-delegate). Therefore, the companion's watchdog (issue #6) can kill unceremoniously — the only loss is the session context which would be discarded across phases anyway.
@@ -207,4 +205,3 @@ Reference: issue #36 comment "Design confirmation before starting → Decision 3
 Managed via issues:
 - #8 (upstream tracking: report and fix opencode format:json_schema bug)
 - #33 (best-of-n tournament)
-- #60 (split chain rework rounds by the nature of findings, not their count — the follow-up to the `kind` tag described in `docs/design/phase-chain.md` §3.5.3)
