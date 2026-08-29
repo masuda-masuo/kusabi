@@ -48,10 +48,10 @@ What does *not* change with the CLI:
 
 Two phases exist only as `task --phase` invocations — the chain never dispatches them (kusabi #408 / #409). Both take a draft brief and return a derived artifact you fold back into the next brief.
 
-- **test-first**: dispatch test-author with the draft brief → inspect the tests it wrote → list their paths under `## Frozen Tests` and add a `baseline-red` smoke → dispatch the implement chain in the same container. Use when acceptance criteria are specifiable as tests; the frozen oracle then judges the implementation.
-- **plan-first**: dispatch plan with the draft brief → inspect the returned plan → paste the adopted parts into `## Suggested design` → dispatch the chain. Use for multi-module wiring or structural changes; skip for small targeted tasks.
+- **test-first**: dispatch test-author with the draft brief → inspect the tests it wrote → list their paths under `## Frozen Tests` and add a `baseline-red` smoke → dispatch the implement chain in the same container (see Writing the brief for when to trigger this phase; the frozen oracle then judges the implementation).
+- **plan-first**: dispatch plan with the draft brief → inspect the returned plan → paste the adopted parts into `## Suggested design` → dispatch the chain (see Writing the brief for when to trigger this phase).
 
-Neither loop changes the worker's contract: test-author writes only tests, plan writes nothing. They are cheap pre-implementation gates, not shortcuts around briefing or inspection.
+Neither loop changes the worker's contract: test-author writes only tests, plan writes nothing. They are cheap pre-implementation gates, not shortcuts around briefing or inspection. Record in the chain's review record whether a pre-phase was used or skipped for a matching brief — the triggers are provisional until measured, and instrumentation only counts from the day it exists.
 
 ## Model selection
 
@@ -122,7 +122,11 @@ end up re-running a doomed cheap round three times.
   (`(none frozen by name — use judgement.)`) burned a whole 4-round budget on unwinnable
   reworks. Dispatch now refuses such a brief outright, naming the section — an empty section
   must omit its heading. The same applies to `## Deliverables` and `## Smoke`: entries, or no
-  heading.
+  heading. Before omitting the heading, check one thing: if the acceptance criteria state
+  new behaviour as concrete input→output (a bug repro, a parser case, an API contract) and
+  no existing test covers it, dispatch test-author first — it manufactures the tests this
+  section then freezes, with a `baseline-red` smoke (see Two operating loops for the
+  mechanics). Omit and proceed when the acceptance criteria are structural or judgement-based.
 - **Keep the smoke cheap, deterministic and one command per line — never comprehensive.**
   Across nine chains sharing one author, one day and one template, briefs carrying
   `## Smoke` averaged 1.25 rounds against 2.40 without it; the winning smoke was a single
@@ -176,7 +180,11 @@ end up re-running a doomed cheap round three times.
   owns the loop/retry, where the state lives, and which single function makes the
   decision. Without it, an entire round of findings was about where the wiring
   belonged. This does not contradict "Freeze outcomes, not architecture", which governs
-  acceptance criteria.
+  acceptance criteria. If the orchestrator cannot write that block from knowledge
+  already in hand — naming the wiring point would be a guess, or would require first
+  reading substantial unfamiliar code — do not guess: dispatch a plan-phase worker
+  with the draft brief and fold the adopted parts back into the block (see Two operating
+  loops for the mechanics). If the block can be written from knowledge, skip the phase.
 - **Name the source to read, not the answer.** A brief that named the authoritative
   file let a reviewer refute the orchestrator's own mistaken claim from the real
   source; had the brief stated the answer, the worker would have copied it and the
