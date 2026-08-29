@@ -879,6 +879,8 @@ export async function dispatchWithFallback(opts) {
   let lastStateDir = null;
   /** @type {{ from: string, to: string|null, reason: string|null, attempt: number, message: string|null }[]} */
   const fallbacks = [];
+  /** @type {{ job: object, resultText: string, stateDir: string|null }[]} */
+  const attempts = [];
 
   for (let i = 0; i < candidates.length; i++) {
     const candidate = candidates[i];
@@ -903,6 +905,7 @@ export async function dispatchWithFallback(opts) {
         message: lastJob.retry?.message || null,
       };
       fallbacks.push(fb);
+      attempts.push({ job: lastJob, resultText: lastResultText, stateDir: lastStateDir });
 
       // Remember the dead route for future dispatches (process scope).
       // Only terminal failures (capacity/quota permanently exhausted) are
@@ -933,14 +936,66 @@ export async function dispatchWithFallback(opts) {
   }
 
   // ---- all routes exhausted ----
-  lastJob.fallbacks = fallbacks;
-  lastJob.status = "provider-error";
-  lastJob.error = renderAllExhaustedError({ candidates, fallbacks });
+  // When every route is provider-error, select the substantial attempt that
+  // spent tokens (or steps) so an earlier substantial run is not masked by a
+  // later 0/0 quota retry (kusabi #412).
+  let bestAttempt = attempts[0];
+  let bestTokens = attemptTokens(bestAttempt?.job);
+  let bestSteps = attemptSteps(bestAttempt?.job);
+
+  for (let i = 1; i < attempts.length; i++) {
+    const att = attempts[i];
+    const tokens = attemptTokens(att.job);
+    const steps = attemptSteps(att.job);
+    if (tokens > bestTokens || (tokens === bestTokens && steps > bestSteps)) {
+      bestAttempt = att;
+      bestTokens = tokens;
+      bestSteps = steps;
+    }
+  }
+
+  const primaryJob = bestAttempt ? bestAttempt.job : lastJob;
+  const primaryResultText = bestAttempt ? bestAttempt.resultText : lastResultText;
+  const primaryStateDir = bestAttempt ? bestAttempt.stateDir : lastStateDir;
+
+  const exhaustedFallbacks = fallbacks.map(function (fb, idx) {
+    return {
+      ...fb,
+      jobId: attempts[idx]?.job?.id || null,
+      usage: attempts[idx]?.job?.usage || null,
+    };
+  });
+
+  primaryJob.fallbacks = exhaustedFallbacks;
+  primaryJob.status = "provider-error";
+  primaryJob.error = renderAllExhaustedError({ candidates, fallbacks: exhaustedFallbacks });
   // Closed terminal reason (kusabi #380): every route dead is a provider-side
   // failure regardless of how the last route happened to die.
-  lastJob.stopReason = deriveStopReason({ status: "provider-error" });
-  if (lastStateDir) saveJob(lastStateDir, lastJob);
-  return { job: lastJob, resultText: lastResultText, stateDir: lastStateDir };
+  primaryJob.stopReason = deriveStopReason({ status: "provider-error" });
+  if (primaryStateDir) saveJob(primaryStateDir, primaryJob);
+  return { job: primaryJob, resultText: primaryResultText, stateDir: primaryStateDir };
+}
+
+/**
+ * Compute total input + output tokens from a job's usage object.
+ *
+ * @param {object|null|undefined} job
+ * @returns {number}
+ */
+function attemptTokens(job) {
+  const u = job?.usage;
+  if (!u) return 0;
+  return (u.input || 0) + (u.output || 0);
+}
+
+/**
+ * Extract step count from a job's stats object.
+ *
+ * @param {object|null|undefined} job
+ * @returns {number}
+ */
+function attemptSteps(job) {
+  return (job?.stats && typeof job.stats.steps === "number") ? job.stats.steps : 0;
 }
 
 /**
