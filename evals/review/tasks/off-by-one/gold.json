@@ -1,0 +1,6 @@
+{
+  "file": "bug.js",
+  "line_start": 8,
+  "line_end": 8,
+  "kind": "off-by-one"
+}
