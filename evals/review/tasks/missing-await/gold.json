@@ -1,0 +1,7 @@
+{
+  "file": "bug.js",
+  "line_start": 7,
+  "line_end": 8,
+  "kind": "missing-await"
+}
+

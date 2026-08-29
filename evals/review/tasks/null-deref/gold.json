@@ -1,0 +1,6 @@
+{
+  "file": "bug.js",
+  "line_start": 6,
+  "line_end": 6,
+  "kind": "null-deref"
+}
