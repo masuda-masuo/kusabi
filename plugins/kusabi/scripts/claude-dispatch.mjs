@@ -277,7 +277,6 @@ export function resolveClaudeModel({ flag, phase, config }) {
 // Passed to `claude -p` via --allowedTools.  NEVER
 // --dangerously-skip-permissions.
 const IMPLEMENT_ALLOWED_TOOLS = [
-  "mcp__sunaba__sandbox_attach",
   "mcp__sunaba__read_file_range",
   "mcp__sunaba__search_in_container",
   "mcp__sunaba__list_files",
@@ -310,7 +309,6 @@ const IMPLEMENT_ALLOWED_TOOLS = [
 ];
 
 const REVIEW_ALLOWED_TOOLS = [
-  "mcp__sunaba__sandbox_attach",
   "mcp__sunaba__read_file_range",
   "mcp__sunaba__search_in_container",
   "mcp__sunaba__list_files",
