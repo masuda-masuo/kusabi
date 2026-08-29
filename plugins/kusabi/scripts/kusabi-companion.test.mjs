@@ -664,8 +664,8 @@ describe("probe function local bindings", () => {
 // ---------------------------------------------------------------------------
 
 describe("PHASE_AGENTS", () => {
-  it("contains 7 entries", () => {
-    assert.equal(Object.keys(PHASE_AGENTS).length, 7);
+  it("contains 9 entries", () => {
+    assert.equal(Object.keys(PHASE_AGENTS).length, 9);
   });
 
   it("maps gofer to kusabi-gofer", () => {
@@ -679,6 +679,8 @@ describe("PHASE_AGENTS", () => {
     assert.equal(PHASE_AGENTS.review, "kusabi-review");
     assert.equal(PHASE_AGENTS.respond, "kusabi-respond");
     assert.equal(PHASE_AGENTS.salvage, "kusabi-salvage");
+    assert.equal(PHASE_AGENTS["test-author"], "kusabi-test-author");
+    assert.equal(PHASE_AGENTS.plan, "kusabi-plan");
   });
 
   it("every phase value ends with a .md file in opencode-agents directory", () => {
@@ -1519,6 +1521,19 @@ describe("chain per-phase config validation (kusabi #192)", () => {
       assert.notEqual(result.status, 0, `expected failure, got: ${result.stdout}`);
       assert.match(result.stdout, /unknown phase: rework/);
       assert.doesNotMatch(result.stdout, /mixes backends/);
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("task --phase with an unknown phase lists test-author and plan in the error (#408/#409)", () => {
+    const { tmp, stateDir } = makeState({});
+    try {
+      const result = runCompanion(["task", "--phase", "bogus", "do it"], tmp, stateDir);
+      assert.notEqual(result.status, 0, `expected failure, got: ${result.stdout}`);
+      assert.match(result.stdout, /unknown phase: bogus/);
+      assert.match(result.stdout, /test-author/, "error must name the test-author phase");
+      assert.match(result.stdout, /plan/, "error must name the plan phase");
     } finally {
       fs.rmSync(tmp, { recursive: true, force: true });
     }

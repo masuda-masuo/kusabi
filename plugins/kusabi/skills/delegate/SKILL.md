@@ -44,6 +44,15 @@ What does *not* change with the CLI:
   even under `--read-only`, because read-only constrains the repo, not the network exit.
   Decide that the issue should receive a public comment *before* dispatching.
 
+## Two operating loops (test-first and plan-first)
+
+Two phases exist only as `task --phase` invocations — the chain never dispatches them (kusabi #408 / #409). Both take a draft brief and return a derived artifact you fold back into the next brief.
+
+- **test-first**: dispatch test-author with the draft brief → inspect the tests it wrote → list their paths under `## Frozen Tests` and add a `baseline-red` smoke → dispatch the implement chain in the same container. Use when acceptance criteria are specifiable as tests; the frozen oracle then judges the implementation.
+- **plan-first**: dispatch plan with the draft brief → inspect the returned plan → paste the adopted parts into `## Suggested design` → dispatch the chain. Use for multi-module wiring or structural changes; skip for small targeted tasks.
+
+Neither loop changes the worker's contract: test-author writes only tests, plan writes nothing. They are cheap pre-implementation gates, not shortcuts around briefing or inspection.
+
 ## Model selection
 
 The model resolves from config or the built-in chain; an explicit `--model` is the

@@ -16,8 +16,14 @@ Long sessions cause context pollution, so work is split into phases, with **each
 | review | Adversarial review of PR | ○ | ✕ | ✕ |
 | respond | Address review findings | ✕ | ○ | ✕ |
 | gofer | Evidence-gathering errands (#64) — run, observe, quote verbatim; no judgments, no issue writes | ✕ | ✕ | ✕ |
+| test-author | Write acceptance tests before implementation (#408) — frozen oracle producer | ✕ | ○ (tests only) | ✕ |
+| plan | Read-only implementation plan (#409) — approach check, no writes | ✕ | ✕ | ✕ |
 
 The gofer phase (`kusabi-gofer`, added in #64) is a cheap evidence-collector: it runs commands via `sunaba_sandbox_exec`, reads files/logs, and reports verbatim excerpts with provenance. Unlike investigate, gofer never posts to issues and never forms judgments — its contract is raw evidence returned in the final report. Write tools, host bash, and shiori are denied; `sunaba_sandbox_exec`, `sunaba_run_python` (post-collection compression only — the prompt forbids using it to pre-filter exploration, #216), verify/lint/type tools, and sunaba read tools are explicitly allowed. The chain does not use gofer; it is for `task --phase gofer` invocations.
+
+The test-author phase (`kusabi-test-author`, added in #408) is the producer half of test/implementation separation: it writes frozen acceptance tests from the brief's criteria before the implementation exists, so the implementer is judged against an oracle it did not write. Its contract forbids reading implementation internals to resolve ambiguity, forbids editing implementation files, and grants no issue write or publish — the deliverable is test files only, and each must fail at base for a behavioral reason (RED evidence quoted verbatim). The chain does not use test-author; it is for `task --phase test-author` invocations.
+
+The plan phase (`kusabi-plan`, added in #409) is a read-only approach check: it returns an implementation plan — files to touch, where the state lives, which function decides, alternatives rejected, and open risks — in its final report, which the orchestrator pastes into a brief's `## Suggested design`. Its contract forbids any code change, diff, or file write (no edit tools, no shiori, no issue write); it is a cheap pre-implementation guard against approach errors that would otherwise surface as round-1 review findings. The chain does not use plan; it is for `task --phase plan` invocations.
 
 Design principles:
 
