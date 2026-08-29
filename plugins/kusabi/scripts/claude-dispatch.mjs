@@ -341,10 +341,32 @@ const INVESTIGATE_ALLOWED_TOOLS = [
   "mcp__sunaba__sandbox_issue_write",
 ];
 
+// kusabi-plan.md is read-only planning and shiori-✕ (see the §3.1 row in
+// docs/design/phase-chain.md, the body paragraph, kusabi-plan.md, and the
+// code comment below).  It shares the review-shaped read/verify toolset but
+// must NOT carry the `mcp__shiori__*` grant that REVIEW_ALLOWED_TOOLS has
+// (kusabi #409).  Derive it from the review list by filtering the shiori
+// entry out, so future review-list edits stay inherited (kusabi mtdnies34569
+// round-1 finding).
+const PLAN_ALLOWED_TOOLS = REVIEW_ALLOWED_TOOLS.filter(
+  t => !t.startsWith("mcp__shiori__")
+);
+
+// kusabi-test-author.md writes test files but does NOT grant run_python;
+// agent-permissions.test.mjs enforces run_python as exclusive to
+// implement/respond/gofer.  Derive the test-author list from the implement
+// list by filtering run_python out, so future implement-list edits stay
+// inherited (kusabi mtdnies34569 round-1 finding).
+const TEST_AUTHOR_ALLOWED_TOOLS = IMPLEMENT_ALLOWED_TOOLS.filter(
+  t => t !== "mcp__sunaba__run_python"
+);
+
 export const ALLOWED_TOOLS = {
   implement: IMPLEMENT_ALLOWED_TOOLS.join(","),
   review: REVIEW_ALLOWED_TOOLS.join(","),
   investigate: INVESTIGATE_ALLOWED_TOOLS.join(","),
+  plan: PLAN_ALLOWED_TOOLS.join(","),
+  testAuthor: TEST_AUTHOR_ALLOWED_TOOLS.join(","),
 };
 
 /**
@@ -374,9 +396,25 @@ export function allowedToolsForAgent(agent) {
   if (agent === "kusabi-investigate") {
     return ALLOWED_TOOLS.investigate;
   }
+  if (agent === "kusabi-test-author") {
+    // test-author writes test files (same deliverable shape as implement), so
+    // it gets the implement family's edit/read/verify toolset.  It must never
+    // run code, so `mcp__sunaba__run_python` is filtered out of the implement
+    // list (kusabi #408, mtdnies34569 round-1 finding).  It must never post to
+    // issues or publish, so the filtered implement allowlist is the exact right
+    // set (kusabi #408).
+    return ALLOWED_TOOLS.testAuthor;
+  }
+  if (agent === "kusabi-plan") {
+    // plan is read-only planning: the review-shaped toolset (no edits, no issue
+    // write) is the right set.  But plan is shiori-✕ everywhere else, so the
+    // `mcp__shiori__*` grant is filtered out of the review list (kusabi #409,
+    // mtdnies34569 round-1 finding).
+    return ALLOWED_TOOLS.plan;
+  }
   throw new Error(
     `claude backend: no permission allowlist for agent "${agent}" ` +
-    "(v1 hardcodes the implement, review, and investigate allowlists only)"
+    "(v1 hardcodes the implement, review, investigate, test-author, and plan allowlists only)"
   );
 }
 
@@ -1653,12 +1691,14 @@ export function renderClaudeSessionGuardRefusal(observation) {
 export const CLAUDE_WRITE_WATCHDOG_DEFAULT_WARN_S = 300;
 
 // Phases whose deliverable IS a file edit.  Review / investigate / draft /
-// respond / salvage / gofer legitimately never write, so the watchdog must
-// never be armed for them.  Chain REWORK rounds are covered: they dispatch
+// respond / salvage / gofer / plan legitimately never write, so the watchdog
+// must never be armed for them.  Chain REWORK rounds are covered: they dispatch
 // through runImplementPhase (chain-phases.mjs), which passes
 // `phase: "implement"` for every round — `models.phases.rework` selects the
-// MODEL for those rounds, it is not a dispatch phase name.
-const WRITE_WATCHDOG_PHASES = new Set(["implement"]);
+// MODEL for those rounds, it is not a dispatch phase name.  test-author's
+// deliverable is a test file edit (same rationale as implement), so it is in
+// the set; plan is read-only and stays out (kusabi #408 / #409).
+const WRITE_WATCHDOG_PHASES = new Set(["implement", "test-author"]);
 
 /**
  * Is this a phase the write watchdog may be armed for?

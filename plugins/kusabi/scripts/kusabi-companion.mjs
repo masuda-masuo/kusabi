@@ -243,6 +243,8 @@ export const PHASE_AGENTS = {
   respond: "kusabi-respond",
   salvage: "kusabi-salvage",
   gofer: "kusabi-gofer",
+  "test-author": "kusabi-test-author",
+  plan: "kusabi-plan",
 };
 
 // ---------------------------------------------------------------------------
@@ -1057,7 +1059,7 @@ async function cmdTask(cwd, { flags, text }) {
   if (flags.phase) {
     phase = flags.phase;
     if (!PHASE_AGENTS[phase]) {
-      throw new Error(`unknown phase: ${phase}. Use draft|investigate|implement|review|respond|salvage|gofer`);
+      throw new Error(`unknown phase: ${phase}. Use draft|investigate|implement|review|respond|salvage|gofer|test-author|plan`);
     }
     if (flags.agent) {
       throw new Error("--phase and --agent are mutually exclusive");
@@ -2682,7 +2684,7 @@ function usage() {
     "",
     "Flags:",
     "  --read-only, --resume-last",
-    "  --base <ref> (review: branch diff base; task: diff base for --phase review --container, rejected elsewhere), --agent <id>, --phase <name> (draft|investigate|implement|review|respond|salvage|gofer)",
+    "  --base <ref> (review: branch diff base; task: diff base for --phase review --container, rejected elsewhere), --agent <id>, --phase <name> (draft|investigate|implement|review|respond|salvage|gofer|test-author|plan)",
     "  --model <identifier> (task/chain: the identifier CARRIES its backend and decides it for the phases it pins — claude/<model> (bare alias opus|sonnet|haiku or a full model id; a :variant suffix is rejected) runs those phases on claude, provider/model[:variant] runs them on opencode, and a bare alias with no / names no backend, so the phase keeps its configured backend. The model is always validated against the backend the same identifier chose. A pinned model is the ONLY candidate: no fallback to the configured chain is attempted, so a pinned route that fails terminally ends the dispatch instead of silently running a different model)",
     "  --backend opencode|claude|agy|cursor (task/chain: force EVERY phase onto that backend; default opencode. Redundant when --model names a backend — a --backend that disagrees with such a --model is a contradiction and is rejected, naming both. With neither, the config chain entries decide: models.phases.<phase> (or models.chain) entries may carry a claude/, agy/, or cursor/ prefix for per-phase backend mixing; one phase's chain must be single-backend. agy resumes via --conversation: --session/--resume-last are accepted when the job store proves the id an agy conversation, and --read-only/--deny are rejected on it. chain-resume accepts --backend/--model only to route a quota-exhausted review seat onto a different backend or model)",
     "  --session <id>, --timeout <s>, --watchdog <s>, --deny <tools>",

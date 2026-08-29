@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { readFileSync, readdirSync } from "node:fs";
+import { readFileSync, readdirSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -587,5 +587,101 @@ describe("agent permission allowlists", () => {
       const fm = parseFrontmatter("---\npermission:\n  \"*\": deny\n");
       assert.equal(fm, null);
     });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// kusabi #408 / #409 — the two new dispatch-only phase agents
+// ---------------------------------------------------------------------------
+
+describe("test-author and plan agent files", () => {
+  const testAuthorPath = join(AGENTS_DIR, "kusabi-test-author.md");
+  const planPath = join(AGENTS_DIR, "kusabi-plan.md");
+
+  it("both new agent files exist", () => {
+    assert.ok(existsSync(testAuthorPath), "kusabi-test-author.md missing");
+    assert.ok(existsSync(planPath), "kusabi-plan.md missing");
+  });
+
+  it("kusabi-test-author: permission invariants hold and denies all first", () => {
+    const fm = parseFrontmatter(readFileSync(testAuthorPath, "utf-8"));
+    assert.ok(fm !== null, "could not parse frontmatter");
+    const permission = fm.permission;
+    assert.ok(permission !== null && typeof permission === "object");
+    // \"*\": deny MUST be the first entry.
+    assert.equal(permission["*"], "deny");
+    const violations = checkAgentPermissions(permission, "test-author");
+    assert.deepEqual(violations, [], `test-author violations:\n  ${violations.join("\n  ")}`);
+    // Expected allows present (implement-family edit/read/verify tools).
+    for (const tool of [
+      "sunaba_write_file",
+      "sunaba_edit_file",
+      "sunaba_transform_file",
+      "sunaba_undo_file_edit",
+      "sunaba_verify_in_container",
+      "sunaba_lint_in_container",
+      "sunaba_type_check_in_container",
+      "sunaba_sandbox_exec",
+      "sunaba_sandbox_attach",
+      "sunaba_read_file_range",
+      "sunaba_search_in_container",
+      "sunaba_list_files",
+      "sunaba_diff_in_container",
+      "sunaba_issue_view",
+    ]) {
+      assert.equal(permission[tool], "allow", `test-author must allow ${tool}`);
+    }
+    // Forbidden tools absent: issue write, publish / init / stop, run_python.
+    for (const tool of [
+      "sunaba_sandbox_issue_write",
+      "sunaba_publish",
+      "sunaba_sandbox_initialize",
+      "sunaba_sandbox_stop",
+      "sunaba_run_container_and_exec",
+      "sunaba_run_python",
+    ]) {
+      assert.notEqual(permission[tool], "allow", `test-author must NOT allow ${tool}`);
+    }
+  });
+
+  it("kusabi-plan: read-only invariants hold and denies all first", () => {
+    const fm = parseFrontmatter(readFileSync(planPath, "utf-8"));
+    assert.ok(fm !== null, "could not parse frontmatter");
+    const permission = fm.permission;
+    assert.ok(permission !== null && typeof permission === "object");
+    assert.equal(permission["*"], "deny");
+    const violations = checkAgentPermissions(permission, "plan");
+    assert.deepEqual(violations, [], `plan violations:\n  ${violations.join("\n  ")}`);
+    // Expected read-side allows present.
+    for (const tool of [
+      "sunaba_sandbox_attach",
+      "sunaba_read_file_range",
+      "sunaba_search_in_container",
+      "sunaba_list_files",
+      "sunaba_diff_in_container",
+      "sunaba_issue_view",
+      "sunaba_verify_in_container",
+      "sunaba_lint_in_container",
+      "sunaba_type_check_in_container",
+      "sunaba_sandbox_exec",
+    ]) {
+      assert.equal(permission[tool], "allow", `plan must allow ${tool}`);
+    }
+    // Forbidden: no edit tools, no issue write, no shiori, no run_python,
+    // no publish / init / stop.
+    for (const tool of [
+      "sunaba_write_file",
+      "sunaba_edit_file",
+      "sunaba_transform_file",
+      "sunaba_undo_file_edit",
+      "sunaba_sandbox_issue_write",
+      "sunaba_run_python",
+      "shiori*",
+      "sunaba_publish",
+      "sunaba_sandbox_initialize",
+      "sunaba_sandbox_stop",
+    ]) {
+      assert.notEqual(permission[tool], "allow", `plan must NOT allow ${tool}`);
+    }
   });
 });

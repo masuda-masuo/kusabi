@@ -836,6 +836,57 @@ describe("allowedToolsForAgent", () => {
       assert.deepEqual(kaibaTools, ["mcp__kaiba__recall", "mcp__kaiba__progress"], `${phase}: kaiba must be recall and progress only`);
     }
   });
+
+  it("maps kusabi-test-author to the implement allowlist minus run_python (kusabi #408)", () => {
+    const csv = allowedToolsForAgent("kusabi-test-author");
+    assert.equal(csv, ALLOWED_TOOLS.testAuthor);
+    assert.ok(csv.includes("mcp__sunaba__write_file"));
+    assert.ok(csv.includes("mcp__sunaba__edit_file"));
+    assert.ok(csv.includes("mcp__sunaba__verify_in_container"));
+    assert.ok(!csv.includes("mcp__sunaba__sandbox_issue_write"));
+    assert.ok(!csv.includes("mcp__sunaba__publish"));
+    // Acceptance criterion 2: identical to the implement allowlist EXCEPT for
+    // the absent run_python grant.  Enforce the "otherwise identical" clause
+    // directly rather than trusting the hand-listed positives above.
+    const implementTools = ALLOWED_TOOLS.implement.split(",");
+    const testAuthorTools = new Set(csv.split(","));
+    for (const t of implementTools) {
+      if (t === "mcp__sunaba__run_python") {
+        assert.ok(!testAuthorTools.has(t), `test-author must NOT grant ${t}`);
+      } else {
+        assert.ok(testAuthorTools.has(t), `test-author must keep implement tool ${t}`);
+      }
+    }
+    assert.equal(testAuthorTools.size, implementTools.length - 1, "test-author must differ from implement only by the run_python removal");
+  });
+
+  it("maps kusabi-plan to the review allowlist minus shiori (kusabi #409)", () => {
+    const csv = allowedToolsForAgent("kusabi-plan");
+    assert.equal(csv, ALLOWED_TOOLS.plan);
+    assert.ok(csv.includes("mcp__sunaba__verify_in_container"));
+    assert.ok(!csv.includes("mcp__shiori__*"));
+    assert.ok(!csv.includes("mcp__sunaba__write_file"));
+    assert.ok(!csv.includes("mcp__sunaba__sandbox_issue_write"));
+    // Acceptance criterion 1: identical to the review allowlist EXCEPT for the
+    // absent shiori grant.  Enforce the "otherwise identical" clause directly.
+    const reviewTools = ALLOWED_TOOLS.review.split(",");
+    const planTools = new Set(csv.split(","));
+    for (const t of reviewTools) {
+      if (t.startsWith("mcp__shiori__")) {
+        assert.ok(!planTools.has(t), `plan must NOT grant ${t}`);
+      } else {
+        assert.ok(planTools.has(t), `plan must keep review tool ${t}`);
+      }
+    }
+    const shioriCount = reviewTools.filter(t => t.startsWith("mcp__shiori__")).length;
+    assert.equal(planTools.size, reviewTools.length - shioriCount, "plan must differ from review only by the shiori removal");
+  });
+
+  it("no v1 allowlist still thrown for unknown agents (error text names test-author and plan)", () => {
+    assert.throws(() => allowedToolsForAgent("kusabi-draft"), /no permission allowlist/);
+    assert.throws(() => allowedToolsForAgent("custom-agent"), /no permission allowlist/);
+  });
+
 });
 
 describe("applyToolDenies", () => {
@@ -4264,6 +4315,12 @@ describe("writeWatchdogAppliesToPhase", () => {
     for (const phase of [null, undefined, "", 0, {}]) {
       assert.equal(writeWatchdogAppliesToPhase(phase), false);
     }
+  });
+
+  it("test-author is armed — its deliverable is a test file edit (kusabi #408)", () => {
+    // plan stays out: it is read-only and legitimately never writes.
+    assert.equal(writeWatchdogAppliesToPhase("test-author"), true);
+    assert.equal(writeWatchdogAppliesToPhase("plan"), false, "plan must never trip the write watchdog");
   });
 
   it("chain rework rounds dispatch under the phase name 'implement'", () => {
