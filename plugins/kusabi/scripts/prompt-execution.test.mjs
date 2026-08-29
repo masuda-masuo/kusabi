@@ -354,10 +354,10 @@ function fakeResult(status, overrides = {}) {
       error: overrides.error || null,
       retry: overrides.retry || null,
       fallbacks: null,
-      usage: null,
+      usage: overrides.usage !== undefined ? overrides.usage : null,
       startedAt: new Date().toISOString(),
       finishedAt: new Date().toISOString(),
-      stats: { steps: overrides.steps || 0 },
+      stats: { steps: overrides.steps || 0, ...(overrides.stats || {}) },
     },
     resultText: overrides.resultText || "",
     stateDir: overrides.stateDir || null,
@@ -436,6 +436,96 @@ describe("dispatchWithFallback", () => {
     assert.ok(Array.isArray(job.fallbacks));
     assert.equal(job.fallbacks.length, 3);
     assert.equal(callCount, 3);
+  });
+
+  it("all routes fail → returns substantial attempt that spent tokens over later 0/0 quota retry (kusabi #412)", async () => {
+    let callCount = 0;
+    const fakeRunner = async () => {
+      callCount++;
+      if (callCount === 1) {
+        // First route ran 62 steps and spent tokens before hitting provider-error
+        return fakeResult("provider-error", {
+          id: "job-mtdzrhmv9e71",
+          usage: { available: true, input: 181539, output: 17174 },
+          steps: 62,
+          retry: { reason: "rate_limit", message: "rate limit exceeded", attempt: 1, count: 1, terminal: false },
+        });
+      }
+      // Second route failed immediately with 0 tokens / 0 steps
+      return fakeResult("provider-error", {
+        id: "job-mte0cb81ce91",
+        usage: { available: false, input: 0, output: 0 },
+        steps: 0,
+        retry: { reason: "free_tier_limit", message: "Free usage exceeded, subscribe to Go", attempt: 1, count: 1, terminal: true },
+      });
+    };
+
+    const { job } = await dispatchWithFallback({
+      _runPrompt: fakeRunner,
+      tiers: [["route/free-a", "route/free-b"]],
+      round: 1,
+      kind: "task",
+      promptText: "test",
+    });
+
+    assert.equal(job.status, "provider-error");
+    assert.equal(job.id, "job-mtdzrhmv9e71");
+    assert.deepEqual(job.usage, { available: true, input: 181539, output: 17174 });
+    assert.equal(job.stats.steps, 62);
+    assert.equal(job.modelEntry, "route/free-a");
+    assert.ok(Array.isArray(job.fallbacks));
+    assert.equal(job.fallbacks.length, 2);
+    // Route 1 fallback entry
+    assert.equal(job.fallbacks[0].from, "route/free-a");
+    assert.equal(job.fallbacks[0].to, "route/free-b");
+    assert.equal(job.fallbacks[0].jobId, "job-mtdzrhmv9e71");
+    assert.deepEqual(job.fallbacks[0].usage, { available: true, input: 181539, output: 17174 });
+    // Route 2 fallback entry preserves quota death visibility
+    assert.equal(job.fallbacks[1].from, "route/free-b");
+    assert.equal(job.fallbacks[1].to, null);
+    assert.equal(job.fallbacks[1].reason, "free_tier_limit");
+    assert.equal(job.fallbacks[1].message, "Free usage exceeded, subscribe to Go");
+    assert.equal(job.fallbacks[1].jobId, "job-mte0cb81ce91");
+    // All routes exhausted error names both routes and quota reason
+    assert.ok(job.error.includes("All routes exhausted:"));
+    assert.ok(job.error.includes("route/free-a"));
+    assert.ok(job.error.includes("route/free-b"));
+    assert.ok(job.error.includes("free_tier_limit"));
+    assert.ok(job.error.includes("Free usage exceeded, subscribe to Go"));
+  });
+
+  it("all routes fail with 0 tokens → chooses attempt with more steps", async () => {
+    let callCount = 0;
+    const fakeRunner = async () => {
+      callCount++;
+      if (callCount === 1) {
+        return fakeResult("provider-error", {
+          id: "job-step-10",
+          usage: null,
+          steps: 10,
+          retry: { reason: "timeout", attempt: 1, terminal: false },
+        });
+      }
+      return fakeResult("provider-error", {
+        id: "job-step-0",
+        usage: null,
+        steps: 0,
+        retry: { reason: "free_tier_limit", attempt: 1, terminal: true },
+      });
+    };
+
+    const { job } = await dispatchWithFallback({
+      _runPrompt: fakeRunner,
+      tiers: [["route/x", "route/y"]],
+      round: 1,
+      kind: "task",
+      promptText: "test",
+    });
+
+    assert.equal(job.status, "provider-error");
+    assert.equal(job.id, "job-step-10");
+    assert.equal(job.stats.steps, 10);
+    assert.equal(job.fallbacks.length, 2);
   });
 
   it("does not throw and does not loop forever on all-exhausted", async () => {
