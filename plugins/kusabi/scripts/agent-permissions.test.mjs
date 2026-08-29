@@ -34,7 +34,6 @@ export function checkAgentPermissions(permission, roleName) {
 
   // 3. Common read-core tools required for every role.
   const requiredReadCore = [
-    "sunaba_sandbox_attach",
     "sunaba_read_file_range",
     "sunaba_search_in_container",
     "sunaba_list_files",
@@ -280,7 +279,7 @@ describe("agent permission allowlists", () => {
 
     it("missing common read-core tool", () => {
       const violations = checkAgentPermissions(
-        { "*": "deny", "sunaba_sandbox_attach": "allow", "sunaba_read_file_range": "allow" },
+        { "*": "deny", "sunaba_read_file_range": "allow" },
         "test-role",
       );
       assert.ok(violations.length > 0);
@@ -327,7 +326,6 @@ describe("agent permission allowlists", () => {
       const violations = checkAgentPermissions(
         {
           "*": "deny",
-          "sunaba_sandbox_attach": "allow",
           "sunaba_read_file_range": "allow",
           "sunaba_search_in_container": "allow",
           "sunaba_list_files": "allow",
@@ -344,7 +342,6 @@ describe("agent permission allowlists", () => {
       const violations = checkAgentPermissions(
         {
           "*": "deny",
-          "sunaba_sandbox_attach": "allow",
           "sunaba_read_file_range": "allow",
           "sunaba_search_in_container": "allow",
           "sunaba_list_files": "allow",
@@ -361,7 +358,6 @@ describe("agent permission allowlists", () => {
       const violations = checkAgentPermissions(
         {
           "*": "deny",
-          "sunaba_sandbox_attach": "allow",
           "sunaba_read_file_range": "allow",
           "sunaba_search_in_container": "allow",
           "sunaba_list_files": "allow",
@@ -379,7 +375,6 @@ describe("agent permission allowlists", () => {
       const violations = checkAgentPermissions(
         {
           "*": "deny",
-          "sunaba_sandbox_attach": "allow",
           "sunaba_read_file_range": "allow",
           "sunaba_search_in_container": "allow",
           "sunaba_list_files": "allow",
@@ -396,7 +391,6 @@ describe("agent permission allowlists", () => {
       const violations = checkAgentPermissions(
         {
           "*": "deny",
-          "sunaba_sandbox_attach": "allow",
           "sunaba_read_file_range": "allow",
           "sunaba_search_in_container": "allow",
           "sunaba_list_files": "allow",
@@ -412,7 +406,6 @@ describe("agent permission allowlists", () => {
     // --- kaiba is read-only for every phase ---
     const READ_CORE = {
       "*": "deny",
-      "sunaba_sandbox_attach": "allow",
       "sunaba_read_file_range": "allow",
       "sunaba_search_in_container": "allow",
       "sunaba_list_files": "allow",
@@ -451,7 +444,6 @@ describe("agent permission allowlists", () => {
       const violations = checkAgentPermissions(
         {
           "*": "deny",
-          "sunaba_sandbox_attach": "allow",
           "sunaba_read_file_range": "allow",
           "sunaba_search_in_container": "allow",
           "sunaba_list_files": "allow",
@@ -467,7 +459,6 @@ describe("agent permission allowlists", () => {
       const violations = checkAgentPermissions(
         {
           "*": "deny",
-          "sunaba_sandbox_attach": "allow",
           "sunaba_read_file_range": "allow",
           "sunaba_search_in_container": "allow",
           "sunaba_list_files": "allow",
@@ -483,7 +474,6 @@ describe("agent permission allowlists", () => {
       const violations = checkAgentPermissions(
         {
           "*": "deny",
-          "sunaba_sandbox_attach": "allow",
           "sunaba_read_file_range": "allow",
           "sunaba_search_in_container": "allow",
           "sunaba_list_files": "allow",
@@ -499,7 +489,6 @@ describe("agent permission allowlists", () => {
       const violations = checkAgentPermissions(
         {
           "*": "deny",
-          "sunaba_sandbox_attach": "allow",
           "sunaba_read_file_range": "allow",
           "sunaba_search_in_container": "allow",
           "sunaba_list_files": "allow",
@@ -622,7 +611,6 @@ describe("test-author and plan agent files", () => {
       "sunaba_lint_in_container",
       "sunaba_type_check_in_container",
       "sunaba_sandbox_exec",
-      "sunaba_sandbox_attach",
       "sunaba_read_file_range",
       "sunaba_search_in_container",
       "sunaba_list_files",
@@ -654,7 +642,6 @@ describe("test-author and plan agent files", () => {
     assert.deepEqual(violations, [], `plan violations:\n  ${violations.join("\n  ")}`);
     // Expected read-side allows present.
     for (const tool of [
-      "sunaba_sandbox_attach",
       "sunaba_read_file_range",
       "sunaba_search_in_container",
       "sunaba_list_files",

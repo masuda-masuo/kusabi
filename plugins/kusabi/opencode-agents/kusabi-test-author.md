@@ -7,7 +7,6 @@ permission:
   kaiba_progress: allow
   skill:
     "kusabi-*": allow
-  sunaba_sandbox_attach: allow
   sunaba_read_file_range: allow
   sunaba_search_in_container: allow
   sunaba_list_files: allow
