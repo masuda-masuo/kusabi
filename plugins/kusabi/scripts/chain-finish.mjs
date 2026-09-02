@@ -21,8 +21,8 @@ import { deriveDisposition } from "./disposition.mjs";
 import { stateRoot, writeJson } from "./state-paths.mjs";
 import { countUnfilledReviewRecords } from "./review-record-scan.mjs";
 import { finalizeChainControl, updateChainControlRound } from "./chain-control.mjs";
+import { runReviewPhase } from "./chain-review.mjs";
 import {
-  runReviewPhase,
   computeChainTotals,
   persistChainState,
   writeReviewRecord,

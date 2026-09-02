@@ -33,6 +33,7 @@ import {
 } from "./chain-control.mjs";
 import { dispatchWithFallback } from "./prompt-execution.mjs";
 import { deriveStopReason } from "./stop-reason.mjs";
+import { shouldSkipReview } from "./chain-review.mjs";
 import {
   captureBaseSha,
   resolveRoundResume,
@@ -44,7 +45,6 @@ import {
   persistChainState,
   renderMaxRoundsOutcome,
   handleProviderExhaustion,
-  shouldSkipReview,
   archiveFailedReviewSeat,
   collectReviewContext,
 } from "./chain-phases.mjs";

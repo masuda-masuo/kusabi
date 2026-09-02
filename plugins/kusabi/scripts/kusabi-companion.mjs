@@ -65,11 +65,13 @@ import { renderJobProgress } from "./kaiba-progress-watch.mjs";
 // Probe functions are imported separately below with local bindings so
 // cmdTask can call them directly, and re-exported for test compatibility.
 import {
+  parseReviewResult,
+  buildReviewRepairPrompt,
+} from "./chain-review.mjs";
+import {
   collectContainerReviewInput,
   // The chain's container header, shared with `task --container` (kusabi #289).
   withContainerWorkspace,
-  parseReviewResult,
-  buildReviewRepairPrompt,
 } from "./chain-phases.mjs";
 
 // Import the probe functions locally so cmdTask can call them directly.
