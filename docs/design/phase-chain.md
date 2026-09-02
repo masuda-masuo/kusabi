@@ -63,7 +63,7 @@ rounds are always carried forward.
 
 ### 3.5 Auto-chain (chain subcommand) — implemented
 
-Launched in foreground with `chain --container <cid> --model <m> [--max-rounds N] "<brief>"` or in background with `chain-detach --container <cid> --model <m> [--max-rounds N] "<brief>"`. Implementation is `cmdChain` in `plugins/kusabi/scripts/chain-driver.mjs` and `cmdChainDetach` in `plugins/kusabi/scripts/kusabi-companion.mjs`.
+Launched in foreground with `chain --container <cid> --model <m> [--max-rounds N] "<brief>"` or in background with `chain-detach --container <cid> --model <m> [--max-rounds N] "<brief>"`. Implementation is `cmdChain` in `plugins/kusabi/scripts/chain-cmd.mjs` and `cmdChainDetach` in `plugins/kusabi/scripts/kusabi-companion.mjs`.
 
 #### 3.5.1 Round structure
 
@@ -610,7 +610,7 @@ The one place the disposition set lies is **after a `chain-resume`**: `rearmChai
 
 #### 3.5.10 chain-resume — implemented
 
-`chain-resume <chainId>` continues a stopped chain from its persisted state. The resumption context comes entirely from the saved records — `chain.json` (brief, round records, ladder, `verifyBaseline`) and `control.json` (container) — so the only accepted flag is `--keep-serve`; any other flag is rejected rather than ignored. The CLI wrapper (`cmdChainResume` in `kusabi-companion.mjs`) validates that the recorded container still exists and is reachable (the chain's work lives in it), and refuses to start while any job of the chain is still recorded as running — a dead driver may have left a phase job dispatched but unfinished, and resuming over it would duplicate the phase. It then re-arms the control record (status `running` again, stop-request fields cleared) and hands the position to `runChainDriver` — the same driver `chain` uses.
+`chain-resume <chainId>` continues a stopped chain from its persisted state. The resumption context comes entirely from the saved records — `chain.json` (brief, round records, ladder, `verifyBaseline`) and `control.json` (container) — so the only accepted flag is `--keep-serve`; any other flag is rejected rather than ignored. The CLI wrapper (`cmdChainResume` in `chain-cmd.mjs`) validates that the recorded container still exists and is reachable (the chain's work lives in it), and refuses to start while any job of the chain is still recorded as running — a dead driver may have left a phase job dispatched but unfinished, and resuming over it would duplicate the phase. It then re-arms the control record (status `running` again, stop-request fields cleared) and hands the position to `runChainDriver` — the same driver `chain` uses.
 
 **Resume position.** The decision is the pure `resolveChainResume` in `chain-phases.mjs`, from the LAST round record alone:
 

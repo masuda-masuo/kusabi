@@ -482,12 +482,12 @@ describe("resolveOrchestratorRecord (kusabi #227)", () => {
 
   it("both dispatch sites resolve through it, not through the bare parser (source guard)", () => {
     // cmdTask is not exported; this pins the wiring.  cmdChain lives in
-    // chain-driver.mjs since kusabi #264 PR 2/2, so its half of the guard
+    // chain-cmd.mjs since kusabi #422 Job 2, so its half of the guard
     // reads that file — the wiring being pinned is the same wiring.
     const source = fs.readFileSync(path.join(import.meta.dirname, "kusabi-companion.mjs"), "utf8");
-    const driverSource = fs.readFileSync(path.join(import.meta.dirname, "chain-driver.mjs"), "utf8");
+    const chainCmdSource = fs.readFileSync(path.join(import.meta.dirname, "chain-cmd.mjs"), "utf8");
     const cmdTaskSource = source.slice(source.indexOf("async function cmdTask("), source.indexOf("async function cmdReview("));
-    const cmdChainSource = driverSource.slice(driverSource.indexOf("async function cmdChain("));
+    const cmdChainSource = chainCmdSource.slice(chainCmdSource.indexOf("async function cmdChain("));
     assert.ok(cmdTaskSource.includes("const orchestrator = resolveOrchestratorRecord(text);"));
     assert.ok(cmdChainSource.includes("const orchestrator = resolveOrchestratorRecord(text);"));
     // No dispatch site may bypass the resolution by parsing the brief itself.
@@ -4606,8 +4606,8 @@ describe("brief lint and container delivery (kusabi #289)", () => {
     });
 
     it("cmdChain lints before any chain state exists", () => {
-      const driverSource = fs.readFileSync(path.join(import.meta.dirname, "chain-driver.mjs"), "utf8");
-      const cmdChainSource = driverSource.slice(driverSource.indexOf("export async function cmdChain("));
+      const chainCmdSource = fs.readFileSync(path.join(import.meta.dirname, "chain-cmd.mjs"), "utf8");
+      const cmdChainSource = chainCmdSource.slice(chainCmdSource.indexOf("export async function cmdChain("));
       const lintAt = cmdChainSource.indexOf("briefLintReport(");
       assert.ok(lintAt > 0, "cmdChain must call the lint");
       assert.ok(lintAt < cmdChainSource.indexOf("createChainDir(stateDir)"), "the lint precedes createChainDir");
