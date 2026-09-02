@@ -175,6 +175,30 @@ export function providerStatusFromError(error) {
   };
 }
 
+/**
+ * Extract a catalog-miss status from a session.error payload, or null.
+ *
+ * An UnknownError session.error payload with data.message containing "Model not found"
+ * indicates a catalog miss: the requested model is not registered or supported by
+ * the provider. This is route-scoped and terminal for this model route.
+ *
+ * @param {unknown} error  — the session.error payload (`properties.error`).
+ * @returns {{ reason: string, message: string, terminal: boolean }|null}
+ */
+export function catalogMissFromError(error) {
+  if (!error || typeof error !== "object") return null;
+  if (error.name !== "UnknownError") return null;
+  const data = error.data;
+  if (!data || typeof data !== "object") return null;
+  if (typeof data.message !== "string") return null;
+  if (!data.message.includes("Model not found")) return null;
+  return {
+    reason: "catalog-miss",
+    message: data.message,
+    terminal: true,
+  };
+}
+
 // =========================================================================
 // failed-route memo — process-scoped, survives rounds of one chain run
 // =========================================================================
@@ -684,6 +708,7 @@ export async function runPrompt({ cwd, kind, title, promptText, agent, model, se
           } else if (type === "session.error") {
             const rawError = event?.properties?.error ?? event?.properties ?? null;
             const providerStatus = providerStatusFromError(rawError);
+            const catalogMiss = catalogMissFromError(rawError);
             if (providerStatus) {
               // A remote provider failure with a structured status is
               // route-scoped: this route cannot do the work, which says
@@ -705,6 +730,25 @@ export async function runPrompt({ cwd, kind, title, promptText, agent, model, se
                 attempt: 0,
                 message: providerStatus.message,
                 terminal: false,
+              });
+            } else if (catalogMiss) {
+              // A catalog miss session.error (UnknownError with "Model not found")
+              // is route-scoped and terminal: the missing model will not reappear
+              // in this process, so classify provider-error with terminal: true
+              // to poison the route and let dispatchWithFallback try the next route.
+              providerError = {
+                reason: catalogMiss.reason,
+                message: catalogMiss.message,
+                attempt: 0,
+                count: 0,
+                terminal: catalogMiss.terminal,
+              };
+              appendEvent(stateDir, job.id, {
+                type: "companion.provider-error",
+                reason: providerError.reason,
+                attempt: 0,
+                message: catalogMiss.message,
+                terminal: catalogMiss.terminal,
               });
             } else {
               sessionError = JSON.stringify(rawError ?? {}).slice(0, 500);
