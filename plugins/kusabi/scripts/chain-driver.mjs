@@ -37,14 +37,16 @@ import { shouldSkipReview } from "./chain-review.mjs";
 import {
   captureBaseSha,
   resolveRoundResume,
-  buildImplementText,
   resolveReworkScope,
-  runImplementPhase,
-  runProbePhase,
   computeChainTotals,
   persistChainState,
   collectReviewContext,
 } from "./chain-phases.mjs";
+import {
+  buildImplementText,
+  runImplementPhase,
+  runProbePhase,
+} from "./chain-run.mjs";
 import { archiveFailedReviewSeat } from "./chain-resume-resolve.mjs";
 import {
   renderMaxRoundsOutcome,

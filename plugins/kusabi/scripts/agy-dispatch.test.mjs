@@ -64,7 +64,7 @@ import {
 } from "./chain-driver.mjs";
 import { claudeDispatch, readAgentSystemPrompt } from "./claude-dispatch.mjs";
 import { dispatchWithFallback } from "./prompt-execution.mjs";
-import { runImplementPhase } from "./chain-phases.mjs";
+import { runImplementPhase } from "./chain-run.mjs";
 import { backendSupportsResume, splitRouteBackend, stripBackendPrefixChain } from "./cli.mjs";
 import { stateDirFor, readJson } from "./state-paths.mjs";
 import { loadJob, jobDir, listJobs } from "./job-store.mjs";
