@@ -159,7 +159,7 @@ The following content is derived from the design agreed in the "design confirmat
 
 ### 9.1 Decision 4: strategist stage (stall countermeasure) — **implemented**
 
-Implemented across `plugins/kusabi/scripts/`: `deriveDisposition` in `disposition.mjs`, `renderStrategistPrompt` in `render.mjs`, the strategist dispatch (`runStrategizePhase`) in `chain-phases.mjs`, orchestrated by `runChainDriver` in `kusabi-companion.mjs`.
+Implemented across `plugins/kusabi/scripts/`: `deriveDisposition` in `disposition.mjs`, `renderStrategistPrompt` in `render.mjs`, the strategist dispatch (`runStrategizePhase`) in `chain-phases.mjs`, orchestrated by `runChainDriver` in `chain-driver.mjs`.
 
 - `deriveDisposition` accepts an optional `strategizeEligible` boolean, combined internally with `round < maxRounds` into `strategizeAllowed` (a strategist job on the final round has no next round to consume its output — #117). When `repeatedAreas` holds on a non-shippable round and `strategizeAllowed` is true — `needs-attention`, or `approve` with probes red — returns `{ disposition: "strategize", ... }` (needs-attention reason: "same file area flagged twice; structural re-diagnosis before next rework"). On the second stagnation (strategized=true), escalates as before.
 - `renderStrategistPrompt` is an exported pure function that builds the prompt for the strategist: acceptance criteria + findings from the last two rounds + one-structural-change instruction.
@@ -170,7 +170,7 @@ Implemented across `plugins/kusabi/scripts/`: `deriveDisposition` in `dispositio
 
 ### 9.2 Decision 5: accept-with-followup (economic cutoff) — **implemented**
 
-Implemented across `plugins/kusabi/scripts/`: `deriveDisposition` in `disposition.mjs`, `renderFollowupDraft` in `render.mjs`, the draft storage and terminal handling in `runChainDriver` (`kusabi-companion.mjs`), rendered by `chain-show` via `renderChainShow` (`render.mjs`).
+Implemented across `plugins/kusabi/scripts/`: `deriveDisposition` in `disposition.mjs`, `renderFollowupDraft` in `render.mjs`, the draft storage and terminal handling in `runChainDriver` (`chain-driver.mjs`), rendered by `chain-show` via `renderChainShow` (`render.mjs`).
 
 - `deriveDisposition` accepts an optional `findingSeverities` array. When `probesGreen=true`, `verdict="needs-attention"`, and every element of `findingSeverities` is `"low"` or `"medium"`, returns `{ disposition: "accept-with-followup", reason: "probes green; remaining findings all minor" }`.
 - `renderFollowupDraft` is an exported pure function that builds a markdown draft from chainId, briefTitle, and findings.
