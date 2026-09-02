@@ -574,7 +574,7 @@ The one place the disposition set lies is **after a `chain-resume`**: `rearmChai
 
 ### 3.5.9 metrics store (query/report) — implemented
 
-`metrics-report.mjs`, wired as the `metrics-report` subcommand in `kusabi-companion.mjs`. The read surface phase 1 (§3.5.8) deliberately left unbuilt (closes #83, #81): where transcript token spend goes and whether cache reads dominate it, and what the recorded chain history looks like when brief metrics are cross-tabulated against outcomes.
+`metrics-report.mjs`, wired as the `metrics-report` subcommand in `plugins/kusabi/scripts/metrics-cmd.mjs` (kusabi #443). Companion `main()` keeps the switch case and does not re-export the cmd. The read surface phase 1 (§3.5.8) deliberately left unbuilt (closes #83, #81): where transcript token spend goes and whether cache reads dominate it, and what the recorded chain history looks like when brief metrics are cross-tabulated against outcomes.
 
 **Ownership amendment to §3.5.8.** §3.5.8 states "metrics-db.mjs owns all SQL" — that invariant existed so the ingest modules stay testable against `:memory:`; the load-bearing part is *who opens the handle*, not which module's SELECTs run where. That is preserved exactly: `metrics-db.mjs` remains the only module that constructs a `DatabaseSync` (it gains `openMetricsDbReadOnly(dbPath)` alongside the existing writable `openMetricsDb`). `metrics-report.mjs`'s SELECT statements run against an already-open handle passed in by the caller, which is what makes its own tests runnable against `:memory:` too. Recorded here explicitly so a future reader does not mistake this for the invariant having been broken by accident.
 

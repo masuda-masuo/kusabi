@@ -5255,3 +5255,19 @@ describe("kusabi-companion extraction invariants (kusabi #437)", () => {
     assert.ok(!source.includes("export { cmdReview }"), "no cmdReview re-export");
   });
 });
+
+describe("kusabi-companion extraction invariants (kusabi #443)", () => {
+  it("companion contains no moved metrics/dashboard/chain-stats command definitions or re-exports", () => {
+    const source = fs.readFileSync(path.join(import.meta.dirname, "kusabi-companion.mjs"), "utf8");
+    assert.ok(!source.includes("function cmdChainStats("), "cmdChainStats must not be defined in companion");
+    assert.ok(!source.includes("function cmdMetricsIngest("), "cmdMetricsIngest must not be defined in companion");
+    assert.ok(!source.includes("function cmdMetricsReport("), "cmdMetricsReport must not be defined in companion");
+    assert.ok(!source.includes("function dashboardPortFlag("), "dashboardPortFlag must not be defined in companion");
+    assert.ok(!source.includes("async function cmdDashboard("), "cmdDashboard must not be defined in companion");
+    assert.ok(!source.includes("export { cmdChainStats"), "no cmdChainStats re-export");
+    assert.ok(!source.includes("export { cmdMetricsIngest"), "no cmdMetricsIngest re-export");
+    assert.ok(!source.includes("export { cmdMetricsReport"), "no cmdMetricsReport re-export");
+    assert.ok(!source.includes("export { cmdDashboard"), "no cmdDashboard re-export");
+  });
+});
+
