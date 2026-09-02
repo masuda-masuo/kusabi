@@ -43,11 +43,13 @@ import {
   runProbePhase,
   computeChainTotals,
   persistChainState,
-  renderMaxRoundsOutcome,
-  handleProviderExhaustion,
   archiveFailedReviewSeat,
   collectReviewContext,
 } from "./chain-phases.mjs";
+import {
+  renderMaxRoundsOutcome,
+  handleProviderExhaustion,
+} from "./chain-outcomes.mjs";
 import { captureWorktreeState } from "./worktree-baseline.mjs";
 
 // The companion side of the round loop's import needs.

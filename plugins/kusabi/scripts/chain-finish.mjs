@@ -27,15 +27,17 @@ import {
   persistChainState,
   writeReviewRecord,
   runStrategizePhase,
+  recordReworkEscalation,
+  quotaExhaustionReason,
+} from "./chain-phases.mjs";
+import {
   renderAcceptOutcome,
   renderAcceptWithFollowupOutcome,
   renderEscalateOutcome,
   renderRefusalOutcome,
   renderBriefSyntaxDefectOutcome,
   handleProviderExhaustion,
-  recordReworkEscalation,
-  quotaExhaustionReason,
-} from "./chain-phases.mjs";
+} from "./chain-outcomes.mjs";
 import {
   runVerifyProbe,
   runSmokeProbe,
