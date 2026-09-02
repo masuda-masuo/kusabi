@@ -13,7 +13,7 @@ import {
   parseSmoke,
 } from "./brief-parsing.mjs";
 import { checkSmokeProbe } from "./probe-decisions.mjs";
-import { runSmokeEntries, captureGitStatusPorcelain } from "./chain-phases.mjs";
+import { runSmokeEntries, captureGitStatusPorcelain } from "./chain-probes.mjs";
 
 // ---------------------------------------------------------------------------
 // brief guards — evaluated before any chain state or job exists

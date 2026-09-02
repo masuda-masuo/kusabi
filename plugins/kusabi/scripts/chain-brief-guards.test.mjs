@@ -9,7 +9,7 @@ import {
   renderSmokeWrongAnnotationReport,
   renderSmokeDirtReport,
 } from "./chain-brief-guards.mjs";
-import { runSmokeProbe } from "./chain-phases.mjs";
+import { runSmokeProbe } from "./chain-probes.mjs";
 import { parseSmoke } from "./brief-parsing.mjs";
 
 
