@@ -5,6 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import {
   accumulateUsage,
+  catalogMissFromError,
   decidePermission,
   dispatchWithFallback,
   failedRoutes,
@@ -946,6 +947,52 @@ describe("providerStatusFromError", () => {
 });
 
 // =========================================================================
+// catalogMissFromError — session.error catalog-miss classification (kusabi #431)
+// =========================================================================
+
+const INCIDENT_CATALOG_MISS = {
+  name: "UnknownError",
+  data: {
+    message: "Model not found: opencode/hy3-free. Did you mean: ling-3.0-flash-fin-free, mimo-v2.5-free, muse-spark-1.2-contributor-free?",
+  },
+};
+
+describe("catalogMissFromError", () => {
+  it("recognises the incident UnknownError catalog-miss payload", () => {
+    assert.deepEqual(catalogMissFromError(INCIDENT_CATALOG_MISS), {
+      reason: "catalog-miss",
+      message: "Model not found: opencode/hy3-free. Did you mean: ling-3.0-flash-fin-free, mimo-v2.5-free, muse-spark-1.2-contributor-free?",
+      terminal: true,
+    });
+  });
+
+  it("rejects UnknownError whose message does not contain 'Model not found'", () => {
+    assert.equal(catalogMissFromError({ name: "UnknownError", data: { message: "Internal server error" } }), null);
+    assert.equal(catalogMissFromError({ name: "UnknownError", data: { message: "Model error" } }), null);
+  });
+
+  it("rejects UnknownError with missing, non-string, or malformed data.message", () => {
+    assert.equal(catalogMissFromError({ name: "UnknownError" }), null);
+    assert.equal(catalogMissFromError({ name: "UnknownError", data: null }), null);
+    assert.equal(catalogMissFromError({ name: "UnknownError", data: {} }), null);
+    assert.equal(catalogMissFromError({ name: "UnknownError", data: { message: 123 } }), null);
+    assert.equal(catalogMissFromError({ name: "UnknownError", data: { message: null } }), null);
+  });
+
+  it("rejects non-UnknownError names even with 'Model not found' message", () => {
+    assert.equal(catalogMissFromError({ name: "APIError", data: { message: "Model not found: foo" } }), null);
+    assert.equal(catalogMissFromError({ name: "OtherError", data: { message: "Model not found: foo" } }), null);
+  });
+
+  it("rejects null, undefined and primitive payloads", () => {
+    assert.equal(catalogMissFromError(null), null);
+    assert.equal(catalogMissFromError(undefined), null);
+    assert.equal(catalogMissFromError("UnknownError"), null);
+    assert.equal(catalogMissFromError(500), null);
+  });
+});
+
+// =========================================================================
 // dispatchWithFallback — session.error-shaped provider failure advances the
 // walk within the dispatch only (kusabi #233)
 // =========================================================================
@@ -1024,6 +1071,48 @@ describe("dispatchWithFallback — non-retryable provider failure (session.error
     assert.equal(job.status, "error");
     assert.equal(callCount, 1, "the second route must not be tried");
     assert.equal(job.fallbacks, null);
+  });
+
+  it("catalog-miss provider failure advances to next route and poisons the route", async () => {
+    let callCount = 0;
+    const fakeRunner = async () => {
+      callCount++;
+      if (callCount === 1) {
+        return fakeResult("provider-error", {
+          retry: {
+            reason: "catalog-miss",
+            message: "Model not found: opencode/hy3-free",
+            attempt: 0,
+            count: 0,
+            terminal: true,
+          },
+        });
+      }
+      return fakeResult("completed", { resultText: "done via route two" });
+    };
+
+    const { job, resultText } = await dispatchWithFallback({
+      _runPrompt: fakeRunner,
+      tiers: [["opencode/hy3-free", "opencode/ling-3.0"]],
+      round: 1,
+      kind: "task",
+      promptText: "test",
+    });
+
+    assert.equal(job.status, "completed");
+    assert.equal(resultText, "done via route two");
+    assert.equal(job.modelEntry, "opencode/ling-3.0");
+    assert.equal(callCount, 2);
+    assert.ok(failedRoutes.has("opencode/hy3-free"));
+    assert.ok(Array.isArray(job.fallbacks));
+    assert.equal(job.fallbacks.length, 1);
+    assert.deepEqual(job.fallbacks[0], {
+      from: "opencode/hy3-free",
+      to: "opencode/ling-3.0",
+      reason: "catalog-miss",
+      attempt: 0,
+      message: "Model not found: opencode/hy3-free",
+    });
   });
 });
 
@@ -1306,6 +1395,50 @@ describe("dispatchWithFallback — end-to-end against a fake serve (kusabi #233)
       assert.ok(types.includes("session.error"));
       assert.ok(!types.includes("companion.provider-error"));
       assert.ok(!types.includes("companion.fallback"));
+    } finally {
+      ctx.killAll();
+      ctx.restore();
+      ctx.rm();
+    }
+  });
+
+  it("the incident UnknownError stream ('Model not found') advances to the tier's second route and poisons the dead route", async () => {
+    const ctx = incidentServeContext({ firstError: INCIDENT_CATALOG_MISS });
+    try {
+      const { job, resultText } = await dispatchWithFallback(dispatchIncidentOpts(ctx.cwd, "catalog miss incident"));
+
+      assert.equal(job.status, "completed");
+      assert.equal(job.modelEntry, "opencode-go/deepseek-v4-flash:max");
+      assert.equal(resultText, "survived via route two");
+
+      assert.ok(Array.isArray(job.fallbacks));
+      assert.equal(job.fallbacks.length, 1);
+      assert.equal(job.fallbacks[0].from, "opencode/deepseek-v4-flash-free:max");
+      assert.equal(job.fallbacks[0].to, "opencode-go/deepseek-v4-flash:max");
+      assert.equal(job.fallbacks[0].reason, "catalog-miss");
+      assert.equal(job.fallbacks[0].attempt, 0);
+
+      assert.ok(failedRoutes.has("opencode/deepseek-v4-flash-free:max"));
+    } finally {
+      ctx.killAll();
+      ctx.restore();
+      ctx.rm();
+    }
+  });
+
+  it("an UnknownError WITHOUT 'Model not found' in message keeps today's error outcome and does NOT walk", async () => {
+    const ctx = incidentServeContext({
+      firstError: { name: "UnknownError", data: { message: "Internal server crash" } },
+    });
+    try {
+      const { job } = await dispatchWithFallback(dispatchIncidentOpts(ctx.cwd, "unknown error without catalog miss"));
+
+      assert.equal(job.status, "error");
+      assert.equal(job.fallbacks, null);
+      assert.deepEqual(requestLogLines(ctx.testLog), [
+        "create ses-1", "prompt ses-1",
+      ]);
+      assert.equal(failedRoutes.size, 0);
     } finally {
       ctx.killAll();
       ctx.restore();
