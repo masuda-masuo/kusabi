@@ -12,8 +12,6 @@ import {
   hasRepeatedAreas,
   applyTierEscalation,
   recordReworkEscalation,
-  classifyDispatchQuotaExhaustion,
-  quotaExhaustionReason,
 } from "./chain-phases.mjs";
 import { renderPriorFindings } from "./render.mjs";
 
@@ -275,42 +273,6 @@ describe("resolveRoundResume", () => {
     // No checkpoint_restore or checkpoint_restore_failed type
     assert.notEqual(result.resumeMethod.type, "checkpoint_restore");
     assert.notEqual(result.resumeMethod.type, "checkpoint_restore_failed");
-  });
-});
-
-// =========================================================================
-// classifyDispatchQuotaExhaustion (kusabi #373)
-// =========================================================================
-
-describe("classifyDispatchQuotaExhaustion", () => {
-  it("classifies the observed agy individual-quota phrase and extracts the reset", () => {
-    const text = "agy dispatch failed: agy returned no payload {\"status\":\"ERROR\",\"response\":\"\",\"error\":\"Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 1h1m21s.\"}";
-    const failure = classifyDispatchQuotaExhaustion(text);
-    assert.equal(failure.kind, "quota-exhaustion");
-    assert.equal(failure.backend, "agy");
-    assert.equal(failure.quota, "individual");
-    assert.equal(failure.backendBlocked, true);
-    assert.equal(failure.reset, "1h1m21s");
-    assert.match(quotaExhaustionReason(failure), /quota exhausted \(agy individual pool\)/);
-    assert.match(quotaExhaustionReason(failure), /resets in 1h1m21s/);
-    assert.doesNotMatch(quotaExhaustionReason(failure), /unparseable/);
-  });
-
-  it("classifies the observed opencode free-tier phrase", () => {
-    const failure = classifyDispatchQuotaExhaustion("Free usage exceeded, subscribe to Go");
-    assert.equal(failure.kind, "quota-exhaustion");
-    assert.equal(failure.backend, "opencode");
-    assert.equal(failure.quota, "free-tier");
-    assert.equal(failure.reset, null);
-    assert.match(quotaExhaustionReason(failure), /opencode free-tier pool/);
-  });
-
-  it("does not classify unrelated dispatch failures, including a claude session-limit string", () => {
-    assert.equal(classifyDispatchQuotaExhaustion(null), null);
-    assert.equal(classifyDispatchQuotaExhaustion(""), null);
-    assert.equal(classifyDispatchQuotaExhaustion("claude dispatch failed: session limit"), null);
-    assert.equal(classifyDispatchQuotaExhaustion("All routes exhausted"), null);
-    assert.equal(classifyDispatchQuotaExhaustion("quota reached"), null);
   });
 });
 

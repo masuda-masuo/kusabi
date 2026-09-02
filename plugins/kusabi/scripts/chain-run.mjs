@@ -43,7 +43,7 @@ import {
 } from "./chain-collect.mjs";
 import {
   classifyDispatchQuotaExhaustion,
-} from "./chain-phases.mjs";
+} from "./chain-quota.mjs";
 
 /**
  * Prepend the workspace header naming the exact container ID, or return the

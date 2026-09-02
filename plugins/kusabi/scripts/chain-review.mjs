@@ -29,9 +29,11 @@ import {
   normalizeFilePath,
   hasRepeatedAreas,
   inScopeFindingFiles,
-  classifyDispatchQuotaExhaustion,
   resolveReworkScope,
 } from "./chain-phases.mjs";
+import {
+  classifyDispatchQuotaExhaustion,
+} from "./chain-quota.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const PLUGIN_ROOT = path.resolve(HERE, "..");
