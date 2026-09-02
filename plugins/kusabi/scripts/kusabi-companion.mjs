@@ -85,7 +85,7 @@ import {
   runDeliverablesProbe,
   runFrozenProbe,
   runCollectedProbe,
-} from "./chain-phases.mjs";
+} from "./chain-probes.mjs";
 
 // Re-export so external consumers (tests) that import these functions
 // from kusabi-companion.mjs continue to resolve correctly.

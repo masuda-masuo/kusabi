@@ -77,7 +77,7 @@ Each round r (1..maxRounds, default 4) flows as follows:
 
 #### 3.5.2 Deterministic probes (P1–P6, non-LLM)
 
-Direct container inspection via sunaba-rpc (§3.6). Does not involve the LLM:
+P1–P6 helpers (`runHeadCleanProbe`, `runVerifyProbe`, `runDeliverablesProbe`, `runSmokeProbe`, `runFrozenProbe`, `runCollectedProbe`, and `summariseOracleViolations`) live in `plugins/kusabi/scripts/chain-probes.mjs`. `runProbePhase` stays in `chain-phases.mjs` and calls them. Direct container inspection via sunaba-rpc (§3.6). Does not involve the LLM:
 
 | Probe | Content | Behavior on failure |
 |---|---|---|

@@ -35,13 +35,15 @@ import {
   handleProviderExhaustion,
   recordReworkEscalation,
   quotaExhaustionReason,
+} from "./chain-phases.mjs";
+import {
   runVerifyProbe,
   runSmokeProbe,
   runDeliverablesProbe,
   runFrozenProbe,
   runCollectedProbe,
   summariseOracleViolations,
-} from "./chain-phases.mjs";
+} from "./chain-probes.mjs";
 
 /**
  * Write a final review record and append an unfilled-records note.
