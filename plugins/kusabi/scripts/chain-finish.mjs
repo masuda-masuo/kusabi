@@ -26,6 +26,8 @@ import {
   computeChainTotals,
   persistChainState,
   writeReviewRecord,
+} from "./chain-persist.mjs";
+import {
   runStrategizePhase,
   recordReworkEscalation,
   quotaExhaustionReason,

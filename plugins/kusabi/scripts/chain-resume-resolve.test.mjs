@@ -12,6 +12,8 @@ import {
 } from "./chain-resume-resolve.mjs";
 import {
   computeChainTotals,
+} from "./chain-persist.mjs";
+import {
   recordQuotaExhaustion,
   quotaExhaustionReason,
   quotaReplacementRefusal,
