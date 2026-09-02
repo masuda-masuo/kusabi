@@ -43,9 +43,9 @@ import {
   runProbePhase,
   computeChainTotals,
   persistChainState,
-  archiveFailedReviewSeat,
   collectReviewContext,
 } from "./chain-phases.mjs";
+import { archiveFailedReviewSeat } from "./chain-resume-resolve.mjs";
 import {
   renderMaxRoundsOutcome,
   handleProviderExhaustion,
