@@ -15,10 +15,12 @@ import {
 } from "./chain-review.mjs";
 import {
   computeChainTotals,
-  collectContainerReviewInput,
   resolveReworkScope,
   inScopeFindingFiles,
 } from "./chain-phases.mjs";
+import {
+  collectContainerReviewInput,
+} from "./chain-collect.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const PLUGIN_ROOT = path.resolve(HERE, "..");

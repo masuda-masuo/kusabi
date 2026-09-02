@@ -45,7 +45,7 @@ import {
 } from "./chain-review.mjs";
 import {
   collectContainerReviewInput,
-} from "./chain-phases.mjs";
+} from "./chain-collect.mjs";
 import {
   withContainerWorkspace,
 } from "./chain-run.mjs";
