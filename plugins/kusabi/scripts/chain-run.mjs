@@ -40,6 +40,8 @@ import {
 import {
   collectChangeScope,
   collectContainerBaseContext,
+} from "./chain-collect.mjs";
+import {
   classifyDispatchQuotaExhaustion,
 } from "./chain-phases.mjs";
 

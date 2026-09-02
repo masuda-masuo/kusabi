@@ -40,8 +40,10 @@ import {
   resolveReworkScope,
   computeChainTotals,
   persistChainState,
-  collectReviewContext,
 } from "./chain-phases.mjs";
+import {
+  collectReviewContext,
+} from "./chain-collect.mjs";
 import {
   buildImplementText,
   runImplementPhase,
