@@ -11,7 +11,7 @@ import {
   roundDiscardReason,
   roundChangedColumn,
 } from "./render.mjs";
-import { computeChainTotals } from "./chain-phases.mjs";
+import { computeChainTotals } from "./chain-persist.mjs";
 
 /**
  * Render the outcome string when the chain is accepted.

@@ -22,7 +22,7 @@ import {
   writeChainControl,
   rearmChainControl,
 } from "./chain-control.mjs";
-import { computeChainTotals } from "./chain-phases.mjs";
+import { computeChainTotals } from "./chain-persist.mjs";
 import { resolveChainResume } from "./chain-resume-resolve.mjs";
 import { readJson, writeJson } from "./state-paths.mjs";
 import { renderChainShow } from "./render.mjs";

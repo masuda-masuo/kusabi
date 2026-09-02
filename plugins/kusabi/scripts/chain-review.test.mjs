@@ -15,6 +15,8 @@ import {
 } from "./chain-review.mjs";
 import {
   computeChainTotals,
+} from "./chain-persist.mjs";
+import {
   resolveReworkScope,
   inScopeFindingFiles,
 } from "./chain-phases.mjs";
