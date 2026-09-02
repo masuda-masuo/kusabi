@@ -5,7 +5,7 @@
 // not present in this container when this PR was written (the directory
 // existed but was empty).  These tests reconstruct the two chain shapes
 // the brief describes from the actual chain.json writer
-// (persistChainState / handleProviderExhaustion in chain-phases.mjs and
+// (persistChainState in chain-phases.mjs / handleProviderExhaustion in chain-outcomes.mjs and
 // cmdChain in kusabi-companion.mjs), matching the described characteristics:
 //
 //  - chain-modern (chain-ms1g7lesd89b): 2 rounds, HAS `findings` +
