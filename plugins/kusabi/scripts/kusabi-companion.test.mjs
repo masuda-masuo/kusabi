@@ -5271,3 +5271,17 @@ describe("kusabi-companion extraction invariants (kusabi #443)", () => {
   });
 });
 
+describe("kusabi-companion extraction invariants (kusabi #445)", () => {
+  it("companion contains no moved host command definitions or re-exports", () => {
+    const source = fs.readFileSync(path.join(import.meta.dirname, "kusabi-companion.mjs"), "utf8");
+    assert.ok(!source.includes("function copyDirTree("), "copyDirTree must not be defined in companion");
+    assert.ok(!source.includes("function opencodeConfigDir("), "opencodeConfigDir must not be defined in companion");
+    assert.ok(!source.includes("function destDirState("), "destDirState must not be defined in companion");
+    assert.ok(!source.includes("function cmdInstallAgents("), "cmdInstallAgents must not be defined in companion");
+    assert.ok(!source.includes("async function cmdSalvage("), "cmdSalvage must not be defined in companion");
+    assert.ok(!source.includes("export { cmdInstallAgents"), "no cmdInstallAgents re-export");
+    assert.ok(!source.includes("export { cmdSalvage"), "no cmdSalvage re-export");
+  });
+});
+
+
