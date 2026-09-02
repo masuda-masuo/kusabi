@@ -14,10 +14,11 @@ import { cmdInstallCli, diagnoseCompanionShim, formatShimSetupLine } from "./ins
 // Exit path only (kusabi #243); its own module since kusabi #277 so that the
 // test children exercising it do not import everything above.
 import { flushAndExit } from "./flush-and-exit.mjs";
-// The chain driver (kusabi #264 PR 2/2).  chain-driver.mjs imports helpers
-// back from this module; see its header for why that cycle is safe and why
-// nothing moved is re-exported from here.
-import { cmdChain, cmdChainResume, sessionProvenanceRefusal } from "./chain-driver.mjs";
+// chain-cmd (kusabi #422 Job 2): the `chain` and `chain-resume` command
+// surfaces.  chain-cmd.mjs imports helpers back from this module; see its
+// header for why that cycle is safe and why nothing moved is re-exported
+// from here.
+import { cmdChain, cmdChainResume, sessionProvenanceRefusal } from "./chain-cmd.mjs";
 import { smokeBaselineReport, publishWarningForBrief, smokeViolationReport } from "./chain-brief-guards.mjs";
 import { cursorUsageDir, resolveLatestCursorSession } from "./cursor-statusline-sink.mjs";
 import { countUnfilledReviewRecords } from "./review-record-scan.mjs";
