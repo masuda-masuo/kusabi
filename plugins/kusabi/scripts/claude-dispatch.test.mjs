@@ -55,7 +55,7 @@ import {
 import { agyDispatch } from "./agy-dispatch.mjs";
 import { resolveBackend, resolveDispatchBackend } from "./kusabi-companion.mjs";
 import { dispatchWithFallback } from "./prompt-execution.mjs";
-import { runImplementPhase } from "./chain-phases.mjs";
+import { runImplementPhase } from "./chain-run.mjs";
 import { WRITE_TOOL_NAMES, implementDenyTools, firstRoute } from "./cli.mjs";
 import { stateDirFor, readJson } from "./state-paths.mjs";
 import { loadJob, jobDir, listJobs } from "./job-store.mjs";
@@ -3696,14 +3696,14 @@ describe("writeWatchdogAppliesToPhase", () => {
 
   it("chain rework rounds dispatch under the phase name 'implement'", () => {
     // The gate is only correct if rework rounds carry the phase it names.
-    // runImplementPhase (chain-phases.mjs) dispatches EVERY implement round —
+    // runImplementPhase (chain-run.mjs) dispatches EVERY implement round —
     // round 1 and every rework round — with phase: "implement"; the
     // `models.phases.rework` config key selects a MODEL, it is not a
     // dispatch phase name.  Asserted at the source, so a future rename
     // cannot silently disarm the watchdog for rework rounds.
-    const source = fs.readFileSync(new URL("./chain-phases.mjs", import.meta.url), "utf8");
+    const source = fs.readFileSync(new URL("./chain-run.mjs", import.meta.url), "utf8");
     const dispatchPhases = [...source.matchAll(/phase: "([a-z]+)"/g)].map((m) => m[1]);
-    assert.ok(dispatchPhases.includes("implement"), "chain-phases must dispatch an implement phase");
+    assert.ok(dispatchPhases.includes("implement"), "chain-run must dispatch an implement phase");
     assert.ok(!dispatchPhases.includes("rework"), "no dispatch uses a distinct 'rework' phase name");
   });
 });

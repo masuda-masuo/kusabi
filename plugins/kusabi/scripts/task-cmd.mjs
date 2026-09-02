@@ -45,8 +45,10 @@ import {
 } from "./chain-review.mjs";
 import {
   collectContainerReviewInput,
-  withContainerWorkspace,
 } from "./chain-phases.mjs";
+import {
+  withContainerWorkspace,
+} from "./chain-run.mjs";
 import {
   runSmokeProbe,
   runHeadCleanProbe,

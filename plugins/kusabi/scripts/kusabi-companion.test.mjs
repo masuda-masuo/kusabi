@@ -22,7 +22,7 @@ import {
 // The container header the chain injects into its implement prompt, and the
 // builder that injects it: the #289 suite at the end of this file asserts the
 // task path now sends the very same text (one wording, two paths).
-import { withContainerWorkspace, buildImplementText } from "./chain-phases.mjs";
+import { withContainerWorkspace, buildImplementText } from "./chain-run.mjs";
 // Two suites below straddle the kusabi #264 PR 2/2 split and stayed here on
 // purpose (see the banner above each): the chain-finally serve-stop guard,
 // which shares the serve fixture of the two serve-stop suites around it, and

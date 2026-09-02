@@ -4,8 +4,8 @@
 // chain-cmd.mjs, chain-finish.mjs, or kusabi-companion.mjs.
 //
 // Extracted from chain-phases.mjs (kusabi #425 Job 4) — same
-// definitions, same semantics.  runProbePhase stays in chain-phases.mjs
-// and imports individual probes from here.
+// definitions, same semantics.  runProbePhase lives in chain-run.mjs
+// (kusabi #447) and imports individual probes from here.
 
 import { parseChangedPaths } from "./brief-parsing.mjs";
 import { checkSmokeProbe } from "./probe-decisions.mjs";
