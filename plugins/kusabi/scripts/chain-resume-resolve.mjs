@@ -13,7 +13,7 @@ import {
   recordQuotaExhaustion,
   explicitRouteDiffersFromRecord,
   quotaReplacementRefusal,
-} from "./chain-phases.mjs";
+} from "./chain-quota.mjs";
 
 /**
  * Every field on a round record that describes the ROUND'S REVIEW, and that a

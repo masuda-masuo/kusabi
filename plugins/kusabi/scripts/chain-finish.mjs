@@ -30,8 +30,10 @@ import {
 import {
   runStrategizePhase,
   recordReworkEscalation,
-  quotaExhaustionReason,
 } from "./chain-phases.mjs";
+import {
+  quotaExhaustionReason,
+} from "./chain-quota.mjs";
 import {
   renderAcceptOutcome,
   renderAcceptWithFollowupOutcome,

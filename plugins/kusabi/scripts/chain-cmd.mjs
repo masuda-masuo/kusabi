@@ -34,9 +34,11 @@ import {
   createChainDir,
   captureBaseSha,
   captureVerifyBaseline,
+} from "./chain-phases.mjs";
+import {
   recordQuotaExhaustion,
   explicitRouteDiffersFromRecord,
-} from "./chain-phases.mjs";
+} from "./chain-quota.mjs";
 import { resolveChainResume } from "./chain-resume-resolve.mjs";
 import { captureWorktreeState } from "./worktree-baseline.mjs";
 import {
