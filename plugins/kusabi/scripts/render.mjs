@@ -453,8 +453,8 @@ export function renderBaseFacts({ baseSha, baseLog, statusOutput, untrackedFiles
  * Single source of the container-flavoured review input (kusabi #204).  Both
  * routes that review a container render it from here:
  *
- *   - the chain's review phase (`runReviewPhase`, chain-phases.mjs), and
- *   - `task --phase review --container <cid>` (cmdTask, kusabi-companion.mjs).
+ *   - the chain's review phase (`runReviewPhase`, chain-review.mjs), and
+ *   - `task --phase review --container <cid>` (cmdTask, task-cmd.mjs).
  *
  * The block used to inline the diff body as well.  It was captured with one
  * default-paged `sandbox_exec` call, so across 91 review prompts on the live

@@ -42,9 +42,8 @@ import {
   recordQuotaExhaustion,
   explicitRouteDiffersFromRecord,
 } from "./chain-phases.mjs";
-import { cmdReview } from "./kusabi-companion.mjs";
 import { renderPriorFindings } from "./render.mjs";
-import { readJson, stateDirFor } from "./state-paths.mjs";
+import { readJson } from "./state-paths.mjs";
 
 describe("captureVerifyBaseline", () => {
   it("records gate_passed, counts, and the raw result from a gate-failing base", async () => {
@@ -5073,93 +5072,4 @@ describe("change-scope wiring into review and probe phases (kusabi #379)", () =>
 
 
 
-describe("cmdReview — schema-invalid repair loop (kusabi #395)", () => {
-  const SCHEMA_INVALID_MISSING_VERSION = JSON.stringify({
-    verdict: "needs-attention",
-    summary: "One defect found.",
-    findings: [
-      { severity: "medium", title: "Off-by-one", body: "b", file: "src/calc.js", line_start: 7, line_end: 7, confidence: 0.8, recommendation: "r" },
-    ],
-    next_steps: [],
-  });
 
-  const VALID_REVIEW = JSON.stringify({
-    schema_version: 1,
-    verdict: "needs-attention",
-    summary: "One real finding.",
-    findings: [
-      { severity: "medium", title: "Off-by-one", body: "b", file: "src/calc.js", line_start: 7, line_end: 7, confidence: 0.8, recommendation: "r" },
-    ],
-    next_steps: [],
-  });
-
-  const GARBAGE = "definitely not JSON and no VERDICT token here at all";
-
-  it("repairs schema-invalid review output in the same session", async () => {
-    const calls = [];
-    const jobs = [
-      {
-        job: { id: "job-r1", status: "completed", sessionID: "sess-rev-1" },
-        resultText: SCHEMA_INVALID_MISSING_VERSION,
-      },
-      {
-        job: { id: "job-r2", status: "completed", sessionID: "sess-rev-1" },
-        resultText: VALID_REVIEW,
-      },
-    ];
-
-    async function stubPrompt(opts) {
-      calls.push(opts);
-      const next = jobs.shift();
-      if (next?.job?.id) {
-        fs.mkdirSync(path.join(stateDirFor(process.cwd()), "jobs", next.job.id), { recursive: true });
-      }
-      return next;
-    }
-
-    const output = await cmdReview(process.cwd(), {
-      flags: { model: "test/model" },
-      text: "test focus",
-      _runPrompt: stubPrompt,
-    });
-
-    assert.equal(calls.length, 2);
-    assert.equal(calls[1].session, "sess-rev-1");
-    assert.ok(calls[1].promptText.includes("Schema validation errors:"));
-    assert.ok(output.includes("needs-attention"));
-    assert.ok(output.includes("Off-by-one"));
-  });
-
-  it("retries garbage output with identical prompt in cmdReview", async () => {
-    const calls = [];
-    const jobs = [
-      {
-        job: { id: "job-g1", status: "completed" },
-        resultText: GARBAGE,
-      },
-      {
-        job: { id: "job-g2", status: "completed" },
-        resultText: VALID_REVIEW,
-      },
-    ];
-
-    async function stubPrompt(opts) {
-      calls.push(opts);
-      const next = jobs.shift();
-      if (next?.job?.id) {
-        fs.mkdirSync(path.join(stateDirFor(process.cwd()), "jobs", next.job.id), { recursive: true });
-      }
-      return next;
-    }
-
-    const output = await cmdReview(process.cwd(), {
-      flags: { model: "test/model" },
-      text: "test focus",
-      _runPrompt: stubPrompt,
-    });
-
-    assert.equal(calls.length, 2);
-    assert.equal(calls[0].promptText, calls[1].promptText);
-    assert.ok(output.includes("needs-attention"));
-  });
-});
