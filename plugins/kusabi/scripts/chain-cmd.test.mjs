@@ -143,7 +143,7 @@ describe("chain-start banner (kusabi #192 follow-up)", () => {
 
 describe("smoke baseline wiring (kusabi #292)", () => {
   const chainCmdSource = fs.readFileSync(path.join(import.meta.dirname, "chain-cmd.mjs"), "utf8");
-  const companionSource = fs.readFileSync(path.join(import.meta.dirname, "kusabi-companion.mjs"), "utf8");
+  const taskCmdSource = fs.readFileSync(path.join(import.meta.dirname, "task-cmd.mjs"), "utf8");
 
   // The body of the top-level function starting at `anchor`, i.e. up to the
   // next top-level export.
@@ -176,9 +176,9 @@ describe("smoke baseline wiring (kusabi #292)", () => {
   });
 
   it("cmdTask runs the baseline before the dispatch", () => {
-    const body = companionSource.slice(
-      companionSource.indexOf("async function cmdTask("),
-      companionSource.indexOf("async function cmdReview("),
+    const body = taskCmdSource.slice(
+      taskCmdSource.indexOf("async function cmdTask("),
+      taskCmdSource.indexOf("async function cmdReview("),
     );
     const baselineAt = body.indexOf("smokeBaselineReport(");
     const dispatchAt = body.indexOf("await dispatch({");
