@@ -63,7 +63,7 @@ rounds are always carried forward.
 
 ### 3.5 Auto-chain (chain subcommand) — implemented
 
-Launched in foreground with `chain --container <cid> --model <m> [--max-rounds N] "<brief>"` or in background with `chain-detach --container <cid> --model <m> [--max-rounds N] "<brief>"`. Implementation is `cmdChain` / `cmdChainDetach` in `plugins/kusabi/scripts/kusabi-companion.mjs`.
+Launched in foreground with `chain --container <cid> --model <m> [--max-rounds N] "<brief>"` or in background with `chain-detach --container <cid> --model <m> [--max-rounds N] "<brief>"`. Implementation is `cmdChain` in `plugins/kusabi/scripts/chain-driver.mjs` and `cmdChainDetach` in `plugins/kusabi/scripts/kusabi-companion.mjs`.
 
 #### 3.5.1 Round structure
 

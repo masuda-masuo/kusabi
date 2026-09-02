@@ -30,7 +30,8 @@ import { withContainerWorkspace, buildImplementText } from "./chain-phases.mjs";
 // the #250 smoke refusal, whose unit tests share their brief constants with
 // CLI-through-the-binary tests.  Both reach the driver by import, never
 // through a compatibility re-export from kusabi-companion.mjs.
-import { runChainDriver, smokeViolationReport } from "./chain-driver.mjs";
+import { runChainDriver } from "./chain-driver.mjs";
+import { smokeViolationReport } from "./chain-brief-guards.mjs";
 import {
   parseOrchestratorSignature,
   parseFrozenTests,

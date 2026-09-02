@@ -17,7 +17,8 @@ import { flushAndExit } from "./flush-and-exit.mjs";
 // The chain driver (kusabi #264 PR 2/2).  chain-driver.mjs imports helpers
 // back from this module; see its header for why that cycle is safe and why
 // nothing moved is re-exported from here.
-import { cmdChain, cmdChainResume, smokeBaselineReport, publishWarningForBrief, smokeViolationReport, sessionProvenanceRefusal } from "./chain-driver.mjs";
+import { cmdChain, cmdChainResume, sessionProvenanceRefusal } from "./chain-driver.mjs";
+import { smokeBaselineReport, publishWarningForBrief, smokeViolationReport } from "./chain-brief-guards.mjs";
 import { cursorUsageDir, resolveLatestCursorSession } from "./cursor-statusline-sink.mjs";
 import { countUnfilledReviewRecords } from "./review-record-scan.mjs";
 import fs from "node:fs";
