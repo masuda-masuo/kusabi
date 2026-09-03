@@ -11,7 +11,7 @@ import {
 } from "./chain-run.mjs";
 import {
   resolveReworkScope,
-} from "./chain-phases.mjs";
+} from "./chain-rework.mjs";
 
 const PLUGIN_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 

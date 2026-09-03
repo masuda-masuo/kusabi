@@ -30,7 +30,7 @@ import {
   hasRepeatedAreas,
   inScopeFindingFiles,
   resolveReworkScope,
-} from "./chain-phases.mjs";
+} from "./chain-rework.mjs";
 import {
   classifyDispatchQuotaExhaustion,
 } from "./chain-quota.mjs";

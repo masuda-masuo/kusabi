@@ -9,7 +9,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { readJson } from "./state-paths.mjs";
-import { hasRepeatedAreas, inScopeFindingFiles, resolveReworkScope } from "./chain-phases.mjs";
+import { hasRepeatedAreas, inScopeFindingFiles, resolveReworkScope } from "./chain-rework.mjs";
 import { classifyEscalate } from "./chain-substance.mjs";
 
 // =========================================================================

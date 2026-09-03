@@ -37,8 +37,10 @@ import { shouldSkipReview } from "./chain-review.mjs";
 import {
   captureBaseSha,
   resolveRoundResume,
-  resolveReworkScope,
 } from "./chain-phases.mjs";
+import {
+  resolveReworkScope,
+} from "./chain-rework.mjs";
 import {
   computeChainTotals,
   persistChainState,
