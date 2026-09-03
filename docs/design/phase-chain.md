@@ -393,7 +393,7 @@ The shared function `recoverVerdictFromText` in `render.mjs` powers both the dis
 
 Step 1 grouped findings by `kind` in the rework brief; step 2 schedules the rework rounds themselves so a design finding does not drown among mechanical ones and mechanical cleanup rounds do not eat the design budget.
 
-**Single decision point.** Pure function `resolveReworkScope(previousRecord)` in `chain-phases.mjs` maps the previous round's findings to the next round's scope, returning `{ scope, findings }`:
+**Single decision point.** Pure function `resolveReworkScope(previousRecord)` in `chain-rework.mjs` (kusabi #457) maps the previous round's findings to the next round's scope, returning `{ scope, findings }`:
 
 | previous round's findings | scope | findings subset |
 |---|---|---|
@@ -432,7 +432,7 @@ Launched with `chain-stats [--since <ISO>] [--until <ISO>] [--compare <ISO>]`. R
 - Final dispositions (last round of each chain): `accept`, `accept-with-followup`, `rework`, `strategize`, `escalate`, `discard`
 - Review verdict distribution across all rounds
 - Deterministic probe pass/fail counts
-- `repeatedAreas` computed via `hasRepeatedAreas` from `chain-phases.mjs` (re-imported, never reimplemented), over the **same narrowed input the live chain decides on** (kusabi #334): a round recording a `reworkScope` has its predecessor's files reduced through `inScopeFindingFiles`, so the aggregate and the disposition cannot mean different things. The scoped subset is not persisted, so the scope is re-derived with `resolveReworkScope` — and **the derivation is trusted only when its name matches the `reworkScope` the round recorded**. A disagreement means the branch table changed after the round ran, so the derivation describes a round that never executed; such a round is counted "n/a" rather than measured, which is what keeps a future scheduling change from silently rewriting historical figures. Rounds without a previous round are excluded from the denominator. Rounds missing `findingFiles` or `findings` are counted in the same "n/a" figure.
+- `repeatedAreas` computed via `hasRepeatedAreas` from `chain-rework.mjs` (re-imported, never reimplemented), over the **same narrowed input the live chain decides on** (kusabi #334): a round recording a `reworkScope` has its predecessor's files reduced through `inScopeFindingFiles`, so the aggregate and the disposition cannot mean different things. The scoped subset is not persisted, so the scope is re-derived with `resolveReworkScope` — and **the derivation is trusted only when its name matches the `reworkScope` the round recorded**. A disagreement means the branch table changed after the round ran, so the derivation describes a round that never executed; such a round is counted "n/a" rather than measured, which is what keeps a future scheduling change from silently rewriting historical figures. Rounds without a previous round are excluded from the denominator. Rounds missing `findingFiles` or `findings` are counted in the same "n/a" figure.
 - Prior-finding-unresolved heuristic: textual match against patterns like `(prior finding, not addressed)` and `Prior finding #N unresolved:` in `findingsText` / finding titles. **Explicitly labelled as heuristic/approximate** — there is no structured field for it.
 - Token and cost totals: per-chain from `chainTotals`, overall from per-round usage sums. Per-chain min/median/max shown for multi-chain workspaces.
 - Chains with unreadable `chain.json` are skipped and the count is reported.

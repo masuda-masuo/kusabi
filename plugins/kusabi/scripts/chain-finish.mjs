@@ -29,7 +29,7 @@ import {
 } from "./chain-persist.mjs";
 import {
   recordReworkEscalation,
-} from "./chain-phases.mjs";
+} from "./chain-rework.mjs";
 import {
   runStrategizePhase,
 } from "./chain-strategize.mjs";

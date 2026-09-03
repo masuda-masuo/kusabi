@@ -19,7 +19,7 @@ import {
 import {
   resolveReworkScope,
   inScopeFindingFiles,
-} from "./chain-phases.mjs";
+} from "./chain-rework.mjs";
 import {
   collectContainerReviewInput,
 } from "./chain-collect.mjs";
