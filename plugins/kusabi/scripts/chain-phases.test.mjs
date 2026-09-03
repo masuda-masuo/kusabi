@@ -7,7 +7,6 @@ import {
   resolveReworkScope,
   resolveRoundResume,
   captureVerifyBaseline,
-  runStrategizePhase,
   normalizeFilePath,
   hasRepeatedAreas,
   applyTierEscalation,
@@ -288,18 +287,6 @@ describe("phase functions carry the failure classification (kusabi #215)", () =>
     reset: "1:20am (Asia/Tokyo)",
   };
 
-  function failingDispatch(status, failure) {
-    return async () => ({
-      job: {
-        id: "job-fail", status, modelEntry: "opus", modelVariant: null,
-        fallbacks: null, sessionID: null,
-        usage: null, error: "claude dispatch failed: session limit",
-        failure: failure ?? null,
-      },
-      resultText: "",
-    });
-  }
-
   it("runReviewPhase writes reviewJobFailure onto the round record (single conduit)", async () => {
     const roundRecord = { round: 1 };
     const dispatch = async () => {
@@ -413,16 +400,6 @@ describe("phase functions carry the failure classification (kusabi #215)", () =>
     assert.equal(roundRecord.verdict, "unparseable");
     assert.equal(roundRecord.reviewJobFailure, null);
     assert.equal(Object.prototype.hasOwnProperty.call(roundRecord, "reviewJobError"), false);
-  });
-
-  it("runStrategizePhase returns strategistJobFailure from the failed job's record", async () => {
-    const result = await runStrategizePhase({
-      cwd: "/tmp", chainId: "chain-test", round: 1, brief: "brief",
-      previousRecord: null, roundRecord: { round: 1 }, modelChain: [["opus"]],
-      _dispatchWithFallback: failingDispatch("provider-error", QUOTA_FAILURE),
-    });
-    assert.equal(result.strategistJobStatus, "provider-error");
-    assert.deepEqual(result.strategistJobFailure, QUOTA_FAILURE);
   });
 });
 
@@ -764,46 +741,6 @@ describe("hasRepeatedAreas", () => {
 // guard ever did.
 //
 // If you are tempted to re-add a `.toString()` guard here, read the above.
-
-// ---------------------------------------------------------------------------
-// runReviewPhase / runStrategizePhase — stubbed dispatch route recording
-// ---------------------------------------------------------------------------
-
-describe("runStrategizePhase — stubbed dispatch route recording", () => {
-  it("records strategistModelEntry and strategistModelVariant on the roundRecord", async () => {
-    function stubbedDispatch() {
-      return {
-        job: {
-          id: "strat-job-1",
-          status: "completed",
-          modelEntry: "test-org/test-strategist-model:max",
-          modelVariant: "max",
-          fallbacks: null,
-          usage: null,
-          error: null,
-        },
-        resultText: "Switch to a Map data structure",
-      };
-    }
-
-    const roundRecord = { round: 1 };
-
-    await runStrategizePhase({
-      cwd: process.cwd(),
-      chainId: "test-chain",
-      round: 1,
-      brief: "test brief",
-      previousRecord: null,
-      roundRecord,
-      modelChain: ["test-org/test-flash", "test-org/test-pro"],
-      _dispatchWithFallback: stubbedDispatch,
-    });
-
-    assert.equal(roundRecord.strategistModelEntry, "test-org/test-strategist-model:max");
-    assert.equal(roundRecord.strategistModelVariant, "max");
-    assert.equal(roundRecord.strategistFallbacks, null);
-  });
-});
 
 // ---------------------------------------------------------------------------
 // Fallback trails: the three states must stay distinguishable on disk

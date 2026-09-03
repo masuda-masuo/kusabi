@@ -28,9 +28,11 @@ import {
   writeReviewRecord,
 } from "./chain-persist.mjs";
 import {
-  runStrategizePhase,
   recordReworkEscalation,
 } from "./chain-phases.mjs";
+import {
+  runStrategizePhase,
+} from "./chain-strategize.mjs";
 import {
   quotaExhaustionReason,
 } from "./chain-quota.mjs";
