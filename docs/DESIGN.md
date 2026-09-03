@@ -159,7 +159,7 @@ The following content is derived from the design agreed in the "design confirmat
 
 ### 9.1 Decision 4: strategist stage (stall countermeasure) — **implemented**
 
-Implemented across `plugins/kusabi/scripts/`: `deriveDisposition` in `disposition.mjs`, `renderStrategistPrompt` in `render.mjs`, the strategist dispatch (`runStrategizePhase`) in `chain-phases.mjs`, orchestrated by `runChainDriver` in `chain-driver.mjs`.
+Implemented across `plugins/kusabi/scripts/`: `deriveDisposition` in `disposition.mjs`, `renderStrategistPrompt` in `render.mjs`, the strategist dispatch (`runStrategizePhase`) in `chain-strategize.mjs` (kusabi #455), orchestrated by `runChainDriver` in `chain-driver.mjs`.
 
 - `deriveDisposition` accepts an optional `strategizeEligible` boolean, combined internally with `round < maxRounds` into `strategizeAllowed` (a strategist job on the final round has no next round to consume its output — #117). When `repeatedAreas` holds on a non-shippable round and `strategizeAllowed` is true — `needs-attention`, or `approve` with probes red — returns `{ disposition: "strategize", ... }` (needs-attention reason: "same file area flagged twice; structural re-diagnosis before next rework"). On the second stagnation (strategized=true), escalates as before.
 - `renderStrategistPrompt` is an exported pure function that builds the prompt for the strategist: acceptance criteria + findings from the last two rounds + one-structural-change instruction.
