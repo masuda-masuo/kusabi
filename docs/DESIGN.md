@@ -132,7 +132,7 @@ Recovery changes nothing upstream of itself: a job that does have a final messag
 
 | Constraint | Impact | Mitigation |
 |---|---|---|
-| `format: json_schema` corrupts session | provider 400 + all subsequent GET /message also 400 | Embed schema in prompt. Upstream tracking → issue #8 |
+| `format: json_schema` corrupts session | provider 400 + all subsequent GET /message also 400 | Embed schema in prompt. Upstream issue exists; local workaround retained (#8, closed) |
 | MCP tools do not trigger permission asks (silent allow) | Companion's permission firewall is ineffective against MCP | `tools: {name: false}` (= `--deny`) blocks at execution time |
 | Denied tools are physically excluded from the model's tool list (1.18.3+) | Reduces context, also eliminates wasted call attempts | Full deny, implemented via agent definitions (see `docs/design/phase-chain.md` §3.3) |
 | Default `mcp_timeout` 120s | Full verify times out as tests increase | Raised to 600000 |
@@ -195,7 +195,7 @@ Reference: issue #36 comment "Decision 5: accept-with-followup (economic cutoff 
 |---|---|---|
 | **B** | Brief-declaration probes: `kind: refactor` format. Migration byte identity (unnumbered — P1–P6 are taken by the implemented probes) | Stage A stable operation |
 | **B** | Decision 5 (accept-with-followup) — **done**. Decision 4 (strategist stage) — **done** | Stage A |
-| **C** | Patch-target audit (future, unnumbered): mechanically classify patch/monkeypatch.setattr targets via AST. Use only for mock-target determination; exclude system-under-test tests | Stage B |
+| **C candidate** | Patch-target audit (unscheduled): mechanically classify patch/monkeypatch.setattr targets via AST. Use only for mock-target determination; exclude system-under-test tests | File an issue only after a concrete incident or measured need |
 
 The deliverables probe (P3), the smoke probe (P4), the frozen-tests probe (P5) and the collected-count probe (P6) are now implemented; see `docs/design/phase-chain.md` §3.5.2. The `baseline_collected: N` book-keeping format this stage once envisaged is superseded: the count is captured automatically at chain start (`buildVerifyBaseline`, `collected`) and compared by P6, so no brief declares it. Migration byte identity and the patch-target audit remain design candidates, not scheduled work: file an issue only after a concrete incident or measured need supplies their acceptance evidence.
 
