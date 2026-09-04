@@ -75,7 +75,6 @@
 import fs from "node:fs";
 import path from "node:path";
 import process from "node:process";
-import { spawn } from "node:child_process";
 
 import { firstRoute } from "./cli.mjs";
 import { readAgentSystemPrompt } from "./claude-dispatch.mjs";
@@ -85,6 +84,7 @@ import { durationS } from "./render.mjs";
 import { resolveCompletedResult } from "./result-recovery.mjs";
 import { deriveStopReason } from "./stop-reason.mjs";
 import { startKaibaProgressWatch } from "./kaiba-progress-watch.mjs";
+import { isUsableTimeoutS, runBackendProcess } from "./backend-process-runner.mjs";
 
 export const CURSOR_BACKEND = "cursor";
 
@@ -508,33 +508,14 @@ export function assertNoOpencodeSessionOnCursor(session) {
   }
 }
 
-// =========================================================================
-// process — spawn/IO
-// =========================================================================
-
-function isUsableTimeoutS(value) {
-  return typeof value === "number" && Number.isFinite(value) && value > 0;
-}
-
-/**
- * Kill the child's whole process group.  Copied from agy's mechanism
- * (ASSUMED applicable; not re-measured on cursor-agent).
- *
- * @param {import("node:child_process").ChildProcess} child
- */
-function killProcessGroup(child) {
-  if (!child.pid) return;
-  try {
-    process.kill(-child.pid, "SIGKILL");
-  } catch {
-    try { child.kill("SIGKILL"); } catch { /* already dead */ }
-  }
-}
-
 /**
  * Spawn cursor-agent, write the prompt on stdin, and fold its NDJSON stream.
- * Timeout and silence-watchdog honour the same options as agy/claude and
- * kill the process group the same way.  No agy-specific watchdog floor.
+ *
+ * Delegates the mechanical lifecycle (spawn, line framing, timeout, silence
+ * watchdog, process-group kill, close handling) to the shared
+ * `runBackendProcess` module (kusabi #462).  Cursor-specific concerns — the
+ * parse function for the silence clock, stdin prompt transport — are wired
+ * here.
  *
  * @param {object} opts
  * @returns {Promise<{ code: number|null, stdout: string, stderr: string,
@@ -544,80 +525,9 @@ function killProcessGroup(child) {
 export function runCursorProcess({
   bin, args, cwd, promptText, timeoutS, watchdogS, onStart, onLine, onWatchdog,
 }) {
-  return new Promise((resolve) => {
-    const child = spawn(bin, args, {
-      cwd,
-      env: { ...process.env, KUSABI_WORKER_CONTEXT: "1" },
-      stdio: ["pipe", "pipe", "pipe"],
-      detached: true,
-    });
-    if (typeof onStart === "function" && child.pid) {
-      try { onStart({ pid: child.pid }); } catch { /* best-effort */ }
-    }
-
-    let stdout = "";
-    let stderr = "";
-    let timedOut = false;
-    let stalled = false;
-    let spawnError = null;
-    let lineBuffer = "";
-    let lastEventAt = Date.now();
-
-    function deliverLine(line) {
-      if (parseCursorStreamLine(line) !== null) lastEventAt = Date.now();
-      if (typeof onLine === "function") {
-        try { onLine(line); } catch { /* a stats-fold bug must not take down the dispatch */ }
-      }
-    }
-
-    if (child.stdin) {
-      child.stdin.on("error", () => {});
-      child.stdin.end(promptText ?? "");
-    }
-
-    child.stdout.setEncoding("utf8");
-    child.stderr.setEncoding("utf8");
-    child.stdout.on("data", (chunk) => {
-      stdout += chunk;
-      lineBuffer += chunk;
-      const lines = lineBuffer.split("\n");
-      lineBuffer = lines.pop();
-      for (const line of lines) deliverLine(line);
-    });
-    child.stderr.on("data", (chunk) => { stderr += chunk; });
-    child.on("error", (err) => { spawnError = err; });
-
-    const timer = isUsableTimeoutS(timeoutS)
-      ? setTimeout(() => {
-          timedOut = true;
-          killProcessGroup(child);
-        }, timeoutS * 1000)
-      : null;
-
-    const watchdogTimer = isUsableTimeoutS(watchdogS)
-      ? setInterval(() => {
-          if (timedOut || stalled) return;
-          const silenceMs = Date.now() - lastEventAt;
-          if (silenceMs > watchdogS * 1000) {
-            stalled = true;
-            clearInterval(watchdogTimer);
-            if (typeof onWatchdog === "function") {
-              try { onWatchdog({ kind: "fired", silenceS: Math.round(silenceMs / 1000) }); } catch { /* best-effort */ }
-            }
-            killProcessGroup(child);
-            if (typeof onWatchdog === "function") {
-              try { onWatchdog({ kind: "kill" }); } catch { /* best-effort */ }
-            }
-          }
-        }, 250)
-      : null;
-
-    child.on("close", (code) => {
-      if (timer) clearTimeout(timer);
-      if (watchdogTimer) clearInterval(watchdogTimer);
-      if (lineBuffer) deliverLine(lineBuffer);
-      resolve({ code, stdout, stderr, timedOut, stalled, spawnError });
-    });
+  return runBackendProcess({
+    bin, args, cwd, promptText, timeoutS, watchdogS, onStart, onLine, onWatchdog,
+    parseLine: parseCursorStreamLine,
   });
 }
 

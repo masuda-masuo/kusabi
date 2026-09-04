@@ -147,7 +147,6 @@
 import path from "node:path";
 import fs from "node:fs";
 import process from "node:process";
-import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 import { firstRoute } from "./cli.mjs";
@@ -158,6 +157,7 @@ import { durationS } from "./render.mjs";
 import { resolveCompletedResult } from "./result-recovery.mjs";
 import { deriveStopReason } from "./stop-reason.mjs";
 import { startKaibaProgressWatch } from "./kaiba-progress-watch.mjs";
+import { isUsableTimeoutS, runBackendProcess } from "./backend-process-runner.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const PLUGIN_ROOT = path.resolve(HERE, "..");
@@ -387,23 +387,6 @@ export function formatGoDuration(totalSeconds) {
 // =========================================================================
 // timeoutS resolution — the ONE decision (kusabi #328)
 // =========================================================================
-
-/**
- * The ONE usable-timeout predicate (kusabi #328): a positive finite number
- * of seconds.  resolveAgyTimeoutS decides with this rule and nothing else,
- * and the two bound sites — buildAgyArgs' `--print-timeout` and
- * runAgyProcess' outer timer — re-check with THIS same named rule, so no
- * value can be accepted by one bound and refused by another (or by the
- * resolver), whether reached through agyDispatch or by a direct call.
- * A hand-copied `typeof === "number" && > 0` would drift exactly as the
- * #327 truthy guard did: it accepts Infinity, which the resolver refuses.
- *
- * @param {unknown} value
- * @returns {boolean} true only for a positive finite number of seconds.
- */
-function isUsableTimeoutS(value) {
-  return typeof value === "number" && Number.isFinite(value) && value > 0;
-}
 
 /**
  * Resolve the OUTER timeout bound for an agy dispatch: the one place that
@@ -971,178 +954,31 @@ export function assertNoAgySession(session, { provenance } = {}) {
 // =========================================================================
 
 /**
- * Kill the child's whole process group.  agy spawns MCP servers and tool
- * subprocesses of its own; signalling only the direct child leaves those
- * running against the shared container after the job record says timeout.
- *
- * @param {import("node:child_process").ChildProcess} child
- */
-function killProcessGroup(child) {
-  if (!child.pid) return;
-  try {
-    process.kill(-child.pid, "SIGKILL");
-  } catch {
-    // The group may already be gone; fall back to the direct child.
-    try { child.kill("SIGKILL"); } catch { /* already dead */ }
-  }
-}
-
-/**
  * Spawn the agy CLI and fold its NDJSON event stream as it arrives.
  *
- * `--output-format stream-json` (kusabi #332) makes the run observable:
- * each complete stdout line is delivered to `onLine` the moment it arrives,
- * the silence clock resets on every PARSED event, and the folded stream
- * decides `job.stats` and the terminal payload while the child still runs —
- * no more waiting for one blob at exit.
- *
- * The OUTER bound (`timeoutS`) and the silence watchdog (`watchdogS`) are
- * independent bounds.  The child carries its own inner bound
- * (`--print-timeout`, built by buildAgyArgs) set strictly larger, so THIS
- * timer is the one that fires — see AGY_PRINT_TIMEOUT_MARGIN_S.  The
- * watchdog measures time since the last parsed stream event and kills the
- * group on expiry; the armed interval is never below
- * AGY_WATCHDOG_FLOOR_S (agy emits nothing, not even `init`, for the first
- * ~11 seconds of a healthy run — measured 2026-08-20), and the floor is
- * applied by agyWatchdogSeconds in the CALLER so the stall error text and
- * the armed interval cannot disagree.
+ * Delegates the mechanical lifecycle (spawn, line framing, timeout, silence
+ * watchdog, process-group kill, close handling) to the shared
+ * `runBackendProcess` module (kusabi #462).  agy-specific concerns — the
+ * parse function for the silence clock, no stdin transport — are wired here.
  *
  * @param {object} opts
  * @param {string} opts.bin
  * @param {string[]} opts.args
  * @param {string} opts.cwd
- * @param {number|null} [opts.timeoutS] — the value agyDispatch already
- *        resolved (resolveAgyTimeoutS).  Guarded by the SAME predicate
- *        buildAgyArgs uses on the same value: a positive finite number
- *        arms this timer, anything else arms nothing (kusabi #328).
- * @param {number|null} [opts.watchdogS] — the value agyDispatch already
- *        resolved and FLOORED (agyWatchdogSeconds): a positive finite
- *        number arms the silence watchdog at that value, anything else
- *        arms none.
- * @param {(info: {pid: number}) => void} [opts.onStart] — called with the
- *        child's pid the instant it exists, so `cancel` has a lever.
- * @param {(line: string) => void} [opts.onLine] — called with each complete
- *        stdout line, parsed or not; the caller folds parsed lines into its
- *        accumulator.  Wrapped: a stats-fold bug must never take down the
- *        dispatch.
- * @param {({kind: "fired", silenceS: number}|{kind: "kill"}) => void}
- *        [opts.onWatchdog] — called with `{kind: "fired", silenceS}` the
- *        moment the watchdog expires (BEFORE the group kill, so the audit
- *        trail can never be lost to the kill) and with `{kind: "kill"}`
- *        after the kill.  Wrapped: an audit-trail failure must never take
- *        down the kill.
+ * @param {number|null} [opts.timeoutS]
+ * @param {number|null} [opts.watchdogS]
+ * @param {(info: {pid: number}) => void} [opts.onStart]
+ * @param {(line: string) => void} [opts.onLine]
+ * @param {(event: {kind: "fired", silenceS: number}|{kind: "kill"}) => void}
+ *        [opts.onWatchdog]
  * @returns {Promise<{ code: number|null, stdout: string, stderr: string,
  *                     timedOut: boolean, stalled: boolean,
  *                     spawnError: Error|null }>}
  */
 export function runAgyProcess({ bin, args, cwd, timeoutS, watchdogS, onStart, onLine, onWatchdog }) {
-  return new Promise((resolve) => {
-    const child = spawn(bin, args, {
-      cwd,
-      env: { ...process.env, KUSABI_WORKER_CONTEXT: "1" },
-      stdio: ["ignore", "pipe", "pipe"],
-      // Own process group (session leader): the timeout/watchdog kill
-      // targets the group, so agy's children die with it.
-      detached: true,
-    });
-    if (typeof onStart === "function" && child.pid) {
-      try { onStart({ pid: child.pid }); } catch { /* best-effort */ }
-    }
-
-    let stdout = "";
-    let stderr = "";
-    let timedOut = false;
-    let stalled = false;
-    let spawnError = null;
-    let lineBuffer = "";
-    // The silence clock starts at spawn, not at the first event: a child
-    // that never prints anything at all still trips the watchdog (the same
-    // rule as the claude backend, kusabi #215 Job B item 3).
-    let lastEventAt = Date.now();
-
-    // Delivers one complete NDJSON line to the caller and resets the
-    // silence clock the watchdog measures against.  Only a PARSED event
-    // resets the clock: an unparseable prose line is stream noise, not
-    // activity — it must not masquerade as an event and hold the watchdog
-    // off.
-    function deliverLine(line) {
-      if (parseAgyStreamLine(line) !== null) lastEventAt = Date.now();
-      if (typeof onLine === "function") {
-        try { onLine(line); } catch { /* a stats-fold bug must not take down the dispatch */ }
-      }
-    }
-
-    // UTF-8 decoding must be stream-level, not chunk-level: a multibyte
-    // character split across two "data" chunks decodes to U+FFFD under
-    // per-chunk toString(), corrupting the JSON line it sits in — and a
-    // corrupted terminal result line is a lost run.  setEncoding routes
-    // chunks through a StringDecoder that holds partial byte sequences back
-    // until they complete.
-    child.stdout.setEncoding("utf8");
-    child.stderr.setEncoding("utf8");
-    child.stdout.on("data", (chunk) => {
-      stdout += chunk;
-      lineBuffer += chunk;
-      const lines = lineBuffer.split("\n");
-      lineBuffer = lines.pop(); // last element: an unterminated partial line, or ""
-      for (const line of lines) deliverLine(line);
-    });
-    child.stderr.on("data", (chunk) => { stderr += chunk; });
-    child.on("error", (err) => { spawnError = err; });
-
-    // The SAME predicate buildAgyArgs applies to the inner bound and
-    // resolveAgyTimeoutS decides with — isUsableTimeoutS, the one rule in
-    // one place (kusabi #328): a positive finite number arms this timer,
-    // anything else arms nothing.  A truthy-only check would arm THIS timer
-    // for a string that buildAgyArgs refuses, and a hand-copied
-    // `typeof === "number" && > 0` would arm it for Infinity — the #327
-    // half-armed regression, structurally impossible here.
-    const timer = isUsableTimeoutS(timeoutS)
-      ? setTimeout(() => {
-          timedOut = true;
-          killProcessGroup(child);
-        }, timeoutS * 1000)
-      : null;
-
-    // Silence watchdog (kusabi #332): polled rather than a single deadline
-    // timer, since the bound restarts on every parsed stream event.  250ms
-    // resolution keeps a small test watchdog tight without meaningful
-    // overhead against the real multi-minute intervals.  The bound itself
-    // was already resolved and floored by agyWatchdogSeconds in the caller;
-    // re-checking here (idempotently) keeps a direct call to this function
-    // honest too.  Reports each step to the caller so the stall lands in
-    // the job's audit trail AT THE MOMENT it is detected, not after the
-    // process has closed — the "fired" notification runs BEFORE the group
-    // kill, so a failing trail can never swallow the kill.  Wrapped: an
-    // audit-trail failure must never take down the kill that is this
-    // watchdog's actual job.
-    const armedWatchdogS = agyWatchdogSeconds(watchdogS);
-    const notifyWatchdog = (event) => {
-      if (typeof onWatchdog !== "function") return;
-      try { onWatchdog(event); } catch { /* best-effort audit trail */ }
-    };
-    const watchdogTimer = armedWatchdogS !== null
-      ? setInterval(() => {
-          if (timedOut || stalled) return;
-          const silenceMs = Date.now() - lastEventAt;
-          if (silenceMs > armedWatchdogS * 1000) {
-            stalled = true;
-            clearInterval(watchdogTimer);
-            // Measured silence, rounded to seconds — the same quantity the
-            // opencode/claude watchdog reports, not the configured bound.
-            notifyWatchdog({ kind: "fired", silenceS: Math.round(silenceMs / 1000) });
-            killProcessGroup(child);
-            notifyWatchdog({ kind: "kill" });
-          }
-        }, 250)
-      : null;
-
-    child.on("close", (code) => {
-      if (timer) clearTimeout(timer);
-      if (watchdogTimer) clearInterval(watchdogTimer);
-      if (lineBuffer) deliverLine(lineBuffer);
-      resolve({ code, stdout, stderr, timedOut, stalled, spawnError });
-    });
+  return runBackendProcess({
+    bin, args, cwd, timeoutS, watchdogS, onStart, onLine, onWatchdog,
+    parseLine: parseAgyStreamLine,
   });
 }
 
