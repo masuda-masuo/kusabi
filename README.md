@@ -1,20 +1,21 @@
 # kusabi
 
-Use kusabi from inside Claude Code to delegate tasks or run adversarial code reviews to a worker backend — [opencode](https://opencode.ai) by default, the Claude Code CLI in headless mode (`--backend claude`), or the Antigravity CLI (`--backend agy`) — without flooding Claude's context with the worker's intermediate output.
+Use kusabi from inside Claude Code or Cursor to delegate tasks or run adversarial code reviews to a worker backend — [opencode](https://opencode.ai) by default, the Claude Code CLI in headless mode (`--backend claude`), the Antigravity CLI (`--backend agy`), or the Cursor CLI (`--backend cursor`) — without flooding the orchestrator's context with the worker's intermediate output.
 
 ## How it works
 
 ```
 orchestrator ——> kusabi-companion <subcommand> —┬—HTTP——> opencode serve (127.0.0.1, on-demand)
-                                                ├—spawn——> claude -p (headless, no server)
-                                                └—spawn——> agy -p    (headless, no server)
+                                                ├—spawn——> claude -p       (headless, no server)
+                                                ├—spawn——> agy -p          (headless, no server)
+                                                └—spawn——> cursor-agent -p (headless, no server)
                                                 │
                                                 ├─ SSE /event: progress tracking + automatic permission replies
                                                 ├─ state dir: full event log, job records, stored results
                                                 └─ stdout: rendered final result ONLY
 ```
 
-With `--backend claude` or `--backend agy` there is no serve process — the companion spawns the CLI per job and the same state-dir/stdout contract applies (see [Backends](#backends) for flags and v1 limits).
+With `--backend claude`, `--backend agy`, or `--backend cursor` there is no serve process — the companion spawns the CLI per job and the same state-dir/stdout contract applies (see [Backends](#backends) for flags and v1 limits).
 
 The companion script is a context firewall: the worker's narration, tool logs, and raw events are persisted under `~/.kusabi/<dir-hash>/` and never reach the orchestrator. The orchestrator only sees the rendered final result (or a compact status summary).
 
@@ -26,7 +27,7 @@ Key mechanics:
 
 ## Requirements
 
-- [opencode CLI](https://opencode.ai) installed and authenticated (`opencode auth login`) — or the Claude Code CLI (`claude`) for `--backend claude` (binary via `CLAUDE_BIN`, default `claude`), or the Antigravity CLI (`agy`) for `--backend agy` (binary via `AGY_BIN`, default `agy`)
+- [opencode CLI](https://opencode.ai) installed and authenticated (`opencode auth login`) — or the Claude Code CLI (`claude`) for `--backend claude` (binary via `CLAUDE_BIN`, default `claude`), the Antigravity CLI (`agy`) for `--backend agy` (binary via `AGY_BIN`, default `agy`), or the Cursor CLI (`cursor-agent`) for `--backend cursor` (binary via `CURSOR_BIN`, default `cursor-agent`)
 - Node.js 18.18 or later
 
 ## Install
@@ -100,7 +101,7 @@ Slash commands (`plugins/kusabi/commands/`):
 
 | Command | What it does |
 | --- | --- |
-| `/kusabi:task [--brief-file <path>]` | Delegate a task. Provide the brief inline or via `--brief-file <path>` (mutually exclusive). Flags: `--model provider/model`, `--agent name`, `--phase <name>`, `--read-only`, `--resume-last`, `--session <id>`, `--wait`, `--background`, `--deny <tools>`, `--timeout <s>`, `--watchdog <s>` |
+| `/kusabi:task [--brief-file <path>]` | Delegate a task. Provide the brief inline or via `--brief-file <path>` (mutually exclusive). Flags: `--model <identifier>`, `--backend opencode|claude|agy|cursor`, `--agent name`, `--phase <name>`, `--read-only`, `--resume-last`, `--session <id>`, `--wait`, `--background`, `--deny <tools>`, `--timeout <s>`, `--watchdog <s>` |
 | `/kusabi:review` | Adversarial, read-only review of the working tree; `--base <ref>` for branch review; `--prior <text>` for anti-ratchet carry-over; extra text = review focus. Host worktree only — `--container` is rejected; use `task --phase review` for container reviews |
 | `/kusabi:status [job-id]` | Compact job list, or progress detail for one job |
 | `/kusabi:result [job-id]` | Stored final output of a finished job |
@@ -112,8 +113,8 @@ Everything else is a companion subcommand, invoked directly as
 
 | Subcommand | What it does |
 | --- | --- |
-| `chain [--brief-file <path>]` | **Auto chain** — run implement → review → rework until acceptance or escalate. Requires `--container <cid>`. Optional: `--model <provider/model>`, `--brief-file <path>`, `--max-rounds <N>` (default 4), `--session`, `--keep-serve`. When `--model` is omitted the model is resolved from the config file or built-in default chain. |
-| `chain-resume <chainId>` | Resume a cancelled chain from its last recorded phase boundary, or buy a replacement review seat for a chain that escalated on a dead review seat over green probes (reads `chain.json` / `control.json`; same chain lifecycle as `chain`; only flag: `--keep-serve`) |
+| `chain [--brief-file <path>]` | **Auto chain** — run implement → review → rework until acceptance or escalate. Requires `--container <cid>`. Optional: `--model <identifier>`, `--backend opencode|claude|agy|cursor`, `--brief-file <path>`, `--max-rounds <N>` (default 4), `--session <id>`, `--keep-serve`. When `--model` is omitted the model and backend are resolved from the config file or built-in default chain. |
+| `chain-resume <chainId>` | Resume a cancelled chain from its last recorded phase boundary, or buy a replacement review seat for a chain that escalated on a dead review seat over green probes (reads `chain.json` / `control.json`; same chain lifecycle as `chain`). Optional: `--keep-serve`; `--backend` / `--model` are accepted only when routing a quota-exhausted review seat to a replacement. |
 | `chain-show` | Compact plain-text digest of a chain (read-only, no LLM) |
 | `chain-stats` | Aggregate every chain record and print a summary (read-only, no LLM) |
 | `chain-cancel <chainId>` | Request a running chain to stop (file-based, works across processes) |
@@ -139,7 +140,7 @@ The `delegate` skill intentionally points at `--help` and `docs/design/phase-cha
 surface and the chain semantics instead of restating them, so that improving kusabi does
 not silently make the skill wrong.
 
-Every result includes the backend's session ID — an opencode `ses_*` id, the Claude Code CLI's UUID with `--backend claude`, or the Antigravity CLI's conversation UUID with `--backend agy`; continue an opencode session in the opencode TUI with `opencode -s <session-id>`. Session ids are backend-specific: passing one to a different backend is rejected, naming both.
+Every result includes the backend's session ID — an opencode `ses_*` id, the Claude Code CLI's UUID with `--backend claude`, the Antigravity CLI's conversation UUID with `--backend agy`, or the Cursor CLI's session id with `--backend cursor`. Kusabi continues them through `--session <id>` / `--resume-last` (agy maps this to `agy --conversation <id>` and Cursor to `cursor-agent --resume <id>`); continue an opencode session in its TUI with `opencode -s <session-id>`. Session ids are backend-specific: passing one to a different backend is rejected, naming both.
 
 ## Model configuration
 
@@ -177,9 +178,18 @@ You can customise this with a config file at `<state root>/config.json`
 Flat all-string chains are still accepted (each string is a single-route
 tier) — but the built-in default is the tiered shape above.
 
+A route prefixed with `claude/`, `agy/`, or `cursor/` selects that backend and
+passes the remainder as its model: for example, `agy/gemini-3.6-flash-high`
+and `cursor/default`. An unprefixed `provider/model[:variant]` route selects
+opencode. The same grammar applies to `--model`: a prefixed identifier pins
+both backend and model, while a bare alias names no backend and keeps the
+phase's configured backend. If `--backend` contradicts a backend named by
+`--model`, the command is rejected; each phase's configured chain must also
+contain routes for only one backend.
+
 ### Variant syntax
 
-Chain entries (and `--model` / `task --model`) accept an optional `:variant` suffix:
+Opencode chain entries (and opencode `--model` / `task --model`) accept an optional `:variant` suffix:
 
     provider/model[:variant]
 
@@ -196,7 +206,7 @@ A trailing colon (`p/a:`) or missing `/` are fatal parse errors.
 
 ### Backends
 
-`chain` and `task` accept `--backend opencode|claude|agy` (default `opencode`).
+`chain` and `task` accept `--backend opencode|claude|agy|cursor` (default `opencode`).
 The backend is resolved once at command start and recorded as `backend` on
 every job record and chain round record; records written before the backend
 split (or without the field) are treated as `opencode` by readers.
@@ -221,24 +231,42 @@ split (or without the field) are treated as `opencode` by readers.
   (default `claude`). A **pre-dispatch session-quota guard** can refuse a
   dispatch before it starts — see below.
 - **agy** — dispatch through the Antigravity CLI in headless mode
-  (`agy -p <prompt> --output-format json --model <id>`; a single JSON object
-  on stdout). It buys a separate quota pool (Gemini, metered apart from both
-  other backends) and a third model family for cross-family review; any
-  phase may route to it. v1 limits: one model per phase (no tier ladder, no
-  capacity fallback), `:variant` suffixes rejected, and **fresh dispatch
-  only** — the CLI's `conversation_id` is recorded as the job's session id
-  but `--session` / `--resume-last` are rejected, as are `--read-only` /
-  `--deny` (the CLI has no per-job permission flags, so the restriction
-  cannot be applied and must not look applied). Success is decided by
-  PAYLOAD, not by the CLI's `status` field: a run with any failed tool call
-  reports `status: "ERROR"` even when the answer was delivered in full, so a
-  non-empty response is a completed job and `status` is recorded as advisory
-  metadata. Model syntax is a plain model id (e.g.
-  `gemini-3.6-flash-high`) — the agy CLI itself validates which ids exist,
-  so kusabi checks only the shape. The binary is resolved through `AGY_BIN`
-  (default `agy`), and the sunaba MCP server is assumed to be configured
-  globally in `~/.gemini/antigravity-cli/mcp_config.json` (kusabi never
-  touches that file).
+  (`agy -p <prompt> --output-format stream-json --model <id>
+  --print-timeout <duration>`, plus `--json-schema` for reviews and
+  `--conversation <id>` when resuming). It buys a separate quota pool
+  (Gemini, metered apart from the other backends) and another model family
+  for cross-family review; any phase may route to it. Config entries and
+  `--model` use `agy/<model>` to select this backend, with the prefix stripped
+  before dispatch. v1 limits: one model per phase (no tier ladder or capacity
+  fallback) and `:variant` suffixes rejected. Session resume IS supported:
+  `--session <id>` / `--resume-last`, chain rework rounds, and `chain-resume`
+  continue the recorded `conversation_id` via `agy --conversation <id>`, but
+  only when the job store proves that the id belongs to agy. `--read-only` /
+  `--deny` are rejected because the CLI has no per-job permission flags.
+  Success is decided by PAYLOAD, not by the CLI's `status` field: a run with
+  any failed tool call can report `status: "ERROR"` even when the answer was
+  delivered in full, so a non-empty response is a completed job and `status`
+  is recorded as advisory metadata. The agy CLI validates plain model ids
+  (for example `gemini-3.6-flash-high`), while kusabi checks only their shape.
+  The binary is resolved through `AGY_BIN` (default `agy`), and the sunaba MCP
+  server is assumed to be configured globally in
+  `~/.gemini/antigravity-cli/mcp_config.json` (kusabi never touches that file).
+- **cursor** — dispatch through the Cursor CLI in headless mode
+  (`cursor-agent -p --approve-mcps --force --output-format stream-json`, with
+  `--model <id>` only for an explicit pin and `--resume <session-id>` when
+  resuming); the prompt is supplied on stdin. Config entries and `--model`
+  use `cursor/<model>` to select this backend, with `cursor/default` meaning
+  the model already configured in the CLI and therefore no `--model` flag.
+  A pinned model is recorded with a `modelResidueHazard` because Cursor writes
+  that choice to its persistent CLI config; kusabi does not rewrite the file.
+  `:variant` suffixes are rejected. Session resume IS supported through
+  `--session <id>` / `--resume-last`, chain rework rounds, and `chain-resume`,
+  which pass the recorded session id to `cursor-agent --resume`. Cursor has
+  no enforceable per-job deny flags, so phase denies are recorded as
+  `toolDeniesUnenforced` rather than presented as applied. Success is decided
+  by a non-empty terminal result payload, with `is_error` retained only as
+  advisory metadata. The binary is resolved through `CURSOR_BIN` (default
+  `cursor-agent`).
 
 The claude backend mirrors the opencode agents' permission tables with two
 hardcoded `--allowedTools` allowlists (implement, review; see
@@ -293,8 +321,8 @@ no longer matches degrades to "quota unreadable" and the dispatch proceeds,
 with that recorded on the record. `/usage` output has no stability contract
 and its number counts this machine only (a lower bound), so a guard that
 failed closed on it would be worse than no guard. The probe runs once per
-dispatch, never cached. opencode and agy are separate accounts and are never
-probed.
+dispatch, never cached. opencode, agy, and cursor use separate pools and are
+never probed.
 
 The agy backend has no permission flags to mirror: it carries the agent body
 inside the prompt (the CLI has no `--append-system-prompt`) and reaches
