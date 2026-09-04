@@ -132,7 +132,7 @@ Recovery changes nothing upstream of itself: a job that does have a final messag
 
 | Constraint | Impact | Mitigation |
 |---|---|---|
-| `format: json_schema` corrupts session | provider 400 + all subsequent GET /message also 400 | Embed schema in prompt. Upstream tracking → issue #8 |
+| `format: json_schema` corrupts session | provider 400 + all subsequent GET /message also 400 | Embed schema in prompt. Upstream issue exists; local workaround retained (#8, closed) |
 | MCP tools do not trigger permission asks (silent allow) | Companion's permission firewall is ineffective against MCP | `tools: {name: false}` (= `--deny`) blocks at execution time |
 | Denied tools are physically excluded from the model's tool list (1.18.3+) | Reduces context, also eliminates wasted call attempts | Full deny, implemented via agent definitions (see `docs/design/phase-chain.md` §3.3) |
 | Default `mcp_timeout` 120s | Full verify times out as tests increase | Raised to 600000 |
@@ -195,15 +195,14 @@ Reference: issue #36 comment "Decision 5: accept-with-followup (economic cutoff 
 |---|---|---|
 | **B** | Brief-declaration probes: `kind: refactor` format. Migration byte identity (unnumbered — P1–P6 are taken by the implemented probes) | Stage A stable operation |
 | **B** | Decision 5 (accept-with-followup) — **done**. Decision 4 (strategist stage) — **done** | Stage A |
-| **C** | Patch-target audit (future, unnumbered): mechanically classify patch/monkeypatch.setattr targets via AST. Use only for mock-target determination; exclude system-under-test tests | Stage B |
-| **D** | Connect discard path to #33 (best-of-N) | Stage C, awaiting real-world experience |
+| **C candidate** | Patch-target audit (unscheduled): mechanically classify patch/monkeypatch.setattr targets via AST. Use only for mock-target determination; exclude system-under-test tests | File an issue only after a concrete incident or measured need |
 
-The deliverables probe (P3), the smoke probe (P4), the frozen-tests probe (P5) and the collected-count probe (P6) are now implemented; see `docs/design/phase-chain.md` §3.5.2. The `baseline_collected: N` book-keeping format this stage once envisaged is superseded: the count is captured automatically at chain start (`buildVerifyBaseline`, `collected`) and compared by P6, so no brief declares it. Migration byte identity remains as future work.
+The deliverables probe (P3), the smoke probe (P4), the frozen-tests probe (P5) and the collected-count probe (P6) are now implemented; see `docs/design/phase-chain.md` §3.5.2. The `baseline_collected: N` book-keeping format this stage once envisaged is superseded: the count is captured automatically at chain start (`buildVerifyBaseline`, `collected`) and compared by P6, so no brief declares it. Migration byte identity and the patch-target audit remain design candidates, not scheduled work: file an issue only after a concrete incident or measured need supplies their acceptance evidence.
+
+The former Stage D proposal to connect the discard path to best-of-N was retired with #33. Its assumptions changed, and the implemented vertical chain (implement → probe → review → disposition) covers the useful selection loop without parallel candidate orchestration. Re-open the design from current evidence rather than treating #33 as a roadmap item if model-output variance becomes a measured problem.
 
 Reference: issue #36 comment "Design confirmation before starting → Decision 3: stage split (1 PR = 1 stage)"
 
 ### 9.4 Remaining tasks (current state)
 
-Managed via issues:
-- #8 (upstream tracking: report and fix opencode format:json_schema bug)
-- #33 (best-of-n tournament)
+There are no standing tasks inherited from the original expansion plan. #8 was closed because the upstream issue already exists and Kusabi has a working prompt-embedded-schema workaround. #33 was closed because its cost and quality assumptions no longer held and the chain absorbed the useful behavior in a different form. Future work is created from observed friction rather than kept here as a speculative backlog.
