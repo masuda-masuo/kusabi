@@ -34,6 +34,12 @@ authoritative source instead, once per session before the first dispatch:
 What does *not* change with the CLI:
 
 - **Pass the brief as a file**, not inline — inline quoting is an accident generator.
+- **Use the wait command returned by `chain-detach`** for a launched chain; for an
+  existing or resumed chain, use `chain-wait` with its explicit id. Let the caller's
+  background-task mechanism track that read-only wait instead of repeatedly invoking
+  `status` or `chain-show` from LLM turns. Read the digest at completion and use
+  `chain-show` for inspection. A nonzero wait exit needs diagnosis; it is not a reason
+  to dispatch the same implementation again.
 - **Container preparation is the orchestrator's job.** Implement-phase workers are denied
   `sandbox_initialize` / `publish` / issue writes by design, so hand them a container id
   in the brief. (The chain companion injects the ID into implement and review prompts
@@ -64,7 +70,12 @@ exception, not the routine. Escalate to the stronger model when:
 - the chain stalled on the same area twice.
 
 Quota exhaustion is only one of the triggers. Reading it as the *only* trigger is how you
-end up re-running a doomed cheap round three times.
+end up re-running a doomed cheap round three times. Before manually resuming or
+redispatching a failed job, name what changed: the brief, code, environment, evidence or
+route. If the same failure recurs with none of those changed, stop that retry path and
+report the blocker or choose a different route. A user's explicit request to retry takes
+precedence; preserve any limit they set. Keep transient provider retries in the companion's
+existing bounded fallback logic.
 
 ## Writing the brief
 
@@ -198,8 +209,10 @@ end up re-running a doomed cheap round three times.
   frozen test.
 - **Paste facts you have already verified** rather than making the worker re-derive
   them — but the thing you name instead of state is the claim you have *not* verified.
-  Both halves belong in one item. A worker made to re-derive confirmed facts once spent its
-  whole context reading and finished with no edits at all.
+  Both halves belong in one item. Give each worker its bounded scope, relevant verified
+  facts, source paths and acceptance criteria; omit unrelated conversation and raw logs.
+  Parallel workers should own independent work. The parent inspects their evidence
+  rather than repeating their investigation unless a gap or contradiction needs checking.
 - **Write the brief in English** even when the surrounding discussion is not. Small worker
   models follow English instructions more reliably and spend fewer tokens doing it.
 
