@@ -293,6 +293,14 @@ Worker reports are claims, not evidence. They have been false before.
   post it to the archive repository. Posting is orchestrator-exclusive, by the same
   exit principle as publish; an unposted record is write-only state the next brief
   cannot learn from.
+- **Terminal notification is automatic.** Every terminal chain (completed / cancelled /
+  failed) writes an inbox file at `{stateDir}/inbox/{chainId}.md` and best-effort
+  appends a kaiba agenda row — no session-bound `chain-wait` required. The inbox
+  file contains the chain id, status, disposition, container, and a `chain-show`
+  command. The agenda row is deduped and fail-soft (missing DB or table is silent).
+  `chain-wait` remains available for same-session blocking / live interrupt, but
+  the inbox + agenda is the durable completion signal. Opt-out: set
+  `KUSABI_CHAIN_NOTIFY=0`.
 - **Move your work queue in the same turn that a chain terminates or a merge is
   confirmed.** A session's end cannot be relied on to do it — the sessions that need
   closing hygiene most (freezes, context exhaustion, kills) never get it, and a queue
