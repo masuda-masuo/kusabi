@@ -104,7 +104,48 @@ function parseSseResponse(body) {
  */
 function unwrapResult(result) {
   if (!result || typeof result !== "object") return result;
+
+  const structuredContent = result.structuredContent;
   const content = result.content;
+
+  // If structuredContent is a non-null, non-array object, decide whether
+  // it is compact (authoritative) or legacy (duplicate wrapper).
+  //
+  // Legacy shape: { result: <string exactly equal to content[0].text> }
+  //   – FastMCP sends the full JSON string in both text and structuredContent.
+  //   – We must fall through to text parsing to preserve legacy behaviour.
+  //
+  // Compact shape: everything else that is a valid object.
+  //   – structuredContent holds the decoded dict directly; return it whole.
+  if (
+    structuredContent !== null &&
+    structuredContent !== undefined &&
+    typeof structuredContent === "object" &&
+    !Array.isArray(structuredContent)
+  ) {
+    const keys = Object.keys(structuredContent);
+    const firstText =
+      Array.isArray(content) &&
+      content.length > 0 &&
+      content[0]?.type === "text" &&
+      typeof content[0].text === "string"
+        ? content[0].text
+        : undefined;
+
+    const isLegacy =
+      keys.length === 1 &&
+      keys[0] === "result" &&
+      typeof structuredContent.result === "string" &&
+      structuredContent.result === firstText;
+
+    if (!isLegacy) {
+      // Compact: structuredContent is authoritative — return it whole.
+      return structuredContent;
+    }
+    // Legacy duplicated wrapper — fall through to text parsing below.
+  }
+
+  // Original text-based unwrap (legacy path).
   if (!Array.isArray(content) || content.length === 0) {
     // Non-content result (e.g. initialize serverInfo); return as-is.
     return result;
