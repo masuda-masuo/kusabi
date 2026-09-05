@@ -8,7 +8,18 @@ import { ensureServer, api, authHeader, judgeServeDeath, isOurServe } from "./se
 import { newJobId, saveJob, jobDir, appendEvent } from "./job-store.mjs";
 import { writeJson, stateRoot } from "./state-paths.mjs";
 import { durationS } from "./render.mjs";
-import { parseModel, selectRoutes } from "./cli.mjs";
+import { parseModel, selectRoutes, splitRouteBackend } from "./cli.mjs";
+import { agyDispatch } from "./agy-dispatch.mjs";
+import { cursorDispatch } from "./cursor-dispatch.mjs";
+
+let _cachedClaudeDispatch = null;
+async function getClaudeDispatch() {
+  if (!_cachedClaudeDispatch) {
+    const mod = await import("./claude" + "-dispatch.mjs");
+    _cachedClaudeDispatch = mod.claudeDispatch;
+  }
+  return _cachedClaudeDispatch;
+}
 import { resolveCompletedResult } from "./result-recovery.mjs";
 import { deriveStopReason } from "./stop-reason.mjs";
 import { startKaibaProgressWatch } from "./kaiba-progress-watch.mjs";
@@ -890,8 +901,18 @@ export async function runPrompt({ cwd, kind, title, promptText, agent, model, se
  * @returns {Promise<{ job: object, resultText: string, stateDir: string }>}
  */
 export async function dispatchWithFallback(opts) {
-  const { tiers, round, tierIndex, explicitModel, _runPrompt, ...runPromptOpts } = opts;
-  const doPrompt = _runPrompt || runPrompt;
+  const {
+    tiers,
+    round,
+    tierIndex,
+    explicitModel,
+    _runPrompt,
+    _agyDispatch,
+    _claudeDispatch,
+    _cursorDispatch,
+    _backendDispatch,
+    ...runPromptOpts
+  } = opts;
   const candidates = selectRoutes({ tiers, round, tierIndex, explicitModel, failedRoutes });
 
   if (candidates.length === 0) {
@@ -926,18 +947,89 @@ export async function dispatchWithFallback(opts) {
   /** @type {{ job: object, resultText: string, stateDir: string|null }[]} */
   const attempts = [];
 
+  let currentSession = runPromptOpts.session;
+  let currentSessionProvenance = runPromptOpts.sessionProvenance;
+  let lastAttemptBackend = null;
+
   for (let i = 0; i < candidates.length; i++) {
     const candidate = candidates[i];
-    const model = parseModel(candidate);
+    const { route: modelStr, backend: candidateBackend } = splitRouteBackend(candidate);
 
-    const result = await doPrompt({ ...runPromptOpts, model });
+    // Cross-backend session guard: when switching backends during the fallback walk,
+    // drop session and dispatch fresh on the new backend (kusabi #470).
+    if (lastAttemptBackend !== null && candidateBackend !== lastAttemptBackend) {
+      currentSession = undefined;
+      currentSessionProvenance = undefined;
+    } else if (currentSession) {
+      if (currentSession.startsWith("ses_") && candidateBackend !== "opencode") {
+        currentSession = undefined;
+        currentSessionProvenance = undefined;
+      } else if (currentSessionProvenance && currentSessionProvenance !== candidateBackend) {
+        currentSession = undefined;
+        currentSessionProvenance = undefined;
+      }
+    }
+
+    let model = null;
+    let result;
+
+    if (candidateBackend === "opencode") {
+      model = parseModel(candidate);
+      const doPrompt = _backendDispatch ? _backendDispatch("opencode") : (_runPrompt || runPrompt);
+      result = await doPrompt({
+        ...runPromptOpts,
+        session: currentSession,
+        sessionProvenance: currentSessionProvenance,
+        model,
+      });
+    } else if (candidateBackend === "agy") {
+      const doAgy = _backendDispatch ? _backendDispatch("agy") : (_agyDispatch || agyDispatch);
+      result = await doAgy({
+        ...runPromptOpts,
+        session: currentSession,
+        sessionProvenance: currentSessionProvenance,
+        explicitModel: modelStr,
+        model: modelStr,
+        tiers: [[modelStr]],
+      });
+    } else if (candidateBackend === "claude") {
+      const doClaude = _backendDispatch ? _backendDispatch("claude") : (_claudeDispatch || (await getClaudeDispatch()));
+      result = await doClaude({
+        ...runPromptOpts,
+        session: currentSession,
+        sessionProvenance: currentSessionProvenance,
+        explicitModel: modelStr,
+        model: modelStr,
+        tiers: [[modelStr]],
+      });
+    } else if (candidateBackend === "cursor") {
+      const doCursor = _backendDispatch ? _backendDispatch("cursor") : (_cursorDispatch || cursorDispatch);
+      result = await doCursor({
+        ...runPromptOpts,
+        session: currentSession,
+        sessionProvenance: currentSessionProvenance,
+        explicitModel: modelStr,
+        model: modelStr,
+        tiers: [[modelStr]],
+      });
+    } else {
+      const doPrompt = _backendDispatch ? _backendDispatch(candidateBackend) : (_runPrompt || runPrompt);
+      result = await doPrompt({
+        ...runPromptOpts,
+        session: currentSession,
+        sessionProvenance: currentSessionProvenance,
+      });
+    }
+
+    lastAttemptBackend = candidateBackend;
     lastJob = result.job;
     lastResultText = result.resultText;
     lastStateDir = result.stateDir;
 
     // Record the route that was actually used (overwrites what runPrompt set).
     lastJob.modelEntry = candidate;
-    lastJob.modelVariant = model?.variant || null;
+    lastJob.modelVariant = candidateBackend === "opencode" ? (model?.variant || null) : null;
+    lastJob.backend = lastJob.backend || candidateBackend;
 
     if (lastJob.status === "provider-error") {
       const nextCandidate = i + 1 < candidates.length ? candidates[i + 1] : null;

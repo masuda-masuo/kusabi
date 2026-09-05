@@ -1226,15 +1226,30 @@ describe("chain per-phase config validation (kusabi #192)", () => {
     return { tmp, stateDir };
   }
 
-  it("a phase array mixing backends fails before chain-dir creation with a nonzero exit", () => {
+  it("a phase array mixing backends passes command-start resolution as a capacity ladder (kusabi #470)", () => {
     const { tmp, stateDir } = makeState({
       models: { phases: { implement: ["claude/opus", "opencode/x:max"] } },
     });
     try {
-      const result = runCompanion(["chain", "--container", "abc123", "brief text"], tmp, stateDir);
+      // chain with no container fails on the container requirement — NOT on
+      // the config: proves the mixed config was accepted at command start.
+      const result = runCompanion(["chain", "brief text"], tmp, stateDir);
+      assert.notEqual(result.status, 0);
+      assert.doesNotMatch(result.stdout, /mixes backends/);
+      assert.match(result.stdout, /chain requires --container/);
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("explicit --backend claude with a mixed phase array fails before chain-dir creation (kusabi #470)", () => {
+    const { tmp, stateDir } = makeState({
+      models: { phases: { implement: ["claude/opus", "opencode/x:max"] } },
+    });
+    try {
+      const result = runCompanion(["chain", "--backend", "claude", "--container", "abc123", "brief text"], tmp, stateDir);
       assert.notEqual(result.status, 0, `expected failure, got: ${result.stdout}`);
-      assert.match(result.stdout, /mixes backends/);
-      assert.match(result.stdout, /single-backend/);
+      assert.match(result.stdout, /--backend claude conflicts with the chain/);
       // Failed at command start: no chain directory was created.
       const hash = crypto.createHash("sha256").update(tmp).digest("hex").slice(0, 12);
       assert.equal(fs.existsSync(path.join(stateDir, hash, "chains")), false);
@@ -1243,14 +1258,14 @@ describe("chain per-phase config validation (kusabi #192)", () => {
     }
   });
 
-  it("a mixed models.chain fails task --phase review at command start too", () => {
+  it("a mixed models.chain fails task --backend claude at command start (kusabi #470)", () => {
     const { tmp, stateDir } = makeState({
       models: { chain: ["claude/opus", "opencode/x:max"] },
     });
     try {
-      const result = runCompanion(["task", "--phase", "review", "do the review"], tmp, stateDir);
+      const result = runCompanion(["task", "--backend", "claude", "--phase", "review", "do the review"], tmp, stateDir);
       assert.notEqual(result.status, 0, `expected failure, got: ${result.stdout}`);
-      assert.match(result.stdout, /mixes backends/);
+      assert.match(result.stdout, /--backend claude conflicts with the chain/);
     } finally {
       fs.rmSync(tmp, { recursive: true, force: true });
     }
@@ -1282,6 +1297,47 @@ describe("chain per-phase config validation (kusabi #192)", () => {
       // Failed at command start: no chain directory was created.
       const hash = crypto.createHash("sha256").update(tmp).digest("hex").slice(0, 12);
       assert.equal(fs.existsSync(path.join(stateDir, hash, "chains")), false);
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("explicit --backend opencode rejects an opencode-first mixed capacity ladder (kusabi #470)", () => {
+    const { tmp, stateDir } = makeState({
+      models: {
+        phases: {
+          implement: [["opencode/mimo-v2.5-free", "agy/gemini-3.8-flash-high"]],
+        },
+      },
+    });
+    try {
+      const result = runCompanion(["chain", "--backend", "opencode", "--container", "abc123", "brief text"], tmp, stateDir);
+      assert.notEqual(result.status, 0, `expected failure, got: ${result.stdout}`);
+      assert.match(result.stdout, /--backend opencode/);
+      assert.match(result.stdout, /mixed-backend/);
+      assert.match(result.stdout, /models\.phases\.implement/);
+      const hash = crypto.createHash("sha256").update(tmp).digest("hex").slice(0, 12);
+      assert.equal(fs.existsSync(path.join(stateDir, hash, "chains")), false);
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("bare --model opus on a claude-first mixed ladder pins claude without parseModel crash (kusabi #470)", () => {
+    const { tmp, stateDir } = makeState({
+      models: {
+        phases: {
+          implement: [["claude/opus", "opencode/mimo-v2.5-free"]],
+          review: [["claude/opus", "opencode/mimo-v2.5-free"]],
+        },
+      },
+    });
+    try {
+      const result = runCompanion(["chain", "--model", "opus", "brief text"], tmp, stateDir);
+      assert.notEqual(result.status, 0);
+      assert.doesNotMatch(result.stdout, /expects provider\/model/);
+      assert.doesNotMatch(result.stdout, /got: opus/);
+      assert.match(result.stdout, /chain requires --container/);
     } finally {
       fs.rmSync(tmp, { recursive: true, force: true });
     }
@@ -1337,7 +1393,7 @@ describe("chain per-phase config validation (kusabi #192)", () => {
 
   // ---- models.phases.rework (kusabi #192 axis 2) — same fail-loud rules ----
 
-  it("a mixed-backend rework array fails before chain-dir creation naming models.phases.rework", () => {
+  it("explicit --backend claude with a mixed-backend rework array fails before chain-dir creation naming models.phases.rework (kusabi #470)", () => {
     const { tmp, stateDir } = makeState({
       models: {
         phases: {
@@ -1347,10 +1403,9 @@ describe("chain per-phase config validation (kusabi #192)", () => {
       },
     });
     try {
-      const result = runCompanion(["chain", "--container", "abc123", "brief text"], tmp, stateDir);
+      const result = runCompanion(["chain", "--backend", "claude", "--container", "abc123", "brief text"], tmp, stateDir);
       assert.notEqual(result.status, 0, `expected failure, got: ${result.stdout}`);
-      assert.match(result.stdout, /mixes backends/);
-      assert.match(result.stdout, /single-backend/);
+      assert.match(result.stdout, /--backend claude conflicts with the chain/);
       assert.match(result.stdout, /models\.phases\.rework/, "the error must name the offending config key");
       // Failed at command start: no chain directory was created.
       const hash = crypto.createHash("sha256").update(tmp).digest("hex").slice(0, 12);

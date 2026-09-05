@@ -1162,27 +1162,23 @@ describe("resolveDispatchBackend — agy routing (criteria 3, 4, 5)", () => {
     );
   });
 
-  it("the single-backend-per-phase rule applies to agy entries too", () => {
+  it("mixed chains resolve to fallback ladder, while explicit --backend agy conflicts (kusabi #470)", () => {
+    const r = resolveDispatchBackend({
+      flags: {},
+      phase: "review",
+      config: { models: { phases: { review: ["agy/gemini-3.6-flash-high", "claude/opus"] } } },
+    });
+    assert.equal(r.backend, "agy");
+    assert.equal(r.dispatch, dispatchWithFallback);
+    assert.deepEqual(r.chain, ["agy/gemini-3.6-flash-high", "claude/opus"]);
+
     assert.throws(
       () => resolveDispatchBackend({
-        flags: {},
-        phase: "review",
-        config: { models: { phases: { review: ["agy/gemini-3.6-flash-high", "claude/opus"] } } },
-      }),
-      (err) => {
-        assert.match(err.message, /mixes backends/);
-        assert.match(err.message, /single-backend/);
-        assert.match(err.message, /models\.phases\.review/);
-        return true;
-      },
-    );
-    assert.throws(
-      () => resolveDispatchBackend({
-        flags: {},
+        flags: { backend: "agy" },
         phase: "review",
         config: { models: { phases: { review: ["agy/gemini-3.6-flash-high", "opencode/x:max"] } } },
       }),
-      /mixes backends/,
+      /--backend agy conflicts with the chain/,
     );
   });
 });

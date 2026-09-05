@@ -7,7 +7,7 @@
 // session never sees intermediate narration, tool logs, or raw events.
 
 
-import { parseArgs, resolveModel, validateChainEntries, splitRouteBackend, resolveChainBackend, stripBackendPrefixChain, resolveModelBackend, chainNamesBackend } from "./cli.mjs";
+import { parseArgs, resolveModel, validateChainEntries, splitRouteBackend, resolveChainBackend, stripBackendPrefixChain, resolveModelBackend, chainNamesBackend, isMixedChain } from "./cli.mjs";
 import { renderJobLine, renderHeader } from "./render.mjs";
 import { hasSectionHeading, parseDeliverables, parseOrchestratorSignature, zeroEntrySections, findFrozenQualifierItems } from "./brief-parsing.mjs";
 import { cmdInstallCli, diagnoseCompanionShim, formatShimSetupLine } from "./install-cli.mjs";
@@ -505,6 +505,7 @@ export function backendPinsModel(backend) {
  * @returns {Function}
  */
 export function phaseDispatchFor(backend, dispatch, model) {
+  if (dispatch === dispatchWithFallback) return dispatch;
   return backendPinsModel(backend) ? clampModelDispatch(dispatch, model ?? null) : dispatch;
 }
 
@@ -664,16 +665,51 @@ function resolveDispatchBackendForPhase({ flags, phase, config, backendFlag }) {
     );
   }
 
-  // ---- THE single decision point ----
-  // Everything below — the dispatch function, the model spelling, and the
-  // backend that model is validated against — derives from this one value.
-  // The chain is consulted ONLY when neither the identifier nor the flag
-  // decided (`??` short-circuits), which is what keeps kusabi #186's
-  // carve-out intact: with the backend already decided and `--model` given,
-  // an opencode-shaped models.chain must not block startup.
-  const backend = namedBackend
-    ?? flagBackend
-    ?? resolveChainBackend(resolveModel({ flag: undefined, phase, config }).chain);
+  // Explicit --backend flag or backend-naming --model takes precedence.
+  // The chain is consulted ONLY when neither decided (kusabi #186 carve-out).
+  if (flagBackend === "claude" || namedBackend === "claude") {
+    return resolveClaudePhaseDispatch({ flags, phase, config, modelSpec });
+  }
+  if (flagBackend === "agy" || namedBackend === "agy") {
+    return resolveAgyPhaseDispatch({ flags, phase, config, modelSpec });
+  }
+  if (flagBackend === "cursor" || namedBackend === "cursor") {
+    return resolveCursorPhaseDispatch({ flags, phase, config, modelSpec });
+  }
+  if (flagBackend === "opencode" || namedBackend === "opencode") {
+    return resolveOpencodePhaseDispatch({ phase, config, modelSpec, namedBackend, flagBackend });
+  }
+
+  // Neither --backend nor a backend-naming --model was passed.
+  // The backend derives from the configured chain (kusabi #470).
+  const rawChain = (phase && config?.models?.phases?.[phase])
+    ? config.models.phases[phase]
+    : config?.models?.chain;
+
+  if (rawChain && isMixedChain(rawChain)) {
+    // Capacity ladders always walk through dispatchWithFallback. A bare
+    // --model alias (no backend/) pins against the ladder's STARTING
+    // backend (#210 / #470 finding 2) — never parseModel on "opus".
+    if (modelSpec && modelSpec.backend === null) {
+      const startBackend = resolveChainBackend(rawChain);
+      if (startBackend === "claude") {
+        return resolveClaudePhaseDispatch({ flags, phase, config, modelSpec });
+      }
+      if (startBackend === "agy") {
+        return resolveAgyPhaseDispatch({ flags, phase, config, modelSpec });
+      }
+      if (startBackend === "cursor") {
+        return resolveCursorPhaseDispatch({ flags, phase, config, modelSpec });
+      }
+      throw flagError(
+        `--model "${flags.model}" on a mixed capacity ladder that starts on opencode ` +
+        `needs provider/model (or a backend-qualified id), not a bare alias`
+      );
+    }
+    return resolveOpencodePhaseDispatch({ phase, config, modelSpec, namedBackend, flagBackend });
+  }
+
+  const backend = resolveChainBackend(resolveModel({ flag: undefined, phase, config }).chain);
 
   if (backend === "claude") return resolveClaudePhaseDispatch({ flags, phase, config, modelSpec });
   if (backend === "agy") return resolveAgyPhaseDispatch({ flags, phase, config, modelSpec });
@@ -697,14 +733,16 @@ function resolveClaudePhaseDispatch({ flags, phase, config, modelSpec }) {
   const chain = stripBackendPrefixChain(resolved.chain);
 
   if (!modelSpec) {
-    // No --model: the model comes from the chain, so the WHOLE chain can be
-    // consulted by a dispatch (a rework/strategize/resume round derives its
-    // model from it) and must be valid here — before createChainDir /
-    // before any job is dispatched — never mid-flight after round 1 (kusabi
-    // #184 finding 1).  The single-backend invariant (kusabi #192) is
-    // checked on the RAW chain: an opencode entry with no :variant would
-    // otherwise pass validateClaudeChain and silently run as a claude model.
-    resolveChainBackend(resolved.chain);
+    if (flags.backend === "claude" && isMixedChain(resolved.chain)) {
+      const chainKey = (phase && config?.models?.phases?.[phase])
+        ? `models.phases.${phase}`
+        : (config?.models?.chain ? "models.chain" : "the built-in default chain");
+      throw new Error(
+        `--backend claude conflicts with the chain of the ${phase ?? "task"} phase ` +
+        `(${chainKey}: ${JSON.stringify(resolved.chain)}) — an explicit --backend forces every phase ` +
+        `onto that backend; remove --backend claude or point ${chainKey} at claude entries`
+      );
+    }
     validateClaudeChain(chain);
     const model = resolved.model == null ? undefined : splitRouteBackend(String(resolved.model)).route;
     if (model != null) validateClaudeModel(model);
@@ -747,13 +785,16 @@ function resolveAgyPhaseDispatch({ flags, phase, config, modelSpec }) {
   const chain = stripBackendPrefixChain(resolved.chain);
 
   if (!modelSpec) {
-    // No --model: the model comes from the chain, so the WHOLE chain can be
-    // consulted by a dispatch and must be valid HERE — before createChainDir
-    // / before any job is dispatched, never mid-flight after round 1.  The
-    // single-backend invariant is checked on the RAW chain: an opencode
-    // entry with no :variant would otherwise pass validateAgyChain and
-    // silently run as an agy model id.
-    resolveChainBackend(resolved.chain);
+    if (flags.backend === "agy" && isMixedChain(resolved.chain)) {
+      const chainKey = (phase && config?.models?.phases?.[phase])
+        ? `models.phases.${phase}`
+        : (config?.models?.chain ? "models.chain" : "the built-in default chain");
+      throw new Error(
+        `--backend agy conflicts with the chain of the ${phase ?? "task"} phase ` +
+        `(${chainKey}: ${JSON.stringify(resolved.chain)}) — an explicit --backend forces every phase ` +
+        `onto that backend; remove --backend agy or point ${chainKey} at agy entries`
+      );
+    }
     validateAgyChain(chain);
     const model = resolved.model == null ? undefined : splitRouteBackend(String(resolved.model)).route;
     if (model != null) validateAgyModel(model);
@@ -786,7 +827,16 @@ function resolveCursorPhaseDispatch({ flags, phase, config, modelSpec }) {
   const chain = stripBackendPrefixChain(resolved.chain);
 
   if (!modelSpec) {
-    resolveChainBackend(resolved.chain);
+    if (flags.backend === "cursor" && isMixedChain(resolved.chain)) {
+      const chainKey = (phase && config?.models?.phases?.[phase])
+        ? `models.phases.${phase}`
+        : (config?.models?.chain ? "models.chain" : "the built-in default chain");
+      throw new Error(
+        `--backend cursor conflicts with the chain of the ${phase ?? "task"} phase ` +
+        `(${chainKey}: ${JSON.stringify(resolved.chain)}) — an explicit --backend forces every phase ` +
+        `onto that backend; remove --backend cursor or point ${chainKey} at cursor entries`
+      );
+    }
     validateCursorChain(chain);
     const model = resolved.model == null ? undefined : splitRouteBackend(String(resolved.model)).route;
     if (model != null) validateCursorModel(model);
@@ -825,12 +875,20 @@ function resolveOpencodePhaseDispatch({ phase, config, modelSpec, namedBackend, 
   // names a backend the operator has stated their intent unambiguously (and
   // a disagreeing --backend already threw above), so firing anyway would
   // reproduce the incident kusabi #210 was filed for.
-  if (flagBackend === "opencode" && namedBackend === null && configuredBackend !== "opencode") {
+  // Explicit --backend opencode forces EVERY phase onto opencode alone.
+  // A mixed capacity ladder (kusabi #470) still contradicts that force even
+  // when the first route is opencode — resolveChainBackend only reports the
+  // starting backend, so isMixedChain is the check that catches free→agy.
+  if (flagBackend === "opencode" && namedBackend === null
+    && (configuredBackend !== "opencode" || isMixedChain(configuredChain))) {
     const chainKey = (phase && config?.models?.phases?.[phase])
       ? `models.phases.${phase}`
       : (config?.models?.chain ? "models.chain" : "the built-in default chain");
+    const other = isMixedChain(configuredChain)
+      ? "mixed-backend"
+      : `${configuredBackend}-native`;
     throw new Error(
-      `--backend opencode conflicts with the ${configuredBackend}-native chain of the ${phase ?? "task"} phase ` +
+      `--backend opencode conflicts with the ${other} chain of the ${phase ?? "task"} phase ` +
       `(${chainKey}: ${JSON.stringify(configuredChain)}) — an explicit --backend forces every phase ` +
       `onto that backend; remove --backend opencode or point ${chainKey} at opencode entries`
     );
@@ -849,7 +907,7 @@ function resolveOpencodePhaseDispatch({ phase, config, modelSpec, namedBackend, 
   }
   return {
     dispatch: dispatchWithFallback,
-    backend: "opencode",
+    backend: namedBackend ?? configuredBackend,
     model: resolved.model,
     explicitModel: modelSpec ? modelSpec.model : null,
     chain,

@@ -2737,23 +2737,24 @@ describe("resolveDispatchBackend (per-phase mixing, kusabi #192)", () => {
     assert.deepEqual(r.chain, ["opus"]);
   });
 
-  it("a phase array mixing backends fails loudly at command start", () => {
-    assert.throws(
-      () => resolveDispatchBackend({
-        flags: {},
-        phase: "implement",
-        config: { models: { phases: { implement: ["claude/opus", "opencode/x:max"] } } },
-      }),
-      /mixes backends/,
-    );
-    assert.throws(
-      () => resolveDispatchBackend({
-        flags: {},
-        phase: "implement",
-        config: { models: { phases: { implement: [["claude/opus"], ["opencode/x:max"]] } } },
-      }),
-      /mixes backends/,
-    );
+  it("a phase array mixing backends resolves to a fallback ladder (kusabi #470)", () => {
+    const r1 = resolveDispatchBackend({
+      flags: {},
+      phase: "implement",
+      config: { models: { phases: { implement: ["claude/opus", "opencode/x:max"] } } },
+    });
+    assert.equal(r1.backend, "claude");
+    assert.equal(r1.dispatch, dispatchWithFallback);
+    assert.deepEqual(r1.chain, ["claude/opus", "opencode/x:max"]);
+
+    const r2 = resolveDispatchBackend({
+      flags: {},
+      phase: "implement",
+      config: { models: { phases: { implement: [["claude/opus"], ["opencode/x:max"]] } } },
+    });
+    assert.equal(r2.backend, "claude");
+    assert.equal(r2.dispatch, dispatchWithFallback);
+    assert.deepEqual(r2.chain, [["claude/opus"], ["opencode/x:max"]]);
   });
 
   it("a claude/<model>:variant entry fails loudly at command start", () => {
@@ -2794,7 +2795,7 @@ describe("resolveDispatchBackend (per-phase mixing, kusabi #192)", () => {
         phase: "implement",
         config: { models: { phases: { implement: ["claude/opus", "opencode/x"] } } },
       }),
-      /mixes backends/,
+      /--backend claude conflicts with the chain/,
     );
   });
 

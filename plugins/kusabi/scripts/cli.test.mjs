@@ -435,7 +435,7 @@ describe("reviewDenyTools", () => {
 // selectRoutes — tiered chain route selection with clamp and failed-route memo
 // =========================================================================
 
-import { selectRoutes, validateChainEntries, firstRoute, splitRouteBackend, resolveChainBackend, stripClaudePrefixChain } from "./cli.mjs";
+import { selectRoutes, validateChainEntries, firstRoute, splitRouteBackend, resolveChainBackend, stripClaudePrefixChain, validateRoute, isMixedChain } from "./cli.mjs";
 
 describe("selectRoutes", () => {
   const tiers = [
@@ -651,26 +651,70 @@ describe("resolveChainBackend", () => {
     assert.equal(resolveChainBackend(["opencode/x:max", "opencode-go/y:max"]), "opencode");
   });
 
-  it("a flat array mixing backends throws with a clear message", () => {
-    assert.throws(
-      () => resolveChainBackend(["claude/opus", "opencode/x:max"]),
-      /mixes backends/,
-    );
-    assert.throws(
-      () => resolveChainBackend(["opencode/x:max", "claude/opus"]),
-      /single-backend/,
-    );
+  it("a flat array mixing backends returns the starting backend (kusabi #470)", () => {
+    assert.equal(resolveChainBackend(["claude/opus", "opencode/x:max"]), "claude");
+    assert.equal(resolveChainBackend(["opencode/x:max", "claude/opus"]), "opencode");
   });
 
-  it("a tiered array mixing backends throws (even across tiers)", () => {
-    assert.throws(
-      () => resolveChainBackend([["claude/opus"], ["opencode/x:max"]]),
-      /mixes backends/,
-    );
+  it("a tiered array mixing backends returns the first route's backend (kusabi #470)", () => {
+    assert.equal(resolveChainBackend([["claude/opus"], ["opencode/x:max"]]), "claude");
+    assert.equal(resolveChainBackend([["opencode/x:max"], ["claude/opus"]]), "opencode");
   });
 
   it("an empty array is opencode (unreachable after validation, graceful anyway)", () => {
     assert.equal(resolveChainBackend([]), "opencode");
+  });
+
+  it("validates per-route syntax and fails loud on bad spelling (kusabi #470)", () => {
+    assert.throws(
+      () => resolveChainBackend(["agy/gemini-3.6-flash-high:max"]),
+      /agy backend does not support the :variant suffix/,
+    );
+    assert.throws(
+      () => resolveChainBackend(["claude/opus:max"]),
+      /claude backend does not support the :variant suffix/,
+    );
+    assert.throws(
+      () => resolveChainBackend(["cursor/default:max"]),
+      /cursor backend does not support the :variant suffix/,
+    );
+    assert.throws(
+      () => resolveChainBackend(["agy/"]),
+      /empty model/,
+    );
+    assert.throws(
+      () => resolveChainBackend(["invalidopencode"]),
+      /expects provider\/model/,
+    );
+  });
+});
+
+describe("validateRoute (kusabi #470)", () => {
+  it("accepts valid opencode routes with or without variant", () => {
+    assert.deepEqual(validateRoute("opencode/model:max"), { route: "opencode/model:max", backend: "opencode" });
+    assert.deepEqual(validateRoute("provider/model"), { route: "provider/model", backend: "opencode" });
+  });
+
+  it("accepts valid prefixed routes for agy, claude, cursor", () => {
+    assert.deepEqual(validateRoute("agy/gemini-3.8-flash-high"), { route: "gemini-3.8-flash-high", backend: "agy" });
+    assert.deepEqual(validateRoute("claude/opus"), { route: "opus", backend: "claude" });
+    assert.deepEqual(validateRoute("cursor/default"), { route: "default", backend: "cursor" });
+  });
+
+  it("rejects :variant on non-opencode backends", () => {
+    assert.throws(() => validateRoute("agy/gemini:high"), /agy backend does not support the :variant suffix/);
+    assert.throws(() => validateRoute("claude/sonnet:max"), /claude backend does not support the :variant suffix/);
+    assert.throws(() => validateRoute("cursor/model:fast"), /cursor backend does not support the :variant suffix/);
+  });
+
+  it("rejects empty prefix models", () => {
+    assert.throws(() => validateRoute("agy/"), /empty model/);
+    assert.throws(() => validateRoute("claude/"), /empty model/);
+  });
+
+  it("rejects malformed opencode routes", () => {
+    assert.throws(() => validateRoute("noslash"), /expects provider\/model/);
+    assert.throws(() => validateRoute("p/m:"), /empty variant/);
   });
 });
 
@@ -747,5 +791,18 @@ describe("chainNamesBackend", () => {
   it("is a probe, not the invariant check: a mixed chain does not throw", () => {
     assert.equal(chainNamesBackend(["claude/opus", "opencode/x:max"], "claude"), true);
     assert.equal(chainNamesBackend(["claude/opus", "opencode/x:max"], "opencode"), true);
+  });
+});
+
+describe("isMixedChain", () => {
+  it("returns false for an empty chain or single-backend chains", () => {
+    assert.equal(isMixedChain([]), false);
+    assert.equal(isMixedChain(["claude/opus", "claude/sonnet"]), false);
+    assert.equal(isMixedChain([["opencode/a:max"], ["opencode/b:max"]]), false);
+  });
+
+  it("returns true when entries span multiple backends", () => {
+    assert.equal(isMixedChain(["claude/opus", "opencode/x:max"]), true);
+    assert.equal(isMixedChain([["opencode/a:max"], ["agy/gemini-3.6-flash-high"]]), true);
   });
 });
