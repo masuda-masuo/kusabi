@@ -534,6 +534,23 @@ The one place the disposition set lies is **after a `chain-resume`**: `rearmChai
 
 **`chain-detach` — background launch and wait handoff.** Launches a chain in a detached background process and prints a runnable `chain-wait` command line (`kusabi-companion chain-wait --next --since <ISO> ...`), eliminating hand-rolled backgrounding and PID tracking. Pre-flight checks (brief-file resolution, publish warning, lossy-smoke refusal, session provenance, container requirement, and dispatch-time brief lint) run before child spawn so invalid dispatches exit non-zero immediately without spawning a background child or printing a wait command line. It accepts the same flags as `chain` (`--container <cid>`, `--model <identifier>`, `--backend opencode|claude|agy|cursor`, `--brief-file <path>`, `--max-rounds <N>`, `--session <id>`, `--timeout <s>`, `--watchdog <s>`, `--deny <tools>`, `--keep-serve`) and forwards tracking flags (`--appear-timeout <s>`, `--poll-interval <s>`, `--progress-timeout <s>`, `--since <ISO>`) into the generated `chain-wait` invocation. The operator (or orchestrator harness) waits on the **chain id** via `chain-wait`, not on a hand-rolled process watcher.
 
+#### 3.5.7c Terminal inbox + kaiba agenda auto-add (kusabi #472)
+
+`chain-wait` is a session-bound poll — it only notifies the session that launched it. Orchestrators miss completion when `chain-wait` dies, is never armed, or runs in a different session. The **host-side, surface-agnostic notify** fires from `finalizeChainControl()` on every terminal path (completed / cancelled / failed), covering all chains regardless of whether a wait is watching.
+
+**Inbox file.** On terminal status, `notifyChainTerminal` writes `{stateDir}/inbox/{chainId}.md` (creates `inbox/` as needed). The file contains the chain id, control status, disposition (if known), container, absolute inbox path, and an instruction to run `kusabi-companion chain-show {chainId}`. Writes are idempotent — overwriting the same path on re-entry is fine.
+
+**Kaiba agenda.** Best-effort append to the kaiba `actions` table via `node:sqlite` (WAL mode). The path resolution follows `kaiba-progress-watch.mjs` style: honour `KAIBA_DB` env var, fall back to `~/.kaiba/kaiba.db`. Dedup: if any open row (`done_at IS NULL`) already contains the chain id as a substring, the insert is skipped. Position is `MAX(position) + 1.0` over open rows, or `1.0` if none. Author is `KUSABI_AGENDA_AUTHOR` env var or `"kusabi"`. Content follows the pattern:
+```
+Inspect {cwdLabel} {chainId} (status={status}, disposition={disposition}) container={container} — chain-show then adjudicate/publish/record. inbox={inboxPath}
+```
+
+**Fail-soft.** The kaiba write is wrapped in try/catch. Missing DB, missing `actions` table, SQL errors — all log-and-continue. The inbox file is always written; the agenda row is best-effort. Chain finalisation is never prevented by notify errors.
+
+**Opt-out.** Set `KUSABI_CHAIN_NOTIFY=0` to skip both inbox and agenda writes entirely (returns `{ skipped: true }`).
+
+**Wiring.** `finalizeChainControl()` calls `notifyChainTerminal` after a successful control write when the status is terminal. It reads `chain.json` for disposition and container, and derives the brief filename for `cwdLabel`. The stale-chain cancellation path in `requestChainStop()` also notifies. No second detach waiter is required for correctness — `chain-wait` remains for same-session blocking only.
+
 ### 3.5.8 metrics store (ingest) — implemented
 
 `metrics-db.mjs`, `transcript-ingest.mjs`, `chain-ingest.mjs`. A durable SQLite digest of two perishable/durable data sources, feeding the token-efficiency work (#83) and brief/outcome correlation work (#81). **Ingest + store only** — the write side lives here; the query/report surface it was built to feed is delivered and documented in §3.5.9.

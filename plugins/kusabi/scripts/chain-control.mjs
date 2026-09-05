@@ -15,6 +15,35 @@ import fs from "node:fs";
 import path from "node:path";
 import process from "node:process";
 import { readJson, writeJson } from "./state-paths.mjs";
+import { notifyChainTerminal, stateDirForChain } from "./chain-notify.mjs";
+
+/**
+ * Build args for notifyChainTerminal from a chain directory + control record.
+ * Shared by finalizeChainControl and the stale-pid path in requestChainStop.
+ *
+ * @param {string} chainDir
+ * @param {object} existing — control record
+ * @param {string} status — completed / cancelled / failed
+ * @returns {object}
+ */
+export function buildNotifyArgs(chainDir, existing, status) {
+  const chainJson = readJson(path.join(chainDir, "chain.json"));
+  const chainId = existing.chainId || (chainJson && chainJson.chainId) || path.basename(chainDir);
+  const disposition = chainJson?.disposition?.disposition ?? null;
+  const container = existing.container || chainJson?.container || null;
+  let cwdLabel = "";
+  if (chainJson?.brief) {
+    cwdLabel = path.basename(chainJson.brief, path.extname(chainJson.brief));
+  }
+  return {
+    stateDir: stateDirForChain(chainDir),
+    chainId,
+    status,
+    disposition,
+    container,
+    cwdLabel,
+  };
+}
 
 /** @returns {string} */
 export function chainControlFilePath(chainDir) {
@@ -96,6 +125,12 @@ export function requestChainStop(chainDir, requestedBy) {
         stopRequestedAt: new Date().toISOString(),
         finishedAt: new Date().toISOString(),
       });
+      // Host-side terminal notification for stale-chain cancellation
+      try {
+        notifyChainTerminal(buildNotifyArgs(chainDir, existing, "cancelled"));
+      } catch {
+        // Best-effort — never fail the chain for notify errors
+      }
       return { chainId: existing.chainId, wasRunning: false, wasStale: true };
     }
   }
@@ -243,6 +278,16 @@ export function finalizeChainControl({ chainDir, status, round }) {
     round,
     finishedAt: new Date().toISOString(),
   });
+
+  // Host-side terminal notification: inbox file + best-effort kaiba agenda.
+  // Fail-soft — notify errors must never prevent the chain from finalising.
+  if (["completed", "cancelled", "failed"].includes(status)) {
+    try {
+      notifyChainTerminal(buildNotifyArgs(chainDir, existing, status));
+    } catch {
+      // Best-effort — never fail the chain for notify errors
+    }
+  }
 }
 
 /**

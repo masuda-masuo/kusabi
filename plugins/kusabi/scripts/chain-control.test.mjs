@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import os from "node:os";
 import path from "node:path";
 import fs from "node:fs";
+import { DatabaseSync } from "node:sqlite";
 import {
   chainControlFilePath,
   readChainControl,
@@ -18,6 +19,7 @@ import {
   chainIdForJob,
   listChainDirs,
   collectChainStatuses,
+  buildNotifyArgs,
 } from "./chain-control.mjs";
 
 // ---------------------------------------------------------------------------
@@ -269,13 +271,21 @@ describe("updateChainControlRound", () => {
 
 describe("finalizeChainControl", () => {
   let tmpDir;
+  let prevNotify;
 
   beforeEach(() => {
     tmpDir = makeTmpDir();
+    // Existing tests use a flat tmpDir as chainDir; without a proper
+    // stateDir/chains/<id> layout, notify would resolve to a bad root.
+    // Opt out for the status-field tests; the notify path has its own test.
+    prevNotify = process.env.KUSABI_CHAIN_NOTIFY;
+    process.env.KUSABI_CHAIN_NOTIFY = "0";
   });
 
   afterEach(() => {
     fs.rmSync(tmpDir, { recursive: true, force: true });
+    if (prevNotify === undefined) delete process.env.KUSABI_CHAIN_NOTIFY;
+    else process.env.KUSABI_CHAIN_NOTIFY = prevNotify;
   });
 
   it("sets status to completed and records finishedAt", () => {
@@ -313,6 +323,60 @@ describe("finalizeChainControl", () => {
   it("does nothing when no control file exists", () => {
     finalizeChainControl({ chainDir: tmpDir, status: "completed", round: 1 });
     assert.equal(readChainControl(tmpDir), null);
+  });
+
+  it("writes inbox under stateDir when notify is enabled", () => {
+    if (prevNotify === undefined) delete process.env.KUSABI_CHAIN_NOTIFY;
+    else process.env.KUSABI_CHAIN_NOTIFY = prevNotify;
+
+    const stateDir = tmpDir;
+    const chainDir = path.join(stateDir, "chains", "chain-notify-wire");
+    fs.mkdirSync(chainDir, { recursive: true });
+    writeChainControl(chainDir, {
+      chainId: "chain-notify-wire",
+      container: "cid-wire",
+      pid: 123,
+      status: "running",
+      round: 0,
+    });
+    fs.writeFileSync(
+      path.join(chainDir, "chain.json"),
+      JSON.stringify({
+        chainId: "chain-notify-wire",
+        container: "cid-wire",
+        disposition: { disposition: "accept", round: 1 },
+        brief: "/tmp/briefs/demo.md",
+      }),
+      "utf8",
+    );
+
+    const kaibaDb = path.join(stateDir, "kaiba.db");
+    const db = new DatabaseSync(kaibaDb, { open: true, write: true });
+    db.exec(
+      "CREATE TABLE actions (id INTEGER PRIMARY KEY AUTOINCREMENT, content TEXT NOT NULL, position REAL NOT NULL, author TEXT, created_at TEXT NOT NULL, done_at TEXT)"
+    );
+    db.close();
+
+    const prevDb = process.env.KAIBA_DB;
+    process.env.KAIBA_DB = kaibaDb;
+    try {
+      finalizeChainControl({ chainDir, status: "completed", round: 1 });
+    } finally {
+      if (prevDb === undefined) delete process.env.KAIBA_DB;
+      else process.env.KAIBA_DB = prevDb;
+    }
+
+    const inboxPath = path.join(stateDir, "inbox", "chain-notify-wire.md");
+    assert.ok(fs.existsSync(inboxPath), "inbox file should exist");
+    const body = fs.readFileSync(inboxPath, "utf8");
+    assert.ok(body.includes("chain-notify-wire"));
+    assert.ok(body.includes("completed"));
+
+    const args = buildNotifyArgs(chainDir, readChainControl(chainDir), "completed");
+    assert.equal(args.chainId, "chain-notify-wire");
+    assert.equal(args.disposition, "accept");
+    assert.equal(args.container, "cid-wire");
+    assert.equal(args.cwdLabel, "demo");
   });
 });
 
