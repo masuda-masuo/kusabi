@@ -278,6 +278,33 @@ host `~/.claude.json` (`mcpServers.sunaba`) into a generated
 with `KUSABI_CLAUDE_MCP_SOURCE`; a missing entry is a clear error. See
 `docs/design/phase-chain.md` §3.5.11 for the v1 limits and failure semantics.
 
+#### Mixed-backend capacity ladders (kusabi #470)
+
+A phase's model chain (in `models.chain` or `models.phases.<phase>`) may mix
+routes across backends to form a same-phase capacity escalation ladder — for example,
+trying free opencode routes first and falling back to agy when provider capacity or
+quota is exhausted:
+
+```json
+{
+  "models": {
+    "phases": {
+      "implement": [
+        ["opencode/deepseek-v4-flash-free:max", "agy/gemini-3.8-flash-high"]
+      ]
+    }
+  }
+}
+```
+
+When a provider error triggers capacity fallback across backend boundaries, the
+in-flight session is automatically dropped because session IDs are backend-specific
+(`ses_*` for opencode vs UUIDs for claude/agy); the newly targeted backend starts
+a fresh session cleanly. If `--model` is explicitly specified, it pins the phase
+and prevents walking to subsequent routes. Passing an explicit `--backend <backend>`
+flag enforces that all phases run strictly on that single backend, failing at command
+start if a mixed chain is configured.
+
 ### Pre-dispatch session-quota guard (claude backend only)
 
 A claude dispatch can start into a session window that is nearly exhausted:

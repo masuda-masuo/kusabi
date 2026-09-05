@@ -347,44 +347,93 @@ export function chainNamesBackend(chain, backend) {
 }
 
 /**
- * Determine the single backend of a (tiered) chain array from its entries.
+ * Validate a single route string against its backend syntax (kusabi #470).
  *
- * kusabi #192 invariant: one phase's chain array is single-backend.  An
- * array mixing entries of two backends (`claude/` with opencode, `agy/`
- * with `claude/`, …) is a config error and throws — the per-phase backend
- * would be ambiguous.  The check runs at command start
- * (resolveDispatchBackend), before createChainDir and before any job is
- * dispatched.  Per-route mixed ladders within one phase are out of scope by
- * design.
+ * opencode routes: provider/model[:variant] (via parseModel)
+ * agy / claude / cursor: plain model ids (no :variant suffix)
+ * Empty prefix (e.g. "agy/") is rejected by splitRouteBackend.
  *
- * The message names the TWO backends actually found rather than a hardcoded
- * pair, so a third backend (kusabi #199) reports itself instead of being
- * described as something it is not.
+ * @param {string} route
+ * @returns {{ route: string, backend: "opencode"|"claude"|"agy"|"cursor" }}
+ * @throws {Error} On invalid model syntax, :variant suffix for non-opencode, or empty prefix.
+ */
+export function validateRoute(route) {
+  const { route: model, backend } = splitRouteBackend(route);
+  if (backend === "opencode") {
+    parseModel(route);
+  } else if (backend === "agy") {
+    if (model.includes(":")) {
+      throw new Error(
+        `agy backend does not support the :variant suffix in model "${model}" — ` +
+        "use a plain agy model id (e.g. gemini-3.6-flash-high); the agy CLI validates which ids exist"
+      );
+    }
+  } else if (backend === "claude") {
+    if (model.includes(":")) {
+      throw new Error(
+        `claude backend does not support the :variant suffix in model "${model}" — ` +
+        "use a bare alias (opus, sonnet, haiku) or a full model id (e.g. claude-sonnet-4-5)"
+      );
+    }
+  } else if (backend === "cursor") {
+    if (model.includes(":")) {
+      throw new Error(
+        `cursor backend does not support the :variant suffix in model "${model}" — ` +
+        "use a plain cursor model id or the literal default"
+      );
+    }
+  }
+  return { route: model, backend };
+}
+
+/**
+ * True when a (tiered) chain array contains routes from more than one backend (kusabi #470).
  *
  * @param {(string|string[])[]} chain
- * @returns {"opencode"|"claude"|"agy"} The chain's single backend
- *          ("opencode" for an empty/unknown chain, which callers never reach
- *          post-validation).
- * @throws {Error} When the array mixes two backends' entries.
+ * @returns {boolean}
  */
-export function resolveChainBackend(chain) {
-  let backend = null;
+export function isMixedChain(chain) {
+  let first = null;
   for (const tier of Array.isArray(chain) ? chain : []) {
     const routes = Array.isArray(tier) ? tier : [tier];
     for (const route of routes) {
-      const b = splitRouteBackend(route).backend;
-      if (backend === null) {
-        backend = b;
-      } else if (backend !== b) {
-        throw new Error(
-          `kusabi config: chain mixes backends — one chain array contains both ${backend} and ${b} entries ` +
-          `(${JSON.stringify(chain)}); each phase's chain must be single-backend (per-phase mixing is ` +
-          `across phases, never within one array)`
-        );
+      const { backend } = splitRouteBackend(route);
+      if (first === null) {
+        first = backend;
+      } else if (first !== backend) {
+        return true;
       }
     }
   }
-  return backend ?? "opencode";
+  return false;
+}
+
+/**
+ * Determine the starting backend of a (tiered) chain array from its entries.
+ *
+ * Under kusabi #470, one phase's chain array may mix backends to form a capacity
+ * escalation ladder (e.g. opencode free routes falling through to agy).
+ * resolveChainBackend stops throwing solely because an array mixes backends;
+ * instead, it returns the backend of the first route in the chain (defaulting
+ * to "opencode" when empty).
+ * Every route is validated against its own backend syntax (validateRoute).
+ *
+ * @param {(string|string[])[]} chain
+ * @returns {"opencode"|"claude"|"agy"|"cursor"} The chain's starting backend
+ * @throws {Error} On per-route bad spelling or empty model prefix.
+ */
+export function resolveChainBackend(chain) {
+  let firstBackend = null;
+  for (const tier of Array.isArray(chain) ? chain : []) {
+    const routes = Array.isArray(tier) ? tier : [tier];
+    for (const route of routes) {
+      const { backend } = validateRoute(route);
+      if (firstBackend === null) {
+        firstBackend = backend;
+      }
+    }
+  }
+  return firstBackend ?? "opencode";
 }
 
 /**

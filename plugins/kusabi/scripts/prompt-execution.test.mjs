@@ -412,6 +412,87 @@ describe("dispatchWithFallback", () => {
     assert.ok(failedRoutes.has("route/flash-free"));
   });
 
+  it("fake-dispatch: tier [['opencode/a', 'opencode/b', 'agy/gemini-3.8-flash-high']], first two provider-error, third succeeds on agy without opencode session (kusabi #470)", async () => {
+    let callCount = 0;
+    const opencodeSessions = [];
+    const fakeRunner = async (opts) => {
+      callCount++;
+      opencodeSessions.push(opts.session);
+      return fakeResult("provider-error", {
+        retry: { reason: "rate_limit", message: "temporarily unavailable", attempt: 1, count: 1, terminal: false },
+      });
+    };
+
+    let agyCalled = false;
+    let agyOptsReceived = null;
+    const fakeAgyDispatch = async (opts) => {
+      agyCalled = true;
+      agyOptsReceived = opts;
+      return fakeResult("completed", {
+        id: "agy-job-470",
+        resultText: "agy work complete",
+        backend: "agy",
+      });
+    };
+
+    const { job, resultText } = await dispatchWithFallback({
+      _runPrompt: fakeRunner,
+      _agyDispatch: fakeAgyDispatch,
+      tiers: [["opencode/a", "opencode/b", "agy/gemini-3.8-flash-high"]],
+      round: 1,
+      session: "ses_opencode_active_session",
+      sessionProvenance: "opencode",
+      kind: "task",
+      promptText: "do implement",
+    });
+
+    assert.equal(callCount, 2, "both opencode candidates were tried");
+    assert.deepEqual(opencodeSessions, ["ses_opencode_active_session", "ses_opencode_active_session"], "opencode candidates received session");
+    assert.equal(agyCalled, true, "agy candidate was called");
+    assert.equal(agyOptsReceived.session, undefined, "agy attempt did not receive the opencode session id");
+    assert.equal(agyOptsReceived.explicitModel, "gemini-3.8-flash-high");
+    assert.equal(job.status, "completed");
+    assert.equal(job.backend, "agy");
+    assert.equal(resultText, "agy work complete");
+    assert.ok(Array.isArray(job.fallbacks));
+    assert.ok(job.fallbacks.length >= 2, "fallbacks length >= 2");
+    assert.equal(job.fallbacks[0].from, "opencode/a");
+    assert.equal(job.fallbacks[0].to, "opencode/b");
+    assert.equal(job.fallbacks[1].from, "opencode/b");
+    assert.equal(job.fallbacks[1].to, "agy/gemini-3.8-flash-high");
+  });
+
+  it("pin test: mixed config + explicitModel for an opencode route that fails terminally does not walk to agy (kusabi #470)", async () => {
+    let opencodeCalls = 0;
+    const fakeRunner = async () => {
+      opencodeCalls++;
+      return fakeResult("provider-error", {
+        retry: { reason: "free_tier_limit", message: "quota exhausted", attempt: 1, count: 1, terminal: true },
+      });
+    };
+
+    let agyCalls = 0;
+    const fakeAgyDispatch = async () => {
+      agyCalls++;
+      return fakeResult("completed", { backend: "agy" });
+    };
+
+    const { job } = await dispatchWithFallback({
+      _runPrompt: fakeRunner,
+      _agyDispatch: fakeAgyDispatch,
+      tiers: [["opencode/a", "opencode/b", "agy/gemini-3.8-flash-high"]],
+      explicitModel: "opencode/a",
+      round: 1,
+      kind: "task",
+      promptText: "pinned task",
+    });
+
+    assert.equal(opencodeCalls, 1, "only pinned model was attempted");
+    assert.equal(agyCalls, 0, "did not walk to agy");
+    assert.equal(job.status, "provider-error");
+    assert.ok(failedRoutes.has("opencode/a"));
+  });
+
   it("every route fails → returns provider-error with exhaustive error", async () => {
     let callCount = 0;
     const fakeRunner = async () => {
