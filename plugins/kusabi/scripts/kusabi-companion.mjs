@@ -1040,14 +1040,57 @@ function cmdStatus(cwd, { text }) {
   return lines.join("\n");
 }
 
-function cmdResult(cwd, { text }) {
+function cmdResult(cwd, { flags, text }) {
   const stateDir = stateDirFor(cwd);
   const jobId = text.split(/\s+/).filter(Boolean)[0];
   const job = jobId ? loadJob(stateDir, jobId) : latestJob(stateDir, (j) => j.status === "completed");
   if (!job) return jobId ? `no such job: ${jobId}` : "no completed jobs for this directory yet.";
   const resultFile = path.join(jobDir(stateDir, job.id), "result.md");
   const body = fs.existsSync(resultFile) ? fs.readFileSync(resultFile, "utf8") : "(no stored result)";
-  return `${renderHeader(job)}${body}`;
+
+  // --full: restore the original behaviour — header + full result.md body.
+  if (flags?.full) {
+    return `${renderHeader(job)}${body}`;
+  }
+
+  // Default: compact output.
+  const header = renderHeader(job);
+  const chainId = chainIdForJob(job);
+  if (chainId) {
+    // Chain job: point at chain-show instead of dumping the full result.
+    return `${header}Chain: ${chainId}\nRun: kusabi-companion chain-show ${chainId}\n`;
+  }
+
+  // Non-chain job: compact summary — extract verdict/summary from JSONL if
+  // present, otherwise a short truncated preview (≤40 lines or ≤2 KiB).
+  if (body === "(no stored result)") {
+    return `${header}(no stored result)\n`;
+  }
+  // Try to extract a verdict or summary line from JSONL.
+  const lines = body.split("\n");
+  let verdictLine = null;
+  for (const line of lines) {
+    try {
+      const obj = JSON.parse(line);
+      if (obj?.type === "verdict") {
+        const parts = [];
+        if (obj.verdict) parts.push(`verdict: ${obj.verdict}`);
+        if (obj.summary) parts.push(`summary: ${obj.summary}`);
+        if (parts.length) { verdictLine = parts.join(" | "); break; }
+      }
+    } catch { /* not JSONL — skip */ }
+  }
+  if (verdictLine) {
+    return `${header}${verdictLine}\n`;
+  }
+  // Truncated preview: ≤40 lines, hard-capped at 2 KiB.
+  const PREVIEW_MAX_LINES = 40;
+  const PREVIEW_MAX_BYTES = 2048;
+  const preview = lines.slice(0, PREVIEW_MAX_LINES).join("\n");
+  const truncated = preview.length > PREVIEW_MAX_BYTES ? preview.slice(0, PREVIEW_MAX_BYTES) + "…" : preview;
+  const skipped = lines.length - Math.min(lines.length, PREVIEW_MAX_LINES);
+  const suffix = skipped > 0 ? `\n… (${skipped} more lines — use --full for the full result)` : "";
+  return `${header}${truncated}${suffix}\n`;
 }
 
 /**
@@ -1317,7 +1360,7 @@ function usage() {
     "  dashboard  Serve a read-only local JSON API over the state root and metrics.db (no LLM, no writes)",
     "  chain-cancel  Request a running chain to stop (file-based, works across processes)",
     "  status     List recent jobs or show one by ID",
-    "  result     Show completed job result (latest, or by ID)",
+    "  result     Show completed job result (latest, or by ID; --full for the full body)",
     "  cancel     Cancel a running job",
     "  serve-stop Stop the background opencode server and remove its state file",
     "  install-agents  Copy phase agent definitions to OPENCODE_AGENT_DIR and skills to OPENCODE_SKILL_DIR",
@@ -1335,6 +1378,7 @@ function usage() {
     "  --brief-file <path> (task / chain: read the brief from a file; exclusive with inline text)",
     "  --container <cid> (chain/task: container to run deterministic probes in; NOT supported by review)",
     "  --keep-serve (chain / chain-resume: keep the serve alive after the chain finishes)",
+    "  --full (result: show the full stored result body instead of the compact default)",
     "  --force (serve-stop: force kill the serve even when jobs are running)",
     "  --cursor-rule (install-cli: also symlink the alwaysApply kusabi-delegate rule into <cursor dir>/rules; opt-in, since it taxes every conversation on the machine)",
     "  --prior <text> (review: prior findings for anti-ratchet)",

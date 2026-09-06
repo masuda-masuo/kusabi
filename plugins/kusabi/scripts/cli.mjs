@@ -29,7 +29,7 @@ export function parseArgs(argv) {
       arg === "--auto" || arg === "--read-only" || arg === "--resume-last" ||
       arg === "--wait" || arg === "--background" || arg === "--keep-serve" || arg === "--help" || arg === "-h" ||
       arg === "--force" || arg === "--dry-run" || arg === "--json" || arg === "--cursor-rule" ||
-      arg === "--next"
+      arg === "--next" || arg === "--full"
     ) {
       const key = arg.startsWith("--")
         ? arg.slice(2).replace(/-([a-z])/g, (_, c) => c.toUpperCase())
