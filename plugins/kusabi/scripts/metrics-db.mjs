@@ -814,6 +814,19 @@ export function deleteCursorTurnsForSession(db, sessionId) {
   return Number(result.changes ?? 0);
 }
 
+/**
+ * Read a single turn row by request_id.
+ *
+ * @param {import("node:sqlite").DatabaseSync} db
+ * @param {string} requestId
+ * @returns {object | undefined}
+ */
+export function getTurn(db, requestId) {
+  return db.prepare(
+    "SELECT * FROM turn WHERE request_id = $requestId"
+  ).get({ requestId });
+}
+
 export function countRows(db, table) {
   return db.prepare(`SELECT COUNT(*) as c FROM ${table}`).get().c;
 }
