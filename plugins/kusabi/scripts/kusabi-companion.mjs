@@ -1321,7 +1321,7 @@ function usage() {
     "  cancel     Cancel a running job",
     "  serve-stop Stop the background opencode server and remove its state file",
     "  install-agents  Copy phase agent definitions to OPENCODE_AGENT_DIR and skills to OPENCODE_SKILL_DIR",
-    "  install-cli  Write a kusabi-companion shim to $KUSABI_BIN_DIR (default ~/.local/bin), and symlink the delegate / kusabi-result-handling skills into $KUSABI_CURSOR_DIR/skills (default ~/.cursor/skills) when that directory exists",
+    "  install-cli  Write a kusabi-companion shim to $KUSABI_BIN_DIR (default ~/.local/bin), and symlink the delegate / kusabi-result-handling skills into $KUSABI_CURSOR_DIR/skills (default ~/.cursor/skills) and $KUSABI_CODEX_DIR/skills (default ~/.codex/skills) when those directories exist",
     "  salvage    Salvage a dead job (inspect progress and produce structured report)",
     "  baseline   Report collected test count, gate states, and optional smoke baseline for a container (read-only, no LLM)",
     "  help       Show this help message",
