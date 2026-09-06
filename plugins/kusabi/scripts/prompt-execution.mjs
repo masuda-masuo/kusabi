@@ -20,6 +20,15 @@ async function getClaudeDispatch() {
   }
   return _cachedClaudeDispatch;
 }
+
+let _cachedTranslateDenyTools = null;
+async function translateDenyToolsForFallback(tools) {
+  if (!_cachedTranslateDenyTools) {
+    const mod = await import("./claude" + "-dispatch.mjs");
+    _cachedTranslateDenyTools = mod.translateDenyTools;
+  }
+  return _cachedTranslateDenyTools(tools);
+}
 import { resolveCompletedResult } from "./result-recovery.mjs";
 import { deriveStopReason } from "./stop-reason.mjs";
 import { startKaibaProgressWatch } from "./kaiba-progress-watch.mjs";
@@ -906,6 +915,7 @@ export async function dispatchWithFallback(opts) {
     round,
     tierIndex,
     explicitModel,
+    explicitRestrictions = false,
     _runPrompt,
     _agyDispatch,
     _claudeDispatch,
@@ -913,12 +923,26 @@ export async function dispatchWithFallback(opts) {
     _backendDispatch,
     ...runPromptOpts
   } = opts;
-  const candidates = selectRoutes({ tiers, round, tierIndex, explicitModel, failedRoutes });
+  const routeCandidates = selectRoutes({ tiers, round, tierIndex, explicitModel, failedRoutes });
+  const skippedRestrictedRoutes = [];
+  const candidates = routeCandidates.filter((candidate) => {
+    const { backend: candidateBackend } = splitRouteBackend(candidate);
+    if (explicitRestrictions && (candidateBackend === "agy" || candidateBackend === "cursor")) {
+      skippedRestrictedRoutes.push({
+        route: candidate,
+        reason: `explicit tool restriction cannot be applied on the ${candidateBackend} backend; candidate skipped`,
+      });
+      return false;
+    }
+    return true;
+  });
 
   if (candidates.length === 0) {
-    const errorMsg = explicitModel && failedRoutes.has(explicitModel)
-      ? `Pinned model "${explicitModel}" has already failed terminally in this process.`
-      : "No available routes: all routes have failed or the chain is empty.";
+    const errorMsg = skippedRestrictedRoutes.length > 0
+      ? `No compatible routes: ${skippedRestrictedRoutes.map((entry) => `${entry.route} — ${entry.reason}`).join("; ")}`
+      : explicitModel && failedRoutes.has(explicitModel)
+        ? `Pinned model "${explicitModel}" has already failed terminally in this process.`
+        : "No available routes: all routes have failed or the chain is empty.";
     const errorJob = {
       id: "no-route-" + Date.now(),
       kind: runPromptOpts.kind || "task",
@@ -996,6 +1020,7 @@ export async function dispatchWithFallback(opts) {
       const doClaude = _backendDispatch ? _backendDispatch("claude") : (_claudeDispatch || (await getClaudeDispatch()));
       result = await doClaude({
         ...runPromptOpts,
+        ...(explicitRestrictions ? { tools: await translateDenyToolsForFallback(runPromptOpts.tools) } : {}),
         session: currentSession,
         sessionProvenance: currentSessionProvenance,
         explicitModel: modelStr,
@@ -1104,7 +1129,11 @@ export async function dispatchWithFallback(opts) {
 
   primaryJob.fallbacks = exhaustedFallbacks;
   primaryJob.status = "provider-error";
-  primaryJob.error = renderAllExhaustedError({ candidates, fallbacks: exhaustedFallbacks });
+  primaryJob.error = renderAllExhaustedError({
+    candidates: routeCandidates,
+    fallbacks: exhaustedFallbacks,
+    skippedRestrictedRoutes,
+  });
   // Closed terminal reason (kusabi #380): every route dead is a provider-side
   // failure regardless of how the last route happened to die.
   primaryJob.stopReason = deriveStopReason({ status: "provider-error" });
@@ -1140,14 +1169,18 @@ function attemptSteps(job) {
  * @param {object}   opts
  * @param {string[]} opts.candidates
  * @param {{ from: string, reason: string|null, attempt: number, message: string|null }[]} opts.fallbacks
+ * @param {{ route: string, reason: string }[]} [opts.skippedRestrictedRoutes]
  * @returns {string}
  */
-function renderAllExhaustedError({ candidates, fallbacks }) {
+function renderAllExhaustedError({ candidates, fallbacks, skippedRestrictedRoutes = [] }) {
   const parts = ["All routes exhausted:"];
   for (const c of candidates) {
     const fb = fallbacks.find(function (f) { return f.from === c; });
+    const skipped = skippedRestrictedRoutes.find(function (entry) { return entry.route === c; });
     if (fb) {
       parts.push(`  ${c} — ${fb.reason || "retry"} at attempt ${fb.attempt}${fb.message ? ": " + fb.message : ""}`);
+    } else if (skipped) {
+      parts.push(`  ${c} — ${skipped.reason}`);
     } else {
       parts.push(`  ${c} — (not attempted)`);
     }

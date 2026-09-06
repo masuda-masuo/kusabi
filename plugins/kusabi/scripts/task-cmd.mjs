@@ -389,6 +389,10 @@ export async function cmdTask(cwd, { flags, text }) {
     tiers: modelChain,
     round: 1,
     explicitModel,
+    // Only CLI-specified --read-only/--deny restrictions are hard constraints
+    // across fallback backends. Phase-default deny maps are intentionally
+    // backend-specific and retain their existing fallback behavior.
+    explicitRestrictions: Boolean(flags.readOnly || flags.deny),
   });
 
   // Store the resolved model chain, orchestrator, and backend on the job
