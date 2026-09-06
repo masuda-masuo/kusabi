@@ -186,7 +186,7 @@ export async function buildTaskReviewInput({ phase, flags, callTool = null }) {
   return collectContainerReviewInput({ container: flags.container, callTool: call, base });
 }
 
-export async function cmdTask(cwd, { flags, text }) {
+export async function cmdTask(cwd, { flags, text, _dispatch = null }) {
   // ---- brief-file resolution ----
   text = readBriefFile(flags, text);
   if (!text) throw new Error("task requires a task description (inline or via --brief-file)");
@@ -215,7 +215,10 @@ export async function cmdTask(cwd, { flags, text }) {
   // dispatch as `opus`, an opencode route reaches the ladder verbatim.  The
   // raw flag string must never be handed to a dispatch — a claude CLI given
   // `--model claude/opus` would take the prefix for part of the model id.
-  const { dispatch, backend, chain: modelChain, explicitModel } = resolveDispatchBackend({ flags, phase, config });
+  const { dispatch: resolvedDispatch, backend, chain: modelChain, explicitModel } = resolveDispatchBackend({ flags, phase, config });
+  // Internal test seam: command-boundary tests inject a deterministic fallback
+  // dispatcher without starting a real backend process.
+  const dispatch = _dispatch ?? resolvedDispatch;
 
   // An explicitly named `--session` is checked against the backend it would
   // run on BEFORE anything else, so the error the operator gets names both
@@ -400,7 +403,10 @@ export async function cmdTask(cwd, { flags, text }) {
   // opencode path record it too).
   job.modelChain = modelChain;
   job.orchestrator = orchestrator;
-  job.backend = backend;
+  // dispatchWithFallback records the backend of the attempt that returned.
+  // Preserve it across mixed-backend fallback; only legacy/injected results
+  // without provenance need the command-start default.
+  job.backend = job.backend ?? backend;
 
   // ---- deterministic probes (when --container given) ----
   if (flags.container) {

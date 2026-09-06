@@ -13,6 +13,9 @@ import {
   resetFailedRoutes,
 } from "./prompt-execution.mjs";
 import { stateDirFor } from "./state-paths.mjs";
+import { loadJob } from "./job-store.mjs";
+import { cmdTask } from "./task-cmd.mjs";
+import { resolveResumeLastSession } from "./kusabi-companion.mjs";
 import { WRITE_TOOL_NAMES, implementDenyTools, reviewDenyTools } from "./cli.mjs";
 import { translateDenyTools } from "./claude-dispatch.mjs";
 
@@ -1791,5 +1794,123 @@ describe("dispatchWithFallback — end-to-end against a fake serve (kusabi #233)
       ctx.restore();
       ctx.rm();
     }
+  });
+});
+
+
+// =========================================================================
+// cmdTask command boundary — preserve backend of final fallback attempt
+// (kusabi #483)
+// =========================================================================
+
+const CMD_TASK_483_BRIEF = [
+  "## Purpose",
+  "",
+  "Exercise mixed-backend task fallback persistence.",
+  "",
+].join("\n");
+
+async function runCmdTask483(finalStatus) {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-483-test-"));
+  const stateRoot = path.join(tmp, "state");
+  const cwd = path.join(tmp, "cwd");
+  fs.mkdirSync(cwd, { recursive: true });
+  fs.mkdirSync(stateRoot, { recursive: true });
+  fs.writeFileSync(
+    path.join(stateRoot, "config.json"),
+    JSON.stringify({
+      models: {
+        chain: [["opencode/opencode-test", "agy/gemini-3.8-flash-high"]],
+      },
+    }),
+    "utf8",
+  );
+
+  const savedStateRoot = process.env.KUSABI_STATE_DIR;
+  process.env.KUSABI_STATE_DIR = stateRoot;
+  const dispatchCalls = [];
+  const attemptBackends = [];
+
+  try {
+    const output = await cmdTask(cwd, {
+      flags: {},
+      text: CMD_TASK_483_BRIEF,
+      _dispatch: async (opts) => {
+        dispatchCalls.push(opts);
+        return dispatchWithFallback({
+          ...opts,
+          _backendDispatch: (backend) => async () => {
+            attemptBackends.push(backend);
+            if (backend === "opencode") {
+              return fakeResult("provider-error", {
+                id: "job-483-opencode",
+                sessionID: "ses-483-opencode",
+                retry: {
+                  reason: "free_tier_limit",
+                  message: "opencode quota exhausted",
+                  attempt: 1,
+                  terminal: true,
+                },
+              });
+            }
+            return fakeResult(finalStatus, {
+              id: `job-483-agy-${finalStatus}`,
+              sessionID: "agy-session-483",
+              backend: "agy",
+              error: finalStatus === "completed" ? null : "agy final attempt failed",
+              resultText: finalStatus === "completed" ? "agy completed" : "",
+            });
+          },
+        });
+      },
+    });
+
+    const stateDir = stateDirFor(cwd);
+    const job = loadJob(stateDir, `job-483-agy-${finalStatus}`);
+    return {
+      output,
+      job,
+      resumedSession: resolveResumeLastSession(stateDir, { backend: "agy" }),
+      dispatchCalls,
+      attemptBackends,
+    };
+  } finally {
+    if (savedStateRoot === undefined) delete process.env.KUSABI_STATE_DIR;
+    else process.env.KUSABI_STATE_DIR = savedStateRoot;
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+}
+
+describe("cmdTask mixed-backend fallback persistence (kusabi #483)", () => {
+  beforeEach(() => {
+    resetFailedRoutes();
+  });
+
+  afterEach(() => {
+    resetFailedRoutes();
+  });
+
+  it("persists and displays agy when opencode falls back to a successful agy attempt", async () => {
+    const { output, job, resumedSession, dispatchCalls, attemptBackends } = await runCmdTask483("completed");
+
+    assert.equal(dispatchCalls.length, 1);
+    assert.deepEqual(attemptBackends, ["opencode", "agy"]);
+    assert.equal(job.status, "completed");
+    assert.equal(job.backend, "agy");
+    assert.equal(job.sessionID, "agy-session-483");
+    assert.equal(resumedSession, "agy-session-483");
+    assert.match(output, /^agy task /);
+    assert.match(output, /continue in agy/);
+  });
+
+  it("persists agy when the final agy fallback attempt fails", async () => {
+    const { output, job, attemptBackends } = await runCmdTask483("timeout");
+
+    assert.deepEqual(attemptBackends, ["opencode", "agy"]);
+    assert.equal(job.status, "timeout");
+    assert.equal(job.backend, "agy");
+    assert.equal(job.sessionID, "agy-session-483");
+    assert.match(output, /^agy task /);
+    assert.match(output, /agy final attempt failed/);
   });
 });
