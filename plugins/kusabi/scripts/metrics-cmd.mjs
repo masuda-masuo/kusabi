@@ -28,6 +28,7 @@ import {
 import { openMetricsDb, openMetricsDbReadOnly } from "./metrics-db.mjs";
 import { ingestTranscriptDirectory } from "./transcript-ingest.mjs";
 import { ingestCursorUsageDirectory } from "./cursor-usage-ingest.mjs";
+import { ingestCodexUsageDirectory } from "./codex-usage-ingest.mjs";
 import { ingestChainDirectory, ingestJobDirectory } from "./chain-ingest.mjs";
 import {
   computeReport,
@@ -106,6 +107,7 @@ export function cmdMetricsIngest(cwd, { flags }) {
   const home = os.homedir();
   const transcriptDir = flags["transcript-dir"] || path.join(home, ".claude", "projects");
   const cursorDir = flags["cursor-usage-dir"] || cursorUsageDir();
+  const codexDir = flags["codex-usage-dir"] || path.join(process.env.CODEX_HOME || path.join(home, ".codex"), "sessions");
   const metricsStateRoot = flags["state-root"] || stateRoot();
   const dryRun = !!flags.dryRun;
   const dbPath = dryRun ? ":memory:" : (flags.db || path.join(metricsStateRoot, "metrics.db"));
@@ -114,12 +116,14 @@ export function cmdMetricsIngest(cwd, { flags }) {
 
   let transcriptSummary;
   let cursorSummary;
+  let codexSummary;
   let chainSummary;
   let jobSummary;
   db.exec("BEGIN");
   try {
     transcriptSummary = ingestTranscriptDirectory(db, transcriptDir);
     cursorSummary = ingestCursorUsageDirectory(db, cursorDir);
+    codexSummary = ingestCodexUsageDirectory(db, codexDir);
     chainSummary = ingestChainDirectory(db, metricsStateRoot);
     jobSummary = ingestJobDirectory(db, metricsStateRoot);
     db.exec("COMMIT");
@@ -169,6 +173,20 @@ export function cmdMetricsIngest(cwd, { flags }) {
   lines.push(`  stale turn rows deleted before re-insert:    ${cursorSummary.staleTurnsRemoved}`);
   lines.push(`  I/O failures (whole file unreadable): ${cursorSummary.ioFailures}`);
   lines.push(`  parse failures (malformed JSON):       ${cursorSummary.parseFailures}`);
+  lines.push("");
+  lines.push("Codex usage:");
+  lines.push(`  codex-usage dir:           ${codexDir}`);
+  if (!fs.existsSync(codexDir)) {
+    lines.push(`warning: codex-usage dir not found: ${codexDir}`);
+  }
+  lines.push(`  files scanned:             ${codexSummary.filesScanned}`);
+  lines.push(`  files skipped (unchanged): ${codexSummary.filesSkippedUnchanged}`);
+  lines.push(`  turns:                     ${codexSummary.turns}`);
+  lines.push(`  legacy token_count events: ${codexSummary.legacyTokenCountRecords}`);
+  lines.push(`  I/O failures (whole file unreadable): ${codexSummary.ioFailures}`);
+  lines.push(`  parse failures (malformed JSON):       ${codexSummary.parseFailures}`);
+  lines.push(`  invalid usage records:     ${codexSummary.invalidUsageRecords}`);
+  lines.push(`  duplicate records (deduped): ${codexSummary.duplicateRecords}`);
   lines.push("");
   lines.push("Chains:");
   lines.push(`  state root:                ${metricsStateRoot}`);
