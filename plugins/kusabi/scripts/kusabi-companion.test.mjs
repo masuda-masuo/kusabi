@@ -5301,6 +5301,177 @@ describe("status command kaiba progress rendering (kusabi #391)", () => {
 });
 
 
+
+// =========================================================================
+// result command — compact default / --full (kusabi #478)
+// =========================================================================
+
+describe("result command compact/default vs --full (kusabi #478)", () => {
+  const COMPANION_SCRIPT = path.join(import.meta.dirname, "kusabi-companion.mjs");
+  let tmpDir;
+  let stateRootDir;
+  let workspaceStateDir;
+
+  beforeEach(() => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-result-compact-"));
+    stateRootDir = path.join(tmpDir, "state");
+    const hash = crypto.createHash("sha256").update(tmpDir).digest("hex").slice(0, 12);
+    workspaceStateDir = path.join(stateRootDir, hash);
+    fs.mkdirSync(workspaceStateDir, { recursive: true });
+  });
+
+  afterEach(() => {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  function runCompanion(args) {
+    const env = { ...process.env };
+    delete env.KUSABI_WORKER_CONTEXT;
+    env.KUSABI_STATE_DIR = stateRootDir;
+    return spawnSync(process.execPath, [COMPANION_SCRIPT, ...args], {
+      encoding: "utf8",
+      cwd: tmpDir,
+      env,
+      timeout: 15_000,
+    });
+  }
+
+  const FINDING_BODY = "Distinctive finding body text: xYzzy-478-body-marker";
+  const RESULT_WITH_FINDING = [
+    '{"type":"verdict","verdict":"accepted","summary":"looks good"}',
+    '{"type":"finding","body":"' + FINDING_BODY + '"}',
+  ].join("\n") + "\n";
+
+  function makeCompletedJob(jobId, title) {
+    const jobDirectory = path.join(workspaceStateDir, "jobs", jobId);
+    fs.mkdirSync(jobDirectory, { recursive: true });
+    fs.writeFileSync(
+      path.join(jobDirectory, "job.json"),
+      JSON.stringify({
+        id: jobId,
+        kind: "task",
+        status: "completed",
+        title,
+        startedAt: "2026-09-01T00:00:00.000Z",
+        finishedAt: "2026-09-01T00:05:00.000Z",
+      }),
+      "utf8",
+    );
+    fs.writeFileSync(path.join(jobDirectory, "result.md"), RESULT_WITH_FINDING, "utf8");
+    return jobDirectory;
+  }
+
+  it("chain-linked job without --full prints chain-show and omits finding body", () => {
+    const jobId = "job-chain-r1";
+    makeCompletedJob(jobId, "chain: chain-yz round 1 implement");
+    const res = runCompanion(["result", jobId]);
+    assert.equal(res.status, 0, res.stderr);
+    assert.match(res.stdout, /chain-show\s+chain-yz/, "should mention chain-show with the chain id");
+    assert.doesNotMatch(res.stdout, new RegExp(FINDING_BODY), "must NOT dump the finding body by default");
+  });
+
+  it("chain-linked job with --full prints the full result body", () => {
+    const jobId = "job-chain-r1-full";
+    makeCompletedJob(jobId, "chain: chain-yz round 1 implement");
+    const res = runCompanion(["result", "--full", jobId]);
+    assert.equal(res.status, 0, res.stderr);
+    assert.match(res.stdout, new RegExp(FINDING_BODY), "--full should include the finding body");
+  });
+
+  it("non-chain job without --full extracts verdict and omits finding body", () => {
+    const jobId = "job-standalone";
+    makeCompletedJob(jobId, "standalone task");
+    const res = runCompanion(["result", jobId]);
+    assert.equal(res.status, 0, res.stderr);
+    assert.match(res.stdout, /verdict: accepted/, "should extract verdict from JSONL");
+    assert.doesNotMatch(res.stdout, new RegExp(FINDING_BODY), "must NOT dump the finding body by default");
+  });
+
+  it("non-chain job with --full prints the full result body", () => {
+    const jobId = "job-standalone-full";
+    makeCompletedJob(jobId, "standalone task");
+    const res = runCompanion(["result", "--full", jobId]);
+    assert.equal(res.status, 0, res.stderr);
+    assert.match(res.stdout, new RegExp(FINDING_BODY), "--full should include the finding body");
+  });
+
+  it("--full is accepted by the parser (no unknown-flag error)", () => {
+    // Use a job that does not exist so we test parser acceptance, not file I/O.
+    const res = runCompanion(["result", "--full", "no-such-job"]);
+    assert.equal(res.status, 0, `expected parser acceptance, got: ${res.stderr}`);
+    assert.match(res.stdout, /no such job/);
+    assert.doesNotMatch(res.stdout, /unknown flag/);
+  });
+});
+
+describe("result command truncated preview (kusabi #478)", () => {
+  const COMPANION_SCRIPT = path.join(import.meta.dirname, "kusabi-companion.mjs");
+  let tmpDir;
+  let stateRootDir;
+  let workspaceStateDir;
+
+  beforeEach(() => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-result-preview-"));
+    stateRootDir = path.join(tmpDir, "state");
+    const hash = crypto.createHash("sha256").update(tmpDir).digest("hex").slice(0, 12);
+    workspaceStateDir = path.join(stateRootDir, hash);
+    fs.mkdirSync(workspaceStateDir, { recursive: true });
+  });
+
+  afterEach(() => {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  function runCompanion(args) {
+    const env = { ...process.env };
+    delete env.KUSABI_WORKER_CONTEXT;
+    env.KUSABI_STATE_DIR = stateRootDir;
+    return spawnSync(process.execPath, [COMPANION_SCRIPT, ...args], {
+      encoding: "utf8",
+      cwd: tmpDir,
+      env,
+      timeout: 15_000,
+    });
+  }
+
+  it("non-chain job with plain-text result truncates at 40 lines", () => {
+    const jobId = "job-long-plain";
+    const jobDirectory = path.join(workspaceStateDir, "jobs", jobId);
+    fs.mkdirSync(jobDirectory, { recursive: true });
+    fs.writeFileSync(
+      path.join(jobDirectory, "job.json"),
+      JSON.stringify({ id: jobId, kind: "task", status: "completed", startedAt: "2026-09-01T00:00:00.000Z", finishedAt: "2026-09-01T00:05:00.000Z" }),
+      "utf8",
+    );
+    const longBody = Array.from({ length: 80 }, (_, i) => `line ${i + 1}`).join("\n") + "\n";
+    fs.writeFileSync(path.join(jobDirectory, "result.md"), longBody, "utf8");
+
+    const res = runCompanion(["result", jobId]);
+    assert.equal(res.status, 0, res.stderr);
+    assert.match(res.stdout, /line 1/, "should include first lines");
+    assert.match(res.stdout, /line 40/, "should include up to line 40");
+    assert.doesNotMatch(res.stdout, /line 41/, "must NOT include line 41");
+    assert.match(res.stdout, /more lines.*--full/, "should hint about --full");
+  });
+
+  it("--full shows all lines", () => {
+    const jobId = "job-long-plain-full";
+    const jobDirectory = path.join(workspaceStateDir, "jobs", jobId);
+    fs.mkdirSync(jobDirectory, { recursive: true });
+    fs.writeFileSync(
+      path.join(jobDirectory, "job.json"),
+      JSON.stringify({ id: jobId, kind: "task", status: "completed", startedAt: "2026-09-01T00:00:00.000Z", finishedAt: "2026-09-01T00:05:00.000Z" }),
+      "utf8",
+    );
+    const longBody = Array.from({ length: 80 }, (_, i) => `line ${i + 1}`).join("\n") + "\n";
+    fs.writeFileSync(path.join(jobDirectory, "result.md"), longBody, "utf8");
+
+    const res = runCompanion(["result", "--full", jobId]);
+    assert.equal(res.status, 0, res.stderr);
+    assert.match(res.stdout, /line 80/, "--full should include the last line");
+  });
+});
+
 describe("kusabi-companion extraction invariants (kusabi #437)", () => {
   it("companion contains no moved command definitions or exports", () => {
     const source = fs.readFileSync(path.join(import.meta.dirname, "kusabi-companion.mjs"), "utf8");
