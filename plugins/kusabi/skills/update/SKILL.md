@@ -31,7 +31,7 @@ What is actually required depends on what changed:
 | Changed | Required | Verify by |
 |---|---|---|
 | `scripts/*.mjs` | 1 only | `--help` shows the change |
-| a name added to the install-cli link set (skills or `rules/`), or the shim | 1 → 5 | the new link exists under `~/.cursor/skills` / `~/.cursor/rules` |
+| a name added to the install-cli link set (skills or `rules/`), or the shim | 1 → 5 | the new link exists under `~/.cursor/skills` / `~/.cursor/rules` (and `~/.codex/skills` for Codex) |
 | `opencode-agents/*.md` | 1 → 2 → 3 | grep the changed wording in the distributed copies |
 | `skills/` `commands/` | 1 → 4 → **new session** | the skill list of a fresh session |
 | `docs/` `README` | 1 only | — |

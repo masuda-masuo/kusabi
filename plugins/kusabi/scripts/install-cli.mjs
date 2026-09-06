@@ -90,6 +90,11 @@ function pathHasDir(dir) {
 const CURSOR_SKILL_NAMES = ["delegate", "kusabi-result-handling"];
 const CURSOR_RULE_FILE = "kusabi-delegate.mdc";
 
+// Codex discovers user-level skills at <codexDir>/skills/<name>/SKILL.md (kusabi
+// #477).  The same plugin skills that Cursor needs are wired here, using the
+// same ensureSymlink / formatSymlinkLine helpers.
+const CODEX_SKILL_NAMES = ["delegate", "kusabi-result-handling"];
+
 /** The plugin root (`plugins/kusabi`), resolved from the companion script, never cwd. */
 function pluginRootDir(selfPath) {
   return path.dirname(path.dirname(selfPath));
@@ -97,6 +102,10 @@ function pluginRootDir(selfPath) {
 
 function cursorUserDir() {
   return process.env.KUSABI_CURSOR_DIR || path.join(os.homedir(), ".cursor");
+}
+
+function codexUserDir() {
+  return process.env.KUSABI_CODEX_DIR || path.join(os.homedir(), ".codex");
 }
 
 /**
@@ -281,6 +290,38 @@ function wireCursorSkills({ rule = false, selfPath } = {}) {
   };
 }
 
+/**
+ * Wire Codex's user-level discovery paths to the plugin's own skills (kusabi #477).
+ *
+ * Mirrors wireCursorSkills: Codex looks under <codexDir>/skills/<name>/SKILL.md.
+ * A machine with no `~/.codex` simply has no Codex: that is information, not a
+ * warning, and nothing is created there.  An explicit KUSABI_CODEX_DIR is a
+ * request, so that directory IS created.
+ *
+ * @param {{ selfPath?: string }} [opts]
+ * @returns {{lines: string[], failed: boolean}} One line per artifact (or one
+ *   skip line); `failed` when any artifact rendered an `error:` line.
+ */
+function wireCodexSkills({ selfPath } = {}) {
+  const explicit = Boolean(process.env.KUSABI_CODEX_DIR);
+  const codexDir = codexUserDir();
+  if (!explicit && !fs.existsSync(codexDir)) {
+    return {
+      lines: [`codex skills: skipped (${codexDir} not found — no Codex user directory on this machine)`],
+      failed: false,
+    };
+  }
+  const pluginDir = pluginRootDir(selfPath);
+  const results = CODEX_SKILL_NAMES.map((name) => ensureSymlink(
+    path.join(pluginDir, "skills", name),
+    path.join(codexDir, "skills", name),
+  ));
+  return {
+    lines: results.map(formatSymlinkLine),
+    failed: results.some((r) => r.state === "missing" || r.state === "error"),
+  };
+}
+
 export function cmdInstallCli({ flags, selfPath } = {}) {
   const binDir = companionBinDir();
   const shim = companionShimPath(binDir);
@@ -309,9 +350,11 @@ export function cmdInstallCli({ flags, selfPath } = {}) {
   }
   const cursor = wireCursorSkills({ rule: Boolean(flags?.cursorRule), selfPath });
   lines.push(...cursor.lines);
+  const codex = wireCodexSkills({ selfPath });
+  lines.push(...codex.lines);
   const text = lines.join("\n");
   // Any rendered `error:` line means the wiring is incomplete; reporting it
   // on stdout and still exiting 0 would let a broken install read as a
   // successful one (kusabi #256, #258).
-  return cursor.failed ? { text, exitCode: 1 } : text;
+  return (cursor.failed || codex.failed) ? { text, exitCode: 1 } : text;
 }

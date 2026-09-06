@@ -233,3 +233,117 @@ describe("ensureSymlink (kusabi #256)", () => {
     assert.doesNotMatch(body, /rmSync\(linkPath/, "the old link must never be removed first");
   });
 });
+
+// install-cli: Codex user-level skill discovery (kusabi #477)
+// ---------------------------------------------------------------------------
+// Codex finds user skills at <codexDir>/skills/<name>/SKILL.md, mirroring
+// Cursor.  Tests point HOME at a temp dir so ~/.codex is absent by default;
+// KUSABI_CODEX_DIR overrides the target.
+
+describe("install-cli codex skill wiring", () => {
+  const COMPANION_SCRIPT = path.join(import.meta.dirname, "kusabi-companion.mjs");
+  const PLUGIN_DIR = path.dirname(import.meta.dirname);
+  const SKILLS = ["delegate", "kusabi-result-handling"];
+  let tmpHome;
+  let binDir;
+
+  beforeEach(() => {
+    tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-install-codex-home-"));
+    binDir = path.join(tmpHome, "bin");
+  });
+
+  afterEach(() => {
+    fs.rmSync(tmpHome, { recursive: true, force: true });
+  });
+
+  function run(args = [], extraEnv = {}) {
+    const env = {
+      ...process.env,
+      HOME: tmpHome,
+      KUSABI_BIN_DIR: binDir,
+      OPENCODE_BIN: "/nonexistent-opencode-bin",
+      ...extraEnv,
+    };
+    for (const key of Object.keys(extraEnv)) {
+      if (extraEnv[key] === undefined) delete env[key];
+    }
+    return spawnSync(process.execPath, [COMPANION_SCRIPT, "install-cli", ...args], {
+      encoding: "utf8",
+      env,
+      timeout: 10_000,
+    });
+  }
+
+  const rx = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const skillSrc = (name) => path.join(PLUGIN_DIR, "skills", name);
+
+  it("skips with one informational line when there is no codex directory", () => {
+    const result = run([], { KUSABI_CODEX_DIR: undefined });
+    assert.equal(result.status, 0, result.stderr + result.stdout);
+    const skips = result.stdout.split("\n").filter((l) => l.startsWith("codex skills: skipped"));
+    assert.equal(skips.length, 1, result.stdout);
+    assert.ok(skips[0].includes(path.join(tmpHome, ".codex")), skips[0]);
+    assert.ok(!fs.existsSync(path.join(tmpHome, ".codex")), "skip must not create ~/.codex");
+    assert.doesNotMatch(result.stdout, /^(error|conflict):/m);
+  });
+
+  it("creates both skill symlinks under a temp KUSABI_CODEX_DIR", () => {
+    const codexDir = path.join(tmpHome, "codex");
+    const result = run([], { KUSABI_CODEX_DIR: codexDir });
+    assert.equal(result.status, 0, result.stderr + result.stdout);
+    for (const name of SKILLS) {
+      const link = path.join(codexDir, "skills", name);
+      assert.ok(fs.lstatSync(link).isSymbolicLink(), `${link} is not a symlink`);
+      assert.equal(fs.realpathSync(link), fs.realpathSync(skillSrc(name)));
+      assert.ok(fs.existsSync(path.join(link, "SKILL.md")), `${link}/SKILL.md not reachable`);
+      assert.match(result.stdout, new RegExp(`^created: ${rx(link)} -> ${rx(skillSrc(name))}$`, "m"));
+    }
+  });
+
+  it("reports current and changes nothing on a re-run (idempotent)", () => {
+    const codexDir = path.join(tmpHome, "codex");
+    assert.equal(run([], { KUSABI_CODEX_DIR: codexDir }).status, 0);
+    const before = SKILLS.map((name) => fs.readlinkSync(path.join(codexDir, "skills", name)));
+    const second = run([], { KUSABI_CODEX_DIR: codexDir });
+    assert.equal(second.status, 0, second.stderr + second.stdout);
+    SKILLS.forEach((name, i) => {
+      assert.match(second.stdout, new RegExp(`^current: ${rx(path.join(codexDir, "skills", name))} -> `, "m"));
+      assert.equal(fs.readlinkSync(path.join(codexDir, "skills", name)), before[i]);
+    });
+    assert.doesNotMatch(second.stdout, /^(created|updated|conflict|error):/m);
+  });
+
+  it("leaves a real directory at the target untouched and reports conflict", () => {
+    const codexDir = path.join(tmpHome, "codex");
+    const link = path.join(codexDir, "skills", "delegate");
+    fs.mkdirSync(link, { recursive: true });
+    fs.writeFileSync(path.join(link, "SKILL.md"), "mine\n");
+    const result = run([], { KUSABI_CODEX_DIR: codexDir });
+    assert.equal(result.status, 0, result.stderr + result.stdout);
+    assert.match(result.stdout, new RegExp(`^conflict: ${rx(link)} `, "m"));
+    assert.ok(!fs.lstatSync(link).isSymbolicLink());
+    assert.equal(fs.readFileSync(path.join(link, "SKILL.md"), "utf8"), "mine\n");
+    // The conflict does not stop the other artifact.
+    assert.match(result.stdout, new RegExp(`^created: ${rx(path.join(codexDir, "skills", "kusabi-result-handling"))} -> `, "m"));
+  });
+
+  it("wires ~/.codex when it exists and KUSABI_CODEX_DIR is unset", () => {
+    const homeCodex = path.join(tmpHome, ".codex");
+    fs.mkdirSync(homeCodex, { recursive: true });
+    const result = run([], { KUSABI_CODEX_DIR: undefined });
+    assert.equal(result.status, 0, result.stderr + result.stdout);
+    for (const name of SKILLS) {
+      const link = path.join(homeCodex, "skills", name);
+      assert.equal(fs.realpathSync(link), fs.realpathSync(skillSrc(name)));
+      assert.match(result.stdout, new RegExp(`^created: ${rx(link)} -> `, "m"));
+    }
+  });
+
+  it("wires KUSABI_CODEX_DIR (creating it) and leaves HOME untouched", () => {
+    const codexDir = path.join(tmpHome, "codex");
+    const result = run([], { KUSABI_CODEX_DIR: codexDir });
+    assert.equal(result.status, 0, result.stderr + result.stdout);
+    assert.ok(fs.lstatSync(path.join(codexDir, "skills", "delegate")).isSymbolicLink());
+    assert.ok(!fs.existsSync(path.join(tmpHome, ".codex")), "HOME must not be touched");
+  });
+});
