@@ -15,6 +15,7 @@ import {
 import { stateDirFor } from "./state-paths.mjs";
 import { loadJob } from "./job-store.mjs";
 import { cmdTask } from "./task-cmd.mjs";
+import { commandOutcome } from "./kusabi-companion.mjs";
 import { resolveResumeLastSession } from "./kusabi-companion.mjs";
 import { WRITE_TOOL_NAMES, implementDenyTools, reviewDenyTools } from "./cli.mjs";
 import { translateDenyTools } from "./claude-dispatch.mjs";
@@ -1832,7 +1833,7 @@ async function runCmdTask483(finalStatus) {
   const attemptBackends = [];
 
   try {
-    const output = await cmdTask(cwd, {
+    const output = commandOutcome(await cmdTask(cwd, {
       flags: {},
       text: CMD_TASK_483_BRIEF,
       _dispatch: async (opts) => {
@@ -1863,12 +1864,13 @@ async function runCmdTask483(finalStatus) {
           },
         });
       },
-    });
+    }));
 
     const stateDir = stateDirFor(cwd);
     const job = loadJob(stateDir, `job-483-agy-${finalStatus}`);
     return {
-      output,
+      output: output.text,
+      exitCode: output.exitCode,
       job,
       resumedSession: resolveResumeLastSession(stateDir, { backend: "agy" }),
       dispatchCalls,
@@ -1912,5 +1914,101 @@ describe("cmdTask mixed-backend fallback persistence (kusabi #483)", () => {
     assert.equal(job.sessionID, "agy-session-483");
     assert.match(output, /^agy task /);
     assert.match(output, /agy final attempt failed/);
+  });
+});
+
+
+// =========================================================================
+// task command exit propagation — public command boundary (kusabi #484)
+// =========================================================================
+
+const CMD_TASK_484_BRIEF = [
+  "Orchestrator: test | session kusabi-484 | 2026-09-07",
+  "",
+  "## Purpose",
+  "",
+  "Exercise task command exit propagation.",
+  "",
+].join("\n");
+
+async function runCmdTask484(status, { resultText = "", probeResults = undefined, phase = null } = {}) {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-484-test-"));
+  const stateRoot = path.join(tmp, "state");
+  const cwd = path.join(tmp, "cwd");
+  fs.mkdirSync(cwd, { recursive: true });
+  fs.mkdirSync(stateRoot, { recursive: true });
+  fs.writeFileSync(
+    path.join(stateRoot, "config.json"),
+    JSON.stringify({ models: { chain: [["opencode/opencode-test"]] } }),
+    "utf8",
+  );
+
+  const savedStateRoot = process.env.KUSABI_STATE_DIR;
+  process.env.KUSABI_STATE_DIR = stateRoot;
+  try {
+    const output = await cmdTask(cwd, {
+      flags: phase ? { phase } : {},
+      text: CMD_TASK_484_BRIEF,
+      _dispatch: async (opts) => dispatchWithFallback({
+        ...opts,
+        _backendDispatch: () => async () => {
+          const result = fakeResult(status, {
+            id: `job-484-${status}`,
+            error: status === "completed" ? null : `${status} dispatch failed`,
+            resultText,
+            retry: status === "provider-error"
+              ? { reason: "provider_failure", message: `${status} dispatch failed`, attempt: 1, terminal: true }
+              : null,
+          });
+          if (probeResults !== undefined) {
+            result.job.probeResults = probeResults;
+            result.job.probesGreen = probeResults.every((probe) => probe.passed);
+          }
+          return result;
+        },
+      }),
+    });
+    return commandOutcome(output);
+  } finally {
+    if (savedStateRoot === undefined) delete process.env.KUSABI_STATE_DIR;
+    else process.env.KUSABI_STATE_DIR = savedStateRoot;
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+}
+
+describe("cmdTask exit propagation (kusabi #484)", () => {
+  beforeEach(() => resetFailedRoutes());
+  afterEach(() => resetFailedRoutes());
+
+  it("completed task exits 0", async () => {
+    const result = await runCmdTask484("completed", { resultText: "task complete" });
+    assert.equal(result.exitCode, 0);
+    assert.match(result.text, /task complete/);
+  });
+
+  for (const status of ["error", "provider-error", "timeout", "cancelled"]) {
+    it(`${status} dispatch exits nonzero and keeps its failure text`, async () => {
+      const result = await runCmdTask484(status);
+      assert.notEqual(result.exitCode, 0);
+      assert.match(result.text, new RegExp(`${status} dispatch failed`));
+    });
+  }
+
+  it("completed task with a failed deterministic probe exits nonzero", async () => {
+    const result = await runCmdTask484("completed", {
+      resultText: "task completed",
+      probeResults: [{ probe: "verify", passed: false, detail: "1 test failed" }],
+    });
+    assert.notEqual(result.exitCode, 0);
+    assert.match(result.text, /Probes:[\s\S]*verify — FAIL/);
+  });
+
+  it("successful review execution with findings remains exit 0", async () => {
+    const result = await runCmdTask484("completed", {
+      phase: "review",
+      resultText: "review findings: 1 issue",
+    });
+    assert.equal(result.exitCode, 0);
+    assert.match(result.text, /review findings: 1 issue/);
   });
 });

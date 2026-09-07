@@ -487,7 +487,8 @@ export async function cmdTask(cwd, { flags, text, _dispatch = null }) {
     }
   }
 
-  return taskOutput;
+  const exitCode = job.status !== "completed" || job.probesGreen === false ? 1 : 0;
+  return { text: taskOutput, exitCode };
 }
 
 export async function cmdReview(cwd, { flags, text, _runPrompt = runPrompt } = {}) {
