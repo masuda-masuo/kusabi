@@ -10,6 +10,7 @@ import {
   renderChainStats,
   renderComparison,
 } from "./chain-stats.mjs";
+import { computeChainTotals } from "./chain-persist.mjs";
 
 // ---------------------------------------------------------------------------
 // Helpers: build chain fixture objects
@@ -1891,5 +1892,482 @@ describe("computeStats time-filter timezone handling", () => {
     // Degrades no worse than the previous behaviour rather than throwing.
     const stats = computeStats(chains, { since: "not-a-timestamp" });
     assert.ok(Number.isFinite(stats.roundCount));
+  });
+});
+
+
+// ---------------------------------------------------------------------------
+// Cost coverage and time-range scope (kusabi #485)
+// ---------------------------------------------------------------------------
+
+describe("chain-stats cost coverage and time-range scope", () => {
+  it("excludes wholly out-of-window chains and their costs from active-chain statistics", () => {
+    const chains = [
+      chain({
+        chainId: "august-expensive",
+        rounds: [
+          round({
+            startedAt: "2026-08-01T00:00:00.000Z",
+            implementUsage: { available: true, input: 100, output: 10, cost: 100 },
+          }),
+        ],
+        chainTotals: { input: 100, output: 10, cost: 100 },
+      }),
+      chain({
+        chainId: "september-cheap",
+        rounds: [
+          round({
+            startedAt: "2026-09-07T00:00:00.000Z",
+            implementUsage: { available: true, input: 20, output: 2, cost: 2 },
+          }),
+        ],
+        chainTotals: { input: 20, output: 2, cost: 2 },
+      }),
+    ];
+
+    const stats = computeStats(chains, { since: "2026-09-01" });
+
+    assert.equal(stats.chainCount, 1);
+    assert.equal(stats.filteredTotals.cost, 2);
+    assert.deepEqual(
+      stats.perChainTotals.map(({ chainId }) => chainId),
+      ["september-cheap"],
+      "per-chain statistics must contain only chains active in the selected range",
+    );
+    assert.equal(
+      stats.overallTotals.cost,
+      2,
+      "whole-chain aggregate must not include a chain wholly outside the selected range",
+    );
+  });
+
+  it("renders missing round and chain cost as unknown rather than known zero", () => {
+    const chains = [
+      chain({
+        chainId: "missing-cost",
+        rounds: [
+          round({
+            startedAt: "2026-09-07T00:00:00.000Z",
+            implementUsage: { available: true, input: 10 },
+          }),
+        ],
+      }),
+    ];
+
+    const stats = computeStats(chains, { since: "2026-09-01" });
+    const output = renderChainStats(stats, { since: "2026-09-01" });
+
+    assert.equal(stats.filteredTotals.cost, null, "no measured round cost has no numeric total");
+    assert.equal(stats.overallTotals.cost, null, "no measured chain cost has no numeric total");
+    assert.match(output, /in-range round totals:.*cost=n\/a \(0\/1 measured\)/);
+    assert.match(output, /whole active-chain totals:.*cost=n\/a \(0\/1 measured\)/);
+    assert.doesNotMatch(output, /cost=\$0\.0000/, "missing cost must not be presented as free");
+  });
+
+  it("renders an explicitly measured zero cost as known zero", () => {
+    const chains = [
+      chain({
+        chainId: "known-free",
+        rounds: [
+          round({
+            startedAt: "2026-09-07T00:00:00.000Z",
+            implementUsage: { available: true, input: 10, cost: 0 },
+          }),
+        ],
+        chainTotals: { input: 10, cost: 0 },
+      }),
+    ];
+
+    const stats = computeStats(chains, { since: "2026-09-01" });
+    const output = renderChainStats(stats, { since: "2026-09-01" });
+
+    assert.equal(stats.filteredTotals.cost, 0);
+    assert.equal(stats.overallTotals.cost, 0);
+    assert.match(output, /in-range round totals:.*cost=\$0\.0000 \(1\/1 measured\)/);
+    assert.match(output, /whole active-chain totals:.*cost=\$0\.0000 \(1\/1 measured\)/);
+  });
+
+  it("reports partially measured aggregates and sums only measured cost", () => {
+    const chains = [
+      chain({
+        chainId: "measured",
+        rounds: [
+          round({
+            startedAt: "2026-09-07T00:00:00.000Z",
+            implementUsage: { available: true, input: 10, cost: 0.5 },
+          }),
+        ],
+        chainTotals: { input: 10, cost: 1 },
+      }),
+      chain({
+        chainId: "unmeasured",
+        rounds: [
+          round({
+            startedAt: "2026-09-08T00:00:00.000Z",
+            implementUsage: { available: true, input: 20 },
+          }),
+        ],
+      }),
+    ];
+
+    const stats = computeStats(chains, { since: "2026-09-01" });
+    const output = renderChainStats(stats, { since: "2026-09-01" });
+
+    assert.equal(stats.filteredTotals.cost, 0.5, "missing round cost must not be estimated");
+    assert.equal(stats.overallTotals.cost, 1, "missing chain cost must not be estimated");
+    assert.match(output, /in-range round totals:.*cost=\$0\.5000 \(1\/2 measured\)/);
+    assert.match(output, /per-chain cost:.*\(1\/2 fully measured\)/);
+    assert.match(output, /whole active-chain totals:.*cost=\$1\.0000 \(1\/2 measured\)/);
+  });
+
+  it("labels in-window round totals separately from whole totals for a boundary-spanning chain", () => {
+    const chains = [
+      chain({
+        chainId: "spans-boundary",
+        rounds: [
+          round({
+            round: 1,
+            startedAt: "2026-08-01T00:00:00.000Z",
+            implementUsage: { available: true, input: 100, output: 10, cost: 100 },
+          }),
+          round({
+            round: 2,
+            startedAt: "2026-09-07T00:00:00.000Z",
+            implementUsage: { available: true, input: 20, output: 2, cost: 2 },
+          }),
+        ],
+        chainTotals: { input: 120, output: 12, cost: 102 },
+      }),
+    ];
+
+    const stats = computeStats(chains, { since: "2026-09-01" });
+    const output = renderChainStats(stats, { since: "2026-09-01" });
+
+    assert.equal(stats.chainCount, 1);
+    assert.equal(stats.filteredTotals.cost, 2);
+    assert.equal(stats.overallTotals.cost, 102);
+    assert.deepEqual(stats.perChainTotals.map(({ chainId }) => chainId), ["spans-boundary"]);
+    assert.match(output, /in-range round totals:.*cost=\$2\.0000 \(1\/1 measured\)/);
+    // #485 round 3: whole-chain coverage uses the same phase unit as partial
+    // chains. The cost and whole-chain scope assertions above remain unchanged.
+    assert.match(output, /whole active-chain totals:.*cost=\$102\.0000 \(2\/2 measured\)/);
+  });
+});
+
+
+// ---------------------------------------------------------------------------
+// Producer-derived cost coverage regressions (kusabi #485, round 2)
+// ---------------------------------------------------------------------------
+
+describe("chain-stats producer-derived cost coverage", () => {
+  it("does not treat a producer-generated zero total with no phase cost as measured", () => {
+    const records = [
+      round({
+        startedAt: "2026-09-07T00:00:00.000Z",
+        implementUsage: { available: true, input: 10 },
+      }),
+    ];
+    const chainTotals = computeChainTotals(records);
+    assert.equal(chainTotals.cost, 0, "the persistence producer uses zero when no phase cost was measured");
+
+    const stats = computeStats([chain({ chainId: "producer-wholly-missing", rounds: records, chainTotals })]);
+    const output = renderChainStats(stats);
+
+    assert.equal(stats.overallTotals.cost, null, "a synthesized producer zero is not a measured whole-chain cost");
+    assert.deepEqual(stats.overallTotals.costCoverage, { measured: 0, total: 1 });
+    assert.match(output, /whole active-chain totals:.*cost=n\/a \(0\/1 measured\)/);
+  });
+
+  it("keeps a producer-generated partial total visibly incomplete", () => {
+    const records = [
+      round({
+        startedAt: "2026-09-07T00:00:00.000Z",
+        implementUsage: { available: true, input: 10, cost: 0.4 },
+        reviewUsage: { available: true, input: 5 },
+      }),
+    ];
+    const chainTotals = computeChainTotals(records);
+    assert.equal(chainTotals.cost, 0.4, "the producer sums only the measured phase cost");
+
+    const stats = computeStats([chain({ chainId: "producer-partial", rounds: records, chainTotals })]);
+    const output = renderChainStats(stats);
+
+    assert.equal(stats.overallTotals.cost, 0.4);
+    assert.deepEqual(stats.overallTotals.costCoverage, { measured: 1, total: 2 });
+    assert.match(output, /whole active-chain totals:.*cost=\$0\.4000 \(1\/2 measured\)/);
+  });
+
+  it("counts a present unavailable review usage as an unmeasured in-range observation", () => {
+    const records = [
+      round({
+        startedAt: "2026-09-07T00:00:00.000Z",
+        implementUsage: { available: true, input: 10, cost: 0.5 },
+        reviewUsage: { available: false },
+      }),
+    ];
+
+    const stats = computeStats([chain({
+      chainId: "measured-implementation-unavailable-review",
+      rounds: records,
+      chainTotals: computeChainTotals(records),
+    })]);
+    const output = renderChainStats(stats);
+
+    assert.equal(stats.filteredTotals.cost, 0.5, "only the measured implementation cost is summed");
+    assert.deepEqual(stats.filteredTotals.costCoverage, { measured: 1, total: 2 });
+    assert.match(output, /in-range round totals:.*cost=\$0\.5000 \(1\/2 measured\)/);
+  });
+
+  it("reports wholly unavailable usage as unmeasured in both single-range and comparison output", () => {
+    const records = [
+      round({
+        startedAt: "2026-09-07T00:00:00.000Z",
+        implementUsage: { available: false },
+      }),
+    ];
+    const stats = computeStats([chain({
+      chainId: "wholly-unavailable",
+      rounds: records,
+      chainTotals: computeChainTotals(records),
+    })]);
+
+    assert.equal(stats.filteredTotals.cost, null);
+    assert.deepEqual(stats.filteredTotals.costCoverage, { measured: 0, total: 1 });
+    assert.match(renderChainStats(stats), /in-range round totals:.*cost=n\/a \(0\/1 measured\)/);
+
+    const comparison = renderComparison(stats, stats, "2026-09-07T00:00:00.000Z");
+    assert.match(comparison, /In-range round cost.*n\/a \(0\/1\).*n\/a \(0\/1\)/);
+  });
+});
+
+
+// ---------------------------------------------------------------------------
+// Cost coverage contract regressions (kusabi #485, round 3)
+// ---------------------------------------------------------------------------
+
+describe("chain-stats adjudicated cost coverage contracts", () => {
+  it("uses phase observations for a complete and a partial chain in one denominator", () => {
+    const completeRecords = [
+      round({
+        startedAt: "2026-09-07T00:00:00.000Z",
+        implementUsage: { available: true, cost: 1 },
+        reviewUsage: { available: true, cost: 1 },
+      }),
+    ];
+    const partialRecords = [
+      round({
+        startedAt: "2026-09-07T00:00:00.000Z",
+        implementUsage: { available: true, cost: 1 },
+        reviewUsage: { available: false },
+      }),
+    ];
+
+    const stats = computeStats([
+      chain({ chainId: "complete-two-phase", rounds: completeRecords, chainTotals: computeChainTotals(completeRecords) }),
+      chain({ chainId: "partial-two-phase", rounds: partialRecords, chainTotals: computeChainTotals(partialRecords) }),
+    ]);
+    const output = renderChainStats(stats);
+
+    assert.equal(stats.overallTotals.cost, 3);
+    assert.deepEqual(
+      stats.overallTotals.costCoverage,
+      { measured: 3, total: 4 },
+      "a complete chain must not collapse to one unit when another chain exposes phases",
+    );
+    assert.match(output, /whole active-chain totals:.*cost=\$3\.0000 \(3\/4 measured\)/);
+  });
+
+  it("does not let strategist usage establish whole-chain cost evidence", () => {
+    const records = [
+      round({
+        startedAt: "2026-09-07T00:00:00.000Z",
+        implementUsage: { available: false },
+        strategistUsage: { available: true, input: 50, cost: 2 },
+      }),
+    ];
+    const chainTotals = computeChainTotals(records);
+    assert.equal(chainTotals.cost, 0, "the authoritative producer excludes strategist usage");
+
+    const stats = computeStats([
+      chain({ chainId: "strategist-is-not-total-evidence", rounds: records, chainTotals }),
+    ]);
+    const output = renderChainStats(stats);
+
+    assert.equal(stats.overallTotals.cost, null);
+    assert.deepEqual(stats.overallTotals.costCoverage, { measured: 0, total: 1 });
+    assert.match(output, /whole active-chain totals:.*cost=n\/a \(0\/1 measured\)/);
+  });
+
+  it("preserves a finite aggregate-only legacy cost with visibly unknown completeness", () => {
+    const stats = computeStats([
+      chain({
+        chainId: "legacy-aggregate-only",
+        rounds: [round({ startedAt: "2026-09-07T00:00:00.000Z" })],
+        chainTotals: { input: 0, output: 0, cost: 7.25 },
+      }),
+    ]);
+    const output = renderChainStats(stats);
+
+    assert.equal(stats.overallTotals.cost, 7.25);
+    assert.match(output, /whole active-chain totals:.*cost=\$7\.2500 \(completeness unknown\)/);
+  });
+
+  it("preserves a finite legacy cost when available phase usage lacks a cost", () => {
+    const stats = computeStats([
+      chain({
+        chainId: "legacy-cost-with-unmeasured-phase",
+        rounds: [round({
+          startedAt: "2026-09-07T00:00:00.000Z",
+          implementUsage: { available: true },
+        })],
+        chainTotals: { input: 0, output: 0, cost: 7.25 },
+      }),
+    ]);
+    const output = renderChainStats(stats);
+
+    assert.equal(stats.overallTotals.cost, 7.25);
+    assert.match(output, /whole active-chain totals:.*cost=\$7\.2500 \(completeness unknown\)/);
+    assert.doesNotMatch(output, /whole active-chain totals:.*\(1\/1 measured\)/);
+  });
+
+  it("keeps archived failed-seat tokens out of filtered legacy token totals", () => {
+    const records = [
+      round({
+        startedAt: "2026-09-07T00:00:00.000Z",
+        implementUsage: {
+          available: true, input: 10, output: 2, reasoning: 3,
+          cacheRead: 4, cacheWrite: 5, cost: 1,
+        },
+      }),
+    ];
+    records[0].reviewSeatFailures = [{
+      reviewUsage: {
+        available: true, input: 100, output: 20, reasoning: 30,
+        cacheRead: 40, cacheWrite: 50, cost: 10,
+      },
+    }];
+    const chainTotals = computeChainTotals(records);
+    assert.deepEqual(
+      chainTotals,
+      { input: 110, output: 22, reasoning: 33, cacheRead: 44, cacheWrite: 55, cost: 11 },
+      "the authoritative whole-chain producer retains the archived seat",
+    );
+
+    const stats = computeStats([
+      chain({ chainId: "archived-seat-is-cost-only", rounds: records, chainTotals }),
+    ]);
+
+    assert.deepEqual(
+      {
+        input: stats.filteredTotals.input,
+        output: stats.filteredTotals.output,
+        reasoning: stats.filteredTotals.reasoning,
+        cacheRead: stats.filteredTotals.cacheRead,
+        cacheWrite: stats.filteredTotals.cacheWrite,
+      },
+      { input: 10, output: 2, reasoning: 3, cacheRead: 4, cacheWrite: 5 },
+      "archived seats must not inflate the historical in-range token totals",
+    );
+  });
+
+  it("uses the displayed in-range record set for cost and coverage", () => {
+    const records = [
+      round({
+        startedAt: "2026-09-07T00:00:00.000Z",
+        implementUsage: { available: true, input: 10, cost: 1 },
+        reviewUsage: { available: true, input: 20 },
+        strategistUsage: { available: true, input: 50, cost: 2 },
+      }),
+    ];
+    records[0].reviewSeatFailures = [
+      { reviewUsage: { available: true, input: 100, cost: 10 } },
+      { reviewUsage: { available: true, input: 200, cost: 20 } },
+    ];
+
+    const stats = computeStats([
+      chain({
+        chainId: "in-range-cost-record-set",
+        rounds: records,
+        chainTotals: computeChainTotals(records),
+      }),
+    ]);
+
+    assert.deepEqual(
+      stats.filteredTotals,
+      {
+        input: 80, output: 0, reasoning: 0, cacheRead: 0, cacheWrite: 0,
+        cost: 3, costCoverage: { measured: 2, total: 3 },
+      },
+      "in-range cost and coverage must include strategist usage and exclude archived failed seats",
+    );
+  });
+
+  it("uses only fully measured chains for per-chain cost distribution", () => {
+    const completeRecords = [
+      round({
+        startedAt: "2026-09-07T00:00:00.000Z",
+        implementUsage: { available: true, cost: 1 },
+        reviewUsage: { available: true, cost: 1 },
+      }),
+    ];
+    const partialRecords = [
+      round({
+        startedAt: "2026-09-08T00:00:00.000Z",
+        implementUsage: { available: true, cost: 3 },
+        reviewUsage: { available: true },
+      }),
+    ];
+
+    const output = renderChainStats(computeStats([
+      chain({
+        chainId: "fully-measured",
+        rounds: completeRecords,
+        chainTotals: computeChainTotals(completeRecords),
+      }),
+      chain({
+        chainId: "partially-measured",
+        rounds: partialRecords,
+        chainTotals: computeChainTotals(partialRecords),
+      }),
+    ]));
+
+    assert.match(
+      output,
+      /per-chain cost: min=\$2\.0000, median=\$2\.0000, max=\$2\.0000 \(1\/2 fully measured\)/,
+    );
+    assert.doesNotMatch(output, /per-chain cost:.*\(2\/2 measured\)/);
+  });
+
+  it("marks whole-chain completeness unknown when an active chain has no producer-matching usage", () => {
+    const measuredRecords = [
+      round({
+        startedAt: "2026-09-07T00:00:00.000Z",
+        implementUsage: { available: true, cost: 1 },
+        reviewUsage: { available: true, cost: 2 },
+      }),
+    ];
+    const recordlessRecords = [
+      round({
+        startedAt: "2026-09-08T00:00:00.000Z",
+        strategistUsage: { available: true, cost: 99 },
+      }),
+    ];
+
+    const stats = computeStats([
+      chain({
+        chainId: "two-measured-phases",
+        rounds: measuredRecords,
+        chainTotals: computeChainTotals(measuredRecords),
+      }),
+      chain({
+        chainId: "active-without-producer-cost-records",
+        rounds: recordlessRecords,
+      }),
+    ]);
+    const output = renderChainStats(stats);
+
+    assert.equal(stats.overallTotals.cost, 3);
+    assert.match(output, /whole active-chain totals:.*cost=\$3\.0000 \(completeness unknown\)/);
+    assert.doesNotMatch(output, /whole active-chain totals:.*\(2\/3 measured\)/);
   });
 });

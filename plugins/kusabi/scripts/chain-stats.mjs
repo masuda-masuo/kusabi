@@ -479,49 +479,167 @@ export function computeStats(chains, opts = {}) {
   }
 
   // ---- token and cost totals ----
-  // Per-chain from chainTotals, and per-round from implementUsage/reviewUsage/strategistUsage
-  const overallTotals = { input: 0, output: 0, reasoning: 0, cacheRead: 0, cacheWrite: 0, cost: 0 };
-  const perChainTotals = []; // { chainId, input, output, reasoning, cacheRead, cacheWrite, cost }
+  // Usage records are the only reliable cost-coverage evidence. In particular,
+  // chain-persist's aggregate starts at zero and adds only available phase
+  // costs, so a numeric chainTotals.cost can mean measured zero, partial data,
+  // or no measured cost at all.
+  // Keep the pre-#485 token aggregation independent from cost evidence.
+  // Archived failed review seats belong to the producer's chain cost, but they
+  // are not part of the historical in-range token totals. Strategist usage is
+  // retained for those token totals for backwards compatibility; it is not in
+  // computeChainTotals and therefore cannot validate a whole-chain cost.
+  const tokenUsageRecordsForRound = (round) => {
+    const usages = [];
+    for (const field of ["implementUsage", "reviewUsage", "reviewFirstUsage", "strategistUsage"]) {
+      const usage = round?.[field];
+      if (usage && typeof usage === "object" && !Array.isArray(usage)) {
+        usages.push(usage);
+      }
+    }
+    return usages;
+  };
 
-  for (const chain of chains) {
+  // This set must stay in lockstep with computeChainTotals in chain-persist:
+  // live implementation/review attempts plus archived failed review seats,
+  // but deliberately no strategistUsage.
+  const costEvidenceUsageRecordsForRound = (round) => {
+    const usages = [];
+    for (const field of ["implementUsage", "reviewUsage", "reviewFirstUsage"]) {
+      const usage = round?.[field];
+      if (usage && typeof usage === "object" && !Array.isArray(usage)) {
+        usages.push(usage);
+      }
+    }
+    if (Array.isArray(round?.reviewSeatFailures)) {
+      for (const seat of round.reviewSeatFailures) {
+        if (!seat || typeof seat !== "object") continue;
+        for (const field of ["reviewUsage", "reviewFirstUsage"]) {
+          const usage = seat[field];
+          if (usage && typeof usage === "object" && !Array.isArray(usage)) {
+            usages.push(usage);
+          }
+        }
+      }
+    }
+    return usages;
+  };
+
+  const costEvidenceForRounds = (rounds) => {
+    let measured = 0;
+    let measuredCost = 0;
+    let total = 0;
+    for (const round of rounds) {
+      for (const usage of costEvidenceUsageRecordsForRound(round)) {
+        total += 1;
+        if (usage.available === true && typeof usage.cost === "number" && Number.isFinite(usage.cost)) {
+          measured += 1;
+          measuredCost += usage.cost;
+        }
+      }
+    }
+    return { measured, total, measuredCost };
+  };
+
+  const overallTotals = {
+    input: 0, output: 0, reasoning: 0, cacheRead: 0, cacheWrite: 0,
+    cost: null,
+    costCoverage: { measured: 0, total: 0 },
+  };
+  const perChainTotals = []; // active chains only; cost is number | null
+
+  const aggregateCostCoverage = (evidence, aggregateCost) => {
+    // A finite nonzero legacy aggregate remains authoritative even when phase
+    // observations exist but none has a usable finite cost. There is no honest
+    // phase denominator for that aggregate, so mark completeness explicitly
+    // instead of calling it measured (or silently treating it as free).
+    if (aggregateCost !== null && aggregateCost !== 0 && evidence.measured === 0) {
+      return { measured: 0, total: 0, unknown: true };
+    }
+    // Whenever usable phase evidence exists, every phase observation is one
+    // unit.
+    if (evidence.total > 0) {
+      return { measured: evidence.measured, total: evidence.total };
+    }
+    if (aggregateCost !== null && aggregateCost !== 0) {
+      return { measured: 0, total: 0, unknown: true };
+    }
+    // A chain with no producer-matching usage has no phase denominator.
+    // Keep its cost coverage unknown so aggregate coverage never invents a
+    // synthetic chain unit alongside measured phase units.
+    return { measured: 0, total: 0, unknown: true };
+  };
+
+  for (const ci of activeChainIndices) {
+    const chain = chains[ci];
     const ct = chain.meta.chainTotals;
-    if (ct && typeof ct === "object") {
+    const hasTotals = ct && typeof ct === "object";
+    const aggregateCost = hasTotals && typeof ct.cost === "number" && Number.isFinite(ct.cost)
+      ? ct.cost
+      : null;
+    const evidence = costEvidenceForRounds(chain.rounds);
+    // A producer aggregate is authoritative only when matching phase evidence
+    // exists. The one legacy exception is a finite nonzero aggregate with no
+    // phase records at all: preserve its value, but keep completeness unknown.
+    const chainCost = evidence.measured > 0
+      ? (aggregateCost ?? evidence.measuredCost)
+      : (aggregateCost !== null && aggregateCost !== 0
+        ? aggregateCost
+        : null);
+    const costCoverage = aggregateCostCoverage(evidence, aggregateCost);
+
+    if (hasTotals) {
       overallTotals.input += ct.input || 0;
       overallTotals.output += ct.output || 0;
       overallTotals.reasoning += ct.reasoning || 0;
       overallTotals.cacheRead += ct.cacheRead || 0;
       overallTotals.cacheWrite += ct.cacheWrite || 0;
-      overallTotals.cost += ct.cost || 0;
-
-      perChainTotals.push({
-        chainId: chain.chainId,
-        input: ct.input || 0,
-        output: ct.output || 0,
-        reasoning: ct.reasoning || 0,
-        cacheRead: ct.cacheRead || 0,
-        cacheWrite: ct.cacheWrite || 0,
-        cost: ct.cost || 0,
-      });
-    } else {
-      // Chain has no totals — add a zero entry so per-chain counts match chainCount
-      perChainTotals.push({
-        chainId: chain.chainId,
-        input: 0, output: 0, reasoning: 0, cacheRead: 0, cacheWrite: 0, cost: 0,
-      });
     }
+    if (chainCost !== null) {
+      overallTotals.cost = (overallTotals.cost ?? 0) + chainCost;
+    }
+    overallTotals.costCoverage.measured += costCoverage.measured;
+    overallTotals.costCoverage.total += costCoverage.total;
+    if (costCoverage.unknown) overallTotals.costCoverage.unknown = true;
+
+    perChainTotals.push({
+      chainId: chain.chainId,
+      input: hasTotals ? ct.input || 0 : 0,
+      output: hasTotals ? ct.output || 0 : 0,
+      reasoning: hasTotals ? ct.reasoning || 0 : 0,
+      cacheRead: hasTotals ? ct.cacheRead || 0 : 0,
+      cacheWrite: hasTotals ? ct.cacheWrite || 0 : 0,
+      cost: chainCost,
+      costMeasured: chainCost !== null &&
+        !costCoverage.unknown &&
+        costCoverage.total > 0 &&
+        costCoverage.measured === costCoverage.total,
+      costCoverage,
+    });
   }
 
-  // Also sum per-round usage for the time-filtered subset
-  const filteredTotals = { input: 0, output: 0, reasoning: 0, cacheRead: 0, cacheWrite: 0, cost: 0 };
+  // Token fields retain the pre-#485 aggregation. In-range cost and coverage
+  // use the same round usage records as those tokens, excluding archived
+  // failed-seat records so the displayed scope stays internally consistent.
+  const filteredTotals = {
+    input: 0, output: 0, reasoning: 0, cacheRead: 0, cacheWrite: 0,
+    cost: null,
+    costCoverage: { measured: 0, total: 0 },
+  };
   for (const { round } of allRounds) {
-    for (const usage of [round.implementUsage, round.reviewUsage, round.strategistUsage, round.reviewFirstUsage]) {
-      if (usage && usage.available) {
+    for (const usage of tokenUsageRecordsForRound(round)) {
+      if (usage.available === true) {
         filteredTotals.input += usage.input || 0;
         filteredTotals.output += usage.output || 0;
         filteredTotals.reasoning += usage.reasoning || 0;
         filteredTotals.cacheRead += usage.cacheRead || 0;
         filteredTotals.cacheWrite += usage.cacheWrite || 0;
-        filteredTotals.cost += usage.cost || 0;
+      }
+    }
+    for (const usage of tokenUsageRecordsForRound(round)) {
+      filteredTotals.costCoverage.total += 1;
+      if (usage.available === true && typeof usage.cost === "number" && Number.isFinite(usage.cost)) {
+        filteredTotals.cost = (filteredTotals.cost ?? 0) + usage.cost;
+        filteredTotals.costCoverage.measured += 1;
       }
     }
   }
@@ -960,30 +1078,47 @@ export function renderChainStats(stats, opts = {}) {
     lines.push("");
   }
 
-  // Token and cost totals
+  // Token and cost totals. Keep the two scopes visibly separate: filtered
+  // usage is in-range, while chainTotals necessarily cover each active chain
+  // in full (including rounds outside a date boundary).
   lines.push("Token and cost totals:");
+  const formatCost = (cost, coverage) => {
+    const value = typeof cost === "number" && Number.isFinite(cost)
+      ? `$${cost.toFixed(4)}`
+      : "n/a";
+    if (coverage?.unknown) return `${value} (completeness unknown)`;
+    return `${value} (${coverage.measured}/${coverage.total} measured)`;
+  };
+
   const t = stats.filteredTotals;
   const tokensLine = [
-    `  input=${t.input}`,
+    `  in-range round totals: input=${t.input}`,
     `output=${t.output}`,
   ];
   if (t.reasoning) tokensLine.push(`reasoning=${t.reasoning}`);
   if (t.cacheRead || t.cacheWrite) tokensLine.push(`cacheRead=${t.cacheRead} cacheWrite=${t.cacheWrite}`);
-  tokensLine.push(`cost=$${(t.cost || 0).toFixed(4)}`);
+  tokensLine.push(`cost=${formatCost(t.cost, t.costCoverage)}`);
   lines.push(tokensLine.join(", "));
 
-  // Per-chain totals
+  // Per-chain cost distribution uses only measured costs and reports how many
+  // active chains supplied one. Missing values are never imputed as free.
   if (stats.perChainTotals.length > 1) {
-    const costs = stats.perChainTotals.map((c) => c.cost || 0);
-    const minCost = Math.min(...costs);
-    const maxCost = Math.max(...costs);
-    const medianCost = [...costs].sort((a, b) => a - b)[Math.floor(costs.length / 2)];
-    lines.push(`  per-chain cost: min=$${minCost.toFixed(4)}, median=$${medianCost.toFixed(4)}, max=$${maxCost.toFixed(4)}`);
+    const costs = stats.perChainTotals
+      .filter((c) => c.costMeasured)
+      .map((c) => c.cost);
+    const coverage = `${costs.length}/${stats.perChainTotals.length} fully measured`;
+    if (costs.length > 0) {
+      const minCost = Math.min(...costs);
+      const maxCost = Math.max(...costs);
+      const medianCost = [...costs].sort((a, b) => a - b)[Math.floor(costs.length / 2)];
+      lines.push(`  per-chain cost: min=$${minCost.toFixed(4)}, median=$${medianCost.toFixed(4)}, max=$${maxCost.toFixed(4)} (${coverage})`);
+    } else {
+      lines.push(`  per-chain cost: n/a (${coverage})`);
+    }
   }
 
-  // Chain-level totals from chainTotals (for completeness)
   const ot = stats.overallTotals;
-  lines.push(`  (chainTotals: input=${ot.input}, output=${ot.output}, cost=$${(ot.cost || 0).toFixed(4)})`);
+  lines.push(`  whole active-chain totals: input=${ot.input}, output=${ot.output}, cost=${formatCost(ot.cost, ot.costCoverage)}`);
   lines.push("");
 
   return lines.join("\n");
@@ -1138,11 +1273,16 @@ export function renderComparison(statsBefore, statsAfter, cutoff) {
     lines.push(col(`  unknown`, `${unknownB}/${tierTotalB2}`, `${unknownA}/${tierTotalA2}`));
   }
 
-  // Cost
-  lines.push("  ── Costs ──");
-  const costB = statsBefore.filteredTotals.cost || 0;
-  const costA = statsAfter.filteredTotals.cost || 0;
-  lines.push(col("  Total cost", `$${costB.toFixed(4)}`, `$${costA.toFixed(4)}`));
+  // In-range cost only. Whole-chain totals span a cutoff and therefore are
+  // intentionally omitted from this before/after table.
+  lines.push("  ── Costs (in-range rounds) ──");
+  const costCell = (totals) => {
+    const value = typeof totals.cost === "number" && Number.isFinite(totals.cost)
+      ? `$${totals.cost.toFixed(4)}`
+      : "n/a";
+    return `${value} (${totals.costCoverage.measured}/${totals.costCoverage.total})`;
+  };
+  lines.push(col("  In-range round cost", costCell(statsBefore.filteredTotals), costCell(statsAfter.filteredTotals)));
 
   // Missing fields
   const hasNA = (statsBefore.findingsNA > 0 || statsAfter.findingsNA > 0 ||
