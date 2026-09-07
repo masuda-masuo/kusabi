@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { spawnSync } from "node:child_process";
 import {
   accumulateUsage,
   catalogMissFromError,
@@ -2010,5 +2011,146 @@ describe("cmdTask exit propagation (kusabi #484)", () => {
     });
     assert.equal(result.exitCode, 0);
     assert.match(result.text, /review findings: 1 issue/);
+  });
+});
+
+
+// =========================================================================
+// spawned CLI exit propagation (kusabi #484 follow-up)
+// =========================================================================
+// The in-process #484 suite above exercises `cmdTask` -> `commandOutcome` in
+// the same process.  A regression that strips the outcome object at the
+// public CLI boundary (e.g. `main` always flushAndExit(0)) would still pass
+// those tests because the exitCode is checked via commandOutcome, not via
+// the actual process exit code.  This spawned fixture runs the real
+// kusabi-companion.mjs entrypoint via spawnSync so the process status is
+// the actual exit code -- a regression would surface here.
+
+function spawnedFakeServeSource({ firstError }) {
+  // Minimal fake `opencode serve` that emits a single terminal session.error
+  // for the first session, then holds the SSE connection open.  A config with
+  // one tier and one route means there is no fallback -- the error is terminal.
+  return `#!/usr/bin/env node
+import http from "node:http";
+import fs from "node:fs";
+
+const argv = process.argv.slice(2);
+const port = Number(argv[argv.indexOf("--port") + 1]);
+let nextSession = 0;
+const log = process.env.KUSABI_TEST_LOG;
+
+const FIRST_ERROR = ${JSON.stringify(firstError)};
+
+function sse(res, event) {
+  res.write("data: " + JSON.stringify(event) + "\\n\\n");
+}
+
+const server = http.createServer((req, res) => {
+  res.on("error", () => {});
+  const url = new URL(req.url, "http://127.0.0.1:" + port);
+  const chunks = [];
+  req.on("data", (c) => chunks.push(c));
+  req.on("end", () => {
+    if (req.method === "GET" && url.pathname === "/session") {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end("[]");
+      return;
+    }
+    if (req.method === "POST" && url.pathname === "/session") {
+      const id = "ses-" + (++nextSession);
+      if (log) fs.appendFileSync(log, "create " + id + "\\n");
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ id }));
+      return;
+    }
+    const segs = url.pathname.split("/");
+    const sessionId = segs[2];
+    if (req.method === "POST" && segs[3] === "prompt_async") {
+      if (log) fs.appendFileSync(log, "prompt " + sessionId + "\\n");
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end("{}");
+      return;
+    }
+    if (req.method === "POST" && segs[3] === "abort") {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end("{}");
+      return;
+    }
+    if (req.method === "GET" && url.pathname === "/event") {
+      res.writeHead(200, { "content-type": "text/event-stream" });
+      const props = { sessionID: "ses-" + nextSession };
+      sse(res, { type: "session.error", properties: { ...props, error: FIRST_ERROR } });
+      res.end();
+      return;
+    }
+    res.writeHead(404, { "content-type": "application/json" });
+    res.end("{}");
+  });
+});
+server.listen(port, "127.0.0.1");
+setInterval(() => {}, 1000);
+`;
+}
+
+const SPAWNED_CLI_484_BRIEF = [
+  "Orchestrator: test | session kusabi-484-spawned | 2026-09-08",
+  "",
+  "## Purpose",
+  "",
+  "Exercise task command exit propagation via the real CLI boundary.",
+  "",
+].join("\n");
+
+describe("spawned CLI exit propagation (kusabi #484 follow-up)", () => {
+  const COMPANION_SCRIPT = path.join(import.meta.dirname, "kusabi-companion.mjs");
+  const SPAWNED_401 = {
+    name: "APIError",
+    data: {
+      message: "Upstream request failed: [invalid_bearer_credential] Missing or invalid bearer credential",
+      statusCode: 401,
+      isRetryable: false,
+    },
+  };
+
+  it("a spawned task that fails through the real CLI boundary exits nonzero", () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-484-spawned-"));
+    try {
+      const binPath = path.join(tmp, "fake-serve.mjs");
+      fs.writeFileSync(binPath, spawnedFakeServeSource({ firstError: SPAWNED_401 }), "utf8");
+      fs.chmodSync(binPath, 0o755);
+
+      const stateRoot = path.join(tmp, "state");
+      const cwd = path.join(tmp, "cwd");
+      fs.mkdirSync(cwd, { recursive: true });
+      fs.mkdirSync(stateRoot, { recursive: true });
+      fs.writeFileSync(
+        path.join(stateRoot, "config.json"),
+        JSON.stringify({ models: { chain: [["opencode/opencode-test"]] } }),
+        "utf8",
+      );
+
+      const testLog = path.join(tmp, "requests.log");
+      fs.writeFileSync(testLog, "", "utf8");
+
+      const env = { ...process.env };
+      delete env.KUSABI_WORKER_CONTEXT;
+      env.OPENCODE_BIN = binPath;
+      env.KUSABI_STATE_DIR = stateRoot;
+      env.KUSABI_SERVE_READY_TIMEOUT_MS = "8000";
+      env.KUSABI_TEST_LOG = testLog;
+
+      const result = spawnSync(
+        process.execPath,
+        [COMPANION_SCRIPT, "task", "--model", "opencode/opencode-test", SPAWNED_CLI_484_BRIEF],
+        { encoding: "utf8", cwd, env, timeout: 30_000 },
+      );
+
+      // The real CLI must propagate the nonzero exit code through the process.
+      assert.notEqual(result.status, 0, `expected nonzero exit, got: ${result.stdout} ${result.stderr}`);
+      // The failure text must appear on stdout (commandOutcome -> stdout).
+      assert.match(result.stdout, /401/);
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
   });
 });
