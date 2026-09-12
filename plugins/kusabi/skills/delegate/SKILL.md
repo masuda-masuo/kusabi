@@ -56,7 +56,7 @@ Detailed reference, probe mechanics, and incident background: see [references/br
 - **Sign it**: First 5 lines must include `Orchestrator: <model-id> | session <id> | <date>` for attribution (companion parses; discard/rework rates unattributable without it).
 - **Skeleton**: `Deliverables / Smoke / Purpose / Workplace / Read first / Spec / Acceptance criteria / Frozen Tests / Non-goals / Constraints` (machine-read first).
 - **`## Deliverables` is machine-read**: Empty change set = discard. List files that must change; notes/summaries are NOT deliverables. Accepted: bullets, numbered, indented, code block (first token = path).
-- **`## Smoke` declares runtime behaviour**: Cheap, deterministic, 1 command/line (`exit 0`). Bullets with backtick command + optional `exit <N>`, or code block.
+- **`## Smoke` declares runtime behaviour**: Cheap, deterministic, 1 command/line (`exit 0`). Bullets with backtick command + optional `exit <N>`, or code block. Every Smoke line states the criterion or boundary it proves; reason and pristine-baseline mechanics live in [references/briefing.md](references/briefing.md).
 - **`baseline-red`**: Annotate only when targeting non-existing Deliverables file (licenses failure before round; refuses if already passing).
 - **Never bare `lint`/`type` in `## Smoke` without measuring pristine baseline first**: Measure first: `git show HEAD:<f> | ruff check --stdin-filename <f> -`. If unmeasured, omit — tests/imports usually suffice.
 - **Failing smoke line must be reproduced manually before blaming worker**: Probe shell has no `\xNN` escape (bash extension); POSIX shell `printf` does not support `\xNN` and uses octal (`printf '\xef\xbb\xbf' > f` writes literal chars and fails correct impl).
@@ -65,6 +65,7 @@ Detailed reference, probe mechanics, and incident background: see [references/br
 - **Wiring into existing code**: Add `## Suggested design` block (starting point). Dispatch `plan` pre-phase if unfamiliar.
 - **Grep tests before freezing "all tests pass"**: Catch contradictory criteria before dispatch.
 - **Write brief in English**: Small models follow English instructions more reliably.
+- **Final read before dispatch**: Re-read the brief as the worker will — headings and generic prose do not satisfy this gate. Require concrete, applicable categories: exact in-container source paths; verified context with assumptions named; observable acceptance criteria including relevant failure/boundary behaviour; explicit `## Non-goals` (escape hatch) and restated constraints; deterministic `## Smoke` that exercises the changed behaviour. Inapplicable categories are omitted or explained, never padded.
 
 ## Inspection
 
@@ -72,6 +73,7 @@ Worker reports are claims, not evidence. They have been false before.
 
 - **Start with `chain-show`**, not raw `rounds/*.json` or `events.ndjson`. Re-reading raw chain state into orchestrator context is largest avoidable cost.
 - **Escalate with all probes/smoke green** = dead review seat only when seat failed to finish (findings but no verdict line, or unreadable output). Deterministic checks passed on existing work, so implementation intact; buy replacement review, do not send worker rework. When escalate came from completed review (repeated area across 2 rounds, discarded work, unverified items, round limit), findings stand: use four routes below, or stall lever (stronger model/strategize).
+- **Terminal machine `escalate` is diagnostic, not automatic human handoff**: Reproduce the evidence first (`chain-show`, probe output, verify) before deciding anything. Then continue autonomously for bounded repairable defects — prefer the same worker/session (holds context, cheapest); otherwise a narrow same-container repair job — followed by re-review. Default to at most two repair attempts after the initial result, respecting the chain round limit. Involve the human immediately for missing authority, unresolved product/design choice, contradictory requirements, destructive or external-approval needs, irreparable provider/environment failure, or the same defect after bounded attempts. The dead-review-seat, probe-red discard, critical/high, and publish-exclusive rules above stand unchanged.
 - **Dispute over green gate is scope, not repetition.** Re-running same command proves nothing. Ask what worker's verify did *not* cover (e.g. single-file vs full suite) and run true full gate yourself.
 - **Whatever a check replaced is unverified.** Mocks, stubs, fake containers, skipped toolchains move boundaries; enumerate substitutions and confirm other way (run changed gates end-to-end including failures).
 - **Look for sabotage of criteria**, not just bugs: deleted/weakened tests, loosened assertions, new skip markers, broadened exception handling.

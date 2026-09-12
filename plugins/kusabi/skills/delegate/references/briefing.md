@@ -2,6 +2,18 @@
 
 Authoritative reference for drafting kusabi briefs, probe semantics, and authoring invariants.
 
+## Motivation (measured 2026-09-13, latest ingest 2026-09-12T15:00:54Z)
+
+Brief completeness correlates with chain outcomes — the length gap is diagnostic correlation, not causation and not a minimum-length target. Confounders include model, task difficulty, and kusabi maturity.
+
+- `gpt-5`: 17 chains; median brief 2,836 characters; min 1,421; max 5,369; average 1.00 rounds; 10/17 escalated (58.8%; 8 substantive, 2 no-work).
+- `codex/gpt-5`: 3 chains; median brief 2,675 characters; average 1.00 rounds; 2/3 escalated — n=3 is too small to lean on.
+- `claude-opus-5`: 30 chains; median brief 6,369 characters; average 1.50 rounds; 6/30 escalated (20.0%).
+- `claude-opus-5[1m]`: 119 chains; median brief 7,077 characters; average 1.25 rounds; 32/119 escalated (26.9%).
+- Across all models: 64/145 escalation rounds had all deterministic probes green; 43/530 review rounds matched review pathology (8.1%).
+
+Favour decision-relevant information density and autonomous closure over length — never pad a brief to reach a size. These numbers are dated: re-measure rather than quote them forever.
+
 ## Attribution and metadata
 
 - **Sign the brief.** A line among the first 5 — `Orchestrator: <model-id> | session <id> | <date>` — is parsed by the companion and recorded on the job/chain record. Without it, discard and rework rates cannot be attributed back to who wrote the brief.
@@ -35,6 +47,8 @@ Place machine-read sections (`Deliverables`, `Smoke`, `Frozen Tests`) first.
   `git show HEAD:<f> | ruff check --stdin-filename <f> -`
   If not measured, do not write it — tests and imports usually suffice.
 - **A failing smoke line must be reproduced manually before blaming the worker.** The probe shell has no `\xNN` escape (bash extension); POSIX `printf` takes octal only (e.g. `printf '\xef\xbb\xbf' > f` writes literal chars and fails correct implementation). Rejects correct work.
+- **Every Smoke line states the criterion or boundary it proves, the expected exit/result, and whether it was measured on pristine HEAD.** Reasons may be nearby prose (a prose line or a backtick-less bullet — parseSmoke skips both) or trailing prose, so long as parser syntax holds. Trailing prose on a command line must contain neither extra backticks nor a bare `exit N` token: the first backtick pair is the command (an extra backtick triggers the lossy-command refusal), and the first bare `exit <N>` after the closing backtick becomes the expected-exit annotation — expected exit belongs only in the `exit <N>` annotation.
+- **When behaviour is the point, include at least one end-to-end behavioural/contract boundary probe** that exercises the changed behaviour (wrong input, edge case, exit-code contract). A broad suite alone is insufficient.
 
 ### Frozen Tests
 - **If nothing is frozen, omit the `## Frozen Tests` heading — never write `(none)` under it.** A machine-read heading followed by prose parses to zero entries, failing P5 with "heading present but no entries parsed" every round. Dispatch refuses such briefs outright.
@@ -52,3 +66,13 @@ Place machine-read sections (`Deliverables`, `Smoke`, `Frozen Tests`) first.
 - **Name the source to read, not the answer.** Enables reviewer to refute mistaken claims against the authoritative source.
 - **Grep tests before freezing "all existing tests pass".** Verify existing tests do not pin behavior contradictory to the spec. When contradictions exist, fix the brief, not the test.
 - **Writing "PUBLISH" in a brief does not publish.** Worker toolset has no publish exit; the orchestrator publishes only after acceptance. Briefs demanding publication stop at worker capability limits.
+
+## Pre-dispatch completeness gate
+
+Run before dispatch, reading the brief as the worker will. Headings and generic prose do not satisfy the gate: every applicable category must be concrete, and inapplicable categories are omitted or explained — never padded.
+
+- **Exact in-container source paths.** Name the files the worker must read or change (e.g. `plugins/kusabi/scripts/chain-review.mjs`), not "the relevant code" or a directory.
+- **Verified context with assumptions named.** Paste verified facts; label what is assumed or unverified so the worker neither re-derives established facts nor treats guesses as facts.
+- **Observable acceptance criteria, including relevant failure/boundary behaviour.** Criteria state outputs, exit codes, error messages, and the boundary inputs that matter (wrong input, edge case, contract breach) — not just the happy path.
+- **Explicit Non-goals and restated constraints.** Exclusions live in `## Non-goals` with an escape hatch ("do not X; if truly needed, say so explicitly"); constraints are restated in the brief, not implied.
+- **Deterministic Smoke that exercises the changed behaviour.** Smoke runs what changed and each line states the criterion or boundary it proves. A broad suite alone (e.g. "all tests pass") does not prove the change.
