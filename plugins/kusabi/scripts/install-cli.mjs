@@ -95,6 +95,13 @@ const CURSOR_RULE_FILE = "kusabi-delegate.mdc";
 // same ensureSymlink / formatSymlinkLine helpers.
 const CODEX_SKILL_NAMES = ["delegate", "kusabi-result-handling"];
 
+// Codex discovers plugins at <codexDir>/plugins/<name> (kusabi #491).  The
+// kusabi-codex-notify plugin lives in this checkout next to plugins/kusabi;
+// install-cli symlinks it so Codex loads the working copy (and updates reach
+// it with no reinstall), replacing the previous kairanban-hosted symlink the
+// same way it replaces any other stale link.
+const CODEX_NOTIFY_PLUGIN_DIR_NAME = "kusabi-codex-notify";
+
 /** The plugin root (`plugins/kusabi`), resolved from the companion script, never cwd. */
 function pluginRootDir(selfPath) {
   return path.dirname(path.dirname(selfPath));
@@ -106,6 +113,16 @@ function cursorUserDir() {
 
 function codexUserDir() {
   return process.env.KUSABI_CODEX_DIR || path.join(os.homedir(), ".codex");
+}
+
+/** Codex plugin discovery dir: <codexDir>/plugins (KUSABI_CODEX_PLUGINS_DIR overrides). */
+function codexPluginsUserDir() {
+  return process.env.KUSABI_CODEX_PLUGINS_DIR || path.join(codexUserDir(), "plugins");
+}
+
+/** The kusabi-codex-notify plugin source in THIS checkout (sibling of plugins/kusabi). */
+function codexNotifyPluginSourceDir(selfPath) {
+  return path.resolve(pluginRootDir(selfPath), "..", CODEX_NOTIFY_PLUGIN_DIR_NAME);
 }
 
 /**
@@ -322,6 +339,42 @@ function wireCodexSkills({ selfPath } = {}) {
   };
 }
 
+/**
+ * Wire Codex's plugin discovery path to the kusabi-codex-notify plugin in this
+ * checkout (kusabi #491).
+ *
+ * Codex loads plugins from <codexDir>/plugins/<name>.  The same no-clobber /
+ * atomic-symlink discipline as the skills applies: a real user file or
+ * directory at the destination is a conflict and is never deleted, and a
+ * stale symlink — including one left by the previous kairanban-hosted
+ * install, which pointed at a different checkout — is atomically replaced so
+ * Codex follows this repository's plugin.  A machine with no ~/.codex simply
+ * has no Codex: that is information, not a warning, and nothing is created
+ * there unless KUSABI_CODEX_PLUGINS_DIR explicitly asks for it.
+ *
+ * @param {{ selfPath?: string }} [opts]
+ * @returns {{lines: string[], failed: boolean}} One line for the plugin link;
+ *   `failed` when it rendered an `error:` line (missing source = broken
+ *   checkout, or a destination-side failure).
+ */
+function wireCodexNotifyPlugin({ selfPath } = {}) {
+  const explicit = Boolean(process.env.KUSABI_CODEX_PLUGINS_DIR);
+  const pluginsDir = codexPluginsUserDir();
+  if (!explicit && !fs.existsSync(pluginsDir)) {
+    return {
+      lines: [`codex plugin: skipped (${pluginsDir} not found — no Codex plugins directory on this machine)`],
+      failed: false,
+    };
+  }
+  const source = codexNotifyPluginSourceDir(selfPath);
+  const link = path.join(pluginsDir, CODEX_NOTIFY_PLUGIN_DIR_NAME);
+  const res = ensureSymlink(source, link);
+  return {
+    lines: [formatSymlinkLine(res)],
+    failed: res.state === "missing" || res.state === "error",
+  };
+}
+
 export function cmdInstallCli({ flags, selfPath } = {}) {
   const binDir = companionBinDir();
   const shim = companionShimPath(binDir);
@@ -352,9 +405,11 @@ export function cmdInstallCli({ flags, selfPath } = {}) {
   lines.push(...cursor.lines);
   const codex = wireCodexSkills({ selfPath });
   lines.push(...codex.lines);
+  const codexNotify = wireCodexNotifyPlugin({ selfPath });
+  lines.push(...codexNotify.lines);
   const text = lines.join("\n");
   // Any rendered `error:` line means the wiring is incomplete; reporting it
   // on stdout and still exiting 0 would let a broken install read as a
   // successful one (kusabi #256, #258).
-  return (cursor.failed || codex.failed) ? { text, exitCode: 1 } : text;
+  return (cursor.failed || codex.failed || codexNotify.failed) ? { text, exitCode: 1 } : text;
 }

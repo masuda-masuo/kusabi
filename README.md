@@ -60,6 +60,14 @@ Symlinks, so plugin updates reach Cursor with no reinstall. A machine with no
 overrides the destination. Anything real (not a symlink) already sitting at a
 target path is reported as a conflict and left untouched.
 
+With Codex, `install-cli` applies the same discipline to the
+`kusabi-codex-notify` plugin (see [Codex notifications](#codex-notifications)):
+when `~/.codex/plugins` exists it symlinks
+`<checkout>/plugins/kusabi-codex-notify` there, atomically replacing the stale
+symlink left by the previous kairanban-hosted install and never clobbering a
+real user file or directory at the destination. `KUSABI_CODEX_PLUGINS_DIR`
+overrides the destination.
+
 Add `--cursor-rule` to also install an `alwaysApply` rule into
 `~/.cursor/rules/` that tells the orchestrator to delegate rather than
 implement. It is opt-in: an `alwaysApply` rule taxes every conversation on the
@@ -139,6 +147,47 @@ The `kusabi:opencode-worker` subagent forwards delegation requests to `task` so 
 The `delegate` skill intentionally points at `--help` and `docs/design/phase-chain.md` for the CLI
 surface and the chain semantics instead of restating them, so that improving kusabi does
 not silently make the skill wrong.
+
+## Codex notifications
+
+`plugins/kusabi-codex-notify` is a Codex plugin that bridges **detached** kusabi work back
+into the originating Codex thread: `chain-detach` / `task-detach` return immediately, and the
+plugin runs a detached background watcher that owns the blocking `chain-wait` / `task-wait`
+and queues **exactly one** terminal notification (`codex queue --thread <threadId>`) with
+at-most-once delivery (two-phase claims, bounded retries, fail-closed in-flight boundary).
+
+This repository is the plugin's **source of truth** — it previously lived in kairanban, which
+is no longer the installation source. Install or migrate it from this checkout:
+
+```bash
+node plugins/kusabi/scripts/kusabi-companion.mjs install-cli
+```
+
+which symlinks `<checkout>/plugins/kusabi-codex-notify` into `~/.codex/plugins/` (or
+`$KUSABI_CODEX_PLUGINS_DIR`), atomically replacing the old kairanban symlink and never
+clobbering real user content. Manual equivalent:
+
+```bash
+ln -s "$(pwd)/plugins/kusabi-codex-notify" ~/.codex/plugins/kusabi-codex-notify
+```
+
+Launch surfaces (model-free; see the plugin's own `README.md` for the full state machine):
+
+```bash
+# detached chain -> notification on terminal state
+node plugins/kusabi-codex-notify/scripts/register-watch.mjs \
+  --launch -- --container <cid> --model <model> --brief-file <brief>
+
+# detached task -> notification on terminal state (task-detach selector resolved exactly)
+node plugins/kusabi-codex-notify/scripts/register-watch.mjs \
+  --launch-task -- --container <cid> --phase implement --brief-file <brief>
+```
+
+Task notifications distinguish `completed`, `failed` (provider-error/error), `stalled`
+(timeout/stalled/serve-dead), and `cancelled`, carry the recorded backend/model including the
+fallback trail, and name the exact recovery commands (`kusabi-companion result <jobId>` /
+`status <jobId>`). Cursor backend support in kusabi is unchanged; the plugin's notifier is
+Codex-thread-specific by design.
 
 Every result includes the backend's session ID — an opencode `ses_*` id, the Claude Code CLI's UUID with `--backend claude`, the Antigravity CLI's conversation UUID with `--backend agy`, or the Cursor CLI's session id with `--backend cursor`. Kusabi continues them through `--session <id>` / `--resume-last` (agy maps this to `agy --conversation <id>` and Cursor to `cursor-agent --resume <id>`); continue an opencode session in its TUI with `opencode -s <session-id>`. Session ids are backend-specific: passing one to a different backend is rejected, naming both.
 

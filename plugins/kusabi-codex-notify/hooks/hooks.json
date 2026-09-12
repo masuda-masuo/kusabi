@@ -1,0 +1,16 @@
+{
+  "description": "Register and queue notifications for detached kusabi chains and tasks into the originating Codex thread",
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CODEX_PLUGIN_ROOT}/scripts/register-watch.mjs\""
+          }
+        ]
+      }
+    ]
+  }
+}

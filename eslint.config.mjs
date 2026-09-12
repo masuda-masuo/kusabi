@@ -30,7 +30,7 @@
 
 export default [
   {
-    files: ["plugins/kusabi/scripts/**/*.mjs"],
+    files: ["plugins/kusabi/scripts/**/*.mjs", "plugins/kusabi-codex-notify/scripts/**/*.mjs"],
     languageOptions: {
       ecmaVersion: 2024,
       sourceType: "module",
