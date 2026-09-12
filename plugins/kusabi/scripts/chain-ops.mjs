@@ -34,6 +34,12 @@ import {
   DEFAULT_APPEAR_TIMEOUT_MS,
   DEFAULT_PROGRESS_TIMEOUT_MS,
 } from "./chain-wait.mjs";
+import {
+  waitForTask,
+  DEFAULT_POLL_INTERVAL_MS as TASK_DEFAULT_POLL_INTERVAL_MS,
+  DEFAULT_APPEAR_TIMEOUT_MS as TASK_DEFAULT_APPEAR_TIMEOUT_MS,
+  DEFAULT_PROGRESS_TIMEOUT_MS as TASK_DEFAULT_PROGRESS_TIMEOUT_MS,
+} from "./task-wait.mjs";
 import { renderChainShow } from "./render.mjs";
 import { serverHealthy, api } from "./serve-lifecycle.mjs";
 import { parseSmoke } from "./brief-parsing.mjs";
@@ -361,6 +367,53 @@ export function cmdChainWait(cwd, { flags, text }) {
     pollIntervalMs: waitDurationFlag(flags, "poll-interval", DEFAULT_POLL_INTERVAL_MS),
     appearTimeoutMs: waitDurationFlag(flags, "appear-timeout", DEFAULT_APPEAR_TIMEOUT_MS),
     progressTimeoutMs: waitDurationFlag(flags, "progress-timeout", DEFAULT_PROGRESS_TIMEOUT_MS),
+  }).then((result) => result.digest);
+}
+
+// ---------------------------------------------------------------------------
+// task-wait
+// ---------------------------------------------------------------------------
+
+/**
+ * task-wait — block until a task job reaches a terminal state, print a
+ * one-line digest, exit 0.  Completed, failed/provider-error, timeout, and
+ * cancelled records are all successful terminal OBSERVATIONS (exit 0); only
+ * the WAIT failing — unknown job id, nothing appeared under --next, or a
+ * stalled record — throws, and main()'s catch turns that into a non-zero exit.
+ *
+ * Read-only, no LLM, no writes: it never touches job.json, result.md, or
+ * events.ndjson beyond reading them, so concurrent waits and a later
+ * notification failure cannot corrupt the durable record.
+ */
+export function cmdTaskWait(cwd, { flags, text }) {
+  const stateDir = stateDirFor(cwd);
+  const jobId = text.trim() || null;
+  const next = !!flags.next;
+
+  if (next && jobId) {
+    throw new Error(`task-wait --next waits for the NEXT task job to appear and takes no job id (got ${jobId})`);
+  }
+  if (!next && !jobId) {
+    throw new Error("task-wait requires a job id. Usage: task-wait <jobId> | task-wait --next [--since <ISO>]");
+  }
+  if (flags.since && !next) {
+    throw new Error("--since is only meaningful with task-wait --next (it bounds which job counts as new)");
+  }
+
+  let since = null;
+  if (next && flags.since) {
+    since = Date.parse(flags.since);
+    if (Number.isNaN(since)) throw new Error(`--since expects an ISO timestamp, got: ${flags.since}`);
+  }
+
+  return waitForTask({
+    stateDir,
+    jobId,
+    next,
+    since,
+    pollIntervalMs: waitDurationFlag(flags, "poll-interval", TASK_DEFAULT_POLL_INTERVAL_MS),
+    appearTimeoutMs: waitDurationFlag(flags, "appear-timeout", TASK_DEFAULT_APPEAR_TIMEOUT_MS),
+    progressTimeoutMs: waitDurationFlag(flags, "progress-timeout", TASK_DEFAULT_PROGRESS_TIMEOUT_MS),
   }).then((result) => result.digest);
 }
 

@@ -1,12 +1,14 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import process from "node:process";
 import {
   __testProbeBindings,
   buildTaskReviewInput,
   cmdReview,
+  resolveTaskPreflight,
 } from "./task-cmd.mjs";
 import { stateDirFor } from "./state-paths.mjs";
 
@@ -251,5 +253,76 @@ describe("cmdReview — schema-invalid repair loop (kusabi #395)", () => {
     assert.equal(calls.length, 2);
     assert.equal(calls[0].promptText, calls[1].promptText);
     assert.ok(output.includes("needs-attention"));
+  });
+});
+
+// ---------------------------------------------------------------------------
+// resolveTaskPreflight lossy-smoke option (kusabi #491 followup)
+// Foreground task must not call smokeViolationReport; task-detach must.
+// ---------------------------------------------------------------------------
+
+describe("resolveTaskPreflight lossy-smoke refusal option", () => {
+  const NESTED = "- `! grep -F 'Check `/kusabi:status`' plugins/kusabi/commands/task.md …`";
+  const SIG = "Orchestrator: test-model | session test-session | 2026-09-12";
+  const LOSSY_BRIEF = [SIG, "", "review the change", "", "## Smoke", "", NESTED, ""].join("\n");
+  const CLEAN_BRIEF = [SIG, "", "review the change", "", "## Smoke", "", "- `npm test`", ""].join("\n");
+
+  function withStateRoot(fn) {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-task-preflight-"));
+    const stateRoot = path.join(tmp, "state");
+    fs.mkdirSync(stateRoot, { recursive: true });
+    try {
+      return fn({ tmp, stateRoot });
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  }
+
+  it("skips smokeViolationReport when refuseOnLossySmoke is false (foreground task)", () => {
+    withStateRoot(({ tmp, stateRoot }) => {
+      const pre = resolveTaskPreflight(
+        tmp,
+        { flags: { phase: "review" }, text: LOSSY_BRIEF },
+        { refuseOnLossySmoke: false, stateRoot },
+      );
+      assert.equal(pre.phase, "review");
+      assert.match(pre.text, /## Smoke/);
+    });
+  });
+
+  it("refuses a lossy ## Smoke when refuseOnLossySmoke is true (task-detach)", () => {
+    withStateRoot(({ tmp, stateRoot }) => {
+      assert.throws(
+        () =>
+          resolveTaskPreflight(
+            tmp,
+            { flags: { phase: "review" }, text: LOSSY_BRIEF },
+            { refuseOnLossySmoke: true, stateRoot },
+          ),
+        /brief rejected before dispatch|## Smoke/,
+      );
+    });
+  });
+
+  it("still accepts a clean ## Smoke when refuseOnLossySmoke is true", () => {
+    withStateRoot(({ tmp, stateRoot }) => {
+      const pre = resolveTaskPreflight(
+        tmp,
+        { flags: { phase: "review" }, text: CLEAN_BRIEF },
+        { refuseOnLossySmoke: true, stateRoot },
+      );
+      assert.equal(pre.phase, "review");
+    });
+  });
+
+  it("cmdTask caller opts out of lossy-smoke refusal; cmdTaskDetach opts in (source guard)", () => {
+    const source = fs.readFileSync(path.join(import.meta.dirname, "task-cmd.mjs"), "utf8");
+    const taskIdx = source.indexOf("export async function cmdTask(");
+    const detachIdx = source.indexOf("export async function cmdTaskDetach(");
+    assert.ok(taskIdx >= 0 && detachIdx >= 0);
+    const taskBlock = source.slice(taskIdx, taskIdx + 800);
+    const detachBlock = source.slice(detachIdx, detachIdx + 900);
+    assert.match(taskBlock, /refuseOnLossySmoke:\s*false/);
+    assert.match(detachBlock, /refuseOnLossySmoke:\s*true/);
   });
 });

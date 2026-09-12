@@ -17,7 +17,7 @@
 
 import fs from "node:fs";
 import path from "node:path";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 import {
@@ -57,7 +57,7 @@ import {
   runFrozenProbe,
   runCollectedProbe,
 } from "./chain-probes.mjs";
-import { smokeBaselineReport } from "./chain-brief-guards.mjs";
+import { smokeBaselineReport, smokeViolationReport } from "./chain-brief-guards.mjs";
 import {
   readBriefFile,
   resolveOrchestratorRecord,
@@ -71,6 +71,7 @@ import {
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const PLUGIN_ROOT = path.resolve(HERE, "..");
+const COMPANION_SCRIPT = path.join(HERE, "kusabi-companion.mjs");
 const DEFAULT_TASK_TIMEOUT_S = 3600;
 const DEFAULT_REVIEW_TIMEOUT_S = 1800;
 const DEFAULT_WATCHDOG_S = 900; // must be > opencode mcp_timeout (600s) so inner timeout trips first
@@ -186,10 +187,36 @@ export async function buildTaskReviewInput({ phase, flags, callTool = null }) {
   return collectContainerReviewInput({ container: flags.container, callTool: call, base });
 }
 
-export async function cmdTask(cwd, { flags, text, _dispatch = null }) {
+/**
+ * The synchronous, container-independent pre-flight a `task` dispatch shares
+ * with `task-detach`.  Resolves the brief, phase/agent, dispatch backend,
+ * session, tool restrictions and dispatch-time brief lint, returning the
+ * resolved inputs a dispatch (cmdTask) or a detached spawn (cmdTaskDetach)
+ * needs.  Anything that needs a live container (baseSha probe, smoke baseline,
+ * review input) is intentionally NOT here: it is re-derived by the spawned
+ * `task` process, so `task-detach` pre-flight must not require a reachable
+ * container to validate the invocation.
+ *
+ * @param {object} [opts]
+ * @param {boolean} [opts.refuseOnLossySmoke=false] When true, call
+ *   `smokeViolationReport` and refuse on a lossy/empty `## Smoke` (detach
+ *   parity with chain-detach). When false, skip that call entirely so
+ *   foreground `task` keeps the base cmdTask semantics that never consulted
+ *   `smokeViolationReport`.
+ */
+export function resolveTaskPreflight(cwd, { flags, text }, opts = {}) {
+  const refuseOnLossySmoke = opts.refuseOnLossySmoke === true;
+
   // ---- brief-file resolution ----
   text = readBriefFile(flags, text);
   if (!text) throw new Error("task requires a task description (inline or via --brief-file)");
+
+  // ---- lossy-smoke refusal (opt-in; detach only by default at call sites) ----
+  if (refuseOnLossySmoke) {
+    const smokeRejection = smokeViolationReport(text);
+    if (smokeRejection) throw new Error(smokeRejection);
+  }
+
   // Signature line for model/date; CLAUDE_CODE_SESSION_ID for the session
   // when this companion runs inside an orchestrator session (kusabi #227).
   const orchestrator = resolveOrchestratorRecord(text);
@@ -205,8 +232,9 @@ export async function cmdTask(cwd, { flags, text, _dispatch = null }) {
     }
     agent = PHASE_AGENTS[phase];
   }
+  const stateRootDir = opts.stateRoot || stateRoot();
   const stateDir = stateDirFor(cwd);
-  const config = loadConfig(stateRoot());
+  const config = loadConfig(stateRootDir);
   // Backend resolved ONCE at command start: it picks the dispatch function
   // AND the model syntax (claude: bare alias / full id; opencode:
   // provider/model).
@@ -216,9 +244,6 @@ export async function cmdTask(cwd, { flags, text, _dispatch = null }) {
   // raw flag string must never be handed to a dispatch — a claude CLI given
   // `--model claude/opus` would take the prefix for part of the model id.
   const { dispatch: resolvedDispatch, backend, chain: modelChain, explicitModel } = resolveDispatchBackend({ flags, phase, config });
-  // Internal test seam: command-boundary tests inject a deterministic fallback
-  // dispatcher without starting a real backend process.
-  const dispatch = _dispatch ?? resolvedDispatch;
 
   // An explicitly named `--session` is checked against the backend it would
   // run on BEFORE anything else, so the error the operator gets names both
@@ -327,6 +352,154 @@ export async function cmdTask(cwd, { flags, text, _dispatch = null }) {
   // dispatch.  It sits AFTER the command-start config/session guards above on
   // purpose: those describe a broken invocation rather than a broken brief,
   // and their messages are the more specific answer when both are wrong.
+  const lintRejection = briefLintReport({ brief: text, phase, container: flags.container ?? null });
+  if (lintRejection) throw new Error(lintRejection);
+
+  return {
+    text,
+    phase,
+    agent,
+    stateDir,
+    config,
+    backend,
+    modelChain,
+    explicitModel,
+    resolvedDispatch,
+    session,
+    sessionProvenance,
+    tools,
+    orchestrator,
+  };
+}
+
+export function extractTaskAndWaitArgs(flags, text) {
+  const taskArgs = [];
+  const waitFlags = {};
+
+  const waitFlagNames = new Set([
+    "next",
+    "since",
+    "poll-interval",
+    "pollInterval",
+    "appear-timeout",
+    "appearTimeout",
+    "progress-timeout",
+    "progressTimeout",
+  ]);
+
+  for (const [key, value] of Object.entries(flags)) {
+    const kebab = key.replace(/([A-Z])/g, "-$1").toLowerCase();
+    if (waitFlagNames.has(key) || waitFlagNames.has(kebab)) {
+      waitFlags[kebab] = value;
+      continue;
+    }
+    if (value === true) {
+      taskArgs.push(`--${kebab}`);
+    } else if (typeof value === "string" || typeof value === "number") {
+      taskArgs.push(`--${kebab}`, String(value));
+    }
+  }
+
+  if (!flags["brief-file"] && typeof text === "string" && text.trim()) {
+    taskArgs.push(text.trim());
+  }
+
+  return { taskArgs, waitFlags };
+}
+
+/**
+ * task-detach — launch a task in a detached background process and print
+ * the exact task-wait command line to run for tracking.
+ *
+ * Performs pre-flight checks up front so invalid dispatches exit non-zero
+ * without launching a child process or printing a wait command line.
+ */
+export async function cmdTaskDetach(cwd, { flags, text }, opts = {}) {
+  if (process.env.KUSABI_WORKER_CONTEXT) {
+    throw new Error(
+      "refusing to dispatch from inside a kusabi worker context (KUSABI_WORKER_CONTEXT is set). " +
+      "Workers must not spawn jobs — put your findings in your final answer and let the orchestrator decide."
+    );
+  }
+
+  const startedAtIso = (opts.now ? new Date(opts.now) : new Date()).toISOString();
+
+  // Detach keeps lossy-smoke refusal so a broken ## Smoke never spawns a child.
+  const pre = resolveTaskPreflight(cwd, { flags, text }, { ...opts, refuseOnLossySmoke: true });
+  const { stateDir } = pre;
+
+  // Pre-flight checks passed! Create log file in stateDir
+  fs.mkdirSync(stateDir, { recursive: true });
+  const logFile = path.join(stateDir, `task-detach-${Date.now()}.log`);
+  const logFd = fs.openSync(logFile, "a");
+
+  const { taskArgs, waitFlags } = extractTaskAndWaitArgs(flags, text);
+
+  const standin = opts.standin || process.env.KUSABI_TEST_TASK_STANDIN;
+  const spawnCmd = process.execPath;
+  const spawnArgs = standin
+    ? [standin, ...taskArgs]
+    : [COMPANION_SCRIPT, "task", ...taskArgs];
+
+  const child = (opts.spawn || spawn)(spawnCmd, spawnArgs, {
+    cwd,
+    detached: true,
+    stdio: ["ignore", logFd, logFd],
+    env: { ...process.env },
+  });
+
+  if (child.unref) child.unref();
+  fs.closeSync(logFd);
+
+  const since = flags.since || startedAtIso;
+  let waitCmd = `kusabi-companion task-wait --next --since ${since}`;
+  if (waitFlags["appear-timeout"]) {
+    waitCmd += ` --appear-timeout ${waitFlags["appear-timeout"]}`;
+  }
+  if (waitFlags["poll-interval"]) {
+    waitCmd += ` --poll-interval ${waitFlags["poll-interval"]}`;
+  }
+  if (waitFlags["progress-timeout"]) {
+    waitCmd += ` --progress-timeout ${waitFlags["progress-timeout"]}`;
+  }
+
+  const lines = [
+    `Detached task launched (pid ${child.pid ?? "unknown"}).`,
+    `Log: ${logFile}`,
+    "",
+    "To wait for completion, run:",
+    `  ${waitCmd}`,
+  ];
+
+  return lines.join("\n");
+}
+
+export async function cmdTask(cwd, { flags, text, _dispatch = null }, opts = {}) {
+  // Shared synchronous pre-flight with task-detach (brief, phase/agent, backend,
+  // session, tools, dispatch-time brief lint).  Foreground task does NOT refuse
+  // on lossy ## Smoke — base cmdTask never called smokeViolationReport.
+  // Container-dependent work (baseSha, smoke baseline, review input) stays below.
+  const pre = resolveTaskPreflight(cwd, { flags, text }, { ...opts, refuseOnLossySmoke: false });
+  text = pre.text;
+  let phase = pre.phase;
+  let agent = pre.agent;
+  const stateDir = pre.stateDir;
+  const backend = pre.backend;
+  const modelChain = pre.modelChain;
+  const explicitModel = pre.explicitModel;
+  const session = pre.session;
+  const sessionProvenance = pre.sessionProvenance;
+  const tools = pre.tools;
+  // Idempotent reaffirmation at the dispatch site — pinned by the #237 source
+  // guard in kusabi-companion.test.mjs.  resolveTaskPreflight already resolved
+  // this; same brief yields the same record.
+  const orchestrator = resolveOrchestratorRecord(text);
+  // Internal test seam: command-boundary tests inject a deterministic fallback
+  // dispatcher without starting a real backend process.
+  const dispatch = _dispatch ?? pre.resolvedDispatch;
+
+  // Idempotent reaffirmation — pinned by the #289 wiring source guard (lint
+  // before container read / dispatch).  resolveTaskPreflight already refused.
   const lintRejection = briefLintReport({ brief: text, phase, container: flags.container ?? null });
   if (lintRejection) throw new Error(lintRejection);
 
