@@ -16,6 +16,7 @@ import path from "node:path";
 import process from "node:process";
 import { readJson, writeJson } from "./state-paths.mjs";
 import { notifyChainTerminal, stateDirForChain } from "./chain-notify.mjs";
+import { retireJobProgress } from "./kaiba-progress-retire.mjs";
 
 /**
  * Build args for notifyChainTerminal from a chain directory + control record.
@@ -131,6 +132,11 @@ export function requestChainStop(chainDir, requestedBy) {
       } catch {
         // Best-effort — never fail the chain for notify errors
       }
+      // Job-scoped kaiba progress retirement (kusabi #497): the stale-pid stop
+      // is an authoritative terminal boundary for every job the chain ever
+      // dispatched. Best-effort and idempotent - never throws, never changes
+      // the cancelled disposition.
+      sweepChainJobRetirement(chainDir);
       return { chainId: existing.chainId, wasRunning: false, wasStale: true };
     }
   }
@@ -287,6 +293,49 @@ export function finalizeChainControl({ chainDir, status, round }) {
     } catch {
       // Best-effort — never fail the chain for notify errors
     }
+    // Job-scoped kaiba progress retirement (kusabi #497): chain finalization
+    // is an authoritative terminal boundary for every job the chain
+    // dispatched. Best-effort and idempotent — never throws, never changes
+    // the control record or chain.json.
+    sweepChainJobRetirement(chainDir);
+  }
+}
+
+/**
+ * Retire the kaiba progress rows of every unique job id recorded in a chain's
+ * chain.json — the implement, review, and replacement-review seats, including
+ * each round record's top-level `reviewFirstJobId` — each exactly once
+ * (Set-deduped), best-effort and idempotent. The chain id itself is never
+ * retired: retirement is job-scoped and only `progress.job` values recorded by
+ * dispatched workers are valid targets. Invalid/missing ids are skipped by
+ * kaiba-progress-retire.mjs; malformed records are ignored. Never throws — a
+ * sweep failure must not prevent chain finalisation.
+ *
+ * @param {string} chainDir
+ */
+function sweepChainJobRetirement(chainDir) {
+  try {
+    const chainJson = readJson(path.join(chainDir, "chain.json"));
+    const records = Array.isArray(chainJson?.records) ? chainJson.records : [];
+    const ids = new Set();
+    for (const record of records) {
+      if (!record || typeof record !== "object" || Array.isArray(record)) continue;
+      if (typeof record.implementJobId === "string") ids.add(record.implementJobId);
+      if (typeof record.reviewJobId === "string") ids.add(record.reviewJobId);
+      if (typeof record.reviewFirstJobId === "string") ids.add(record.reviewFirstJobId);
+      if (Array.isArray(record.reviewSeatFailures)) {
+        for (const seat of record.reviewSeatFailures) {
+          if (!seat || typeof seat !== "object" || Array.isArray(seat)) continue;
+          if (typeof seat.reviewJobId === "string") ids.add(seat.reviewJobId);
+          if (typeof seat.reviewFirstJobId === "string") ids.add(seat.reviewFirstJobId);
+        }
+      }
+    }
+    for (const id of ids) {
+      retireJobProgress({ jobId: id });
+    }
+  } catch {
+    // Best-effort — never fail the chain for sweep errors.
   }
 }
 

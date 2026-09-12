@@ -648,3 +648,261 @@ describe("listChainDirs / collectChainStatuses", () => {
     assert.deepEqual(statuses, []);
   });
 });
+// ---------------------------------------------------------------------------
+// kaiba job retirement at chain terminal paths (kusabi #497 / kaiba#33)
+// ---------------------------------------------------------------------------
+//
+// At chain finalization (finalizeChainControl with a terminal status) and at
+// the stale-pid stop terminal path (requestChainStop finalising a dead chain),
+// the chain sweeps the unique job ids recorded in chain.json — implement,
+// review, and replacement review seats — and retires each through
+// kaiba-progress-retire.mjs. The sweep is best-effort and idempotent: failures
+// never throw and never change chain/control state, and the chain id itself is
+// never retired.
+
+describe("kaiba job retirement at chain terminal paths", () => {
+  let tmpDir;
+  let fakeBin;
+  let logFile;
+  let savedEnv = {};
+
+  function makeFakeBin(file) {
+    const script = [
+      "#!/usr/bin/env node",
+      'const fs = require("node:fs");',
+      'const logFile = process.env.KUSABI_RETIRE_LOG;',
+      'if (logFile) fs.appendFileSync(logFile, JSON.stringify(process.argv.slice(2)) + "\\n");',
+      'if (process.env.KUSABI_RETIRE_EXIT) process.exit(Number(process.env.KUSABI_RETIRE_EXIT));',
+      "process.exit(0);",
+      "",
+    ].join("\n");
+    fs.writeFileSync(file, script, "utf8");
+    fs.chmodSync(file, 0o755);
+    return file;
+  }
+
+  beforeEach(() => {
+    tmpDir = makeTmpDir();
+    fakeBin = makeFakeBin(path.join(tmpDir, "fake-retire-bin"));
+    logFile = path.join(tmpDir, "retire.log");
+    for (const key of ["KAIBA_RETIRE_BIN", "KUSABI_KAIBA_RETIRE", "KUSABI_RETIRE_LOG", "KUSABI_RETIRE_EXIT", "KUSABI_CHAIN_NOTIFY"]) {
+      savedEnv[key] = process.env[key];
+    }
+    process.env.KAIBA_RETIRE_BIN = fakeBin;
+    delete process.env.KUSABI_KAIBA_RETIRE;
+    delete process.env.KUSABI_RETIRE_EXIT;
+    process.env.KUSABI_RETIRE_LOG = logFile;
+    process.env.KUSABI_CHAIN_NOTIFY = "0";
+  });
+
+  afterEach(() => {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+    for (const key of Object.keys(savedEnv)) {
+      if (savedEnv[key] === undefined) delete process.env[key];
+      else process.env[key] = savedEnv[key];
+    }
+  });
+
+  function readLog() {
+    if (!fs.existsSync(logFile)) return [];
+    return fs
+      .readFileSync(logFile, "utf8")
+      .split("\n")
+      .filter((l) => l.trim() !== "")
+      .map((l) => JSON.parse(l));
+  }
+
+  function loggedJobIds() {
+    return readLog().map((args) => args[1]);
+  }
+
+  // A chain.json whose records exercise every seat: an implement job per
+  // round, a duplicated implement job id across rounds, a live review job, and
+  // archived replacement review seats carrying their own job ids (the dead
+  // seat's `reviewJobId` and the unparseable retry's `reviewFirstJobId`).
+  function writeChainJson(chainDir, records, chainId = "chain-sweep-1") {
+    fs.writeFileSync(
+      path.join(chainDir, "chain.json"),
+      JSON.stringify({ chainId, container: "cid", records }, null, 2),
+      "utf8"
+    );
+  }
+
+  function writeRunningControl(chainDir, chainId = "chain-sweep-1", pid = 1) {
+    writeChainControl(chainDir, { chainId, container: "cid", pid, status: "running", round: 0 });
+  }
+
+  const SWEEP_RECORDS = [
+    { round: 1, implementJobId: "job-imp-1", reviewJobId: "job-rev-1" },
+    {
+      round: 2,
+      implementJobId: "job-imp-2",
+      reviewJobId: "job-rev-2",
+      reviewSeatFailures: [
+        { seat: 1, reviewJobId: "job-rev-dead-2", reviewFirstJobId: "job-rev-retry-2", verdict: "unparseable" },
+      ],
+    },
+    {
+      round: 3,
+      implementJobId: "job-imp-1", // duplicate across rounds — retired once
+      reviewJobId: "job-rev-3",
+      reviewSeatFailures: [{ seat: 1, reviewJobId: "job-rev-dead-3", verdict: "partial" }],
+    },
+  ];
+
+  const EXPECTED_SWEEP_IDS = new Set([
+    "job-imp-1", "job-rev-1",
+    "job-imp-2", "job-rev-2", "job-rev-dead-2", "job-rev-retry-2",
+    "job-rev-3", "job-rev-dead-3",
+  ]);
+
+  it("finalizeChainControl retires every unique chain job id, never the chain id", () => {
+    writeRunningControl(tmpDir);
+    writeChainJson(tmpDir, SWEEP_RECORDS);
+    finalizeChainControl({ chainDir: tmpDir, status: "completed", round: 3 });
+
+    const ids = loggedJobIds();
+    assert.equal(ids.length, EXPECTED_SWEEP_IDS.size, "each unique job id must be retired exactly once");
+    for (const id of EXPECTED_SWEEP_IDS) {
+      assert.ok(ids.includes(id), `chain sweep must retire ${id}`);
+    }
+    assert.ok(!ids.includes("chain-sweep-1"), "the chain id must never be retired");
+    const control = readChainControl(tmpDir);
+    assert.equal(control.status, "completed");
+    assert.ok(control.finishedAt);
+  });
+
+  it("retires a top-level reviewFirstJobId like any other job id, deduplicated and never as the chain id", () => {
+    // chain-review.mjs writes `roundRecord.reviewFirstJobId` at the TOP level
+    // of the round record on the schema-repair (kusabi #395) and unparseable
+    // retry (#145) paths. The sweep must collect that top-level reviewFirstJobId
+    // exactly like every other recorded job id: deduplicated against the same
+    // id recorded in another seat (Set semantics, retired once), and retired
+    // as a JOB id — never as the chain id. (The seat-level `reviewFirstJobId`
+    // inside reviewSeatFailures[] is exercised by SWEEP_RECORDS above; this
+    // fixture pins the top-level variant the sweep currently misses.)
+    writeRunningControl(tmpDir);
+    writeChainJson(tmpDir, [
+      {
+        round: 1,
+        implementJobId: "job-imp-1",
+        reviewJobId: "job-rev-1",
+        reviewSchemaRepaired: true,
+        reviewFirstJobId: "job-rev-1", // top-level, duplicates reviewJobId — retired once
+        reviewSeatFailures: [
+          { seat: 1, reviewJobId: "job-rev-dead-1", reviewFirstJobId: "job-rev-retry-1", verdict: "unparseable" },
+        ],
+      },
+      {
+        round: 2,
+        implementJobId: "job-imp-2",
+        reviewJobId: "job-rev-2",
+        reviewUnparseableRetried: true,
+        reviewFirstJobId: "job-rev-first-2", // top-level, recorded only here
+      },
+    ]);
+    finalizeChainControl({ chainDir: tmpDir, status: "completed", round: 2 });
+
+    const ids = loggedJobIds();
+    const expected = new Set([
+      "job-imp-1", "job-rev-1",
+      "job-rev-dead-1", "job-rev-retry-1",
+      "job-imp-2", "job-rev-2", "job-rev-first-2",
+    ]);
+    for (const id of expected) {
+      assert.ok(ids.includes(id), `chain sweep must retire ${id}`);
+    }
+    assert.equal(ids.length, expected.size, "each unique job id must be retired exactly once");
+    assert.ok(!ids.includes("chain-sweep-1"), "the chain id must never be retired");
+  });
+
+  it("finalizeChainControl with cancelled status also sweeps", () => {
+    writeRunningControl(tmpDir);
+    writeChainJson(tmpDir, [{ round: 1, implementJobId: "job-imp-9", reviewJobId: "job-rev-9" }]);
+    finalizeChainControl({ chainDir: tmpDir, status: "cancelled", round: 1 });
+    assert.deepEqual(new Set(loggedJobIds()), new Set(["job-imp-9", "job-rev-9"]));
+    assert.equal(readChainControl(tmpDir).status, "cancelled");
+  });
+
+  it("finalizeChainControl with no chain.json does not spawn, with one it sweeps", () => {
+    writeRunningControl(tmpDir);
+    finalizeChainControl({ chainDir: tmpDir, status: "completed", round: 1 });
+    assert.deepEqual(readLog(), [], "no chain.json means no job ids to sweep");
+    writeChainJson(tmpDir, SWEEP_RECORDS);
+    finalizeChainControl({ chainDir: tmpDir, status: "completed", round: 3 });
+    assert.equal(loggedJobIds().length, EXPECTED_SWEEP_IDS.size);
+  });
+
+  it("the stale-pid stop terminal path sweeps chain job ids and finalises to cancelled", () => {
+    writeRunningControl(tmpDir, "chain-stale-1", 0 /* dead pid */);
+    writeChainJson(tmpDir, SWEEP_RECORDS, "chain-stale-1");
+    const result = requestChainStop(tmpDir, "cli-test");
+    assert.equal(result.wasStale, true);
+
+    const ids = loggedJobIds();
+    assert.equal(ids.length, EXPECTED_SWEEP_IDS.size);
+    assert.ok(!ids.includes("chain-stale-1"), "the chain id must never be retired");
+    const control = readChainControl(tmpDir);
+    assert.equal(control.status, "cancelled", "stale finalisation must stay cancelled");
+    assert.ok(control.finishedAt);
+  });
+
+  it("the stale-pid path with no chain.json is a silent no-op, with one it sweeps", () => {
+    writeRunningControl(tmpDir, "chain-stale-2", 0 /* dead pid */);
+    const result = requestChainStop(tmpDir, "cli-test");
+    assert.equal(result.wasStale, true);
+    assert.deepEqual(readLog(), [], "no chain.json means no job ids to sweep");
+
+    const secondDir = path.join(tmpDir, "chain-stale-3");
+    fs.mkdirSync(secondDir, { recursive: true });
+    writeRunningControl(secondDir, "chain-stale-3", 0 /* dead pid */);
+    writeChainJson(secondDir, SWEEP_RECORDS, "chain-stale-3");
+    const second = requestChainStop(secondDir, "cli-test");
+    assert.equal(second.wasStale, true);
+    assert.equal(loggedJobIds().length, EXPECTED_SWEEP_IDS.size);
+  });
+
+  it("chain sweep failures are fail-soft, observable, and never change chain state", () => {
+    process.env.KUSABI_RETIRE_EXIT = "1";
+    writeRunningControl(tmpDir);
+    writeChainJson(tmpDir, SWEEP_RECORDS);
+    const chainJsonBefore = fs.readFileSync(path.join(tmpDir, "chain.json"), "utf8");
+    finalizeChainControl({ chainDir: tmpDir, status: "completed", round: 3 }); // must not throw
+    assert.equal(loggedJobIds().length, EXPECTED_SWEEP_IDS.size, "the sweep must still be attempted");
+    const control = readChainControl(tmpDir);
+    assert.equal(control.status, "completed", "retire failure must not change the disposition");
+    assert.equal(
+      fs.readFileSync(path.join(tmpDir, "chain.json"), "utf8"),
+      chainJsonBefore,
+      "retire failure must not rewrite chain.json"
+    );
+  });
+
+  it("malformed records and invalid ids are skipped without throwing", () => {
+    writeRunningControl(tmpDir);
+    writeChainJson(tmpDir, [
+      { round: 1, implementJobId: "bad id!", reviewJobId: "job-rev-ok-1" },
+      { round: 2, implementJobId: null, reviewSeatFailures: "not-an-array" },
+      "a record that is not an object",
+    ]);
+    finalizeChainControl({ chainDir: tmpDir, status: "completed", round: 2 });
+    assert.deepEqual(loggedJobIds(), ["job-rev-ok-1"], "only valid ids may be retired");
+    assert.equal(readChainControl(tmpDir).status, "completed");
+  });
+
+  it("the chain sweep respects KUSABI_KAIBA_RETIRE=0, and resumes when unset", () => {
+    process.env.KUSABI_KAIBA_RETIRE = "0";
+    writeRunningControl(tmpDir);
+    writeChainJson(tmpDir, SWEEP_RECORDS);
+    finalizeChainControl({ chainDir: tmpDir, status: "completed", round: 3 });
+    assert.deepEqual(readLog(), [], "opt-out must disable the sweep");
+
+    const secondDir = path.join(tmpDir, "chain-enabled");
+    fs.mkdirSync(secondDir, { recursive: true });
+    delete process.env.KUSABI_KAIBA_RETIRE;
+    writeRunningControl(secondDir);
+    writeChainJson(secondDir, SWEEP_RECORDS);
+    finalizeChainControl({ chainDir: secondDir, status: "completed", round: 3 });
+    assert.equal(loggedJobIds().length, EXPECTED_SWEEP_IDS.size);
+  });
+});
