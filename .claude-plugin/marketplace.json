@@ -16,6 +16,15 @@
         "name": "masuda-masuo"
       },
       "source": "./plugins/kusabi"
+    },
+    {
+      "name": "kusabi-codex-notify",
+      "description": "Queue at most one terminal notification for detached kusabi chains and tasks into the originating Codex thread.",
+      "version": "0.1.0",
+      "author": {
+        "name": "masuda-masuo"
+      },
+      "source": "./plugins/kusabi-codex-notify"
     }
   ]
 }

@@ -1,0 +1,40 @@
+{
+  "name": "kusabi-codex-notify",
+  "description": "Register detached kusabi chains and tasks and queue exactly one terminal notification into the originating Codex thread.",
+  "version": "0.1.0",
+  "commands": {
+    "kusabi-notify": {
+      "description": "Register a detached kusabi chain or task and queue at most one terminal notification into the originating Codex thread.",
+      "usage": "kusabi-notify --launch -- <chain-detach args> | kusabi-notify --launch-task -- <task-detach args> | kusabi-notify --chain <chainId> --thread <threadId> | kusabi-notify --task <jobId> --thread <threadId>",
+      "args": {
+        "type": "object",
+        "properties": {
+          "launch": {
+            "type": "boolean",
+            "description": "Launch a detached chain via kusabi-companion chain-detach and register its background watcher (model-free launch wrapper)."
+          },
+          "launchTask": {
+            "type": "boolean",
+            "description": "Launch a detached task via kusabi-companion task-detach and register its background watcher (model-free launch wrapper)."
+          },
+          "chain": {
+            "type": "string",
+            "description": "Chain id of an existing detached chain to watch."
+          },
+          "task": {
+            "type": "string",
+            "description": "Job id of an existing detached task to watch."
+          },
+          "thread": {
+            "type": "string",
+            "description": "Originating Codex thread id to notify on terminal state."
+          },
+          "remote": {
+            "type": "string",
+            "description": "Shared Codex app-server endpoint passed to codex queue."
+          }
+        }
+      }
+    }
+  }
+}

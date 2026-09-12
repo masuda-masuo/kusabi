@@ -347,3 +347,122 @@ describe("install-cli codex skill wiring", () => {
     assert.ok(!fs.existsSync(path.join(tmpHome, ".codex")), "HOME must not be touched");
   });
 });
+// install-cli: Codex plugin link for kusabi-codex-notify (kusabi #491)
+// ---------------------------------------------------------------------------
+// install-cli symlinks <codexDir>/plugins/kusabi-codex-notify to THIS
+// checkout's plugins/kusabi-codex-notify so Codex loads the plugin from the
+// kusabi repository (source of truth) instead of kairanban.  The same
+// no-clobber / atomic-symlink discipline as the skills applies: a real user
+// file or directory at the destination is a conflict and is never deleted,
+// and the old kairanban symlink is atomically replaced.
+
+describe("install-cli codex plugin link", () => {
+  const COMPANION_SCRIPT = path.join(import.meta.dirname, "kusabi-companion.mjs");
+  const REPO_ROOT = path.resolve(import.meta.dirname, "..", "..", "..");
+  const NOTIFY_SOURCE = path.join(REPO_ROOT, "plugins", "kusabi-codex-notify");
+  let tmpHome;
+  let binDir;
+
+  beforeEach(() => {
+    tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-install-plugin-home-"));
+    binDir = path.join(tmpHome, "bin");
+  });
+
+  afterEach(() => {
+    fs.rmSync(tmpHome, { recursive: true, force: true });
+  });
+
+  function run(args = [], extraEnv = {}) {
+    const env = {
+      ...process.env,
+      HOME: tmpHome,
+      KUSABI_BIN_DIR: binDir,
+      OPENCODE_BIN: "/nonexistent-opencode-bin",
+      ...extraEnv,
+    };
+    for (const key of Object.keys(extraEnv)) {
+      if (extraEnv[key] === undefined) delete env[key];
+    }
+    return spawnSync(process.execPath, [COMPANION_SCRIPT, "install-cli", ...args], {
+      encoding: "utf8",
+      env,
+      timeout: 10_000,
+    });
+  }
+
+  it("skips with one informational line when there is no codex plugins directory", () => {
+    const result = run([], { KUSABI_CODEX_PLUGINS_DIR: undefined });
+    assert.equal(result.status, 0, result.stderr + result.stdout);
+    const skips = result.stdout.split("\n").filter((l) => l.startsWith("codex plugin: skipped"));
+    assert.equal(skips.length, 1, result.stdout);
+    assert.ok(skips[0].includes(path.join(tmpHome, ".codex", "plugins")), skips[0]);
+    assert.ok(!fs.existsSync(path.join(tmpHome, ".codex")), "skip must not create ~/.codex");
+  });
+
+  it("creates the plugin symlink under a temp KUSABI_CODEX_PLUGINS_DIR pointing at this checkout", () => {
+    const pluginsDir = path.join(tmpHome, "codex-plugins");
+    const result = run([], { KUSABI_CODEX_PLUGINS_DIR: pluginsDir });
+    assert.equal(result.status, 0, result.stderr + result.stdout);
+
+    const link = path.join(pluginsDir, "kusabi-codex-notify");
+    assert.ok(fs.lstatSync(link).isSymbolicLink(), `${link} is not a symlink`);
+    assert.equal(fs.realpathSync(link), fs.realpathSync(NOTIFY_SOURCE));
+    // The manifest the plugin validator checks is reachable through the link.
+    assert.ok(fs.existsSync(path.join(link, ".codex-plugin", "plugin.json")), "plugin.json not reachable");
+    assert.match(result.stdout, new RegExp(`^created: ${link.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")} -> `, "m"));
+  });
+
+  it("reports current and changes nothing on a re-run (idempotent)", () => {
+    const pluginsDir = path.join(tmpHome, "codex-plugins");
+    assert.equal(run([], { KUSABI_CODEX_PLUGINS_DIR: pluginsDir }).status, 0);
+    const before = fs.readlinkSync(path.join(pluginsDir, "kusabi-codex-notify"));
+    const second = run([], { KUSABI_CODEX_PLUGINS_DIR: pluginsDir });
+    assert.equal(second.status, 0, second.stderr + second.stdout);
+    const link = path.join(pluginsDir, "kusabi-codex-notify");
+    assert.match(second.stdout, new RegExp(`^current: ${link.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")} -> `, "m"));
+    assert.equal(fs.readlinkSync(link), before);
+    assert.doesNotMatch(second.stdout, /^(created|updated|conflict|error):/m);
+  });
+
+  it("atomically replaces the old kairanban symlink (updated, previous recorded)", () => {
+    const pluginsDir = path.join(tmpHome, "codex-plugins");
+    fs.mkdirSync(pluginsDir, { recursive: true });
+    const link = path.join(pluginsDir, "kusabi-codex-notify");
+    const kairanbanTarget = path.join(tmpHome, "agents", "codex-local", "plugins", "kusabi-codex-notify");
+    fs.mkdirSync(path.join(kairanbanTarget, ".codex-plugin"), { recursive: true });
+    fs.writeFileSync(path.join(kairanbanTarget, ".codex-plugin", "plugin.json"), "{}");
+    fs.symlinkSync(kairanbanTarget, link);
+
+    const result = run([], { KUSABI_CODEX_PLUGINS_DIR: pluginsDir });
+    assert.equal(result.status, 0, result.stderr + result.stdout);
+
+    assert.ok(fs.lstatSync(link).isSymbolicLink());
+    assert.equal(fs.realpathSync(link), fs.realpathSync(NOTIFY_SOURCE));
+    assert.match(result.stdout, new RegExp(`^updated: ${link.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")} -> ${NOTIFY_SOURCE.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")} \\(was ${kairanbanTarget.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\)`, "m"));
+    // The old kairanban checkout is left untouched.
+    assert.ok(fs.existsSync(path.join(kairanbanTarget, ".codex-plugin", "plugin.json")));
+  });
+
+  it("leaves a real user directory at the destination untouched and reports conflict", () => {
+    const pluginsDir = path.join(tmpHome, "codex-plugins");
+    const link = path.join(pluginsDir, "kusabi-codex-notify");
+    fs.mkdirSync(link, { recursive: true });
+    fs.writeFileSync(path.join(link, "my-notes.txt"), "mine\n");
+
+    const result = run([], { KUSABI_CODEX_PLUGINS_DIR: pluginsDir });
+    assert.equal(result.status, 0, result.stderr + result.stdout);
+    assert.match(result.stdout, new RegExp(`^conflict: ${link.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")} `, "m"));
+    assert.ok(!fs.lstatSync(link).isSymbolicLink());
+    assert.equal(fs.readFileSync(path.join(link, "my-notes.txt"), "utf8"), "mine\n");
+  });
+
+  it("wires ~/.codex/plugins when it exists and KUSABI_CODEX_PLUGINS_DIR is unset", () => {
+    const homeCodex = path.join(tmpHome, ".codex");
+    fs.mkdirSync(path.join(homeCodex, "plugins"), { recursive: true });
+    const result = run([], { KUSABI_CODEX_PLUGINS_DIR: undefined });
+    assert.equal(result.status, 0, result.stderr + result.stdout);
+    const link = path.join(homeCodex, "plugins", "kusabi-codex-notify");
+    assert.equal(fs.realpathSync(link), fs.realpathSync(NOTIFY_SOURCE));
+    assert.match(result.stdout, new RegExp(`^created: ${link.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")} -> `, "m"));
+  });
+});
