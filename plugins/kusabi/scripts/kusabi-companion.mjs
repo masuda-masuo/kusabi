@@ -27,9 +27,10 @@ import {
   cmdChainShow,
   cmdChainWait,
   cmdChainDetach,
+  cmdTaskWait,
 } from "./chain-ops.mjs";
 // task-cmd (kusabi #437): the `task` and `review` single-shot phase commands.
-import { cmdTask, cmdReview } from "./task-cmd.mjs";
+import { cmdTask, cmdReview, cmdTaskDetach } from "./task-cmd.mjs";
 // metrics-cmd (kusabi #443): the look-at-recorded-work command surfaces
 // (chain-stats, metrics-ingest, metrics-report, dashboard). Unlike chain-cmd,
 // chain-ops, and task-cmd, metrics-cmd.mjs is NOT on a cycle with companion:
@@ -1355,6 +1356,8 @@ function usage() {
     "  chain-show Print a compact plain-text digest of a chain (read-only, no LLM)",
     "  chain-wait Block until a chain reaches a terminal state, print a one-line digest, exit 0 (read-only, no LLM, no serve; safe to SIGTERM at any moment). Non-zero means the WAIT itself failed — unknown chain id, nothing appeared under --next, or the chain stalled — never a disposition you dislike",
     "  chain-stats Aggregate every chain record and print a summary (read-only, no LLM)",
+    "  task-detach Launch a task in a detached background process and print a runnable task-wait command line (no LLM in launcher)",
+    "  task-wait  Block until a task reaches a terminal state, print a one-line digest, exit 0 (read-only, no LLM; safe to SIGTERM at any moment). Non-zero means the WAIT itself failed — unknown job id, nothing appeared under --next, or the task stalled",
     "  metrics-ingest  Ingest transcripts + Cursor usage + Codex usage + chain records + delegated-job records into a durable SQLite store (read-only source, no LLM)",
     "  metrics-report  Query/report over the SQLite metrics store (read-only, no LLM, never ingests)",
     "  dashboard  Serve a read-only local JSON API over the state root and metrics.db (no LLM, no writes)",
@@ -1427,7 +1430,7 @@ function usage() {
 //   salvage      -> runPrompt            (cmdSalvage)
 //   chain        -> dispatchWithFallback via runImplementPhase, per round (cmdChain)
 //   chain-resume -> same as chain, from a saved position (cmdChainResume)
-const JOB_CREATING_SUBCOMMANDS = new Set(["task", "review", "salvage", "chain", "chain-resume", "chain-detach", "chainDetach"]);
+const JOB_CREATING_SUBCOMMANDS = new Set(["task", "review", "salvage", "chain", "chain-resume", "chainResume", "chain-detach", "chainDetach", "task-detach", "taskDetach"]);
 
 async function main() {
   const [subcommand, ...argv] = process.argv.slice(2);
@@ -1484,7 +1487,7 @@ async function main() {
 
   // --backend is a task/chain dispatch decision (kusabi #184); on any other
   // subcommand it would be silently ignored — reject it out loud instead.
-  if (parsed.flags.backend && subcommand !== "task" && subcommand !== "chain" && subcommand !== "chain-detach" && subcommand !== "chainDetach" && subcommand !== "chain-resume" && subcommand !== "chainResume") {
+  if (parsed.flags.backend && subcommand !== "task" && subcommand !== "task-detach" && subcommand !== "taskDetach" && subcommand !== "chain" && subcommand !== "chain-detach" && subcommand !== "chainDetach" && subcommand !== "chain-resume" && subcommand !== "chainResume") {
     throw new Error(`--backend is only supported by task and chain (got subcommand ${subcommand ?? "(none)"})`);
   }
 
@@ -1498,7 +1501,13 @@ async function main() {
   // would be silently ignored, and a wait flag that did nothing is exactly
   // the silent-failure class chain-wait exists to remove.  (--since is shared
   // with chain-stats / metrics, so it is checked inside cmdChainWait instead.)
-  if (subcommand !== "chain-wait" && subcommand !== "chainWait" && subcommand !== "chain-detach" && subcommand !== "chainDetach") {
+  const waitSubcommands = new Set([
+    "chain-wait", "chainWait",
+    "chain-detach", "chainDetach",
+    "task-wait", "taskWait",
+    "task-detach", "taskDetach",
+  ]);
+  if (!waitSubcommands.has(subcommand)) {
     for (const flag of ["next", "poll-interval", "appear-timeout", "progress-timeout"]) {
       if (parsed.flags[flag] !== undefined) {
         throw new Error(`--${flag} is only supported by chain-wait and chain-detach (got subcommand ${subcommand ?? "(none)"})`);
@@ -1550,6 +1559,9 @@ async function main() {
     case "chain-detach":
     case "chainDetach":
       return cmdChainDetach(cwd, parsed);
+    case "task-detach":
+    case "taskDetach":
+      return cmdTaskDetach(cwd, parsed);
     case "chain-resume":
     case "chainResume":
       return cmdChainResume(cwd, parsed);
@@ -1559,6 +1571,9 @@ async function main() {
     case "chain-wait":
     case "chainWait":
       return cmdChainWait(cwd, parsed);
+    case "task-wait":
+    case "taskWait":
+      return cmdTaskWait(cwd, parsed);
     case "chain-stats":
     case "chainStats":
       return cmdChainStats(cwd, parsed);
@@ -1571,7 +1586,7 @@ async function main() {
     case "dashboard":
       return cmdDashboard(cwd, parsed);
     default:
-      throw new Error(`unknown subcommand: ${subcommand ?? "(none)"}. Use setup|task|review|chain|baseline|chain-detach|chain-resume|chain-show|chain-wait|chain-stats|metrics-ingest|metrics-report|dashboard|chain-cancel|status|result|cancel|serve-stop|install-agents|install-cli|salvage`);
+      throw new Error(`unknown subcommand: ${subcommand ?? "(none)"}. Use setup|task|review|chain|baseline|chain-detach|task-detach|task-wait|chain-resume|chain-show|chain-wait|chain-stats|metrics-ingest|metrics-report|dashboard|chain-cancel|status|result|cancel|serve-stop|install-agents|install-cli|salvage`);
   }
 }
 

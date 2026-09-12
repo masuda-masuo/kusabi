@@ -5199,6 +5199,120 @@ setTimeout(() => {
 });
 
 // =========================================================================
+// task-detach and task-wait CLI surface (kusabi #491)
+// =========================================================================
+
+describe("task-detach and task-wait CLI surface (kusabi #491)", () => {
+  const COMPANION_SCRIPT = path.join(import.meta.dirname, "kusabi-companion.mjs");
+
+  const VALID_BRIEF =
+    "# Task\n\nOrchestrator: test-model | session s-1 | 2026-08-23\n\n" +
+    "## Deliverables\n\n- `plugins/kusabi/scripts/x.mjs`\n\n" +
+    "## Smoke\n\n- `npm test`\n";
+
+  it("refuses task-detach when pre-flight checks fail (missing brief description)", () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-test-task-detach-refuse-"));
+    try {
+      const env = { ...process.env };
+      delete env.KUSABI_WORKER_CONTEXT;
+      env.KUSABI_STATE_DIR = path.join(tmp, "state");
+
+      const res = spawnSync(
+        process.execPath,
+        [COMPANION_SCRIPT, "task-detach", "--phase", "review"],
+        { encoding: "utf8", cwd: tmp, env },
+      );
+      assert.notEqual(res.status, 0);
+      assert.match(res.stdout + res.stderr, /task requires a task description|task-detach requires/i);
+      assert.doesNotMatch(res.stdout, /task-wait/);
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses task-detach dispatch when KUSABI_WORKER_CONTEXT is set", () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-test-task-detach-worker-"));
+    try {
+      const briefPath = path.join(tmp, "brief.md");
+      fs.writeFileSync(briefPath, VALID_BRIEF);
+      const env = { ...process.env, KUSABI_WORKER_CONTEXT: "1" };
+      const res = spawnSync(
+        process.execPath,
+        [COMPANION_SCRIPT, "task-detach", "--phase", "review", "--container", "cid-1", "--brief-file", briefPath],
+        { encoding: "utf8", cwd: tmp, env },
+      );
+      assert.notEqual(res.status, 0);
+      assert.match(res.stdout + res.stderr, /refusing to dispatch from inside a kusabi worker context/);
+      assert.doesNotMatch(res.stdout, /task-wait/);
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("launches a detached task stand-in, prints log path and runnable task-wait command line", async () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-test-task-detach-success-"));
+    try {
+      const briefPath = path.join(tmp, "brief.md");
+      fs.writeFileSync(briefPath, VALID_BRIEF);
+      const stateRootDir = path.join(tmp, "state");
+
+      const standinScript = path.join(tmp, "task-standin.mjs");
+      fs.writeFileSync(
+        standinScript,
+        `import fs from "node:fs";
+import path from "node:path";
+import crypto from "node:crypto";
+
+const stateDir = process.env.KUSABI_TEST_STATE_DIR;
+const jobId = "job-" + Date.now().toString(36) + crypto.randomBytes(2).toString("hex");
+const jobDir = path.join(stateDir, "jobs", jobId);
+fs.mkdirSync(jobDir, { recursive: true });
+
+fs.writeFileSync(path.join(jobDir, "job.json"), JSON.stringify({
+  id: jobId, kind: "task", phase: "review", status: "completed",
+  startedAt: new Date().toISOString(), finishedAt: new Date().toISOString(),
+}));
+`,
+        "utf8",
+      );
+
+      const env = { ...process.env };
+      delete env.KUSABI_WORKER_CONTEXT;
+      env.KUSABI_STATE_DIR = stateRootDir;
+
+      const hash = crypto.createHash("sha256").update(tmp).digest("hex").slice(0, 12);
+      const workspaceStateDir = path.join(stateRootDir, hash);
+      env.KUSABI_TEST_STATE_DIR = workspaceStateDir;
+      env.KUSABI_TEST_TASK_STANDIN = standinScript;
+
+      const res = spawnSync(
+        process.execPath,
+        [COMPANION_SCRIPT, "task-detach", "--phase", "review", "--container", "cid-1", "--brief-file", briefPath, "--appear-timeout", "10"],
+        { encoding: "utf8", cwd: tmp, env },
+      );
+
+      assert.equal(res.status, 0, res.stdout + res.stderr);
+      assert.match(res.stdout, /Detached task launched \(pid \d+\)/i);
+      assert.match(res.stdout, /Log: .*task-detach-\d+\.log/i);
+      assert.match(res.stdout, /kusabi-companion task-wait/);
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("subcommand list and --help include task-detach and task-wait", () => {
+    const helpRes = spawnSync(process.execPath, [COMPANION_SCRIPT, "--help"], { encoding: "utf8" });
+    assert.equal(helpRes.status, 0);
+    assert.match(helpRes.stdout, /task-detach/);
+    assert.match(helpRes.stdout, /task-wait/);
+
+    const badRes = spawnSync(process.execPath, [COMPANION_SCRIPT, "definitely-not-a-subcommand"], { encoding: "utf8" });
+    assert.equal(badRes.status, 1);
+    assert.match(badRes.stdout + badRes.stderr, /task-detach.*task-wait|task-wait.*task-detach/);
+  });
+});
+
+// =========================================================================
 // status command with kaiba progress (kusabi #391)
 // =========================================================================
 
