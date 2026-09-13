@@ -12,6 +12,7 @@ import { createFakeCallTool } from "./fixtures.mjs";
 import { saveJob } from "./job-store.mjs";
 import {
   runChainDriver,
+  runTddExecutor,
   resolveReviewDispatch,
   resolveResumeDispatches,
   resolveResumeReviewContext,
@@ -27,6 +28,12 @@ import { resolveChainResume } from "./chain-resume-resolve.mjs";
 import { readJson, writeJson } from "./state-paths.mjs";
 import { renderChainShow } from "./render.mjs";
 import { TERMINAL_DISPOSITIONS } from "./chain-wait.mjs";
+import {
+  createTddChainState,
+  loadTddState,
+  buildSlicePlan,
+  parseRequirements,
+} from "./tdd-chain.mjs";
 
 
 /** Valid change-scope JSON for driver mocks (kusabi #379). Production must not fabricate this. */
@@ -4976,3 +4983,332 @@ describe("runChainDriver change-scope fail-closed (kusabi #379)", () => {
     }
   });
 });
+
+// =========================================================================
+// runTddExecutor — driver-level lifecycle tests (kusabi #502)
+// -------------------------------------------------------------------------
+// Tests the TDD executor with mocked dispatch/probes for:
+//   - two sequential slices
+//   - cancellation
+//   - exception handling
+//   - terminal control finalization
+//   - round record persistence
+//   - resume from frozen subphase
+// =========================================================================
+
+describe("runTddExecutor lifecycle", () => {
+  const BRIEF = "Implement TDD chain.\n\n## Deliverables\n- tests/foo.test.mjs\n";
+
+  function makeTddChainDir() {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-tdd-"));
+    const chainDir = path.join(tmp, "chains", "chain-tdd-1");
+    fs.mkdirSync(chainDir, { recursive: true });
+    return { tmp, chainDir };
+  }
+
+  function makeTddChainState(chainId = "chain-tdd-1", reqsMd) {
+    const md = reqsMd || "## Auth\n- login\n\n## Export\n- csv\n";
+    const requirements = parseRequirements(md);
+    const planResult = buildSlicePlan(requirements);
+    return createTddChainState({
+      chainId,
+      requirementsFile: "reqs.md",
+      plan: planResult.plan,
+    });
+  }
+
+  function fakeTddCallTool() {
+    let worktreeCaptureCount = 0;
+    return async (toolName, params) => {
+      if (toolName === "verify_in_container") {
+        return { gate_passed: true };
+      }
+      if (toolName === "copy_file") {
+        // collectChangeScope inject script — succeed silently
+        return {};
+      }
+      if (toolName !== "sandbox_exec") return { output: "" };
+      const scope = fakeChangeScopeResult(params);
+      if (scope) return scope;
+      const cmd = params.commands?.[0] ?? "";
+      const argv = params.argv;
+      // collectChangeScope uses argv style; check if any argv element contains change-scope
+      if (Array.isArray(argv) && argv.some((a) => a.includes("change-scope"))) {
+        return {
+          output: JSON.stringify({
+            formatVersion: 1, repositoryRoot: "/workspace",
+            input: { base: "abc123", head: "HEAD" },
+            resolved: { baseSha: "abc123", headSha: "abc123", mergeBaseSha: "abc123" },
+            paths: { committed: [], staged: [], unstaged: [], untracked: [] },
+          }),
+        };
+      }
+      // captureWorktreeState: return different content on second call.
+      // After the baseline (call 1), alternate between test-author and
+      // implement phases: odd calls are test-author (test files only),
+      // even calls are implement (impl files only).  This ensures P5
+      // (frozen probe) does not see test files in the implement phase's
+      // changed paths, matching production behaviour.
+      if (cmd.startsWith("cd /workspace &&") && cmd.includes("TMPIDX=")) {
+        worktreeCaptureCount++;
+        if (worktreeCaptureCount === 1) {
+          return {
+            output: "TREE_HASH=baseline\n" +
+              "aaa111|tests/foo.test.mjs\n" +
+              "COUNT=1\n",
+            truncated: false, has_more: false,
+          };
+        }
+        // Odd after first = test-author; even = implement.
+        const isImplement = worktreeCaptureCount % 2 === 0;
+        if (isImplement) {
+          return {
+            output: "TREE_HASH=current\n" +
+              "bbb222|src/foo.js\n" +
+              "COUNT=1\n",
+            truncated: false, has_more: false,
+          };
+        }
+        return {
+          output: "TREE_HASH=current\n" +
+            "ccc333|tests/foo.test.mjs\n" +
+            "COUNT=1\n",
+          truncated: false, has_more: false,
+        };
+      }
+      if (cmd === "git rev-parse HEAD") return { output: "abc123\n" };
+      if (cmd === "git status --porcelain") return { output: " M tests/foo.test.mjs\n" };
+      if (cmd === "git log --oneline -5") return { output: "abc123 latest\n" };
+      if (cmd === "git diff") return { output: "diff --git a/tests/foo.test.mjs\n" };
+      if (cmd === "git ls-files --others --exclude-standard") return { output: "" };
+      return { output: "" };
+    };
+  }
+
+  function makeTddDispatch({ implementStatus = "completed" } = {}) {
+    const calls = [];
+    const dispatch = async (opts) => {
+      calls.push(opts);
+      if (opts.kind === "review") {
+        return {
+          job: {
+            id: "job-rev-tdd", status: "completed", modelEntry: "fake/review",
+            modelVariant: null, fallbacks: null, sessionID: "sess-rev-tdd",
+            usage: { available: true, input: 1, output: 1, reasoning: 0, cacheRead: 0, cacheWrite: 0, cost: 0.01 },
+            error: null,
+          },
+          resultText: JSON.stringify({
+            schema_version: 1, verdict: "approve", findings: [],
+            summary: "ok", next_steps: [],
+          }),
+        };
+      }
+      // Detect test-author vs implement phase from the prompt text.
+      // Test-author briefs contain "Write failing tests"; implement briefs contain "Implement requirement".
+      const promptText = opts.promptText ?? "";
+      const isTestAuthor = /Write failing tests/i.test(promptText);
+      return {
+        job: {
+          id: "job-imp-tdd-" + calls.length, status: implementStatus,
+          modelEntry: "fake/model", modelVariant: null, fallbacks: null,
+          sessionID: "sess-imp-tdd-" + calls.length,
+          usage: { available: true, input: 1, output: 1, reasoning: 0, cacheRead: 0, cacheWrite: 0, cost: 0.01 },
+          error: null,
+        },
+        // Test-author phases produce test paths; implement phases produce implementation paths.
+        resultText: isTestAuthor
+          ? "wrote failing tests in tests/foo.test.mjs"
+          : "implemented src/foo.js",
+      };
+    };
+    dispatch.calls = calls;
+    return dispatch;
+  }
+
+  async function runTdd({ tddState, chainDir, dispatch, callTool, signalReceived, records }) {
+    const tmp = path.dirname(path.dirname(chainDir));
+    writeChainControl(chainDir, {
+      chainId: tddState.chainId, container: "cid-tdd", pid: process.pid,
+      status: "running", round: 0,
+    });
+    return runTddExecutor({
+      tddState, chainDir,
+      chainId: tddState.chainId, container: "cid-tdd",
+      callTool: callTool ?? fakeTddCallTool(),
+      cwd: tmp, flagsModel: null,
+      dispatchWithFallback: dispatch ?? makeTddDispatch(),
+      backend: "opencode",
+      modelChain: [["fake/model"]],
+      baseSha: "abc123",
+      // worktreeBaseline: empty state; mock captureWorktreeState returns a
+      // state with one file → computeNewlyChanged detects the diff →
+      // worktreeChanged = true, so isSliceRed / isSliceGreen pass.
+      worktreeBaseline: { treeHash: "empty", files: {} },
+      verifyBaseline: null,
+      stateDir: path.dirname(chainDir),
+      model: "fake/model", maxRounds: 4, brief: BRIEF,
+      orchestrator: null,
+      records: records ?? [],
+      signalReceived: signalReceived ?? (() => false),
+    });
+  }
+
+  // ---- Two sequential slices ----
+  it("runs two sequential slices with test-author and implement phases each", async () => {
+    const { tmp, chainDir } = makeTddChainDir();
+    try {
+      const tddState = makeTddChainState();
+      const result = await runTdd({ tddState, chainDir });
+
+      // Both slices completed
+      assert.match(result, /status: completed/);
+      assert.match(result, /progress: 2\/2/);
+
+      // Control finalized as completed
+      const control = readChainControl(chainDir);
+      assert.equal(control.status, "completed");
+
+      // Round records persisted
+      const round1 = readJson(path.join(chainDir, "round-1.json"));
+      assert.ok(round1, "round-1.json must exist");
+      assert.equal(round1.round, 1);
+
+      const round2 = readJson(path.join(chainDir, "round-2.json"));
+      assert.ok(round2, "round-2.json must exist");
+      assert.equal(round2.round, 2);
+
+      const round3 = readJson(path.join(chainDir, "round-3.json"));
+      assert.ok(round3, "round-3.json must exist");
+      assert.equal(round3.round, 3);
+
+      const round4 = readJson(path.join(chainDir, "round-4.json"));
+      assert.ok(round4, "round-4.json must exist");
+      assert.equal(round4.round, 4);
+
+      // TDD state persisted with correct nextRound
+      const persisted = loadTddState(chainDir);
+      assert.equal(persisted.nextRound, 5); // 4 rounds done, next is 5
+      assert.equal(persisted.status, "completed");
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  // ---- Cancellation ----
+  it("cancels on signal before dispatch and finalises control", async () => {
+    const { tmp, chainDir } = makeTddChainDir();
+    try {
+      const tddState = makeTddChainState();
+      const result = await runTdd({
+        tddState, chainDir,
+        signalReceived: () => true, // signal already fired
+      });
+
+      assert.match(result, /status: cancelled/);
+      const control = readChainControl(chainDir);
+      assert.equal(control.status, "cancelled");
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  // ---- Exception handling ----
+  it("catches dispatch exceptions, marks slice failed, finalises when exhausted", async () => {
+    const { tmp, chainDir } = makeTddChainDir();
+    try {
+      const tddState = makeTddChainState();
+      const throwingDispatch = async () => { throw new Error("worker crashed"); };
+      const result = await runTdd({ tddState, chainDir, dispatch: throwingDispatch });
+
+      assert.match(result, /status: failed/);
+      const control = readChainControl(chainDir);
+      assert.equal(control.status, "failed");
+
+      // State persisted with failure
+      const persisted = loadTddState(chainDir);
+      assert.equal(persisted.status, "failed");
+      assert.ok(persisted.failureReason.includes("worker crashed"));
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  // ---- Terminal control finalization ----
+  it("finalizes control.json on every terminal path", async () => {
+    const { tmp, chainDir } = makeTddChainDir();
+    try {
+      // Completed path
+      const state1 = makeTddChainState("chain-ctrl-1");
+      await runTdd({ tddState: state1, chainDir });
+      assert.equal(readChainControl(chainDir).status, "completed");
+
+      // Cancelled path
+      const { tmp: tmp2, chainDir: dir2 } = makeTddChainDir();
+      const state2 = makeTddChainState("chain-ctrl-2");
+      await runTdd({ tddState: state2, chainDir: dir2, signalReceived: () => true });
+      assert.equal(readChainControl(dir2).status, "cancelled");
+      fs.rmSync(tmp2, { recursive: true, force: true });
+
+      // Failed path
+      const { tmp: tmp3, chainDir: dir3 } = makeTddChainDir();
+      const state3 = makeTddChainState("chain-ctrl-3");
+      await runTdd({ tddState: state3, chainDir: dir3, dispatch: async () => { throw new Error("boom"); } });
+      assert.equal(readChainControl(dir3).status, "failed");
+      fs.rmSync(tmp3, { recursive: true, force: true });
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  // ---- Round record persistence ----
+  it("persists every round record as round-N.json with stable numbering", async () => {
+    const { tmp, chainDir } = makeTddChainDir();
+    try {
+      const tddState = makeTddChainState();
+      await runTdd({ tddState, chainDir });
+
+      // Each phase produces a round-N.json
+      for (let i = 1; i <= 4; i++) {
+        const rec = readJson(path.join(chainDir, `round-${i}.json`));
+        assert.ok(rec, `round-${i}.json must exist`);
+        assert.equal(rec.round, i);
+        assert.equal(rec.backend, "opencode");
+        assert.equal(rec.reviewBackend, "opencode");
+      }
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  // ---- Resume from frozen subphase ----
+  it("resumes from frozen subphase without re-running test-author", async () => {
+    const { tmp, chainDir } = makeTddChainDir();
+    try {
+      const tddState = makeTddChainState();
+      // Simulate: slice 0 green, slice 1 frozen (tests written, implement pending)
+      tddState.currentSliceIndex = 1;
+      tddState.completedReqIds = ["req-auth"];
+      tddState.plan[0].status = "green";
+      tddState.plan[1].status = "frozen";
+      tddState.plan[1].frozenTests = ["tests/export.test.mjs"];
+      tddState.accumulatedFrozenTests = ["tests/auth.test.mjs", "tests/export.test.mjs"];
+      tddState.nextRound = 3; // rounds 1-2 already done
+
+      const result = await runTdd({ tddState, chainDir });
+
+      assert.match(result, /status: completed/);
+
+      // Only round 3 should be created (implement for slice 1)
+      const round3 = readJson(path.join(chainDir, "round-3.json"));
+      assert.ok(round3, "round-3.json must exist");
+      assert.equal(round3.round, 3);
+
+      // No round-1 or round-2 created by this run
+      assert.equal(fs.existsSync(path.join(chainDir, "round-1.json")), false);
+      assert.equal(fs.existsSync(path.join(chainDir, "round-2.json")), false);
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+});
+

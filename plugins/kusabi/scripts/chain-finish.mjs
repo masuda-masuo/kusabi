@@ -710,6 +710,7 @@ export async function finishRound(
     maxRounds, brief, orchestrator, records, baseSha: effectiveBaseSha,
     chainTotals, strategized: ctx.strategized, chainFollowupDraft,
     verifyBaseline: effectiveVerifyBaseline,
+    strategy: ctx.strategy ?? null, requirementsFile: ctx.requirementsFile ?? null,
   });
 
   // Update the chain control round counter
@@ -821,6 +822,7 @@ export async function finishRound(
       maxRounds, brief, orchestrator, records, baseSha: effectiveBaseSha,
       chainTotals: updatedTotals, strategized: true, chainFollowupDraft,
       verifyBaseline: effectiveVerifyBaseline,
+      strategy: ctx.strategy ?? null, requirementsFile: ctx.requirementsFile ?? null,
     });
   }
   return { done: false };

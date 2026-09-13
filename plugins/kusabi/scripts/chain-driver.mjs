@@ -30,6 +30,7 @@ import { writeJson } from "./state-paths.mjs";
 import {
   shouldStopNow,
   finalizeChainControl,
+  updateChainControlRound,
 } from "./chain-control.mjs";
 import { dispatchWithFallback } from "./prompt-execution.mjs";
 import { deriveStopReason } from "./stop-reason.mjs";
@@ -59,6 +60,27 @@ import {
   handleProviderExhaustion,
 } from "./chain-outcomes.mjs";
 import { captureWorktreeState } from "./worktree-baseline.mjs";
+
+// ---------------------------------------------------------------------------
+// Incremental TDD executor (kusabi #502)
+// ---------------------------------------------------------------------------
+
+import {
+  loadTddState,
+  validateTddState,
+  persistTddState,
+  markRed,
+  freezeTests,
+  advanceSlice,
+  markSliceFailed,
+  markEmptyDiff,
+  cancelTddChain,
+  generateTestAuthorBrief,
+  generateImplementBrief,
+  extractTestPaths,
+  renderTddChainStatus,
+  renderCoverageReport,
+} from "./tdd-chain.mjs";
 
 // The companion side of the round loop's import needs.
 import {
@@ -287,6 +309,386 @@ export function resolveResumeDispatches({ resumeBackend, resumeReviewBackend, mo
  * @param {object|null} [opts.resume]       — resolveChainResume position or null.
  * @returns {Promise<string>} Outcome text for the operator.
  */
+
+/**
+ * Run the incremental-TDD executor (kusabi #502).
+ *
+ * Iterates over slices sequentially.  Each slice dispatches two implement
+ * phases: a test-author phase (red) and an implement phase (green).
+ * Frozen tests accumulate across slices.  State is persisted at every
+ * transition boundary.
+ *
+ * Lifecycle contracts match the normal chain:
+ *   - finalizeChainControl on every terminal path
+ *   - signal/stop-lever checked before each dispatch
+ *   - round records persisted as round-N.json via persistChainState
+ *   - exceptions caught, slice marked failed, exhausted → finalize failed
+ *
+ * @param {object} opts — subset of runChainDriver opts plus TDD-specific state
+ * @param {object} opts.tddState — loaded and validated TDD chain state
+ * @param {string} opts.chainDir
+ * @param {string} opts.chainId
+ * @param {string} opts.container
+ * @param {Function} opts.callTool
+ * @param {string} opts.cwd
+ * @param {string|null} opts.flagsModel
+ * @param {Function} opts.dispatchWithFallback
+ * @param {string} opts.backend
+ * @param {Array} opts.modelChain
+ * @param {string|null} opts.baseSha
+ * @param {object} opts.worktreeBaseline
+ * @param {object|null} opts.verifyBaseline
+ * @param {string|null} opts.model
+ * @param {number} opts.maxRounds
+ * @param {string} opts.brief
+ * @param {object|null} opts.orchestrator
+ * @param {Array} opts.records — existing round records (from resume or [])
+ * @param {Function} opts.signalReceived — getter: has SIGTERM/SIGINT fired?
+ * @param {string|null} opts.strategy — TDD strategy name (e.g. "incremental-tdd")
+ * @param {string|null} opts.requirementsFile — path to the requirements file
+ * @returns {Promise<string>} Outcome text for the operator.
+ */
+export async function runTddExecutor({
+  tddState, chainDir, chainId, container, callTool, cwd, flagsModel,
+  dispatchWithFallback: _dispatch, backend, modelChain, baseSha,
+  worktreeBaseline, verifyBaseline, model, maxRounds, brief,
+  orchestrator, records, signalReceived = () => false,
+  strategy = null, requirementsFile = null,
+}) {
+  let session = null;
+  let provenance = null;
+  // Records array: populated from resume context or started empty.
+  // Persisted to chain.json via persistChainState on every round boundary.
+  const roundRecords = Array.isArray(records) ? records : [];
+
+  while (tddState.currentSliceIndex < tddState.plan.length) {
+    const slice = tddState.plan[tddState.currentSliceIndex];
+    const isRetry = slice.retryCount > 0;
+
+    // ---- Stop check: honour file-based stop request or signal ----
+    if (shouldStopNow({ chainDir, signalReceived: signalReceived() })) {
+      cancelTddChain(tddState, "cancelled by operator (stop requested)");
+      persistTddState(chainDir, tddState);
+      finalizeChainControl({ chainDir, status: "cancelled", round: tddState.nextRound - 1 });
+      return finaliseTddChain(tddState, chainDir);
+    }
+
+    try {
+      // ---- Resume from frozen subphase ----
+      // If the current slice is "frozen" (tests frozen but implement not yet run),
+      // skip directly to the implement (green) phase.
+      if (slice.status === "frozen") {
+        // Go straight to Phase 2: implement (green)
+        const implementBrief = generateImplementBrief(slice, tddState.accumulatedFrozenTests);
+        const round = tddState.nextRound;
+
+        const implementResult = await runImplementPhase({
+          cwd, chainId, round,
+          isFirstRound: false,
+          implementText: implementBrief,
+          modelChain,
+          tierIndex: 0,
+          useNewSession: true,
+          session,
+          sessionProvenance: provenance,
+          previousRecord: roundRecords.length > 0 ? roundRecords[roundRecords.length - 1] : null,
+          resumeMethod: undefined,
+          flagsModel,
+          backend,
+          _dispatchWithFallback: _dispatch,
+        });
+
+        implementResult.roundRecord.backend = backend;
+        implementResult.roundRecord.reviewBackend = backend;
+        implementResult.roundRecord.round = round;
+        session = implementResult.session;
+        provenance = implementResult.sessionProvenance ?? null;
+
+        const implementProbes = await runProbePhase({
+          baseSha, container, brief: implementBrief, callTool,
+          worktreeBaseline, verifyBaseline,
+        });
+        implementResult.roundRecord.probesGreen = implementProbes.probesGreen;
+        implementResult.roundRecord.worktreeChanged = implementProbes.worktreeChanged;
+        implementResult.roundRecord.changeScope = implementProbes.changeScope ?? null;
+        implementResult.roundRecord.chainChangedPaths = implementProbes.chainChangedPaths ?? [];
+        implementResult.roundRecord.stopReason = deriveStopReason({
+          status: implementResult.implementJobStatus,
+          stats: { steps: implementResult.implementJobSteps ?? 0 },
+          worktreeChanged: implementResult.roundRecord.worktreeChanged ?? null,
+        });
+
+        // Persist round record
+        roundRecords.push(implementResult.roundRecord);
+        persistChainState({
+          chainDir, round, roundRecord: implementResult.roundRecord,
+          chainId, container, model, modelChain,
+          maxRounds, brief, orchestrator, records: roundRecords,
+          baseSha, chainTotals: computeChainTotals(roundRecords),
+          strategized: false, chainFollowupDraft: null,
+          strategy, requirementsFile,
+        });
+        updateChainControlRound({ chainDir, round });
+        tddState.nextRound += 1;
+
+        // Handle provider error
+        if (implementResult.implementJobStatus === "provider-error") {
+          const { retriable } = markSliceFailed(tddState, "provider exhaustion during implement");
+          persistTddState(chainDir, tddState);
+          if (!retriable) {
+            finalizeChainControl({ chainDir, status: "failed", round });
+            return finaliseTddChain(tddState, chainDir);
+          }
+          continue;
+        }
+
+        const implementSlicesGreen = implementResult.implementJobStatus === "completed"
+          && implementResult.roundRecord.probesGreen === true
+          && implementResult.roundRecord.worktreeChanged === true;
+        if (implementSlicesGreen) {
+          advanceSlice(tddState);
+          persistTddState(chainDir, tddState);
+          if (tddState.status === "completed") {
+            finalizeChainControl({ chainDir, status: "completed", round });
+            return finaliseTddChain(tddState, chainDir);
+          }
+        } else {
+          const reason = implementResult.implementJobStatus !== "completed"
+            ? `implement failed: ${implementResult.implementJobError || implementResult.implementJobStatus}`
+            : "implement completed but probes not green";
+          const { retriable } = markSliceFailed(tddState, reason);
+          persistTddState(chainDir, tddState);
+          if (!retriable) {
+            finalizeChainControl({ chainDir, status: "failed", round });
+            return finaliseTddChain(tddState, chainDir);
+          }
+        }
+        continue;
+      }
+
+      // ---- Phase 1: test-author (red) ----
+      markRed(tddState);
+      persistTddState(chainDir, tddState);
+
+      const testAuthorBrief = generateTestAuthorBrief(slice, tddState.accumulatedFrozenTests);
+      const testAuthorRound = tddState.nextRound;
+
+      const testAuthorResult = await runImplementPhase({
+        cwd, chainId,
+        round: testAuthorRound,
+        isFirstRound: tddState.currentSliceIndex === 0 && !isRetry,
+        implementText: testAuthorBrief,
+        modelChain,
+        tierIndex: 0,
+        useNewSession: true,
+        session: null,
+        sessionProvenance: null,
+        previousRecord: null,
+        resumeMethod: undefined,
+        flagsModel,
+        backend,
+        _dispatchWithFallback: _dispatch,
+      });
+
+      testAuthorResult.roundRecord.backend = backend;
+      testAuthorResult.roundRecord.reviewBackend = backend;
+      testAuthorResult.roundRecord.round = testAuthorRound;
+
+      session = testAuthorResult.session;
+      provenance = testAuthorResult.sessionProvenance ?? null;
+
+      // Run probes to detect worktree changes
+      const testAuthorProbes = await runProbePhase({
+        baseSha, container,
+        brief: testAuthorBrief,
+        callTool,
+        worktreeBaseline,
+        verifyBaseline,
+      });
+      testAuthorResult.roundRecord.probesGreen = testAuthorProbes.probesGreen;
+      testAuthorResult.roundRecord.worktreeChanged = testAuthorProbes.worktreeChanged;
+      testAuthorResult.roundRecord.changeScope = testAuthorProbes.changeScope ?? null;
+      testAuthorResult.roundRecord.chainChangedPaths = testAuthorProbes.chainChangedPaths ?? [];
+      testAuthorResult.roundRecord.stopReason = deriveStopReason({
+        status: testAuthorResult.implementJobStatus,
+        stats: { steps: testAuthorResult.implementJobSteps ?? 0 },
+        worktreeChanged: testAuthorResult.roundRecord.worktreeChanged ?? null,
+      });
+
+      // Persist test-author round record
+      roundRecords.push(testAuthorResult.roundRecord);
+      persistChainState({
+        chainDir, round: testAuthorRound, roundRecord: testAuthorResult.roundRecord,
+        chainId, container, model, modelChain,
+        maxRounds, brief, orchestrator, records: roundRecords,
+        baseSha, chainTotals: computeChainTotals(roundRecords),
+        strategized: false, chainFollowupDraft: null,
+        strategy, requirementsFile,
+      });
+      updateChainControlRound({ chainDir, round: testAuthorRound });
+      tddState.nextRound += 1;
+
+      // ---- check: red phase completed with changes ----
+      if (testAuthorResult.implementJobStatus === "provider-error") {
+        const { retriable } = markSliceFailed(tddState, "provider exhaustion during test-author");
+        persistTddState(chainDir, tddState);
+        if (!retriable) {
+          finalizeChainControl({ chainDir, status: "failed", round: testAuthorRound });
+          return finaliseTddChain(tddState, chainDir);
+        }
+        continue; // retry this slice
+      }
+
+      const testAuthorRed = testAuthorResult.implementJobStatus === "completed"
+        && testAuthorResult.roundRecord.worktreeChanged === true;
+      if (!testAuthorRed) {
+        // No deliverable changes — failed attempt
+        const { retriable } = markEmptyDiff(tddState, "test-author produced no deliverable changes");
+        persistTddState(chainDir, tddState);
+        if (!retriable) {
+          finalizeChainControl({ chainDir, status: "failed", round: testAuthorRound });
+          return finaliseTddChain(tddState, chainDir);
+        }
+        continue; // retry this slice
+      }
+
+      // ---- Phase 1b: freeze tests ----
+      const frozenPaths = extractTestPaths(testAuthorResult.roundRecord);
+      freezeTests(tddState, frozenPaths);
+      persistTddState(chainDir, tddState);
+
+      // ---- Phase 2: implement (green) ----
+      const implementBrief = generateImplementBrief(
+        slice,
+        tddState.accumulatedFrozenTests,
+      );
+      const implementRound = tddState.nextRound;
+
+      const implementResult = await runImplementPhase({
+        cwd, chainId,
+        round: implementRound,
+        isFirstRound: false,
+        implementText: implementBrief,
+        modelChain,
+        tierIndex: 0,
+        useNewSession: true,
+        session,
+        sessionProvenance: provenance,
+        previousRecord: testAuthorResult.roundRecord,
+        resumeMethod: undefined,
+        flagsModel,
+        backend,
+        _dispatchWithFallback: _dispatch,
+      });
+
+      implementResult.roundRecord.backend = backend;
+      implementResult.roundRecord.reviewBackend = backend;
+      implementResult.roundRecord.round = implementRound;
+
+      session = implementResult.session;
+      provenance = implementResult.sessionProvenance ?? null;
+
+      // Run probes
+      const implementProbes = await runProbePhase({
+        baseSha, container,
+        brief: implementBrief,
+        callTool,
+        worktreeBaseline,
+        verifyBaseline,
+      });
+      implementResult.roundRecord.probesGreen = implementProbes.probesGreen;
+      implementResult.roundRecord.worktreeChanged = implementProbes.worktreeChanged;
+      implementResult.roundRecord.changeScope = implementProbes.changeScope ?? null;
+      implementResult.roundRecord.chainChangedPaths = implementProbes.chainChangedPaths ?? [];
+      implementResult.roundRecord.stopReason = deriveStopReason({
+        status: implementResult.implementJobStatus,
+        stats: { steps: implementResult.implementJobSteps ?? 0 },
+        worktreeChanged: implementResult.roundRecord.worktreeChanged ?? null,
+      });
+
+      // Persist implement round record
+      roundRecords.push(implementResult.roundRecord);
+      persistChainState({
+        chainDir, round: implementRound, roundRecord: implementResult.roundRecord,
+        chainId, container, model, modelChain,
+        maxRounds, brief, orchestrator, records: roundRecords,
+        baseSha, chainTotals: computeChainTotals(roundRecords),
+        strategized: false, chainFollowupDraft: null,
+        strategy, requirementsFile,
+      });
+      updateChainControlRound({ chainDir, round: implementRound });
+      tddState.nextRound += 1;
+
+      // ---- check: green phase ----
+      if (implementResult.implementJobStatus === "provider-error") {
+        const { retriable } = markSliceFailed(tddState, "provider exhaustion during implement");
+        persistTddState(chainDir, tddState);
+        if (!retriable) {
+          finalizeChainControl({ chainDir, status: "failed", round: implementRound });
+          return finaliseTddChain(tddState, chainDir);
+        }
+        continue; // retry this slice
+      }
+
+      const implementSlicesGreen = implementResult.implementJobStatus === "completed"
+        && implementResult.roundRecord.probesGreen === true
+        && implementResult.roundRecord.worktreeChanged === true;
+      if (implementSlicesGreen) {
+        // ---- advance to next slice ----
+        advanceSlice(tddState);
+        persistTddState(chainDir, tddState);
+
+        // Check if we've completed all slices
+        if (tddState.status === "completed") {
+          finalizeChainControl({ chainDir, status: "completed", round: implementRound });
+          return finaliseTddChain(tddState, chainDir);
+        }
+      } else {
+        // Not green — failed attempt (empty diff or non-green probes)
+        const reason = implementResult.implementJobStatus !== "completed"
+          ? `implement failed: ${implementResult.implementJobError || implementResult.implementJobStatus}`
+          : "implement completed but probes not green";
+        const { retriable } = markSliceFailed(tddState, reason);
+        persistTddState(chainDir, tddState);
+        if (!retriable) {
+          finalizeChainControl({ chainDir, status: "failed", round: implementRound });
+          return finaliseTddChain(tddState, chainDir);
+        }
+        // Don't advance — retry this slice
+      }
+    } catch (err) {
+      // ---- Exception: mark slice failed, persist, finalize if exhausted ----
+      const { retriable } = markSliceFailed(tddState, `exception: ${err?.message || String(err)}`);
+      persistTddState(chainDir, tddState);
+      if (!retriable) {
+        finalizeChainControl({ chainDir, status: "failed", round: tddState.nextRound - 1 });
+        return finaliseTddChain(tddState, chainDir);
+      }
+      // Retry this slice on retriable exception
+    }
+  }
+
+  // Should not reach here normally — all slices exhausted or completed
+  finalizeChainControl({ chainDir, status: tddState.status === "completed" ? "completed" : "failed", round: tddState.nextRound - 1 });
+  return finaliseTddChain(tddState, chainDir);
+}
+
+/**
+ * Finalise a completed or failed TDD chain and produce outcome text.
+ *
+ * @param {object} tddState
+ * @param {string} chainDir
+ * @returns {string}
+ */
+function finaliseTddChain(tddState, chainDir) {
+  persistTddState(chainDir, tddState);
+  const statusLines = renderTddChainStatus(tddState);
+  const coverageReport = renderCoverageReport(tddState);
+  const header = statusLines.join("\n");
+  const tail = `\n\n${coverageReport}`;
+  return header + tail;
+}
+
 export async function runChainDriver({
   cwd, stateDir, chainDir, chainId, container, model, modelChain, maxRounds,
   brief, orchestrator, baseSha, worktreeBaseline, verifyBaseline, callTool,
@@ -308,6 +710,7 @@ export async function runChainDriver({
   reworkDispatchWithFallback = null,
   initialSession, flagsModel = null, reviewFlagsModel = null, signalReceived = () => false,
   keepServe = false, resume = null, sessionProvenance = null,
+  strategy = null, requirementsFile = null,
 }) {
   // Per-phase dispatch (kusabi #192): the review phase dispatches through its
   // own backend-specific dispatch unless the caller threads a single one
@@ -348,6 +751,41 @@ export async function runChainDriver({
   // would measure the round's changes and silently ratchet the baseline.
   const effectiveVerifyBaseline = verifyBaseline ?? null;
 
+  // ---- incremental-TDD executor (kusabi #502) ----
+  // When the strategy is "incremental-tdd", bypass the normal round loop and
+  // run the TDD executor which owns sequential slice-by-slice dispatch.
+  if (strategy === "incremental-tdd") {
+    const tddState = loadTddState(chainDir);
+    const validation = validateTddState(tddState, { retryTransition: true });
+    if (!validation.ok) {
+      throw new Error(`TDD chain ${chainId}: ${validation.error}`);
+    }
+    try {
+      return await runTddExecutor({
+        tddState: validation.state,
+        chainDir, chainId, container, callTool, cwd, flagsModel,
+        dispatchWithFallback: injectedDispatch,
+        backend, modelChain,
+        baseSha: effectiveBaseSha,
+        worktreeBaseline: effectiveBaseline,
+        verifyBaseline: effectiveVerifyBaseline,
+        stateDir, model, maxRounds, brief, orchestrator,
+        records: resume ? (resume.records ?? []) : [],
+        signalReceived,
+        strategy, requirementsFile,
+      });
+    } finally {
+      if (!keepServe) {
+        try {
+          const hasRunning = liveRunningJobs(stateDir).length > 0;
+          if (!hasRunning) {
+            cmdServeStop(cwd);
+          }
+        } catch { /* best-effort */ }
+      }
+    }
+  }
+
   // ---- round loop state (cross-round) ----
   const records = resume ? resume.records : [];
   let session = resume ? resume.session : initialSession;
@@ -368,6 +806,7 @@ export async function runChainDriver({
     reviewModel, reviewModelChain, reworkModel, reworkModelChain, reworkBackend,
     reviewDispatch, injectedDispatch,
     reworkTierCount: effectiveTierCount(effectiveReworkChain, effectiveReworkBackend),
+    strategy, requirementsFile,
     // Mutable cross-round state (owned by the loop, mutated by finishRound)
     records,
     strategized: resume ? resume.strategized : false,
@@ -689,6 +1128,7 @@ export async function runChainDriver({
           chainTotals: partialTotals, strategized: ctx.strategized, chainFollowupDraft: null,
           interrupted: true,
           verifyBaseline: effectiveVerifyBaseline,
+          strategy, requirementsFile,
         });
         finalizeChainControl({ chainDir, status: "cancelled", round });
         const text = `Chain ${chainId} cancelled during round ${round} (stop requested after probes, before review). Progress preserved — resume with chain-resume ${chainId}.`;

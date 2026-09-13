@@ -57,6 +57,7 @@ export function persistChainState({
   reworkModel = null, reworkModelChain = null, reworkBackend = null,
   maxRounds, brief, orchestrator, records, baseSha, chainTotals,
   strategized, chainFollowupDraft, interrupted = false, verifyBaseline = null,
+  strategy = null, requirementsFile = null,
 }) {
   if (interrupted) {
     roundRecord.interrupted = true;
@@ -107,6 +108,9 @@ export function persistChainState({
     // Chain-start verify baseline (kusabi #173): captured on the pristine
     // base before round-1 implement, reused verbatim by chain-resume.
     verifyBaseline,
+    // Incremental TDD strategy (kusabi #502): strategy and requirements file
+    // persisted on chain.json so chain-show renders strategy info.
+    ...(strategy ? { strategy, requirementsFile } : {}),
   });
 }
 

@@ -176,6 +176,56 @@ export function renderChainShow(chain, rounds, unreadable = [], control = null, 
     lines.push(`container: ${chain.container}`);
   }
 
+  // Strategy if present (kusabi #502)
+  if (chain?.strategy) {
+    lines.push(`strategy: ${chain.strategy}`);
+  }
+  if (chain?.requirementsFile) {
+    lines.push(`requirements file: ${chain.requirementsFile}`);
+  }
+
+  // ---- TDD chain state (kusabi #502) ----
+  // When a TDD state is loaded, display strategy, current/total slice,
+  // requirement coverage, frozen tests, and retry reason/route.
+  const tddState = opts?.tddState ?? null;
+  if (tddState && tddState.strategy === "incremental-tdd") {
+    const totalSlices = tddState.plan.length;
+    const currentSlice = tddState.currentSliceIndex;
+    const completedCount = tddState.completedReqIds.length;
+    const frozenTestCount = tddState.accumulatedFrozenTests.length;
+    lines.push(`tdd slice: ${currentSlice}/${totalSlices}`);
+    lines.push(`tdd requirement coverage: ${completedCount}/${totalSlices}`);
+    lines.push(`tdd frozen tests: ${frozenTestCount}`);
+
+    // Per-slice detail
+    for (const slice of tddState.plan) {
+      const statusIcon =
+        slice.status === "green" ? "✓" :
+        slice.status === "failed" ? "✗" :
+        slice.status === "frozen" ? "❄" :
+        slice.status === "red" ? "●" : "○";
+      const retry = slice.retryCount > 0
+        ? ` (retry ${slice.retryCount}/${3})`
+        : "";
+      const frozen = slice.frozenTests.length > 0
+        ? ` [${slice.frozenTests.length} frozen]`
+        : "";
+      lines.push(`  ${statusIcon} ${slice.id}: ${slice.title} [${slice.reqIds.join(", ")}]${retry}${frozen}`);
+    }
+
+    // Retry reason/route
+    if (tddState.retryInfo.reason) {
+      lines.push(
+        `tdd retry: attempt ${tddState.retryInfo.attempts}, reason: ${tddState.retryInfo.reason}${
+          tddState.retryInfo.exhausted ? " (EXHAUSTED)" : ""
+        }`
+      );
+    }
+    if (tddState.failureReason) {
+      lines.push(`tdd failure: ${tddState.failureReason}`);
+    }
+  }
+
   const unfilled = typeof opts?.unfilledCount === "number" ? opts.unfilledCount : 0;
   if (unfilled > 0) {
     lines.push(`unadjudicated review records: ${unfilled}`);
