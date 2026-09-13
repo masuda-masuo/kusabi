@@ -5624,4 +5624,34 @@ describe("kusabi-companion extraction invariants (kusabi #445)", () => {
   });
 });
 
+describe("incremental-TDD help flags (kusabi #505)", () => {
+  const COMPANION_SCRIPT = path.join(import.meta.dirname, "kusabi-companion.mjs");
+
+  function runHelp() {
+    return spawnSync(process.execPath, [COMPANION_SCRIPT, "--help"], {
+      encoding: "utf8",
+      timeout: 10_000,
+    });
+  }
+
+  it("--help lists --strategy with chain-only semantics", () => {
+    const result = runHelp();
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stdout, /--strategy <name> \(chain:.*incremental-tdd/s);
+  });
+
+  it("--help lists --requirements-file and notes it is required for incremental-tdd", () => {
+    const result = runHelp();
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stdout, /--requirements-file <path> \(chain:.*required.*incremental-tdd/s);
+  });
+
+  it("--help explains incremental-tdd requires both --requirements-file and --container", () => {
+    const result = runHelp();
+    assert.equal(result.status, 0, result.stderr);
+    // The strategy line explicitly states both requirements for incremental-tdd.
+    assert.match(result.stdout, /--strategy <name>.*incremental-tdd.*requires both --requirements-file and --container/s);
+  });
+});
+
 
