@@ -661,6 +661,180 @@ async function registerSubjectWatch({
   };
 }
 
+// ---------------------------------------------------------------------------
+// delayed detached-refusal detection
+//
+// chain-detach / task-detach run their pre-flight checks synchronously, then
+// spawn a detached child (the actual `chain` / `task` run, stdio redirected
+// to the printed log) and return immediately.  The child itself can still
+// reach a terminal refusal — e.g. the lossy-smoke refusal — after the
+// launcher already reported success.  That refusal is written only to the
+// detached log; no chain/job directory is ever created, so the --since
+// selector wait would otherwise burn the whole appearance window for a
+// subject that can never appear.
+//
+// While resolving the subject, the wrapper therefore also observes whether
+// the detached child has terminated.  Positive termination before any
+// selectable state exists means the dispatch refused: read the log, surface
+// the useful diagnostic, state plainly that no watch was registered, and
+// exit promptly/nonzero.  A live (or unobservable) child stays eligible
+// until the normal appearance deadline.
+// ---------------------------------------------------------------------------
+
+/**
+ * Extract the detached child pid and log path from detach command output.
+ * `startTime` is captured immediately so later termination checks can prove
+ * identity — a pid alone can be recycled to an unrelated process.
+ */
+export function extractDetachedChild(output, { procRoot = "/proc" } = {}) {
+  const combined = String(output || "");
+  const pidMatch = combined.match(/Detached (?:chain|task) launched \(pid (\d+)\)/);
+  const logMatch = combined.match(/^Log:\s*(\S+)/m);
+  let pid = null;
+  if (pidMatch) {
+    const n = Number(pidMatch[1]);
+    if (Number.isInteger(n) && n > 0) pid = n;
+  }
+  return {
+    pid,
+    startTime: pid ? getProcessStartTime(pid, procRoot) : null,
+    logPath: logMatch ? logMatch[1] : null,
+  };
+}
+
+/**
+ * True when `dir` exists as a directory (procfs mounted / fake root usable).
+ */
+function procRootPresent(dir) {
+  try {
+    return fs.statSync(dir).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Read /proc/<pid>/stat for process state and startTime.  Returns
+ * `{ state, startTime }` on success; `{ absent: true }` when the entry is
+ * authoritatively gone (ENOENT/ENOTDIR/ESRCH against a present procfs); and
+ * `{ transient: true, error }` when the read failed for an observability
+ * reason (EACCES/EIO/resource exhaustion, or procfs itself unavailable).
+ * `startTime` is field 22 (index 19 after the comm), exactly as watch-chain's
+ * getProcessStartTime reads it.
+ */
+function readProcStat(pid, procRoot) {
+  let stat;
+  try {
+    stat = fs.readFileSync(path.join(procRoot, String(pid), "stat"), "utf8");
+  } catch (err) {
+    const code = err && err.code;
+    if ((code === "ENOENT" || code === "ENOTDIR" || code === "ESRCH") && procRootPresent(procRoot)) {
+      // The pid is not in procfs while procfs itself is mounted: the process
+      // is authoritatively gone (exited and reaped, or never spawned).
+      return { absent: true };
+    }
+    // EACCES / EIO / resource exhaustion / a missing procfs: the process may
+    // well be alive but momentarily unobservable — never a refusal.
+    return { transient: true, error: err };
+  }
+  const lastParen = stat.lastIndexOf(")");
+  if (lastParen === -1) return { transient: true };
+  const rest = stat.slice(lastParen + 2).trim().split(/\s+/);
+  if (rest.length < 20) return { transient: true };
+  return { state: rest[0], startTime: rest[19] };
+}
+
+/**
+ * Positive evidence that the detached child has terminated: the pid is gone
+ * from procfs, the pid is a zombie (exited, awaiting reaping — the log may
+ * outlive it briefly), or the pid was recycled to an unrelated process.
+ *
+ * Absence is authoritative whenever procfs is present: the launcher printed
+ * this pid a moment ago and the kernel cannot recycle a pid in that window,
+ * so a missing entry means the announced child has exited (or never spawned)
+ * — with or without a startTime anchor.  With an anchor, identity is provable
+ * in every branch: a live pid whose startTime differs is a recycled process,
+ * and the reuse is never mistaken for the child itself.
+ *
+ * Transient observation failures (EACCES/EIO, a missing procfs) fail open: a
+ * live-but-unobservable child must stay eligible until the appearance
+ * deadline and must never produce a false refusal or lose its watcher.
+ */
+export function detachedChildTerminated(pid, expectedStartTime = null, procRoot = "/proc") {
+  if (!pid || typeof pid !== "number" || pid <= 0) return false;
+  const proc = readProcStat(pid, procRoot);
+  if (proc.absent) return true; // authoritative: the announced pid is not running
+  if (proc.transient) return false; // live-but-unobservable: stay eligible
+  if (expectedStartTime && proc.startTime !== expectedStartTime) return true; // pid reused
+  if (proc.state === "Z" || proc.state === "X") return true; // ours, exited
+  return false;
+}
+
+/** Best-effort tail of a file (bytes), capped.  Empty string when unreadable. */
+function readFileTail(filePath, maxBytes = 8192) {
+  try {
+    const size = fs.statSync(filePath).size;
+    if (size <= 0) return "";
+    const fd = fs.openSync(filePath, "r");
+    try {
+      const start = Math.max(0, size - maxBytes);
+      const buf = Buffer.alloc(size - start);
+      fs.readSync(fd, buf, 0, buf.length, start);
+      return buf.toString("utf8");
+    } finally {
+      fs.closeSync(fd);
+    }
+  } catch {
+    return "";
+  }
+}
+
+/**
+ * Extract a concise refusal diagnostic from the detached child's log.
+ * Returns `{ diagnostic, logTail }` — diagnostic is the refusal lines joined
+ * into one line (or the tail's last lines when no refusal marker matches).
+ */
+export function readDetachedRefusal(logPath, { maxBytes = 8192, maxLines = 8 } = {}) {
+  const logTail = readFileTail(logPath, maxBytes);
+  if (!logTail) return { diagnostic: null, logTail: "" };
+  const lines = logTail.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+  const refusalPattern =
+    /dispatch refused|brief refusal|\brefusal\b|nothing was dispatched|no job and no round state|kusabi-companion error|error:/i;
+  const matched = lines.filter((l) => refusalPattern.test(l)).slice(0, maxLines);
+  const picked = matched.length > 0 ? matched : lines.slice(-Math.min(3, lines.length));
+  return { diagnostic: picked.join(" ") || null, logTail };
+}
+
+/**
+ * Failure result for a detached dispatch whose child terminated before any
+ * chain/job state became selectable.  Carries the log diagnostic, the raw
+ * log tail, and an explicit statement that no watch was registered — the
+ * caller must not be pointed at a second appearance wait.
+ */
+function detachedRefusalResult({ kind, stdout, stderr, child }) {
+  const { diagnostic, logTail } = readDetachedRefusal(child.logPath);
+  const isTask = kind === "task";
+  const stateWord = isTask ? "job" : "chain";
+  const watchWord = isTask ? "task" : "chain";
+  const message =
+    `Detached ${kind} dispatch refused before creating any ${stateWord} state — ` +
+    `no ${watchWord} watch was registered` +
+    (diagnostic ? `: ${diagnostic}` : ".") +
+    (child.logPath ? ` (log: ${child.logPath})` : "");
+  const result = {
+    success: false,
+    exitCode: 1,
+    stdout,
+    stderr,
+    registration: null,
+    refusal: { pid: child.pid, logPath: child.logPath, diagnostic, logTail },
+    error: new Error(message),
+  };
+  if (isTask) result.jobId = null;
+  else result.chainId = null;
+  return result;
+}
+
 /**
  * Model-free launch wrapper for CHAINS:
  * Invokes kusabi-companion chain-detach directly with argv (no shell),
@@ -724,11 +898,26 @@ export async function launchAndWatch({
     if (!Number.isNaN(sinceStamp)) {
       hasValidSince = true;
       if (!chainId) {
+        const child = extractDetachedChild(combined, { procRoot });
         const startTime = Date.now();
         const boundMs = timeoutMs;
         while (true) {
           chainId = resolveChainFromSince(sinceStamp, cwd, env);
           if (chainId) break;
+          // Re-anchor if the very first read raced the child's spawn.
+          if (child.pid && !child.startTime) {
+            child.startTime = getProcessStartTime(child.pid, procRoot);
+          }
+          // The detached child may have reached a terminal refusal without
+          // creating any chain state — surface the log diagnostic promptly
+          // instead of burning the whole appearance window.
+          if (detachedChildTerminated(child.pid, child.startTime, procRoot)) {
+            // Brief settle so state written in the same instant is not missed.
+            await new Promise((r) => setTimeout(r, 100));
+            chainId = resolveChainFromSince(sinceStamp, cwd, env);
+            if (chainId) break;
+            return detachedRefusalResult({ kind: "chain", stdout, stderr, child });
+          }
           if (Date.now() - startTime >= boundMs) break;
           await new Promise((r) => setTimeout(r, 50));
         }
@@ -849,10 +1038,25 @@ export async function launchTaskAndWatch({
     if (!Number.isNaN(sinceStamp)) {
       // Bounded poll: task-detach creates the job record as it spawns, racing
       // this launcher — the job may legitimately appear a moment later.
+      const child = extractDetachedChild(combined, { procRoot });
       const startTime = Date.now();
       while (true) {
         jobId = resolveJobIdFromSince(sinceStamp, cwd, env);
         if (jobId) break;
+        // Re-anchor if the very first read raced the child's spawn.
+        if (child.pid && !child.startTime) {
+          child.startTime = getProcessStartTime(child.pid, procRoot);
+        }
+        // The detached child may have reached a terminal refusal without
+        // creating any job state — surface the log diagnostic promptly
+        // instead of burning the whole appearance window.
+        if (detachedChildTerminated(child.pid, child.startTime, procRoot)) {
+          // Brief settle so state written in the same instant is not missed.
+          await new Promise((r) => setTimeout(r, 100));
+          jobId = resolveJobIdFromSince(sinceStamp, cwd, env);
+          if (jobId) break;
+          return detachedRefusalResult({ kind: "task", stdout, stderr, child });
+        }
         if (Date.now() - startTime >= timeoutMs) break;
         await new Promise((r) => setTimeout(r, 50));
       }
@@ -1057,6 +1261,33 @@ async function readStdinAll() {
   });
 }
 
+/**
+ * Emit a launch result the way a human should read it.  On a delayed
+ * detached refusal the launcher's "To wait for completion" advice must NOT
+ * be echoed — it would send the caller into a second futile appearance wait
+ * for a subject that can never appear.  The refusal diagnostic and the
+ * explicit "no watch was registered" statement replace it.
+ */
+function emitLaunchOutput(res) {
+  if (res.refusal) {
+    if (res.stdout) {
+      const withoutAdvice = String(res.stdout).replace(
+        /\n*To wait for completion, run:\n[^\n]*\n?\s*$/,
+        ""
+      );
+      if (withoutAdvice) process.stdout.write(withoutAdvice);
+    }
+    if (res.stderr) process.stderr.write(res.stderr);
+    process.stderr.write(`${res.error.message}\n`);
+    if (res.refusal.logTail) {
+      process.stderr.write(`--- detached log tail ---\n${res.refusal.logTail}\n`);
+    }
+    return;
+  }
+  if (res.stdout) process.stdout.write(res.stdout);
+  if (res.stderr) process.stderr.write(res.stderr);
+}
+
 export async function main() {
   const flags = parseArgs(process.argv.slice(2));
 
@@ -1071,8 +1302,7 @@ export async function main() {
       remote: flags.remote,
       sync: !!flags.sync,
     });
-    if (res.stdout) process.stdout.write(res.stdout);
-    if (res.stderr) process.stderr.write(res.stderr);
+    emitLaunchOutput(res);
     if (!res.success) {
       process.exit(res.exitCode || 1);
     }
@@ -1090,8 +1320,7 @@ export async function main() {
       remote: flags.remote,
       sync: !!flags.sync,
     });
-    if (res.stdout) process.stdout.write(res.stdout);
-    if (res.stderr) process.stderr.write(res.stderr);
+    emitLaunchOutput(res);
     if (!res.success) {
       process.exit(res.exitCode || 1);
     }

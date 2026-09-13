@@ -31,6 +31,8 @@ import {
 import {
   registerTaskWatch,
   resumePendingWatches,
+  launchAndWatch,
+  launchTaskAndWatch,
 } from "./register-watch.mjs";
 
 // The wait command's own terminal set — the other half of "the chosen
@@ -359,5 +361,510 @@ process.exitCode = 0;
     // The durable job record is untouched by the watcher.
     assert.equal(readTaskJob(jobId, workspaceDir, kusabiStateDir).status, "error");
     assert.equal(getQueueInvocations().length, 1);
+  });
+});
+describe("kusabi-codex-notify delayed detached refusal (kusabi #494)", () => {
+  let tmpRoot;
+  let stateDir;
+  let kusabiStateDir;
+  let workspaceDir;
+  let queueLogDir;
+  let mockCodexScript;
+
+  beforeEach(() => {
+    tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "kcn-494-"));
+    stateDir = path.join(tmpRoot, "notify-state");
+    kusabiStateDir = path.join(tmpRoot, "kusabi-state");
+    workspaceDir = path.join(tmpRoot, "workspace");
+    queueLogDir = path.join(tmpRoot, "queue-logs");
+
+    fs.mkdirSync(stateDir, { recursive: true });
+    fs.mkdirSync(kusabiStateDir, { recursive: true });
+    fs.mkdirSync(workspaceDir, { recursive: true });
+    fs.mkdirSync(queueLogDir, { recursive: true });
+
+    mockCodexScript = path.join(tmpRoot, "mock-codex.mjs");
+    fs.writeFileSync(
+      mockCodexScript,
+      `#!/usr/bin/env node
+import fs from "node:fs";
+import path from "node:path";
+import process from "node:process";
+
+const logDir = process.env.TEST_QUEUE_LOG_DIR;
+const args = process.argv.slice(2);
+
+if (logDir) {
+  const file = path.join(logDir, Date.now() + "-" + process.pid + "-" + Math.random().toString(36).slice(2) + ".json");
+  fs.writeFileSync(file, JSON.stringify({ argv: args, pid: process.pid, time: Date.now() }), "utf8");
+}
+process.exitCode = 0;
+`,
+      { mode: 0o755 }
+    );
+  });
+
+  afterEach(() => {
+    try {
+      fs.rmSync(tmpRoot, { recursive: true, force: true });
+    } catch { /* best-effort */ }
+  });
+
+  function getQueueInvocations() {
+    try {
+      const files = fs.readdirSync(queueLogDir);
+      const invocations = [];
+      for (const file of files) {
+        if (file.endsWith(".json")) {
+          invocations.push(JSON.parse(fs.readFileSync(path.join(queueLogDir, file), "utf8")));
+        }
+      }
+      return invocations;
+    } catch {
+      return [];
+    }
+  }
+
+  function writeMockChainFiles(chainId) {
+    const resolved = path.resolve(workspaceDir);
+    const hash = crypto.createHash("sha256").update(resolved).digest("hex").slice(0, 12);
+    const chainDir = path.join(kusabiStateDir, hash, "chains", chainId);
+    fs.mkdirSync(chainDir, { recursive: true });
+    const now = new Date().toISOString();
+    fs.writeFileSync(
+      path.join(chainDir, "control.json"),
+      JSON.stringify({
+        pid: 424242,
+        container: "cid-live",
+        status: "completed",
+        round: 1,
+        startedAt: now,
+        finishedAt: now,
+        createdAt: now,
+      }),
+      "utf8"
+    );
+    fs.writeFileSync(
+      path.join(chainDir, "chain.json"),
+      JSON.stringify({
+        chainId,
+        records: [{ round: 1, disposition: "accept", implementJobId: "job-i-1", reviewJobId: "job-r-1" }],
+      }),
+      "utf8"
+    );
+    return chainDir;
+  }
+
+  function writeMockJobFiles(jobId) {
+    const resolved = path.resolve(workspaceDir);
+    const hash = crypto.createHash("sha256").update(resolved).digest("hex").slice(0, 12);
+    const jobDir = path.join(kusabiStateDir, hash, "jobs", jobId);
+    fs.mkdirSync(jobDir, { recursive: true });
+    const now = new Date().toISOString();
+    fs.writeFileSync(
+      path.join(jobDir, "job.json"),
+      JSON.stringify({
+        id: jobId,
+        kind: "task",
+        title: "kusabi 494 live-child fixture",
+        status: "completed",
+        phase: "implement",
+        backend: "opencode",
+        modelEntry: "opencode-go/deepseek-v4-flash:max",
+        startedAt: now,
+        finishedAt: now,
+        cwd: resolved,
+        sessionID: "ses-494",
+        result: { source: "final-message", recovered: false, fetchFailed: false, fetchError: null, recovery: null },
+      }),
+      "utf8"
+    );
+    return jobDir;
+  }
+
+  /**
+   * Mock companion whose chain-detach / task-detach prints a REAL detached
+   * child pid and log path (like the real companion), exits 0, and lets the
+   * child run its own lifecycle:
+   *
+   *  - delayed refusal mode (`refuse: true`): the child appends the terminal
+   *    refusal to the log after ~150ms and exits 1 — no chain/job state is
+   *    created;
+   *  - immediate refusal mode (`refuse: "immediate"`): the child writes the
+   *    same refusal synchronously and exits before any /proc startTime anchor
+   *    can be captured — the anchor-less fast-refusal race;
+   *  - live mode (`refuse: false`): the child stays alive ~3s writing nothing.
+   *
+   * The wait subcommand is answered trivially so sync watchers can deliver.
+   */
+  function writeMockDetachCompanion(kind, { refuse }) {
+    const label = kind === "task" ? "task" : "chain";
+    const waitPrefix =
+      kind === "task"
+        ? "kusabi-companion task-wait --next --since "
+        : "kusabi-companion chain-wait --next --since ";
+    const mode = refuse === "immediate" ? "immediate" : refuse ? "refuse" : "live";
+    const refusalText =
+      "kusabi-companion error: dispatch refused: the declared ## Smoke is already red on the checkout as handed to the worker\\n" +
+      "Nothing was dispatched: no job and no round state exist.\\n";
+    let childCode;
+    if (mode === "immediate") {
+      childCode =
+        "const fs=require('fs');const p=process.env.TEST_DETACH_LOG;" +
+        `fs.appendFileSync(p,${JSON.stringify(refusalText)});process.exit(1);`;
+    } else if (mode === "refuse") {
+      childCode =
+        "const fs=require('fs');const p=process.env.TEST_DETACH_LOG;" +
+        `setTimeout(()=>{fs.appendFileSync(p,${JSON.stringify(refusalText)});process.exit(1);},150);`;
+    } else {
+      childCode = "setTimeout(()=>{process.exit(0);},3000);";
+    }
+    const script = path.join(tmpRoot, `mock-detach-${kind}-${mode}.mjs`);
+    fs.writeFileSync(
+      script,
+      `#!/usr/bin/env node
+import fs from "node:fs";
+import { spawn } from "node:child_process";
+import process from "node:process";
+
+const logPath = process.env.TEST_DETACH_LOG;
+if (logPath) fs.writeFileSync(logPath, "");
+const childCode = ${JSON.stringify(childCode)};
+const child = spawn(process.execPath, ["-e", childCode], {
+  detached: true,
+  stdio: "ignore",
+  env: process.env,
+});
+if (child.unref) child.unref();
+
+const subcmd = process.argv[2];
+if (subcmd === "chain-detach" || subcmd === "task-detach") {
+  const since = process.env.TEST_DETACH_SINCE || new Date(Date.now() - 60000).toISOString();
+  const waitCmd = ${JSON.stringify(waitPrefix)} + since;
+  fs.writeSync(1,
+    "Detached ${label} launched (pid " + child.pid + ").\\n" +
+    "Log: " + logPath + "\\n\\n" +
+    "To wait for completion, run:\\n  " + waitCmd + "\\n");
+  process.exitCode = 0;
+} else if (subcmd === "chain-wait") {
+  const id = process.argv[3];
+  fs.writeSync(1, "chain " + id + ": status=completed disposition=accept rounds=1 waited=2s container=cid-live\\n");
+  process.exitCode = 0;
+} else if (subcmd === "task-wait") {
+  const id = process.argv[3];
+  fs.writeSync(1, "task " + id + ": status=completed phase=implement waited=2s\\n");
+  process.exitCode = 0;
+} else {
+  process.exitCode = 0;
+}
+`,
+      { mode: 0o755 }
+    );
+    return script;
+  }
+
+  const detachEnv = (extra = {}) => ({
+    ...process.env,
+    KUSABI_STATE_DIR: kusabiStateDir,
+    TEST_QUEUE_LOG_DIR: queueLogDir,
+    ...extra,
+  });
+
+  /**
+   * Deterministically inject transient /proc observation failures: the next
+   * `attempts` reads of any /proc/<pid>/stat throw an error carrying
+   * `errCode` (EACCES/EIO, ...), then reads pass through again.  The module
+   * under test and this file share the `node:fs` instance, so the patch is
+   * visible to launchAndWatch / launchTaskAndWatch; child processes (mock
+   * companion, detached children) have their own copies and are unaffected.
+   * Returns a restore function.
+   */
+  function injectTransientProcReadFailures({ attempts = 3, errCode = "EACCES" } = {}) {
+    const original = fs.readFileSync;
+    let remaining = attempts;
+    const statPathPattern = /^\/proc\/\d+\/stat$/;
+    fs.readFileSync = function injectedReadFileSync(filePath, ...rest) {
+      if (remaining > 0 && typeof filePath === "string" && statPathPattern.test(filePath)) {
+        remaining -= 1;
+        const err = new Error(`${errCode}: injected transient /proc read failure`);
+        err.code = errCode;
+        throw err;
+      }
+      return original.call(this, filePath, ...rest);
+    };
+    return () => {
+      fs.readFileSync = original;
+    };
+  }
+
+  it("chain delayed refusal: detached child refuses after a successful launch — refusal surfaced, nothing registered, no full appearance wait", async () => {
+    const logPath = path.join(tmpRoot, "chain-detach-refused.log");
+    const refusedCompanion = writeMockDetachCompanion("chain", { refuse: true });
+
+    const started = Date.now();
+    const res = await launchAndWatch({
+      companionBin: refusedCompanion,
+      codexBin: mockCodexScript,
+      args: ["--container", "cid-delayed-refuse", "--brief-file", "/tmp/brief.md"],
+      threadId: "thread-delayed-refuse-chain",
+      cwd: workspaceDir,
+      stateDir,
+      sync: true,
+      timeoutMs: 30_000,
+      env: detachEnv({ TEST_DETACH_LOG: logPath }),
+    });
+    const elapsed = Date.now() - started;
+
+    // Prompt, nonzero, refusal text surfaced, nothing registered.
+    assert.equal(res.success, false);
+    assert.equal(res.exitCode, 1);
+    assert.equal(res.chainId, null);
+    assert.equal(res.registration, null);
+    assert.ok(elapsed < 5_000, `refusal must surface promptly, took ${elapsed}ms`);
+    assert.ok(res.refusal, "refusal detail expected on a delayed refusal");
+    assert.match(res.refusal.diagnostic, /dispatch refused/i);
+    assert.match(res.refusal.logTail, /Nothing was dispatched/);
+    assert.match(res.error.message, /no chain watch was registered/i);
+    assert.match(res.error.message, /chain-detach-refused\.log/);
+
+    const recordsDir = path.join(stateDir, "records");
+    if (fs.existsSync(recordsDir)) {
+      assert.equal(fs.readdirSync(recordsDir).filter((r) => r.endsWith(".json")).length, 0);
+    }
+    assert.equal(getQueueInvocations().length, 0);
+  });
+
+  it("task delayed refusal: --launch-task child refuses after a successful launch — refusal surfaced, nothing registered, no full appearance wait", async () => {
+    const logPath = path.join(tmpRoot, "task-detach-refused.log");
+    const refusedCompanion = writeMockDetachCompanion("task", { refuse: true });
+
+    const started = Date.now();
+    const res = await launchTaskAndWatch({
+      companionBin: refusedCompanion,
+      codexBin: mockCodexScript,
+      args: ["--container", "cid-delayed-refuse-task", "--brief-file", "/tmp/brief.md"],
+      threadId: "thread-delayed-refuse-task",
+      cwd: workspaceDir,
+      stateDir,
+      sync: true,
+      timeoutMs: 30_000,
+      env: detachEnv({ TEST_DETACH_LOG: logPath }),
+    });
+    const elapsed = Date.now() - started;
+
+    assert.equal(res.success, false);
+    assert.equal(res.exitCode, 1);
+    assert.equal(res.jobId, null);
+    assert.equal(res.registration, null);
+    assert.ok(elapsed < 5_000, `refusal must surface promptly, took ${elapsed}ms`);
+    assert.ok(res.refusal, "refusal detail expected on a delayed refusal");
+    assert.match(res.refusal.diagnostic, /dispatch refused/i);
+    assert.match(res.refusal.logTail, /Nothing was dispatched/);
+    assert.match(res.error.message, /no task watch was registered/i);
+    assert.match(res.error.message, /task-detach-refused\.log/);
+
+    const recordsDir = path.join(stateDir, "records");
+    if (fs.existsSync(recordsDir)) {
+      assert.equal(fs.readdirSync(recordsDir).filter((r) => r.endsWith(".json")).length, 0);
+    }
+    assert.equal(getQueueInvocations().length, 0);
+  });
+
+  it("live detached child stays eligible: a slow chain appearance binds while the child is still running", async () => {
+    const logPath = path.join(tmpRoot, "chain-live.log");
+    const liveCompanion = writeMockDetachCompanion("chain", { refuse: false });
+    const chainId = "chain-live-slow-001";
+
+    const timer = setTimeout(() => writeMockChainFiles(chainId), 300);
+    try {
+      const res = await launchAndWatch({
+        companionBin: liveCompanion,
+        codexBin: mockCodexScript,
+        args: ["--container", "cid-live", "--brief-file", "/tmp/brief.md"],
+        threadId: "thread-live-chain",
+        cwd: workspaceDir,
+        stateDir,
+        sync: true,
+        timeoutMs: 10_000,
+        env: detachEnv({ TEST_DETACH_LOG: logPath }),
+      });
+
+      assert.equal(res.success, true);
+      assert.equal(res.chainId, chainId);
+      assert.equal(res.refusal, undefined, "a live child must never be reported as refused");
+      assert.ok(res.registration);
+      assert.equal(res.registration.outcome, OUTCOME_DELIVERED);
+      assert.equal(getQueueInvocations().length, 1);
+    } finally {
+      clearTimeout(timer);
+    }
+  });
+
+  it("live detached task child stays eligible: a slow job appearance binds while the child is still running", async () => {
+    const logPath = path.join(tmpRoot, "task-live.log");
+    const liveCompanion = writeMockDetachCompanion("task", { refuse: false });
+    const jobId = "job-live-slow-001";
+
+    const timer = setTimeout(() => writeMockJobFiles(jobId), 300);
+    try {
+      const res = await launchTaskAndWatch({
+        companionBin: liveCompanion,
+        codexBin: mockCodexScript,
+        args: ["--container", "cid-live-task", "--brief-file", "/tmp/brief.md"],
+        threadId: "thread-live-task",
+        cwd: workspaceDir,
+        stateDir,
+        sync: true,
+        timeoutMs: 10_000,
+        env: detachEnv({ TEST_DETACH_LOG: logPath }),
+      });
+
+      assert.equal(res.success, true);
+      assert.equal(res.jobId, jobId);
+      assert.equal(res.refusal, undefined, "a live child must never be reported as refused");
+      assert.ok(res.registration);
+      assert.equal(res.registration.outcome, OUTCOME_DELIVERED);
+      assert.equal(getQueueInvocations().length, 1);
+    } finally {
+      clearTimeout(timer);
+    }
+  });
+
+  it("anchor-less fast refusal (chain): child exits before the startTime anchor is captured — refusal surfaced promptly, nothing registered, no full appearance wait", async () => {
+    const logPath = path.join(tmpRoot, "chain-detach-immediate.log");
+    const immediateCompanion = writeMockDetachCompanion("chain", { refuse: "immediate" });
+
+    const started = Date.now();
+    const res = await launchAndWatch({
+      companionBin: immediateCompanion,
+      codexBin: mockCodexScript,
+      args: ["--container", "cid-immediate-refuse", "--brief-file", "/tmp/brief.md"],
+      threadId: "thread-immediate-refuse-chain",
+      cwd: workspaceDir,
+      stateDir,
+      sync: true,
+      timeoutMs: 30_000,
+      env: detachEnv({ TEST_DETACH_LOG: logPath }),
+    });
+    const elapsed = Date.now() - started;
+
+    assert.equal(res.success, false);
+    assert.equal(res.exitCode, 1);
+    assert.equal(res.chainId, null);
+    assert.equal(res.registration, null);
+    assert.ok(elapsed < 3_000, `immediate refusal must surface without the 150ms safety delay, took ${elapsed}ms`);
+    assert.ok(res.refusal, "refusal detail expected on an anchor-less fast refusal");
+    assert.match(res.refusal.diagnostic, /dispatch refused/i);
+    assert.match(res.refusal.logTail, /Nothing was dispatched/);
+    assert.match(res.error.message, /no chain watch was registered/i);
+    assert.match(res.error.message, /chain-detach-immediate\.log/);
+
+    const recordsDir = path.join(stateDir, "records");
+    if (fs.existsSync(recordsDir)) {
+      assert.equal(fs.readdirSync(recordsDir).filter((r) => r.endsWith(".json")).length, 0);
+    }
+    assert.equal(getQueueInvocations().length, 0);
+  });
+
+  it("anchor-less fast refusal (task): child exits before the startTime anchor is captured — refusal surfaced promptly, nothing registered, no full appearance wait", async () => {
+    const logPath = path.join(tmpRoot, "task-detach-immediate.log");
+    const immediateCompanion = writeMockDetachCompanion("task", { refuse: "immediate" });
+
+    const started = Date.now();
+    const res = await launchTaskAndWatch({
+      companionBin: immediateCompanion,
+      codexBin: mockCodexScript,
+      args: ["--container", "cid-immediate-refuse-task", "--brief-file", "/tmp/brief.md"],
+      threadId: "thread-immediate-refuse-task",
+      cwd: workspaceDir,
+      stateDir,
+      sync: true,
+      timeoutMs: 30_000,
+      env: detachEnv({ TEST_DETACH_LOG: logPath }),
+    });
+    const elapsed = Date.now() - started;
+
+    assert.equal(res.success, false);
+    assert.equal(res.exitCode, 1);
+    assert.equal(res.jobId, null);
+    assert.equal(res.registration, null);
+    assert.ok(elapsed < 3_000, `immediate refusal must surface without the 150ms safety delay, took ${elapsed}ms`);
+    assert.ok(res.refusal, "refusal detail expected on an anchor-less fast refusal");
+    assert.match(res.refusal.diagnostic, /dispatch refused/i);
+    assert.match(res.refusal.logTail, /Nothing was dispatched/);
+    assert.match(res.error.message, /no task watch was registered/i);
+    assert.match(res.error.message, /task-detach-immediate\.log/);
+
+    const recordsDir = path.join(stateDir, "records");
+    if (fs.existsSync(recordsDir)) {
+      assert.equal(fs.readdirSync(recordsDir).filter((r) => r.endsWith(".json")).length, 0);
+    }
+    assert.equal(getQueueInvocations().length, 0);
+  });
+
+  it("transient /proc read failure while the chain child stays live: EACCES is never a refusal and the subject still resolves", async () => {
+    const logPath = path.join(tmpRoot, "chain-transient-eacces.log");
+    const liveCompanion = writeMockDetachCompanion("chain", { refuse: false });
+    const chainId = "chain-transient-eacces-001";
+
+    const timer = setTimeout(() => writeMockChainFiles(chainId), 300);
+    let restore = null;
+    try {
+      restore = injectTransientProcReadFailures({ attempts: 3, errCode: "EACCES" });
+      const res = await launchAndWatch({
+        companionBin: liveCompanion,
+        codexBin: mockCodexScript,
+        args: ["--container", "cid-transient-eacces", "--brief-file", "/tmp/brief.md"],
+        threadId: "thread-transient-chain",
+        cwd: workspaceDir,
+        stateDir,
+        sync: true,
+        timeoutMs: 10_000,
+        env: detachEnv({ TEST_DETACH_LOG: logPath }),
+      });
+
+      assert.equal(res.success, true);
+      assert.equal(res.chainId, chainId);
+      assert.equal(res.refusal, undefined, "a transient /proc failure must never become a refusal");
+      assert.ok(res.registration, "the live child must keep its completion watcher");
+      assert.equal(res.registration.outcome, OUTCOME_DELIVERED);
+      assert.equal(getQueueInvocations().length, 1);
+    } finally {
+      clearTimeout(timer);
+      if (restore) restore();
+    }
+  });
+
+  it("transient /proc read failure while the task child stays live: EIO is never a refusal and the subject still resolves", async () => {
+    const logPath = path.join(tmpRoot, "task-transient-eio.log");
+    const liveCompanion = writeMockDetachCompanion("task", { refuse: false });
+    const jobId = "job-transient-eio-001";
+
+    const timer = setTimeout(() => writeMockJobFiles(jobId), 300);
+    let restore = null;
+    try {
+      restore = injectTransientProcReadFailures({ attempts: 3, errCode: "EIO" });
+      const res = await launchTaskAndWatch({
+        companionBin: liveCompanion,
+        codexBin: mockCodexScript,
+        args: ["--container", "cid-transient-eio", "--brief-file", "/tmp/brief.md"],
+        threadId: "thread-transient-task",
+        cwd: workspaceDir,
+        stateDir,
+        sync: true,
+        timeoutMs: 10_000,
+        env: detachEnv({ TEST_DETACH_LOG: logPath }),
+      });
+
+      assert.equal(res.success, true);
+      assert.equal(res.jobId, jobId);
+      assert.equal(res.refusal, undefined, "a transient /proc failure must never become a refusal");
+      assert.ok(res.registration, "the live child must keep its completion watcher");
+      assert.equal(res.registration.outcome, OUTCOME_DELIVERED);
+      assert.equal(getQueueInvocations().length, 1);
+    } finally {
+      clearTimeout(timer);
+      if (restore) restore();
+    }
   });
 });
