@@ -7,14 +7,20 @@ import { spawnSync } from "node:child_process";
 import {
   accumulateUsage,
   catalogMissFromError,
+  classifyIncompleteCompletedRun,
   decidePermission,
   dispatchWithFallback,
   failedRoutes,
+  finalizeIncompleteCompletedRun,
+  finishedUnknownSignal,
+  incompleteRunError,
+  phaseRequiresOutput,
+  probeEvidenceIncomplete,
   providerStatusFromError,
   resetFailedRoutes,
 } from "./prompt-execution.mjs";
 import { stateDirFor } from "./state-paths.mjs";
-import { loadJob } from "./job-store.mjs";
+import { loadJob, saveJob } from "./job-store.mjs";
 import { cmdTask } from "./task-cmd.mjs";
 import { commandOutcome } from "./kusabi-companion.mjs";
 import { resolveResumeLastSession } from "./kusabi-companion.mjs";
@@ -2152,5 +2158,818 @@ describe("spawned CLI exit propagation (kusabi #484 follow-up)", () => {
     } finally {
       fs.rmSync(tmp, { recursive: true, force: true });
     }
+  });
+});
+// =========================================================================
+// kusabi #496 — finished-unknown signal and incomplete-run classification
+// =========================================================================
+// A detached task whose provider stream ends `finish: "unknown"` then idle,
+// with NO final message and only a recovered event/reasoning reconstruction,
+// is a candidate incomplete write for phases that must produce output.  The
+// STREAM signal alone (finish unknown + no final payload) is recorded by
+// runPrompt; the terminal non-success verdict is finalized at the layer that
+// owns probe truth (cmdTask after its container probe phase), and only when
+// the probe evidence proves it deterministic (no declared deliverable
+// changes AND failed P3/P4).  A complete-but-message-less write run whose
+// deliverables/probes are green is never falsely failed.
+//
+// The incident's actual recorded line (job-mtyfpjlc8452, 2026-09) is the
+// FLAT `{ finish: "unknown" }` shape on session.status — the end-to-end
+// fixtures below drive that exact line through the real runPrompt over a
+// fake serve; the structured opencode shape is covered by a second
+// end-to-end fixture and by the unit tests.
+
+describe("finishedUnknownSignal", () => {
+  it("recognises the structured session.status finished-unknown shape", () => {
+    assert.equal(finishedUnknownSignal({
+      type: "session.status",
+      properties: {
+        sessionID: "ses-1",
+        status: { type: "finished", finish: "unknown", reason: { type: "done" } },
+      },
+    }), true);
+  });
+
+  it("recognises the incident's flat recorded shape { finish: \"unknown\" }", () => {
+    assert.equal(finishedUnknownSignal({
+      type: "session.status",
+      properties: { sessionID: "ses-1", finish: "unknown" },
+    }), true);
+  });
+
+  it("rejects done / error / cancel / max-turns finishes", () => {
+    for (const finish of ["done", "error", "cancel", "max-turns", null, undefined]) {
+      assert.equal(finishedUnknownSignal({
+        type: "session.status",
+        properties: { sessionID: "ses-1", status: { type: "finished", finish } },
+      }), false, `finish=${finish}`);
+    }
+  });
+
+  it("rejects non-finished status types even with finish unknown", () => {
+    for (const type of ["start", "retry", "permission"]) {
+      assert.equal(finishedUnknownSignal({
+        type: "session.status",
+        properties: { sessionID: "ses-1", status: { type, finish: "unknown" } },
+      }), false, `status.type=${type}`);
+    }
+  });
+
+  it("tolerates missing or malformed properties", () => {
+    assert.equal(finishedUnknownSignal(null), false);
+    assert.equal(finishedUnknownSignal({}), false);
+    assert.equal(finishedUnknownSignal({ type: "session.idle" }), false);
+    assert.equal(finishedUnknownSignal({ type: "session.status", properties: { status: "finished" } }), false);
+    assert.equal(finishedUnknownSignal({ type: "session.status" }), false);
+  });
+});
+
+describe("phaseRequiresOutput", () => {
+  it("write-producing phases require output", () => {
+    for (const phase of ["implement", "test-author", "investigate", "gofer", "draft", "respond", "salvage", null]) {
+      assert.equal(phaseRequiresOutput(phase, "task"), true, `phase=${phase}`);
+    }
+  });
+
+  it("plan and review are read-only", () => {
+    assert.equal(phaseRequiresOutput("plan", "task"), false);
+    assert.equal(phaseRequiresOutput("review", "task"), false);
+  });
+
+  it("kind review is read-only even without a phase", () => {
+    assert.equal(phaseRequiresOutput(null, "review"), false);
+  });
+});
+
+describe("probeEvidenceIncomplete", () => {
+  const red = (probe, passed) => ({ probe, passed });
+
+  it("P3 and P4 both red is deterministic incomplete evidence", () => {
+    assert.equal(probeEvidenceIncomplete({
+      probeResults: [
+        red("P3: deliverables", false),
+        red("P4: smoke", false),
+        red("P2: verify", true),
+      ],
+    }), true);
+  });
+
+  it("either probe green is NOT incomplete evidence (complete-but-message-less runs pass)", () => {
+    assert.equal(probeEvidenceIncomplete({
+      probeResults: [red("P3: deliverables", true), red("P4: smoke", false)],
+    }), false, "P3 green");
+    assert.equal(probeEvidenceIncomplete({
+      probeResults: [red("P3: deliverables", false), red("P4: smoke", true)],
+    }), false, "P4 green");
+  });
+
+  it("a missing P3 or P4 is NOT incomplete evidence", () => {
+    assert.equal(probeEvidenceIncomplete({
+      probeResults: [red("P3: deliverables", false)],
+    }), false, "P4 absent");
+    assert.equal(probeEvidenceIncomplete({
+      probeResults: [red("P4: smoke", false)],
+    }), false, "P3 absent");
+  });
+
+  it("absent or non-array probe results are NOT incomplete evidence", () => {
+    assert.equal(probeEvidenceIncomplete({ probeResults: null }), false);
+    assert.equal(probeEvidenceIncomplete({ probeResults: undefined }), false);
+    assert.equal(probeEvidenceIncomplete({ probeResults: [] }), false);
+    assert.equal(probeEvidenceIncomplete({ probeResults: "nope" }), false);
+  });
+});
+
+describe("classifyIncompleteCompletedRun", () => {
+  const RED = [
+    { probe: "P3: deliverables", passed: false, detail: "no declared deliverable paths changed" },
+    { probe: "P4: smoke", passed: false, detail: "declared test files absent, pytest exit 4" },
+  ];
+  const GREEN = [
+    { probe: "P3: deliverables", passed: true, detail: "touches declared deliverables" },
+    { probe: "P4: smoke", passed: true, detail: "all smoke command(s) passed" },
+  ];
+
+  it("regression fixture (job-mtyfpjlc8452): finish unknown + recovered + no final + write phase + P3/P4 red is incomplete", () => {
+    assert.equal(classifyIncompleteCompletedRun({
+      finishedUnknown: true,
+      phase: "test-author",
+      kind: "task",
+      resultRecord: { source: "recovered", recovered: true, fetchFailed: false },
+      probeResults: RED,
+    }), true);
+  });
+
+  it("recovered with nothing to recover (source none) is incomplete for a write phase with red probes", () => {
+    assert.equal(classifyIncompleteCompletedRun({
+      finishedUnknown: true,
+      phase: "implement",
+      kind: "task",
+      resultRecord: { source: "none", recovered: false, fetchFailed: false },
+      probeResults: RED,
+    }), true);
+  });
+
+  it("a complete-but-message-less write run with green P3/P4 is NOT incomplete", () => {
+    assert.equal(classifyIncompleteCompletedRun({
+      finishedUnknown: true,
+      phase: "test-author",
+      kind: "task",
+      resultRecord: { source: "recovered", recovered: true, fetchFailed: false },
+      probeResults: GREEN,
+    }), false);
+  });
+
+  it("no probe evidence (probes never ran) is NOT incomplete", () => {
+    assert.equal(classifyIncompleteCompletedRun({
+      finishedUnknown: true,
+      phase: "test-author",
+      kind: "task",
+      resultRecord: { source: "recovered", recovered: true, fetchFailed: false },
+      probeResults: null,
+    }), false);
+  });
+
+  it("a valid final payload is never downgraded", () => {
+    assert.equal(classifyIncompleteCompletedRun({
+      finishedUnknown: true,
+      phase: "test-author",
+      kind: "task",
+      resultRecord: { source: "final-message", recovered: false },
+      probeResults: RED,
+    }), false);
+  });
+
+  it("no finished-unknown signal is not incomplete", () => {
+    assert.equal(classifyIncompleteCompletedRun({
+      finishedUnknown: false,
+      phase: "test-author",
+      kind: "task",
+      resultRecord: { source: "recovered", recovered: true },
+      probeResults: RED,
+    }), false);
+  });
+
+  it("read-only plan/review with a recovered result stays completed even with red probes", () => {
+    assert.equal(classifyIncompleteCompletedRun({
+      finishedUnknown: true,
+      phase: "plan",
+      kind: "task",
+      resultRecord: { source: "recovered", recovered: true },
+      probeResults: RED,
+    }), false);
+    assert.equal(classifyIncompleteCompletedRun({
+      finishedUnknown: true,
+      phase: "review",
+      kind: "task",
+      resultRecord: { source: "recovered", recovered: true },
+      probeResults: RED,
+    }), false);
+  });
+
+  it("unavailable (fetch failed) is not deterministic incomplete evidence", () => {
+    // We could not even ask for the final message; it may well exist.
+    assert.equal(classifyIncompleteCompletedRun({
+      finishedUnknown: true,
+      phase: "implement",
+      kind: "task",
+      resultRecord: { source: "unavailable", recovered: false, fetchFailed: true },
+      probeResults: RED,
+    }), false);
+  });
+
+  it("a missing result record is not incomplete", () => {
+    assert.equal(classifyIncompleteCompletedRun({
+      finishedUnknown: true,
+      phase: "implement",
+      kind: "task",
+      resultRecord: null,
+      probeResults: RED,
+    }), false);
+  });
+});
+
+describe("incompleteRunError", () => {
+  it("names the phase and the deterministic evidence", () => {
+    const err = incompleteRunError({ phase: "test-author" });
+    assert.match(err, /incomplete execution/);
+    assert.match(err, /finish "unknown"/);
+    assert.match(err, /no final message was produced/);
+    assert.match(err, /test-author/);
+  });
+});
+
+describe("finalizeIncompleteCompletedRun", () => {
+  const RED = [
+    { probe: "P3: deliverables", passed: false, detail: "no declared deliverable paths changed" },
+    { probe: "P4: smoke", passed: false, detail: "declared test files absent, pytest exit 4" },
+    { probe: "P2: verify", passed: true, detail: "1062 passed" },
+  ];
+  const GREEN = [
+    { probe: "P3: deliverables", passed: true, detail: "touches declared deliverables" },
+    { probe: "P4: smoke", passed: true, detail: "all smoke command(s) passed" },
+    { probe: "P2: verify", passed: true, detail: "1062 passed" },
+  ];
+
+  function signalJob(overrides = {}) {
+    return {
+      id: "job-finalize",
+      kind: "task",
+      phase: "test-author",
+      status: "completed",
+      stopReason: "completed",
+      error: null,
+      result: { source: "recovered", recovered: true, fetchFailed: false, recovery: { source: "opencode-events", chars: 42 } },
+      noFinalEvidence: { finishedUnknown: true, source: "recovered", recovered: true, phase: "test-author" },
+      ...overrides,
+    };
+  }
+
+  it("closes the recovered/no-final write run as error when P3/P4 are red", () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-496-finalize-"));
+    try {
+      const job = signalJob();
+      const stateDir = path.join(tmp, "state");
+      const fired = finalizeIncompleteCompletedRun({ job, probeResults: RED, stateDir });
+      assert.equal(fired, true);
+      assert.equal(job.status, "error");
+      assert.equal(job.stopReason, "unknown", "stop reason must never be 'completed'");
+      assert.match(job.error, /incomplete execution/);
+      assert.match(job.error, /test-author/);
+
+      const events = fs.readFileSync(path.join(stateDir, "jobs", job.id, "events.ndjson"), "utf8")
+        .trim().split("\n").map(JSON.parse);
+      const incompleteEvent = events.find((e) => e.type === "companion.result.incomplete");
+      assert.ok(incompleteEvent, "companion.result.incomplete event recorded");
+      assert.equal(incompleteEvent.source, "recovered");
+      assert.equal(incompleteEvent.finishedUnknown, true);
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps a complete-but-message-less write run completed when P3/P4 are green", () => {
+    const job = signalJob();
+    const fired = finalizeIncompleteCompletedRun({ job, probeResults: GREEN, stateDir: null });
+    assert.equal(fired, false);
+    assert.equal(job.status, "completed");
+    assert.equal(job.error, null);
+  });
+
+  it("keeps a run whose probes never ran completed", () => {
+    const job = signalJob();
+    const fired = finalizeIncompleteCompletedRun({ job, probeResults: null, stateDir: null });
+    assert.equal(fired, false);
+    assert.equal(job.status, "completed");
+  });
+
+  it("does nothing without the recorded stream signal", () => {
+    const job = signalJob({ noFinalEvidence: null });
+    const fired = finalizeIncompleteCompletedRun({ job, probeResults: RED, stateDir: null });
+    assert.equal(fired, false);
+    assert.equal(job.status, "completed");
+  });
+
+  it("does nothing for a read-only plan phase", () => {
+    const job = signalJob({ phase: "plan" });
+    const fired = finalizeIncompleteCompletedRun({ job, probeResults: RED, stateDir: null });
+    assert.equal(fired, false);
+    assert.equal(job.status, "completed");
+  });
+
+  it("does nothing for a job that is not completed", () => {
+    const job = signalJob({ status: "timeout" });
+    const fired = finalizeIncompleteCompletedRun({ job, probeResults: RED, stateDir: null });
+    assert.equal(fired, false);
+    assert.equal(job.status, "timeout");
+  });
+});
+
+// =========================================================================
+// kusabi #496 — end-to-end: runPrompt over a fake serve with the incident
+// stream shape (flat `finish: "unknown"` -> idle, no final message)
+// =========================================================================
+
+function incompleteServeSource({ finalMessage, finishShape = "flat" }) {
+  return `#!/usr/bin/env node
+import http from "node:http";
+import fs from "node:fs";
+
+const argv = process.argv.slice(2);
+const port = Number(argv[argv.indexOf("--port") + 1]);
+let nextSession = 0;
+const log = process.env.KUSABI_TEST_LOG;
+const FINAL_MESSAGE = ${JSON.stringify(finalMessage)};
+const FINISH_SHAPE = ${JSON.stringify(finishShape)};
+
+function sse(res, event) {
+  res.write("data: " + JSON.stringify(event) + "\\n\\n");
+}
+
+const server = http.createServer((req, res) => {
+  res.on("error", () => {});
+  const url = new URL(req.url, "http://127.0.0.1:" + port);
+  req.on("data", () => {});
+  req.on("end", () => {
+    if (req.method === "GET" && url.pathname === "/session") {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end("[]");
+      return;
+    }
+    if (req.method === "POST" && url.pathname === "/session") {
+      const id = "ses-" + (++nextSession);
+      if (log) fs.appendFileSync(log, "create " + id + "\\n");
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ id }));
+      return;
+    }
+    const segs = url.pathname.split("/");
+    const sessionId = segs[2];
+    if (req.method === "POST" && segs[3] === "prompt_async") {
+      if (log) fs.appendFileSync(log, "prompt " + sessionId + "\\n");
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end("{}");
+      return;
+    }
+    if (req.method === "POST" && segs[3] === "abort") {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end("{}");
+      return;
+    }
+    if (req.method === "GET" && segs[3] === "message") {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify(FINAL_MESSAGE
+        ? [{ info: { role: "assistant" }, parts: [{ type: "text", text: "final answer" }] }]
+        : []));
+      return;
+    }
+    if (req.method === "GET" && url.pathname === "/event") {
+      res.writeHead(200, { "content-type": "text/event-stream" });
+      const id = "ses-" + nextSession;
+      // The incident stream shape: the provider closes with a session.status
+      // finished-unknown event — the FLAT { finish: "unknown" } line exactly
+      // as recorded for job-mtyfpjlc8452 (or the structured opencode shape
+      // when FINISH_SHAPE is "structured") — an assistant text part lands
+      // (the recovered reasoning), then the session goes idle with NO final
+      // assistant message ever emitted.
+      sse(res, FINISH_SHAPE === "structured"
+        ? {
+            type: "session.status",
+            properties: { sessionID: id, status: { type: "finished", finish: "unknown", reason: { type: "done" } } },
+          }
+        : {
+            type: "session.status",
+            properties: { sessionID: id, finish: "unknown" },
+          });
+      sse(res, {
+        type: "message.updated",
+        properties: {
+          sessionID: id,
+          info: {
+            id: "msg-1",
+            role: "assistant",
+            modelID: "deepseek-v4-flash",
+            providerID: "opencode-go",
+            tokens: { total: 10, input: 5, output: 5 },
+          },
+        },
+      });
+      sse(res, {
+        type: "message.part.updated",
+        properties: {
+          sessionID: id,
+          part: { id: "part-1", messageID: "msg-1", type: "text", text: "unfinished reasoning that breaks off mid-sentence" },
+        },
+      });
+      sse(res, { type: "session.idle", properties: { sessionID: id } });
+      res.end();
+      return;
+    }
+    res.writeHead(404, { "content-type": "application/json" });
+    res.end("{}");
+  });
+});
+server.listen(port, "127.0.0.1");
+setInterval(() => {}, 1000);
+`;
+}
+
+function incompleteServeContext({ finalMessage, finishShape = "flat" }) {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-496-test-"));
+  const binPath = path.join(tmp, "fake-serve.mjs");
+  fs.writeFileSync(binPath, incompleteServeSource({ finalMessage, finishShape }), "utf8");
+  fs.chmodSync(binPath, 0o755);
+  const stateRoot = path.join(tmp, "state");
+  const cwd = path.join(tmp, "cwd");
+  fs.mkdirSync(cwd, { recursive: true });
+  const saved = {
+    OPENCODE_BIN: process.env.OPENCODE_BIN,
+    KUSABI_STATE_DIR: process.env.KUSABI_STATE_DIR,
+    KUSABI_SERVE_READY_TIMEOUT_MS: process.env.KUSABI_SERVE_READY_TIMEOUT_MS,
+  };
+  process.env.OPENCODE_BIN = binPath;
+  process.env.KUSABI_STATE_DIR = stateRoot;
+  process.env.KUSABI_SERVE_READY_TIMEOUT_MS = "8000";
+  const stateDir = stateDirFor(cwd);
+  return {
+    tmp,
+    cwd,
+    stateDir,
+    restore() {
+      for (const [key, value] of Object.entries(saved)) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+    },
+    killAll() {
+      try {
+        const rec = JSON.parse(fs.readFileSync(path.join(stateDir, "server.json"), "utf8"));
+        try { process.kill(rec.pid, "SIGKILL"); } catch { /* already gone */ }
+      } catch { /* no record written */ }
+    },
+    rm() {
+      try { fs.rmSync(tmp, { recursive: true, force: true }); } catch { /* best-effort */ }
+    },
+  };
+}
+
+function incompleteDispatchOpts(cwd, phase) {
+  return {
+    cwd,
+    tiers: [["opencode-go/deepseek-v4-flash:max"]],
+    round: 1,
+    kind: "task",
+    title: "kusabi 496 fixture",
+    promptText: "implement the declared deliverables",
+    phase,
+    timeoutS: 30,
+    watchdogS: 0,
+  };
+}
+
+const INCIDENT_RED_PROBES = [
+  { probe: "P3: deliverables", passed: false, detail: "no declared deliverable paths changed" },
+  { probe: "P4: smoke", passed: false, detail: "declared test files absent, pytest exit 4" },
+  { probe: "P2: verify", passed: true, detail: "1062 passed" },
+];
+
+describe("runPrompt — recovered/no-final stream signal (kusabi #496)", () => {
+  beforeEach(() => {
+    resetFailedRoutes();
+  });
+
+  afterEach(() => {
+    resetFailedRoutes();
+  });
+
+  function assertSignalRecorded(job, ctx, phase) {
+    // runPrompt never guesses the verdict: the stream signal is recorded on
+    // the job and the dispatch classification stays completed.
+    assert.equal(job.status, "completed");
+    assert.equal(job.stopReason, "completed");
+    assert.equal(job.error, null);
+    assert.equal(job.result.source, "recovered");
+    assert.equal(job.result.recovered, true);
+    assert.equal(job.noFinalEvidence.finishedUnknown, true);
+    assert.equal(job.noFinalEvidence.source, "recovered");
+    assert.equal(job.noFinalEvidence.phase, phase);
+
+    const events = fs.readFileSync(path.join(ctx.stateDir, "jobs", job.id, "events.ndjson"), "utf8")
+      .trim().split("\n").map(JSON.parse);
+    const types = events.map((e) => e.type);
+    assert.ok(types.includes("session.status"));
+    assert.ok(types.includes("session.idle"));
+    assert.ok(types.includes("companion.result.recovered"));
+    assert.ok(types.includes("companion.result.no-final"));
+    assert.ok(!types.includes("companion.result.incomplete"), "the verdict is not guessed at dispatch time");
+  }
+
+  it("incident line (flat finish unknown) + idle + recovered no-final records the signal; the probe-truth layer closes it as non-success", async () => {
+    const ctx = incompleteServeContext({ finalMessage: false, finishShape: "flat" });
+    try {
+      const { job, resultText, stateDir } = await dispatchWithFallback(incompleteDispatchOpts(ctx.cwd, "test-author"));
+
+      // The incident's actual recorded line driven through the real watcher:
+      // the signal is recorded, the run is NOT reclassified at dispatch.
+      assertSignalRecorded(job, ctx, "test-author");
+
+      // The recovered result is preserved as the returned text and on disk.
+      assert.match(resultText, /unfinished reasoning that breaks off mid-sentence/);
+      const resultFile = path.join(ctx.stateDir, "jobs", job.id, "result.md");
+      assert.match(fs.readFileSync(resultFile, "utf8"), /unfinished reasoning that breaks off mid-sentence/);
+
+      // The terminal verdict belongs to the probe-truth layer: with the
+      // incident's probe evidence (P3/P4 red, base suite green) the SAME job
+      // is closed as non-success -- exactly what cmdTask does after its
+      // container probe phase.
+      const fired = finalizeIncompleteCompletedRun({ job, probeResults: INCIDENT_RED_PROBES, stateDir });
+      assert.equal(fired, true);
+      assert.equal(job.status, "error");
+      assert.equal(job.stopReason, "unknown", "stop reason must never be 'completed'");
+      assert.match(job.error, /incomplete execution/);
+      assert.match(job.error, /finish "unknown"/);
+      assert.match(job.error, /test-author/);
+
+      // The probe-truth layer persists the closed record (cmdTask saves right
+      // after finalizing; the test mirrors that exactly).
+      saveJob(stateDir, job);
+      const persisted = loadJob(ctx.stateDir, job.id);
+      assert.equal(persisted.status, "error");
+      assert.equal(persisted.stopReason, "unknown");
+      assert.equal(persisted.result.recovered, true);
+      assert.equal(persisted.noFinalEvidence.finishedUnknown, true);
+      assert.equal(persisted.phase, "test-author");
+
+      // Audit trail: the recovery event, the no-final signal, and the final
+      // incompleteness verdict.
+      const events = fs.readFileSync(path.join(ctx.stateDir, "jobs", job.id, "events.ndjson"), "utf8")
+        .trim().split("\n").map(JSON.parse);
+      const types = events.map((e) => e.type);
+      assert.ok(types.includes("companion.result.recovered"));
+      assert.ok(types.includes("companion.result.no-final"));
+      assert.ok(types.includes("companion.result.incomplete"));
+      const incompleteEvent = events.find((e) => e.type === "companion.result.incomplete");
+      assert.equal(incompleteEvent.source, "recovered");
+      assert.equal(incompleteEvent.finishedUnknown, true);
+
+      // `error` is not a provider-error: the walk does not advance or poison.
+      assert.equal(failedRoutes.size, 0);
+    } finally {
+      ctx.killAll();
+      ctx.restore();
+      ctx.rm();
+    }
+  });
+
+  it("the structured opencode finished-unknown shape also flows through the real path", async () => {
+    const ctx = incompleteServeContext({ finalMessage: false, finishShape: "structured" });
+    try {
+      const { job } = await dispatchWithFallback(incompleteDispatchOpts(ctx.cwd, "implement"));
+      assertSignalRecorded(job, ctx, "implement");
+    } finally {
+      ctx.killAll();
+      ctx.restore();
+      ctx.rm();
+    }
+  });
+
+  it("a valid final payload preserves completed success even after finish unknown", async () => {
+    const ctx = incompleteServeContext({ finalMessage: true, finishShape: "flat" });
+    try {
+      const { job, resultText } = await dispatchWithFallback(incompleteDispatchOpts(ctx.cwd, "implement"));
+
+      assert.equal(job.status, "completed");
+      assert.equal(job.stopReason, "completed");
+      assert.equal(job.error, null);
+      assert.equal(job.result.source, "final-message");
+      assert.equal(job.result.recovered, false);
+      assert.equal(job.noFinalEvidence, undefined, "a real final message records no no-final signal");
+      assert.equal(resultText, "final answer");
+    } finally {
+      ctx.killAll();
+      ctx.restore();
+      ctx.rm();
+    }
+  });
+
+  it("read-only plan keeps its recovered result as completed success and records no signal", async () => {
+    const ctx = incompleteServeContext({ finalMessage: false, finishShape: "flat" });
+    try {
+      const { job, resultText } = await dispatchWithFallback(incompleteDispatchOpts(ctx.cwd, "plan"));
+
+      assert.equal(job.status, "completed");
+      assert.equal(job.stopReason, "completed");
+      assert.equal(job.error, null);
+      assert.equal(job.result.source, "recovered");
+      assert.equal(job.result.recovered, true);
+      assert.equal(job.noFinalEvidence, undefined, "the read-only carve-out records no no-final signal");
+      assert.match(resultText, /unfinished reasoning that breaks off mid-sentence/);
+    } finally {
+      ctx.killAll();
+      ctx.restore();
+      ctx.rm();
+    }
+  });
+});
+
+// =========================================================================
+// kusabi #496 — cmdTask boundary: the probe-truth layer closes the verdict
+// =========================================================================
+// The probes run AFTER the dispatch and are recorded on the job by cmdTask
+// (chain layer equivalent: runProbePhase).  The recovered/no-final write run
+// is therefore finalized HERE, with the probe evidence in hand: P3/P4 red
+// closes it as non-success (and the task exits nonzero), while a
+// complete-but-message-less write run whose deliverables/probes are green
+// is not falsely failed.
+
+const CMD_TASK_496_BRIEF = [
+  "Orchestrator: test | session kusabi-496-task | 2026-09-13",
+  "",
+  "## Purpose",
+  "",
+  "Exercise recovered-incomplete task probe visibility.",
+  "",
+  "## Deliverables",
+  "",
+  "- tests/test_search_log_export.py",
+  "- tests/test_search_log_calibrate.py",
+  "",
+].join("\n");
+
+/**
+ * A job exactly as runPrompt leaves a recovered/no-final run: completed with
+ * the recorded stream signal, plus the probe results the container probe
+ * phase records on it (the fixture's dispatch seam stands in for cmdTask's
+ * own probe block, which needs a live container).
+ */
+function recoveredNoFinalJob({ id, phase = "test-author", probeResults, resultText = "recovered reasoning-only text" }) {
+  const hasProbes = Array.isArray(probeResults) && probeResults.length > 0;
+  const probesGreen = hasProbes ? probeResults.every((p) => p.passed) : undefined;
+  return {
+    job: {
+      id,
+      kind: "task",
+      title: "kusabi 496 fixture",
+      status: "completed",
+      stopReason: "completed",
+      phase,
+      sessionID: "ses-496",
+      modelEntry: "opencode-go/deepseek-v4-flash:max",
+      modelVariant: null,
+      error: null,
+      retry: null,
+      fallbacks: null,
+      usage: { input: 5, output: 5, phase, durationSeconds: 3 },
+      startedAt: new Date().toISOString(),
+      finishedAt: new Date().toISOString(),
+      stats: {
+        events: 9,
+        steps: 4,
+        lastTool: null,
+        permissionsAllowed: 0,
+        permissionsRejected: 0,
+        lastActivity: null,
+        models: ["opencode-go/deepseek-v4-flash"],
+      },
+      noFinalEvidence: { finishedUnknown: true, source: "recovered", recovered: true, phase },
+      result: {
+        source: "recovered",
+        recovered: true,
+        fetchFailed: false,
+        fetchError: null,
+        recovery: { source: "opencode-events", chars: 42, reason: "no-final-message" },
+      },
+      ...(hasProbes ? { probeResults, probesGreen } : {}),
+    },
+    resultText,
+    stateDir: null,
+  };
+}
+
+async function runCmdTask496Recovered({ probeResults }) {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-496-task-"));
+  const stateRoot = path.join(tmp, "state");
+  const cwd = path.join(tmp, "cwd");
+  fs.mkdirSync(cwd, { recursive: true });
+  fs.mkdirSync(stateRoot, { recursive: true });
+  fs.writeFileSync(
+    path.join(stateRoot, "config.json"),
+    JSON.stringify({ models: { chain: [["opencode/opencode-test"]] } }),
+    "utf8",
+  );
+
+  const savedStateRoot = process.env.KUSABI_STATE_DIR;
+  process.env.KUSABI_STATE_DIR = stateRoot;
+  const stateDir = stateDirFor(cwd);
+  try {
+    const output = await cmdTask(cwd, {
+      flags: { phase: "test-author" },
+      text: CMD_TASK_496_BRIEF,
+      _dispatch: async (opts) => dispatchWithFallback({
+        ...opts,
+        _backendDispatch: () => async () => recoveredNoFinalJob({
+          id: "job-496-recovered",
+          phase: "test-author",
+          probeResults,
+        }),
+      }),
+    });
+    // The events are read BEFORE tmp cleanup so the test body can assert on
+    // the audit trail without racing the fixture's finally.
+    const eventsPath = path.join(stateDir, "jobs", "job-496-recovered", "events.ndjson");
+    const events = fs.existsSync(eventsPath) ? fs.readFileSync(eventsPath, "utf8") : "";
+    return { outcome: commandOutcome(output), job: loadJob(stateDir, "job-496-recovered"), stateDir, events };
+  } finally {
+    if (savedStateRoot === undefined) delete process.env.KUSABI_STATE_DIR;
+    else process.env.KUSABI_STATE_DIR = savedStateRoot;
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+}
+
+describe("cmdTask recovered/no-final finalization (kusabi #496)", () => {
+  it("finish unknown + recovered no-final + P3/P4 red closes as non-success and the task exits nonzero", async () => {
+    const probeResults = [
+      { probe: "P3: deliverables", passed: false, detail: "no declared deliverable paths changed" },
+      { probe: "P4: smoke", passed: false, detail: "declared test files absent, pytest exit 4" },
+      { probe: "P2: verify", passed: true, detail: "1062 passed" },
+    ];
+    const { outcome, job, events } = await runCmdTask496Recovered({ probeResults });
+
+    // Nonzero exit: an incomplete recovered run is not a successful task.
+    assert.notEqual(outcome.exitCode, 0);
+
+    // The task output surfaces the incompleteness AND the failed probes.
+    assert.match(outcome.text, /incomplete execution/);
+    assert.match(outcome.text, /Probes:/);
+    assert.match(outcome.text, /P3: deliverables \u2014 FAIL/);
+    assert.match(outcome.text, /P4: smoke \u2014 FAIL/);
+
+    // The stored result keeps the closed non-success status, the recovered
+    // marker, the stream signal, and the probe truth (P3/P4 red, base green).
+    assert.equal(job.status, "error");
+    assert.equal(job.stopReason, "unknown");
+    assert.equal(job.result.recovered, true);
+    assert.equal(job.noFinalEvidence.finishedUnknown, true);
+    assert.equal(job.probesGreen, false);
+    assert.equal(job.probeResults.length, 3);
+    const p3 = job.probeResults.find((p) => p.probe === "P3: deliverables");
+    const p4 = job.probeResults.find((p) => p.probe === "P4: smoke");
+    assert.ok(p3 && p3.passed === false);
+    assert.ok(p4 && p4.passed === false);
+    const p2 = job.probeResults.find((p) => p.probe === "P2: verify");
+    assert.ok(p2 && p2.passed === true);
+
+    // The incompleteness verdict lands in the audit trail (the no-final
+    // stream signal is recorded by runPrompt and is covered by the end-to-end
+    // runPrompt fixtures above, which drive the real stream).
+    assert.match(events, /companion.result.incomplete/);
+  });
+
+  it("a complete-but-message-less write run with P3/P4 green is not falsely failed", async () => {
+    const probeResults = [
+      { probe: "P3: deliverables", passed: true, detail: "touches declared deliverables" },
+      { probe: "P4: smoke", passed: true, detail: "all smoke command(s) passed" },
+      { probe: "P2: verify", passed: true, detail: "1062 passed" },
+    ];
+    const { outcome, job } = await runCmdTask496Recovered({ probeResults });
+
+    assert.equal(outcome.exitCode, 0);
+    assert.equal(job.status, "completed");
+    assert.equal(job.stopReason, "completed");
+    assert.equal(job.error, null);
+    assert.equal(job.result.recovered, true);
+    assert.equal(job.noFinalEvidence.finishedUnknown, true);
+    assert.equal(job.probesGreen, true);
+  });
+
+  it("a run whose probes never ran (no container) keeps its dispatch classification", async () => {
+    const { outcome, job } = await runCmdTask496Recovered({ probeResults: null });
+
+    assert.equal(outcome.exitCode, 0);
+    assert.equal(job.status, "completed");
+    assert.equal(job.stopReason, "completed");
+    assert.equal(job.error, null);
+    assert.equal(job.result.recovered, true);
+    assert.equal(job.probeResults, undefined, "no probe truth was recorded");
   });
 });

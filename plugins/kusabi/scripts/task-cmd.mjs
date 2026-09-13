@@ -35,7 +35,7 @@ import {
 } from "./brief-parsing.mjs";
 import { stateRoot, stateDirFor } from "./state-paths.mjs";
 import { jobDir, saveJob, latestJob, appendEvent } from "./job-store.mjs";
-import { runPrompt } from "./prompt-execution.mjs";
+import { runPrompt, finalizeIncompleteCompletedRun } from "./prompt-execution.mjs";
 import { translateDenyTools } from "./claude-dispatch.mjs";
 import { AGY_BACKEND } from "./agy-dispatch.mjs";
 import { CURSOR_BACKEND } from "./cursor-dispatch.mjs";
@@ -640,6 +640,17 @@ export async function cmdTask(cwd, { flags, text, _dispatch = null }, opts = {})
       job.probesGreen = false;
     }
   }
+
+  // kusabi #496: the terminal classification of a recovered/no-final run is
+  // decided HERE, at the layer that owns probe truth.  runPrompt only
+  // records the deterministic stream signal (provider finish "unknown" + no
+  // final payload, `job.noFinalEvidence`); a write-phase job is closed as
+  // non-success only when the probe evidence also proves it incomplete (no
+  // declared deliverable changes AND failed P3/P4).  A complete-but-message-
+  // less write run whose deliverables/probes are green -- or a run whose
+  // probes never ran -- keeps its dispatch classification, so nothing is
+  // falsely failed on stream shape alone.
+  finalizeIncompleteCompletedRun({ job, probeResults: job.probeResults, stateDir });
   saveJob(stateDir, job);
 
   let taskOutput;
