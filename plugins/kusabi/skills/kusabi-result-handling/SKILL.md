@@ -30,3 +30,17 @@ user-invocable: false
 ## Verification against reports (interface with the reviewer specification)
 
 - A worker's completion report is a claim, not evidence. Before accepting it, verify against the diff and actual behavior (detailed specification is in adversarial-review.md / kusabi-review.md. Here, just remember: **verify first, then trust**)
+
+## Escalation recovery
+
+Before discarding work or re-dispatching after an escalation, perform a terminal-event check:
+
+1. **Read the chain state.** Run `chain-show` on the escalated chain. Note the exact disposition reason it reports — this is the authoritative cause of the escalation. Inspect the underlying implement/review job status and result, including recovered or no-final results. Check for `reviewSeatFailures` entries — they indicate review seats that died and may have left useful progress behind.
+
+2. **Inspect retained work.** Check the worktree diff (`git diff` or `git status --porcelain` against the chain base) and any checkpoint or progress artifacts. An escalated chain may retain valuable implementation progress even when review failed — this is expected and the work should not be discarded without evidence it is unsalvageable.
+
+3. **For temporary container access failures** (transient network issues, provider errors), preserve the container and inspect `sandbox_list_containers` to assess its current state. Wait/retry the access operation once as appropriate. Use a non-destructive same-container restart only when the environment permits. For stopped or removed containers, inspect durable chain/job/checkpoint artifacts before declaring work lost.
+
+4. **Never use `chain-resume` for an unreachable container.** Resume applies only after a terminal chain when the recorded container remains reachable.
+
+5. **This is a terminal-event check, not a polling loop.** Inspect the state once and decide — do not repeatedly probe companion status or spin on container health. The check exists to prevent discarding useful progress, not to extend chain lifetime.
