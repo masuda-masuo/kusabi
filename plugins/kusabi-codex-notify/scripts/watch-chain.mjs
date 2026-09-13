@@ -885,17 +885,59 @@ export function getTaskRecoveryCommands(jobId) {
   return `kusabi-companion result ${jobId} | kusabi-companion status ${jobId}`;
 }
 
-export function formatTaskNotificationMessage({ jobId, status, phase, backendModel, container }) {
+/**
+ * The recovered/no-final state of a task result, for the notification
+ * message.  Null when the job carries no such state (a normal final
+ * message, or no job record).
+ *
+ * kusabi #496: a recovered/no-final write run that is closed as non-success
+ * must not read as a bare status line — the message names the state so the
+ * reader sees there was no final message.
+ */
+export function describeTaskResultState(job) {
+  const source = job?.result?.source;
+  if (source === "recovered") return "recovered (no final message)";
+  if (source === "none") return "no final message";
+  if (job?.noFinalEvidence?.finishedUnknown === true) return "recovered (no final message)";
+  return null;
+}
+
+/**
+ * One-line summaries of the job's failed probes, for the notification
+ * message.  Empty when there are none.
+ */
+export function describeFailedProbes(job) {
+  const results = Array.isArray(job?.probeResults) ? job.probeResults : [];
+  return results
+    .filter((p) => p && p.passed === false)
+    .map((p) => {
+      let detail = p.detail || "";
+      if (typeof detail === "string" && detail.length > 200) detail = detail.slice(0, 200) + "...";
+      return `${p.probe || "(unnamed probe)"} — FAIL${detail ? " (" + detail + ")" : ""}`;
+    });
+}
+
+export function formatTaskNotificationMessage({ jobId, status, phase, backendModel, container, job = null }) {
   const containerValue = container || "unavailable";
-  return [
+  const lines = [
     `[kusabi] Task ${jobId} ${status}.`,
     `- Status: ${status}`,
     `- Class: ${classifyTaskStatusClass(status)}`,
     `- Phase: ${phase || "unknown"}`,
     `- Backend/Model: ${backendModel}`,
     `- Container: ${containerValue}`,
-    `- Recover: ${getTaskRecoveryCommands(jobId)}`,
-  ].join("\n");
+  ];
+  // kusabi #496: a recovered/no-final result and the failed probes must be
+  // visible in the notification, not hidden behind the status line.
+  const resultState = describeTaskResultState(job);
+  if (resultState) lines.push(`- Result: ${resultState}`);
+  const failedProbes = describeFailedProbes(job);
+  if (failedProbes.length > 0) {
+    lines.push("- Failed probes:");
+    for (const probeLine of failedProbes) lines.push(`  ${probeLine}`);
+  }
+  lines.push(`- Recover: ${getTaskRecoveryCommands(jobId)}`);
+  return lines.join("\n");
 }
 
 export function evaluateQueueResult(queueResult) {
@@ -1514,6 +1556,7 @@ export async function watchTask({
     phase: phaseValue,
     backendModel,
     container: containerValue,
+    job,
   });
 
   // 5. Mark queue-in-flight immediately before spawn (fail-closed boundary for at-most-once)

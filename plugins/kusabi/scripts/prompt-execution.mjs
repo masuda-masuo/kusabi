@@ -159,6 +159,201 @@ export function classifyJobOutcome({
   return { status: "completed", error: null };
 }
 
+// =========================================================================
+// completed-run integrity (kusabi #496) — pure, exported, unit-testable
+// =========================================================================
+
+/**
+ * Detect the provider's "finished, reason unknown" terminal signal on a
+ * session.status event.
+ *
+ * opencode closes a session with a `session.status` event whose
+ * `properties.status` is `{ type: "finished", finish: "unknown", ... }`
+ * when the run ended without a known reason.  The measured incident
+ * (job-mtyfpjlc8452, 2026-09): a connection reset mid-run, one retry, then
+ * `finish: "unknown"` followed by `session.idle` -- the recorded stream
+ * carried the flat `{ finish: "unknown" }` line verbatim.  Only `unknown`
+ * counts: a `done` finish is a normal completion, and `error` / `cancel`
+ * finishes arrive with their own signals.
+ *
+ * @param {object} event — one recorded SSE event (only called for
+ *                        `session.status` events).
+ * @returns {boolean}
+ */
+export function finishedUnknownSignal(event) {
+  const props = event?.properties;
+  if (!props || typeof props !== "object") return false;
+  // Flat shape (the incident's recorded line, verbatim).
+  if (props.finish === "unknown") return true;
+  // Structured opencode shape: properties.status = { type: "finished", finish: "unknown" }.
+  const status = props.status;
+  if (!status || typeof status !== "object") return false;
+  if (status.type !== "finished") return false;
+  return status.finish === "unknown";
+}
+
+/**
+ * Phases whose deliverable IS the analysis itself: a run that changes no
+ * files -- and even one that never emits a final message -- is still a
+ * legitimate completion for them, so a recovered-only result must not be
+ * downgraded.  Every other phase is expected to produce output.
+ */
+export const READ_ONLY_PHASES = Object.freeze(["plan", "review"]);
+
+/**
+ * Does this phase contract require the run to produce output?
+ *
+ * The standalone `review` command (kind "review") and the read-only
+ * plan/review phases may legitimately finish with nothing written; every
+ * other phase (implement, test-author, investigate, gofer, draft, respond,
+ * salvage, ...) must.
+ *
+ * @param {string|null} phase — job phase, or null.
+ * @param {string|null} kind  — job kind ("task" | "review" | ...), or null.
+ * @returns {boolean}
+ */
+export function phaseRequiresOutput(phase, kind) {
+  if (kind === "review") return false;
+  return !READ_ONLY_PHASES.includes(phase);
+}
+
+/**
+ * Deterministic probe evidence that a write run produced nothing.
+ *
+ * Incompleteness is only PROVEN when the applicable probes are red: P3
+ * (no declared deliverable change) and P4 (smoke failed).  Green P3/P4 —
+ * or probe results that never ran (absent) — is NOT incomplete evidence:
+ * the work may well be done despite the missing final message, so the run
+ * keeps its dispatch classification.
+ *
+ * @param {object}   opts
+ * @param {Array<object>|null|undefined} opts.probeResults — the probe
+ *   results recorded at the probe-truth layer (cmdTask / the chain's probe
+ *   phase).  Probe names follow the chain probes ("P3: deliverables",
+ *   "P4: smoke").
+ * @returns {boolean}
+ */
+export function probeEvidenceIncomplete({ probeResults }) {
+  const results = Array.isArray(probeResults) ? probeResults : [];
+  const p3 = results.find((p) => typeof p?.probe === "string" && p.probe.startsWith("P3"));
+  const p4 = results.find((p) => typeof p?.probe === "string" && p.probe.startsWith("P4"));
+  if (!p3 || !p4) return false;
+  return p3.passed === false && p4.passed === false;
+}
+
+/**
+ * Decide whether a job the stream classified `completed` is in fact an
+ * incomplete run that must be recorded as a non-success.
+ *
+ * The stream signal is necessary but NOT sufficient:
+ *   - the provider itself reported the session finished with reason
+ *     `unknown` (finishedUnknownSignal) — the signature of a connection
+ *     that died mid-run rather than a normal completion;
+ *   - the job has no terminal final payload: the result was recovered from
+ *     the recorded stream (`recovered`) or there was nothing to recover
+ *     (`none`) — a final assistant message never existed;
+ *   - the phase requires output (see phaseRequiresOutput).
+ *
+ * The verdict additionally requires the probe evidence that makes
+ * incompleteness deterministic (probeEvidenceIncomplete — no declared
+ * deliverable changes AND failed P3/P4), so a complete-but-message-less
+ * write run whose deliverables/probes are green is never falsely failed.
+ *
+ * `unavailable` (we could not even ask for the final message) is NOT
+ * deterministic incomplete evidence — the final message may well exist —
+ * and keeps today's classification.  Read-only plan/review phases keep
+ * their recovered/empty result as a completed success.  Probe results that
+ * never ran (no container) carry no deterministic evidence either.
+ *
+ * @param {object}    opts
+ * @param {boolean}   opts.finishedUnknown — provider finished with reason "unknown".
+ * @param {string|null} opts.phase         — job phase.
+ * @param {string|null} opts.kind          — job kind ("task" | "review" | ...).
+ * @param {object|null} opts.resultRecord  — job.result record from
+ *                                            resolveCompletedResult.
+ * @param {Array<object>|null|undefined} opts.probeResults — the probe
+ *                                            results from the probe-truth layer.
+ * @returns {boolean}
+ */
+export function classifyIncompleteCompletedRun({ finishedUnknown, phase, kind, resultRecord, probeResults }) {
+  if (finishedUnknown !== true) return false;
+  const source = resultRecord?.source;
+  if (source !== "recovered" && source !== "none") return false;
+  if (!phaseRequiresOutput(phase, kind)) return false;
+  return probeEvidenceIncomplete({ probeResults });
+}
+
+/**
+ * The error text recorded on a reclassified incomplete job (kusabi #496).
+ * Names the deterministic evidence: the provider's own "unknown" finish and
+ * the absent terminal final payload.
+ *
+ * @param {object} [opts]
+ * @param {string|null} [opts.phase] — job phase.
+ * @param {string|null} [opts.kind]  — job kind.
+ * @returns {string}
+ */
+export function incompleteRunError({ phase = null, kind = null } = {}) {
+  const label = phase ? `phase ${phase}` : (kind ? `${kind} run` : "run");
+  return `incomplete execution: provider reported finish "unknown" and no final message was produced — the recovered ${label} result is not a completed output`;
+}
+
+/**
+ * Finalize a recovered/no-final run's classification at the probe-truth
+ * layer (kusabi #496).
+ *
+ * runPrompt records only the deterministic STREAM signal on the job
+ * (`job.noFinalEvidence`: provider finish "unknown" + no final payload);
+ * the terminal non-success verdict additionally requires the
+ * deliverable/probe evidence (no declared deliverable changes AND failed
+ * P3/P4, see classifyIncompleteCompletedRun), which exists only after the
+ * probes have run.  This function is therefore called by the layer that
+ * owns probe truth (cmdTask after its container probe phase; chain
+ * equivalents read the same helper) -- never by runPrompt, which would
+ * guess the verdict before the evidence exists.
+ *
+ * A job without the stream signal, a read-only plan/review phase, a green
+ * P3/P4, or probe results that never ran all keep their dispatch
+ * classification: only the deterministic combination is closed as
+ * `error`.  The recovered text stays on disk so `kusabi-companion result
+ * <id>` still returns it.
+ *
+ * @param {object} opts
+ * @param {object}   opts.job          — the durable job record (mutated in
+ *                                      place when the verdict fires).
+ * @param {Array<object>|null|undefined} opts.probeResults — probe results
+ *                                      recorded at this layer.
+ * @param {string|null} [opts.stateDir] — job state dir for the audit event.
+ * @returns {boolean} true when the job was reclassified to `error`.
+ */
+export function finalizeIncompleteCompletedRun({ job, probeResults, stateDir }) {
+  if (!job || job.status !== "completed") return false;
+  const evidence = job.noFinalEvidence;
+  if (!evidence || evidence.finishedUnknown !== true) return false;
+  if (!classifyIncompleteCompletedRun({
+    finishedUnknown: true,
+    phase: job.phase,
+    kind: job.kind,
+    resultRecord: { source: evidence.source, recovered: evidence.recovered === true },
+    probeResults,
+  })) return false;
+  job.status = "error";
+  job.error = incompleteRunError({ phase: job.phase, kind: job.kind });
+  // deriveStopReason maps any non-completed status outside the provider
+  // set to the fail-closed `unknown` sentinel -- never "completed".
+  job.stopReason = deriveStopReason({ status: job.status });
+  if (stateDir && job.id) {
+    appendEvent(stateDir, job.id, {
+      type: "companion.result.incomplete",
+      source: evidence.source,
+      recovered: evidence.recovered === true,
+      finishedUnknown: true,
+      phase: job.phase,
+    });
+  }
+  return true;
+}
+
 /**
  * Extract a structured provider status from a session.error payload, or null.
  *
@@ -526,6 +721,12 @@ export async function runPrompt({ cwd, kind, title, promptText, agent, model, se
   const timeout = setTimeout(() => abort.abort(), timeoutS * 1000);
   const replied = new Set();
   let sawIdle = false;
+  // Provider-side terminal signal (kusabi #496): the session closed with
+  // `finish: "unknown"` -- the provider could not say why the run ended.
+  // Recorded on the job as `noFinalEvidence` when no final payload exists;
+  // the terminal verdict is finalized at the probe-truth layer
+  // (finalizeIncompleteCompletedRun), never guessed here.
+  let finishedUnknown = false;
   let sessionError = null;
   let providerError = null;
   let watchdogFired = false;
@@ -686,6 +887,13 @@ export async function runPrompt({ cwd, kind, title, promptText, agent, model, se
                 });
                 break;
               }
+            } else if (finishedUnknownSignal(event)) {
+              // kusabi #496: the provider's own terminal signal.  A session
+              // that finished with `finish: "unknown"` (measured incident:
+              // connection reset mid-run, one retry, then unknown finish
+              // followed by idle) is recorded as the stream signal; the
+              // terminal verdict is finalized at the probe-truth layer.
+              finishedUnknown = true;
             }
           }
 
@@ -879,6 +1087,40 @@ export async function runPrompt({ cwd, kind, title, promptText, agent, model, se
       });
     }
     fs.writeFileSync(path.join(dir, "result.md"), resultText, "utf8");
+
+    // kusabi #496: a provider stream that ended `finish: "unknown"` and then
+    // went idle, with NO terminal final payload -- only a recovered
+    // event/reasoning reconstruction -- carries the deterministic STREAM
+    // signal of a run cut off mid-flight (measured incident job-mtyfpjlc8452:
+    // finish unknown, recovered reasoning-only text, zero deliverable
+    // changes, failed P3/P4 -- stored and notified as completed success).
+    // The signal alone is NOT the terminal verdict: the phase contract and
+    // the deliverable/probe evidence (no declared deliverable changes +
+    // failed P3/P4) decide it, and that evidence exists only at the
+    // probe-truth layer (cmdTask / the chain's probe phase).  runPrompt
+    // therefore only records the evidence on the job -- finalizeIncomplete
+    // CompletedRun closes the record there, and a complete-but-message-less
+    // write run whose deliverables/probes are green is never falsely
+    // failed.  The recovered text stays on disk so `kusabi-companion
+    // result <id>` still returns it.
+    if (finishedUnknown && phaseRequiresOutput(job.phase, job.kind)) {
+      const source = resolved.record.source;
+      if (source === "recovered" || source === "none") {
+        job.noFinalEvidence = {
+          finishedUnknown: true,
+          source,
+          recovered: resolved.record.recovered === true,
+          phase: job.phase,
+        };
+        appendEvent(stateDir, job.id, {
+          type: "companion.result.no-final",
+          source,
+          recovered: resolved.record.recovered === true,
+          finishedUnknown: true,
+          phase: job.phase,
+        });
+      }
+    }
   }
   saveJob(stateDir, job);
   return { job, resultText, stateDir };
