@@ -49,8 +49,20 @@ export const OUTCOME_TASK_WAIT_FAILURE = "task-wait failure";
 export const OUTCOME_MALFORMED_REGISTRATION = "malformed registration";
 export const OUTCOME_ALREADY_DELIVERED = "already delivered";
 export const OUTCOME_AMBIGUOUS_DELIVERY = "ambiguous queue delivery";
+export const OUTCOME_WAIT_INTERRUPTED = "wait interrupted (resumable)";
 
 export const MAX_DELIVERY_ATTEMPTS = 3;
+
+/**
+ * A blocking wait that was interrupted by a signal (the watcher received
+ * SIGTERM/SIGINT/SIGHUP, or the wait child was killed) is RESUMABLE: the
+ * subject's lifecycle is intact and a later sweep re-runs the wait.  A
+ * genuine non-signal wait failure (non-zero exit, no signal) is a real
+ * watcher failure and stays terminal (`*_wait_failed`).
+ */
+export function isSignalInterruption(waitResult) {
+  return Boolean(waitResult && waitResult.signal);
+}
 
 /**
  * Terminal task statuses (the task-wait digest contract, mirroring
@@ -1068,6 +1080,27 @@ export async function watchChain({
   const waitResult = await runProcess(companionCmd, companionArgs, { cwd, env });
 
   if (waitResult.exitCode !== 0) {
+    if (isSignalInterruption(waitResult)) {
+      // Signal-killed wait: resumable, not a terminal watcher failure.  A
+      // later sweep re-runs chain-wait and delivers when the chain is
+      // terminal.  A genuine non-signal failure stays chain_wait_failed.
+      currentRecord = {
+        ...currentRecord,
+        status: "wait_interrupted",
+        outcome: OUTCOME_WAIT_INTERRUPTED,
+        retryable: true,
+        updatedAt: new Date().toISOString(),
+        waitInterruptedAt: new Date().toISOString(),
+        error: {
+          message: `chain-wait interrupted by ${waitResult.signal}`,
+          signal: waitResult.signal,
+          exitCode: waitResult.exitCode,
+          stderr: waitResult.stderr,
+        },
+      };
+      writeRecordAtomic(recordPath, currentRecord);
+      return { outcome: OUTCOME_WAIT_INTERRUPTED, record: currentRecord };
+    }
     currentRecord = {
       ...currentRecord,
       status: "chain_wait_failed",
@@ -1135,6 +1168,16 @@ export async function watchChain({
     chainState.disposition = chainState.status;
   }
 
+  // Persist the terminal observation BEFORE acquiring the claim or invoking
+  // codex queue: a watcher killed after observation but before delivery leaves
+  // a durable diagnostic (terminalObservedAt) and the record stays resumable.
+  currentRecord = {
+    ...currentRecord,
+    terminalObservedAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+  };
+  writeRecordAtomic(recordPath, currentRecord);
+
   // 3. Atomically ensure at-most-once delivery via durable two-phase claim
   const claimResult = tryAcquireClaim(claimsDir, subject, { maxAttempts, procRoot });
   if (!claimResult.acquired) {
@@ -1182,11 +1225,16 @@ export async function watchChain({
     nextAction,
   });
 
-  // 5. Mark queue-in-flight immediately before spawn (fail-closed boundary for at-most-once)
+  // 5. Mark queue-in-flight immediately before spawn (fail-closed boundary).
+  //    Persist the attempt timestamp on the record too, so a kill mid-queue
+  //    leaves the "delivery attempted" diagnostic durable on disk.
+  const attemptedAt = new Date().toISOString();
   updateClaim(claimPath, {
     phase: "queue_inflight",
-    inflightAt: new Date().toISOString(),
+    inflightAt: attemptedAt,
   });
+  currentRecord = { ...currentRecord, attemptedAt, updatedAt: attemptedAt };
+  writeRecordAtomic(recordPath, currentRecord);
 
   // 6. Call codex queue
   const codexCmd = codexBin || env.CODEX_BIN || "codex";
@@ -1209,6 +1257,7 @@ export async function watchChain({
       attempts: currentAttempt,
       retryable: false,
       updatedAt: new Date().toISOString(),
+      deliveredAt: new Date().toISOString(),
       chainWait: {
         exitCode: waitResult.exitCode,
         stdout: waitResult.stdout,
@@ -1468,6 +1517,28 @@ export async function watchTask({
   };
 
   if (waitResult.exitCode !== 0) {
+    if (isSignalInterruption(waitResult)) {
+      // Signal-killed wait: resumable, not a terminal watcher failure.  A
+      // later sweep re-runs task-wait and delivers when the job is terminal.
+      // A genuine non-signal failure stays task_wait_failed.
+      currentRecord = {
+        ...currentRecord,
+        status: "wait_interrupted",
+        outcome: OUTCOME_WAIT_INTERRUPTED,
+        retryable: true,
+        updatedAt: new Date().toISOString(),
+        waitInterruptedAt: new Date().toISOString(),
+        taskWait,
+        error: {
+          message: `task-wait interrupted by ${waitResult.signal}`,
+          signal: waitResult.signal,
+          exitCode: waitResult.exitCode,
+          stderr: waitResult.stderr,
+        },
+      };
+      writeRecordAtomic(recordPath, currentRecord);
+      return { outcome: OUTCOME_WAIT_INTERRUPTED, record: currentRecord };
+    }
     return failTaskWait(
       waitResult.signal
         ? `task-wait interrupted by ${waitResult.signal}`
@@ -1503,6 +1574,16 @@ export async function watchTask({
       { digest, jobStatus: job?.status ?? null },
     );
   }
+
+  // Persist the terminal observation BEFORE acquiring the claim or invoking
+  // codex queue: a watcher killed after observation but before delivery leaves
+  // a durable diagnostic (terminalObservedAt) and the record stays resumable.
+  currentRecord = {
+    ...currentRecord,
+    terminalObservedAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+  };
+  writeRecordAtomic(recordPath, currentRecord);
 
   // 3. Atomically ensure at-most-once delivery via durable two-phase claim
   const claimResult = tryAcquireClaim(claimsDir, subject, { maxAttempts, procRoot });
@@ -1559,11 +1640,16 @@ export async function watchTask({
     job,
   });
 
-  // 5. Mark queue-in-flight immediately before spawn (fail-closed boundary for at-most-once)
+  // 5. Mark queue-in-flight immediately before spawn (fail-closed boundary).
+  //    Persist the attempt timestamp on the record too, so a kill mid-queue
+  //    leaves the "delivery attempted" diagnostic durable on disk.
+  const attemptedAt = new Date().toISOString();
   updateClaim(claimPath, {
     phase: "queue_inflight",
-    inflightAt: new Date().toISOString(),
+    inflightAt: attemptedAt,
   });
+  currentRecord = { ...currentRecord, attemptedAt, updatedAt: attemptedAt };
+  writeRecordAtomic(recordPath, currentRecord);
 
   // 6. Call codex queue
   const codexCmd = codexBin || env.CODEX_BIN || "codex";
@@ -1599,6 +1685,7 @@ export async function watchTask({
       attempts: currentAttempt,
       retryable: false,
       updatedAt: new Date().toISOString(),
+      deliveredAt: new Date().toISOString(),
       ...baseRecord,
       notification: {
         message: summaryMessage,

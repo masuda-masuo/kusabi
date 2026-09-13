@@ -18,6 +18,9 @@ import crypto from "node:crypto";
 
 import {
   OUTCOME_DELIVERED,
+  OUTCOME_QUEUE_FAILURE,
+  OUTCOME_AMBIGUOUS_DELIVERY,
+  OUTCOME_WAIT_INTERRUPTED,
   TASK_TERMINAL_STATUSES,
   readJson,
   writeRecordAtomic,
@@ -25,6 +28,7 @@ import {
   readTaskJob,
   parseTaskWaitDigest,
   classifyTaskStatusClass,
+  isSignalInterruption,
   watchTask,
 } from "./watch-chain.mjs";
 
@@ -33,6 +37,7 @@ import {
   resumePendingWatches,
   launchAndWatch,
   launchTaskAndWatch,
+  describeRecordForList,
 } from "./register-watch.mjs";
 
 // The wait command's own terminal set — the other half of "the chosen
@@ -866,5 +871,146 @@ if (subcmd === "chain-detach" || subcmd === "task-detach") {
       clearTimeout(timer);
       if (restore) restore();
     }
+  });
+});
+describe("kusabi-codex-notify lifecycle hardening units (kusabi #503)", () => {
+  let tmpRoot;
+  let stateDir;
+
+  beforeEach(() => {
+    tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "kcn-503-unit-"));
+    stateDir = path.join(tmpRoot, "notify-state");
+    fs.mkdirSync(path.join(stateDir, "records"), { recursive: true });
+    fs.mkdirSync(path.join(stateDir, "claims"), { recursive: true });
+  });
+
+  afterEach(() => {
+    try {
+      fs.rmSync(tmpRoot, { recursive: true, force: true });
+    } catch { /* best-effort */ }
+  });
+
+  it("signal interruption classification: signal-killed waits are resumable; non-signal failures are not", () => {
+    assert.equal(isSignalInterruption({ exitCode: 143, signal: "SIGTERM" }), true);
+    assert.equal(isSignalInterruption({ exitCode: 130, signal: "SIGINT" }), true);
+    assert.equal(isSignalInterruption({ exitCode: 1, signal: "SIGHUP" }), true);
+    // Genuine failures carry no signal and stay terminal wait failures.
+    assert.equal(isSignalInterruption({ exitCode: 1 }), false);
+    assert.equal(isSignalInterruption({ exitCode: 1, signal: null }), false);
+    assert.equal(isSignalInterruption({ exitCode: 0 }), false);
+    assert.equal(isSignalInterruption(null), false);
+    assert.equal(isSignalInterruption(undefined), false);
+  });
+
+  it("the launcher owns no post-spawn write: pid/startTime metadata belongs to the watcher alone (kusabi #503 F1)", () => {
+    // The record the launcher writes before spawn is pid-less; the watcher is
+    // the only writer of pid/startTime.  No post-spawn write exists, so no
+    // launcher write can regress a fast watcher's terminal record — the
+    // guarantee is structural (the post-spawn patch was removed entirely).
+    const recPath = getRecordPath(stateDir, { kind: "task", id: "job-f1-nopostwrite" });
+    writeRecordAtomic(recPath, {
+      subject: { kind: "task", id: "job-f1-nopostwrite" },
+      jobId: "job-f1-nopostwrite",
+      threadId: "thread-f1",
+      cwd: "/tmp",
+      status: "waiting",
+      outcome: null,
+      registeredAt: "2026-09-13T00:00:00.000Z",
+      updatedAt: "2026-09-13T00:00:00.000Z",
+      pid: null,
+      startTime: null,
+      attempts: 0,
+      retryable: true,
+    });
+
+    const onDisk = readJson(recPath);
+    assert.equal(onDisk.pid, null, "pre-spawn record carries no pid");
+    assert.equal(onDisk.startTime, null);
+    assert.equal(onDisk.status, "waiting");
+    assert.equal(onDisk.outcome, null);
+
+    // The launcher never writes again after spawn, so the pre-spawn pid-less
+    // record is exactly what a sweep sees if the watcher dies before startup
+    // — resume treats a pid-less record as dead (see the end-to-end
+    // "pid-less waiting record is durably resumable" coverage).
+  });
+
+  it("describeRecordForList: surfaces terminal observed, attempted, delivered, retry-pending, running and ambiguity diagnostics", () => {
+    const deliveredLine = describeRecordForList({
+      subject: { kind: "task", id: "job-list" },
+      status: "delivered",
+      outcome: OUTCOME_DELIVERED,
+      terminalObservedAt: "2026-09-13T00:00:01.000Z",
+      attemptedAt: "2026-09-13T00:00:02.000Z",
+      deliveredAt: "2026-09-13T00:00:03.000Z",
+      retryable: false,
+    }, "task-job-list.json");
+    assert.match(deliveredLine, /^task job-list: status=delivered outcome=delivered /);
+    assert.match(deliveredLine, /terminalObserved=2026-09-13T00:00:01\.000Z/);
+    assert.match(deliveredLine, /attempted=2026-09-13T00:00:02\.000Z/);
+    assert.match(deliveredLine, /delivered=2026-09-13T00:00:03\.000Z/);
+    assert.match(deliveredLine, /retryPending=false/);
+
+    // A healthy live waiting watcher: running=true, retryPending=false.
+    // The test process cmdline contains "register-watch" and its own pid is
+    // alive, so a record whose subject id is "register-watch" verifies live.
+    const liveLine = describeRecordForList({
+      subject: { kind: "task", id: "register-watch" },
+      status: "waiting",
+      outcome: null,
+      pid: process.pid,
+      startTime: null,
+    }, "x.json");
+    assert.match(liveLine, /running=true/);
+    assert.match(liveLine, /retryPending=false/);
+
+    // A dead waiting watcher: running=false, retryPending=true.
+    const deadLine = describeRecordForList({
+      subject: { kind: "task", id: "job-dead" },
+      status: "waiting",
+      outcome: null,
+      pid: 99999999,
+      startTime: "12345",
+    }, "x.json");
+    assert.match(deadLine, /running=false/);
+    assert.match(deadLine, /retryPending=true/);
+
+    // A pid-less waiting record (watcher died before startup): same retry-pending truth.
+    const pidlessLine = describeRecordForList({
+      subject: { kind: "task", id: "job-pidless" },
+      status: "waiting",
+      outcome: null,
+      pid: null,
+      startTime: null,
+    }, "x.json");
+    assert.match(pidlessLine, /running=false/);
+    assert.match(pidlessLine, /retryPending=true/);
+
+    const retryLine = describeRecordForList({
+      subject: { kind: "task", id: "job-retry" },
+      status: "queue_failed",
+      outcome: OUTCOME_QUEUE_FAILURE,
+      retryable: true,
+      attempts: 1,
+    }, "x.json");
+    assert.match(retryLine, /retryPending=true/);
+
+    const interruptedLine = describeRecordForList({
+      subject: { kind: "task", id: "job-int" },
+      status: "wait_interrupted",
+      outcome: OUTCOME_WAIT_INTERRUPTED,
+      retryable: true,
+    }, "x.json");
+    assert.match(interruptedLine, /retryPending=true/);
+    assert.match(interruptedLine, /running=false/);
+
+    const ambiguousLine = describeRecordForList({
+      subject: { kind: "task", id: "job-amb" },
+      status: "ambiguous",
+      outcome: OUTCOME_AMBIGUOUS_DELIVERY,
+      retryable: false,
+    }, "x.json");
+    assert.match(ambiguousLine, /ambiguous=true/);
+    assert.match(ambiguousLine, /retryPending=false/);
   });
 });

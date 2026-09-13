@@ -43,6 +43,44 @@ import {
 import { writeJson, stateDirFor } from "./state-paths.mjs";
 
 
+/**
+ * Actionable detail for a CLI subprocess that did not exit 0, or whose status
+ * is null because spawnSync timed out or the child was signalled (kusabi
+ * #503): a timeout/signal failure has no stdout/stderr to show, so an
+ * assertion message built only from those is empty and undiagnosable.  The
+ * detail carries `status`, `signal` and `error.message`; it is empty for a
+ * clean exit so callers can always append it to their message.
+ */
+function subprocessFailureDetail(result) {
+  if (!result || result.status === 0) return "";
+  return (
+    `status=${result.status === null ? "null" : result.status} ` +
+    `signal=${result.signal === null || result.signal === undefined ? "null" : result.signal} ` +
+    `error=${result.error && result.error.message ? result.error.message : "none"}`
+  );
+}
+
+describe("CLI subprocess failure diagnostics (kusabi #503)", () => {
+  it("reports status, signal and error.message for null/nonzero exits and nothing for a clean exit", () => {
+    assert.equal(subprocessFailureDetail({ status: 0, signal: null, error: null }), "");
+    assert.equal(subprocessFailureDetail(null), "");
+
+    const timedOut = subprocessFailureDetail({
+      status: null,
+      signal: "SIGTERM",
+      error: new Error("spawnSync ... ETIMEDOUT"),
+    });
+    assert.match(timedOut, /status=null/);
+    assert.match(timedOut, /signal=SIGTERM/);
+    assert.match(timedOut, /error=spawnSync \.\.\. ETIMEDOUT/);
+
+    const nonzero = subprocessFailureDetail({ status: 3, signal: null, error: null });
+    assert.match(nonzero, /status=3/);
+    assert.match(nonzero, /signal=null/);
+    assert.match(nonzero, /error=none/);
+  });
+});
+
 
 // loadConfig — config file loading
 // ---------------------------------------------------------------------------
@@ -2413,12 +2451,20 @@ describe("serve-stop identity gate (CLI subprocess)", () => {
       stranger,
       run(args = []) {
         const env = { ...process.env, KUSABI_STATE_DIR: stateRootDir };
-        return spawnSync(process.execPath, [COMPANION_SCRIPT, "serve-stop", ...args], {
+        // 30s (not 15s): under concurrent full-suite load the companion
+        // subprocess can be slow to start; a timeout here would surface as a
+        // bare null status with empty stdout/stderr.
+        const result = spawnSync(process.execPath, [COMPANION_SCRIPT, "serve-stop", ...args], {
           cwd,
           encoding: "utf8",
           env,
-          timeout: 15_000,
+          timeout: 30_000,
         });
+        // A null status (timeout/signal) or a nonzero exit carries no
+        // actionable stdout/stderr; attach status/signal/error.message so the
+        // assertions below stay diagnosable under full-suite load.
+        result.failureDetail = subprocessFailureDetail(result);
+        return result;
       },
       cleanup() {
         try { process.kill(stranger.pid, "SIGKILL"); } catch { /* already gone */ }
@@ -2435,7 +2481,7 @@ describe("serve-stop identity gate (CLI subprocess)", () => {
     const fx = identityDeclineFixture();
     try {
       const result = fx.run();
-      assert.equal(result.status, 0, `serve-stop failed: ${result.stdout} ${result.stderr}`);
+      assert.equal(result.status, 0, `serve-stop failed: ${result.failureDetail} ${result.stdout} ${result.stderr}`);
       assert.match(result.stdout, /declined to stop pid \d+/);
       assert.match(result.stdout, /KUSABI_WORKER_CONTEXT/);
       assert.ok(pidAlive(fx.stranger.pid), "a marker-less recorded pid must never be signalled");
@@ -2492,7 +2538,7 @@ setInterval(() => {}, 1000);
       assert.ok(workerTid !== null, "threaded stranger never reported a worker TID");
       fs.writeFileSync(fx.serverFile, JSON.stringify({ pid: workerTid, port: 0, password: "x", cwd: fx.cwd }), "utf8");
       const result = fx.run();
-      assert.equal(result.status, 0, `serve-stop failed: ${result.stdout} ${result.stderr}`);
+      assert.equal(result.status, 0, `serve-stop failed: ${result.failureDetail} ${result.stdout} ${result.stderr}`);
       assert.match(result.stdout, /declined to stop pid \d+/);
       assert.ok(pidAlive(threaded.pid), "the whole process must survive the CLI invocation");
       assert.ok(!fs.existsSync(fx.serverFile), "the invalid record must be removed by cmdServeStop");
