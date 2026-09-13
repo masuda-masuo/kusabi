@@ -648,12 +648,12 @@ async function registerSubjectWatch({
 
   if (child.unref) child.unref();
 
-  const childStartTime = getProcessStartTime(child.pid, procRoot);
-  initialRecord.pid = child.pid;
-  initialRecord.startTime = childStartTime;
-  initialRecord.updatedAt = new Date().toISOString();
-  writeRecordAtomic(recordPath, initialRecord);
-
+  // The watcher is the ONLY writer of pid/startTime metadata: the launcher
+  // never touches the record again after spawn, so a fast watcher's terminal
+  // write can never be regressed by stale initial waiting state (no read-
+  // then-write window exists at all).  If the watcher dies before its first
+  // record write, the pre-spawn pid-less waiting record stays durably
+  // resumable — resume treats a pid-less record as dead and re-registers.
   return {
     outcome: "registered",
     pid: child.pid,
@@ -1126,6 +1126,7 @@ export async function resumePendingWatches({
 
   const entries = fs.readdirSync(recordsDir);
   const resumedSubjects = [];
+  const errors = [];
 
   for (const entry of entries) {
     if (!entry.endsWith(".json")) continue;
@@ -1140,7 +1141,10 @@ export async function resumePendingWatches({
     if (!id) continue;
     const subject = { kind, id };
 
-    const isPending = record.status === "waiting" || record.status === "pending";
+    const isPending =
+      record.status === "waiting" ||
+      record.status === "pending" ||
+      record.status === "wait_interrupted"; // signal-killed wait: resumable
     const isRetryableQueue =
       record.status === "queue_failed" &&
       record.retryable !== false &&
@@ -1178,41 +1182,100 @@ export async function resumePendingWatches({
       }
 
       if (shouldResume) {
-        resumedSubjects.push(subject);
-        if (kind === "task") {
-          await registerTaskWatch({
-            jobId: id,
-            threadId: record.threadId,
-            cwd: record.cwd,
-            stateDir,
-            companionBin,
-            codexBin,
-            sync,
-            procRoot,
-            env,
-            container: record.launch?.container || null,
-            phase: record.launch?.phase || null,
-            backend: record.launch?.backend || null,
-            model: record.launch?.model || null,
-          });
-        } else {
-          await registerWatch({
-            chainId: id,
-            threadId: record.threadId,
-            cwd: record.cwd,
-            stateDir,
-            companionBin,
-            codexBin,
-            sync,
-            procRoot,
-            env,
-          });
+        // Per-record resilience: one failing subject must not abort the whole
+        // sweep/resume — the failure is collected so callers can surface it
+        // with the partial counts instead of silently losing the rest.
+        try {
+          if (kind === "task") {
+            await registerTaskWatch({
+              jobId: id,
+              threadId: record.threadId,
+              cwd: record.cwd,
+              stateDir,
+              companionBin,
+              codexBin,
+              sync,
+              procRoot,
+              env,
+              container: record.launch?.container || null,
+              phase: record.launch?.phase || null,
+              backend: record.launch?.backend || null,
+              model: record.launch?.model || null,
+            });
+          } else {
+            await registerWatch({
+              chainId: id,
+              threadId: record.threadId,
+              cwd: record.cwd,
+              stateDir,
+              companionBin,
+              codexBin,
+              sync,
+              procRoot,
+              env,
+            });
+          }
+          resumedSubjects.push(subject);
+        } catch (err) {
+          errors.push(err);
         }
       }
     }
   }
 
-  return { resumed: resumedSubjects.length, subjects: resumedSubjects, chains: resumedSubjects.filter((s) => s.kind === "chain").map((s) => s.id) };
+  return {
+    resumed: resumedSubjects.length,
+    subjects: resumedSubjects,
+    chains: resumedSubjects.filter((s) => s.kind === "chain").map((s) => s.id),
+    errors,
+  };
+}
+
+/**
+ * Bounded, lazy sweep of persisted pending duties, invoked automatically at
+ * mutating CLI entrypoints (never on read-only `--list`).  Reuses
+ * `resumePendingWatches`: only records whose watcher is dead/absent or whose
+ * retryable queue failure is pending are resumed — live subjects are never
+ * touched, and no watcher ever triggers the sweep, so there is no recursion.
+ *
+ * A sweep failure must never fail the primary invocation, but it must also
+ * not be swallowed silently: on any failure a concise warning (with the
+ * failure and the partial resumed count) is written to stderr, and the
+ * remaining pending duties are retried by the next mutating invocation or by
+ * an explicit `--resume-all`.
+ */
+export async function sweepPendingWatches({
+  stateDir: customStateDir,
+  companionBin,
+  codexBin,
+  sync = false,
+  procRoot = "/proc",
+  env = process.env,
+} = {}) {
+  let result;
+  try {
+    result = await resumePendingWatches({
+      stateDir: customStateDir,
+      companionBin,
+      codexBin,
+      sync,
+      procRoot,
+      env,
+    });
+  } catch (err) {
+    result = { resumed: 0, subjects: [], chains: [], errors: [err] };
+  }
+
+  const failures = result.errors && result.errors.length > 0 ? result.errors : [];
+  if (failures.length > 0) {
+    const extra = failures.length > 1 ? ` (+${failures.length - 1} more)` : "";
+    process.stderr.write(
+      `register-watch: automatic sweep warning: ${failures[0].message}${extra} ` +
+        `(resumed ${result.resumed} subject(s); remaining pending duties are retried ` +
+        `by the next mutating invocation or --resume-all)\n`
+    );
+  }
+  return result;
 }
 
 /** Claim path resolver usable from resume (claimsDir-relative, kind-aware). */
@@ -1288,10 +1351,72 @@ function emitLaunchOutput(res) {
   if (res.stderr) process.stderr.write(res.stderr);
 }
 
+/**
+ * One-line `--list` rendering with the durable diagnostics: status/outcome
+ * plus timestamps for terminal observation, delivery attempt and delivery,
+ * the retry-pending flag, and (for a waiting subject) whether its watcher is
+ * still live.  A still-running subject is distinguishable from a stale
+ * waiting record, and an ambiguous delivery is flagged explicitly.
+ */
+export function describeRecordForList(record, entry) {
+  const kind = record.subject?.kind || "chain";
+  const id = record.subject?.id || record.chainId || record.jobId || entry;
+  const parts = [`status=${record.status}`, `outcome=${record.outcome || "pending"}`];
+
+  if (record.terminalObservedAt) parts.push(`terminalObserved=${record.terminalObservedAt}`);
+  if (record.attemptedAt) parts.push(`attempted=${record.attemptedAt}`);
+  if (record.deliveredAt || record.notification?.deliveredAt) {
+    parts.push(`delivered=${record.deliveredAt || record.notification.deliveredAt}`);
+  }
+
+  // retryPending is false while a healthy watcher is actively waiting; only a
+  // dead or pid-less waiting record (or an interrupted wait / retryable queue
+  // failure) is a duty the next sweep must pick up.
+  let retryPending = false;
+  if (record.status === "waiting" || record.status === "pending") {
+    const alive =
+      record.pid != null &&
+      isWatcherProcessAlive(record.pid, record.startTime || null, id);
+    parts.push(`running=${alive}`);
+    retryPending = !alive;
+  } else if (record.status === "wait_interrupted") {
+    parts.push("running=false");
+    retryPending = true;
+  } else if (record.status === "queue_failed") {
+    retryPending = record.retryable === true;
+  }
+  parts.push(`retryPending=${retryPending}`);
+
+  if (record.status === "ambiguous") {
+    parts.push("ambiguous=true");
+  }
+
+  return `${kind} ${id}: ${parts.join(" ")}`;
+}
+
+/**
+ * Bounded, lazy auto-sweep invoked at mutating CLI entrypoints.  Never runs
+ * on read-only `--list` and never re-enters itself (resume spawns watchers,
+ * not sweeps).  Always spawns detached watchers — even when the primary
+ * command uses `--sync`, the automatic sweep must never block the primary
+ * invocation on a stale still-running subject.  Explicit `--resume-all
+ * --sync` remains the synchronous debugging path.  Best-effort and non-fatal
+ * for the primary invocation.
+ */
+async function sweepAtMutatingEntrypoint(flags) {
+  await sweepPendingWatches({
+    stateDir: flags["state-dir"],
+    companionBin: flags["companion-bin"],
+    codexBin: flags["codex-bin"],
+    sync: false,
+  });
+}
+
 export async function main() {
   const flags = parseArgs(process.argv.slice(2));
 
   if (flags["launch-task"]) {
+    await sweepAtMutatingEntrypoint(flags);
     const res = await launchTaskAndWatch({
       companionBin: flags["companion-bin"],
       codexBin: flags["codex-bin"],
@@ -1310,6 +1435,7 @@ export async function main() {
   }
 
   if (flags.launch || flags.detach) {
+    await sweepAtMutatingEntrypoint(flags);
     const res = await launchAndWatch({
       companionBin: flags["companion-bin"],
       codexBin: flags["codex-bin"],
@@ -1339,9 +1465,7 @@ export async function main() {
       if (entry.endsWith(".json")) {
         const record = readJson(path.join(recordsDir, entry));
         if (record) {
-          const kind = record.subject?.kind || "chain";
-          const id = record.subject?.id || record.chainId || record.jobId || entry;
-          console.log(`${kind} ${id}: status=${record.status} outcome=${record.outcome || "pending"}`);
+          console.log(describeRecordForList(record, entry));
         }
       }
     }
@@ -1360,6 +1484,7 @@ export async function main() {
   }
 
   if (flags.task) {
+    await sweepAtMutatingEntrypoint(flags);
     const res = await registerTaskWatch({
       jobId: flags.task,
       threadId: flags.thread,
@@ -1382,6 +1507,7 @@ export async function main() {
   }
 
   if (flags.chain) {
+    await sweepAtMutatingEntrypoint(flags);
     const res = await registerWatch({
       chainId: flags.chain,
       threadId: flags.thread,
@@ -1404,6 +1530,7 @@ export async function main() {
   if (stdinData.trim()) {
     const dispatch = extractDispatchFromHookInput(stdinData);
     if (dispatch && dispatch.threadId && !dispatch.refused) {
+      await sweepAtMutatingEntrypoint(flags);
       if (dispatch.subjectKind === "task" && dispatch.jobId) {
         await registerTaskWatch({
           jobId: dispatch.jobId,

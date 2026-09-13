@@ -14,7 +14,7 @@ import path from "node:path";
 import os from "node:os";
 import crypto from "node:crypto";
 import process from "node:process";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 import {
@@ -26,6 +26,7 @@ import {
   OUTCOME_MALFORMED_REGISTRATION,
   OUTCOME_ALREADY_DELIVERED,
   OUTCOME_AMBIGUOUS_DELIVERY,
+  OUTCOME_WAIT_INTERRUPTED,
   MAX_DELIVERY_ATTEMPTS,
   TASK_TERMINAL_STATUSES,
   getStateDir,
@@ -59,6 +60,7 @@ import {
   registerWatch,
   registerTaskWatch,
   resumePendingWatches,
+  sweepPendingWatches,
   extractDispatchFromHookInput,
   launchAndWatch,
   launchTaskAndWatch,
@@ -3072,5 +3074,1128 @@ process.exitCode = 1;
     assert.equal(resumeRes.resumed, 1);
     assert.deepEqual(resumeRes.subjects, [{ kind: "task", id: jobId }]);
     assert.equal(getQueueInvocations().length, 2, "one chain delivery + one resumed task delivery");
+  });
+});
+describe("kusabi-codex-notify lifecycle hardening (kusabi #503)", () => {
+  let tmpRoot;
+  let stateDir;
+  let kusabiStateDir;
+  let workspaceDir;
+  let mockCompanionScript;
+  let mockCodexScript;
+  let queueLogDir;
+
+  // Test-owned process registry (test isolation, kusabi #503).  Under this
+  // container's pids.max=500 and non-reaping PID1 (`sleep infinity`), a
+  // detached process whose parent exits first is reparented to PID1 and its
+  // eventual exit becomes an UNREAPABLE zombie that permanently consumes a
+  // pids.max slot (repeated full runs then hit EAGAIN on fork).  So every
+  // detached watcher/mock pid a test creates is registered here and
+  // terminated + waited for in afterEach, and the register-watch CLI
+  // subprocess is HELD ALIVE (see cli-hold-hook.mjs) until its detached
+  // watchers are done: the watchers stay children of a live reaping process.
+  let cliHoldHookPath = null;
+  let heldCli = null;
+  let cliHoldCounter = 0;
+  const trackedOwnedPids = new Set();
+
+  beforeEach(() => {
+    tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "kcn-503-"));
+    stateDir = path.join(tmpRoot, "notify-state");
+    kusabiStateDir = path.join(tmpRoot, "kusabi-state");
+    workspaceDir = path.join(tmpRoot, "workspace");
+    queueLogDir = path.join(tmpRoot, "queue-logs");
+
+    fs.mkdirSync(stateDir, { recursive: true });
+    fs.mkdirSync(kusabiStateDir, { recursive: true });
+    fs.mkdirSync(workspaceDir, { recursive: true });
+    fs.mkdirSync(queueLogDir, { recursive: true });
+
+    heldCli = null;
+    trackedOwnedPids.clear();
+
+    // Deterministic stand-in companion.  TEST_COMPANION_SIGNAL_SELF makes the
+    // blocking wait child kill itself with the named signal after 50ms — a
+    // deterministic simulation of a signal interrupting task-wait/chain-wait.
+    mockCompanionScript = path.join(tmpRoot, "mock-companion.mjs");
+    fs.writeFileSync(
+      mockCompanionScript,
+      `#!/usr/bin/env node
+import fs from "node:fs";
+import path from "node:path";
+import crypto from "node:crypto";
+import process from "node:process";
+
+const args = process.argv.slice(2);
+const subcmd = args[0];
+const id = args[1];
+const cwd = process.cwd();
+const hash = crypto.createHash("sha256").update(path.resolve(cwd)).digest("hex").slice(0, 12);
+const kusabiRoot = process.env.KUSABI_STATE_DIR || path.join(process.env.HOME || "/tmp", ".kusabi");
+const jobFile = path.join(kusabiRoot, hash, "jobs", id, "job.json");
+const TERMINAL = new Set(["completed", "timeout", "cancelled", "provider-error", "error", "stalled", "serve-dead"]);
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+if (process.env.TEST_COMPANION_FAIL === "1") {
+  fs.writeSync(2, "mock error: companion failed or stalled\\n");
+  process.exitCode = 1;
+} else if ((subcmd === "task-wait" || subcmd === "chain-wait") && process.env.TEST_COMPANION_SIGNAL_SELF) {
+  setTimeout(() => { process.kill(process.pid, process.env.TEST_COMPANION_SIGNAL_SELF); }, 50);
+} else if (subcmd === "chain-detach") {
+  fs.writeSync(1, "Detached chain launched (pid 999).\\nLog: /tmp/log\\nTo wait for completion, run:\\n  kusabi-companion chain-wait chain-x\\n");
+  process.exitCode = 0;
+} else if (subcmd === "chain-wait") {
+  fs.writeSync(1, "chain " + id + ": status=completed disposition=accept rounds=1 waited=2s container=1d90ea9e70b6\\n");
+  process.exitCode = 0;
+} else if (subcmd === "task-detach") {
+  const since = process.env.TEST_TASK_SINCE || "2026-09-06T12:00:00.000Z";
+  fs.writeSync(1, "Detached task launched (pid 999).\\nLog: /tmp/kusabi/state/task-detach-1788698641659.log\\n\\nTo wait for completion, run:\\n  kusabi-companion task-wait --next --since " + since + "\\n");
+  process.exitCode = 0;
+} else if (subcmd === "task-wait") {
+  (async () => {
+    const pollMs = Number(process.env.TEST_TASK_WAIT_POLL_MS || 25);
+    const deadline = Date.now() + 30000;
+    while (Date.now() < deadline) {
+      let job = null;
+      try { job = JSON.parse(fs.readFileSync(jobFile, "utf8")); } catch {}
+      if (job && TERMINAL.has(job.status)) {
+        const phase = job.phase ? " phase=" + job.phase : "";
+        const err = (typeof job.error === "string" && job.error) ? " error=" + job.error.replace(/\\s+/g, " ").slice(0, 120) : "";
+        fs.writeSync(1, "task " + id + ": status=" + job.status + phase + err + " waited=2s\\n");
+        process.exitCode = 0;
+        return;
+      }
+      await sleep(pollMs);
+    }
+    fs.writeSync(2, "task " + id + ": timed out waiting for terminal state\\n");
+    process.exitCode = 1;
+  })();
+} else {
+  fs.writeSync(2, "unknown subcommand " + subcmd + "\\n");
+  process.exitCode = 1;
+}
+`,
+      { mode: 0o755 }
+    );
+
+    mockCodexScript = path.join(tmpRoot, "mock-codex.mjs");
+    fs.writeFileSync(
+      mockCodexScript,
+      `#!/usr/bin/env node
+import fs from "node:fs";
+import path from "node:path";
+import process from "node:process";
+
+const logDir = process.env.TEST_QUEUE_LOG_DIR;
+const args = process.argv.slice(2);
+
+if (logDir) {
+  const file = path.join(logDir, Date.now() + "-" + process.pid + "-" + Math.random().toString(36).slice(2) + ".json");
+  fs.writeFileSync(file, JSON.stringify({ argv: args, pid: process.pid, time: Date.now() }), "utf8");
+}
+process.exitCode = 0;
+`,
+      { mode: 0o755 }
+    );
+
+    // NODE_OPTIONS keepalive hook (test isolation, kusabi #503): holds ONLY
+    // the register-watch CLI subprocess alive.  The sweep/launch running
+    // inside it spawns detached watchers, and while the CLI child lives those
+    // watchers are ITS children — so when they exit, the child (libuv's
+    // SIGCHLD handling) reaps them and no unreapable PID1 orphan is ever
+    // created.  The watchers (watch-chain.mjs) and the mock companion/codex
+    // children inherit NODE_OPTIONS but are never held (argv[1] basename
+    // guard).  The test releases the child by writing the done file; a safety
+    // bound prevents a permanently hung child if the runner itself dies.
+    cliHoldHookPath = path.join(tmpRoot, "cli-hold-hook.mjs");
+    fs.writeFileSync(
+      cliHoldHookPath,
+      `#!/usr/bin/env node
+import fs from "node:fs";
+import path from "node:path";
+const argv1 = process.argv[1] ? path.basename(process.argv[1]) : "";
+if (process.env.TEST_CLI_HOLD === "1" && argv1 === "register-watch.mjs") {
+  const doneFile = process.env.TEST_CLI_HOLD_DONE || "";
+  const maxMs = Number(process.env.TEST_CLI_HOLD_MAX_MS || 60000);
+  const started = Date.now();
+  const hold = setInterval(() => {
+    if ((doneFile && fs.existsSync(doneFile)) || Date.now() - started > maxMs) {
+      clearInterval(hold);
+    }
+  }, 25);
+}
+`,
+      { mode: 0o644 }
+    );
+  });
+
+  afterEach(async () => {
+    try {
+      // Test isolation (kusabi #503): terminate and wait for every test-owned
+      // detached watcher/mock pid.  Runs on assertion failure and timeout, and
+      // never signals a pid whose cmdline does not reference this test's
+      // private tmpRoot (an unrelated process is never touched).
+      await terminateOwnedPids();
+      if (heldCli) {
+        // Release the held CLI subprocess AFTER its watchers are gone: a
+        // process that exits while a detached child still lives would orphan
+        // that child to PID1 (unreapable zombie under `sleep infinity`).
+        const { child, doneFile } = heldCli;
+        heldCli = null;
+        try { fs.writeFileSync(doneFile, "done"); } catch { /* already released */ }
+        await waitChildExit(child, 5000);
+      }
+      // Cleanup assertion: no test-owned detached pid (live or zombie) may
+      // remain after the test.
+      const leftovers = collectOwnedPids().filter((pid) => pidState(pid) !== null);
+      assert.deepEqual(
+        leftovers,
+        [],
+        `test-owned detached processes still present after cleanup: ${leftovers
+          .map((pid) => `pid ${pid} state=${pidState(pid)}`)
+          .join(", ")}`
+      );
+    } finally {
+      try { fs.rmSync(tmpRoot, { recursive: true, force: true }); } catch { /* best-effort */ }
+      trackedOwnedPids.clear();
+    }
+  });
+
+  function getQueueInvocations() {
+    try {
+      const files = fs.readdirSync(queueLogDir);
+      const invocations = [];
+      for (const file of files) {
+        if (file.endsWith(".json")) {
+          invocations.push(JSON.parse(fs.readFileSync(path.join(queueLogDir, file), "utf8")));
+        }
+      }
+      return invocations;
+    } catch {
+      return [];
+    }
+  }
+
+  function setupMockJobFiles(jobId, { status = "running", phase = "implement" } = {}) {
+    const ws = path.resolve(workspaceDir);
+    const hash = crypto.createHash("sha256").update(ws).digest("hex").slice(0, 12);
+    const jobDir = path.join(kusabiStateDir, hash, "jobs", jobId);
+    fs.mkdirSync(jobDir, { recursive: true });
+    const now = new Date().toISOString();
+    fs.writeFileSync(
+      path.join(jobDir, "job.json"),
+      JSON.stringify({
+        id: jobId,
+        kind: "task",
+        title: "kusabi 503 fixture",
+        status,
+        phase,
+        backend: "opencode",
+        modelEntry: "opencode-go/deepseek-v4-flash:max",
+        startedAt: now,
+        finishedAt: status !== "running" ? now : null,
+        cwd: ws,
+        sessionID: "ses-503",
+      }),
+      "utf8"
+    );
+    return jobDir;
+  }
+
+  /** Recovered/no-final job record (kusabi #496 style) for launch handoff. */
+  function setupRecoveredJobFiles(jobId, { status = "error", phase = "implement" } = {}) {
+    const ws = path.resolve(workspaceDir);
+    const hash = crypto.createHash("sha256").update(ws).digest("hex").slice(0, 12);
+    const jobDir = path.join(kusabiStateDir, hash, "jobs", jobId);
+    fs.mkdirSync(jobDir, { recursive: true });
+    const now = new Date().toISOString();
+    fs.writeFileSync(
+      path.join(jobDir, "job.json"),
+      JSON.stringify({
+        id: jobId,
+        kind: "task",
+        title: "kusabi 503 recovered fixture",
+        status,
+        phase,
+        backend: "opencode",
+        modelEntry: "opencode-go/deepseek-v4-flash:max",
+        startedAt: now,
+        finishedAt: now,
+        cwd: ws,
+        sessionID: "ses-503",
+        result: {
+          source: "recovered",
+          recovered: true,
+          fetchFailed: false,
+          fetchError: null,
+          recovery: { source: "opencode-events", chars: 155517 },
+        },
+      }),
+      "utf8"
+    );
+    return jobDir;
+  }
+
+  function setupMockChainFiles(chainId, { status = "completed", disposition = "accept", container = "1d90ea9e70b6" } = {}) {
+    const ws = path.resolve(workspaceDir);
+    const hash = crypto.createHash("sha256").update(ws).digest("hex").slice(0, 12);
+    const chainDir = path.join(kusabiStateDir, hash, "chains", chainId);
+    fs.mkdirSync(chainDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(chainDir, "control.json"),
+      JSON.stringify({ status, round: 1, container }),
+      "utf8"
+    );
+    fs.writeFileSync(
+      path.join(chainDir, "chain.json"),
+      JSON.stringify({ chainId, records: [{ round: 1, disposition: { disposition } }] }),
+      "utf8"
+    );
+  }
+
+  const taskEnv = (extra = {}) => ({
+    ...process.env,
+    KUSABI_STATE_DIR: kusabiStateDir,
+    TEST_QUEUE_LOG_DIR: queueLogDir,
+    ...extra,
+  });
+
+  // ---------------------------------------------------------------------------
+  // Test-isolation helpers (kusabi #503).  Every detached watcher/mock pid a
+  // test creates must be terminated and waited for in teardown; cleanup runs
+  // on assertion failure and timeout (afterEach), and never kills an
+  // unrelated process (every kill is gated on the pid's cmdline referencing
+  // this test's private tmpRoot).
+  // ---------------------------------------------------------------------------
+
+  /**
+   * True when pid runs one of our stand-in scripts (watch-chain.mjs watcher,
+   * mock-companion.mjs, mock-codex.mjs) AND its cmdline references this
+   * test's private tmpRoot.  The EXECUTED script is argv[1] — not any other
+   * argv entry: the held CLI subprocess's argv legitimately contains
+   * `--companion-bin <tmpRoot>/mock-companion.mjs` and
+   * `--codex-bin <tmpRoot>/mock-codex.mjs` as VALUES and must NEVER be
+   * collected or signalled (it is released via its done-file instead).
+   */
+  function isOwnedWatcherPid(pid) {
+    const cmdline = pidCmdline(pid);
+    if (cmdline === null || !cmdline.includes(tmpRoot)) return false;
+    const argv = cmdline.split("\0");
+    const mainScript = argv[1] ? path.basename(argv[1]) : "";
+    return /^(watch-chain|mock-companion|mock-codex)\.mjs$/.test(mainScript);
+  }
+
+  function trackOwnedPid(pid) {
+    if (Number.isInteger(pid) && pid > 0) trackedOwnedPids.add(pid);
+  }
+
+  function pidCmdline(pid) {
+    try {
+      return fs.readFileSync(path.join("/proc", String(pid), "cmdline"), "utf8");
+    } catch {
+      return null;
+    }
+  }
+
+  function pidState(pid) {
+    try {
+      const stat = fs.readFileSync(path.join("/proc", String(pid), "stat"), "utf8");
+      const lastParen = stat.lastIndexOf(")");
+      return stat.slice(lastParen + 2).trim().split(/\s+/)[0] || null;
+    } catch {
+      return null; // gone from /proc (reaped)
+    }
+  }
+
+  /** Every test-owned pid: explicitly tracked + watcher/mock pids in /proc. */
+  function collectOwnedPids() {
+    const pids = new Set(trackedOwnedPids);
+    // Live watchers/mocks reference this tmpRoot in their cmdline.
+    for (const entry of fs.readdirSync("/proc")) {
+      if (!/^\d+$/.test(entry)) continue;
+      const pid = Number(entry);
+      if (isOwnedWatcherPid(pid)) {
+        pids.add(pid);
+      }
+    }
+    // Records scan: pids stamped by the watchers themselves.  Catches a
+    // killed-but-unreaped zombie (empty cmdline, state Z) that still occupies
+    // a pids.max slot.  In-process deliveries stamp the CURRENT process's pid
+    // (the test process or the held CLI child) — never a watcher — so only
+    // isOwnedWatcherPid cmdlines qualify, plus empty-cmdline zombies.
+    const recordsDir = path.join(stateDir, "records");
+    try {
+      for (const entry of fs.readdirSync(recordsDir)) {
+        if (!entry.endsWith(".json")) continue;
+        const rec = readJson(path.join(recordsDir, entry));
+        if (!rec || !Number.isInteger(rec.pid) || rec.pid <= 0 || rec.pid === 99999999) continue;
+        if (isOwnedWatcherPid(rec.pid)) {
+          pids.add(rec.pid);
+        } else if (pidCmdline(rec.pid) === "") {
+          const state = pidState(rec.pid);
+          if (state === "Z" || state === "X") pids.add(rec.pid);
+        }
+      }
+    } catch { /* records dir absent */ }
+    return [...pids];
+  }
+
+  async function waitPidReaped(pid, timeoutMs) {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      if (pidState(pid) === null) return true;
+      await new Promise((r) => setTimeout(r, 25));
+    }
+    return false;
+  }
+
+  /**
+   * SIGTERM -> SIGKILL every owned watcher/mock and wait until each is fully
+   * reaped (gone from /proc — a zombie still counts against pids.max and
+   * would survive the release of its parent).  The parents (the held CLI
+   * subprocess or this test process) are alive throughout, so libuv reaps the
+   * killed children; nothing is left for the non-reaping PID1.
+   */
+  async function terminateOwnedPids() {
+    const pids = collectOwnedPids();
+    for (const pid of pids) {
+      if (!isOwnedWatcherPid(pid)) continue;
+      try { process.kill(-pid, "SIGTERM"); } catch { /* best-effort */ }
+      try { process.kill(pid, "SIGTERM"); } catch { /* best-effort */ }
+    }
+    for (const pid of pids) {
+      if (pidState(pid) !== null) await waitPidReaped(pid, 1500);
+    }
+    for (const pid of pids) {
+      if (!isOwnedWatcherPid(pid)) continue;
+      try { process.kill(-pid, "SIGKILL"); } catch { /* best-effort */ }
+      try { process.kill(pid, "SIGKILL"); } catch { /* best-effort */ }
+    }
+    for (const pid of pids) {
+      if (pidState(pid) !== null) await waitPidReaped(pid, 1500);
+    }
+  }
+
+  /**
+   * Spawn the register-watch CLI as a subprocess held alive by the
+   * NODE_OPTIONS hook: the sweep/launch inside it spawns detached watchers
+   * that remain children of a live reaping process.  Returns { child,
+   * doneFile, stdout(), stderr() }; release with releaseCli().
+   */
+  function spawnCliHeld(args, envExtra = {}) {
+    const doneFile = path.join(tmpRoot, `cli-hold-${cliHoldCounter++}.done`);
+    const cliEnv = {
+      ...taskEnv(),
+      ...envExtra,
+      TEST_CLI_HOLD: "1",
+      TEST_CLI_HOLD_DONE: doneFile,
+      TEST_CLI_HOLD_MAX_MS: "60000",
+      NODE_OPTIONS: `${process.env.NODE_OPTIONS ? `${process.env.NODE_OPTIONS} ` : ""}--require ${cliHoldHookPath}`,
+    };
+    let stdout = "";
+    let stderr = "";
+    const child = spawn(process.execPath, [REGISTER_SCRIPT, ...args], {
+      env: cliEnv,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    child.stdout.on("data", (chunk) => { stdout += chunk.toString(); });
+    child.stderr.on("data", (chunk) => { stderr += chunk.toString(); });
+    const cli = { child, doneFile, stdout: () => stdout, stderr: () => stderr };
+    heldCli = cli;
+    return cli;
+  }
+
+  function waitChildExit(child, timeoutMs) {
+    if (child.exitCode !== null || child.signalCode !== null) {
+      return Promise.resolve({ code: child.exitCode, signal: child.signalCode });
+    }
+    return new Promise((resolve) => {
+      const timer = setTimeout(() => {
+        try { child.kill("SIGKILL"); } catch { /* best-effort */ }
+      }, timeoutMs);
+      child.once("exit", (code, signal) => {
+        clearTimeout(timer);
+        resolve({ code, signal });
+      });
+    });
+  }
+
+  /** Write the done file so the held CLI subprocess's keepalive clears, then wait for its exit. */
+  async function releaseCli(cli) {
+    if (heldCli === cli) heldCli = null;
+    try { fs.writeFileSync(cli.doneFile, "done"); } catch { /* already released */ }
+    return waitChildExit(cli.child, 5000);
+  }
+
+  /**
+   * Settle on delivered records, failing fast (with the record JSON and the
+   * queue stand-in's stderr) as soon as any record reaches terminal
+   * queue_failed — instead of polling the full generic deadline.  Under
+   * full-suite load the codex stand-in's spawn can itself fail (fork EAGAIN),
+   * which lands the record in queue_failed; that must surface immediately
+   * with the queue diagnostics rather than as a 15s silent poll.
+   */
+  async function settleDelivered(recordPaths, { timeoutMs = 15000 } = {}) {
+    const paths = Array.isArray(recordPaths) ? recordPaths : [recordPaths];
+    const start = Date.now();
+    let lastSnap = "";
+    while (Date.now() - start < timeoutMs) {
+      const records = paths.map((p) => readJson(p));
+      lastSnap = records.map((r, i) => `${paths[i]}: ${JSON.stringify(r)}`).join("\n");
+      if (records.every((r) => r && r.status === "delivered")) return records;
+      const failed = records.filter((r) => r && r.status === "queue_failed");
+      if (failed.length > 0) {
+        const detail = failed
+          .map((r) => {
+            const queue = r.queue
+              ? `queue stderr: ${r.queue.stderr ?? "(none)"} queue stdout: ${r.queue.stdout ?? "(none)"} exit=${r.queue.exitCode}`
+              : "no queue detail";
+            const error = r.error ? `error: ${r.error.message ?? JSON.stringify(r.error)}` : "no record error";
+            return `record=${JSON.stringify(r)}\n  ${error}\n  ${queue}`;
+          })
+          .join("\n\n");
+        throw new Error(`delivery reached terminal queue_failed instead of delivered:\n${detail}`);
+      }
+      await new Promise((r) => setTimeout(r, 50));
+    }
+    throw new Error(`timed out after ${timeoutMs}ms waiting for delivered records:\n${lastSnap}`);
+  }
+
+  it("signal-killed task-wait persists a resumable wait_interrupted record; a later sweep resumes it to exactly one delivery", async () => {
+    const jobId = "job-signal-interrupted";
+    const threadId = "thread-signal";
+    setupMockJobFiles(jobId, { status: "running", phase: "implement" });
+
+    const first = await watchTask({
+      jobId,
+      threadId,
+      cwd: workspaceDir,
+      stateDir,
+      companionBin: mockCompanionScript,
+      codexBin: mockCodexScript,
+      env: taskEnv({ TEST_COMPANION_SIGNAL_SELF: "SIGTERM" }),
+    });
+
+    assert.equal(first.outcome, OUTCOME_WAIT_INTERRUPTED);
+    assert.equal(first.record.status, "wait_interrupted");
+    assert.equal(first.record.retryable, true);
+    assert.notEqual(first.record.status, "task_wait_failed", "a signal interruption is not a terminal wait failure");
+    assert.equal(getQueueInvocations().length, 0);
+
+    // Flip the job terminal: the sweep must resume the interrupted wait.
+    setupMockJobFiles(jobId, { status: "completed", phase: "implement" });
+    const resume = await resumePendingWatches({
+      stateDir,
+      companionBin: mockCompanionScript,
+      codexBin: mockCodexScript,
+      sync: true,
+      env: taskEnv(),
+    });
+    assert.equal(resume.resumed, 1);
+    assert.deepEqual(resume.subjects, [{ kind: "task", id: jobId }]);
+
+    const rec = readJson(getRecordPath(stateDir, { kind: "task", id: jobId }));
+    assert.equal(rec.status, "delivered");
+    assert.equal(rec.outcome, OUTCOME_DELIVERED);
+    assert.ok(rec.terminalObservedAt, "terminal observation timestamp must persist");
+    assert.ok(rec.attemptedAt, "delivery attempt timestamp must persist");
+    assert.ok(rec.deliveredAt, "delivery timestamp must persist");
+    assert.equal(getQueueInvocations().length, 1, "exactly one queue call after resume");
+  });
+
+  it("signal-killed chain-wait persists a resumable wait_interrupted record; a later sweep resumes it to exactly one delivery", async () => {
+    const chainId = "chain-signal-interrupted";
+    const threadId = "thread-signal-chain";
+    setupMockChainFiles(chainId, { status: "completed" });
+
+    const first = await watchChain({
+      chainId,
+      threadId,
+      cwd: workspaceDir,
+      stateDir,
+      companionBin: mockCompanionScript,
+      codexBin: mockCodexScript,
+      env: taskEnv({ TEST_COMPANION_SIGNAL_SELF: "SIGTERM" }),
+    });
+
+    assert.equal(first.outcome, OUTCOME_WAIT_INTERRUPTED);
+    assert.equal(first.record.status, "wait_interrupted");
+    assert.equal(getQueueInvocations().length, 0);
+
+    const resume = await resumePendingWatches({
+      stateDir,
+      companionBin: mockCompanionScript,
+      codexBin: mockCodexScript,
+      sync: true,
+      env: taskEnv(),
+    });
+    assert.equal(resume.resumed, 1);
+    assert.deepEqual(resume.chains, [chainId]);
+
+    const rec = readJson(getRecordPath(stateDir, chainId));
+    assert.equal(rec.status, "delivered");
+    assert.equal(getQueueInvocations().length, 1, "exactly one queue call after chain resume");
+  });
+
+  it("a genuine non-signal task-wait failure stays task_wait_failed and is never resumed", async () => {
+    const jobId = "job-genuine-fail";
+    setupMockJobFiles(jobId, { status: "running" });
+
+    const res = await watchTask({
+      jobId,
+      threadId: "thread-genuine",
+      cwd: workspaceDir,
+      stateDir,
+      companionBin: mockCompanionScript,
+      codexBin: mockCodexScript,
+      env: taskEnv({ TEST_COMPANION_FAIL: "1" }),
+    });
+
+    assert.equal(res.outcome, OUTCOME_TASK_WAIT_FAILURE);
+    assert.equal(res.record.status, "task_wait_failed");
+
+    const sweep = await resumePendingWatches({
+      stateDir,
+      companionBin: mockCompanionScript,
+      codexBin: mockCodexScript,
+      sync: true,
+      env: taskEnv(),
+    });
+    assert.equal(sweep.resumed, 0, "a genuine wait failure must never be resumed");
+    assert.equal(getQueueInvocations().length, 0);
+  });
+
+  it("auto-sweep: a later mutating CLI invocation resumes stale waiting and interrupted records, never ambiguous ones", async () => {
+    const staleJob = "job-stale-waiting";
+    const interruptedJob = "job-stale-interrupted";
+    const ambiguousJob = "job-stale-ambiguous";
+    setupMockJobFiles(staleJob, { status: "completed", phase: "implement" });
+    setupMockJobFiles(interruptedJob, { status: "completed", phase: "plan" });
+
+    const staleRecPath = getRecordPath(stateDir, { kind: "task", id: staleJob });
+    writeRecordAtomic(staleRecPath, {
+      subject: { kind: "task", id: staleJob },
+      jobId: staleJob,
+      threadId: "thread-stale",
+      cwd: workspaceDir,
+      status: "waiting",
+      outcome: null,
+      pid: 99999999,
+      startTime: "12345",
+    });
+    const interruptedRecPath = getRecordPath(stateDir, { kind: "task", id: interruptedJob });
+    writeRecordAtomic(interruptedRecPath, {
+      subject: { kind: "task", id: interruptedJob },
+      jobId: interruptedJob,
+      threadId: "thread-interrupted",
+      cwd: workspaceDir,
+      status: "wait_interrupted",
+      outcome: OUTCOME_WAIT_INTERRUPTED,
+      retryable: true,
+      pid: 99999999,
+      startTime: "12345",
+    });
+    const ambiguousRecPath = getRecordPath(stateDir, { kind: "task", id: ambiguousJob });
+    writeRecordAtomic(ambiguousRecPath, {
+      subject: { kind: "task", id: ambiguousJob },
+      jobId: ambiguousJob,
+      threadId: "thread-ambiguous",
+      cwd: workspaceDir,
+      status: "ambiguous",
+      outcome: OUTCOME_AMBIGUOUS_DELIVERY,
+      retryable: false,
+      pid: 99999999,
+      startTime: "12345",
+    });
+
+    const newJob = "job-new-001";
+    setupMockJobFiles(newJob, { status: "completed", phase: "implement" });
+    const newJobRecPath = getRecordPath(stateDir, { kind: "task", id: newJob });
+
+    // The mutating CLI invocation runs in a HELD subprocess: the sweep inside
+    // it spawns detached watchers for the stale/interrupted records, and they
+    // stay children of this live subprocess (reaped on exit — never PID1
+    // orphans).  The primary --sync registration completes synchronously.
+    const cli = spawnCliHeld([
+      "--task", newJob,
+      "--thread", "thread-new",
+      "--cwd", workspaceDir,
+      "--state-dir", stateDir,
+      "--companion-bin", mockCompanionScript,
+      "--codex-bin", mockCodexScript,
+      "--sync",
+    ]);
+    try {
+      // The primary --sync registration completes synchronously...
+      await settleDelivered(newJobRecPath);
+      assert.equal(readJson(newJobRecPath).status, "delivered");
+
+      // ...while the automatic sweep resumed the stale records NON-blockingly
+      // (detached watchers — the sweep never blocks, even under --sync), so
+      // their delivery lands a moment later: settle on it, failing fast if a
+      // resumed delivery reaches terminal queue_failed (the record and the
+      // queue stand-in's stderr are surfaced instead of a generic deadline
+      // poll).
+      await settleDelivered([staleRecPath, interruptedRecPath]);
+
+      // All resumed watchers are done; kill any straggler (idempotent) so the
+      // held CLI subprocess can exit with no orphaned children, then release
+      // it and verify the CLI itself succeeded.
+      await terminateOwnedPids();
+      const exit = await releaseCli(cli);
+      assert.equal(exit.code, 0, `register-watch CLI failed: signal=${exit.signal} ${cli.stderr() || cli.stdout()}`);
+
+      assert.equal(readJson(staleRecPath).status, "delivered", `stale waiting record auto-resumed (record: ${JSON.stringify(readJson(staleRecPath))})`);
+      assert.equal(readJson(interruptedRecPath).status, "delivered", `interrupted record auto-resumed (record: ${JSON.stringify(readJson(interruptedRecPath))})`);
+      assert.equal(
+        readJson(ambiguousRecPath).status,
+        "ambiguous",
+        "fail-closed ambiguous records are never auto-retried"
+      );
+      assert.equal(getQueueInvocations().length, 3, "one queue call per resumed/new subject");
+    } finally {
+      await terminateOwnedPids();
+    }
+  });
+
+  it("automatic sweep never blocks the primary command: a --sync invocation is not held up by a stale still-running subject (kusabi #503 F5)", async () => {
+    const runningJob = "job-slow-running";
+    const newJob = "job-f5-new";
+    setupMockJobFiles(runningJob, { status: "running", phase: "implement" });
+    setupMockJobFiles(newJob, { status: "completed", phase: "implement" });
+
+    // Hard-kill-style stale record whose job is STILL RUNNING: a synchronous
+    // resume would block in task-wait until terminal (mock deadline 30s).
+    const runningRecPath = getRecordPath(stateDir, { kind: "task", id: runningJob });
+    writeRecordAtomic(runningRecPath, {
+      subject: { kind: "task", id: runningJob },
+      jobId: runningJob,
+      threadId: "thread-slow",
+      cwd: workspaceDir,
+      status: "waiting",
+      outcome: null,
+      pid: 99999999,
+      startTime: "12345",
+    });
+
+    const launchedAt = Date.now();
+    // The --sync CLI invocation runs in a HELD subprocess: its automatic
+    // sweep resumes the stale running subject NON-blockingly (a new detached
+    // watcher that stays a child of the held subprocess — never a PID1
+    // orphan), while the primary registration completes synchronously.
+    const cli = spawnCliHeld([
+      "--task", newJob,
+      "--thread", "thread-f5",
+      "--cwd", workspaceDir,
+      "--state-dir", stateDir,
+      "--companion-bin", mockCompanionScript,
+      "--codex-bin", mockCodexScript,
+      "--sync",
+    ]);
+    try {
+      // The primary --sync registration completing is the "invocation
+      // returned" signal: if the sweep had blocked the primary on a
+      // synchronous resume of the still-running subject, the mock task-wait
+      // deadline (30s) would push this far past the 10s bound.
+      await settleDelivered(getRecordPath(stateDir, { kind: "task", id: newJob }));
+      const elapsed = Date.now() - launchedAt;
+      assert.ok(
+        elapsed < 10000,
+        `--sync primary invocation must not block on the stale running subject (took ${elapsed}ms)`
+      );
+      assert.equal(
+        readJson(getRecordPath(stateDir, { kind: "task", id: newJob })).status,
+        "delivered",
+        "the primary registration still completed synchronously"
+      );
+
+      // The stale running subject got a NEW detached watcher (non-blocking
+      // resume): the record is waiting with a live watcher, then delivers once
+      // the job flips terminal.
+      const waitStart = Date.now();
+      while (Date.now() - waitStart < 10000) {
+        const candidate = readJson(runningRecPath);
+        if (candidate?.status === "waiting" && candidate?.pid != null && candidate?.startTime != null) break;
+        await new Promise((r) => setTimeout(r, 50));
+      }
+      const waiting = readJson(runningRecPath);
+      assert.equal(waiting.status, "waiting");
+      assert.ok(waiting.pid, "non-blocking resume spawned a live watcher for the running subject");
+
+      setupMockJobFiles(runningJob, { status: "completed", phase: "implement" });
+      await settleDelivered(runningRecPath);
+      assert.equal(readJson(runningRecPath).status, "delivered");
+      assert.equal(getQueueInvocations().length, 2, "one queue call for new job + one for the resumed running subject");
+
+      await terminateOwnedPids();
+      const exit = await releaseCli(cli);
+      assert.equal(exit.code, 0, `register-watch CLI failed: signal=${exit.signal} ${cli.stderr() || cli.stdout()}`);
+    } finally {
+      await terminateOwnedPids();
+    }
+  });
+
+  it("a failing automatic sweep is observable on stderr with partial counts and never fails the primary operation (kusabi #503 F2)", async () => {
+    const jobA = "job-sweep-a";
+    const jobB = "job-sweep-b";
+    setupMockJobFiles(jobA, { status: "completed", phase: "implement" });
+    setupMockJobFiles(jobB, { status: "completed", phase: "plan" });
+    const recA = getRecordPath(stateDir, { kind: "task", id: jobA });
+    const recB = getRecordPath(stateDir, { kind: "task", id: jobB });
+    for (const [job, recPath] of [[jobA, recA], [jobB, recB]]) {
+      writeRecordAtomic(recPath, {
+        subject: { kind: "task", id: job },
+        jobId: job,
+        threadId: "thread-sweep-fail",
+        cwd: workspaceDir,
+        status: "waiting",
+        outcome: null,
+        pid: 99999999,
+        startTime: "12345",
+      });
+    }
+
+    // Inject one durable-write failure: the first writeFileSync the sweep's
+    // resume performs (jobA's record write) throws, so jobA's resume fails
+    // while jobB's must still succeed — partial counts on stderr.
+    const originalWrite = fs.writeFileSync;
+    let writes = 0;
+    fs.writeFileSync = function injectedWriteFileSync(filePath, ...rest) {
+      writes += 1;
+      if (writes === 1) {
+        const err = new Error("injected EACCES: injected sweep write failure");
+        err.code = "EACCES";
+        throw err;
+      }
+      return originalWrite.call(this, filePath, ...rest);
+    };
+    const stderrChunks = [];
+    const originalStderr = process.stderr.write.bind(process.stderr);
+    process.stderr.write = (chunk) => {
+      stderrChunks.push(String(chunk));
+      return true;
+    };
+
+    let res;
+    try {
+      res = await sweepPendingWatches({
+        stateDir,
+        companionBin: mockCompanionScript,
+        codexBin: mockCodexScript,
+        sync: true,
+        env: taskEnv(),
+      });
+    } finally {
+      fs.writeFileSync = originalWrite;
+      process.stderr.write = originalStderr;
+    }
+
+    // Partial counts: jobA failed, jobB resumed.
+    assert.equal(res.resumed, 1);
+    assert.deepEqual(res.subjects, [{ kind: "task", id: jobB }]);
+    assert.equal(res.errors.length, 1);
+    assert.match(res.errors[0].message, /injected EACCES/);
+
+    // The failure is NOT silent: a concise stderr warning names it and the
+    // partial resumed count, and the caller result carries the error too.
+    const warning = stderrChunks.join("");
+    assert.match(warning, /automatic sweep warning: injected EACCES/);
+    assert.match(warning, /resumed 1 subject\(s\)/);
+
+    assert.equal(readJson(recB).status, "delivered", "jobB resumed despite jobA failing");
+    assert.equal(readJson(recA).status, "waiting", "jobA stays pending for the next sweep");
+  });
+
+  it("a pid-less waiting record (watcher died before startup) is durably resumable (kusabi #503 F1)", async () => {
+    const jobId = "job-pidless";
+    setupMockJobFiles(jobId, { status: "completed", phase: "implement" });
+
+    const recPath = getRecordPath(stateDir, { kind: "task", id: jobId });
+    writeRecordAtomic(recPath, {
+      subject: { kind: "task", id: jobId },
+      jobId,
+      threadId: "thread-pidless",
+      cwd: workspaceDir,
+      status: "waiting",
+      outcome: null,
+      pid: null,
+      startTime: null,
+    });
+
+    const resume = await resumePendingWatches({
+      stateDir,
+      companionBin: mockCompanionScript,
+      codexBin: mockCodexScript,
+      sync: true,
+      env: taskEnv(),
+    });
+    assert.equal(resume.resumed, 1, "a pid-less waiting record is treated as dead and resumed");
+    assert.deepEqual(resume.subjects, [{ kind: "task", id: jobId }]);
+    assert.equal(readJson(recPath).status, "delivered");
+    assert.equal(getQueueInvocations().length, 1);
+  });
+
+  it("launcher returns the pid-less pre-spawn record and never writes after spawn (kusabi #503 F1)", async () => {
+    const jobId = "job-no-postwrite";
+    setupMockJobFiles(jobId, { status: "completed", phase: "implement" });
+
+    const res = await launchTaskAndWatch({
+      companionBin: mockCompanionScript,
+      codexBin: mockCodexScript,
+      args: ["--container", "cid-npw", "--phase", "implement", "--model", "opencode-go/deepseek-v4-flash:max", "--brief-file", "/tmp/b-npw.md"],
+      threadId: "thread-npw",
+      cwd: workspaceDir,
+      stateDir,
+      sync: false,
+      env: taskEnv({ TEST_TASK_SINCE: "2026-09-06T12:00:00.000Z" }),
+    });
+
+    assert.equal(res.success, true);
+    assert.equal(res.jobId, jobId);
+    assert.ok(res.registration, "registration expected");
+    assert.equal(res.registration.outcome, "registered");
+    assert.ok(Number.isInteger(res.registration.pid) && res.registration.pid > 0, "the launcher knows the child pid it spawned");
+    // The detached watcher is this test process's child (reaped on exit); it
+    // is registered so afterEach terminates/waits for it if the test fails
+    // before the watcher finishes.
+    trackOwnedPid(res.registration.pid);
+    assert.equal(res.registration.record.pid, null, "the returned record is the pid-less pre-spawn record");
+    assert.equal(res.registration.record.startTime, null);
+    assert.equal(res.registration.record.status, "waiting");
+
+    // The watcher is the only writer of pid/startTime: settle on delivery and
+    // verify the watcher stamped its own metadata.
+    const recPath = getRecordPath(stateDir, { kind: "task", id: jobId });
+    await settleDelivered(recPath);
+    const record = readJson(recPath);
+    assert.ok(record, "already-terminal launch must settle delivered");
+    assert.equal(record.status, "delivered");
+    assert.ok(record.pid && record.pid > 0, "the watcher stamps its own pid");
+    assert.ok(record.startTime, "the watcher stamps its own startTime");
+    assert.equal(getQueueInvocations().length, 1);
+  });
+
+  it("launch handoff: an already-terminal task settles delivered with one queue call and never regresses", async () => {
+    const jobId = "job-handoff-terminal";
+    const threadId = "thread-handoff";
+    setupMockJobFiles(jobId, { status: "completed", phase: "implement" });
+    const recPath = getRecordPath(stateDir, { kind: "task", id: jobId });
+
+    // The launcher runs in a HELD subprocess: the detached task watcher it
+    // spawns stays its child (reaped on exit — never a PID1 orphan) until the
+    // test releases the subprocess after delivery.
+    const cli = spawnCliHeld([
+      "--launch-task",
+      "--thread", threadId,
+      "--cwd", workspaceDir,
+      "--state-dir", stateDir,
+      "--companion-bin", mockCompanionScript,
+      "--codex-bin", mockCodexScript,
+      "--",
+      "--container", "cid-handoff",
+      "--phase", "implement",
+      "--model", "opencode-go/deepseek-v4-flash:max",
+      "--brief-file", "/tmp/brief-handoff.md",
+    ], { TEST_TASK_SINCE: "2026-09-06T12:00:00.000Z" });
+    try {
+      await settleDelivered(recPath);
+
+      await terminateOwnedPids();
+      const exit = await releaseCli(cli);
+      assert.equal(exit.code, 0, `register-watch CLI failed: signal=${exit.signal} ${cli.stderr() || cli.stdout()}`);
+      assert.match(cli.stdout(), /Detached task launched/);
+
+      const record = readJson(recPath);
+      assert.ok(record, "already-terminal launch must settle delivered");
+      assert.equal(record.status, "delivered");
+      assert.equal(record.outcome, OUTCOME_DELIVERED);
+      assert.ok(record.terminalObservedAt, "terminal observation timestamp must persist");
+      assert.ok(record.attemptedAt, "delivery attempt timestamp must persist");
+      assert.ok(record.deliveredAt, "delivery timestamp must persist");
+
+      // Once delivered the record never regresses: the launcher's post-spawn
+      // pid patch and any later sweep must leave it untouched.
+      for (let i = 0; i < 5; i++) {
+        await new Promise((r) => setTimeout(r, 40));
+        assert.equal(readJson(recPath).status, "delivered", "delivered record must never regress to waiting");
+      }
+
+      const invocations = getQueueInvocations();
+      assert.equal(invocations.length, 1, "exactly one queue stand-in call");
+      assert.deepEqual(invocations[0].argv.slice(0, 3), ["queue", "--thread", threadId]);
+    } finally {
+      await terminateOwnedPids();
+    }
+  });
+
+  it("launch handoff: a recovered no-final-message task settles delivered exactly once", async () => {
+    const jobId = "job-handoff-recovered";
+    const threadId = "thread-handoff-recovered";
+    setupRecoveredJobFiles(jobId, { status: "error", phase: "implement" });
+    const recPath = getRecordPath(stateDir, { kind: "task", id: jobId });
+
+    // The launcher runs in a HELD subprocess (see the handoff-terminal test
+    // above for why): the detached watcher stays its child until released.
+    const cli = spawnCliHeld([
+      "--launch-task",
+      "--thread", threadId,
+      "--cwd", workspaceDir,
+      "--state-dir", stateDir,
+      "--companion-bin", mockCompanionScript,
+      "--codex-bin", mockCodexScript,
+      "--",
+      "--container", "cid-handoff-rec",
+      "--phase", "implement",
+      "--model", "opencode-go/deepseek-v4-flash:max",
+      "--brief-file", "/tmp/brief-handoff-rec.md",
+    ], { TEST_TASK_SINCE: "2026-09-06T12:00:00.000Z" });
+    try {
+      await settleDelivered(recPath);
+
+      await terminateOwnedPids();
+      const exit = await releaseCli(cli);
+      assert.equal(exit.code, 0, `register-watch CLI failed: signal=${exit.signal} ${cli.stderr() || cli.stdout()}`);
+
+      const record = readJson(recPath);
+      assert.ok(record, "recovered launch must settle delivered");
+      assert.equal(record.status, "delivered");
+      assert.match(record.notification.message, /- Result: recovered \(no final message\)/);
+      assert.match(record.notification.message, /- Class: failed/);
+      assert.equal(getQueueInvocations().length, 1, "exactly one queue call");
+    } finally {
+      await terminateOwnedPids();
+    }
+  });
+
+  it("--list: surfaces durable diagnostics and distinguishes delivered, retry-pending, interrupted and ambiguous records", async () => {
+    writeRecordAtomic(getRecordPath(stateDir, { kind: "task", id: "job-list-delivered" }), {
+      subject: { kind: "task", id: "job-list-delivered" },
+      jobId: "job-list-delivered",
+      status: "delivered",
+      outcome: OUTCOME_DELIVERED,
+      terminalObservedAt: "2026-09-13T00:00:01.000Z",
+      attemptedAt: "2026-09-13T00:00:02.000Z",
+      deliveredAt: "2026-09-13T00:00:03.000Z",
+      updatedAt: "2026-09-13T00:00:03.000Z",
+      retryable: false,
+    });
+    writeRecordAtomic(getRecordPath(stateDir, { kind: "task", id: "job-list-retry" }), {
+      subject: { kind: "task", id: "job-list-retry" },
+      jobId: "job-list-retry",
+      status: "queue_failed",
+      outcome: OUTCOME_QUEUE_FAILURE,
+      retryable: true,
+      attempts: 1,
+      updatedAt: "2026-09-13T00:00:04.000Z",
+    });
+    writeRecordAtomic(getRecordPath(stateDir, { kind: "task", id: "job-list-amb" }), {
+      subject: { kind: "task", id: "job-list-amb" },
+      jobId: "job-list-amb",
+      status: "ambiguous",
+      outcome: OUTCOME_AMBIGUOUS_DELIVERY,
+      retryable: false,
+      updatedAt: "2026-09-13T00:00:05.000Z",
+    });
+    writeRecordAtomic(getRecordPath(stateDir, { kind: "task", id: "job-list-interrupted" }), {
+      subject: { kind: "task", id: "job-list-interrupted" },
+      jobId: "job-list-interrupted",
+      status: "wait_interrupted",
+      outcome: OUTCOME_WAIT_INTERRUPTED,
+      retryable: true,
+      updatedAt: "2026-09-13T00:00:06.000Z",
+    });
+    // Waiting records: a dead watcher and a pid-less record are retry-pending
+    // duties; only a live watcher shows retryPending=false (covered by the
+    // live-watcher --list test below).
+    writeRecordAtomic(getRecordPath(stateDir, { kind: "task", id: "job-list-dead" }), {
+      subject: { kind: "task", id: "job-list-dead" },
+      jobId: "job-list-dead",
+      status: "waiting",
+      outcome: null,
+      pid: 99999999,
+      startTime: "12345",
+      updatedAt: "2026-09-13T00:00:07.000Z",
+    });
+    writeRecordAtomic(getRecordPath(stateDir, { kind: "task", id: "job-list-pidless" }), {
+      subject: { kind: "task", id: "job-list-pidless" },
+      jobId: "job-list-pidless",
+      status: "waiting",
+      outcome: null,
+      pid: null,
+      startTime: null,
+      updatedAt: "2026-09-13T00:00:08.000Z",
+    });
+
+    const proc = spawnSync(process.execPath, [
+      REGISTER_SCRIPT,
+      "--list",
+      "--state-dir", stateDir,
+    ], {
+      env: taskEnv(),
+      encoding: "utf8",
+    });
+    assert.equal(proc.status, 0, proc.stderr);
+    const out = proc.stdout;
+
+    assert.match(out, /job-list-delivered: status=delivered outcome=delivered .*terminalObserved=2026-09-13T00:00:01\.000Z .*attempted=2026-09-13T00:00:02\.000Z .*delivered=2026-09-13T00:00:03\.000Z .*retryPending=false/);
+    assert.match(out, /job-list-retry: status=queue_failed .*retryPending=true/);
+    assert.match(out, /job-list-amb: status=ambiguous .*retryPending=false .*ambiguous=true/);
+    assert.match(out, /job-list-interrupted: status=wait_interrupted .*running=false .*retryPending=true/);
+    assert.match(out, /job-list-dead: status=waiting .*running=false .*retryPending=true/);
+    assert.match(out, /job-list-pidless: status=waiting .*running=false .*retryPending=true/);
+  });
+
+  it("--list: a live waiting watcher is distinguishable as running=true, retryPending=false (kusabi #503 F6)", async () => {
+    const jobId = "job-list-live";
+    const threadId = "thread-list-live";
+    setupMockJobFiles(jobId, { status: "running", phase: "implement" });
+
+    // Spawn a real detached watcher on a still-running job; it stays alive
+    // and blocks in task-wait until the job flips terminal.  The watcher is
+    // this test process's child (reaped on exit) and is registered so
+    // afterEach terminates/waits for it if the test fails before the flip.
+    const reg = await registerTaskWatch({
+      jobId,
+      threadId,
+      cwd: workspaceDir,
+      stateDir,
+      companionBin: mockCompanionScript,
+      codexBin: mockCodexScript,
+      env: taskEnv(),
+    });
+    trackOwnedPid(reg.pid);
+
+    const recPath = getRecordPath(stateDir, { kind: "task", id: jobId });
+    const start = Date.now();
+    while (Date.now() - start < 10000) {
+      const candidate = readJson(recPath);
+      if (candidate?.status === "waiting" && candidate?.pid != null && candidate?.startTime != null) break;
+      await new Promise((r) => setTimeout(r, 50));
+    }
+    const waiting = readJson(recPath);
+    assert.equal(waiting.status, "waiting");
+    assert.ok(waiting.pid, "the watcher owns pid metadata");
+
+    const proc = spawnSync(process.execPath, [
+      REGISTER_SCRIPT,
+      "--list",
+      "--state-dir", stateDir,
+    ], {
+      env: taskEnv(),
+      encoding: "utf8",
+    });
+    assert.equal(proc.status, 0, proc.stderr);
+    assert.match(
+      proc.stdout,
+      /job-list-live: status=waiting .*running=true .*retryPending=false/,
+      "a healthy live waiting watcher must not read as retry pending"
+    );
+
+    // Flip the job terminal so the detached watcher delivers and exits (no
+    // lingering process): exactly one queue call for it.
+    setupMockJobFiles(jobId, { status: "completed", phase: "implement" });
+    await settleDelivered(recPath);
+    assert.equal(readJson(recPath).status, "delivered");
+    assert.equal(getQueueInvocations().length, 1);
   });
 });

@@ -15,7 +15,7 @@ When running detached kusabi chains or tasks, the orchestrating Codex thread wou
 5. **Distinguishes** the four task terminal classes in the notification: `completed`, `failed` (provider-error/error), `stalled` (timeout/stalled/serve-dead), and `cancelled`, and names the exact recovery commands (`kusabi-companion result <jobId>` / `status <jobId>`). A `task-wait` infrastructure failure is a separate watcher failure and never queues.
 6. **Enforces at-most-once delivery** using an atomic, mutually exclusive two-phase claim (`claims/<kind>-<id>.claim`) with bounded retries on definitive failure. Chain and task registrations never collide: every record and claim persists an explicit `subject: { kind: "chain"|"task", id }`.
 7. **Queues** exactly one terminal notification into the originating Codex thread via `codex queue --thread <threadId> --message <summary>`.
-8. **Persists** durable outcome, diagnostic metadata, and recovery state.
+8. **Persists** durable outcome, diagnostic metadata (terminal-observed / attempt / delivery timestamps), and recovery state. A signal-interrupted `task-wait` / `chain-wait` persists a distinct **resumable** `wait_interrupted` record — never a terminal `*_wait_failed` — which a later mutating invocation auto-sweeps (see [Restart & Resume Trigger](#restart--resume-trigger-no-polling)).
 
 ## Installation & Manifest Specification
 
@@ -130,13 +130,85 @@ Record and claim keys are namespaced by the **explicit subject kind** — never 
 Delivery rights are strictly coordinated through a state machine with atomic directory locks:
 
 - **`preparing`**: Claim acquired by an active watcher. The process is reading control/inbox state and formatting the notification. If the process dies or crashes here, **no external process was spawned**. This state is safe to recover and will be resumed by restart recovery.
-- **`queue_inflight`**: Transitioned immediately before spawning `codex queue`. Because process spawning and durable disk state cannot be made atomic without external transaction coordinators, marking in-flight before spawn provides a fail-closed boundary: if a crash or kill occurs while in-flight, the state is recorded as `ambiguous` and **is never automatically retried**, guaranteeing at-most-once notification delivery.
+- **`queue_inflight`**: Transitioned immediately before spawning `codex queue`. Because process spawning and durable disk state cannot be made atomic without external transaction coordinators, marking in-flight before spawn provides a fail-closed boundary: if a crash or kill occurs while in-flight, the state is recorded as `ambiguous` and **is never automatically retried**, preventing a duplicate `codex queue` invocation. This is duplicate prevention, not an exactly-once guarantee — the external queue is non-idempotent, so the ambiguous record names the boundary and manual verification is the resolution path (see [Fail-Closed In-Flight Boundary](#fail-closed-in-flight-boundary)).
 - **`delivered`**: Terminal delivery confirmed via exit code 0 from `codex queue`. Subsequent registrations return `already delivered` without calling `codex queue` again.
 - **`failed_retryable`**: Definitive queue failure occurred before delivery (e.g. non-zero exit code). Concurrent retry reclamation is mutually exclusive via `acquireClaimLock`. Retryable up to `MAX_DELIVERY_ATTEMPTS = 3`.
 - **`failed_terminal`**: Terminal failure reached after exhausting max delivery attempts or destination thread closed/unavailable.
 - **`ambiguous`**: In-flight queue command was interrupted or terminated unconfirmed. Recorded distinctly and never automatically retried.
 
 A task queue failure preserves the durable job record (the notifier is read-only over the kusabi job store — job.json / result.md / events.ndjson are never touched), so `kusabi-companion result <jobId>` stays available and the claim remains retryable under the same bounded protocol.
+
+### Restart & Resume Trigger (no polling)
+
+Terminal notification duties are durable: a watcher that is interrupted or
+killed mid-lifecycle leaves a resumable record. Recovery has exactly two
+triggers, **neither of which is a polling loop, timer, cron, or supervisor**:
+
+- **Explicit resume**: `register-watch.mjs --resume-all` re-registers every
+  pending record (`waiting` / `pending` / `wait_interrupted` / retryable
+  `queue_failed`) whose watcher is dead or absent.
+- **Automatic bounded sweep**: every *mutating* invocation
+  (`--launch-task`, `--launch`, `--task`, `--chain`, and the hook entrypoint)
+  first runs the same resume pass over persisted records. Read-only `--list`
+  never sweeps. The sweep is lazy and bounded — only records whose watcher is
+  dead/absent are resumed, live subjects are never touched, and no watcher
+  ever triggers the sweep, so there is no recursion and nothing runs in the
+  background between invocations.
+
+  The automatic sweep always resumes non-blockingly (detached watchers), even
+  when the primary command uses `--sync` — it must never hold up the primary
+  invocation on a stale still-running subject. Explicit `--resume-all --sync`
+  remains the synchronous debugging path. If part of the sweep fails, a
+  concise warning with the failure and the partial resumed count is written
+  to stderr (`register-watch: automatic sweep warning: ...`); the primary
+  command continues, and the remaining duties are retried by the next
+  mutating invocation or by `--resume-all`.
+
+A blocking `task-wait` / `chain-wait` interrupted by a signal
+(SIGTERM/SIGINT/SIGHUP, or the wait child itself being killed) is recorded as
+`status: "wait_interrupted"` / `outcome: "wait interrupted (resumable)"` — a
+resumable state, never a terminal `*_wait_failed`. A genuine non-signal wait
+failure (non-zero exit, no signal) remains `chain_wait_failed` /
+`task_wait_failed` and is never resumed. On the next mutating invocation the
+sweep re-runs the wait; the terminal observation then flows through the
+normal claim/queue path with one queue call per subject.
+
+The launcher writes the record exactly once, before spawning the detached
+watcher, and never touches it again: pid/startTime metadata belongs to the
+watcher alone. There is therefore **no post-spawn launcher write at all**, so
+a fast watcher's terminal record can never be regressed by stale initial
+`waiting` state — the guarantee is structural rather than a read-then-write
+patch. If the watcher dies before its first record write, the pre-spawn
+pid-less `waiting` record stays durably resumable: resume treats a pid-less
+record as dead and re-registers.
+
+### Diagnostics & `--list`
+
+Records persist timestamps that distinguish each lifecycle phase:
+
+- `terminalObservedAt` — the blocking wait returned a terminal status
+  (recorded **before** any claim acquisition or queue call).
+- `attemptedAt` — `codex queue` was about to be spawned (recorded before the
+  spawn, so a kill mid-queue leaves this on disk).
+- `deliveredAt` — `codex queue` exited 0.
+- status/`retryable` — `queue_failed` with `retryable: true`, or
+  `wait_interrupted`, means delivery retry is pending; `ambiguous` means the
+  in-flight boundary was hit and delivery is never auto-retried.
+
+`--list` renders one line per record with these diagnostics:
+
+```text
+task job-x: status=delivered outcome=delivered terminalObserved=2026-09-13T12:00:01.000Z attempted=2026-09-13T12:00:02.000Z delivered=2026-09-13T12:00:03.000Z retryPending=false
+task job-y: status=waiting outcome=pending retryPending=false running=true
+task job-z: status=wait_interrupted outcome="wait interrupted (resumable)" retryPending=true running=false
+task job-w: status=ambiguous outcome="ambiguous queue delivery" retryPending=false ambiguous=true
+```
+
+`retryPending` is **false while a healthy watcher is actively waiting** — a
+live subject is not a pending duty. A waiting record whose watcher is dead or
+absent (`running=false`, including a pid-less record left by a watcher that
+died before startup) shows `retryPending=true` and is exactly what the next
+mutating invocation will sweep.
 
 ### Diagnostic Classification
 
@@ -155,7 +227,7 @@ Process verification distinguishes process existence from verified identity:
   - Its `preparing` claim will **never be reclaimed** by a competing watcher.
   - A duplicate `codex queue` invocation is strictly prevented.
 - **Dead Processes**: `kill(pid, 0)` failure (or zombie status in procfs) confirms the owner has terminated. Genuinely dead `preparing` owners and stale locks remain safely recoverable.
-- **Fail-Closed In-Flight Boundary**: If a claim is in `queue_inflight` and the owner process is dead or has unverified/unknown identity, the claim is permanently marked `ambiguous` and is **never automatically retried**, ensuring strict at-most-once notification guarantees.
+- **Fail-Closed In-Flight Boundary**: If a claim is in `queue_inflight` and the owner process is dead or has unverified/unknown identity, the claim is permanently marked `ambiguous` and is **never automatically retried**. This preserves the existing duplicate prevention — no second `codex queue` invocation is ever made for a subject whose delivery outcome is unknown. It is **not** a claim of exactly-once delivery: `codex queue` is a non-idempotent external call, so a kill between the queue process spawn and its exit can in principle have delivered the message. The ambiguous record names the boundary explicitly (`ambiguous=true` in `--list`); manual verification (thread inspection / `codex queue`) is the resolution path.
 
 ### Child Lifecycle & Process Groups
 
