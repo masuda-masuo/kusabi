@@ -253,6 +253,43 @@ export async function cmdChain(cwd, { flags, text }) {
   const container = flags.container;
   if (!container) throw new Error("chain requires --container <cid>");
 
+  // ---- incremental-tdd strategy (kusabi #502) ----
+  // When --strategy incremental-tdd is passed with --requirements-file,
+  // parse the requirements, build a slice plan, and persist TDD state.
+  // The ordinary chain loop is NOT used; instead the caller must use the
+  // tdd-chain executor (chain-resume-aware) which owns sequential slices.
+  const strategy = flags.strategy || null;
+  if (strategy && strategy !== "incremental-tdd") {
+    throw new Error(`unknown strategy: ${strategy}. Supported: incremental-tdd`);
+  }
+  let tddChainState = null;
+  if (strategy === "incremental-tdd") {
+    const reqFile = flags["requirements-file"];
+    if (!reqFile) {
+      throw new Error("--strategy incremental-tdd requires --requirements-file <path>");
+    }
+    const reqPath = path.isAbsolute(reqFile) ? reqFile : path.resolve(cwd, reqFile);
+    if (!fs.existsSync(reqPath)) {
+      throw new Error(`requirements file not found: ${reqPath}`);
+    }
+    const reqText = fs.readFileSync(reqPath, "utf8");
+    const { parseRequirements, buildSlicePlan, createTddChainState } = await import("./tdd-chain.mjs");
+    const requirements = parseRequirements(reqText);
+    if (requirements.length === 0) {
+      throw new Error(`no requirements found in ${reqPath}`);
+    }
+    const planResult = buildSlicePlan(requirements);
+    if (!planResult.ok) {
+      throw new Error(`failed to build slice plan: ${planResult.error}`);
+    }
+    tddChainState = createTddChainState({
+      chainId: "placeholder",
+      requirementsFile: reqPath,
+      plan: planResult.plan,
+    });
+    process.stdout.write(`incremental-tdd: ${requirements.length} requirements, ${planResult.plan.length} slices\n`);
+  }
+
   // ---- dispatch-time brief lint (kusabi #289) ----
   // A chain being started is an implement dispatch, so it carries the
   // implement requirements: `## Deliverables` (the probe reads it every
@@ -290,6 +327,13 @@ export async function cmdChain(cwd, { flags, text }) {
     container,
     pid: process.pid,
   }));
+
+  // ---- persist TDD chain state (kusabi #502) ----
+  if (tddChainState) {
+    const { persistTddState } = await import("./tdd-chain.mjs");
+    tddChainState.chainId = chainId;
+    persistTddState(chainDir, tddChainState);
+  }
 
   // ---- SIGTERM/SIGINT handler feeds the same predicate as the file-based stop ----
   let signalReceived = false;
@@ -376,6 +420,8 @@ export async function cmdChain(cwd, { flags, text }) {
       signalReceived: () => signalReceived,
       keepServe: !!flags.keepServe,
       resume: null,
+      strategy: flags.strategy || null,
+      requirementsFile: tddChainState?.requirementsFile ?? null,
     });
   } finally {
     process.removeListener("SIGTERM", onSignal);
@@ -678,6 +724,8 @@ export async function cmdChainResume(cwd, { flags, text }) {
       signalReceived: () => signalReceived,
       keepServe: !!flags.keepServe,
       resume: position,
+      strategy: chainJson.strategy ?? null,
+      requirementsFile: chainJson.requirementsFile ?? null,
     });
   } finally {
     process.removeListener("SIGTERM", onSignal);

@@ -51,6 +51,7 @@ import {
   publishWarningForBrief,
   smokeViolationReport,
 } from "./chain-brief-guards.mjs";
+import { loadTddState } from "./tdd-chain.mjs";
 
 import {
   readBriefFile,
@@ -304,7 +305,21 @@ export function cmdChainShow(cwd, { text }) {
   } catch {
     unfilled = 0;
   }
-  return renderChainShow(chainJson, rounds, unreadable, chainControlEarly, { unfilledCount: unfilled });
+
+  // ---- load TDD chain state (kusabi #502) ----
+  let tddState = null;
+  if (chainJson?.strategy === "incremental-tdd") {
+    try {
+      tddState = loadTddState(chainDir);
+    } catch {
+      tddState = null;
+    }
+  }
+
+  return renderChainShow(chainJson, rounds, unreadable, chainControlEarly, {
+    unfilledCount: unfilled,
+    tddState,
+  });
 }
 
 // ---------------------------------------------------------------------------

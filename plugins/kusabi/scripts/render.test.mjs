@@ -2623,3 +2623,77 @@ describe("renderBaseFacts and renderContainerReviewInput with changeScope (kusab
     assert.ok(out.includes("`base` set to `base-sha-1234567890`"));
   });
 });
+
+
+// ---------------------------------------------------------------------------
+// renderChainShow — TDD state (kusabi #502)
+// ---------------------------------------------------------------------------
+
+describe("renderChainShow TDD state", () => {
+  it("renders TDD strategy info when tddState is provided", () => {
+    const chain = { chainId: "chain-tdd", strategy: "incremental-tdd", requirementsFile: "reqs.md" };
+    const tddState = {
+      strategy: "incremental-tdd",
+      requirementsFile: "reqs.md",
+      plan: [
+        { id: "slice-0", index: 0, reqIds: ["r0"], title: "Auth", status: "green", frozenTests: ["t1"], retryCount: 0, retryReason: null, lastError: null },
+        { id: "slice-1", index: 1, reqIds: ["r1"], title: "Export", status: "pending", frozenTests: [], retryCount: 0, retryReason: null, lastError: null },
+      ],
+      currentSliceIndex: 1,
+      completedReqIds: ["r0"],
+      accumulatedFrozenTests: ["t1"],
+      status: "running",
+      retryInfo: { attempts: 0, reason: null, exhausted: false },
+      failureReason: null,
+    };
+    const result = renderChainShow(chain, [], [], null, { tddState });
+    assert.match(result, /tdd slice: 1\/2/);
+    assert.match(result, /tdd requirement coverage: 1\/2/);
+    assert.match(result, /tdd frozen tests: 1/);
+    assert.match(result, /✓ slice-0: Auth.*\[r0\]/);
+    assert.match(result, /○ slice-1: Export.*\[r1\]/);
+  });
+
+  it("renders retry info when present", () => {
+    const chain = { chainId: "chain-tdd-retry", strategy: "incremental-tdd" };
+    const tddState = {
+      strategy: "incremental-tdd",
+      plan: [
+        { id: "slice-0", index: 0, reqIds: ["r0"], title: "A", status: "pending", frozenTests: [], retryCount: 2, retryReason: "implement failed", lastError: "implement failed" },
+      ],
+      currentSliceIndex: 0,
+      completedReqIds: [],
+      accumulatedFrozenTests: [],
+      status: "running",
+      retryInfo: { attempts: 2, reason: "implement failed", exhausted: false },
+      failureReason: null,
+    };
+    const result = renderChainShow(chain, [], [], null, { tddState });
+    assert.match(result, /tdd retry: attempt 2.*implement failed/);
+    assert.match(result, /\(retry 2\/3\)/);
+  });
+
+  it("renders failure reason when chain is failed", () => {
+    const chain = { chainId: "chain-tdd-fail", strategy: "incremental-tdd" };
+    const tddState = {
+      strategy: "incremental-tdd",
+      plan: [
+        { id: "slice-0", index: 0, reqIds: ["r0"], title: "A", status: "failed", frozenTests: [], retryCount: 3, retryReason: "exhausted", lastError: "exhausted" },
+      ],
+      currentSliceIndex: 0,
+      completedReqIds: [],
+      accumulatedFrozenTests: [],
+      status: "failed",
+      retryInfo: { attempts: 3, reason: "exhausted", exhausted: true },
+      failureReason: "slice slice-0 exhausted retries",
+    };
+    const result = renderChainShow(chain, [], [], null, { tddState });
+    assert.match(result, /tdd failure: slice slice-0 exhausted retries/);
+  });
+
+  it("does not render TDD info when tddState is absent", () => {
+    const chain = { chainId: "chain-normal" };
+    const result = renderChainShow(chain, [], [], null, {});
+    assert.doesNotMatch(result, /tdd slice/);
+  });
+});

@@ -65,6 +65,42 @@ rounds are always carried forward.
 
 Launched in foreground with `chain --container <cid> --model <m> [--max-rounds N] "<brief>"` or in background with `chain-detach --container <cid> --model <m> [--max-rounds N] "<brief>"`. Implementation is `cmdChain` in `plugins/kusabi/scripts/chain-cmd.mjs` and `cmdChainDetach` in `plugins/kusabi/scripts/chain-ops.mjs`.
 
+#### 3.5.0 Incremental TDD strategy (kusabi #502)
+
+An opt-in strategy that accepts a Markdown requirements file and owns bounded decomposition plus sequential red/green slices. Usage:
+
+```bash
+chain --container <cid> --strategy incremental-tdd --requirements-file requirements.md "<brief>"
+```
+
+The strategy parses the requirements file into stable requirement IDs (deterministic short hashes), builds a bounded ordered slice plan (one slice per requirement, max 24 slices), and persists the plan as `tdd-chain.json` alongside the chain state.
+
+Each slice runs sequentially in one container/worktree:
+1. Test-author: write minimal tests for the requirement
+2. Prove red: verify the new test fails for the intended reason
+3. Freeze: record accepted test paths in accumulated frozen list
+4. Implement: write implementation code
+5. Prove green: verify all tests pass (including accumulated frozen)
+6. Advance: move to next slice
+
+State persisted at phase boundaries: current slice index, completed requirement IDs, accumulated frozen test paths, retry history. Resume is safe from any phase boundary.
+
+Completed workers with no deliverable changes are treated as failed attempts (not progress). Bounded retry (3 attempts per slice) with configured alternate route; exhaustion escalates with precise reason.
+
+Final review receives requirement-to-test coverage report and full verification evidence. `chain-show` displays strategy, slice progress, coverage, and retry reason/route.
+
+Backward compatibility: ordinary chain invocations (no `--strategy` flag) are unchanged.
+
+**Chain driver integration**: When `strategy === "incremental-tdd"`, `runChainDriver` loads the persisted `tdd-chain.json` state, validates it (rejecting completed or exhausted chains; requiring retry-transition for failed-but-retryable states), and enters the `runTddExecutor` loop instead of the normal round loop. The executor iterates slices sequentially:
+
+- **Test-author phase**: `generateTestAuthorBrief` produces a slice-specific brief that instructs the worker to write failing tests. The brief includes all accumulated frozen tests from previous slices as context. `runImplementPhase` dispatches the worker, `runProbePhase` checks worktree changes, and `extractTestPaths` captures new `.test.mjs`/`.spec.mjs` files. `markRed` → `freezeTests` transitions are persisted immediately.
+- **Implement phase**: `generateImplementBrief` produces a brief that instructs the worker to implement the requirement so all tests pass. It includes all accumulated frozen tests as mandatory-pass constraints. `runImplementPhase` + `runProbePhase` are called again. `isSliceGreen` checks completion + probes-green + worktree-changed.
+- **Advance**: `advanceSlice` marks the current slice green, appends its frozen tests to the accumulated list, resets retry info, and moves to the next slice.
+- **Failure/retry**: `markSliceFailed` increments retry count; `markEmptyDiff` treats completed-but-empty workers as failed attempts. Retries reset the slice to `pending`; exhaustion sets the chain to `failed` and terminates.
+- **State persistence**: `persistTddState` writes `tdd-chain.json` after every transition boundary (red/frozen/green/advance/failure/retry). Resume is safe from any durable phase boundary.
+
+**chain-show rendering**: When a TDD state is present, `renderChainShow` displays: strategy, current/total slice, requirement coverage, per-slice status icons (✓ green, ● red, ❄ frozen, ○ pending, ✗ failed), frozen test counts, retry reason/route, and failure reason.
+
 #### 3.5.1 Round structure
 
 Each round r (1..maxRounds, default 4) flows as follows:
