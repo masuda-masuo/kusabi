@@ -5,6 +5,11 @@ import path from "node:path";
 import fs from "node:fs";
 import crypto from "node:crypto";
 import { spawn, spawnSync } from "node:child_process";
+import {
+  waitForTask,
+  TaskWaitError,
+  readTaskSnapshot,
+} from "./task-wait.mjs";
 
 const COMPANION_SCRIPT = path.join(import.meta.dirname, "kusabi-companion.mjs");
 
@@ -588,5 +593,147 @@ describe("regression: existing chain-wait and chain-detach behavior remains unch
     const res = runCompanion(["chain-detach", "--brief-file", briefPath], { cwd: tmpDir, stateRootDir });
     assert.notEqual(res.status, 0);
     assert.match(res.stdout + res.stderr, /chain requires --container/);
+  });
+});
+// ===========================================================================
+// torn-read resilience: exists vs parsed, atomic writes (kusabi #511)
+// ===========================================================================
+
+describe("task-wait torn-read resilience", () => {
+  let tmpDir;
+  let stateDir;
+
+  beforeEach(() => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-task-wait-torn-"));
+    stateDir = path.join(tmpDir, "state");
+  });
+
+  afterEach(() => {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  // One event-loop turn, so a wait loop whose injected sleep yields to the
+  // macrotask queue gets to complete one poll per flush.
+  const flush = () => new Promise((resolve) => setTimeout(resolve, 0));
+
+  it("readTaskSnapshot reports whether job.json exists separately from whether it parsed", () => {
+    const jobId = "job-snapshot-1";
+    const jobFile = path.join(stateDir, "jobs", jobId, "job.json");
+    fs.mkdirSync(path.dirname(jobFile), { recursive: true });
+
+    // Truncated: exists on disk but does not parse.
+    fs.writeFileSync(jobFile, '{"id": "job-snapshot-1", "status": "ru', "utf8");
+    let snap = readTaskSnapshot(stateDir, jobId);
+    assert.equal(snap.exists, true);
+    assert.equal(snap.parsed, false);
+    assert.equal(snap.job, null);
+    assert.equal(snap.terminal, false);
+
+    // Missing entirely.
+    fs.rmSync(jobFile);
+    snap = readTaskSnapshot(stateDir, jobId);
+    assert.equal(snap.exists, false);
+    assert.equal(snap.parsed, false);
+    assert.equal(snap.terminal, false);
+
+    // Valid terminal record.
+    writeJob(stateDir, { id: jobId, kind: "task", status: "completed" });
+    snap = readTaskSnapshot(stateDir, jobId);
+    assert.equal(snap.exists, true);
+    assert.equal(snap.parsed, true);
+    assert.equal(snap.terminal, true);
+
+    // An unparsed file is "no new information": its fingerprint is stable.
+    fs.writeFileSync(jobFile, '{"id": "job-snapshot-1", "status": "ru', "utf8");
+    assert.equal(
+      readTaskSnapshot(stateDir, jobId).fingerprint,
+      readTaskSnapshot(stateDir, jobId).fingerprint,
+      "two unparsed reads of the same file must carry the same fingerprint",
+    );
+  });
+
+  it("does not stall when job.json exists but holds truncated JSON past the appear window, then resolves once a valid terminal record appears", async () => {
+    const jobId = "job-torn-1";
+    const jobFile = path.join(stateDir, "jobs", jobId, "job.json");
+    fs.mkdirSync(path.dirname(jobFile), { recursive: true });
+    // A torn rewrite caught mid-flight: the file exists but does not parse.
+    fs.writeFileSync(jobFile, '{"id": "job-torn-1", "kind": "task", "status": "ru', "utf8");
+
+    let t = 0;
+    const sleep = async () => {
+      t += 10_000;
+      await flush();
+    };
+
+    let outcome = "pending";
+    const promise = waitForTask({
+      stateDir,
+      jobId,
+      pollIntervalMs: 10_000,
+      appearTimeoutMs: 120_000,
+      progressTimeoutMs: 3_600_000,
+      sleep,
+      now: () => t,
+    }).then(
+      (result) => { outcome = "resolved"; return result; },
+      (err) => { outcome = "rejected"; throw err; },
+    );
+
+    // Poll far past the appear window while the file stays truncated
+    // (each flush advances one poll; 15 polls x 10s = 150s > 120s).
+    for (let i = 0; i < 40 && t <= 120_000 && outcome === "pending"; i += 1) {
+      await flush();
+    }
+    assert.ok(t > 120_000, `fake clock should pass the appear window (t=${t})`);
+    assert.equal(outcome, "pending", "an existing-but-unparseable job.json must not stall the wait");
+
+    // The record finally lands as a valid terminal record.
+    writeJob(stateDir, {
+      id: jobId,
+      kind: "task",
+      phase: "review",
+      status: "completed",
+      startedAt: new Date(0).toISOString(),
+      finishedAt: new Date(60_000).toISOString(),
+    });
+
+    const result = await promise;
+    assert.equal(result.status, "completed");
+    assert.match(result.digest, /status=completed/);
+  });
+
+  it("still stalls with the 'no job.json record' error when an existing record disappears and never comes back", async () => {
+    const jobId = "job-gone-1";
+    const jobFile = path.join(stateDir, "jobs", jobId, "job.json");
+    // Start with a valid record so the wait accepts the id, then it vanishes.
+    writeJob(stateDir, { id: jobId, kind: "task", status: "running" });
+
+    let t = 0;
+    const sleep = async () => {
+      t += 10_000;
+      await flush();
+    };
+
+    const promise = waitForTask({
+      stateDir,
+      jobId,
+      pollIntervalMs: 10_000,
+      appearTimeoutMs: 120_000,
+      progressTimeoutMs: 3_600_000,
+      sleep,
+      now: () => t,
+    });
+
+    // Let the loop read the running record once, then remove job.json.
+    await flush();
+    fs.rmSync(jobFile);
+
+    await assert.rejects(promise, (err) => {
+      assert.ok(err instanceof TaskWaitError, `expected TaskWaitError, got ${err}`);
+      assert.equal(err.code, "stalled");
+      assert.match(err.message, /no job\.json record/);
+      assert.match(err.message, new RegExp(jobId));
+      return true;
+    });
   });
 });
