@@ -1105,6 +1105,20 @@ export async function launchTaskAndWatch({
 }
 
 /**
+ * Whether a `queue_failed` record is still a retryable delivery duty: not
+ * explicitly marked non-retryable and not past the delivery attempt budget.
+ * Single source of truth shared by the resume selection and the `--list`
+ * retry-pending diagnostic, so the two can never disagree about a record.
+ */
+export function isRetryableQueueFailure(record) {
+  return (
+    record.status === "queue_failed" &&
+    record.retryable !== false &&
+    (record.attempts || 0) < MAX_DELIVERY_ATTEMPTS
+  );
+}
+
+/**
  * Resume all pending/interrupted watches after process or system restart.
  * Covers interrupted "waiting" watches as well as retryable "queue_failed"
  * states, for chain AND task records alike (each record persists its explicit
@@ -1145,10 +1159,7 @@ export async function resumePendingWatches({
       record.status === "waiting" ||
       record.status === "pending" ||
       record.status === "wait_interrupted"; // signal-killed wait: resumable
-    const isRetryableQueue =
-      record.status === "queue_failed" &&
-      record.retryable !== false &&
-      (record.attempts || 0) < MAX_DELIVERY_ATTEMPTS;
+    const isRetryableQueue = isRetryableQueueFailure(record);
 
     if (isPending || isRetryableQueue) {
       // Check process identity
@@ -1383,7 +1394,7 @@ export function describeRecordForList(record, entry) {
     parts.push("running=false");
     retryPending = true;
   } else if (record.status === "queue_failed") {
-    retryPending = record.retryable === true;
+    retryPending = isRetryableQueueFailure(record);
   }
   parts.push(`retryPending=${retryPending}`);
 
@@ -1480,6 +1491,15 @@ export async function main() {
       sync: !!flags.sync,
     });
     console.log(`Resumed ${res.resumed} pending watches.`);
+    // Per-record resilience: failures are surfaced individually on stderr and
+    // the command exits non-zero, while the successfully resumed watches stay
+    // resumed (partial success preserved, same as the automatic sweep).
+    if (res.errors && res.errors.length > 0) {
+      for (const err of res.errors) {
+        process.stderr.write(`register-watch: resume error: ${err.message}\n`);
+      }
+      process.exit(1);
+    }
     return;
   }
 
