@@ -15,6 +15,12 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import crypto from "node:crypto";
+import { spawn } from "node:child_process";
+import { fileURLToPath } from "node:url";
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+/** The register-watch CLI under test, spawned by the --resume-all diagnostics. */
+const REGISTER_WATCH_SCRIPT = path.join(__dirname, "register-watch.mjs");
 
 import {
   OUTCOME_DELIVERED,
@@ -22,6 +28,7 @@ import {
   OUTCOME_AMBIGUOUS_DELIVERY,
   OUTCOME_WAIT_INTERRUPTED,
   TASK_TERMINAL_STATUSES,
+  MAX_DELIVERY_ATTEMPTS,
   readJson,
   writeRecordAtomic,
   getRecordPath,
@@ -38,6 +45,7 @@ import {
   launchAndWatch,
   launchTaskAndWatch,
   describeRecordForList,
+  isRetryableQueueFailure,
 } from "./register-watch.mjs";
 
 // The wait command's own terminal set — the other half of "the chosen
@@ -1012,5 +1020,331 @@ describe("kusabi-codex-notify lifecycle hardening units (kusabi #503)", () => {
     }, "x.json");
     assert.match(ambiguousLine, /ambiguous=true/);
     assert.match(ambiguousLine, /retryPending=false/);
+  });
+
+  it("describeRecordForList queue_failed retryPending agrees with the resume selection predicate (kusabi #508)", () => {
+    // retryable missing, attempts 0: legacy/partial record, still a retryable
+    // duty the next sweep picks up.
+    const legacyPartial = describeRecordForList({
+      subject: { kind: "task", id: "job-qf-legacy" },
+      status: "queue_failed",
+      outcome: OUTCOME_QUEUE_FAILURE,
+      attempts: 0,
+    }, "x.json");
+    assert.match(legacyPartial, /retryPending=true/);
+    assert.equal(isRetryableQueueFailure({ status: "queue_failed", attempts: 0 }), true);
+
+    // Attempts exhausted: terminal, never selected by resume.
+    const exhausted = describeRecordForList({
+      subject: { kind: "task", id: "job-qf-exhausted" },
+      status: "queue_failed",
+      outcome: OUTCOME_QUEUE_FAILURE,
+      retryable: true,
+      attempts: MAX_DELIVERY_ATTEMPTS,
+    }, "x.json");
+    assert.match(exhausted, /retryPending=false/);
+    assert.equal(
+      isRetryableQueueFailure({ status: "queue_failed", retryable: true, attempts: MAX_DELIVERY_ATTEMPTS }),
+      false
+    );
+
+    // Explicitly non-retryable: terminal, never selected by resume.
+    const nonRetryable = describeRecordForList({
+      subject: { kind: "task", id: "job-qf-terminal" },
+      status: "queue_failed",
+      outcome: OUTCOME_QUEUE_FAILURE,
+      retryable: false,
+      attempts: 1,
+    }, "x.json");
+    assert.match(nonRetryable, /retryPending=false/);
+    assert.equal(isRetryableQueueFailure({ status: "queue_failed", retryable: false, attempts: 1 }), false);
+
+    // The diagnostic and the resume selection share one predicate:
+    // `isRetryableQueueFailure` is exactly the gate resumePendingWatches
+    // applies to queue_failed records, so list and sweep can never disagree.
+    for (const record of [
+      { status: "queue_failed", attempts: 0 },
+      { status: "queue_failed", retryable: true, attempts: 1 },
+      { status: "queue_failed", retryable: true, attempts: MAX_DELIVERY_ATTEMPTS },
+      { status: "queue_failed", retryable: false, attempts: 0 },
+      { status: "queue_failed", attempts: MAX_DELIVERY_ATTEMPTS },
+    ]) {
+      const line = describeRecordForList({ subject: { kind: "task", id: "job-qf-agree" }, ...record }, "x.json");
+      assert.equal(
+        /retryPending=true/.test(line),
+        isRetryableQueueFailure(record),
+        `retryPending must agree with resume selection for ${JSON.stringify(record)}`
+      );
+    }
+  });
+});
+describe("kusabi-codex-notify --resume-all diagnostics (kusabi #508)", () => {
+  let tmpRoot;
+  let stateDir;
+  let kusabiStateDir;
+  let workspaceDir;
+  let mockCompanionScript;
+  let mockCodexScript;
+
+  beforeEach(() => {
+    tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "kcn-508-"));
+    stateDir = path.join(tmpRoot, "notify-state");
+    kusabiStateDir = path.join(tmpRoot, "kusabi-state");
+    workspaceDir = path.join(tmpRoot, "workspace");
+    fs.mkdirSync(path.join(stateDir, "records"), { recursive: true });
+    fs.mkdirSync(path.join(stateDir, "claims"), { recursive: true });
+    fs.mkdirSync(kusabiStateDir, { recursive: true });
+    fs.mkdirSync(workspaceDir, { recursive: true });
+
+    // Deterministic stand-in companion: task-wait polls the durable job
+    // record until a terminal status appears, then prints the digest.
+    mockCompanionScript = path.join(tmpRoot, "mock-companion.mjs");
+    fs.writeFileSync(
+      mockCompanionScript,
+      `#!/usr/bin/env node
+import fs from "node:fs";
+import path from "node:path";
+import crypto from "node:crypto";
+import process from "node:process";
+
+const args = process.argv.slice(2);
+const subcmd = args[0];
+const id = args[1];
+const cwd = process.cwd();
+const hash = crypto.createHash("sha256").update(path.resolve(cwd)).digest("hex").slice(0, 12);
+const kusabiRoot = process.env.KUSABI_STATE_DIR || path.join(process.env.HOME || "/tmp", ".kusabi");
+const jobFile = path.join(kusabiRoot, hash, "jobs", id, "job.json");
+const TERMINAL = new Set(["completed", "timeout", "cancelled", "provider-error", "error", "stalled", "serve-dead"]);
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+if (subcmd === "task-wait") {
+  (async () => {
+    const deadline = Date.now() + 30000;
+    while (Date.now() < deadline) {
+      let job = null;
+      try { job = JSON.parse(fs.readFileSync(jobFile, "utf8")); } catch {}
+      if (job && TERMINAL.has(job.status)) {
+        const phase = job.phase ? " phase=" + job.phase : "";
+        fs.writeSync(1, "task " + id + ": status=" + job.status + phase + " waited=2s\\n");
+        process.exitCode = 0;
+        return;
+      }
+      await sleep(25);
+    }
+    fs.writeSync(2, "task " + id + ": timed out waiting for terminal state\\n");
+    process.exitCode = 1;
+  })();
+} else {
+  fs.writeSync(2, "unknown subcommand " + subcmd + "\\n");
+  process.exitCode = 1;
+}
+`,
+      { mode: 0o755 }
+    );
+
+    // Queue stand-in: a successful queue call simply exits 0.
+    mockCodexScript = path.join(tmpRoot, "mock-codex.mjs");
+    fs.writeFileSync(
+      mockCodexScript,
+      `#!/usr/bin/env node
+import process from "node:process";
+process.exitCode = 0;
+`,
+      { mode: 0o755 }
+    );
+  });
+
+  afterEach(() => {
+    try {
+      fs.rmSync(tmpRoot, { recursive: true, force: true });
+    } catch { /* best-effort */ }
+  });
+
+  /** Durable job record a terminal task-wait resolves, keyed to workspaceDir. */
+  function setupTaskJob(jobId, { status = "completed", phase = "implement" } = {}) {
+    const ws = path.resolve(workspaceDir);
+    const hash = crypto.createHash("sha256").update(ws).digest("hex").slice(0, 12);
+    const jobDir = path.join(kusabiStateDir, hash, "jobs", jobId);
+    fs.mkdirSync(jobDir, { recursive: true });
+    const now = new Date().toISOString();
+    fs.writeFileSync(
+      path.join(jobDir, "job.json"),
+      JSON.stringify({
+        id: jobId,
+        kind: "task",
+        title: "kusabi 508 fixture",
+        status,
+        phase,
+        backend: "opencode",
+        modelEntry: "opencode-go/deepseek-v4-flash:max",
+        startedAt: now,
+        finishedAt: now,
+        cwd: ws,
+        sessionID: "ses-508",
+        result: { source: "final-message", recovered: false, fetchFailed: false, fetchError: null, recovery: null },
+      }),
+      "utf8"
+    );
+    return jobDir;
+  }
+
+  /** A pending task record whose watcher is dead: the sweep must pick it up. */
+  function writeDeadPendingTaskRecord(id) {
+    writeRecordAtomic(getRecordPath(stateDir, { kind: "task", id }), {
+      subject: { kind: "task", id },
+      jobId: id,
+      threadId: "thread-508",
+      cwd: workspaceDir,
+      status: "waiting",
+      outcome: null,
+      pid: 99999999,
+      startTime: "12345",
+    });
+  }
+
+  /**
+   * Spawn the real register-watch CLI with `--resume-all --sync` (sync so the
+   * watchers deliver inside the child and it exits on its own) and resolve
+   * { code, stdout, stderr } when the child exits.  `envExtra` lets a test
+   * inject a NODE_OPTIONS preload hook into the child process only.
+   */
+  async function runCliResumeAll(envExtra = {}) {
+    const child = spawn(
+      process.execPath,
+      [
+        REGISTER_WATCH_SCRIPT,
+        "--resume-all",
+        "--sync",
+        "--state-dir", stateDir,
+        "--companion-bin", mockCompanionScript,
+        "--codex-bin", mockCodexScript,
+      ],
+      {
+        env: { ...process.env, KUSABI_STATE_DIR: kusabiStateDir, ...envExtra },
+        stdio: ["ignore", "pipe", "pipe"],
+      }
+    );
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (chunk) => { stdout += chunk.toString(); });
+    child.stderr.on("data", (chunk) => { stderr += chunk.toString(); });
+    return new Promise((resolve) => {
+      const timer = setTimeout(() => {
+        try { child.kill("SIGKILL"); } catch { /* best-effort */ }
+      }, 30000);
+      // "close", not "exit": stdio pipes may still hold unread output at exit.
+      child.once("close", (code, signal) => {
+        clearTimeout(timer);
+        resolve({ code, signal, stdout, stderr });
+      });
+    });
+  }
+
+  it("resumePendingWatches selects exactly the records the list marks retryPending (kusabi #508)", async () => {
+    const retryableA = "job-qf-retryable-a";
+    const retryableB = "job-qf-retryable-b";
+    const exhausted = "job-qf-exhausted";
+    const terminal = "job-qf-terminal";
+    for (const id of [retryableA, retryableB, exhausted, terminal]) {
+      writeRecordAtomic(getRecordPath(stateDir, { kind: "task", id }), {
+        subject: { kind: "task", id },
+        jobId: id,
+        threadId: "thread-508",
+        cwd: workspaceDir,
+        status: "queue_failed",
+        outcome: OUTCOME_QUEUE_FAILURE,
+        pid: 99999999,
+        startTime: "12345",
+        attempts: id === exhausted ? MAX_DELIVERY_ATTEMPTS : id === terminal ? 1 : 0,
+        retryable: id === terminal ? false : true,
+      });
+      // Only the retryable records are expected to resume, so only they need
+      // a terminal job for the (synchronous) watcher to deliver.
+      if (id !== exhausted && id !== terminal) setupTaskJob(id);
+    }
+
+    // --list agrees with resume selection BEFORE any resume mutates records.
+    const listRetryPending = new Set();
+    for (const id of [retryableA, retryableB, exhausted, terminal]) {
+      const record = readJson(getRecordPath(stateDir, { kind: "task", id }));
+      if (/retryPending=true/.test(describeRecordForList(record, `${id}.json`))) {
+        listRetryPending.add(id);
+      }
+    }
+    assert.deepEqual(listRetryPending, new Set([retryableA, retryableB]));
+
+    const res = await resumePendingWatches({
+      stateDir,
+      companionBin: mockCompanionScript,
+      codexBin: mockCodexScript,
+      sync: true,
+      env: { ...process.env, KUSABI_STATE_DIR: kusabiStateDir },
+    });
+
+    assert.equal(res.resumed, 2);
+    assert.deepEqual(res.subjects.map((s) => s.id).sort(), [retryableA, retryableB].sort());
+    assert.deepEqual(res.errors, []);
+    // The exhausted and non-retryable records are untouched and stay terminal.
+    assert.equal(readJson(getRecordPath(stateDir, { kind: "task", id: exhausted })).status, "queue_failed");
+    assert.equal(readJson(getRecordPath(stateDir, { kind: "task", id: terminal })).status, "queue_failed");
+  });
+
+  it("--resume-all with no failures exits 0 and reports the resumed count without error lines (kusabi #508)", async () => {
+    const goodId = "job-508-clean";
+    setupTaskJob(goodId, { status: "completed", phase: "implement" });
+    writeDeadPendingTaskRecord(goodId);
+
+    const { code, stdout, stderr } = await runCliResumeAll();
+
+    assert.equal(code, 0, `CLI failed: ${stderr || stdout}`);
+    assert.match(stdout, /Resumed 1 pending watches\./);
+    assert.doesNotMatch(stderr, /resume error/);
+    assert.equal(readJson(getRecordPath(stateDir, { kind: "task", id: goodId })).status, "delivered");
+  });
+
+  it("--resume-all reports partial success: one resumed, one failed, resume error on stderr, exit 1 (kusabi #508)", async () => {
+    const goodId = "job-508-good";
+    const badId = "job-508-bad";
+    setupTaskJob(goodId, { status: "completed", phase: "implement" });
+    writeDeadPendingTaskRecord(goodId);
+    writeDeadPendingTaskRecord(badId);
+
+    // NODE_OPTIONS preload hook, applied to the child process only: any write
+    // touching the bad record's path throws, so its resume fails while the
+    // good record's resume is unaffected.
+    const hookPath = path.join(tmpRoot, "inject-resume-failure.cjs");
+    fs.writeFileSync(
+      hookPath,
+      `const fs = require("fs");
+const originalWrite = fs.writeFileSync;
+fs.writeFileSync = function injectedWriteFileSync(filePath, ...rest) {
+  if (String(filePath).includes("task-job-508-bad.json")) {
+    const err = new Error("injected EACCES: injected resume write failure");
+    err.code = "EACCES";
+    throw err;
+  }
+  return originalWrite.call(this, filePath, ...rest);
+};
+`
+    );
+
+    const { code, stdout, stderr } = await runCliResumeAll({
+      NODE_OPTIONS: `${process.env.NODE_OPTIONS ? `${process.env.NODE_OPTIONS} ` : ""}--require ${hookPath}`,
+    });
+
+    // Partial success preserved: the good watch was resumed and delivered;
+    // the bad one stays pending for the next invocation.
+    assert.equal(
+      readJson(getRecordPath(stateDir, { kind: "task", id: goodId })).status,
+      "delivered",
+      `good record not delivered; CLI stderr: ${stderr} stdout: ${stdout}`
+    );
+    assert.equal(readJson(getRecordPath(stateDir, { kind: "task", id: badId })).status, "waiting");
+
+    // Diagnostics: stdout keeps the resumed count, stderr names each failure,
+    // and the command exits non-zero.
+    assert.match(stdout, /Resumed 1 pending watches\./);
+    assert.match(stderr, /^register-watch: resume error: injected EACCES: injected resume write failure\n$/m);
+    assert.equal(code, 1);
   });
 });
