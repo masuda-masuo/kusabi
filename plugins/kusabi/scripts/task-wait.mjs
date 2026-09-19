@@ -76,27 +76,38 @@ function mtimeOf(file) {
 
 /**
  * A read-only snapshot of one job's terminal-ness and its observable movement.
- * `fingerprint` is any observable change, including a rewrite that changed no
- * field we render: a task still writing is a task still working.
+ *
+ * "Exists" and "parsed" are separate facts: `exists` is whether job.json is on
+ * disk at all, `parsed` whether it also read as valid JSON.  A file that
+ * exists but does not parse is a torn rewrite caught mid-write (the writer
+ * rewrites job.json on every stats update) — it carries no new information,
+ * so its fingerprint is a stable marker and a wait keeps the previous
+ * fingerprint while polling on.  `fingerprint` is otherwise any observable
+ * change, including a rewrite that changed no field we render: a task still
+ * writing is a task still working.
  */
 export function readTaskSnapshot(stateDir, jobId) {
-  const job = loadJob(stateDir, jobId);
-  const exists = job !== null;
-  const status = exists && typeof job.status === "string" ? job.status : null;
+  const file = path.join(jobDir(stateDir, jobId), "job.json");
+  const exists = fs.existsSync(file);
+  const job = exists ? loadJob(stateDir, jobId) : null;
+  const parsed = exists && job !== null;
+  const status = parsed && typeof job.status === "string" ? job.status : null;
   return {
     jobId,
     exists,
+    parsed,
     job,
     status,
-    terminal: exists && TERMINAL_TASK_STATUSES.has(status),
-    fingerprint: JSON.stringify([
-      exists,
-      status,
-      job?.finishedAt ?? null,
-      job?.error ?? null,
-      job?.failure ?? null,
-      mtimeOf(path.join(jobDir(stateDir, jobId), "job.json")),
-    ]),
+    terminal: parsed && TERMINAL_TASK_STATUSES.has(status),
+    fingerprint: parsed
+      ? JSON.stringify([
+          status,
+          job.finishedAt ?? null,
+          job.error ?? null,
+          job.failure ?? null,
+          mtimeOf(file),
+        ])
+      : JSON.stringify([exists ? "unparsed" : "missing"]),
   };
 }
 
@@ -205,7 +216,7 @@ function makeNextJobCandidateSelector({ stateDir, since, startedAt, appearTimeou
     if (!preexisting.has(id)) return true;
     const snapshot = readTaskSnapshot(stateDir, id);
     if (snapshot.terminal) return false;
-    if (snapshot.job === null && createdAt(stateDir, id) < startedAt - appearTimeoutMs) {
+    if (!snapshot.exists && createdAt(stateDir, id) < startedAt - appearTimeoutMs) {
       if (!reported.has(id)) {
         reported.add(id);
         reportIgnored(id);
@@ -334,8 +345,11 @@ export async function waitForTask({
 
     // A selected job whose record disappeared / never landed: nothing here can
     // advance it.  In --next mode a newer eligible job that appears may win;
-    // otherwise bound it with the appear window.
-    if (snapshot.job === null) {
+    // otherwise bound it with the appear window.  Only a file that truly does
+    // NOT exist counts as missing: a file that exists but does not parse is a
+    // torn rewrite caught mid-write, carries no new information, and must not
+    // be called stalled (readTaskSnapshot keeps a stable fingerprint for it).
+    if (!snapshot.exists) {
       if (candidates !== null) {
         const lockedAt = createdAt(stateDir, id);
         const target = candidates().find((c) => c.createdAt >= lockedAt && c.id !== id);

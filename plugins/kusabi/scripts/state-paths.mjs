@@ -35,5 +35,21 @@ export function readJson(file) {
 
 export function writeJson(file, value) {
   fs.mkdirSync(path.dirname(file), { recursive: true });
-  fs.writeFileSync(file, `${JSON.stringify(value, null, 2)}\n`, "utf8");
+  // Atomic replace: write to a unique temp file in the SAME directory, then
+  // rename over the target.  A reader can otherwise catch a partially written
+  // target (a torn job.json rewrite mid stats-update used to make task-wait
+  // call a healthy running task "stalled").  rename(2) on the same
+  // filesystem is atomic, so the target is always the old or the new full
+  // content, never a mix.
+  const tmp = path.join(
+    path.dirname(file),
+    `.${path.basename(file)}.${process.pid}.${crypto.randomBytes(6).toString("hex")}.tmp`,
+  );
+  try {
+    fs.writeFileSync(tmp, `${JSON.stringify(value, null, 2)}\n`, "utf8");
+    fs.renameSync(tmp, file);
+  } catch (err) {
+    try { fs.unlinkSync(tmp); } catch { /* best-effort: temp may not exist */ }
+    throw err;
+  }
 }
