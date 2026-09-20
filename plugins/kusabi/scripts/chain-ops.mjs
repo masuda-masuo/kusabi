@@ -344,9 +344,10 @@ function waitDurationFlag(flags, name, fallbackMs) {
 
 /**
  * chain-wait — block until a chain reaches a terminal state, print a one-line
- * digest, exit 0.  Every way the WAIT failed (unknown id, nothing appeared,
- * stall) throws, and main()'s catch turns that into a non-zero exit: the
- * caller scripts on the exit code, so the two must never be confused.
+ * digest, exit 0.  Every way the WAIT failed (a chain that never appeared, a
+ * malformed id, nothing appeared under --next, stall) throws, and main()'s
+ * catch turns that into a non-zero exit: the caller scripts on the exit code,
+ * so the two must never be confused.
  *
  * Runs no LLM, spawns no serve, holds nothing that needs cleanup — safe to
  * SIGTERM at any moment, which is what makes it trackable by the caller's
