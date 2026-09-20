@@ -209,6 +209,7 @@ export function firstRoute(chain) {
 export const CLAUDE_ENTRY_PREFIX = "claude/";
 export const AGY_ENTRY_PREFIX = "agy/";
 export const CURSOR_ENTRY_PREFIX = "cursor/";
+export const CODEX_ENTRY_PREFIX = "codex/";
 
 /**
  * The backend-naming prefixes, as a TABLE: a further backend is one row
@@ -224,6 +225,7 @@ export const BACKEND_ENTRY_PREFIXES = [
   { prefix: CLAUDE_ENTRY_PREFIX, backend: "claude" },
   { prefix: AGY_ENTRY_PREFIX, backend: "agy" },
   { prefix: CURSOR_ENTRY_PREFIX, backend: "cursor" },
+  { prefix: CODEX_ENTRY_PREFIX, backend: "codex" },
 ];
 
 /**
@@ -249,6 +251,7 @@ export const BACKEND_RESUME_SUPPORT = {
   claude: true,
   agy: true,
   cursor: true, // MEASURED 2026-08-23: --resume <session_id> carries context
+  codex: true, // MEASURED 2026-09-20: `codex exec resume` under the same CODEX_HOME preserves the thread id
 };
 
 /**
@@ -380,6 +383,14 @@ export function validateRoute(route) {
       throw new Error(
         `cursor backend does not support the :variant suffix in model "${model}" — ` +
         "use a plain cursor model id or the literal default"
+      );
+    }
+  } else if (backend === "codex") {
+    if (model.includes(":")) {
+      throw new Error(
+        `codex backend does not support the :variant suffix in model "${model}" — ` +
+        "reasoning effort is fixed to high; use one of the exact supported seat ids: " +
+        "gpt-5.6-luna or gpt-5.6-sol"
       );
     }
   }

@@ -1,6 +1,6 @@
 # kusabi
 
-Use kusabi from inside Claude Code or Cursor to delegate tasks or run adversarial code reviews to a worker backend — [opencode](https://opencode.ai) by default, the Claude Code CLI in headless mode (`--backend claude`), the Antigravity CLI (`--backend agy`), or the Cursor CLI (`--backend cursor`) — without flooding the orchestrator's context with the worker's intermediate output.
+Use kusabi from inside Claude Code or Cursor to delegate tasks or run adversarial code reviews to a worker backend — [opencode](https://opencode.ai) by default, the Claude Code CLI in headless mode (`--backend claude`), the Antigravity CLI (`--backend agy`), the Cursor CLI (`--backend cursor`), or the Codex CLI (`--backend codex`) — without flooding the orchestrator's context with the worker's intermediate output.
 
 ## How it works
 
@@ -8,14 +8,15 @@ Use kusabi from inside Claude Code or Cursor to delegate tasks or run adversaria
 orchestrator ——> kusabi-companion <subcommand> —┬—HTTP——> opencode serve (127.0.0.1, on-demand)
                                                 ├—spawn——> claude -p       (headless, no server)
                                                 ├—spawn——> agy -p          (headless, no server)
-                                                └—spawn——> cursor-agent -p (headless, no server)
+                                                ├—spawn——> cursor-agent -p (headless, no server)
+                                                └—spawn——> codex exec      (headless, no server)
                                                 │
                                                 ├─ SSE /event: progress tracking + automatic permission replies
                                                 ├─ state dir: full event log, job records, stored results
                                                 └─ stdout: rendered final result ONLY
 ```
 
-With `--backend claude`, `--backend agy`, or `--backend cursor` there is no serve process — the companion spawns the CLI per job and the same state-dir/stdout contract applies (see [Backends](#backends) for flags and v1 limits).
+With `--backend claude`, `--backend agy`, `--backend cursor`, or `--backend codex` there is no serve process — the companion spawns the CLI per job and the same state-dir/stdout contract applies (see [Backends](#backends) for flags and v1 limits).
 
 The companion script is a context firewall: the worker's narration, tool logs, and raw events are persisted under `~/.kusabi/<dir-hash>/` and never reach the orchestrator. The orchestrator only sees the rendered final result (or a compact status summary).
 
@@ -27,7 +28,7 @@ Key mechanics:
 
 ## Requirements
 
-- [opencode CLI](https://opencode.ai) installed and authenticated (`opencode auth login`) — or the Claude Code CLI (`claude`) for `--backend claude` (binary via `CLAUDE_BIN`, default `claude`), the Antigravity CLI (`agy`) for `--backend agy` (binary via `AGY_BIN`, default `agy`), or the Cursor CLI (`cursor-agent`) for `--backend cursor` (binary via `CURSOR_BIN`, default `cursor-agent`)
+- [opencode CLI](https://opencode.ai) installed and authenticated (`opencode auth login`) — or the Claude Code CLI (`claude`) for `--backend claude` (binary via `CLAUDE_BIN`, default `claude`), the Antigravity CLI (`agy`) for `--backend agy` (binary via `AGY_BIN`, default `agy`), the Cursor CLI (`cursor-agent`) for `--backend cursor` (binary via `CURSOR_BIN`, default `cursor-agent`), or the Codex CLI (`codex`) for `--backend codex` (binary via `CODEX_BIN`, default `codex`)
 - Node.js 18.18 or later
 
 ## Install
@@ -109,7 +110,7 @@ Slash commands (`plugins/kusabi/commands/`):
 
 | Command | What it does |
 | --- | --- |
-| `/kusabi:task [--brief-file <path>]` | Delegate a task. Provide the brief inline or via `--brief-file <path>` (mutually exclusive). Flags: `--model <identifier>`, `--backend opencode|claude|agy|cursor`, `--agent name`, `--phase <name>`, `--read-only`, `--resume-last`, `--session <id>`, `--wait`, `--background`, `--deny <tools>`, `--timeout <s>`, `--watchdog <s>` |
+| `/kusabi:task [--brief-file <path>]` | Delegate a task. Provide the brief inline or via `--brief-file <path>` (mutually exclusive). Flags: `--model <identifier>`, `--backend opencode|claude|agy|cursor|codex`, `--agent name`, `--phase <name>`, `--read-only`, `--resume-last`, `--session <id>`, `--wait`, `--background`, `--deny <tools>`, `--timeout <s>`, `--watchdog <s>` |
 | `/kusabi:review` | Adversarial, read-only review of the working tree; `--base <ref>` for branch review; `--prior <text>` for anti-ratchet carry-over; extra text = review focus. Host worktree only — `--container` is rejected; use `task --phase review` for container reviews |
 | `/kusabi:status [job-id]` | Compact job list, or progress detail for one job |
 | `/kusabi:result [job-id]` | Stored final output of a finished job |
@@ -121,7 +122,7 @@ Everything else is a companion subcommand, invoked directly as
 
 | Subcommand | What it does |
 | --- | --- |
-| `chain [--brief-file <path>]` | **Auto chain** — run implement → review → rework until acceptance or escalate. Requires `--container <cid>`. Optional: `--model <identifier>`, `--backend opencode|claude|agy|cursor`, `--brief-file <path>`, `--max-rounds <N>` (default 4), `--session <id>`, `--keep-serve`. When `--model` is omitted the model and backend are resolved from the config file or built-in default chain. **Incremental TDD strategy**: add `--strategy incremental-tdd --requirements-file <path>` to parse a Markdown requirements file and run sequential red/green slices. |
+| `chain [--brief-file <path>]` | **Auto chain** — run implement → review → rework until acceptance or escalate. Requires `--container <cid>`. Optional: `--model <identifier>`, `--backend opencode|claude|agy|cursor|codex`, `--brief-file <path>`, `--max-rounds <N>` (default 4), `--session <id>`, `--keep-serve`. When `--model` is omitted the model and backend are resolved from the config file or built-in default chain. **Incremental TDD strategy**: add `--strategy incremental-tdd --requirements-file <path>` to parse a Markdown requirements file and run sequential red/green slices. |
 | `chain-resume <chainId>` | Resume a cancelled chain from its last recorded phase boundary, or buy a replacement review seat for a chain that escalated on a dead review seat over green probes (reads `chain.json` / `control.json`; same chain lifecycle as `chain`). Optional: `--keep-serve`; `--backend` / `--model` are accepted only when routing a quota-exhausted review seat to a replacement. |
 | `chain-show` | Compact plain-text digest of a chain (read-only, no LLM) |
 | `chain-stats` | Aggregate every chain record and print a summary (read-only, no LLM) |
@@ -189,7 +190,7 @@ fallback trail, and name the exact recovery commands (`kusabi-companion result <
 `status <jobId>`). Cursor backend support in kusabi is unchanged; the plugin's notifier is
 Codex-thread-specific by design.
 
-Every result includes the backend's session ID — an opencode `ses_*` id, the Claude Code CLI's UUID with `--backend claude`, the Antigravity CLI's conversation UUID with `--backend agy`, or the Cursor CLI's session id with `--backend cursor`. Kusabi continues them through `--session <id>` / `--resume-last` (agy maps this to `agy --conversation <id>` and Cursor to `cursor-agent --resume <id>`); continue an opencode session in its TUI with `opencode -s <session-id>`. Session ids are backend-specific: passing one to a different backend is rejected, naming both.
+Every result includes the backend's session ID — an opencode `ses_*` id, the Claude Code CLI's UUID with `--backend claude`, the Antigravity CLI's conversation UUID with `--backend agy`, the Cursor CLI's session id with `--backend cursor`, or the Codex CLI's thread id with `--backend codex`. Kusabi continues them through `--session <id>` / `--resume-last` (agy maps this to `agy --conversation <id>` and Cursor to `cursor-agent --resume <id>`); continue an opencode session in its TUI with `opencode -s <session-id>`. Session ids are backend-specific: passing one to a different backend is rejected, naming both.
 
 ## Model configuration
 
@@ -227,7 +228,7 @@ You can customise this with a config file at `<state root>/config.json`
 Flat all-string chains are still accepted (each string is a single-route
 tier) — but the built-in default is the tiered shape above.
 
-A route prefixed with `claude/`, `agy/`, or `cursor/` selects that backend and
+A route prefixed with `claude/`, `agy/`, `cursor/`, or `codex/` selects that backend and
 passes the remainder as its model: for example, `agy/gemini-3.6-flash-high`
 and `cursor/default`. An unprefixed `provider/model[:variant]` route selects
 opencode. The same grammar applies to `--model`: a prefixed identifier pins
@@ -255,7 +256,7 @@ A trailing colon (`p/a:`) or missing `/` are fatal parse errors.
 
 ### Backends
 
-`chain` and `task` accept `--backend opencode|claude|agy|cursor` (default `opencode`).
+`chain` and `task` accept `--backend opencode|claude|agy|cursor|codex` (default `opencode`).
 The backend is resolved once at command start and recorded as `backend` on
 every job record and chain round record; records written before the backend
 split (or without the field) are treated as `opencode` by readers.
@@ -316,6 +317,32 @@ split (or without the field) are treated as `opencode` by readers.
   by a non-empty terminal result payload, with `is_error` retained only as
   advisory metadata. The binary is resolved through `CURSOR_BIN` (default
   `cursor-agent`).
+- **codex** — dispatch through the Codex CLI in headless mode
+  (`codex exec --ignore-user-config --ignore-rules --skip-git-repo-check
+  -C <cwd> -s read-only --json -m <model> -c 'model_reasoning_effort="high"'
+  -c 'mcp_servers={}' -`; the prompt is supplied on stdin, never argv).
+  Config entries and `--model` use `codex/<model>` to select this backend,
+  and v1 accepts exactly the seat ids `gpt-5.6-luna` and `gpt-5.6-sol` — a
+  `:variant` suffix or any other id is rejected. The backend is an **opt-in
+  trusted-seat evaluation**: every invocation runs in a dedicated job-owned
+  HOME/CODEX_HOME (no inherited config/rules/sessions/MCP files; the minimum
+  auth symlink to the operator's own cache is the only bridge), in the fixed
+  read-only sandbox, with reasoning effort fixed to `high` and no MCP
+  servers configured. `--read-only` is accepted (it states what the
+  invocation already enforces); `--deny` is rejected because the CLI has no
+  per-job tool-deny flags. Session resume IS supported through
+  `--session <id>` / `--resume-last` (provenance-gated like agy: only a
+  thread id a codex job recorded may be resumed), via
+  `codex exec resume <thread_id>` with the sandbox and approval policy
+  carried as config. After the process closes the job-owned rollout is
+  cross-checked: a recorded model (or reasoning effort) different from the
+  request fails the job closed with no result and no substitute model; a
+  missing rollout is recorded explicitly as `unverifiable`. The built-in
+  Codex command tool remains inside the sandbox, and credential
+  non-readability is NOT claimed — the codex seat shares the operator's
+  OS-user trust boundary (documented, never described as tool-free or
+  credential-isolated). The binary is resolved through `CODEX_BIN` (default
+  `codex`).
 
 The claude backend mirrors the opencode agents' permission tables with two
 hardcoded `--allowedTools` allowlists (implement, review; see
