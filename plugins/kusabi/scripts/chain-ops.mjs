@@ -476,7 +476,10 @@ export function extractChainAndWaitArgs(flags, text) {
  * the exact chain-wait command line to run for tracking.
  *
  * Performs pre-flight checks up front so invalid dispatches exit non-zero
- * without launching a child process or printing a wait command line.
+ * without launching a child process or printing a wait command line.  The
+ * declared ## Smoke is also measured against the container BEFORE the log fd
+ * is opened (kusabi #513): a dispatch the child would refuse (the baseline
+ * above all) must never have been announced as launched.
  */
 export async function cmdChainDetach(cwd, { flags, text }, opts = {}) {
   const startedAtIso = (opts.now ? new Date(opts.now) : new Date()).toISOString();
@@ -530,6 +533,18 @@ export async function cmdChainDetach(cwd, { flags, text }, opts = {}) {
   // ---- dispatch-time brief lint ----
   const lintRejection = briefLintReport({ brief: briefText, container, chain: true });
   if (lintRejection) throw new Error(lintRejection);
+
+  // ---- smoke baseline refusal (kusabi #292, #513) ----
+  // The spawned child performs this measurement after launch; when it refuses
+  // there, the operator has already been told the chain was launched and is
+  // waiting on a chain that does not exist (kusabi #494 — hit twice on
+  // 2026-09-20).  Measure in the parent too, with the same guard and the same
+  // refusal text the foreground path prints, before the log fd is even
+  // opened, so a refused dispatch leaves nothing behind and no banner.
+  // callTool is injectable (opts.callTool) for tests, mirroring opts.spawn.
+  const callTool = opts.callTool || (await import("./sunaba-rpc.mjs")).callTool;
+  const baselineRejection = await smokeBaselineReport({ brief: briefText, callTool, container });
+  if (baselineRejection) throw new Error(baselineRejection);
 
   // Pre-flight checks passed! Create log file in stateDir
   fs.mkdirSync(stateDir, { recursive: true });

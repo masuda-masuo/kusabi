@@ -4,7 +4,10 @@ import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
 
-import { newestChainDir } from "./chain-ops.mjs";
+import { newestChainDir, cmdChainDetach } from "./chain-ops.mjs";
+import { smokeBaselineReport } from "./chain-brief-guards.mjs";
+import { createFakeCallTool } from "./fixtures.mjs";
+import { stateDirFor } from "./state-paths.mjs";
 
 describe("newestChainDir", () => {
   let tmpDir;
@@ -101,6 +104,134 @@ describe("chain-ops source guard", () => {
         !companionSource.includes(pat),
         `kusabi-companion.mjs must not contain '${pat}'`
       );
+    }
+  });
+});
+// cmdChainDetach — smoke baseline refusal before spawn (kusabi #513)
+// ---------------------------------------------------------------------------
+// chain-detach spawned the chain child detached, unref'd it and immediately
+// printed a launch banner; refusals that only fire inside the child (the
+// ## Smoke baseline above all) then left the operator waiting on a chain that
+// never existed.  The parent now measures the declared ## Smoke against the
+// container BEFORE the log fd is opened, using the same guard and the same
+// refusal text the foreground path prints.  The fakes below drive the REAL
+// smokeBaselineReport (via createFakeCallTool's exit codes), never a stub of
+// it.
+
+const DETACH_BRIEF =
+  "# Task\n\nOrchestrator: test-model | session s-1 | 2026-08-23\n\n" +
+  "## Deliverables\n\n- `plugins/kusabi/scripts/x.mjs`\n\n" +
+  "## Smoke\n\n- `npm test`\n";
+
+describe("cmdChainDetach smoke baseline refusal (kusabi #513)", () => {
+  function detachFixture() {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-test-chaindetach-"));
+    const cwd = path.join(tmp, "ws");
+    fs.mkdirSync(cwd, { recursive: true });
+    const prevStateEnv = process.env.KUSABI_STATE_DIR;
+    process.env.KUSABI_STATE_DIR = path.join(tmp, "state");
+    const stateDir = stateDirFor(cwd);
+    const spawnCalls = [];
+    const fakeSpawn = (cmd, args, options) => {
+      spawnCalls.push({ cmd, args, options });
+      return { pid: 424242, unref() {} };
+    };
+    return {
+      tmp,
+      cwd,
+      stateDir,
+      spawnCalls,
+      opts(callTool) {
+        return {
+          stateRoot: path.join(tmp, "state"),
+          now: "2026-09-20T00:00:00.000Z",
+          spawn: fakeSpawn,
+          callTool,
+        };
+      },
+      cleanup() {
+        if (prevStateEnv === undefined) delete process.env.KUSABI_STATE_DIR;
+        else process.env.KUSABI_STATE_DIR = prevStateEnv;
+        fs.rmSync(tmp, { recursive: true, force: true });
+      },
+    };
+  }
+
+  function detachLogs(stateDir) {
+    if (!fs.existsSync(stateDir)) return [];
+    return fs.readdirSync(stateDir).filter((f) => f.startsWith("chain-detach-"));
+  }
+
+  it("throws the exact smokeBaselineReport refusal and never spawns for a red ## Smoke", async () => {
+    const fx = detachFixture();
+    try {
+      const callTool = createFakeCallTool({ exitCode: 1 });
+      const expected = await smokeBaselineReport({ brief: DETACH_BRIEF, callTool, container: "cid-1" });
+      assert.ok(expected, "a red smoke must produce a refusal from the real guard");
+      await assert.rejects(
+        () =>
+          cmdChainDetach(
+            fx.cwd,
+            { flags: { container: "cid-1" }, text: DETACH_BRIEF },
+            fx.opts(callTool),
+          ),
+        (err) => {
+          assert.equal(
+            err.message,
+            expected,
+            "the refusal text must be exactly what smokeBaselineReport returned",
+          );
+          return true;
+        },
+      );
+      assert.equal(fx.spawnCalls.length, 0, "the injected spawn must never be called for a refused dispatch");
+    } finally {
+      fx.cleanup();
+    }
+  });
+
+  it("creates no chain-detach log for a refused dispatch", async () => {
+    const fx = detachFixture();
+    try {
+      const callTool = createFakeCallTool({ exitCode: 1 });
+      const before = detachLogs(fx.stateDir);
+      await assert.rejects(
+        () =>
+          cmdChainDetach(
+            fx.cwd,
+            { flags: { container: "cid-1" }, text: DETACH_BRIEF },
+            fx.opts(callTool),
+          ),
+      );
+      assert.deepEqual(
+        detachLogs(fx.stateDir),
+        before,
+        "the log fd must not be opened before the refusal fires",
+      );
+    } finally {
+      fx.cleanup();
+    }
+  });
+
+  it("spawns exactly once and returns the unchanged banner for a green ## Smoke", async () => {
+    const fx = detachFixture();
+    try {
+      const callTool = createFakeCallTool({ exitCode: 0 });
+      const banner = await cmdChainDetach(
+        fx.cwd,
+        { flags: { container: "cid-1" }, text: DETACH_BRIEF },
+        fx.opts(callTool),
+      );
+      assert.equal(fx.spawnCalls.length, 1, "a green baseline must spawn exactly once");
+      assert.match(banner, /^Detached chain launched \(pid 424242\)\.$/m);
+      assert.match(banner, /Log: .*chain-detach-\d+\.log/);
+      assert.match(
+        banner,
+        /kusabi-companion chain-wait --next --since 2026-09-20T00:00:00\.000Z/,
+      );
+      assert.equal(detachLogs(fx.stateDir).length, 1, "one log file is created for the launched chain");
+    } finally {
+      fx.cleanup();
     }
   });
 });

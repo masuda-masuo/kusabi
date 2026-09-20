@@ -5006,6 +5006,83 @@ describe("help flags validation (kusabi #360)", () => {
   });
 });
 
+// ---------------------------------------------------------------------------
+// Detach smoke-baseline stub (kusabi #513)
+// ---------------------------------------------------------------------------
+// chain-detach / task-detach now measure the declared ## Smoke against the
+// container BEFORE spawning, so the CLI tests below that launch with
+// --container and a ## Smoke brief must answer those probes.  The stub
+// answers the guard's three reads like a clean container: an empty worktree
+// (git status --porcelain), an unmoved HEAD (git rev-parse HEAD) and a smoke
+// command that exits 0 (SMOKE_EXIT=0).  Diagnostic tail reads fall through to
+// an empty output.
+function startDetachStub() {
+  const server = http.createServer((req, res) => {
+    res.on("error", () => {});
+    let body = "";
+    req.on("data", (chunk) => { body += chunk; });
+    req.on("end", () => {
+      let payload = null;
+      try {
+        payload = JSON.parse(body);
+      } catch {
+        // not JSON — still answer the handshake
+      }
+      res.setHeader("mcp-session-id", "stub-session");
+      res.writeHead(200, { "content-type": "text/event-stream" });
+      let resultText = { output: "" };
+      if (payload?.method === "tools/call") {
+        const args = payload.params?.arguments ?? {};
+        const cmd = (args.commands ?? [])[0] ?? "";
+        if (cmd === "git rev-parse HEAD") resultText = { output: "deadbeefcafe\n" };
+        else if (cmd.includes("SMOKE_EXIT=")) resultText = { output: "SMOKE_EXIT=0\n" };
+        else resultText = { output: "" };
+      }
+      const envelope =
+        payload?.method === "tools/call"
+          ? {
+              jsonrpc: "2.0",
+              id: payload.id ?? 1,
+              result: { content: [{ type: "text", text: JSON.stringify(resultText) }] },
+            }
+          : {
+              jsonrpc: "2.0",
+              id: payload?.id ?? 1,
+              result: {
+                protocolVersion: "2024-11-05",
+                capabilities: {},
+                serverInfo: { name: "kusabi-stub", version: "0.0.0" },
+              },
+            };
+      res.end(`data: ${JSON.stringify(envelope)}\n\n`);
+    });
+  });
+  return new Promise((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", () => {
+      const { port } = server.address();
+      resolve({ server, url: `http://127.0.0.1:${port}/mcp` });
+    });
+  });
+}
+
+// spawnSync would block the event loop, so the stub could never answer the
+// child: detach launches that need a live baseline answer run async.
+function runDetachAsync(script, args, { cwd, env } = {}) {
+  return new Promise((resolve) => {
+    const child = spawn(process.execPath, [script, ...args], { cwd, env });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (chunk) => { stdout += chunk; });
+    child.stderr.on("data", (chunk) => { stderr += chunk; });
+    const timer = setTimeout(() => child.kill("SIGTERM"), 15_000);
+    child.on("close", (code) => {
+      clearTimeout(timer);
+      resolve({ status: code, stdout, stderr });
+    });
+  });
+}
+
 describe("chain-detach CLI", () => {
   const COMPANION_SCRIPT = path.join(import.meta.dirname, "kusabi-companion.mjs");
 
@@ -5094,6 +5171,7 @@ describe("chain-detach CLI", () => {
 
   it("launches a detached chain stand-in, prints log path and runnable chain-wait command line", async () => {
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-test-detach-success-"));
+    let server;
     try {
       const briefPath = path.join(tmp, "brief.md");
       fs.writeFileSync(briefPath, VALID_BRIEF);
@@ -5136,10 +5214,16 @@ setTimeout(() => {
       env.KUSABI_TEST_STATE_DIR = workspaceStateDir;
       env.KUSABI_TEST_CHAIN_STANDIN = standinScript;
 
-      const res = spawnSync(
-        process.execPath,
-        [COMPANION_SCRIPT, "chain-detach", "--container", "cid-1", "--brief-file", briefPath, "--appear-timeout", "10"],
-        { encoding: "utf8", cwd: tmp, env },
+      // The launch measures the declared ## Smoke against the container
+      // before spawning (kusabi #513): answer it with a clean container.
+      const stub = await startDetachStub();
+      server = stub.server;
+      env.KUSABI_SUNABA_URL = stub.url;
+
+      const res = await runDetachAsync(
+        COMPANION_SCRIPT,
+        ["chain-detach", "--container", "cid-1", "--brief-file", briefPath, "--appear-timeout", "10"],
+        { cwd: tmp, env },
       );
 
       assert.equal(res.status, 0, res.stdout);
@@ -5160,12 +5244,14 @@ setTimeout(() => {
       assert.equal(waitRes.status, 0, waitRes.stdout);
       assert.match(waitRes.stdout, /^chain chain-[a-z0-9]+: status=completed disposition=accept/m);
     } finally {
+      server?.close();
       fs.rmSync(tmp, { recursive: true, force: true });
     }
   });
 
   it("unambiguously selects the new chain when another chain pre-exists in the same workspace", async () => {
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-test-detach-concurrent-"));
+    let server;
     try {
       const briefPath = path.join(tmp, "brief.md");
       fs.writeFileSync(briefPath, VALID_BRIEF);
@@ -5216,10 +5302,16 @@ setTimeout(() => {
       env.KUSABI_TEST_STATE_DIR = workspaceStateDir;
       env.KUSABI_TEST_CHAIN_STANDIN = standinScript;
 
-      const res = spawnSync(
-        process.execPath,
-        [COMPANION_SCRIPT, "chain-detach", "--container", "cid-1", "--brief-file", briefPath, "--appear-timeout", "10"],
-        { encoding: "utf8", cwd: tmp, env },
+      // Answer the launch-time ## Smoke baseline (kusabi #513) with a clean
+      // container so the detach proceeds to spawn the stand-in.
+      const stub = await startDetachStub();
+      server = stub.server;
+      env.KUSABI_SUNABA_URL = stub.url;
+
+      const res = await runDetachAsync(
+        COMPANION_SCRIPT,
+        ["chain-detach", "--container", "cid-1", "--brief-file", briefPath, "--appear-timeout", "10"],
+        { cwd: tmp, env },
       );
 
       assert.equal(res.status, 0, res.stdout);
@@ -5239,6 +5331,7 @@ setTimeout(() => {
       assert.match(waitRes.stdout, /^chain chain-newer-002: status=completed/m);
       assert.doesNotMatch(waitRes.stdout, /chain-older-001/);
     } finally {
+      server?.close();
       fs.rmSync(tmp, { recursive: true, force: true });
     }
   });
@@ -5297,6 +5390,7 @@ describe("task-detach and task-wait CLI surface (kusabi #491)", () => {
 
   it("launches a detached task stand-in, prints log path and runnable task-wait command line", async () => {
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-test-task-detach-success-"));
+    let server;
     try {
       const briefPath = path.join(tmp, "brief.md");
       fs.writeFileSync(briefPath, VALID_BRIEF);
@@ -5331,10 +5425,16 @@ fs.writeFileSync(path.join(jobDir, "job.json"), JSON.stringify({
       env.KUSABI_TEST_STATE_DIR = workspaceStateDir;
       env.KUSABI_TEST_TASK_STANDIN = standinScript;
 
-      const res = spawnSync(
-        process.execPath,
-        [COMPANION_SCRIPT, "task-detach", "--phase", "review", "--container", "cid-1", "--brief-file", briefPath, "--appear-timeout", "10"],
-        { encoding: "utf8", cwd: tmp, env },
+      // Answer the launch-time ## Smoke baseline (kusabi #513) with a clean
+      // container so the detach proceeds to spawn the stand-in.
+      const stub = await startDetachStub();
+      server = stub.server;
+      env.KUSABI_SUNABA_URL = stub.url;
+
+      const res = await runDetachAsync(
+        COMPANION_SCRIPT,
+        ["task-detach", "--phase", "review", "--container", "cid-1", "--brief-file", briefPath, "--appear-timeout", "10"],
+        { cwd: tmp, env },
       );
 
       assert.equal(res.status, 0, res.stdout + res.stderr);
@@ -5342,6 +5442,7 @@ fs.writeFileSync(path.join(jobDir, "job.json"), JSON.stringify({
       assert.match(res.stdout, /Log: .*task-detach-\d+\.log/i);
       assert.match(res.stdout, /kusabi-companion task-wait/);
     } finally {
+      server?.close();
       fs.rmSync(tmp, { recursive: true, force: true });
     }
   });

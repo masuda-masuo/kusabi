@@ -193,9 +193,11 @@ export async function buildTaskReviewInput({ phase, flags, callTool = null }) {
  * session, tool restrictions and dispatch-time brief lint, returning the
  * resolved inputs a dispatch (cmdTask) or a detached spawn (cmdTaskDetach)
  * needs.  Anything that needs a live container (baseSha probe, smoke baseline,
- * review input) is intentionally NOT here: it is re-derived by the spawned
- * `task` process, so `task-detach` pre-flight must not require a reachable
- * container to validate the invocation.
+ * review input) is intentionally NOT here: the smoke baseline is measured by
+ * the CALLERS after this returns (cmdTask always, cmdTaskDetach only when
+ * --container is given) and is re-derived by the spawned `task` process, so
+ * this pre-flight must not require a reachable container to validate the
+ * invocation.
  *
  * @param {object} [opts]
  * @param {boolean} [opts.refuseOnLossySmoke=false] When true, call
@@ -412,7 +414,12 @@ export function extractTaskAndWaitArgs(flags, text) {
  * the exact task-wait command line to run for tracking.
  *
  * Performs pre-flight checks up front so invalid dispatches exit non-zero
- * without launching a child process or printing a wait command line.
+ * without launching a child process or printing a wait command line.  With
+ * --container the declared ## Smoke is also measured in the parent, before
+ * the log fd is opened (kusabi #513): a dispatch the spawned `task` would
+ * refuse must never have been announced as launched.  The child still
+ * re-measures it — the double run is deliberate.  Without --container there
+ * is nothing to measure and the command behaves exactly as before.
  */
 export async function cmdTaskDetach(cwd, { flags, text }, opts = {}) {
   if (process.env.KUSABI_WORKER_CONTEXT) {
@@ -427,6 +434,21 @@ export async function cmdTaskDetach(cwd, { flags, text }, opts = {}) {
   // Detach keeps lossy-smoke refusal so a broken ## Smoke never spawns a child.
   const pre = resolveTaskPreflight(cwd, { flags, text }, { ...opts, refuseOnLossySmoke: true });
   const { stateDir } = pre;
+  const container = flags.container;
+
+  // ---- smoke baseline refusal (kusabi #292, #513) ----
+  // cmdTask measures the declared ## Smoke before creating any job; detach
+  // must do the same in the parent, before the log fd is opened — a refusal
+  // that fires only inside the spawned `task` leaves the operator with a
+  // "Detached task launched" banner for a dispatch that never happened.
+  // Guarded by flags.container exactly like cmdTask guards its own call: no
+  // --container means nothing to measure, no probe and no container call.
+  // callTool is injectable (opts.callTool) for tests, mirroring opts.spawn.
+  if (container) {
+    const callTool = opts.callTool || (await import("./sunaba-rpc.mjs")).callTool;
+    const baselineRejection = await smokeBaselineReport({ brief: pre.text, callTool, container });
+    if (baselineRejection) throw new Error(baselineRejection);
+  }
 
   // Pre-flight checks passed! Create log file in stateDir
   fs.mkdirSync(stateDir, { recursive: true });

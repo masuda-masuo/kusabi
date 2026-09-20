@@ -8,9 +8,12 @@ import {
   __testProbeBindings,
   buildTaskReviewInput,
   cmdReview,
+  cmdTaskDetach,
   resolveTaskPreflight,
 } from "./task-cmd.mjs";
 import { stateDirFor } from "./state-paths.mjs";
+import { smokeBaselineReport } from "./chain-brief-guards.mjs";
+import { createFakeCallTool } from "./fixtures.mjs";
 
 // cmdTask probe binding regression test
 // ---------------------------------------------------------------------------
@@ -324,5 +327,123 @@ describe("resolveTaskPreflight lossy-smoke refusal option", () => {
     const detachBlock = source.slice(detachIdx, detachIdx + 900);
     assert.match(taskBlock, /refuseOnLossySmoke:\s*false/);
     assert.match(detachBlock, /refuseOnLossySmoke:\s*true/);
+  });
+});
+// cmdTaskDetach — smoke baseline refusal before spawn (kusabi #513)
+// ---------------------------------------------------------------------------
+// Same class as the chain-detach fix: the ## Smoke baseline refusal fired
+// only inside the spawned `task`, after the launcher had already printed the
+// "Detached task launched" banner.  task-detach now measures the declared
+// ## Smoke in the parent when --container is given (never without), before
+// the log fd is opened, with the same guard and refusal text the foreground
+// path prints.  The fakes drive the REAL smokeBaselineReport through
+// createFakeCallTool's exit codes.
+
+const DETACH_TASK_BRIEF =
+  "# Task\n\nOrchestrator: test-model | session s-1 | 2026-08-23\n\n" +
+  "## Smoke\n\n- `npm test`\n";
+
+describe("cmdTaskDetach smoke baseline refusal (kusabi #513)", () => {
+  function detachFixture() {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-test-taskdetach-"));
+    const cwd = path.join(tmp, "ws");
+    fs.mkdirSync(cwd, { recursive: true });
+    const prevStateEnv = process.env.KUSABI_STATE_DIR;
+    process.env.KUSABI_STATE_DIR = path.join(tmp, "state");
+    const stateDir = stateDirFor(cwd);
+    const spawnCalls = [];
+    const fakeSpawn = (cmd, args, options) => {
+      spawnCalls.push({ cmd, args, options });
+      return { pid: 424243, unref() {} };
+    };
+    return {
+      tmp,
+      cwd,
+      stateDir,
+      spawnCalls,
+      opts(callTool) {
+        return {
+          stateRoot: path.join(tmp, "state"),
+          now: "2026-09-20T00:00:00.000Z",
+          spawn: fakeSpawn,
+          callTool,
+        };
+      },
+      cleanup() {
+        if (prevStateEnv === undefined) delete process.env.KUSABI_STATE_DIR;
+        else process.env.KUSABI_STATE_DIR = prevStateEnv;
+        fs.rmSync(tmp, { recursive: true, force: true });
+      },
+    };
+  }
+
+  it("with --container: throws the exact smokeBaselineReport refusal and never spawns", async () => {
+    const fx = detachFixture();
+    try {
+      const callTool = createFakeCallTool({ exitCode: 1 });
+      const expected = await smokeBaselineReport({ brief: DETACH_TASK_BRIEF, callTool, container: "cid-1" });
+      assert.ok(expected, "a red smoke must produce a refusal from the real guard");
+      await assert.rejects(
+        () =>
+          cmdTaskDetach(
+            fx.cwd,
+            { flags: { container: "cid-1", phase: "review" }, text: DETACH_TASK_BRIEF },
+            fx.opts(callTool),
+          ),
+        (err) => {
+          assert.equal(
+            err.message,
+            expected,
+            "the refusal text must be exactly what smokeBaselineReport returned",
+          );
+          return true;
+        },
+      );
+      assert.equal(fx.spawnCalls.length, 0, "the injected spawn must never be called for a refused dispatch");
+    } finally {
+      fx.cleanup();
+    }
+  });
+
+  it("with --container: green ## Smoke spawns exactly once and returns the unchanged banner", async () => {
+    const fx = detachFixture();
+    try {
+      const callTool = createFakeCallTool({ exitCode: 0 });
+      const banner = await cmdTaskDetach(
+        fx.cwd,
+        { flags: { container: "cid-1", phase: "review" }, text: DETACH_TASK_BRIEF },
+        fx.opts(callTool),
+      );
+      assert.equal(fx.spawnCalls.length, 1, "a green baseline must spawn exactly once");
+      assert.match(banner, /^Detached task launched \(pid 424243\)\.$/m);
+      assert.match(banner, /Log: .*task-detach-\d+\.log/);
+      assert.match(
+        banner,
+        /kusabi-companion task-wait --next --since 2026-09-20T00:00:00\.000Z/,
+      );
+    } finally {
+      fx.cleanup();
+    }
+  });
+
+  it("without --container: never calls callTool and spawns exactly once", async () => {
+    const fx = detachFixture();
+    try {
+      const calls = [];
+      const spyCallTool = async (tool, params) => {
+        calls.push([tool, params]);
+        return { output: "" };
+      };
+      const banner = await cmdTaskDetach(
+        fx.cwd,
+        { flags: { phase: "review" }, text: DETACH_TASK_BRIEF },
+        fx.opts(spyCallTool),
+      );
+      assert.deepEqual(calls, [], "no --container must mean no container call at all");
+      assert.equal(fx.spawnCalls.length, 1, "without a probe the detach spawns exactly once");
+      assert.match(banner, /Detached task launched/);
+    } finally {
+      fx.cleanup();
+    }
   });
 });
