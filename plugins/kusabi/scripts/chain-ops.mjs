@@ -44,7 +44,7 @@ import { renderChainShow } from "./render.mjs";
 import { serverHealthy, api } from "./serve-lifecycle.mjs";
 import { parseSmoke } from "./brief-parsing.mjs";
 import { countUnfilledReviewRecords } from "./review-record-scan.mjs";
-import { captureVerifyBaseline } from "./chain-phases.mjs";
+import { captureVerifyBaseline, mintChainId, assertChainIdShape, assertChainIdAvailable } from "./chain-phases.mjs";
 import { sessionProvenanceRefusal } from "./chain-cmd.mjs";
 import {
   smokeBaselineReport,
@@ -482,8 +482,6 @@ export function extractChainAndWaitArgs(flags, text) {
  * above all) must never have been announced as launched.
  */
 export async function cmdChainDetach(cwd, { flags, text }, opts = {}) {
-  const startedAtIso = (opts.now ? new Date(opts.now) : new Date()).toISOString();
-
   // ---- brief-file resolution ----
   const briefText = readBriefFile(flags, text);
   if (!briefText) {
@@ -500,9 +498,33 @@ export async function cmdChainDetach(cwd, { flags, text }, opts = {}) {
   const smokeRejection = smokeViolationReport(briefText);
   if (smokeRejection) throw new Error(smokeRejection);
 
+  // ---- chain-id validation (kusabi #514) ----
+  // The chain id becomes a path segment under chains/, so a value containing
+  // `/`, `..` or a NUL must never reach path.join.  Refuse at the same stage
+  // as the other dispatch refusals — before stateDirFor and before the log
+  // fd is opened, so a malformed id causes no filesystem write at all.
+  const chainIdFlag = flags["chain-id"];
+  if (chainIdFlag !== undefined) {
+    assertChainIdShape(chainIdFlag);
+  }
+
   // ---- setup ----
   const stateRootDir = opts.stateRoot || stateRoot();
   const stateDir = stateDirFor(cwd);
+
+  // ---- chain identity + existence refusal (kusabi #514) ----
+  // The id is minted in the parent (or was supplied and validated above) so
+  // the wait line can name the chain before the child has created it.  It is
+  // resolved HERE, before the log fd is opened and before spawn: an id whose
+  // chains/<id> directory already exists would be refused by the child's
+  // createChainDir, and a wait line whose subject already exists latches onto
+  // the pre-existing chain — a false completion for a launch that was
+  // refused.  Same invariant as the #513 baseline refusal above: a dispatch
+  // the child would refuse must never have been announced as launched.  The
+  // child keeps its own check as the TOCTOU backstop.
+  const chainId = flags["chain-id"] ?? (opts.mintChainId ? opts.mintChainId() : mintChainId());
+  assertChainIdAvailable(stateDir, chainId);
+
   const config = loadConfig(stateRootDir);
 
   const initialSessionOwner = flags.session
@@ -553,6 +575,13 @@ export async function cmdChainDetach(cwd, { flags, text }, opts = {}) {
 
   const { chainArgs, waitFlags } = extractChainAndWaitArgs(flags, text);
 
+  // A caller-supplied --chain-id was validated and resolved above and is
+  // already in chainArgs (extractChainAndWaitArgs forwards it to the child);
+  // a minted id is appended here, exactly once.
+  if (flags["chain-id"] === undefined) {
+    chainArgs.push("--chain-id", chainId);
+  }
+
   const standin = opts.standin || process.env.KUSABI_TEST_CHAIN_STANDIN;
   const spawnCmd = process.execPath;
   const spawnArgs = standin
@@ -569,8 +598,11 @@ export async function cmdChainDetach(cwd, { flags, text }, opts = {}) {
   if (child.unref) child.unref();
   fs.closeSync(logFd);
 
-  const since = flags.since || startedAtIso;
-  let waitCmd = `kusabi-companion chain-wait --next --since ${since}`;
+  // The wait line names the chain instead of selecting by recency: the id
+  // was minted (or validated) in the parent, so `chain-wait <id>` waits on
+  // exactly the chain this launcher spawned — no --next, no --since, and no
+  // recency race with another orchestrator working the same cwd.
+  let waitCmd = `kusabi-companion chain-wait ${chainId}`;
   if (waitFlags["appear-timeout"]) {
     waitCmd += ` --appear-timeout ${waitFlags["appear-timeout"]}`;
   }
