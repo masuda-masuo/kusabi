@@ -26,7 +26,7 @@ import {
   WRITE_TOOL_NAMES,
   backendSupportsResume,
 } from "./cli.mjs";
-import { renderReview, renderHeader } from "./render.mjs";
+import { renderReview, renderHeader, probeVerdictLabel } from "./render.mjs";
 import {
   hasSectionHeading,
   parseDeliverables,
@@ -688,7 +688,7 @@ export async function cmdTask(cwd, { flags, text, _dispatch = null }, opts = {})
     for (const p of job.probeResults) {
       let detail = p.detail || "";
       if (detail.length > 300) detail = detail.slice(0, 300) + "...";
-      taskOutput += "\n  " + p.probe + " — " + (p.passed ? "PASS" : "FAIL");
+      taskOutput += "\n  " + p.probe + " — " + probeVerdictLabel(p);
       if (detail) taskOutput += " (" + detail + ")";
     }
   }

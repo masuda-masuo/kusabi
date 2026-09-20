@@ -88,6 +88,23 @@ export function roundChangedColumn(round) {
 }
 
 /**
+ * The verdict label to SHOW for a probe result (kusabi #517).
+ *
+ * A probe that passed but carries a `limitation` did not actually check
+ * anything (today: P6 when either collected count is unavailable) — it must
+ * not read as "PASS".  One shared describer owns the label, exactly like
+ * roundDiscardReason / roundChangedColumn; no renderer keeps its own copy of
+ * the condition.
+ *
+ * @param {object|null|undefined} probe
+ * @returns {"UNCHECKED"|"PASS"|"FAIL"}
+ */
+export function probeVerdictLabel(probe) {
+  if (probe && probe.passed === true && probe.limitation) return "UNCHECKED";
+  return probe && probe.passed ? "PASS" : "FAIL";
+}
+
+/**
  * Resolve the status label for a chain by combining the control record
  * (explicit lifecycle status) with the round-derived disposition when the
  * control record is absent (old chains from before stop-lever).
@@ -420,7 +437,7 @@ export function renderChainShow(chain, rounds, unreadable = [], control = null, 
     const probes = round.probeResults || [];
     if (probes.length > 0) {
       for (const probe of probes) {
-        const status = probe.passed ? "PASS" : "FAIL";
+        const status = probeVerdictLabel(probe);
         let detailSuffix = "";
         if (probe.detail) {
           let parsed = null;

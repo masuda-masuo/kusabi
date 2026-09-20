@@ -966,6 +966,20 @@ describe("runCollectedProbe (P6)", () => {
     assert.equal(more.detail, "collected 620 >= baseline 607");
   });
 
+  it("comparison-capable passes carry no limitation, missing-count passes carry exactly passed+limitation (kusabi #517)", () => {
+    // The renderers key on `passed === true && limitation` to print UNCHECKED
+    // instead of PASS.  Pin both sides of that contract here: a real P6 pass
+    // must have NO limitation (→ PASS), and a missing-count pass must have
+    // passed true, a truthy limitation, and no oracleViolation (→ UNCHECKED).
+    const comparable = runCollectedProbe({ collected: 607, baselineCollected: 607 });
+    assert.equal(comparable.limitation, undefined);
+
+    const missing = runCollectedProbe({ collected: null, baselineCollected: 607 });
+    assert.equal(missing.passed, true);
+    assert.ok(missing.limitation);
+    assert.equal(missing.oracleViolation, undefined);
+  });
+
   it("fails and names both numbers when the round ran fewer tests", () => {
     // The kusabi #197 incident: a dependency drift made 273 of 607 tests
     // uncollectable while verify stayed green.

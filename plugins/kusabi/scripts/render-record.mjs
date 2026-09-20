@@ -1,6 +1,6 @@
 // Postable review record rendering.
 
-import { roundChangedColumn } from "./render-chain.mjs";
+import { roundChangedColumn, probeVerdictLabel } from "./render-chain.mjs";
 
 // =========================================================================
 // Review record rendering (kusabi #52)
@@ -135,7 +135,7 @@ function reviewRecordFinishedAt(record) {
 function reviewRecordProbeLine(probe) {
   if (!probe || typeof probe !== "object") return "? — unknown";
   const name = probe.probe || "probe";
-  const status = probe.passed ? "PASS" : "FAIL";
+  const status = probeVerdictLabel(probe);
   let detail = "";
   if (probe.detail) {
     let parsed = null;
