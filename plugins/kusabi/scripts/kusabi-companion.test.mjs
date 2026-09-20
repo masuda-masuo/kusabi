@@ -4473,11 +4473,15 @@ describe("brief lint and container delivery (kusabi #289)", () => {
       assert.ok(lintAt < cmdTaskSource.indexOf("await dispatch({"), "the lint precedes the dispatch");
     });
 
-    it("cmdChain lints before any chain state exists", () => {
+    it("the chain lifecycle lints before any chain state exists", () => {
+      // Since kusabi #526 the fresh-chain sequence lives in
+      // runChainLifecycle (cmdChain delegates); the property pinned -- the
+      // lint precedes createChainDir -- is unchanged, asserted against the
+      // function that owns it.
       const chainCmdSource = fs.readFileSync(path.join(import.meta.dirname, "chain-cmd.mjs"), "utf8");
-      const cmdChainSource = chainCmdSource.slice(chainCmdSource.indexOf("export async function cmdChain("));
+      const cmdChainSource = chainCmdSource.slice(chainCmdSource.indexOf("export async function runChainLifecycle("));
       const lintAt = cmdChainSource.indexOf("briefLintReport(");
-      assert.ok(lintAt > 0, "cmdChain must call the lint");
+      assert.ok(lintAt > 0, "runChainLifecycle must call the lint");
       assert.ok(lintAt < cmdChainSource.indexOf("createChainDir(stateDir, chainIdFlag ?? null)"), "the lint precedes createChainDir");
     });
   });
