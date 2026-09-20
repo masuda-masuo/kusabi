@@ -63,13 +63,113 @@ import {
 // =========================================================================
 
 /**
- * Create a new chain directory and return its identity.
+ * Mint a fresh chain id in the shape the chain directories use.
+ *
+ * Extracted from createChainDir (kusabi #514): chain-detach mints the id in
+ * the PARENT so it can hand the id back to the caller before the child has
+ * even created the directory — `chain-wait <id>` then waits for the chain
+ * by name instead of selecting by recency (--next), which keyed on cwd and
+ * let two orchestrators working the same repo select each other's chains.
  */
-export function createChainDir(stateDir) {
-  const chainId = `chain-${Date.now().toString(36)}${crypto.randomBytes(2).toString("hex")}`;
-  const chainDir = path.join(stateDir, "chains", chainId);
-  fs.mkdirSync(chainDir, { recursive: true });
-  return { chainId, chainDir };
+export function mintChainId() {
+  return `chain-${Date.now().toString(36)}${crypto.randomBytes(2).toString("hex")}`;
+}
+
+/**
+ * Validate an externally supplied chain id against the shape mintChainId
+ * produces.
+ *
+ * This is a security boundary, not a tidiness check: the id becomes a path
+ * segment under `chains/`, so a value containing `/`, `..` or a NUL must
+ * never reach path.join.  The shape check rejects all of them by
+ * construction — only lowercase letters and digits may follow `chain-`.
+ *
+ * @param {string} chainId
+ * @throws {Error} when the id does not match the generator's shape.
+ */
+export function assertChainIdShape(chainId) {
+  if (typeof chainId !== "string" || !/^chain-[a-z0-9]+$/.test(chainId)) {
+    throw new Error(
+      `invalid chain id: ${JSON.stringify(chainId)} — a chain id must match ` +
+      `chain-[a-z0-9]+ (it becomes a path segment under chains/, so /, .. and ` +
+      `other separators are refused)`,
+    );
+  }
+}
+
+/**
+ * The refusal for a chain id whose directory already exists.
+ *
+ * One wording, shared by createChainDir and cmdChainDetach (kusabi #514
+ * finding 1): the detach launcher must refuse a pre-existing id in the
+ * PARENT with the same words the child's createChainDir would have used,
+ * so the operator meets one refusal text wherever it fires.
+ *
+ * @param {string} chainId
+ * @returns {string}
+ */
+export function chainIdExistsMessage(chainId) {
+  return (
+    `chain id already exists: ${chainId} — two chains sharing a directory would ` +
+    `interleave round records. Pick a fresh --chain-id or inspect the existing ` +
+    `chain with chain-show ${chainId}.`
+  );
+}
+
+/**
+ * Refuse an id whose chains/<id> directory already exists.
+ *
+ * Used by the detach launcher in the parent (finding 1) and by
+ * createChainDir's own fast path; the EEXIST catch in createChainDir is the
+ * atomic backstop that makes the guarantee under a check-then-act race
+ * (finding 2).  The id must already be shape-validated — it is joined onto
+ * the chains/ path.
+ *
+ * @param {string} stateDir
+ * @param {string} chainId
+ * @throws {Error} with chainIdExistsMessage when the directory exists.
+ */
+export function assertChainIdAvailable(stateDir, chainId) {
+  if (fs.existsSync(path.join(stateDir, "chains", chainId))) {
+    throw new Error(chainIdExistsMessage(chainId));
+  }
+}
+
+/**
+ * Create a chain directory and return its identity.
+ *
+ * A supplied chainId (kusabi #514) is validated against the minted shape and
+ * refused when its directory already exists — two chains sharing a
+ * directory would interleave round records, so the id must be fresh.  When
+ * no id is supplied one is minted.
+ *
+ * The refusal is enforced by an atomic claim, not a check-then-act
+ * (finding 2): chains/ is created recursively, then the chain directory
+ * itself is created with a NON-recursive mkdir that throws EEXIST on an
+ * existing directory — so two dispatches that pass the existsSync fast path
+ * in the same window cannot both "create" it and interleave round records.
+ *
+ * @param {string} stateDir
+ * @param {string|null} [chainId] — externally supplied id; minted when null.
+ * @returns {{ chainId: string, chainDir: string }}
+ */
+export function createChainDir(stateDir, chainId = null) {
+  const id = chainId ?? mintChainId();
+  assertChainIdShape(id);
+  const chainDir = path.join(stateDir, "chains", id);
+  // Fast path for the friendlier error before any write; the EEXIST catch
+  // below is what must make the guarantee.
+  assertChainIdAvailable(stateDir, id);
+  fs.mkdirSync(path.join(stateDir, "chains"), { recursive: true });
+  try {
+    fs.mkdirSync(chainDir);
+  } catch (err) {
+    if (err?.code === "EEXIST") {
+      throw new Error(chainIdExistsMessage(id));
+    }
+    throw err;
+  }
+  return { chainId: id, chainDir };
 }
 
 /**

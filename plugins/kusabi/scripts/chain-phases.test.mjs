@@ -1,11 +1,15 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import {
   runReviewPhase,
 } from "./chain-review.mjs";
 import {
   resolveRoundResume,
   captureVerifyBaseline,
+  createChainDir,
 } from "./chain-phases.mjs";
 import { renderPriorFindings } from "./render.mjs";
 
@@ -331,3 +335,77 @@ describe("phase functions carry the failure classification (kusabi #215)", () =>
 // A review finding claiming otherwise was refuted by mutating the operator and
 // observing that no test changed colour.
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// createChainDir — atomic claim of the chain directory (kusabi #514 finding 2)
+// ---------------------------------------------------------------------------
+// The exists-refusal used to be check-then-act: `existsSync` then a recursive
+// mkdir that succeeds silently on an existing directory, so two dispatches
+// that passed the check in the same window both "created" the chain and
+// interleaved round records.  The directory is now claimed with a
+// NON-recursive mkdir that throws EEXIST, and the EEXIST catch throws the
+// same refusal message as the fast path.
+
+describe("createChainDir (kusabi #514 finding 2)", () => {
+  it("refuses a supplied id whose directory already exists", () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-test-createchaindir-"));
+    try {
+      const stateDir = path.join(tmp, "state");
+      fs.mkdirSync(path.join(stateDir, "chains", "chain-taken"), { recursive: true });
+      assert.throws(
+        () => createChainDir(stateDir, "chain-taken"),
+        /chain id already exists: chain-taken/,
+      );
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("throws the refusal message when the create hits EEXIST after the check passed (the race)", () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-test-createchaindir-"));
+    try {
+      const stateDir = path.join(tmp, "state");
+      const chainDir = path.join(stateDir, "chains", "chain-race");
+      // Another dispatcher "wins" the window: the directory is already there.
+      fs.mkdirSync(chainDir, { recursive: true });
+
+      const realExistsSync = fs.existsSync;
+      const realMkdirSync = fs.mkdirSync;
+      // The fast-path check sees nothing (check and create race); the
+      // non-recursive create then hits EEXIST, exactly as when another
+      // process claims the directory between our check and our mkdir.
+      fs.existsSync = (p) => (p === chainDir ? false : realExistsSync(p));
+      fs.mkdirSync = (dir, opts) => {
+        if (dir === chainDir && opts === undefined) {
+          throw Object.assign(new Error(`EEXIST: file already exists, mkdir '${dir}'`), { code: "EEXIST" });
+        }
+        return realMkdirSync(dir, opts);
+      };
+      try {
+        assert.throws(
+          () => createChainDir(stateDir, "chain-race"),
+          // The refusal message, never a raw EEXIST escaping to the caller.
+          /chain id already exists: chain-race/,
+        );
+      } finally {
+        fs.existsSync = realExistsSync;
+        fs.mkdirSync = realMkdirSync;
+      }
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("creates chains/<id> when chains/ itself does not exist yet", () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-test-createchaindir-"));
+    try {
+      const stateDir = path.join(tmp, "state"); // neither state/ nor chains/ exist
+      const { chainId, chainDir } = createChainDir(stateDir, "chain-first");
+      assert.equal(chainId, "chain-first");
+      assert.equal(chainDir, path.join(stateDir, "chains", "chain-first"));
+      assert.equal(fs.existsSync(chainDir), true);
+      assert.equal(fs.existsSync(path.join(stateDir, "chains")), true);
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+});

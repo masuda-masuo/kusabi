@@ -32,6 +32,7 @@ import { latestJob, listJobs } from "./job-store.mjs";
 import { resetFailedRoutes } from "./prompt-execution.mjs";
 import {
   createChainDir,
+  assertChainIdShape,
   captureBaseSha,
   captureVerifyBaseline,
 } from "./chain-phases.mjs";
@@ -187,6 +188,16 @@ export async function cmdChain(cwd, { flags, text }) {
   const smokeRejection = smokeViolationReport(text);
   if (smokeRejection) throw new Error(smokeRejection);
 
+  // ---- chain-id validation (kusabi #514) ----
+  // The chain id becomes a path segment under chains/, so a value containing
+  // `/`, `..` or a NUL must never reach path.join.  Refuse at the same stage
+  // as the other dispatch refusals — before stateDirFor, so a malformed id
+  // causes no filesystem write at all.
+  const chainIdFlag = flags["chain-id"];
+  if (chainIdFlag !== undefined) {
+    assertChainIdShape(chainIdFlag);
+  }
+
   // ---- setup ----
   const stateDir = stateDirFor(cwd);
   const config = loadConfig(stateRoot());
@@ -317,7 +328,7 @@ export async function cmdChain(cwd, { flags, text }) {
   });
   if (baselineRejection) throw new Error(baselineRejection);
 
-  const { chainId, chainDir } = createChainDir(stateDir);
+  const { chainId, chainDir } = createChainDir(stateDir, chainIdFlag ?? null);
   const maxRounds = Number(flags["max-rounds"] ?? 4); // B6: default maxRounds is 4
   const brief = text;
 

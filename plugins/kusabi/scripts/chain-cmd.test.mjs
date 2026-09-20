@@ -2,7 +2,10 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
-import { sessionProvenanceRefusal, renderChainBanner } from "./chain-cmd.mjs";
+import os from "node:os";
+import crypto from "node:crypto";
+import { sessionProvenanceRefusal, renderChainBanner, cmdChain } from "./chain-cmd.mjs";
+import { createChainDir } from "./chain-phases.mjs";
 import { effectiveTierCount } from "./chain-driver.mjs";
 
 // sessionProvenanceRefusal — the agy --session chain-start gate (kusabi #321)
@@ -221,4 +224,158 @@ describe("session-provenance wiring (kusabi #321)", () => {
     assert.ok(chainCmdSource.includes("sessionProvenanceRefusal("), "the gate exists in chain-cmd");
   });
 });
+// ---------------------------------------------------------------------------
+// cmdChain --chain-id (kusabi #514)
+// ---------------------------------------------------------------------------
+// The chain id becomes a path segment under chains/, so a malformed value is
+// refused at the dispatch-refusal stage (before any filesystem write) and a
+// supplied id is honoured by createChainDir instead of minting a fresh one.
+// These tests use a brief WITHOUT a ## Smoke section: the baseline guard then
+// returns null without a single container call (chain-brief-guards.mjs), so
+// the refusal paths are reachable with no RPC seam at all.
 
+const CHAIN_BRIEF_NO_SMOKE =
+  "# Task\n\nOrchestrator: test-model | session s-1 | 2026-08-23\n\n" +
+  "## Deliverables\n\n- `plugins/kusabi/scripts/x.mjs`\n";
+
+describe("cmdChain --chain-id (kusabi #514)", () => {
+  const chainCmdSource = fs.readFileSync(path.join(import.meta.dirname, "chain-cmd.mjs"), "utf8");
+
+  function functionSource(source, anchor) {
+    const start = source.indexOf(anchor);
+    assert.ok(start >= 0, `anchor not found: ${anchor}`);
+    const end = source.indexOf("\nexport ", start + anchor.length);
+    return source.slice(start, end === -1 ? undefined : end);
+  }
+
+  function chainFixture() {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-test-chaincmd-"));
+    const cwd = path.join(tmp, "ws");
+    fs.mkdirSync(cwd, { recursive: true });
+    const prevStateEnv = process.env.KUSABI_STATE_DIR;
+    process.env.KUSABI_STATE_DIR = path.join(tmp, "state");
+    const stateRootDir = path.join(tmp, "state");
+    const hash = crypto.createHash("sha256").update(cwd).digest("hex").slice(0, 12);
+    const stateDir = path.join(stateRootDir, hash);
+    return {
+      tmp,
+      cwd,
+      stateDir,
+      cleanup() {
+        if (prevStateEnv === undefined) delete process.env.KUSABI_STATE_DIR;
+        else process.env.KUSABI_STATE_DIR = prevStateEnv;
+        fs.rmSync(tmp, { recursive: true, force: true });
+      },
+    };
+  }
+
+  it("createChainDir honours a supplied id: exactly chains/<id> and no other chain directory", () => {
+    const fx = chainFixture();
+    try {
+      const { chainId, chainDir } = createChainDir(fx.stateDir, "chain-fixed");
+      assert.equal(chainId, "chain-fixed");
+      assert.equal(chainDir, path.join(fx.stateDir, "chains", "chain-fixed"));
+      assert.equal(fs.existsSync(chainDir), true);
+      assert.deepEqual(
+        fs.readdirSync(path.join(fx.stateDir, "chains")),
+        ["chain-fixed"],
+        "no other chain directory may exist",
+      );
+      // The minted path produces a fresh id of the same shape.
+      const minted = createChainDir(fx.stateDir);
+      assert.match(minted.chainId, /^chain-[a-z0-9]+$/);
+      assert.equal(fs.readdirSync(path.join(fx.stateDir, "chains")).length, 2);
+    } finally {
+      fx.cleanup();
+    }
+  });
+
+  it("cmdChain threads --chain-id into createChainDir, validated before any filesystem write", () => {
+    const body = functionSource(chainCmdSource, "export async function cmdChain(");
+    const flagAt = body.indexOf('flags["chain-id"]');
+    const assertAt = body.indexOf("assertChainIdShape(");
+    const createAt = body.indexOf("createChainDir(");
+    const stateDirAt = body.indexOf("stateDirFor(");
+    assert.ok(flagAt > 0, "cmdChain must read the --chain-id flag");
+    assert.ok(assertAt > 0, "cmdChain must validate the id shape");
+    assert.ok(createAt > 0, "cmdChain must still create the chain dir");
+    assert.ok(flagAt < stateDirAt, "the flag is read before any filesystem write");
+    assert.ok(assertAt < stateDirAt, "the shape check precedes any filesystem write");
+    assert.ok(assertAt < createAt, "the shape check precedes the dir creation");
+    assert.ok(
+      body.includes("createChainDir(stateDir, chainIdFlag ?? null)"),
+      "the supplied id must reach createChainDir",
+    );
+  });
+
+  it("cmdChain refuses a --chain-id whose directory already exists, with no job and no round state", async () => {
+    const fx = chainFixture();
+    try {
+      const chainsDir = path.join(fx.stateDir, "chains");
+      const chainPre = path.join(chainsDir, "chain-pre");
+      fs.mkdirSync(chainPre, { recursive: true });
+      const control = {
+        chainId: "chain-pre", container: "cid-0", pid: 1, status: "running", round: 1,
+        startedAt: "2026-08-16T00:00:00.000Z",
+      };
+      const controlPath = path.join(chainPre, "control.json");
+      fs.writeFileSync(controlPath, JSON.stringify(control, null, 2));
+
+      await assert.rejects(
+        () =>
+          cmdChain(fx.cwd, {
+            flags: { container: "cid-1", "chain-id": "chain-pre" },
+            text: CHAIN_BRIEF_NO_SMOKE,
+          }),
+        /chain id already exists: chain-pre/,
+      );
+
+      // The existing chain is untouched: no re-use, no rewrite.
+      assert.deepEqual(JSON.parse(fs.readFileSync(controlPath, "utf8")), control);
+      // No job and no round state were created by the refused invocation.
+      assert.deepEqual(
+        fs.readdirSync(path.join(fx.stateDir, "jobs")),
+        [],
+        "no job record may be created by a refused invocation",
+      );
+      assert.equal(
+        fs.existsSync(path.join(chainPre, "chain.json")),
+        false,
+        "no round state may be created",
+      );
+      assert.deepEqual(
+        fs.readdirSync(chainsDir),
+        ["chain-pre"],
+        "no other chain directory may be created",
+      );
+    } finally {
+      fx.cleanup();
+    }
+  });
+
+  it("cmdChain refuses a malformed --chain-id before any filesystem write, parent untouched", async () => {
+    for (const bad of ["../escape", "chain-a/b", "nope", ""]) {
+      const fx = chainFixture();
+      try {
+        await assert.rejects(
+          () =>
+            cmdChain(fx.cwd, {
+              flags: { container: "cid-1", "chain-id": bad },
+              text: CHAIN_BRIEF_NO_SMOKE,
+            }),
+          /invalid chain id/,
+        );
+        // The refusal fires before stateDirFor: nothing at all was written,
+        // so the parent of chains/ is untouched — ../escape cannot land
+        // anywhere, it never even becomes a string passed to path.join.
+        assert.equal(
+          fs.existsSync(fx.stateDir),
+          false,
+          `no state directory may be created for --chain-id ${JSON.stringify(bad)}`,
+        );
+      } finally {
+        fx.cleanup();
+      }
+    }
+  });
+});

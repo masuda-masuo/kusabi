@@ -398,10 +398,10 @@ describe("waitForChain on a running chain", () => {
 });
 
 // ---------------------------------------------------------------------------
-// waitForChain — unknown chain id
+// waitForChain — named chain id
 // ---------------------------------------------------------------------------
 
-describe("waitForChain on an unknown chain id", () => {
+describe("waitForChain named on a chain id", () => {
   let tmp;
   let chainsDir;
 
@@ -413,17 +413,63 @@ describe("waitForChain on an unknown chain id", () => {
     fs.rmSync(tmp, { recursive: true, force: true });
   });
 
-  it("fails immediately, naming the id and the state root it searched", async () => {
+  it("waits for a named chain whose directory appears after a few poll intervals (kusabi #514)", async () => {
+    // chain-detach hands the id back the instant it spawns the child, while
+    // the child creates chains/<id> only after its own pre-flight — "not
+    // there yet" is the normal shape of a wait started right after the
+    // launcher returned, so the wait polls instead of throwing.
+    let sleeps = 0;
+    const sleep = async () => {
+      sleeps += 1;
+      if (sleeps === 2) {
+        const dir = makeChainDir(chainsDir, "chain-late");
+        writeControl(dir, runningControl("chain-late"));
+      }
+      if (sleeps === 3) {
+        writeControl(path.join(chainsDir, "chain-late"), { ...runningControl("chain-late"), status: "completed" });
+      }
+    };
+
+    const result = await waitForChain({
+      chainsDir, chainId: "chain-late", sleep, probeProcess: ALIVE, pollIntervalMs: 1, appearTimeoutMs: 60_000,
+    });
+    assert.equal(result.chainId, "chain-late");
+    assert.equal(result.status, "completed");
+    assert.equal(sleeps, 3, "the wait polls until the chain appears and completes");
+  });
+
+  it("throws no-chain-appeared when a named chain never appears, naming the id and the launcher-died possibility (kusabi #514)", async () => {
+    // The refusal of a refused dispatch exits non-zero in the parent since
+    // kusabi #513, so a named chain that never appears means the spawned
+    // child died — the message must say so, not just report an absence.
     await assert.rejects(
-      () => waitForChain({ chainsDir, chainId: "chain-ghost", sleep: NEVER_SLEEP, probeProcess: ALIVE }),
+      () => waitForChain({
+        chainsDir, chainId: "chain-ghost", appearTimeoutMs: 30_000, pollIntervalMs: 1,
+        sleep: async () => {}, probeProcess: ALIVE, now: steppingClock(10_000),
+      }),
       (err) => {
         assert.ok(err instanceof ChainWaitError);
-        assert.equal(err.code, "unknown-chain");
+        assert.equal(err.code, "no-chain-appeared");
         assert.match(err.message, /chain-ghost/);
+        assert.match(err.message, /pre-flight/);
+        assert.match(err.message, /child died/);
         assert.ok(err.message.includes(chainsDir), err.message);
         return true;
       },
     );
+  });
+
+  it("refuses a malformed id as usage without sleeping once (kusabi #514)", async () => {
+    for (const bad of ["../escape", "chain-a/b", "nope"]) {
+      await assert.rejects(
+        () => waitForChain({ chainsDir, chainId: bad, sleep: NEVER_SLEEP, probeProcess: ALIVE }),
+        (err) => {
+          assert.equal(err.code, "usage");
+          assert.match(err.message, new RegExp(bad.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+          return true;
+        },
+      );
+    }
   });
 
   it("refuses a wait with no chain id and no --next", async () => {
@@ -431,6 +477,36 @@ describe("waitForChain on an unknown chain id", () => {
       () => waitForChain({ chainsDir, sleep: NEVER_SLEEP, probeProcess: ALIVE }),
       (err) => err.code === "usage",
     );
+  });
+
+  it("never trades a named recordless chain away when a newer chain appears (kusabi #514)", async () => {
+    // --next may switch away from a recordless dir to a newer chain (kusabi
+    // #309), but a NAMED chain is the caller's explicit choice: while it
+    // stays recordless the wait keeps holding it even when another chain
+    // appears, and bounds it with the appear window.
+    makeChainDir(chainsDir, "chain-named-empty");
+    let sleeps = 0;
+    const sleep = async () => {
+      sleeps += 1;
+      if (sleeps === 1) {
+        const dir = makeChainDir(chainsDir, "chain-newcomer");
+        writeControl(dir, { ...runningControl("chain-newcomer"), status: "completed" });
+      }
+    };
+
+    await assert.rejects(
+      () => waitForChain({
+        chainsDir, chainId: "chain-named-empty", sleep, probeProcess: ALIVE,
+        pollIntervalMs: 1, appearTimeoutMs: 10_000, now: steppingClock(4_000),
+      }),
+      (err) => {
+        assert.equal(err.code, "stalled");
+        assert.match(err.message, /chain-named-empty/);
+        assert.match(err.message, /no control record/);
+        return true;
+      },
+    );
+    assert.ok(sleeps >= 1, "a newer chain appeared mid-wait and was never selected");
   });
 });
 
@@ -1171,10 +1247,15 @@ describe("chain-wait CLI", () => {
     assert.match(result.stdout, /chain chain-cli: status=completed disposition=accept rounds=1/);
   });
 
-  it("exits non-zero on an unknown chain id, naming it and the state root", () => {
-    const result = run(["chain-wait", "chain-nope"]);
+  it("exits non-zero when a named chain never appears, naming it and the state root (kusabi #514)", () => {
+    // A named wait on a chain that never materialises used to throw
+    // "unknown chain" immediately; since kusabi #514 it polls for the chain
+    // to appear (the id is handed back before the child created the dir) and
+    // fails within the appear window with the launcher-died wording.  The
+    // window is shrunk here so the test does not wait the 120s default.
+    const result = run(["chain-wait", "chain-nope", "--appear-timeout", "1", "--poll-interval", "1"]);
     assert.equal(result.status, 1, result.stdout);
-    assert.match(result.stdout, /unknown chain: chain-nope/);
+    assert.match(result.stdout, /no chain appeared within 1s for chain chain-nope/);
     assert.match(result.stdout, /chains/);
   });
 

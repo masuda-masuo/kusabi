@@ -4478,7 +4478,7 @@ describe("brief lint and container delivery (kusabi #289)", () => {
       const cmdChainSource = chainCmdSource.slice(chainCmdSource.indexOf("export async function cmdChain("));
       const lintAt = cmdChainSource.indexOf("briefLintReport(");
       assert.ok(lintAt > 0, "cmdChain must call the lint");
-      assert.ok(lintAt < cmdChainSource.indexOf("createChainDir(stateDir)"), "the lint precedes createChainDir");
+      assert.ok(lintAt < cmdChainSource.indexOf("createChainDir(stateDir, chainIdFlag ?? null)"), "the lint precedes createChainDir");
     });
   });
 
@@ -5182,10 +5182,12 @@ describe("chain-detach CLI", () => {
         standinScript,
         `import fs from "node:fs";
 import path from "node:path";
-import crypto from "node:crypto";
 
 const stateDir = process.env.KUSABI_TEST_STATE_DIR;
-const chainId = "chain-" + Date.now().toString(36) + crypto.randomBytes(2).toString("hex");
+// The launcher mints the id and passes it via --chain-id (kusabi #514); the
+// stand-in honours it like the real child would.
+const argIndex = process.argv.indexOf("--chain-id");
+const chainId = argIndex >= 0 ? process.argv[argIndex + 1] : "chain-" + Date.now().toString(36);
 const chainDir = path.join(stateDir, "chains", chainId);
 fs.mkdirSync(chainDir, { recursive: true });
 
@@ -5229,9 +5231,9 @@ setTimeout(() => {
       assert.equal(res.status, 0, res.stdout);
       assert.match(res.stdout, /Detached chain launched \(pid \d+\)/);
       assert.match(res.stdout, /Log: .*chain-detach-\d+\.log/);
-      assert.match(res.stdout, /kusabi-companion chain-wait --next --since \d{4}-\d{2}-\d{2}T.* --appear-timeout 10/);
+      assert.match(res.stdout, /kusabi-companion chain-wait chain-[a-z0-9]+ --appear-timeout 10/);
 
-      const waitCmdMatch = res.stdout.match(/kusabi-companion (chain-wait --next --since \S+ --appear-timeout \d+)/);
+      const waitCmdMatch = res.stdout.match(/kusabi-companion (chain-wait chain-[a-z0-9]+ --appear-timeout \d+)/);
       assert.ok(waitCmdMatch, "wait command found in stdout");
       const waitArgs = waitCmdMatch[1].split(/\s+/);
 
@@ -5242,14 +5244,16 @@ setTimeout(() => {
       );
 
       assert.equal(waitRes.status, 0, waitRes.stdout);
+      // The named wait resolves the chain the launcher actually spawned.
       assert.match(waitRes.stdout, /^chain chain-[a-z0-9]+: status=completed disposition=accept/m);
+      assert.doesNotMatch(waitRes.stdout, /--next|--since/);
     } finally {
       server?.close();
       fs.rmSync(tmp, { recursive: true, force: true });
     }
   });
 
-  it("unambiguously selects the new chain when another chain pre-exists in the same workspace", async () => {
+  it("names the launched chain in the wait line, so a pre-existing chain in the same workspace cannot be confused with it (kusabi #514)", async () => {
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-test-detach-concurrent-"));
     let server;
     try {
@@ -5273,10 +5277,12 @@ setTimeout(() => {
         standinScript,
         `import fs from "node:fs";
 import path from "node:path";
-import crypto from "node:crypto";
 
 const stateDir = process.env.KUSABI_TEST_STATE_DIR;
-const chainId = "chain-newer-002";
+// The launcher mints the id and passes it via --chain-id (kusabi #514); the
+// stand-in honours it like the real child would.
+const argIndex = process.argv.indexOf("--chain-id");
+const chainId = argIndex >= 0 ? process.argv[argIndex + 1] : "chain-newer-002";
 const chainDir = path.join(stateDir, "chains", chainId);
 fs.mkdirSync(chainDir, { recursive: true });
 
@@ -5315,10 +5321,10 @@ setTimeout(() => {
       );
 
       assert.equal(res.status, 0, res.stdout);
-      assert.match(res.stdout, /kusabi-companion chain-wait --next --since/);
+      assert.match(res.stdout, /kusabi-companion chain-wait chain-[a-z0-9]+ --appear-timeout \d+/);
 
-      const waitCmdMatch = res.stdout.match(/kusabi-companion (chain-wait --next --since \S+ --appear-timeout \d+)/);
-      assert.ok(waitCmdMatch);
+      const waitCmdMatch = res.stdout.match(/kusabi-companion (chain-wait chain-[a-z0-9]+ --appear-timeout \d+)/);
+      assert.ok(waitCmdMatch, "wait command found in stdout");
       const waitArgs = waitCmdMatch[1].split(/\s+/);
 
       const waitRes = spawnSync(
@@ -5328,7 +5334,13 @@ setTimeout(() => {
       );
 
       assert.equal(waitRes.status, 0, waitRes.stdout);
-      assert.match(waitRes.stdout, /^chain chain-newer-002: status=completed/m);
+      // The named wait resolves the id the launcher named — the chain it
+      // spawned — never the pre-existing chain-older-001 in the same workspace.
+      const namedId = waitArgs[1];
+      assert.match(
+        waitRes.stdout,
+        new RegExp(`^chain ${namedId.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}: status=completed`),
+      );
       assert.doesNotMatch(waitRes.stdout, /chain-older-001/);
     } finally {
       server?.close();

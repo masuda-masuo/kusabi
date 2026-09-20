@@ -65,7 +65,7 @@ export const DEFAULT_PROGRESS_TIMEOUT_MS = 2 * 60 * 60 * 1000;
 
 /**
  * Every way the wait itself failed.  `code` is the machine-readable half:
- * "unknown-chain", "no-chain-appeared", "stalled", "usage".
+ * "no-chain-appeared", "stalled", "usage".
  */
 export class ChainWaitError extends Error {
   constructor(message, code) {
@@ -444,8 +444,9 @@ async function waitForChainToAppear({
  * Block until a chain reaches a terminal state.
  *
  * Resolves with `{ ...snapshot, digest }` when the chain is terminal, whatever
- * its disposition.  Throws ChainWaitError when the WAIT failed: unknown chain
- * id, nothing appeared in appear-mode, or the chain stalled.
+ * its disposition.  Throws ChainWaitError when the WAIT failed: a malformed
+ * chain id (usage), a named chain that never appeared (no-chain-appeared),
+ * nothing appeared in appear-mode (no-chain-appeared), or the chain stalled.
  *
  * Everything the loop cannot decide from files is injected — `sleep`, `now`,
  * and the liveness prober are the seams the tests fake.
@@ -505,8 +506,35 @@ export async function waitForChain({
     if (!id) {
       throw new ChainWaitError("chain-wait needs a chain id (or --next to wait for one to appear)", "usage");
     }
-    if (!fs.existsSync(path.join(chainsDir, id))) {
-      throw new ChainWaitError(`unknown chain: ${id} (searched ${chainsDir})`, "unknown-chain");
+    // Shape check BEFORE any polling: waiting two minutes on a typo is worse
+    // than the error.  An id that is not chain-* or that carries a path
+    // separator would escape chains/ or join onto another directory — this is
+    // a usage error, not a wait failure, and it fires with no sleep at all.
+    // Deliberately looser than the minted shape (chain-[a-z0-9]+): legacy ids
+    // such as chain-resumed-wait stay waitable.
+    if (typeof id !== "string" || !id.startsWith("chain-") || /[\\/\u0000]/.test(id)) {
+      throw new ChainWaitError(
+        `invalid chain id: ${JSON.stringify(id)} — a chain id starts with chain- and is a single path segment`,
+        "usage",
+      );
+    }
+    // The chain may not exist yet: chain-detach (kusabi #514) mints the id
+    // in the parent and hands it back the instant it spawns the child, while
+    // the child creates chains/<id> only after its own pre-flight.  "Not
+    // there yet" is the normal shape of a wait started right after the
+    // launcher returned, so poll until it appears or the appear window
+    // elapses instead of throwing immediately.
+    while (!fs.existsSync(path.join(chainsDir, id))) {
+      if (now() - startedAt >= appearTimeoutMs) {
+        throw new ChainWaitError(
+          `no chain appeared within ${Math.round(appearTimeoutMs / 1000)}s for chain ${id} ` +
+          `(searched ${chainsDir}) — the launcher may still be in its pre-flight, or it ` +
+          `exited without ever creating the chain (since kusabi #513 a refused dispatch ` +
+          `exits non-zero in the parent, so that case means the spawned child died)`,
+          "no-chain-appeared",
+        );
+      }
+      await sleep(pollIntervalMs);
     }
   }
 

@@ -5,6 +5,7 @@ import path from "node:path";
 import os from "node:os";
 
 import { newestChainDir, cmdChainDetach } from "./chain-ops.mjs";
+import { createChainDir } from "./chain-phases.mjs";
 import { smokeBaselineReport } from "./chain-brief-guards.mjs";
 import { createFakeCallTool } from "./fixtures.mjs";
 import { stateDirFor } from "./state-paths.mjs";
@@ -213,7 +214,7 @@ describe("cmdChainDetach smoke baseline refusal (kusabi #513)", () => {
     }
   });
 
-  it("spawns exactly once and returns the unchanged banner for a green ## Smoke", async () => {
+  it("spawns exactly once and returns the launch banner for a green ## Smoke", async () => {
     const fx = detachFixture();
     try {
       const callTool = createFakeCallTool({ exitCode: 0 });
@@ -225,11 +226,178 @@ describe("cmdChainDetach smoke baseline refusal (kusabi #513)", () => {
       assert.equal(fx.spawnCalls.length, 1, "a green baseline must spawn exactly once");
       assert.match(banner, /^Detached chain launched \(pid 424242\)\.$/m);
       assert.match(banner, /Log: .*chain-detach-\d+\.log/);
+      assert.match(banner, /kusabi-companion chain-wait chain-[a-z0-9]+/);
+      assert.equal(detachLogs(fx.stateDir).length, 1, "one log file is created for the launched chain");
+    } finally {
+      fx.cleanup();
+    }
+  });
+
+  it("names the SAME chain id in the wait line and the child argv, passed exactly once (kusabi #514)", async () => {
+    const fx = detachFixture();
+    try {
+      const callTool = createFakeCallTool({ exitCode: 0 });
+      const banner = await cmdChainDetach(
+        fx.cwd,
+        { flags: { container: "cid-1" }, text: DETACH_BRIEF },
+        fx.opts(callTool),
+      );
+      assert.equal(fx.spawnCalls.length, 1);
+      const args = fx.spawnCalls[0].args;
+      assert.equal(
+        args.filter((a) => a === "--chain-id").length,
+        1,
+        "the child argv must carry --chain-id exactly once",
+      );
+      const childChainId = args[args.indexOf("--chain-id") + 1];
+      assert.match(childChainId, /^chain-[a-z0-9]+$/, "the child argv carries a freshly minted id");
+      // One test, both facts: the id the wait line names IS the id the child
+      // was told to use, so a future change cannot drift them apart.
       assert.match(
         banner,
-        /kusabi-companion chain-wait --next --since 2026-09-20T00:00:00\.000Z/,
+        new RegExp(`kusabi-companion chain-wait ${childChainId.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`),
+        "the banner's wait line names the id the child argv carries",
       );
-      assert.equal(detachLogs(fx.stateDir).length, 1, "one log file is created for the launched chain");
+    } finally {
+      fx.cleanup();
+    }
+  });
+
+  it("emits a wait line with neither --next nor --since, forwarding the tracking flags (kusabi #514)", async () => {
+    const fx = detachFixture();
+    try {
+      const callTool = createFakeCallTool({ exitCode: 0 });
+      const banner = await cmdChainDetach(
+        fx.cwd,
+        {
+          flags: {
+            container: "cid-1",
+            "appear-timeout": "30",
+            "poll-interval": "5",
+            "progress-timeout": "900",
+            since: "2026-09-19T00:00:00.000Z",
+          },
+          text: DETACH_BRIEF,
+        },
+        fx.opts(callTool),
+      );
+      const waitLine = banner.split("\n").find((l) => l.trim().startsWith("kusabi-companion chain-wait"));
+      assert.ok(waitLine, "the banner carries a wait line");
+      assert.doesNotMatch(waitLine, /--next/);
+      assert.doesNotMatch(waitLine, /--since/);
+      assert.match(waitLine, /--appear-timeout 30/);
+      assert.match(waitLine, /--poll-interval 5/);
+      assert.match(waitLine, /--progress-timeout 900/);
+    } finally {
+      fx.cleanup();
+    }
+  });
+
+  it("refuses a malformed --chain-id before any filesystem write (kusabi #514)", async () => {
+    for (const bad of ["../escape", "chain-a/b", "nope", ""]) {
+      const fx = detachFixture();
+      try {
+        const callTool = createFakeCallTool({ exitCode: 0 });
+        await assert.rejects(
+          () =>
+            cmdChainDetach(
+              fx.cwd,
+              { flags: { container: "cid-1", "chain-id": bad }, text: DETACH_BRIEF },
+              fx.opts(callTool),
+            ),
+          /invalid chain id/,
+        );
+        assert.equal(fx.spawnCalls.length, 0, `no spawn for --chain-id ${JSON.stringify(bad)}`);
+        assert.equal(
+          detachLogs(fx.stateDir).length,
+          0,
+          `no log file may be created for --chain-id ${JSON.stringify(bad)}`,
+        );
+        // Nothing under chains/ and no traversal: had ../escape ever reached
+        // path.join it would have landed in stateDir/escape — the parent of
+        // chains/ — so that directory must be untouched.
+        assert.equal(
+          fs.existsSync(path.join(fx.stateDir, "chains")),
+          false,
+          `no chains directory may be created for --chain-id ${JSON.stringify(bad)}`,
+        );
+        assert.equal(
+          fs.existsSync(path.join(fx.stateDir, "escape")),
+          false,
+          `the parent directory must be untouched for --chain-id ${JSON.stringify(bad)}`,
+        );
+      } finally {
+        fx.cleanup();
+      }
+    }
+  });
+
+  it("refuses a supplied --chain-id whose directory already exists, before spawn, log or banner (kusabi #514 finding 1)", async () => {
+    const fx = detachFixture();
+    try {
+      // The dangerous shape: the pre-existing chain is TERMINAL, so a wait
+      // line whose subject exists would resolve at once — a false completion
+      // for a launch that was refused.
+      const chainDir = path.join(fx.stateDir, "chains", "chain-pre");
+      fs.mkdirSync(chainDir, { recursive: true });
+      fs.writeFileSync(
+        path.join(chainDir, "control.json"),
+        JSON.stringify({ chainId: "chain-pre", container: "cid-0", pid: 1, status: "completed", round: 1 }),
+      );
+
+      // The refusal must be the SAME message createChainDir throws — assert
+      // equality between the two real messages, not two hand-written strings.
+      let createDirMessage = null;
+      try {
+        createChainDir(fx.stateDir, "chain-pre");
+      } catch (err) {
+        createDirMessage = err.message;
+      }
+      assert.ok(createDirMessage, "createChainDir must refuse the same id");
+
+      const callTool = createFakeCallTool({ exitCode: 0 });
+      await assert.rejects(
+        () =>
+          cmdChainDetach(
+            fx.cwd,
+            { flags: { container: "cid-1", "chain-id": "chain-pre" }, text: DETACH_BRIEF },
+            fx.opts(callTool),
+          ),
+        (err) => err.message === createDirMessage,
+      );
+      assert.equal(fx.spawnCalls.length, 0, "the injected spawn must never be called");
+      assert.equal(detachLogs(fx.stateDir).length, 0, "no log file may be created for a refused launch");
+      // No banner: cmdChainDetach only returns the banner on success, and the
+      // rejection above is the failure path — nothing was announced.
+    } finally {
+      fx.cleanup();
+    }
+  });
+
+  it("refuses a MINTED id whose directory already exists, via the injected mint (kusabi #514 finding 1)", async () => {
+    const fx = detachFixture();
+    try {
+      const chainDir = path.join(fx.stateDir, "chains", "chain-mint-collide");
+      fs.mkdirSync(chainDir, { recursive: true });
+      fs.writeFileSync(
+        path.join(chainDir, "control.json"),
+        JSON.stringify({ chainId: "chain-mint-collide", container: "cid-0", pid: 1, status: "running", round: 1 }),
+      );
+
+      const callTool = createFakeCallTool({ exitCode: 0 });
+      // Inject the collision: the mint the launcher would perform returns
+      // exactly the id whose directory already exists.
+      await assert.rejects(
+        () =>
+          cmdChainDetach(
+            fx.cwd,
+            { flags: { container: "cid-1" }, text: DETACH_BRIEF },
+            { ...fx.opts(callTool), mintChainId: () => "chain-mint-collide" },
+          ),
+        /chain id already exists: chain-mint-collide/,
+      );
+      assert.equal(fx.spawnCalls.length, 0, "the injected spawn must never be called");
+      assert.equal(detachLogs(fx.stateDir).length, 0, "no log file may be created for a refused launch");
     } finally {
       fx.cleanup();
     }
