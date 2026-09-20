@@ -4,7 +4,8 @@ import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import crypto from "node:crypto";
-import { sessionProvenanceRefusal, renderChainBanner, cmdChain } from "./chain-cmd.mjs";
+import { sessionProvenanceRefusal, renderChainBanner, cmdChain, runChainLifecycle } from "./chain-cmd.mjs";
+import { resolveOrchestratorRecord } from "./kusabi-companion.mjs";
 import { createChainDir } from "./chain-phases.mjs";
 import { effectiveTierCount } from "./chain-driver.mjs";
 
@@ -157,12 +158,17 @@ describe("smoke baseline wiring (kusabi #292)", () => {
     return source.slice(start, end === -1 ? undefined : end);
   }
 
-  it("cmdChain runs the baseline before any chain state is created", () => {
-    const body = functionSource(chainCmdSource, "export async function cmdChain(");
+  // Since kusabi #526 the sequence lives in the reusable runChainLifecycle
+  // seam, not in cmdChain (cmdChain is the CLI adapter that delegates).  The
+  // ordering property being pinned -- the baseline runs before any chain
+  // state is created -- is the same property, asserted against the function
+  // that actually owns the sequence.
+  it("runChainLifecycle runs the baseline before any chain state is created", () => {
+    const body = functionSource(chainCmdSource, "export async function runChainLifecycle(");
     const baselineAt = body.indexOf("smokeBaselineReport(");
     const createAt = body.indexOf("createChainDir(");
-    assert.ok(baselineAt > 0, "cmdChain must run the baseline");
-    assert.ok(createAt > 0, "cmdChain must still create the chain dir");
+    assert.ok(baselineAt > 0, "runChainLifecycle must run the baseline");
+    assert.ok(createAt > 0, "runChainLifecycle must still create the chain dir");
     assert.ok(baselineAt < createAt, "the baseline must run before any chain state exists");
   });
 
@@ -205,10 +211,13 @@ describe("session-provenance wiring (kusabi #321)", () => {
     return source.slice(start, end === -1 ? undefined : end);
   }
 
-  it("cmdChain refuses before any baseline measurement or chain state exists", () => {
-    const body = functionSource(chainCmdSource, "export async function cmdChain(");
+  it("runChainLifecycle refuses before any baseline measurement or chain state exists", () => {
+    // Since kusabi #526 the sequence lives in runChainLifecycle, not in
+    // cmdChain (cmdChain delegates); the refusal ordering being pinned is
+    // the same property, asserted against the function that owns it.
+    const body = functionSource(chainCmdSource, "export async function runChainLifecycle(");
     const gateAt = body.indexOf("sessionProvenanceRefusal({");
-    assert.ok(gateAt > 0, "cmdChain must call the session-provenance gate");
+    assert.ok(gateAt > 0, "runChainLifecycle must call the session-provenance gate");
     assert.ok(gateAt < body.indexOf("smokeBaselineReport("), "the gate precedes the smoke baseline run");
     assert.ok(gateAt < body.indexOf("captureVerifyBaseline("), "the gate precedes the verify baseline");
     assert.ok(gateAt < body.indexOf("createChainDir("), "the gate precedes any chain state");
@@ -218,7 +227,10 @@ describe("session-provenance wiring (kusabi #321)", () => {
     assert.ok(body.includes("sessionProvenance,"), "sessionProvenance must still reach the driver");
   });
 
-  it("the gate lives in cmdChain, not in the resume path (chain-resume resolves its own session)", () => {
+  it("the gate lives in runChainLifecycle, not in the resume path (chain-resume resolves its own session)", () => {
+    // kusabi #526 moved the fresh-chain sequence into the runChainLifecycle
+    // seam; the property pinned -- the gate exists in chain-cmd for fresh
+    // chains only, never in the resume path -- is unchanged.
     const body = functionSource(chainCmdSource, "export async function cmdChainResume(");
     assert.ok(!body.includes("sessionProvenanceRefusal("), "resume must not run the fresh-chain gate");
     assert.ok(chainCmdSource.includes("sessionProvenanceRefusal("), "the gate exists in chain-cmd");
@@ -290,15 +302,18 @@ describe("cmdChain --chain-id (kusabi #514)", () => {
     }
   });
 
-  it("cmdChain threads --chain-id into createChainDir, validated before any filesystem write", () => {
-    const body = functionSource(chainCmdSource, "export async function cmdChain(");
+  it("runChainLifecycle threads --chain-id into createChainDir, validated before any filesystem write", () => {
+    // kusabi #526 moved the sequence into runChainLifecycle; the property
+    // pinned -- the flag is read and validated before any write and reaches
+    // createChainDir -- is unchanged, asserted against the owning function.
+    const body = functionSource(chainCmdSource, "export async function runChainLifecycle(");
     const flagAt = body.indexOf('flags["chain-id"]');
     const assertAt = body.indexOf("assertChainIdShape(");
     const createAt = body.indexOf("createChainDir(");
     const stateDirAt = body.indexOf("stateDirFor(");
-    assert.ok(flagAt > 0, "cmdChain must read the --chain-id flag");
-    assert.ok(assertAt > 0, "cmdChain must validate the id shape");
-    assert.ok(createAt > 0, "cmdChain must still create the chain dir");
+    assert.ok(flagAt > 0, "runChainLifecycle must read the --chain-id flag");
+    assert.ok(assertAt > 0, "runChainLifecycle must validate the id shape");
+    assert.ok(createAt > 0, "runChainLifecycle must still create the chain dir");
     assert.ok(flagAt < stateDirAt, "the flag is read before any filesystem write");
     assert.ok(assertAt < stateDirAt, "the shape check precedes any filesystem write");
     assert.ok(assertAt < createAt, "the shape check precedes the dir creation");
@@ -376,6 +391,348 @@ describe("cmdChain --chain-id (kusabi #514)", () => {
       } finally {
         fx.cleanup();
       }
+    }
+  });
+});
+// ---------------------------------------------------------------------------
+// runChainLifecycle (kusabi #526) — the reusable fresh-chain seam
+// ---------------------------------------------------------------------------
+// cmdChain is now only the CLI adapter: it resolves the brief file and the
+// orchestrator record and delegates to runChainLifecycle, which owns the
+// whole fresh-chain sequence (publish/brief checks, refusals, backend
+// resolution, baselines, chain creation, the driver dispatch and the
+// terminal cleanup).  The future mission driver calls the seam directly, so
+// the tests here pin (a) that cmdChain really delegates and keeps no second
+// copy of the sequence, and (b) that the two entry points are the same path:
+// identical returned output and identical durable artifacts on a full chain
+// run and on pre-dispatch refusals.
+
+describe("runChainLifecycle seam (kusabi #526)", () => {
+  const chainCmdSource = fs.readFileSync(path.join(import.meta.dirname, "chain-cmd.mjs"), "utf8");
+
+  // The body of the top-level function starting at `anchor`, i.e. up to the
+  // next top-level export (same shape as the wiring blocks above).
+  function functionSource(source, anchor) {
+    const start = source.indexOf(anchor);
+    assert.ok(start >= 0, `anchor not found: ${anchor}`);
+    const end = source.indexOf("\nexport ", start + anchor.length);
+    return source.slice(start, end === -1 ? undefined : end);
+  }
+
+  it("cmdChain delegates the whole sequence to runChainLifecycle and retains no second copy", () => {
+    const cmdBody = functionSource(chainCmdSource, "export async function cmdChain(");
+    const lifecycleBody = functionSource(chainCmdSource, "export async function runChainLifecycle(");
+    assert.ok(
+      cmdBody.includes("runChainLifecycle(cwd, { flags, text, orchestrator }, opts)"),
+      "cmdChain must delegate to the lifecycle seam",
+    );
+    // Every step of the extracted sequence lives in the seam, not in cmdChain.
+    for (const marker of [
+      "smokeBaselineReport(",
+      "createChainDir(",
+      "sessionProvenanceRefusal({",
+      "captureVerifyBaseline(",
+      "runChainDriver({",
+    ]) {
+      assert.ok(lifecycleBody.includes(marker), `runChainLifecycle must own the extracted sequence (${marker})`);
+      assert.ok(
+        !cmdBody.includes(marker),
+        `cmdChain must not retain a second copy of the extracted sequence (${marker})`,
+      );
+    }
+  });
+
+  // ---- equivalence harness ----
+  // Both paths are driven with the SAME injected fakes (test-only injection:
+  // the container RPC and the backend dispatch seams; production callers get
+  // the real implementations).  Each run gets its own tmp workspace and its
+  // own state root so the pinned --chain-id does not collide.
+  const BRIEF = "# Task\n\nOrchestrator: test-model | session s-1 | 2026-08-23\n\n## Deliverables\n\n- `src/foo.js`\n";
+  const APPROVE = JSON.stringify({
+    schema_version: 1, verdict: "approve", findings: [], summary: "ok", next_steps: [],
+  });
+  const FLAGS = { container: "cid-1", "chain-id": "chain-fixed", "keepServe": true };
+
+  // Normalization for the equivalence assertions (documented):
+  //   - ISO timestamps (startedAt / finishedAt / round startedAt ...) vary by
+  //     milliseconds between two runs → replaced by "<ts>".
+  //   - `pid` values (control.json records process.pid) are identical within
+  //     one test process, but are normalized to "<pid>" anyway so the
+  //     assertion does not depend on that.
+  //   - the returned text embeds the absolute review-record path, which
+  //     contains each run's own tmp root AND the state-dir hash derived from
+  //     that root's cwd → both are replaced by placeholders (the
+  //     chainDir-relative remainder is compared verbatim).
+  const ISO_RE = /20\d\d-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d+)?Z?/g;
+
+  function normalizeJson(value) {
+    if (Array.isArray(value)) return value.map(normalizeJson);
+    if (value && typeof value === "object") {
+      const out = {};
+      for (const key of Object.keys(value).sort()) {
+        out[key] = key === "pid" ? "<pid>" : normalizeJson(value[key]);
+      }
+      return out;
+    }
+    if (typeof value === "string") return value.replace(ISO_RE, "<ts>");
+    return value;
+  }
+
+  function fixture() {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-lc526-"));
+    const cwd = path.join(tmp, "ws");
+    fs.mkdirSync(cwd, { recursive: true });
+    const prevStateEnv = process.env.KUSABI_STATE_DIR;
+    process.env.KUSABI_STATE_DIR = path.join(tmp, "state");
+    const hash = crypto.createHash("sha256").update(cwd).digest("hex").slice(0, 12);
+    const stateDir = path.join(tmp, "state", hash);
+    return {
+      tmp,
+      cwd,
+      stateDir,
+      chainDir: path.join(stateDir, "chains", "chain-fixed"),
+      setStateEnv() {
+        process.env.KUSABI_STATE_DIR = path.join(tmp, "state");
+      },
+      cleanup() {
+        if (prevStateEnv === undefined) delete process.env.KUSABI_STATE_DIR;
+        else process.env.KUSABI_STATE_DIR = prevStateEnv;
+        fs.rmSync(tmp, { recursive: true, force: true });
+      },
+    };
+  }
+
+  // Swallow stdout during a run so the banner / publish warning can be
+  // compared as a captured value instead of leaking into the test output.
+  function captureStdout() {
+    const chunks = [];
+    const orig = process.stdout.write;
+    process.stdout.write = (chunk) => {
+      chunks.push(String(chunk));
+      return true;
+    };
+    return {
+      text() { return chunks.join(""); },
+      restore() { process.stdout.write = orig; },
+    };
+  }
+
+  // The fake container: answers every call a green round-1 chain makes --
+  // captureBaseSha / P1 (git rev-parse HEAD), the worktree capture, the
+  // verify gate (chain-start baseline + P2), P3's git reads, and the
+  // change-scope helper used during review context collection.
+  function makeFakeCallTool() {
+    return async (toolName, params) => {
+      if (toolName === "verify_in_container") return { gate_passed: true };
+      if (toolName !== "sandbox_exec") return { output: "" };
+      const cmd = params?.commands?.[0] ?? params?.argv?.join(" ") ?? "";
+      if (cmd.includes("change-scope.mjs")) {
+        return {
+          output: JSON.stringify({
+            formatVersion: 1,
+            repositoryRoot: "/workspace",
+            input: { base: "abc123", head: "HEAD" },
+            resolved: { baseSha: "abc123", headSha: "abc123", mergeBaseSha: "abc123" },
+            paths: { committed: [], staged: [], unstaged: [], untracked: [] },
+          }),
+        };
+      }
+      if (cmd.startsWith("cd /workspace &&") && cmd.includes("TMPIDX=")) {
+        return { output: "ERROR_NO_INDEX\n" };
+      }
+      if (cmd === "git rev-parse HEAD") return { output: "abc123\n" };
+      if (cmd === "git status --porcelain") return { output: " M src/foo.js\n" };
+      if (cmd === "git log --oneline -5") return { output: "abc123 latest change\n" };
+      if (cmd === "git diff") return { output: "diff --git a/src/foo.js b/src/foo.js\n" };
+      if (cmd === "git ls-files --others --exclude-standard") return { output: "untracked.txt\n" };
+      return { output: "" };
+    };
+  }
+
+  // The fake dispatch: one seam handling every kind the driver can ask for,
+  // with deterministic ids / sessions / usage so the persisted records match.
+  function makeFakeDispatch() {
+    return async (opts) => {
+      if (opts.kind === "review") {
+        return {
+          job: {
+            id: "job-rev-1", status: "completed", modelEntry: "opencode/fake-review", modelVariant: null,
+            fallbacks: null, sessionID: "ses_rev_1",
+            usage: { available: true, input: 2, output: 2, reasoning: 0, cacheRead: 0, cacheWrite: 0, cost: 0.01 },
+            error: null,
+          },
+          resultText: APPROVE,
+        };
+      }
+      if (opts.kind === "task") {
+        return {
+          job: {
+            id: "job-imp-1", status: "completed", modelEntry: "opencode/fake-model", modelVariant: null,
+            fallbacks: null, sessionID: "ses_imp_1",
+            usage: { available: true, input: 1, output: 1, reasoning: 0, cacheRead: 0, cacheWrite: 0, cost: 0.01 },
+            error: null,
+          },
+          resultText: "implemented",
+        };
+      }
+      if (opts.kind === "strategist") {
+        return {
+          job: {
+            id: "job-strat-1", status: "completed", modelEntry: "opencode/fake-strat", modelVariant: null,
+            fallbacks: null, sessionID: "ses_strat_1",
+            usage: { available: true, input: 1, output: 1, reasoning: 0, cacheRead: 0, cacheWrite: 0, cost: 0.01 },
+            error: null,
+          },
+          resultText: "restructure the module",
+        };
+      }
+      throw new Error("unexpected dispatch kind: " + opts.kind);
+    };
+  }
+
+  function injectable() {
+    return {
+      inject: {
+        callTool: makeFakeCallTool(),
+        dispatchWithFallback: makeFakeDispatch(),
+        reviewDispatchWithFallback: makeFakeDispatch(),
+        reworkDispatchWithFallback: makeFakeDispatch(),
+      },
+    };
+  }
+
+  // Read the durable artifacts of a finished chain -- chain.json,
+  // control.json, round-N.json and review-record.md under the chain dir, plus
+  // every job.json under the state dir -- normalized for the comparison.
+  function readArtifacts(fx) {
+    const out = {};
+    function walk(dir, prefix) {
+      for (const name of fs.readdirSync(dir)) {
+        const full = path.join(dir, name);
+        const rel = path.join(prefix, name);
+        if (fs.statSync(full).isDirectory()) {
+          walk(full, rel);
+        } else if (name.endsWith(".json")) {
+          out[rel] = normalizeJson(JSON.parse(fs.readFileSync(full, "utf8")));
+        } else if (name === "review-record.md") {
+          out[rel] = fs.readFileSync(full, "utf8").replace(ISO_RE, "<ts>");
+        }
+      }
+    }
+    walk(fx.chainDir, "chain");
+    const jobsDir = path.join(fx.stateDir, "jobs");
+    if (fs.existsSync(jobsDir)) walk(jobsDir, "jobs");
+    return out;
+  }
+
+  function normalizeReturned(text, fx) {
+    return text.replace(fx.stateDir, "<stateDir>").replace(fx.tmp, "<tmp>");
+  }
+
+  it("cmdChain and direct runChainLifecycle invocation are the same path on a full success run", async () => {
+    const fx1 = fixture();
+    const fx2 = fixture();
+    try {
+      fx1.setStateEnv();
+      const cap1 = captureStdout();
+      const text1 = await cmdChain(fx1.cwd, { flags: FLAGS, text: BRIEF }, injectable());
+      const stdout1 = cap1.text();
+      cap1.restore();
+
+      fx2.setStateEnv();
+      const cap2 = captureStdout();
+      const text2 = await runChainLifecycle(
+        fx2.cwd,
+        { flags: FLAGS, text: BRIEF, orchestrator: resolveOrchestratorRecord(BRIEF) },
+        injectable(),
+      );
+      const stdout2 = cap2.text();
+      cap2.restore();
+
+      // Both runs must have succeeded and reached the same terminal outcome.
+      assert.match(text1, /accepted at round 1/);
+      assert.match(text2, /accepted at round 1/);
+      // Returned output is equivalent up to the inherently variable review-
+      // record path prefix (each run's own tmp root); the rest is verbatim.
+      assert.equal(normalizeReturned(text1, fx1), normalizeReturned(text2, fx2));
+      // stdout (the chain-start banner; the publish warning is absent for a
+      // clean brief) is byte-identical.
+      assert.equal(stdout1, stdout2);
+      // Durable artifacts are key/value identical after timestamp and pid
+      // normalization.
+      assert.deepEqual(readArtifacts(fx1), readArtifacts(fx2));
+    } finally {
+      fx1.cleanup();
+      fx2.cleanup();
+    }
+  });
+
+  it("cmdChain and direct runChainLifecycle invocation refuse identically before dispatch", async () => {
+    // Lossy-smoke brief: a `## Smoke` heading the parser reads nothing out
+    // of → the #250 refusal fires before any filesystem write.
+    const lossyBrief = "# Task\n\nOrchestrator: test-model | session s-1 | 2026-08-23\n\n## Deliverables\n\n- `src/foo.js`\n\n## Smoke\n\n- a bullet with no backtick-quoted command\n";
+    const fx1 = fixture();
+    const fx2 = fixture();
+    try {
+      fx1.setStateEnv();
+      let err1 = null;
+      try {
+        await cmdChain(fx1.cwd, { flags: { container: "cid-1" }, text: lossyBrief });
+      } catch (e) { err1 = e; }
+
+      fx2.setStateEnv();
+      let err2 = null;
+      try {
+        await runChainLifecycle(
+          fx2.cwd,
+          { flags: { container: "cid-1" }, text: lossyBrief, orchestrator: resolveOrchestratorRecord(lossyBrief) },
+        );
+      } catch (e) { err2 = e; }
+
+      assert.ok(err1 && err2, "both paths must refuse the lossy-smoke brief");
+      assert.equal(err1.message, err2.message);
+      assert.match(err1.message, /brief rejected before dispatch/);
+      // The refusal fires before stateDirFor: no state root at all.
+      assert.equal(fs.existsSync(fx1.stateDir), false, "cmdChain left no state behind");
+      assert.equal(fs.existsSync(fx2.stateDir), false, "runChainLifecycle left no state behind");
+    } finally {
+      fx1.cleanup();
+      fx2.cleanup();
+    }
+
+    // Missing-container refusal: fires after backend resolution, before the
+    // lint and before createChainDir -- the state root may exist (stateDirFor
+    // creates the jobs dir) but no chain state and no job may.
+    const fx3 = fixture();
+    const fx4 = fixture();
+    try {
+      fx3.setStateEnv();
+      let err3 = null;
+      try {
+        await cmdChain(fx3.cwd, { flags: {}, text: BRIEF });
+      } catch (e) { err3 = e; }
+
+      fx4.setStateEnv();
+      let err4 = null;
+      try {
+        await runChainLifecycle(
+          fx4.cwd,
+          { flags: {}, text: BRIEF, orchestrator: resolveOrchestratorRecord(BRIEF) },
+        );
+      } catch (e) { err4 = e; }
+
+      assert.ok(err3 && err4, "both paths must refuse a missing container");
+      assert.equal(err3.message, err4.message);
+      assert.equal(err3.message, "chain requires --container <cid>");
+      // No chain state in either root; both have only the empty jobs dir that
+      // stateDirFor itself creates.
+      assert.equal(fs.existsSync(path.join(fx3.stateDir, "chains")), false);
+      assert.equal(fs.existsSync(path.join(fx4.stateDir, "chains")), false);
+      assert.deepEqual(fs.readdirSync(path.join(fx3.stateDir, "jobs")), []);
+      assert.deepEqual(fs.readdirSync(path.join(fx4.stateDir, "jobs")), []);
+    } finally {
+      fx3.cleanup();
+      fx4.cleanup();
     }
   });
 });

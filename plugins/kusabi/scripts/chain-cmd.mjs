@@ -22,6 +22,14 @@
 // runChainDriver, resolveResumeReviewContext, resolveResumeReworkContext,
 // resolveResumeDispatches).  chain-driver.mjs does NOT import from this
 // module -- the import is one-directional: cmd -> driver.
+//
+// The fresh-chain lifecycle itself (publish/brief checks, refusals,
+// phase/backend/model resolution, baselines, chain id/directory/control
+// creation, signal handling, the runChainDriver dispatch and the terminal
+// cleanup) is exported as runChainLifecycle (kusabi #526).  cmdChain is the
+// CLI adapter on top: it resolves the brief file and the orchestrator
+// record and delegates, so a future mission driver can run an inner chain
+// through the same seam without bypassing any of it.
 
 import fs from "node:fs";
 import path from "node:path";
@@ -159,13 +167,70 @@ export function sessionProvenanceRefusal({ session, provenance, implementBackend
   );
 }
 
-export async function cmdChain(cwd, { flags, text }) {
+export async function cmdChain(cwd, { flags, text }, opts = {}) {
   // ---- brief-file resolution ----
   text = readBriefFile(flags, text);
   if (!text) throw new Error("chain requires a brief description (inline or via --brief-file)");
   // Signature line for model/date; CLAUDE_CODE_SESSION_ID for the session
   // when this companion runs inside an orchestrator session (kusabi #227).
   const orchestrator = resolveOrchestratorRecord(text);
+
+  // The whole fresh-chain lifecycle (kusabi #526) lives in the reusable seam
+  // below: publish/brief checks, refusals, backend resolution, baselines,
+  // chain creation, the runChainDriver dispatch and the terminal cleanup.
+  // cmdChain is only the CLI adapter that turns user-facing input into the
+  // lifecycle's inputs; the future mission driver calls runChainLifecycle
+  // directly and therefore cannot skip any check this command used to run
+  // inline.  `opts` is the same test-only injection seam the lifecycle
+  // accepts (forwarded verbatim).
+  return runChainLifecycle(cwd, { flags, text, orchestrator }, opts);
+}
+
+/**
+ * The reusable fresh-chain lifecycle shared by the `chain` CLI and the
+ * future mission driver (kusabi #526).
+ *
+ * Everything that must hold before a worker is handed a container runs
+ * here, in the order `chain` always ran it: the runtime publish guard, the
+ * lossy-smoke refusal, chain-id validation, phase/backend/model resolution,
+ * the session-provenance refusal, the container and strategy validation,
+ * the dispatch-time brief lint, the smoke baseline, chain
+ * id/directory/control creation, signal handling, the failed-route reset,
+ * the base SHA / worktree / verify baseline captures, `runChainDriver`, and
+ * the terminal cleanup (signal-listener removal; the driver's own
+ * serve-stop / control finalisation).  A caller invoking this seam directly
+ * gets the same checks in the same order, so a future mission driver cannot
+ * skip any of them by calling it with the normal production options.
+ *
+ * Injection (`opts.inject`) is the TEST-ONLY escape hatch for the two
+ * things a test cannot run for real — the container RPC and the backend
+ * dispatch seams.  Every injectable defaults to the production
+ * implementation and nothing else is overridable, so production callers
+ * pass no options and get exactly the current behaviour.
+ *
+ * @param {string} cwd  — the workspace the chain runs in.
+ * @param {object} input
+ * @param {object} input.flags  — the parsed CLI flags (--container, --session, …).
+ * @param {string} input.text  — the resolved brief text (cmdChain has already
+ *        applied --brief-file).
+ * @param {object|null} input.orchestrator  — the brief's orchestrator record
+ *        (resolveOrchestratorRecord), already resolved by the CLI adapter.
+ * @param {object} [opts]
+ * @param {object} [opts.inject]  — test-only dependency injection; production
+ *        callers omit it and get the defaults below.
+ * @param {Function} [opts.inject.callTool]  — default: the live sunaba RPC
+ *        callTool (used for every baseline, probe and container call).
+ * @param {Function} [opts.inject.dispatchWithFallback]  — the implement /
+ *        strategist dispatch seam (default: the resolved implement phase
+ *        dispatch).
+ * @param {Function} [opts.inject.reviewDispatchWithFallback]  — the review
+ *        dispatch seam (default: the resolved review phase dispatch).
+ * @param {Function} [opts.inject.reworkDispatchWithFallback]  — the rework
+ *        dispatch seam (default: the resolved rework phase dispatch).
+ * @returns {Promise<string>}  — the driver's terminal output text.
+ */
+export async function runChainLifecycle(cwd, { flags, text, orchestrator }, opts = {}) {
+  const inject = opts?.inject ?? {};
 
   // ---- runtime publish guard (kusabi #153) ----
   // publish is structurally absent from the worker toolset (orchestrator-
@@ -311,8 +376,10 @@ export async function cmdChain(cwd, { flags, text }) {
 
   // ---- import callTool once for every phase that needs it ----
   // Hoisted above createChainDir for the baseline smoke run below: that run
-  // has to happen while a refusal can still leave nothing behind.
-  const { callTool } = await import("./sunaba-rpc.mjs");
+  // has to happen while a refusal can still leave nothing behind.  The
+  // injected callTool (test-only) replaces the live RPC; production callers
+  // get the real one.
+  const callTool = inject.callTool ?? (await import("./sunaba-rpc.mjs")).callTool;
 
   // ---- smoke baseline refusal (kusabi #292) ----
   // Run the declared smoke against the unmodified checkout, before the
@@ -411,12 +478,14 @@ export async function cmdChain(cwd, { flags, text }) {
       // neither has a tier ladder, so the model never changes mid-chain
       // (kusabi #184 finding 1).  Each phase clamps to ITS OWN resolved
       // model, so implement and review can run on different backends with
-      // different models (kusabi #192).
-      dispatchWithFallback: phaseDispatchFor(
+      // different models (kusabi #192).  The injected dispatch seams
+      // (test-only) replace the resolved phase dispatches wholesale; a
+      // production caller omits them and gets the resolved seam below.
+      dispatchWithFallback: inject.dispatchWithFallback ?? phaseDispatchFor(
         implementDispatch.backend, implementDispatch.dispatch, implementDispatch.model),
-      reviewDispatchWithFallback: phaseDispatchFor(
+      reviewDispatchWithFallback: inject.reviewDispatchWithFallback ?? phaseDispatchFor(
         reviewDispatch.backend, reviewDispatch.dispatch, reviewDispatch.model),
-      reworkDispatchWithFallback: phaseDispatchFor(
+      reworkDispatchWithFallback: inject.reworkDispatchWithFallback ?? phaseDispatchFor(
         reworkDispatch.backend, reworkDispatch.dispatch, reworkDispatch.model),
       initialSession: flags.session,
       // The provenance of `initialSession` (null when no session, or when
