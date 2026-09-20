@@ -19,6 +19,7 @@ import {
   recoverVerdictFromText,
   roundDiscardReason,
   roundChangedColumn,
+  probeVerdictLabel,
 } from "./render.mjs";
 import { sampleParsed } from "./fixtures.mjs";
 
@@ -778,6 +779,46 @@ describe("renderChainShow", () => {
       roundChangedColumn({ verdict: "discard", verdictSource: "probe", worktreeChanged: false }),
       "NO (dirty-vs-base not recorded)",
     );
+  });
+
+  // ---- probeVerdictLabel: the single home of the probe verdict label (kusabi #517) ----
+  // A probe that passed but carries a `limitation` did not check anything
+  // (today: P6 when either collected count is unavailable) — it must not read
+  // as "PASS".  The label is one shared describer, exactly like
+  // roundDiscardReason / roundChangedColumn — no renderer keeps its own copy
+  // of the condition.
+
+  it("probeVerdictLabel: passed+limitation renders UNCHECKED, passed renders PASS, failed renders FAIL", () => {
+    assert.equal(
+      probeVerdictLabel({ probe: "P6: collected", passed: true, detail: "collected count unavailable (...)", limitation: "collected count unavailable (...)" }),
+      "UNCHECKED",
+    );
+    assert.equal(probeVerdictLabel({ probe: "P1: HEAD clean", passed: true, detail: "HEAD matches base abc123" }), "PASS");
+    assert.equal(probeVerdictLabel({ probe: "P2: verify gate", passed: false, detail: "{}" }), "FAIL");
+    // A passed probe with a non-boolean/empty limitation still passes.
+    assert.equal(probeVerdictLabel({ probe: "P6: collected", passed: true, detail: "x", limitation: "" }), "PASS");
+  });
+
+  it("renderChainShow prints UNCHECKED for a passed probe with a limitation, PASS and FAIL otherwise", () => {
+    const chain = { chainId: "chain-unchecked" };
+    const rounds = [
+      {
+        round: 1,
+        verdict: "approve",
+        disposition: { disposition: "accept" },
+        resumeMethod: { type: "continue_session" },
+        probeResults: [
+          { probe: "P6: collected", passed: true, detail: "collected count unavailable (baseline unavailable, round 773)", limitation: "collected count unavailable (baseline unavailable, round 773)" },
+          { probe: "P1: HEAD clean", passed: true, detail: "HEAD matches base abc123" },
+          { probe: "P5: frozen", passed: false, detail: "frozen path(s) changed: [tests/a.test.mjs]", oracleViolation: true },
+        ],
+      },
+    ];
+    const result = renderChainShow(chain, rounds);
+    assert.match(result, /P6: collected — UNCHECKED \(collected count unavailable/);
+    assert.match(result, /P1: HEAD clean — PASS/);
+    assert.match(result, /P5: frozen — FAIL/);
+    assert.doesNotMatch(result, /P6: collected — PASS/);
   });
 
   it("renders incomplete status when chain has no rounds", () => {
@@ -2027,6 +2068,30 @@ describe("renderReviewRecord", () => {
 
     // Usage totals from chainTotals.
     assert.match(text, /input=10 output=8 reasoning=2 cacheRead=100 cacheWrite=5 cost=\$0\.42/);
+  });
+
+  it("probe one-liners print UNCHECKED for a passed probe with a limitation (kusabi #517)", () => {
+    const text = renderReviewRecord({
+      chainId: "chain-unchecked",
+      brief: "Do the thing.",
+      maxRounds: 1,
+      records: [
+        {
+          round: 1,
+          modelEntry: "flash/quick",
+          verdict: "approve",
+          disposition: { disposition: "accept" },
+          worktreeChanged: true,
+          probeResults: [
+            { probe: "P6: collected", passed: true, detail: "collected count unavailable (baseline unavailable, round 773)", limitation: "collected count unavailable (baseline unavailable, round 773)" },
+          ],
+          findings: [],
+          findingsText: "(no structured findings)",
+        },
+      ],
+    });
+    assert.match(text, /P6: collected — UNCHECKED \(collected count unavailable/);
+    assert.doesNotMatch(text, /P6: collected \u2014 PASS/);
   });
 
   it("zero-findings chains get both fill-at-inspection sections with an explicit no-findings statement", () => {

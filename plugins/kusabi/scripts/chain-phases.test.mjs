@@ -51,6 +51,174 @@ describe("captureVerifyBaseline", () => {
     assert.equal(baseline.captured, false);
     assert.match(baseline.error, /container unreachable/);
   });
+
+  // ---- kusabi #517: two-pass collection on a lint-debt base ----
+  // A gate failure on the lint/type precondition means the first call's tests
+  // never ran (`tests.full` absent), so it measured no collected count.  The
+  // capture re-runs verify with the failed gates' skip flags — the same shape
+  // the round path uses — purely to obtain the base's test count.  The first
+  // call stays authoritative for gate_passed / lint / types.
+
+  it("re-runs with skip_lint_gate only when the gate failed on lint only, and takes collected from the retry", async () => {
+    const lintBlocked = {
+      gate_passed: false,
+      lint: [{ rule: "no-unused-vars" }, { rule: "no-undef" }],
+      types: [],
+      tests: { status: "skipped", message: "precondition gate failed; tests not run" },
+      gate_fail_reasons: ["lint (eslint): 2 violation(s)"],
+    };
+    const lintCleared = {
+      gate_passed: true,
+      lint: [],
+      types: [],
+      tests: { full: { status: "ok", passed: 3446, total: 3446 } },
+    };
+    const calls = [];
+    const fakeTool = async (toolName, args) => {
+      if (toolName !== "verify_in_container") return { output: "" };
+      calls.push(args);
+      return calls.length === 1 ? lintBlocked : lintCleared;
+    };
+    const baseline = await captureVerifyBaseline(fakeTool, "fake-cid");
+    assert.equal(calls.length, 2);
+    // Second call skips the failed gate and only the failed gate.
+    assert.deepEqual(calls[1], { container_id: "fake-cid", path: ".", skip_lint_gate: true });
+    assert.equal(calls[1].skip_type_gate, undefined);
+    // The count comes from the run whose tests actually executed.
+    assert.equal(baseline.collected, 3446);
+    // The first call stays authoritative for the recorded gate truth.
+    assert.equal(baseline.gate_passed, false);
+    assert.equal(baseline.lint, 2);
+    assert.equal(baseline.types, 0);
+    assert.equal(baseline.raw, lintBlocked);
+  });
+
+  it("re-runs with skip_type_gate only when the gate failed on types only", async () => {
+    const typeBlocked = {
+      gate_passed: false,
+      lint: [],
+      types: [{ error: "TS2304" }],
+      tests: { status: "skipped", message: "precondition gate failed; tests not run" },
+      gate_fail_reasons: ["type_check (tsc): 1 error(s)"],
+    };
+    const typeCleared = {
+      gate_passed: true,
+      lint: [],
+      types: [],
+      tests: { full: { status: "ok", passed: 2033, total: 2033 } },
+    };
+    const calls = [];
+    const fakeTool = async (toolName, args) => {
+      if (toolName !== "verify_in_container") return { output: "" };
+      calls.push(args);
+      return calls.length === 1 ? typeBlocked : typeCleared;
+    };
+    const baseline = await captureVerifyBaseline(fakeTool, "fake-cid");
+    assert.equal(calls.length, 2);
+    assert.deepEqual(calls[1], { container_id: "fake-cid", path: ".", skip_type_gate: true });
+    assert.equal(calls[1].skip_lint_gate, undefined);
+    assert.equal(baseline.collected, 2033);
+    assert.equal(baseline.gate_passed, false);
+    assert.equal(baseline.lint, 0);
+    assert.equal(baseline.types, 1);
+    assert.equal(baseline.raw, typeBlocked);
+  });
+
+  it("re-runs with both skip flags when both gates failed", async () => {
+    const bothBlocked = {
+      gate_passed: false,
+      lint: [{ rule: "no-undef" }],
+      types: [{ error: "TS2304" }],
+      tests: { status: "skipped", message: "precondition gate failed; tests not run" },
+      gate_fail_reasons: ["lint (eslint): 1 violation(s)", "type_check (tsc): 1 error(s)"],
+    };
+    const bothCleared = {
+      gate_passed: true,
+      lint: [],
+      types: [],
+      tests: { full: { status: "ok", passed: 77, total: 77 } },
+    };
+    const calls = [];
+    const fakeTool = async (toolName, args) => {
+      if (toolName !== "verify_in_container") return { output: "" };
+      calls.push(args);
+      return calls.length === 1 ? bothBlocked : bothCleared;
+    };
+    const baseline = await captureVerifyBaseline(fakeTool, "fake-cid");
+    assert.equal(calls.length, 2);
+    assert.deepEqual(calls[1], {
+      container_id: "fake-cid",
+      path: ".",
+      skip_lint_gate: true,
+      skip_type_gate: true,
+    });
+    assert.equal(baseline.collected, 77);
+    assert.equal(baseline.gate_passed, false);
+    assert.equal(baseline.lint, 1);
+    assert.equal(baseline.types, 1);
+  });
+
+  it("makes exactly one call when the first call's gate passed", async () => {
+    let calls = 0;
+    const fakeTool = async (toolName) => {
+      if (toolName === "verify_in_container") {
+        calls += 1;
+        return {
+          gate_passed: true,
+          lint: [],
+          types: [],
+          tests: { full: { status: "ok", passed: 100, total: 100 } },
+        };
+      }
+      return { output: "" };
+    };
+    const baseline = await captureVerifyBaseline(fakeTool, "fake-cid");
+    assert.equal(calls, 1);
+    assert.equal(baseline.captured, true);
+    assert.equal(baseline.collected, 100);
+  });
+
+  it("leaves collected null when the retry is itself unmeasurable", async () => {
+    const blocked = {
+      gate_passed: false,
+      lint: [{ rule: "no-unused-vars" }],
+      types: [],
+      tests: { status: "skipped", message: "precondition gate failed; tests not run" },
+      gate_fail_reasons: ["lint (eslint): 1 violation(s)"],
+    };
+    // Both calls answer the same blocked shape — the retry's tests never ran.
+    const fakeTool = async (toolName) => (toolName === "verify_in_container" ? blocked : { output: "" });
+    const baseline = await captureVerifyBaseline(fakeTool, "fake-cid");
+    assert.equal(baseline.captured, true);
+    assert.equal(baseline.collected, null);
+    assert.equal(baseline.lint, 1);
+    assert.equal(baseline.raw, blocked);
+  });
+
+  it("keeps the first call's baseline, collected null, when the retry call throws (kusabi #517 repair)", async () => {
+    const lintBlocked = {
+      gate_passed: false,
+      lint: [{ rule: "no-unused-vars" }, { rule: "no-undef" }],
+      types: [],
+      tests: { status: "skipped", message: "precondition gate failed; tests not run" },
+      gate_fail_reasons: ["lint (eslint): 2 violation(s)"],
+    };
+    let calls = 0;
+    const fakeTool = async (toolName) => {
+      if (toolName !== "verify_in_container") return { output: "" };
+      calls += 1;
+      if (calls === 1) return lintBlocked;
+      throw new Error("retry blew up");
+    };
+    const baseline = await captureVerifyBaseline(fakeTool, "fake-cid");
+    // A failed retry must not cost anything the first call already earned.
+    assert.equal(baseline.captured, true);
+    assert.equal(baseline.gate_passed, false);
+    assert.equal(baseline.lint, 2);
+    assert.equal(baseline.types, 0);
+    assert.equal(baseline.collected, null);
+    assert.equal(baseline.raw, lintBlocked);
+  });
 });
 
 // renderPriorFindings — pure function exported from render.mjs

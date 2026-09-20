@@ -56,6 +56,8 @@ import path from "node:path";
 // never rolls the worktree back.
 import {
   buildVerifyBaseline,
+  countVerifyCollected,
+  countVerifyViolations,
 } from "./chain-probes.mjs";
 
 // =========================================================================
@@ -191,15 +193,28 @@ export async function captureBaseSha(callTool, container) {
 /**
  * Capture the chain-start verify baseline (kusabi #173).
  *
- * Runs `verify_in_container` ONCE on the pristine base worktree (before the
+ * Runs `verify_in_container` on the pristine base worktree (before the
  * round-1 implement dispatch) and records the base's lint/type violation
  * counts plus the raw verify result.  This is the only moment the base is
  * guaranteed unmodified — chain-resume REUSES the recorded baseline from
  * chain.json and never re-captures on a modified worktree.
  *
+ * Two-pass collection (kusabi #517): when the gate failed on the lint/type
+ * precondition the first call's tests never ran (`tests.full` absent), so it
+ * measured no collected count.  The capture then re-runs verify with the skip
+ * flags for the gates that actually failed — the same tolerated re-run shape
+ * the round path uses — purely to obtain the base's test count.  The first
+ * call remains authoritative for gate_passed / lint / types (a run with gates
+ * skipped does not describe the base); a retry may only fill in `collected`,
+ * and an unmeasurable retry leaves it null rather than overwriting a count.
+ * The retry is best-effort: a retry that throws leaves `collected` null and
+ * the first call's measurements intact — only a FIRST-call failure degrades
+ * the capture.  A gate that did not fail is never skipped, and a gate-passed
+ * base is captured with exactly one call.
+ *
  * The returned object is stored on chain.json as `verifyBaseline`:
- *   { captured: true, gate_passed, lint, types, raw }
- * When the RPC call itself fails the capture degrades to
+ *   { captured: true, gate_passed, lint, types, collected, raw }
+ * When the first verify call fails the capture degrades to
  *   { captured: false, error }
  * — the chain still runs, but P2 falls back to today's strict behaviour
  * (a missing baseline is never invented).
@@ -221,7 +236,47 @@ export async function captureVerifyBaseline(callTool, container) {
       container_id: container,
       path: ".",
     });
-    return buildVerifyBaseline(verifyResult);
+    const baseline = buildVerifyBaseline(verifyResult);
+    // Precondition failure: the gate failed and the tests never ran, so the
+    // first call measured no collected count.  Re-run with the skip flags for
+    // the gates that actually failed, purely to obtain the count — mirroring
+    // runVerifyGate's tolerated re-run, including which gates it skips and the
+    // `??` discipline on the count it takes back.
+    const tests = verifyResult?.tests;
+    const testsRan = !!(tests && typeof tests === "object" && tests.full);
+    if (verifyResult?.gate_passed !== true && !testsRan) {
+      const skips = {};
+      const lintCount = countVerifyViolations(verifyResult, "lint");
+      const typesCount = countVerifyViolations(verifyResult, "types");
+      // A gate "failed" when it reports violations (count > 0) — the same rule
+      // the round path uses to pick its skip flags.  Never skip a gate that
+      // did not fail.
+      if (lintCount !== null && lintCount > 0) skips.skip_lint_gate = true;
+      if (typesCount !== null && typesCount > 0) skips.skip_type_gate = true;
+      // No countable gate → no retry worth making: a flags-less second call
+      // would fail the same precondition and measure nothing anyway.
+      if (Object.keys(skips).length > 0) {
+        // The retry is best-effort and sits in its OWN try: if it throws, the
+        // first call's measurements are kept and `collected` stays null — a
+        // failed second call must not discard the baseline the first call
+        // already earned.
+        try {
+          const retryResult = await callTool("verify_in_container", {
+            container_id: container,
+            path: ".",
+            ...skips,
+          });
+          // The retry is the only run whose tests could have executed (the first
+          // call's were skipped by the precondition), so its count is the
+          // baseline's collected count; `??` keeps null rather than letting an
+          // unmeasurable retry overwrite a count with one.
+          baseline.collected = countVerifyCollected(retryResult) ?? baseline.collected;
+        } catch {
+          // Retry failed — keep the baseline from the first call, collected null.
+        }
+      }
+    }
+    return baseline;
   } catch (err) {
     return { captured: false, error: err?.message ?? String(err) };
   }

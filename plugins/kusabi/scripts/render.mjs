@@ -27,6 +27,7 @@ export {
 export {
   roundDiscardReason,
   roundChangedColumn,
+  probeVerdictLabel,
   resolveChainStatus,
   renderChainShow,
 } from "./render-chain.mjs";
