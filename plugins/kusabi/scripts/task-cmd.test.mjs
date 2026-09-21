@@ -507,3 +507,70 @@ describe("resolveTaskPreflight codex capability honesty", () => {
     });
   });
 });
+
+// resolveTaskPreflight phase guard — coordinate stays a seat contract, not a
+// task phase (independent review finding F1, job-muavz7j8ef8c)
+// ---------------------------------------------------------------------------
+// PHASE_AGENTS.coordinate (kusabi #529) is registered NON-enumerably: it
+// exists for the Luna seat prompt contract but must remain unreachable from
+// the `task` surface until the #530 mission driver deliberately wires it.  A
+// property-access guard (`if (!PHASE_AGENTS[phase])`) would accept it — the
+// regressions here pin the enumerable-keys guard: `task --phase coordinate`
+// stays an unknown phase while every ordinary worker phase keeps its preflight
+// behavior.
+
+describe("resolveTaskPreflight phase guard (coordinate stays unknown until #530)", () => {
+  const SIG = "Orchestrator: test-model | session test-session | 2026-09-12";
+  const BRIEF = [
+    SIG,
+    "",
+    "implement the change",
+    "## Deliverables",
+    "",
+    "- `plugins/kusabi/scripts/x.mjs`",
+    "",
+    "## Smoke",
+    "",
+    "- `npm test`",
+    "",
+  ].join("\n");
+
+  function withStateRoot(fn) {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-task-phase-"));
+    const stateRoot = path.join(tmp, "state");
+    fs.mkdirSync(stateRoot, { recursive: true });
+    try {
+      return fn({ tmp, stateRoot });
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  }
+
+  it("rejects --phase coordinate as unknown (the non-enumerable seat contract is not a task phase)", () => {
+    withStateRoot(({ tmp, stateRoot }) => {
+      assert.throws(
+        () =>
+          resolveTaskPreflight(
+            tmp,
+            { flags: { phase: "coordinate", container: "cid-1" }, text: BRIEF },
+            { stateRoot },
+          ),
+        /unknown phase: coordinate\. Use draft\|investigate\|implement\|review\|respond\|salvage\|gofer\|test-author\|plan/,
+      );
+    });
+  });
+
+  it("keeps accepting every ordinary worker phase", () => {
+    withStateRoot(({ tmp, stateRoot }) => {
+      for (const phase of ["draft", "investigate", "implement", "review", "respond", "salvage", "gofer", "test-author", "plan"]) {
+        const pre = resolveTaskPreflight(
+          tmp,
+          { flags: { phase, container: "cid-1" }, text: BRIEF },
+          { stateRoot },
+        );
+        assert.equal(pre.phase, phase);
+        assert.ok(pre.agent, `phase ${phase} must resolve an agent`);
+      }
+    });
+  });
+});
