@@ -772,6 +772,53 @@ describe("runReviewPhase — stubbed dispatch route recording", () => {
     assert.equal(roundRecord.reviewFallbacks.length, 1);
     assert.equal(roundRecord.reviewFallbacks[0].from, "test-org/old-route");
   });
+
+  it("hands the dispatch options carrying phase \"review\" — the seat identity (kusabi #542)", async () => {
+    // The agy backend keys `agy.homes.review` off the dispatch's `phase`, so
+    // a chain review must carry `phase: "review"` — asserted through the
+    // REAL seam (runReviewPhase), not by constructing the options object in
+    // the test.  Before the fix the review dispatched with phase null and
+    // could never select `homes.review`.
+    let seen = null;
+    const stubbedDispatch = (opts) => {
+      seen = opts;
+      return {
+        job: {
+          id: "review-job-3",
+          status: "completed",
+          modelEntry: "test-org/test-review-model",
+          modelVariant: null,
+          fallbacks: null,
+          usage: null,
+          error: null,
+        },
+        resultText: JSON.stringify({ verdict: "approve", findings: [] }),
+      };
+    };
+
+    const roundRecord = { round: 1 };
+
+    await runReviewPhase({
+      container: "test",
+      brief: "test brief",
+      modelChain: ["test-org/test-flash", "test-org/test-pro"],
+      chainId: "test-chain",
+      cwd: process.cwd(),
+      previousRecord: null,
+      baseSha: "abc123",
+      chainStatusOutput: "",
+      chainBaseLog: "",
+      chainUntracked: "",
+      roundRecord,
+      chainChangedPaths: [],
+      chainStatusObserved: false,
+      chainDeliverables: [],
+      flagsModel: null,
+      _dispatchWithFallback: stubbedDispatch,
+    });
+
+    assert.equal(seen.phase, "review");
+  });
 });
 
 // ---------------------------------------------------------------------------
