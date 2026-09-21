@@ -46,6 +46,9 @@ import {
   mapAgyUsage,
   assertNoAgySession,
   agyDispatch,
+  resolveAgyHome,
+  agyDeniedActionNames,
+  agyHomeSettingsPath,
 } from "./agy-dispatch.mjs";
 import {
   BACKENDS,
@@ -941,6 +944,270 @@ describe("assertSessionBackendCompatible — the guard is SYMMETRIC", () => {
   });
 });
 
+// =========================================================================
+// per-role HOME resolution (kusabi #542)
+// =========================================================================
+//
+// Every row of the resolution table in resolveAgyHome's doc comment is a
+// test below.  A role home is an ABSOLUTE path the spawn's HOME is pointed
+// at; `home: null` means "no override" and must be byte-identical to the
+// pre-#542 dispatch.
+
+describe("resolveAgyHome", () => {
+  const IMPLEMENT = "/home/u/.agy-homes/implement";
+  const REVIEW = "/home/u/.agy-homes/review";
+  const DEFAULT = "/home/u/.agy-homes/default";
+
+  it("no config file, or a config that is not an object, resolves to null with reason no-config", () => {
+    for (const config of [null, undefined, "not-an-object", 42, []]) {
+      const r = resolveAgyHome({ phase: "implement", config });
+      assert.deepEqual(r, { home: null, reason: "no-config" }, JSON.stringify(config));
+    }
+  });
+
+  it("agy.homes absent resolves to null with reason absent", () => {
+    // No `agy` key at all, an empty `agy`, and an `agy` that is not an
+    // object all leave `homes` absent — never malformed.
+    for (const config of [
+      {},
+      { agy: {} },
+      { agy: "not-an-object" },
+      { agy: [] },
+      { agy: null },
+    ]) {
+      const r = resolveAgyHome({ phase: "implement", config });
+      assert.deepEqual(r, { home: null, reason: "absent" }, JSON.stringify(config));
+    }
+  });
+
+  it("agy.homes that is not an object (string, array, number) resolves to null with reason malformed", () => {
+    for (const homes of ["/a/path", [], 5]) {
+      const r = resolveAgyHome({ phase: "implement", config: { agy: { homes } } });
+      assert.deepEqual(r, { home: null, reason: "malformed" }, JSON.stringify(homes));
+    }
+  });
+
+  it("a phase with its own non-empty-string entry resolves to that path with reason phase", () => {
+    const config = { agy: { homes: { implement: IMPLEMENT, review: REVIEW } } };
+    assert.deepEqual(
+      resolveAgyHome({ phase: "implement", config }),
+      { home: IMPLEMENT, reason: "phase" },
+    );
+    assert.deepEqual(
+      resolveAgyHome({ phase: "review", config }),
+      { home: REVIEW, reason: "phase" },
+    );
+  });
+
+  it("phase rework with only homes.implement configured resolves to null — no seat borrowing (criterion 1)", () => {
+    // A rework round dispatches as the implement phase (runImplementPhase
+    // passes phase: "implement"), so it never arrives here as "rework" — and
+    // when it somehow does, it must NOT borrow the implement home: an
+    // unrecognised phase is absent, never another seat's home.
+    assert.deepEqual(
+      resolveAgyHome({ phase: "rework", config: { agy: { homes: { implement: IMPLEMENT } } } }),
+      { home: null, reason: "absent" },
+    );
+  });
+
+  it("a null phase never resolves to another seat's home (criteria 2, 3)", () => {
+    // The shape a chain review produced BEFORE the fix: no phase at all.  It
+    // must fall to `default` or `null`, never to `homes.review` or
+    // `homes.implement`.
+    assert.deepEqual(
+      resolveAgyHome({ phase: null, config: { agy: { homes: { review: REVIEW } } } }),
+      { home: null, reason: "absent" },
+    );
+    assert.deepEqual(
+      resolveAgyHome({ phase: null, config: { agy: { homes: { implement: IMPLEMENT, review: REVIEW } } } }),
+      { home: null, reason: "absent" },
+    );
+    assert.deepEqual(
+      resolveAgyHome({ phase: null, config: { agy: { homes: { implement: IMPLEMENT, review: REVIEW, default: DEFAULT } } } }),
+      { home: DEFAULT, reason: "default" },
+    );
+  });
+
+  it("a phase absent from homes falls back to homes.default with reason default", () => {
+    const config = { agy: { homes: { default: DEFAULT } } };
+    assert.deepEqual(
+      resolveAgyHome({ phase: "review", config }),
+      { home: DEFAULT, reason: "default" },
+    );
+    // A null/absent phase (a task dispatch) takes the default too.
+    assert.deepEqual(
+      resolveAgyHome({ phase: null, config }),
+      { home: DEFAULT, reason: "default" },
+    );
+  });
+
+  it("a phase absent from homes with no default resolves to null with reason absent", () => {
+    for (const config of [
+      { agy: { homes: {} } },
+      { agy: { homes: { implement: IMPLEMENT } } }, // phase review, no default
+    ]) {
+      assert.deepEqual(
+        resolveAgyHome({ phase: "review", config }),
+        { home: null, reason: "absent" },
+        JSON.stringify(config),
+      );
+    }
+    // A null phase with only `implement` configured is also absent.
+    assert.deepEqual(
+      resolveAgyHome({ phase: null, config: { agy: { homes: { implement: IMPLEMENT } } } }),
+      { home: null, reason: "absent" },
+    );
+  });
+
+  it("a selected value that is \"\", false, 0, null, a number or an object resolves to null with reason malformed", () => {
+    for (const value of ["", false, 0, null, 42, {}, []]) {
+      const r = resolveAgyHome({ phase: null, config: { agy: { homes: { default: value } } } });
+      assert.deepEqual(r, { home: null, reason: "malformed" }, JSON.stringify(value));
+    }
+    // The same malformed rule applies to a phase entry that exists.
+    const r = resolveAgyHome({
+      phase: "implement",
+      config: { agy: { homes: { implement: false } } },
+    });
+    assert.deepEqual(r, { home: null, reason: "malformed" });
+  });
+
+  it("a relative path THROWS, naming the config key and the value", () => {
+    assert.throws(
+      () => resolveAgyHome({
+        phase: "implement",
+        config: { agy: { homes: { implement: "rel/homes/implement" } } },
+      }),
+      (err) => {
+        assert.match(err.message, /agy\.homes\.implement/);
+        assert.match(err.message, /rel\/homes\/implement/);
+        assert.match(err.message, /ABSOLUTE/);
+        return true;
+      },
+    );
+    // Also via the default key.
+    assert.throws(
+      () => resolveAgyHome({ phase: null, config: { agy: { homes: { default: "rel" } } } }),
+      (err) => {
+        assert.match(err.message, /agy\.homes\.default/);
+        assert.match(err.message, /"rel"/);
+        return true;
+      },
+    );
+  });
+});
+
+describe("agyDeniedActionNames \u2014 taken defensively", () => {
+  it("yields [] when denied_actions is absent, empty, or not an array (older CLIs)", () => {
+    assert.deepEqual(agyDeniedActionNames({}), []);
+    assert.deepEqual(agyDeniedActionNames({ denied_actions: [] }), []);
+    assert.deepEqual(agyDeniedActionNames({ denied_actions: "nope" }), []);
+    assert.deepEqual(agyDeniedActionNames({ denied_actions: { action: "command" } }), []);
+    assert.deepEqual(agyDeniedActionNames(null), []);
+  });
+
+  it("takes the action, with or without a display_name", () => {
+    assert.deepEqual(
+      agyDeniedActionNames({ denied_actions: [{ action: "command", display_name: "RunCommand" }] }),
+      ["command"],
+    );
+    assert.deepEqual(
+      agyDeniedActionNames({ denied_actions: [{ action: "command" }] }),
+      ["command"],
+    );
+  });
+
+  it("falls back to display_name when action is missing", () => {
+    assert.deepEqual(
+      agyDeniedActionNames({ denied_actions: [{ display_name: "RunCommand" }] }),
+      ["RunCommand"],
+    );
+  });
+
+  it("skips entries that are not objects or carry neither field", () => {
+    assert.deepEqual(
+      agyDeniedActionNames({
+        denied_actions: [null, "junk", {}, { action: "read" }, { display_name: "" }],
+      }),
+      ["read"],
+    );
+  });
+});
+
+describe("agyPayload \u2014 denied_actions (kusabi #542)", () => {
+  it("a denied, empty-payload result stays ok:false and the error says the run was DENIED, naming the action and permissions.allow (criterion 6)", () => {
+    const outcome = agyPayload({
+      response: "",
+      denied_actions: [{ action: "command", display_name: "RunCommand" }],
+    });
+    assert.equal(outcome.ok, false);
+    assert.match(outcome.error, /DENIED/);
+    assert.match(outcome.error, /command/);
+    assert.match(outcome.error, /RunCommand/);
+    assert.match(outcome.error, /permissions\.allow/);
+    // Without a settingsPath the message still points at the HOME-derived
+    // file generically.
+    assert.match(outcome.error, /<HOME>\/\.gemini\/antigravity-cli\/settings\.json/);
+  });
+
+  it("names the resolved home's settings.json when one is given", () => {
+    const settingsPath = agyHomeSettingsPath("/home/u/.agy-homes/implement");
+    const outcome = agyPayload({
+      response: "",
+      denied_actions: [{ action: "command", display_name: "RunCommand" }],
+    }, { settingsPath });
+    assert.equal(outcome.ok, false);
+    assert.match(outcome.error, new RegExp(settingsPath.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+    assert.match(outcome.error, /permissions\.allow/);
+  });
+
+  it("a denial mid-turn does NOT void a completed payload (criterion 7)", () => {
+    const outcome = agyPayload({
+      response: "did the thing",
+      denied_actions: [{ action: "command" }],
+    });
+    assert.deepEqual(outcome, { ok: true, text: "did the thing", payloadSource: "response" });
+  });
+
+  it("a denied empty payload without display_name lists just the action", () => {
+    const outcome = agyPayload({ response: "", denied_actions: [{ action: "command" }] });
+    assert.equal(outcome.ok, false);
+    assert.match(outcome.error, /command/);
+    assert.doesNotMatch(outcome.error, /RunCommand/);
+    assert.doesNotMatch(outcome.error, /\(command\)/);
+  });
+
+  it("lists every denied action", () => {
+    const outcome = agyPayload({
+      response: "",
+      denied_actions: [
+        { action: "command", display_name: "RunCommand" },
+        { action: "write", display_name: "Write" },
+      ],
+    });
+    assert.equal(outcome.ok, false);
+    assert.match(outcome.error, /command \(RunCommand\)/);
+    assert.match(outcome.error, /write \(Write\)/);
+  });
+
+  it("an EMPTY denied_actions array keeps the generic no-payload error", () => {
+    const outcome = agyPayload({ response: "", denied_actions: [] });
+    assert.equal(outcome.ok, false);
+    assert.match(outcome.error, /no payload/);
+    assert.doesNotMatch(outcome.error, /DENIED/);
+  });
+
+  it("structured_output still carries the payload next to a denial", () => {
+    const outcome = agyPayload({
+      response: "",
+      structured_output: { verdict: "approve" },
+      denied_actions: [{ action: "command" }],
+    });
+    assert.equal(outcome.ok, true);
+    assert.equal(outcome.payloadSource, "structured_output");
+  });
+});
+
 describe("backendSupportsResume", () => {
   it("all three backends resume (agy since kusabi #316)", () => {
     assert.equal(backendSupportsResume("opencode"), true);
@@ -1202,6 +1469,12 @@ const NL = String.fromCharCode(10);
 const argv = process.argv.slice(2);
 fs.appendFileSync(process.env.FAKE_AGY_ARGS_LOG, JSON.stringify(argv) + NL);
 fs.appendFileSync(process.env.FAKE_AGY_PIDS, String(process.pid) + NL);
+// The HOME the spawn actually ran under (kusabi #542): the fake logs it only
+// when the test asks (FAKE_AGY_HOME_LOG set), so the existing tests' logs
+// stay byte-identical to before.
+if (process.env.FAKE_AGY_HOME_LOG) {
+  fs.appendFileSync(process.env.FAKE_AGY_HOME_LOG, (process.env.HOME || "") + NL);
+}
 
 const mode = process.env.FAKE_AGY_MODE || "ok";
 
@@ -1317,6 +1590,24 @@ if (mode === "review-json") {
   });
   process.exit(0);
 }
+if (mode === "denied") {
+  // The exact shape of a denied run (kusabi #542): headless agy cannot
+  // prompt, so a tool that is not allow-listed is auto-denied while the
+  // status field stays SUCCESS and the response is empty.
+  emitHealthyStream({ ...base, status: "SUCCESS", response: "", denied_actions: [{ action: "command", display_name: "RunCommand" }] });
+  process.exit(0);
+}
+if (mode === "denied-no-display") {
+  // Older CLI shapes: denied_actions entries may lack display_name.
+  emitHealthyStream({ ...base, status: "SUCCESS", response: "", denied_actions: [{ action: "command" }] });
+  process.exit(0);
+}
+if (mode === "denied-with-payload") {
+  // A denial mid-turn does NOT void a completed payload: agy can deny one
+  // tool call and still finish the turn.
+  emitHealthyStream({ ...base, status: "SUCCESS", response: "did the thing", denied_actions: [{ action: "command" }] });
+  process.exit(0);
+}
 if (mode === "slow") {
   setInterval(() => {}, 1000); // never writes, never exits — the timeout must kill us
 } else if (mode === "ok") {
@@ -1334,10 +1625,12 @@ function fakeAgyContext(mode = "ok") {
   const binPath = path.join(tmp, "fake-agy.mjs");
   const argsLog = path.join(tmp, "args.ndjson");
   const pidsLog = path.join(tmp, "spawned.pids");
+  const homeLog = path.join(tmp, "home.log");
   fs.writeFileSync(binPath, FAKE_AGY_SOURCE, "utf8");
   fs.chmodSync(binPath, 0o755);
   fs.writeFileSync(argsLog, "", "utf8");
   fs.writeFileSync(pidsLog, "", "utf8");
+  fs.writeFileSync(homeLog, "", "utf8");
 
   const stateRoot = path.join(tmp, "state");
   const cwd = path.join(tmp, "cwd");
@@ -1349,12 +1642,14 @@ function fakeAgyContext(mode = "ok") {
     FAKE_AGY_MODE: process.env.FAKE_AGY_MODE,
     FAKE_AGY_ARGS_LOG: process.env.FAKE_AGY_ARGS_LOG,
     FAKE_AGY_PIDS: process.env.FAKE_AGY_PIDS,
+    FAKE_AGY_HOME_LOG: process.env.FAKE_AGY_HOME_LOG,
   };
   process.env.AGY_BIN = binPath;
   process.env.KUSABI_STATE_DIR = stateRoot;
   process.env.FAKE_AGY_MODE = mode;
   process.env.FAKE_AGY_ARGS_LOG = argsLog;
   process.env.FAKE_AGY_PIDS = pidsLog;
+  process.env.FAKE_AGY_HOME_LOG = homeLog;
 
   const stateDir = stateDirFor(cwd);
   return {
@@ -1362,8 +1657,11 @@ function fakeAgyContext(mode = "ok") {
     binPath,
     cwd,
     stateDir,
+    // The kusabi config root (KUSABI_STATE_DIR): config.json lives here.
+    configRoot: stateRoot,
     argsLog,
     pidsLog,
+    homeLog,
     setMode(next) { process.env.FAKE_AGY_MODE = next; },
     dispatchOptions(overrides = {}) {
       return {
@@ -1395,6 +1693,11 @@ function fakeAgyContext(mode = "ok") {
 function loggedArgs(argsLog) {
   const text = fs.readFileSync(argsLog, "utf8").trim();
   return text ? text.split("\n").map((l) => JSON.parse(l)) : [];
+}
+
+function loggedHomes(homeLog) {
+  const text = fs.readFileSync(homeLog, "utf8").trim();
+  return text ? text.split("\n") : [];
 }
 
 function isAlive(pid) {
@@ -1767,6 +2070,224 @@ describe("agyDispatch (fake agy binary)", () => {
     const args = loggedArgs(ctx.argsLog)[0];
     const modelIdx = args.indexOf("--model");
     assert.equal(args[modelIdx + 1], "claude-sonnet-4-6");
+  });
+});
+
+// =========================================================================
+// per-role HOME — end-to-end through the fake agy (kusabi #542)
+// =========================================================================
+
+// The kusabi config the HOME resolver reads (KUSABI_STATE_DIR/config.json).
+function writeKusabiConfig(ctx, config) {
+  fs.mkdirSync(ctx.configRoot, { recursive: true });
+  fs.writeFileSync(path.join(ctx.configRoot, "config.json"), JSON.stringify(config), "utf8");
+}
+
+// A usable role home: the settings.json exists and carries an array at
+// `permissions.allow` — the exact shape agy's permission table has.
+function writeRoleHome(ctx, home, settings = { permissions: { allow: [] } }) {
+  const dir = path.join(home, ".gemini", "antigravity-cli");
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, "settings.json"), JSON.stringify(settings), "utf8");
+}
+
+describe("agyDispatch — per-role HOME (kusabi #542)", () => {
+  let ctx;
+
+  beforeEach(() => { ctx = fakeAgyContext(); });
+  afterEach(() => { ctx.restore(); });
+
+  it("with no config file, an implement dispatch spawns under the AMBIENT HOME and records agyHome null (criterion 1)", async () => {
+    const { job } = await agyDispatch(ctx.dispatchOptions({ phase: "implement" }));
+    assert.equal(job.agyHome, null);
+    assert.equal(job.agyHomeReason, "no-config");
+    // The fake logged the HOME it actually ran under: the ambient one — no
+    // override was applied.
+    assert.deepEqual(loggedHomes(ctx.homeLog), [process.env.HOME]);
+    // And the persisted record agrees.
+    const persisted = loadJob(ctx.stateDir, job.id);
+    assert.equal(persisted.agyHome, null);
+    assert.equal(persisted.agyHomeReason, "no-config");
+  });
+
+  it("a config with no agy key records reason absent and still spawns under the ambient HOME", async () => {
+    writeKusabiConfig(ctx, {});
+    const { job } = await agyDispatch(ctx.dispatchOptions({ phase: "implement" }));
+    assert.equal(job.agyHome, null);
+    assert.equal(job.agyHomeReason, "absent");
+    assert.deepEqual(loggedHomes(ctx.homeLog), [process.env.HOME]);
+  });
+
+  it("agy.homes.implement with a usable settings.json → the implement dispatch spawns with HOME set to it (criterion 2)", async () => {
+    const roleHome = path.join(ctx.tmp, "agy-home-implement");
+    writeRoleHome(ctx, roleHome);
+    writeKusabiConfig(ctx, { agy: { homes: { implement: roleHome } } });
+
+    const { job } = await agyDispatch(ctx.dispatchOptions({ phase: "implement" }));
+    assert.equal(job.status, "completed");
+    assert.equal(job.agyHome, roleHome);
+    assert.equal(job.agyHomeReason, "phase");
+    assert.deepEqual(loggedHomes(ctx.homeLog), [roleHome]);
+    // The argv is otherwise unchanged — HOME is an env override, not a flag.
+    assert.equal(loggedArgs(ctx.argsLog).length, 1);
+    const persisted = loadJob(ctx.stateDir, job.id);
+    assert.equal(persisted.agyHome, roleHome);
+    assert.equal(persisted.agyHomeReason, "phase");
+  });
+
+  it("an agy dispatch with phase review spawns under homes.review (criterion 4)", async () => {
+    // A chain review carries `phase: "review"` (chain-review.mjs passes it on
+    // the review dispatch options); the review seat must select its own home.
+    const reviewHome = path.join(ctx.tmp, "agy-home-review");
+    writeRoleHome(ctx, reviewHome);
+    writeKusabiConfig(ctx, { agy: { homes: { review: reviewHome } } });
+
+    const { job } = await agyDispatch(ctx.dispatchOptions({ phase: "review" }));
+    assert.equal(job.status, "completed");
+    assert.equal(job.agyHome, reviewHome);
+    assert.equal(job.agyHomeReason, "phase");
+    // Asserted from the fake agy's logged environment, not from the record.
+    assert.deepEqual(loggedHomes(ctx.homeLog), [reviewHome]);
+  });
+
+  it("homes.default applies to a phase with no entry of its own", async () => {
+    const defaultHome = path.join(ctx.tmp, "agy-home-default");
+    writeRoleHome(ctx, defaultHome);
+    writeKusabiConfig(ctx, { agy: { homes: { default: defaultHome } } });
+
+    const { job } = await agyDispatch(ctx.dispatchOptions({ phase: "review" }));
+    assert.equal(job.agyHome, defaultHome);
+    assert.equal(job.agyHomeReason, "default");
+    assert.deepEqual(loggedHomes(ctx.homeLog), [defaultHome]);
+  });
+
+  it("a configured home whose settings.json is missing THROWS before the spawn (criterion 4)", async () => {
+    const missingHome = path.join(ctx.tmp, "agy-home-missing");
+    writeKusabiConfig(ctx, { agy: { homes: { implement: missingHome } } });
+
+    await assert.rejects(
+      () => agyDispatch(ctx.dispatchOptions({ phase: "implement" })),
+      (err) => {
+        assert.match(err.message, /settings\.json/);
+        assert.match(err.message, /agy\.homes\.implement/);
+        assert.match(err.message, /"implement"/);
+        assert.match(err.message, /refuses/);
+        return true;
+      },
+    );
+    // The fake agy was NEVER executed — no argv, no pid.
+    assert.deepEqual(loggedArgs(ctx.argsLog), []);
+    assert.equal(fs.readFileSync(ctx.pidsLog, "utf8"), "");
+    assert.deepEqual(listJobs(ctx.stateDir), []);
+  });
+
+  it("a settings.json that does not parse as JSON throws before the spawn", async () => {
+    const badHome = path.join(ctx.tmp, "agy-home-bad-json");
+    writeRoleHome(ctx, badHome, "this is not json");
+    writeKusabiConfig(ctx, { agy: { homes: { implement: badHome } } });
+
+    await assert.rejects(
+      () => agyDispatch(ctx.dispatchOptions({ phase: "implement" })),
+      /not parse to a JSON object/,
+    );
+    assert.equal(fs.readFileSync(ctx.pidsLog, "utf8"), "");
+  });
+
+  it("a settings.json whose permissions.allow is not an array throws before the spawn", async () => {
+    const badHome = path.join(ctx.tmp, "agy-home-bad-allow");
+    writeRoleHome(ctx, badHome, { permissions: { allow: "everything" } });
+    writeKusabiConfig(ctx, { agy: { homes: { implement: badHome } } });
+
+    await assert.rejects(
+      () => agyDispatch(ctx.dispatchOptions({ phase: "implement" })),
+      /permissions\.allow.*not an array/,
+    );
+    assert.equal(fs.readFileSync(ctx.pidsLog, "utf8"), "");
+  });
+
+  it("an empty settings.json (no permissions key at all) is a usable table", async () => {
+    const bareHome = path.join(ctx.tmp, "agy-home-bare");
+    writeRoleHome(ctx, bareHome, {});
+    writeKusabiConfig(ctx, { agy: { homes: { implement: bareHome } } });
+
+    const { job } = await agyDispatch(ctx.dispatchOptions({ phase: "implement" }));
+    assert.equal(job.status, "completed");
+    assert.equal(job.agyHome, bareHome);
+    assert.deepEqual(loggedHomes(ctx.homeLog), [bareHome]);
+  });
+
+  it("a relative configured path THROWS, naming the key and the value, before the spawn (criterion 5)", async () => {
+    writeKusabiConfig(ctx, { agy: { homes: { implement: "relative/home" } } });
+
+    await assert.rejects(
+      () => agyDispatch(ctx.dispatchOptions({ phase: "implement" })),
+      (err) => {
+        assert.match(err.message, /agy\.homes\.implement/);
+        assert.match(err.message, /relative\/home/);
+        return true;
+      },
+    );
+    assert.deepEqual(loggedArgs(ctx.argsLog), []);
+    assert.equal(fs.readFileSync(ctx.pidsLog, "utf8"), "");
+  });
+
+  it("a denied, empty-payload run is a failed job naming the action, permissions.allow, and the resolved home's settings.json (criterion 6)", async () => {
+    const roleHome = path.join(ctx.tmp, "agy-home-implement");
+    writeRoleHome(ctx, roleHome);
+    writeKusabiConfig(ctx, { agy: { homes: { implement: roleHome } } });
+    ctx.setMode("denied");
+
+    const { job, resultText } = await agyDispatch(ctx.dispatchOptions({ phase: "implement" }));
+    assert.equal(job.status, "error");
+    assert.deepEqual(job.agyDeniedActions, ["command"]);
+    assert.match(job.error, /DENIED/);
+    assert.match(job.error, /command/);
+    assert.match(job.error, /permissions\.allow/);
+    assert.match(job.error, new RegExp(agyHomeSettingsPath(roleHome).replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+    assert.equal(resultText, "");
+    // The persisted record carries the same denied names.
+    assert.deepEqual(loadJob(ctx.stateDir, job.id).agyDeniedActions, ["command"]);
+    // And the finished event does too.
+    const events = fs.readFileSync(path.join(jobDir(ctx.stateDir, job.id), "events.ndjson"), "utf8")
+      .trim().split("\n").map(JSON.parse);
+    assert.equal(events.at(-1).agyDeniedActions[0], "command");
+  });
+
+  it("a denial mid-turn does not void a completed payload (criterion 7)", async () => {
+    ctx.setMode("denied-with-payload");
+    const { job, resultText } = await agyDispatch(ctx.dispatchOptions());
+    assert.equal(job.status, "completed");
+    assert.equal(job.error, null);
+    assert.equal(resultText, "did the thing");
+    assert.deepEqual(job.agyDeniedActions, ["command"]);
+  });
+
+  it("a denied run without display_name still records and names the action", async () => {
+    ctx.setMode("denied-no-display");
+    const { job } = await agyDispatch(ctx.dispatchOptions());
+    assert.equal(job.status, "error");
+    assert.deepEqual(job.agyDeniedActions, ["command"]);
+    assert.match(job.error, /command/);
+    assert.doesNotMatch(job.error, /RunCommand/);
+  });
+
+  it("EVERY agy job record carries all three fields, whatever the outcome (criterion 8)", async () => {
+    // completed, failed-by-payload, failed-by-exit, failed-by-parse,
+    // failed-by-missing-result — plus the argv-too-large refusal path.
+    for (const mode of ["ok", "success-empty-payload", "exit", "garbage", "no-result"]) {
+      ctx.setMode(mode);
+      const { job } = await agyDispatch(ctx.dispatchOptions());
+      assert.ok(Object.hasOwn(job, "agyHome"), `${mode}: agyHome`);
+      assert.ok(Object.hasOwn(job, "agyHomeReason"), `${mode}: agyHomeReason`);
+      assert.ok(Object.hasOwn(job, "agyDeniedActions"), `${mode}: agyDeniedActions`);
+      assert.ok(Array.isArray(job.agyDeniedActions), `${mode}: agyDeniedActions is an array`);
+    }
+
+    const oversized = "x".repeat(AGY_MAX_ARG_BYTES + 1);
+    const refused = await agyDispatch(ctx.dispatchOptions({ promptText: oversized }));
+    assert.ok(Object.hasOwn(refused.job, "agyHome"), "argv-too-large: agyHome");
+    assert.ok(Object.hasOwn(refused.job, "agyHomeReason"), "argv-too-large: agyHomeReason");
+    assert.deepEqual(refused.job.agyDeniedActions, []);
   });
 });
 

@@ -437,6 +437,16 @@ export async function runReviewPhase({
     const reviewDispatchOptions = {
       cwd,
       kind: "review",
+      // The seat identity (kusabi #542): a chain review IS the review seat,
+      // so it must carry `phase: "review"` — the agy backend keys
+      // `agy.homes.review` off this field, and without it a chain review
+      // resolves no role home (phase null) and can never select
+      // `homes.review`; only the manual `task --phase review` path reached
+      // it.  This field is safe to set here: every backend on this path
+      // (opencode via selectRoutes, claude, agy, cursor) resolves its model
+      // from `tiers`/`explicitModel`, never from `phase`, so carrying the
+      // seat identity cannot re-route model selection.
+      phase: "review",
       title: "chain: " + chainId + " round " + roundRecord.round + " review",
       promptText: reviewPromptText,
       agent: "kusabi-review",

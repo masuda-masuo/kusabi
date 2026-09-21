@@ -126,20 +126,30 @@
 //     error that names the oversized element and the way out, rather than
 //     letting a raw errno surface as a generic dispatch failure.  It is a
 //     caller error (`status: "error"`), not a provider outage.
-//   - Per-job tool permissions cannot be expressed: agy takes no allow/deny
-//     flags.  A deny map that reaches this dispatch (the chain phases pass
-//     implementDenyTools / reviewDenyTools unconditionally) is recorded on
-//     the job record as `toolDeniesUnenforced` rather than silently dropped;
-//     an operator-typed `--read-only` / `--deny` is rejected at command
-//     start instead (kusabi-companion.mjs), because a restriction that
-//     cannot be applied must never look applied.
+//   - Per-dispatch tool permissions cannot be expressed: agy takes no
+//     allow/deny flags.  A deny map that reaches this dispatch (the chain
+//     phases pass implementDenyTools / reviewDenyTools unconditionally) is
+//     recorded on the job record as `toolDeniesUnenforced` rather than
+//     silently dropped; an operator-typed `--read-only` / `--deny` is
+//     rejected at command start instead (kusabi-companion.mjs), because a
+//     restriction that cannot be applied must never look applied.  What CAN
+//     be expressed is a PER-ROLE permission table: agy's allow-list lives in
+//     `<HOME>/.gemini/antigravity-cli/settings.json`, and HOME is derived
+//     from nothing else, so `agy.homes` (see resolveAgyHome) hands each role
+//     its own HOME — and with it its own allow-list, MCP config, and rules.
+//     A role with no configured home runs under the ambient HOME exactly as
+//     before; a configured home whose settings.json is unusable refuses the
+//     dispatch (fail closed) instead of widening back to the operator's own
+//     machine-wide table.
 //
 // ---------------------------------------------------------------------------
 // Assumptions this module makes and does NOT manage
 // ---------------------------------------------------------------------------
 // agy reaches sandbox containers through the sunaba MCP server, configured
-// GLOBALLY in `~/.gemini/antigravity-cli/mcp_config.json` — the same route
-// Claude Code uses.  That file is the operator's; this dispatch neither
+// in `<HOME>/.gemini/config/mcp_config.json` (`agy mcp add` writes it there;
+// the older `~/.gemini/antigravity-cli/mcp_config.json` path is gone) — the
+// same route Claude Code uses, and per-HOME like every other `.gemini` file
+// (see resolveAgyHome).  That file is the operator's; this dispatch neither
 // writes, validates, nor overrides it (contrast the claude backend, which
 // generates its own `--mcp-config`).  If sunaba is not configured there, the
 // worker simply has no container tools and says so in its own output.
@@ -152,7 +162,7 @@ import { fileURLToPath } from "node:url";
 import { firstRoute } from "./cli.mjs";
 import { readAgentSystemPrompt } from "./claude-dispatch.mjs";
 import { newJobId, saveJob, jobDir, appendEvent } from "./job-store.mjs";
-import { stateDirFor, writeJson } from "./state-paths.mjs";
+import { stateDirFor, writeJson, readJson, stateRoot } from "./state-paths.mjs";
 import { durationS } from "./render.mjs";
 import { resolveCompletedResult } from "./result-recovery.mjs";
 import { deriveStopReason } from "./stop-reason.mjs";
@@ -808,19 +818,33 @@ export function agyWatchdogSeconds(value) {
  *     mid-run MCP kwarg typo the model then recovered from.
  *   ok: false — no payload.  A failed job regardless of `status: "SUCCESS"`,
  *     with an error that QUOTES what was received so the operator can see
- *     the shape that arrived rather than guess at it.
+ *     the shape that arrived rather than guess at it.  When the empty result
+ *     also carries a non-empty `denied_actions` array, the failure text says
+ *     the run was DENIED instead of merely empty: headless agy auto-denies
+ *     tool calls that are not allow-listed (it cannot prompt), and an empty
+ *     payload plus `status: SUCCESS` is exactly the shape of a denied run —
+ *     indistinguishable from "returned nothing" without reading the field.
+ *     `ok` stays `false`; the error names the denied actions and points at
+ *     `permissions.allow` in the settings.json of the HOME the run used.
  *
  * When both are present, `response` wins: it is the text the review-parsing
  * path already knows how to read (a schema-enforced run puts clean JSON
  * there, which `extractJson` parses trivially — there is deliberately no
  * second parsing path).  `structured_output` is the fallback for the run
- * that filled the schema but printed nothing.
+ * that filled the schema but printed nothing.  A denial mid-turn does NOT
+ * void a completed payload: agy can deny one tool call and still finish the
+ * turn, so a non-empty `denied_actions` next to a payload leaves `ok: true`
+ * — the payload wins.
  *
  * @param {object|null} parsed — output of `parseAgyResult`.
+ * @param {object} [opts]
+ * @param {string} [opts.settingsPath] — the settings.json of the HOME this
+ *        run used (the resolved role home, or the ambient one), named in the
+ *        denied error so the operator is pointed at the exact file.
  * @returns {{ok: true, text: string, payloadSource: "response"|"structured_output"}
  *          |{ok: false, error: string}}
  */
-export function agyPayload(parsed) {
+export function agyPayload(parsed, { settingsPath } = {}) {
   const response = parsed?.response;
   if (typeof response === "string" && response.trim() !== "") {
     return { ok: true, text: response, payloadSource: "response" };
@@ -828,6 +852,19 @@ export function agyPayload(parsed) {
   const structured = parsed?.structured_output;
   if (structured !== null && structured !== undefined) {
     return { ok: true, text: JSON.stringify(structured), payloadSource: "structured_output" };
+  }
+  const denied = collectAgyDeniedActions(parsed);
+  if (denied.length > 0) {
+    const where = settingsPath ?? "<HOME>/.gemini/antigravity-cli/settings.json";
+    return {
+      ok: false,
+      error:
+        "agy returned no payload and the run was DENIED: headless agy cannot prompt, so the " +
+        "tool call(s) that are not allow-listed were auto-denied: " +
+        `${denied.map((d) => d.label).join(", ")}. ` +
+        `Allow them under permissions.allow in ${where} (the permission table this run's HOME used). ` +
+        `Received: ${describeAgyResult(parsed)}`,
+    };
   }
   return {
     ok: false,
@@ -950,6 +987,276 @@ export function assertNoAgySession(session, { provenance } = {}) {
 }
 
 // =========================================================================
+// per-role HOME resolution \u2014 pure
+// =========================================================================
+//
+// agy takes no allow/deny flags, but its permission table is per-HOME:
+// `<HOME>/.gemini/antigravity-cli/settings.json` carries `permissions.allow`,
+// the CLI derives that path from HOME and nothing else, and a dispatch under
+// a separate HOME is governed by the separate table (measured 2026-09-22:
+// a tool allow-listed only in the main HOME is refused under the separate
+// one, so the main table does not leak).  So the per-role restriction that
+// `--deny` cannot express IS expressible: give the role its own HOME.  The
+// MCP config (`~/.gemini/config/mcp_config.json`, written by `agy mcp add`)
+// and the always-on `~/.gemini/config/rules/AGENTS.md` are per-HOME too, so
+// a role home scopes the whole permission surface, not just the allow-list.
+
+/**
+ * The kusabi config, read straight from the state root for the home
+ * resolver's own use.  `agyDispatch` is handed no config (the dispatch
+ * contract it shares with `dispatchWithFallback` / `claudeDispatch` carries
+ * none, and the chain phases that call it never saw one), so the resolver
+ * reads the ONE key it needs itself rather than threading a config object
+ * through every phase \u2014 exactly the loadClaudeGuardConfig precedent.
+ *
+ * Read-only and fail-quiet: `readJson` returns null for a missing or
+ * unparseable file.  A genuinely broken config never reaches here \u2014 every
+ * command loads and validates it (loadConfig, kusabi-companion.mjs) before
+ * any dispatch happens.
+ *
+ * @returns {object|null}
+ */
+export function loadAgyHomeConfig() {
+  return readJson(path.join(stateRoot(), "config.json"));
+}
+
+/**
+ * Resolve the HOME an agy dispatch should run under, from the `agy.homes`
+ * map in the kusabi config.
+ *
+ * Config shape (documented in README.md, "Backends"):
+ *
+ *   { "agy": { "homes": { "implement": "/home/u/.agy-homes/implement",
+ *                         "review":    "/home/u/.agy-homes/review",
+ *                         "default":   "/home/u/.agy-homes/default" } } }
+ *
+ * `home: null` means "do not override HOME" \u2014 the spawn is byte-identical
+ * to today's dispatch.  Resolution table \u2014 every row is a test:
+ *
+ *   | input | result | reason |
+ *   |---|---|---|
+ *   | no config file, or not an object | `null` | `no-config` |
+ *   | `agy.homes` absent | `null` | `absent` |
+ *   | `agy.homes` not an object (string, array, number) | `null` | `malformed` |
+ *   | `phase` has an entry, non-empty string | that path | `phase` |
+ *   | `phase` absent from `homes`, `homes.default` present | the default path | `default` |
+ *   | `phase` absent and no `default` | `null` | `absent` |
+ *   | the selected value is `""`, `false`, `0`, `null`, a number or an object | `null` | `malformed` |
+ *   | the selected value is a relative path | **throw** | \u2014 |
+ *
+ * There is deliberately NO `rework` row: a rework round dispatches as the
+ * implement phase (`runImplementPhase` passes `phase: "implement"` for every
+ * round), so it is meant to share `homes.implement`.  A `rework` key would
+ * document a home no production caller ever selects, and a phase that is not
+ * an entry falls to `default` or `null` — never to another seat's home.
+ *
+ * A relative path throws rather than resolving: the spawn's cwd is the repo
+ * under test, so a relative HOME would silently point somewhere different per
+ * dispatch.  The message names the key and the value.
+ *
+ * @param {object} opts
+ * @param {string|null|undefined} [opts.phase] \u2014 the dispatch's phase; a key
+ *        into `homes`.
+ * @param {object|null|undefined} [opts.config] \u2014 output of
+ *        loadAgyHomeConfig().
+ * @returns {{ home: string|null, reason: string }}
+ * @throws {Error} When the selected value is a relative path.
+ */
+export function resolveAgyHome({ phase, config }) {
+  if (config === null || config === undefined || typeof config !== "object" || Array.isArray(config)) {
+    return { home: null, reason: "no-config" };
+  }
+  const agy = config.agy;
+  const homes = (agy === null || typeof agy !== "object" || Array.isArray(agy)) ? undefined : agy.homes;
+  if (homes === undefined) return { home: null, reason: "absent" };
+  if (homes === null || typeof homes !== "object" || Array.isArray(homes)) {
+    return { home: null, reason: "malformed" };
+  }
+
+  // Selection: the phase's own entry wins; otherwise `default`.  Presence is
+  // what selects; the selected VALUE is validated below, so a present-but-
+  // malformed entry reports `malformed`, never a silent fall-through.  An
+  // unrecognised or null phase falls to `default` or `null` — never to
+  // another seat's home (there is no rework row on purpose, see the doc
+  // comment).
+  let key;
+  let value;
+  let reason;
+  if (typeof phase === "string" && phase !== "" && Object.hasOwn(homes, phase)) {
+    key = phase;
+    value = homes[phase];
+    reason = "phase";
+  } else if (Object.hasOwn(homes, "default")) {
+    key = "default";
+    value = homes.default;
+    reason = "default";
+  } else {
+    return { home: null, reason: "absent" };
+  }
+
+  if (typeof value !== "string" || value === "") {
+    return { home: null, reason: "malformed" };
+  }
+  if (!path.isAbsolute(value)) {
+    throw new Error(
+      `agy backend: agy.homes.${key} must be an ABSOLUTE path, got "${value}" \u2014 ` +
+      "a relative HOME would silently point somewhere different per dispatch " +
+      "(the spawn's cwd is the repo under test). Use an absolute path, or " +
+      "remove the key to run under the ambient HOME."
+    );
+  }
+  return { home: value, reason };
+}
+
+/**
+ * The config key that produced a resolved home, for error messages.
+ *
+ * The resolver's contract is `{ home, reason }`; the key is recoverable from
+ * the reason, so it is derived here rather than carried on the record.  Only
+ * the two home-producing reasons are ever passed.
+ *
+ * @param {string} reason \u2014 a `reason` from resolveAgyHome.
+ * @param {string|null|undefined} [phase]
+ * @returns {string} e.g. `agy.homes.implement`.
+ */
+export function agyHomeConfigKey(reason, phase) {
+  if (reason === "default") return "agy.homes.default";
+  return `agy.homes.${typeof phase === "string" ? phase : ""}`;
+}
+
+/**
+ * The settings.json an agy role's permission table lives in.
+ *
+ * This is the ONE file this module reads from a role home.  It is derived
+ * from HOME and nothing else (measured 2026-09-22), so the same path that
+ * the CLI consults is the path this module checks.
+ *
+ * @param {string} home \u2014 a resolved role home.
+ * @returns {string}
+ */
+export function agyHomeSettingsPath(home) {
+  return path.join(home, ".gemini", "antigravity-cli", "settings.json");
+}
+
+/**
+ * Fail-closed check on a resolved role home, run BEFORE the spawn.
+ *
+ * When `agy.homes` names a home, kusabi requires that home's permission
+ * table to be usable: the settings.json must exist, parse as JSON, and carry
+ * `permissions` as an object with `permissions.allow` either absent or an
+ * array.  Anything else throws a config-level error (never a failed job):
+ * a missing or unreadable role table would silently fall back to the
+ * ambient HOME \u2014 the operator's own machine-wide table \u2014 running with
+ * MORE access than configured, which is the failure this whole mechanism
+ * exists to prevent.  There is deliberately no fallback path.
+ *
+ * Reading this file is the only filesystem access the HOME mechanism adds;
+ * it is a read, and it happens once per dispatch, before anything is
+ * spawned.
+ *
+ * @param {object} opts
+ * @param {string} opts.home \u2014 the resolved role home.
+ * @param {string|null|undefined} [opts.phase] \u2014 named in the error.
+ * @param {string} opts.configKey \u2014 e.g. `agy.homes.implement`, named in the
+ *        error so the operator can find the line to fix.
+ * @throws {Error} When the table is missing, unparseable, or misshaped.
+ */
+export function assertAgyHomeSettings({ home, phase, configKey }) {
+  const settingsPath = agyHomeSettingsPath(home);
+  const phaseName = JSON.stringify(phase ?? null);
+  const base = `agy backend: phase ${phaseName} resolves HOME "${home}" from ${configKey}, `;
+  let parsed;
+  try {
+    parsed = JSON.parse(fs.readFileSync(settingsPath, "utf8"));
+  } catch (err) {
+    throw new Error(
+      `${base}but ${settingsPath} is missing or not readable as JSON (${err.message}) \u2014 ` +
+      "kusabi refuses rather than falling back to the ambient HOME: a missing role table would " +
+      "silently widen the permission surface back to the operator's own machine-wide table. " +
+      `Fix the file, or remove ${configKey}.`
+    );
+  }
+  const problem =
+    parsed === null || typeof parsed !== "object" || Array.isArray(parsed)
+      ? "the file does not parse to a JSON object"
+      : (() => {
+          const permissions = parsed.permissions;
+          if (permissions !== undefined && (permissions === null || typeof permissions !== "object" || Array.isArray(permissions))) {
+            return "`permissions` is not an object";
+          }
+          const allow = permissions === undefined ? undefined : permissions.allow;
+          if (allow !== undefined && !Array.isArray(allow)) {
+            return "`permissions.allow` is present but not an array";
+          }
+          return null;
+        })();
+  if (problem !== null) {
+    throw new Error(
+      `${base}but ${settingsPath} is not a usable permission table: ${problem}. ` +
+      "kusabi refuses rather than falling back to the ambient HOME: a malformed role table would " +
+      "silently widen the permission surface back to the operator's own machine-wide table. " +
+      `Fix the file, or remove ${configKey}.`
+    );
+  }
+}
+
+// =========================================================================
+// denied_actions \u2014 pure
+// =========================================================================
+//
+// Headless agy cannot prompt, so a tool that is not allow-listed is
+// auto-denied and the terminal result reports it as `denied_actions` while
+// `status` stays SUCCESS and `response` is empty:
+//
+//   {"status":"SUCCESS","response":"","denied_actions":[{"action":"command",
+//    "display_name":"RunCommand"}]}
+//
+// Without reading that field the result is indistinguishable from "the
+// provider returned nothing" (observed 2026-08-22: an implement worker chose
+// the host `bash`, was denied, and burned 84 seconds with zero edits).  The
+// field is taken DEFENSIVELY: entries may lack `display_name`, and the field
+// may be absent entirely on older CLI versions.
+
+/**
+ * The denied tool-call names a result reports, as a bare string array.
+ *
+ * Each entry contributes its `action` when that is a non-empty string,
+ * falling back to `display_name` when the action is missing \u2014 a name is
+ * better than a dropped entry.  Entries that are not objects, and entries
+ * with neither field, are skipped.  Absent or non-array `denied_actions`
+ * yields `[]` (older CLI versions).
+ *
+ * @param {object|null|undefined} parsed \u2014 an agy result object.
+ * @returns {string[]}
+ */
+export function agyDeniedActionNames(parsed) {
+  return collectAgyDeniedActions(parsed).map((d) => d.name);
+}
+
+/**
+ * The structured reading of `denied_actions`: `name` for the record,
+ * `label` for the error text (the action with its display name attached).
+ *
+ * @param {object|null|undefined} parsed
+ * @returns {{name: string, label: string}[]}
+ */
+function collectAgyDeniedActions(parsed) {
+  const raw = parsed?.denied_actions;
+  if (!Array.isArray(raw)) return [];
+  const out = [];
+  for (const entry of raw) {
+    if (entry === null || typeof entry !== "object" || Array.isArray(entry)) continue;
+    const action = typeof entry.action === "string" && entry.action.trim() !== "" ? entry.action : null;
+    const displayName = typeof entry.display_name === "string" && entry.display_name.trim() !== "" ? entry.display_name : null;
+    if (action === null && displayName === null) continue;
+    const name = action ?? displayName;
+    const label = action !== null && displayName !== null ? `${action} (${displayName})` : name;
+    out.push({ name, label });
+  }
+  return out;
+}
+
+// =========================================================================
 // process — spawn/IO
 // =========================================================================
 
@@ -965,6 +1272,13 @@ export function assertNoAgySession(session, { provenance } = {}) {
  * @param {string} opts.bin
  * @param {string[]} opts.args
  * @param {string} opts.cwd
+ * @param {object} [opts.env] — extra environment overrides passed straight
+ *        through to `runBackendProcess` (ADDITIVE: merged on top of the
+ *        parent env there, never a replacement).  The per-role HOME override
+ *        (`agy.homes`, see resolveAgyHome) rides this; when the resolver
+ *        returns null the caller passes nothing and the child inherits the
+ *        parent env byte-for-byte.  No merging logic lives here — the shared
+ *        runner already merges onto `process.env`.
  * @param {number|null} [opts.timeoutS]
  * @param {number|null} [opts.watchdogS]
  * @param {(info: {pid: number}) => void} [opts.onStart]
@@ -975,9 +1289,9 @@ export function assertNoAgySession(session, { provenance } = {}) {
  *                     timedOut: boolean, stalled: boolean,
  *                     spawnError: Error|null }>}
  */
-export function runAgyProcess({ bin, args, cwd, timeoutS, watchdogS, onStart, onLine, onWatchdog }) {
+export function runAgyProcess({ bin, args, cwd, env, timeoutS, watchdogS, onStart, onLine, onWatchdog }) {
   return runBackendProcess({
-    bin, args, cwd, timeoutS, watchdogS, onStart, onLine, onWatchdog,
+    bin, args, cwd, env, timeoutS, watchdogS, onStart, onLine, onWatchdog,
     parseLine: parseAgyStreamLine,
   });
 }
@@ -1001,8 +1315,9 @@ export function runAgyProcess({ bin, args, cwd, timeoutS, watchdogS, onStart, on
  * nonzero exit, unparseable stdout, a payload-less result, timeout —
  * produces a FAILED JOB RECORD whose `error` carries the underlying text;
  * the chain's existing escalate path picks it up.  A config-level error (a
- * session that cannot be resumed, no model resolved) throws BEFORE any job
- * record exists, so it can never leave a stuck "running" record behind.
+ * session that cannot be resumed, no model resolved, an `agy.homes` entry
+ * whose settings.json is unusable) throws BEFORE any job record exists, so
+ * it can never leave a stuck "running" record behind.
  *
  * @param {object} opts
  * @param {string} opts.cwd
@@ -1061,6 +1376,35 @@ export async function agyDispatch(opts) {
   const jsonSchema = agyJsonSchemaFor(opts.agent);
   const promptText = buildAgyPrompt({ systemPrompt, promptText: opts.promptText });
   const bin = agyBin();
+  // ---- the ONE per-role HOME decision (kusabi #542) ----
+  // agy's permission table is `<HOME>/.gemini/antigravity-cli/settings.json`,
+  // derived from HOME and nothing else — so the per-role restriction that the
+  // flag-less CLI cannot express IS expressible as a per-role HOME.  Resolve
+  // it ONCE here from `agy.homes` (resolveAgyHome); when it resolves to a
+  // home, verify that home's settings.json is usable BEFORE anything is
+  // spawned, and fail closed (throw, never a failed job) if it is not: a
+  // missing role table would silently fall back to the operator's own
+  // machine-wide table, running with MORE access than configured.  When it
+  // resolves to null the spawn is byte-identical to today's dispatch (no
+  // HOME override at all).
+  const homeConfig = loadAgyHomeConfig();
+  const { home: agyHome, reason: agyHomeReason } = resolveAgyHome({
+    phase: opts.phase,
+    config: homeConfig,
+  });
+  if (agyHome !== null) {
+    assertAgyHomeSettings({
+      home: agyHome,
+      phase: opts.phase,
+      configKey: agyHomeConfigKey(agyHomeReason, opts.phase),
+    });
+  }
+  // The settings.json the run's HOME will consult — the resolved role home
+  // when there is one, else the ambient one.  Named in a denied-run error so
+  // the operator is pointed at the exact file to edit.
+  const agySettingsPath = agyHome !== null
+    ? agyHomeSettingsPath(agyHome)
+    : path.join(process.env.HOME || "~", ".gemini", "antigravity-cli", "settings.json");
   // ---- the ONE timeout decision (kusabi #328) ----
   // `timeoutS` is resolved and validated ONCE here, and the SAME value
   // feeds both consumers below: buildAgyArgs (the INNER bound,
@@ -1144,6 +1488,18 @@ export async function agyDispatch(opts) {
     // Deny-map entries this backend cannot enforce (agy takes no permission
     // flags).  Empty array when nothing was asked for.
     toolDeniesUnenforced: unenforcedDenies,
+    // The permission surface this run was actually governed by — recorded on
+    // EVERY record, exactly like `toolDeniesUnenforced`, so a record can
+    // never be ambiguous about which table applied:
+    //   agyHome        — the resolved role home, or null (ambient HOME used).
+    //   agyHomeReason  — how it was chosen (no-config/absent/malformed/
+    //                    phase/default).
+    //   agyDeniedActions — tool calls headless agy auto-denied (they were
+    //                    not allow-listed); filled from the terminal result,
+    //                    [] until then and on every failure before parsing.
+    agyHome,
+    agyHomeReason,
+    agyDeniedActions: [],
     // Whether the run's output shape was enforced by `--json-schema`.
     jsonSchemaEnforced: jsonSchema !== null,
     error: null,
@@ -1205,6 +1561,11 @@ export async function agyDispatch(opts) {
     bin,
     jsonSchemaEnforced: job.jsonSchemaEnforced,
     toolDeniesUnenforced: unenforcedDenies,
+    // The permission surface this spawn will run under — written BEFORE the
+    // child starts so the trail and the record can never disagree about it.
+    agyHome,
+    agyHomeReason,
+    agyDeniedActions: [],
   });
 
   // ---- run: fold the NDJSON stream as it arrives (kusabi #332) ----
@@ -1245,6 +1606,10 @@ export async function agyDispatch(opts) {
     bin,
     args,
     cwd: opts.cwd,
+    // The resolved role HOME (or nothing when `agy.homes` resolved to null,
+    // so the child inherits the parent env byte-for-byte).  runBackendProcess
+    // merges this on top of `process.env`, so the override is additive.
+    env: agyHome !== null ? { HOME: agyHome } : undefined,
     // The already-resolved values (the TWO decisions above) — the same
     // values buildAgyArgs and the stall text consumed, so every bound was
     // decided together.
@@ -1325,7 +1690,12 @@ export async function agyDispatch(opts) {
 
     if (parsed !== null) {
       job.agyStatus = typeof parsed.status === "string" ? parsed.status : null;
-      const outcome = agyPayload(parsed);
+      // The tool calls headless agy auto-denied, taken defensively (entries
+      // may lack display_name; the field may be absent on older CLIs).
+      job.agyDeniedActions = agyDeniedActionNames(parsed);
+      // `settingsPath` is the file this run's HOME would consult — named in a
+      // denied-run error so the operator is pointed at the exact table.
+      const outcome = agyPayload(parsed, { settingsPath: agySettingsPath });
       if (outcome.ok) {
         job.status = "completed";
         job.sessionID = parsed.conversation_id ?? streamAcc.conversationIdFromInit ?? null;
@@ -1366,6 +1736,9 @@ export async function agyDispatch(opts) {
     agyStatus: job.agyStatus,
     sessionId: job.sessionID,
     exitCode: code,
+    // The tool calls headless agy auto-denied, as measured on this run's
+    // terminal result ([] when none, or when the run never produced one).
+    agyDeniedActions: job.agyDeniedActions,
   });
 
   // Record the closed terminal reason (kusabi #388).  agy finalizes its

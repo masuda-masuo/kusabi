@@ -434,6 +434,49 @@ routed to agy additionally passes `--json-schema` built from the existing
 `schemas/review-output.schema.json`, so the verdict shape is enforced at the
 CLI rather than hoped for. See `docs/design/phase-chain.md` §3.5.14.
 
+### Per-role permission tables (agy backend)
+
+The agy CLI takes no `--allow` / `--deny` flags, but its permission table is
+per-HOME: the allow-list lives in `<HOME>/.gemini/antigravity-cli/settings.json`
+under `permissions.allow`, the CLI derives that path from HOME and nothing
+else, and a dispatch under a separate HOME is governed by the separate table
+(a tool allow-listed only in the main HOME is refused under the separate
+one). kusabi therefore lets you give each role its own HOME — and with it its
+own allow-list, MCP config (`~/.gemini/config/mcp_config.json`), and
+always-on `~/.gemini/config/rules/AGENTS.md`:
+
+```json
+{
+  "agy": {
+    "homes": {
+      "implement": "/home/u/.agy-homes/implement",
+      "review":    "/home/u/.agy-homes/review",
+      "default":   "/home/u/.agy-homes/default"
+    }
+  }
+}
+```
+
+- A resolved home is passed to the spawned `agy` as its `HOME` environment
+  variable; nothing else about the dispatch changes.
+- Rework rounds dispatch as the implement phase and share `homes.implement`;
+  chain reviews carry the review phase and use `homes.review`.
+- An unset key changes nothing: with no `agy` key (or no matching
+  phase/default entry) the dispatch runs under the ambient HOME, byte-identical
+  to before, and the job record states `agyHome: null` with the reason.
+- A configured home is not optional: kusabi checks
+  `<home>/.gemini/antigravity-cli/settings.json` before the spawn and refuses
+  the dispatch if it is missing or unusable, rather than silently falling
+  back to the ambient (machine-wide) table — running with *more* access than
+  configured is the failure this mechanism exists to prevent.
+
+Every agy job record states which permission surface governed the run:
+`agyHome` (the resolved path or `null`), `agyHomeReason` (how it was chosen),
+and `agyDeniedActions` — tool calls headless agy auto-denied because they
+were not allow-listed (agy cannot prompt, so an unlisted tool is refused
+while `status` still reports SUCCESS). A denied run with an empty payload is
+a failed job whose error names the actions and the `permissions.allow` file.
+
 ### Resolution precedence (highest to lowest)
 
 1. **Explicit `--model` flag** — wins for the phases it applies to: a single `task` dispatch, a chain's round-1 implement, and every chain review. A chain's rework rounds follow the tier ladder instead (see "Chain round escalation" below).
