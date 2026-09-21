@@ -1,9 +1,10 @@
-// luna-driver.mjs — kusabi #530: the deterministic luna mission driver.
+// luna-driver.mjs — kusabi #530 + #531: the deterministic luna mission driver.
 //
 // A luna mission is an opt-in dispatch surface: the gpt-5.6-luna coordinator
 // seat proposes bounded actions as line-oriented JSON records, and THIS
 // driver is the only authority that validates and executes them.  The
-// contract, frozen by luna-driver.test.mjs:
+// contract, frozen by luna-driver.test.mjs (+ #531's luna-sol-gate /
+// luna-cancel-resume / luna-reconcile acceptance tests):
 //
 //   - the coordinator's output is parsed ONLY through parseCoordinatorOutput
 //     (the frozen #529 parser) against the CURRENT immutable evidence
@@ -12,27 +13,65 @@
 //   - only the frozen action enum executes: read_probe, run_chain,
 //     rework_chain, consult_sol, escalate_to_host, finish;
 //   - requests execute sequentially, bounded by an explicit mission budget
-//     (maxChains / maxAttempts / maxProbes); a budget breach terminates the
-//     mission `budget-exhausted` and never creates another chain;
+//     (maxChains / maxAttempts / maxProbes / maxConsults / maxRework); a
+//     budget breach terminates the mission `budget-exhausted` and never
+//     creates another chain;
 //   - run_chain / rework_chain go through the runChainLifecycle seam (never
 //     runChainDriver directly) with a driver-minted chain id and
 //     keepServe: true — the mission is the single outer serve owner;
 //   - read_probe is driver-mediated through an allow-listed tool set and is
 //     recorded; Luna itself has no tool or job-spawn authority;
-//   - consult_sol is RECORDED as a requested consultation/handoff input only
-//     (no Sol gate execution — that is #531);
+//   - consult_sol opens an ADDITIVE Sol gate (it can never suppress, remove,
+//     downgrade, or satisfy a separately mandatory gate) and is recorded;
+//   - Sol audit gates (#531) are evaluated by the deterministic driver at the
+//     three frozen lifecycle points — pre-dispatch (before executing a
+//     run_chain / rework_chain request), post-chain (after each inner-chain
+//     terminal result) and pre-accept (immediately before finalising a
+//     `finish recommend-accept` terminal recommendation, the T11 gate) — plus
+//     an additive gate for an accepted consult_sol.  A Sol seat is bought at
+//     a point ONLY when policy marks the gate required, deterministic
+//     sampling selects it, or Luna requested the consult.  `clear` proceeds;
+//     `rework` permits only bounded rework_chain (consecutive rework beyond
+//     budget.maxRework fails closed); `block` terminates `sol-blocked` and
+//     Luna never gets another dispatch to clear it.  At a MANDATORY gate,
+//     missing / unavailable / empty / malformed / ambiguous /
+//     evidence-mismatched results fail closed to `sol-blocked`; only
+//     sample-only seat unavailability records `audit-sample-skipped` and may
+//     proceed.  Verdict authority binds gate id + exact envelope SHA-256;
+//     evidence changes ARCHIVE the stale verdict (reason `evidence-changed`)
+//     and exclude it from the next envelope's prior_verdicts;
+//   - the terminal mandatory gate applies to approval-shaped
+//     `recommend-accept` (T11); `escalate_to_host` and `recommend-escalate`
+//     are not gated;
+//   - cancellation (#531): the driver checks the recorded stop request
+//     (control.json stopRequestedAt, written by `luna-cancel`) immediately
+//     before every coordinator, Sol, and inner-chain dispatch and again after
+//     an inner chain returns.  After stopRequestedAt no coordinator, auditor,
+//     inner-chain, retry, rework, or replacement seat is dispatched; the
+//     mission finalises `cancelled`, cleans the outer serve once (when inner
+//     chain work was invoked), and notifies once;
+//   - resumability (#531): given an existing mission directory, the driver
+//     continues from the persisted record instead of refusing "mission id
+//     already exists" — evidence numbering, gate numbering, and recorded
+//     attempts/chains/probes/consults/verdicts all continue; nothing recorded
+//     is re-executed, and the terminal notification fires exactly once;
+//   - a terminal mission emits EXACTLY ONE terminal notification (one inbox
+//     record, one deduplicated kaiba agenda row) and the host-facing
+//     recommendation (`recommendation.md`);
 //   - the mission never accepts, publishes, merges, creates issues or
 //     creates containers; its terminal result is a host-facing
-//     recommendation (finish) or a host handoff (escalate_to_host);
+//     recommendation (finish), a host handoff (escalate_to_host), a Sol
+//     block (sol-blocked), or a cancellation (cancelled);
 //   - seat substitution fails before mission creation unless explicitly
 //     authorized, and authorized substitution is loud in the records;
 //   - the evidence envelope is refreshed after every observable action, so
 //     the next coordinator request is bound to current evidence and prior
 //     outcomes.
 //
-// The driver receives injected coordinator/chain/tool seams in tests and real
-// adapters in production (the real coordinator dispatch runs the exact
-// gpt-5.6-luna seat through the codex backend).
+// The driver receives injected coordinator/chain/tool/Sol/notify seams in
+// tests and real adapters in production (the real coordinator dispatch runs
+// the exact gpt-5.6-luna seat through the codex backend, the real Sol
+// dispatch runs the exact gpt-5.6-sol seat through it).
 
 import fs from "node:fs";
 import path from "node:path";
@@ -48,19 +87,25 @@ import {
   readMissionRecord,
   saveMissionRecord,
   finalizeMissionControl,
+  missionStopRequested,
+  rearmMissionControl,
+  TERMINAL_MISSION_DISPOSITIONS,
 } from "./mission-store.mjs";
+import { evaluateMissionGate, realSolDispatch } from "./luna-sol-gate.mjs";
 
 /** The exact default seats of #530: coordinator codex/gpt-5.6-luna, auditor codex/gpt-5.6-sol. */
 export const DEFAULT_COORDINATOR_SEAT = { provider: "codex", model: "gpt-5.6-luna" };
 export const DEFAULT_AUDITOR_SEAT = { provider: "codex", model: "gpt-5.6-sol" };
 
 /**
- * The explicit mission budget: bounded chains, attempts, probes and consults.
- * `maxConsults` bounds `consult_sol` requests (the coordination loop a
- * consult-only coordinator could otherwise run forever) — a conservative
- * default, overridable per mission like every other bound.
+ * The explicit mission budget: bounded chains, attempts, probes, consults and
+ * (kusabi #531) consecutive Sol rework verdicts.  `maxConsults` bounds
+ * `consult_sol` requests (the coordination loop a consult-only coordinator
+ * could otherwise run forever); `maxRework` bounds consecutive `rework`
+ * verdicts (a rework demand beyond it fails closed sol-blocked) — both
+ * conservative defaults, overridable per mission like every other bound.
  */
-export const DEFAULT_BUDGET = { maxChains: 3, maxAttempts: 2, maxProbes: 5, maxConsults: 3 };
+export const DEFAULT_BUDGET = { maxChains: 3, maxAttempts: 2, maxProbes: 5, maxConsults: 3, maxRework: 1 };
 
 /**
  * Documented byte limit for a probe result's serialized payload persisted to
@@ -303,7 +348,8 @@ async function defaultGuardedServeStop(cwd, stateDir) {
  * Write the host-facing recommendation artifact for a terminal mission.
  * `finish` writes the recommendation; `escalate_to_host` writes the handoff
  * reason; the failure dispositions write their disposition and, when present,
- * a reason (e.g. the budget bound that was exhausted).
+ * a reason (e.g. the budget bound that was exhausted, or the fail-closed
+ * cause of a sol-blocked gate).
  */
 function writeRecommendationFile(missionDir, { missionId, disposition, recommendation, reason }) {
   const lines = [
@@ -318,7 +364,27 @@ function writeRecommendationFile(missionDir, { missionId, disposition, recommend
 }
 
 /**
+ * The default terminal mission notification (kusabi #531): one inbox record,
+ * one deduplicated kaiba agenda row.  See chain-notify.notifyMissionTerminal.
+ */
+async function defaultMissionNotify({ missionId, disposition, container, cwdLabel, stateDir }) {
+  const { notifyMissionTerminal } = await import("./chain-notify.mjs");
+  return notifyMissionTerminal({
+    stateDir,
+    missionId,
+    disposition,
+    container,
+    cwdLabel,
+  });
+}
+
+/**
  * Run a luna mission to a terminal host-facing outcome.
+ *
+ * The driver is re-entrant: with `input.missionId` naming an EXISTING mission
+ * directory it resumes from the persisted record (continuing evidence and
+ * gate numbering, never re-executing recorded work, notifying exactly once);
+ * with no mission directory it creates one.
  *
  * @param {object} input
  * @param {string} input.cwd
@@ -329,7 +395,10 @@ function writeRecommendationFile(missionDir, { missionId, disposition, recommend
  * @param {object} [input.coordinator] — {provider, model}; default codex/gpt-5.6-luna.
  * @param {object} [input.auditor] — {provider, model}; default codex/gpt-5.6-sol.
  * @param {boolean} [input.allowSubstitute] — authorizes a non-default seat.
- * @param {object} [input.budget] — {maxChains, maxAttempts, maxProbes}.
+ * @param {object} [input.budget] — {maxChains, maxAttempts, maxProbes, maxConsults, maxRework}.
+ * @param {object} [input.sampling] — {rate, salt}; folded into every
+ *        evaluateAuditGate call (missionId = the mission id); absent = no
+ *        sampling (T12 never fires).
  * @param {object} [input.inject] — test-only seams.
  * @param {Function} [input.inject.coordinatorDispatch]
  * @param {Function} [input.inject.runChainLifecycle]
@@ -337,6 +406,12 @@ function writeRecommendationFile(missionDir, { missionId, disposition, recommend
  * @param {Function} [input.inject.guardedServeStop] — the one-time outer serve
  *        cleanup seam (default: the guarded liveRunningJobs + cmdServeStop
  *        semantics of chain-driver.mjs).
+ * @param {Function} [input.inject.solDispatch] — async
+ *        ({ cwd, missionId, missionDir, envelope, gate, record, auditor }) =>
+ *        string; default: the real gpt-5.6-sol codex dispatch.
+ * @param {Function} [input.inject.notifyMissionTerminal] — called exactly once
+ *        per terminal mission with { missionId, disposition, ... }; default:
+ *        one inbox record + one deduplicated kaiba agenda row.
  * @returns {Promise<string>} a terminal summary line.
  */
 export async function runLunaMission(input) {
@@ -349,10 +424,9 @@ export async function runLunaMission(input) {
     inject.runChainLifecycle ??
     (await import("./chain-cmd.mjs")).runChainLifecycle;
   const callTool = inject.callTool ?? (await import("./sunaba-rpc.mjs")).callTool;
-  // The one-time outer serve cleanup the mission owns because it passes
-  // keepServe: true to inner chains (finding: the mission must stop the
-  // shared serve exactly once after inner work, guarded against live jobs).
   const guardedServeStop = inject.guardedServeStop ?? defaultGuardedServeStop;
+  const solDispatch = inject.solDispatch ?? realSolDispatch;
+  const notifyMissionTerminal = inject.notifyMissionTerminal ?? defaultMissionNotify;
 
   // ---- exact seat resolution (refused BEFORE mission creation) ----
   const coordinator = resolveMissionSeat(input.coordinator, DEFAULT_COORDINATOR_SEAT, "coordinator", input.allowSubstitute);
@@ -364,16 +438,43 @@ export async function runLunaMission(input) {
 
   const budget = { ...DEFAULT_BUDGET, ...(input.budget ?? {}) };
   const stateDir = stateDirFor(cwd);
-  const { missionDir } = createMission(stateDir, {
-    missionId,
-    container,
-    missionFile,
-    pid: process.pid,
-    coordinator,
-    auditor,
-  });
+  const missionDir = path.join(stateDir, "missions", missionId);
+  const resuming = fs.existsSync(missionDir);
 
+  if (!resuming) {
+    createMission(stateDir, {
+      missionId,
+      container,
+      missionFile,
+      pid: process.pid,
+      coordinator,
+      auditor,
+    });
+  }
   let record = readMissionRecord(missionDir);
+  if (!record || typeof record !== "object") {
+    throw new Error(`mission record missing or unreadable for ${missionId} (${missionDir}/mission.json)`);
+  }
+
+  if (resuming) {
+    // A mission that already reached a terminal disposition has already
+    // notified and must never dispatch again (luna-resume refuses terminal
+    // missions; this guard covers direct driver calls).  The one exception is
+    // a sol-blocked mission reopened by a recorded human override —
+    // cmdLunaResume clears the terminal disposition in that case BEFORE the
+    // driver runs, so a terminal disposition here means "already finished".
+    if (
+      typeof record.disposition === "string" &&
+      TERMINAL_MISSION_DISPOSITIONS.has(record.disposition)
+    ) {
+      return (
+        `mission ${missionId}: disposition=${record.disposition} ` +
+        `(already terminal; nothing dispatched)`
+      );
+    }
+    rearmMissionControl(missionDir);
+  }
+
   // Persist the effective budget on the record so show/wait can explain a
   // budget-exhausted termination (the bound and the counts that hit it).
   record = { ...record, budget: { ...budget } };
@@ -383,13 +484,25 @@ export async function runLunaMission(input) {
   // budget fails closed as `coordinator-failed`.
   const coordinatorErrorCap = Math.max(1, budget.maxAttempts);
 
-  let dispatchIndex = 0;
-  let outcome = null; // { disposition, recommendation, handoffReason }
+  // The next dispatch continues the persisted evidence numbering (resume):
+  // envelope files are named envelope-<N>.json, so the count of existing ones
+  // is the deterministic continuation point.
+  const evidenceDir = path.join(missionDir, "evidence");
+  let dispatchIndex = fs.existsSync(evidenceDir)
+    ? fs.readdirSync(evidenceDir).filter((f) => /^envelope-\d+\.json$/.test(f)).length
+    : 0;
+
+  let outcome = null; // { disposition, recommendation, handoffReason, reason }
   // True once the seam was invoked for a run_chain / rework_chain request —
   // the mission then owns the outer serve (keepServe: true) and must stop it
   // once.  A chain that failed inside the seam still touched the serve, so it
   // still counts; a mission that never invoked a chain has nothing to clean.
   let invokedInnerChain = false;
+
+  // The stop predicate keys off the recorded stop request (control.json
+  // stopRequestedAt).  It is checked immediately before every coordinator,
+  // Sol, and inner-chain dispatch and again after an inner chain returns.
+  const stopRequested = () => missionStopRequested(missionDir);
 
   const recordError = (detail) => {
     record = {
@@ -447,9 +560,49 @@ export async function runLunaMission(input) {
     };
     saveMissionRecord(missionDir, record);
   };
+  // Persist a freshly evaluated gate set (archival + the new gate record)
+  // BEFORE any further observable dispatch, so resume continues from a
+  // durable boundary.
+  const recordGates = (gates) => {
+    record = { ...record, auditGates: gates };
+    saveMissionRecord(missionDir, record);
+  };
+
+  /**
+   * The single gate-evaluation helper: runs evaluateMissionGate, persists the
+   * gate records, and returns the outcome.  A "cancelled" outcome means a
+   * stop request landed before the Sol dispatch.
+   */
+  const runGate = async ({ phase, reason }) => {
+    const result = await evaluateMissionGate({
+      cwd,
+      missionId,
+      missionDir,
+      brief,
+      container,
+      auditor,
+      allowSubstitute: input.allowSubstitute,
+      sampling: input.sampling,
+      phase,
+      reason: reason ?? null,
+      record,
+      solDispatch,
+      stopRequested,
+      maxRework: budget.maxRework ?? DEFAULT_BUDGET.maxRework,
+    });
+    if (result.fired) recordGates(result.gates);
+    return result;
+  };
 
   mainLoop: for (;;) {
     if (outcome !== null) break;
+
+    // The stop request is honored at the top of every loop iteration:
+    // cancellation before any seat — no coordinator dispatch at all.
+    if (stopRequested()) {
+      outcome = { disposition: "cancelled", recommendation: null, handoffReason: null, reason: "stop requested" };
+      break;
+    }
 
     // A coordinator that burns the bounded error budget fails closed.
     if ((record.coordinatorErrors ?? 0) >= coordinatorErrorCap) {
@@ -521,6 +674,13 @@ export async function runLunaMission(input) {
     }
 
     for (const req of parsed.requests) {
+      // Stop check before EVERY request execution: no coordinator, auditor,
+      // inner-chain, retry, rework, or replacement seat may be dispatched
+      // after the stop request, including at inner-chain return boundaries.
+      if (stopRequested()) {
+        outcome = { disposition: "cancelled", recommendation: null, handoffReason: null, reason: "stop requested" };
+        break mainLoop;
+      }
       switch (req.action) {
         case "read_probe": {
           const probeCount = Array.isArray(record.probes) ? record.probes.length : 0;
@@ -556,6 +716,30 @@ export async function runLunaMission(input) {
             recordError(`${req.action} refused: the inner chain brief fails deterministic validation`);
             continue;
           }
+          // PRE-DISPATCH GATE: the deterministic driver, never Luna, decides
+          // whether the Sol seat must judge this dispatch.
+          const pre = await runGate({ phase: "pre-dispatch", reason: null });
+          if (pre.outcome === "cancelled") {
+            outcome = { disposition: "cancelled", recommendation: null, handoffReason: null, reason: "stop requested" };
+            break mainLoop;
+          }
+          if (pre.outcome === "sol-blocked" || pre.outcome === "block") {
+            outcome = { disposition: "sol-blocked", recommendation: null, handoffReason: null, reason: "Sol audit gate blocked this dispatch" };
+            break mainLoop;
+          }
+          if (pre.outcome === "rework") {
+            // The audit demands rework before a fresh chain: the request is
+            // refused (counted as a coordinator error, so a coordinator that
+            // keeps proposing chains instead of a rework_chain fails closed).
+            recordError(`${req.action} refused: pre-dispatch Sol gate ${pre.gate.gateId} returned rework`);
+            continue;
+          }
+          // Stop check immediately before the inner-chain dispatch (a stop
+          // that landed between the gate and the seam).
+          if (stopRequested()) {
+            outcome = { disposition: "cancelled", recommendation: null, handoffReason: null, reason: "stop requested" };
+            break mainLoop;
+          }
           const chainId = mintChainId();
           invokedInnerChain = true;
           let chainOutput;
@@ -580,15 +764,33 @@ export async function runLunaMission(input) {
             brief: req.brief,
             output: String(chainOutput ?? ""),
           });
+          // Stop check again AFTER the inner chain returns: cancellation
+          // during an inner chain must stop before any post-chain seat.
+          if (stopRequested()) {
+            outcome = { disposition: "cancelled", recommendation: null, handoffReason: null, reason: "stop requested" };
+            break mainLoop;
+          }
+          // POST-CHAIN GATE: after each inner-chain terminal result.
+          const post = await runGate({ phase: "post-chain", reason: null });
+          if (post.outcome === "cancelled") {
+            outcome = { disposition: "cancelled", recommendation: null, handoffReason: null, reason: "stop requested" };
+            break mainLoop;
+          }
+          if (post.outcome === "sol-blocked" || post.outcome === "block") {
+            outcome = { disposition: "sol-blocked", recommendation: null, handoffReason: null, reason: "Sol audit gate blocked the chain outcome" };
+            break mainLoop;
+          }
+          // A post-chain `rework` (within the bound) is recorded and the loop
+          // continues: the coordinator's next request (a rework_chain) is
+          // itself gated and bounded.
           continue;
         }
         case "consult_sol": {
-          // Recorded as a requested consultation/handoff input only — no Sol
-          // gate execution in this slice (#531 owns it).  A consult-only
-          // coordinator consumes no chain/probe budget, so this bound is what
-          // stops it: each accepted consult consumes one slot, and the request
-          // that would exceed the bound terminates `budget-exhausted` with no
-          // further coordinator dispatch.
+          // An accepted consult_sol opens an ADDITIVE Sol gate: it can never
+          // suppress, remove, downgrade, or satisfy a separately mandatory
+          // gate (the pre-accept T11 gate still fires independently).  A
+          // consult-only coordinator consumes no chain/probe budget, so the
+          // consult bound is what stops it.
           const consultCount = Array.isArray(record.consults) ? record.consults.length : 0;
           if (consultCount >= budget.maxConsults) {
             outcome = {
@@ -601,10 +803,22 @@ export async function runLunaMission(input) {
             };
             break mainLoop;
           }
+          const consult = await runGate({ phase: "consult", reason: req.reason ?? "" });
+          if (consult.outcome === "cancelled") {
+            outcome = { disposition: "cancelled", recommendation: null, handoffReason: null, reason: "stop requested" };
+            break mainLoop;
+          }
+          if (consult.outcome === "sol-blocked" || consult.outcome === "block") {
+            outcome = { disposition: "sol-blocked", recommendation: null, handoffReason: null, reason: "Sol audit gate blocked the requested consultation" };
+            break mainLoop;
+          }
           recordConsult(req);
           continue;
         }
         case "escalate_to_host": {
+          // A host escalation is NOT approval-shaped — it is never held
+          // behind an approval gate (escalate_to_host must always be able to
+          // write the host recommendation).
           outcome = {
             disposition: "host-handoff",
             recommendation: null,
@@ -616,6 +830,32 @@ export async function runLunaMission(input) {
           if (!RECOMMENDATION_VOCABULARY.has(req.recommendation)) {
             recordError(`finish refused: recommendation "${req.recommendation}" is outside the closed vocabulary`);
             continue;
+          }
+          // The terminal mandatory gate (T11) applies to approval-shaped
+          // `recommend-accept` only; recommend-escalate is not gated.
+          if (req.recommendation === "recommend-accept") {
+            const acceptGate = await runGate({ phase: "pre-accept", reason: null });
+            if (acceptGate.outcome === "cancelled") {
+              outcome = { disposition: "cancelled", recommendation: null, handoffReason: null, reason: "stop requested" };
+              break mainLoop;
+            }
+            if (acceptGate.outcome === "sol-blocked" || acceptGate.outcome === "block") {
+              outcome = {
+                disposition: "sol-blocked",
+                recommendation: null,
+                handoffReason: null,
+                reason: "Sol audit gate blocked the accept recommendation",
+              };
+              break mainLoop;
+            }
+            if (acceptGate.outcome === "rework") {
+              // The audit demands rework before the recommendation is trusted:
+              // the finish is refused and the coordinator gets another chance
+              // to propose a bounded rework_chain (or the rework bound fails
+              // the mission closed).
+              recordError(`finish recommend-accept refused: pre-accept Sol gate ${acceptGate.gateId} returned rework`);
+              continue;
+            }
           }
           outcome = {
             disposition: req.recommendation,
@@ -644,13 +884,26 @@ export async function runLunaMission(input) {
     terminationReason,
   };
   saveMissionRecord(missionDir, record);
-  finalizeMissionControl(missionDir, "completed");
+  finalizeMissionControl(missionDir, outcome.disposition === "cancelled" ? "cancelled" : "completed");
   writeRecommendationFile(missionDir, {
     missionId,
     disposition: outcome.disposition,
     recommendation: outcome.recommendation,
     reason: terminationReason,
   });
+
+  // ---- exactly one terminal notification per terminal mission ----
+  try {
+    await notifyMissionTerminal({
+      missionId,
+      disposition: outcome.disposition,
+      missionDir,
+      recommendation: outcome.recommendation,
+      container,
+      cwdLabel: path.basename(cwd),
+      stateDir,
+    });
+  } catch { /* best-effort — the terminal record is already durable */ }
 
   // ---- one-time outer serve cleanup (the mission owns the serve because it
   // passes keepServe: true to inner chains) ----
@@ -667,6 +920,8 @@ export async function runLunaMission(input) {
   return (
     `mission ${missionId}: disposition=${outcome.disposition}` +
     (outcome.recommendation ? ` recommendation=${outcome.recommendation}` : "") +
+    (outcome.disposition === "cancelled" ? ` (cancelled)` : "") +
+    (outcome.disposition === "sol-blocked" ? ` (${terminationReason ?? "sol-blocked"})` : "") +
     ` (recommendation: ${path.join(missionDir, "recommendation.md")})`
   );
 }

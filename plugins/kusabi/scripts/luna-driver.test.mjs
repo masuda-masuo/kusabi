@@ -172,6 +172,32 @@ function makeToolFake(sharedOrder = null) {
   };
 }
 
+/**
+ * Fake Sol seat (kusabi #531): returns a schema-valid `clear` verdict bound
+ * to the CURRENT gate envelope (gate_id + envelope_sha256 come from
+ * input.envelope).  The #531 driver must run a Sol gate whenever policy
+ * requires one — the pre-accept T11 gate fires for `finish recommend-accept`
+ * — so the shared harness injects this default so no existing #530 test can
+ * accidentally reach a real Sol seat.
+ */
+function makeSolFake() {
+  const calls = [];
+  return {
+    calls,
+    dispatch: async (input) => {
+      calls.push(input);
+      return JSON.stringify({
+        type: "verdict",
+        schema_version: 1,
+        gate_id: input.envelope.gate_id,
+        envelope_sha256: input.envelope.envelope_sha256,
+        verdict: "clear",
+        summary: "sol:clear",
+      });
+    },
+  };
+}
+
 // ---------------------------------------------------------------------------
 // briefs
 // ---------------------------------------------------------------------------
@@ -254,6 +280,7 @@ describe("luna mission driver (kusabi #530 criteria 4-8)", () => {
     const coord = makeCoordinator(streams);
     const chain = makeChainFake();
     const tools = makeToolFake();
+    const sol = makeSolFake();
     const input = {
       cwd,
       missionFile,
@@ -267,11 +294,12 @@ describe("luna mission driver (kusabi #530 criteria 4-8)", () => {
         coordinatorDispatch: coord.dispatch,
         runChainLifecycle: chain.run,
         callTool: tools.callTool,
+        solDispatch: sol.dispatch,
         ...(overrides.inject ?? {}),
       },
     };
     const result = await driver.runLunaMission(input);
-    return { driver, coord, chain, tools, result, input };
+    return { driver, coord, chain, tools, sol, result, input };
   }
 
   function readMission() {
@@ -507,8 +535,8 @@ describe("luna mission driver (kusabi #530 criteria 4-8)", () => {
     assert.equal(record.disposition, "recommend-accept", "the mission may still end via a later valid finish");
   });
 
-  it("consult_sol is recorded as a requested next action — never executed as a gate in this slice", async () => {
-    const { chain } = await runMission([
+  it("consult_sol is recorded AND opens an additive Sol gate — the pre-accept T11 gate still fires (kusabi #531 supersedes the #530 'no gates' slice)", async () => {
+    const { chain, sol } = await runMission([
       runChainStream(VALID_RUN_CHAIN_BRIEF),
       consultStream("additional audit requested by coordinator"),
       finishStream("recommend-accept"),
@@ -518,13 +546,17 @@ describe("luna mission driver (kusabi #530 criteria 4-8)", () => {
     assert.ok(Array.isArray(record.consults) && record.consults.length === 1, "the consult request must be recorded");
     assert.equal(record.consults[0].action, "consult_sol");
     assert.equal(record.disposition, "recommend-accept");
-    // No Sol gate execution in this slice: the only side effects are the chain
-    // and the records — the mission never dispatched an audit gate.
-    const gates = record.auditGates;
-    assert.ok(
-      gates === undefined || (Array.isArray(gates) && gates.length === 0),
-      "no audit gate records in the #530 slice",
-    );
+    // #531 supersedes the #530 "no Sol gate in this slice" contract: an
+    // accepted consult_sol is an additive Sol gate, and the mandatory T11
+    // pre-accept gate for `finish recommend-accept` fires independently —
+    // the consult cannot downgrade it.
+    assert.equal(sol.calls.length, 2, "one gate for the consult, one mandatory pre-accept gate");
+    assert.ok(Array.isArray(record.auditGates) && record.auditGates.length === 2,
+      "the #531 driver must record both gates (no audit gates were recorded in the #530 slice)");
+    assert.equal(record.auditGates[0].phase, "consult", "the additive consult gate is recorded first");
+    assert.equal(record.auditGates[1].phase, "pre-accept", "the mandatory pre-accept gate is NOT downgraded by the consult");
+    assert.equal(record.auditGates[0].verdict, "clear");
+    assert.equal(record.auditGates[1].verdict, "clear");
   });
 
   it("escalate_to_host terminates as a handoff, recording the request for the host", async () => {
