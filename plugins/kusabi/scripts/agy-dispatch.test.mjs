@@ -18,6 +18,7 @@ import os from "node:os";
 import path from "node:path";
 import fs from "node:fs";
 import { spawnSync } from "node:child_process";
+import { DatabaseSync } from "node:sqlite";
 
 import {
   AGY_DEFAULT_CHAIN,
@@ -48,6 +49,7 @@ import {
   agyDispatch,
   resolveAgyHome,
   agyDeniedActionNames,
+  agyDeniedToolFromConversation,
   agyHomeSettingsPath,
 } from "./agy-dispatch.mjs";
 import {
@@ -1134,6 +1136,157 @@ describe("agyDeniedActionNames \u2014 taken defensively", () => {
   });
 });
 
+// =========================================================================
+// agyDeniedToolFromConversation — pure (kusabi #545)
+// =========================================================================
+//
+// Fixtures are built with node:sqlite in the EXACT schema of a real agy
+// conversation database (taken from a real DB); the tool-call JSON sits
+// inside a BLOB with binary noise around it, as in production.  The fake
+// agy's fixed conversation_id means `conversationDbPath(home)` is the path
+// a dispatch under that home consults.
+
+describe("agyDeniedToolFromConversation — the denied MCP tool, from the conversation DB (kusabi #545)", () => {
+  let tmp;
+  beforeEach(() => { tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-agy-convdb-")); });
+  afterEach(() => { fs.rmSync(tmp, { recursive: true, force: true }); });
+
+  it("returns null for a missing file — never throws (criterion 6)", () => {
+    const result = agyDeniedToolFromConversation({ dbPath: path.join(tmp, "nope.db") });
+    assert.equal(result, null);
+  });
+
+  it("returns null when dbPath is absent or empty", () => {
+    assert.equal(agyDeniedToolFromConversation({}), null);
+    assert.equal(agyDeniedToolFromConversation({ dbPath: "" }), null);
+    assert.equal(agyDeniedToolFromConversation({ dbPath: null }), null);
+  });
+
+  it("returns null for a file that is not a SQLite database", () => {
+    const notDb = path.join(tmp, "not-a-db.db");
+    fs.writeFileSync(notDb, "this is not sqlite at all", "utf8");
+    assert.equal(agyDeniedToolFromConversation({ dbPath: notDb }), null);
+  });
+
+  it("returns null for a database with no `steps` table", () => {
+    const dbPath = path.join(tmp, "empty.db");
+    const db = new DatabaseSync(dbPath);
+    db.exec("CREATE TABLE other (x integer)");
+    db.close();
+    assert.equal(agyDeniedToolFromConversation({ dbPath }), null);
+  });
+
+  it("returns null when no row's payload carries the ServerName/ToolName pair", () => {
+    const dbPath = conversationDbPath(tmp);
+    writeConversationDb(dbPath, [
+      { idx: 1, status: 3, payload: blobWithNoise(nonToolPayloadJson()) },
+      { idx: 2, status: 7, payload: blobWithNoise(toolPayloadJson("sunaba", "sandbox_list_containers").replace(/"ToolName":/, "\"Renamed\":")) },
+    ]);
+    assert.equal(agyDeniedToolFromConversation({ dbPath }), null);
+  });
+
+  it("identifies the last tool step with status=7 (denied) — criterion 1: status 6 is not the only denial status", () => {
+    const dbPath = conversationDbPath(tmp);
+    // An earlier tool call with a denial status, then the LAST tool step —
+    // also status=7.  The last one governs, whatever the earlier ones were.
+    writeConversationDb(dbPath, [
+      { idx: 1, status: 3, payload: blobWithNoise(nonToolPayloadJson()) },
+      toolStep(2, 7, "sunaba", "sandbox_list_containers"),
+    ]);
+    assert.deepEqual(agyDeniedToolFromConversation({ dbPath }), {
+      server: "sunaba",
+      tool: "sandbox_list_containers",
+    });
+  });
+
+  it("identifies the last tool step with status=6 (denied) — criterion 2", () => {
+    const dbPath = conversationDbPath(tmp);
+    writeConversationDb(dbPath, [
+      toolStep(1, 6, "sunaba", "read_output"),
+    ]);
+    assert.deepEqual(agyDeniedToolFromConversation({ dbPath }), {
+      server: "sunaba",
+      tool: "read_output",
+    });
+  });
+
+  it("returns null when the last tool step has status=3 (completed) — criterion 4: never a guess", () => {
+    const dbPath = conversationDbPath(tmp);
+    writeConversationDb(dbPath, [
+      toolStep(1, 3, "shiori", "shiori_keyword_search"),
+    ]);
+    assert.equal(agyDeniedToolFromConversation({ dbPath }), null);
+  });
+
+  it("returns null when an EARLIER tool step failed and a LATER one succeeded — criterion 7: the last one governs", () => {
+    const dbPath = conversationDbPath(tmp);
+    writeConversationDb(dbPath, [
+      toolStep(1, 6, "sunaba", "sandbox_list_containers"),
+      toolStep(2, 3, "sunaba", "read_output"),
+    ]);
+    assert.equal(agyDeniedToolFromConversation({ dbPath }), null);
+  });
+
+  it("keys on status ≠ 3, NOT on status ∈ {6, 7}: another denied-status value still identifies", () => {
+    const dbPath = conversationDbPath(tmp);
+    writeConversationDb(dbPath, [
+      toolStep(1, 4, "sunaba", "sandbox_list_containers"),
+    ]);
+    assert.deepEqual(agyDeniedToolFromConversation({ dbPath }), {
+      server: "sunaba",
+      tool: "sandbox_list_containers",
+    });
+  });
+
+  it("walks rows in idx order, so the LAST matching row wins even when it is not the last inserted", () => {
+    const dbPath = conversationDbPath(tmp);
+    writeConversationDb(dbPath, [
+      toolStep(1, 7, "sunaba", "sandbox_list_containers"),
+      { idx: 2, status: 3, payload: blobWithNoise(nonToolPayloadJson()) },
+      toolStep(3, 6, "shiori", "shiori_keyword_search"),
+    ]);
+    assert.deepEqual(agyDeniedToolFromConversation({ dbPath }), {
+      server: "shiori",
+      tool: "shiori_keyword_search",
+    });
+  });
+
+  it("handles a payload that arrived as a string rather than a BLOB", () => {
+    const dbPath = conversationDbPath(tmp);
+    writeConversationDb(dbPath, [
+      { idx: 1, status: 7, payload: Buffer.from(toolPayloadJson("sunaba", "sandbox_list_containers"), "latin1") },
+    ]);
+    assert.deepEqual(agyDeniedToolFromConversation({ dbPath }), {
+      server: "sunaba",
+      tool: "sandbox_list_containers",
+    });
+  });
+
+  it("a null step_payload row is skipped, not fatal", () => {
+    const dbPath = conversationDbPath(tmp);
+    writeConversationDb(dbPath, [
+      { idx: 1, status: 3, payload: null },
+      toolStep(2, 6, "sunaba", "read_output"),
+    ]);
+    assert.deepEqual(agyDeniedToolFromConversation({ dbPath }), {
+      server: "sunaba",
+      tool: "read_output",
+    });
+  });
+
+  it("requires ServerName BEFORE ToolName, the exact order the real BLOB carries", () => {
+    const dbPath = conversationDbPath(tmp);
+    // Swap the two keys: the production regex must NOT match this.
+    const swapped = JSON.stringify({
+      Arguments: {},
+      ToolName: "sandbox_list_containers",
+      ServerName: "sunaba",
+    });
+    writeConversationDb(dbPath, [{ idx: 1, status: 7, payload: blobWithNoise(swapped) }]);
+    assert.equal(agyDeniedToolFromConversation({ dbPath }), null);
+  });
+});
+
 describe("agyPayload \u2014 denied_actions (kusabi #542)", () => {
   it("a denied, empty-payload result stays ok:false and the error says the run was DENIED, naming the action and permissions.allow (criterion 6)", () => {
     const outcome = agyPayload({
@@ -1205,6 +1358,44 @@ describe("agyPayload \u2014 denied_actions (kusabi #542)", () => {
     });
     assert.equal(outcome.ok, true);
     assert.equal(outcome.payloadSource, "structured_output");
+  });
+
+  it("an identified MCP tool adds the exact line to paste (criterion 4)", () => {
+    const outcome = agyPayload(
+      { response: "", denied_actions: [{ action: "mcp", display_name: "CallMcpTool" }] },
+      { deniedTool: "sunaba/sandbox_list_containers" },
+    );
+    assert.equal(outcome.ok, false);
+    assert.match(outcome.error, /mcp \(CallMcpTool\)/);
+    assert.match(outcome.error, /mcp\(sunaba\/sandbox_list_containers\)/);
+  });
+
+  it("an mcp class whose tool could NOT be identified says so explicitly, never silently", () => {
+    const outcome = agyPayload(
+      { response: "", denied_actions: [{ action: "mcp", display_name: "CallMcpTool" }] },
+      { deniedTool: null, deniedToolUnresolved: true },
+    );
+    assert.equal(outcome.ok, false);
+    assert.match(outcome.error, /could not be determined from the conversation record/);
+  });
+
+  it("non-mcp classes are fully named by display_name: no tool line, no not-determined sentence", () => {
+    const outcome = agyPayload(
+      { response: "", denied_actions: [{ action: "read_url", display_name: "ReadUrl" }] },
+      { deniedTool: null, deniedToolUnresolved: false },
+    );
+    assert.equal(outcome.ok, false);
+    assert.match(outcome.error, /read_url \(ReadUrl\)/);
+    assert.doesNotMatch(outcome.error, /mcp\(/);
+    assert.doesNotMatch(outcome.error, /could not be determined/);
+  });
+
+  it("a completed payload next to an identified tool stays ok:true — the tool line is for denied runs only", () => {
+    const outcome = agyPayload(
+      { response: "did the thing", denied_actions: [{ action: "mcp" }] },
+      { deniedTool: "sunaba/sandbox_list_containers" },
+    );
+    assert.deepEqual(outcome, { ok: true, text: "did the thing", payloadSource: "response" });
   });
 });
 
@@ -1606,6 +1797,19 @@ if (mode === "denied-with-payload") {
   // A denial mid-turn does NOT void a completed payload: agy can deny one
   // tool call and still finish the turn.
   emitHealthyStream({ ...base, status: "SUCCESS", response: "did the thing", denied_actions: [{ action: "command" }] });
+  process.exit(0);
+}
+if (mode === "denied-mcp") {
+  // An MCP tool call headless agy auto-denied (kusabi #545): the result
+  // names ONLY the class \u2014 the tool itself lives in the conversation
+  // database, not in the result or cli.log.
+  emitHealthyStream({ ...base, status: "SUCCESS", response: "", denied_actions: [{ action: "mcp", display_name: "CallMcpTool" }] });
+  process.exit(0);
+}
+if (mode === "denied-read-url") {
+  // A non-MCP denial: display_name already names the tool, so the
+  // conversation database must never be consulted for this class.
+  emitHealthyStream({ ...base, status: "SUCCESS", response: "", denied_actions: [{ action: "read_url", display_name: "ReadUrl" }] });
   process.exit(0);
 }
 if (mode === "slow") {
@@ -2091,6 +2295,98 @@ function writeRoleHome(ctx, home, settings = { permissions: { allow: [] } }) {
   fs.writeFileSync(path.join(dir, "settings.json"), JSON.stringify(settings), "utf8");
 }
 
+// =========================================================================
+// conversation database fixtures (kusabi #545)
+// =========================================================================
+//
+// agy stores each conversation in its own SQLite file under the home that
+// ran it: `<home>/.gemini/antigravity-cli/conversations/<conversation_id>.db`.
+// The denied MCP tool's name lives as PLAINTEXT inside the `step_payload`
+// protobuf BLOB, so the fixtures below reproduce that shape — the JSON
+// substring buried in binary noise — rather than clean JSON, so the tests
+// exercise the same "find it inside a blob" path as production.
+//
+// The fake agy's conversation_id is fixed
+// (`6f5f0f1e-0000-4a1b-9c2d-1122334455aa`), so a fixture placed at
+// `conversationDbPath(home, conv)` is exactly what a dispatch under that
+// home consults.
+
+const FAKE_CONVERSATION_ID = "6f5f0f1e-0000-4a1b-9c2d-1122334455aa";
+
+function conversationDbPath(home, conversationId = FAKE_CONVERSATION_ID) {
+  return path.join(home, ".gemini", "antigravity-cli", "conversations", `${conversationId}.db`);
+}
+
+// Binary noise around the JSON substring, standing in for the protobuf
+// framing the real BLOB carries.
+function blobWithNoise(jsonText) {
+  const noise = Buffer.from([0x0a, 0x10, 0x00, 0xff, 0x80, 0x01, 0x92, 0x00, 0x1a, 0x03]);
+  return Buffer.concat([noise, Buffer.from(jsonText, "latin1"), noise]);
+}
+
+// The tool-call JSON the way it sits inside a real step_payload: the
+// `ServerName`/`ToolName` pair the lookup matches, with other fields around
+// it so the match has to find the pair, not the whole line.
+function toolPayloadJson(server, tool) {
+  return JSON.stringify({
+    Arguments: { requestId: "req-0001" },
+    ServerName: server,
+    ToolName: tool,
+    ToolCallId: "call-0001",
+    CallContext: { stepId: 7 },
+  });
+}
+
+// A step whose payload carries no tool call at all (thinking text, usage,
+// anything else) — the lookup must skip it.
+function nonToolPayloadJson() {
+  return JSON.stringify({ Text: "reasoning text", Role: "model" });
+}
+
+// Build a conversation database with the EXACT schema of a real one (taken
+// from a real DB) and insert the given steps.  Each step is
+// `{ idx, status, payload }` where `payload` is a Buffer (or null).
+function writeConversationDb(dbPath, steps) {
+  fs.mkdirSync(path.dirname(dbPath), { recursive: true });
+  const db = new DatabaseSync(dbPath);
+  db.exec(
+    "CREATE TABLE `steps` (" +
+    "`idx` integer, `step_type` integer NOT NULL DEFAULT 0, " +
+    "`status` integer NOT NULL DEFAULT 0, " +
+    "`has_subtrajectory` numeric NOT NULL DEFAULT false, " +
+    "`metadata` blob, `error_details` blob, `permissions` blob, " +
+    "`task_details` blob, `render_info` blob, `step_payload` blob, " +
+    "`step_format` integer NOT NULL DEFAULT 0, " +
+    "PRIMARY KEY (`idx`))",
+  );
+  const insert = db.prepare(
+    "INSERT INTO `steps` (`idx`, `step_type`, `status`, `has_subtrajectory`, `metadata`, " +
+    "`error_details`, `permissions`, `task_details`, `render_info`, `step_payload`, `step_format`) " +
+    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+  );
+  for (const step of steps) {
+    insert.run(
+      step.idx,
+      step.step_type ?? 0,
+      step.status ?? 0,
+      step.has_subtrajectory ?? 0,
+      step.metadata ?? null,
+      step.error_details ?? null,
+      step.permissions ?? null,
+      step.task_details ?? null,
+      step.render_info ?? null,
+      step.payload ?? null,
+      step.step_format ?? 0,
+    );
+  }
+  db.close();
+}
+
+// A tool step whose payload carries the server/tool pair inside the blob.
+function toolStep(idx, status, server, tool) {
+  return { idx, status, payload: blobWithNoise(toolPayloadJson(server, tool)) };
+}
+
 describe("agyDispatch — per-role HOME (kusabi #542)", () => {
   let ctx;
 
@@ -2288,6 +2584,220 @@ describe("agyDispatch — per-role HOME (kusabi #542)", () => {
     assert.ok(Object.hasOwn(refused.job, "agyHome"), "argv-too-large: agyHome");
     assert.ok(Object.hasOwn(refused.job, "agyHomeReason"), "argv-too-large: agyHomeReason");
     assert.deepEqual(refused.job.agyDeniedActions, []);
+  });
+});
+
+// =========================================================================
+// denial diagnosis \u2014 naming the denied MCP tool (kusabi #545)
+// =========================================================================
+//
+// The dispatch reads agy's conversation database ONLY when an `mcp` class
+// was denied; the fixtures below place the database under the role home the
+// dispatch resolves, at the exact path the dispatch builds from
+// `agyHome` + the fake agy's fixed conversation_id.
+
+describe("agyDispatch \u2014 the denied MCP tool from the conversation record (kusabi #545)", () => {
+  let ctx;
+
+  beforeEach(() => { ctx = fakeAgyContext(); });
+  afterEach(() => { ctx.restore(); });
+
+  it("an mcp denial whose last tool step has status=7 names the tool on the record, the error, and the event (criteria 1 and 9)", async () => {
+    const roleHome = path.join(ctx.tmp, "agy-home-implement");
+    writeRoleHome(ctx, roleHome);
+    writeKusabiConfig(ctx, { agy: { homes: { implement: roleHome } } });
+    writeConversationDb(conversationDbPath(roleHome), [
+      toolStep(1, 7, "sunaba", "sandbox_list_containers"),
+    ]);
+    ctx.setMode("denied-mcp");
+
+    const { job } = await agyDispatch(ctx.dispatchOptions({ phase: "implement" }));
+    assert.equal(job.status, "error");
+    // The string-array shape is unchanged (criterion 9): the enrichment is a
+    // separate field, never a replacement.
+    assert.deepEqual(job.agyDeniedActions, ["mcp"]);
+    assert.equal(job.agyDeniedTool, "sunaba/sandbox_list_containers");
+    // The exact line to paste into permissions.allow.
+    assert.match(job.error, /mcp\(sunaba\/sandbox_list_containers\)/);
+    assert.match(job.error, /permissions\.allow/);
+    // The persisted record and the finished event carry the same value.
+    assert.equal(loadJob(ctx.stateDir, job.id).agyDeniedTool, "sunaba/sandbox_list_containers");
+    const events = fs.readFileSync(path.join(jobDir(ctx.stateDir, job.id), "events.ndjson"), "utf8")
+      .trim().split("\n").map(JSON.parse);
+    assert.equal(events.at(-1).agyDeniedTool, "sunaba/sandbox_list_containers");
+  });
+
+  it("an mcp denial whose last tool step has status=6 also identifies (criterion 2)", async () => {
+    const roleHome = path.join(ctx.tmp, "agy-home-implement");
+    writeRoleHome(ctx, roleHome);
+    writeKusabiConfig(ctx, { agy: { homes: { implement: roleHome } } });
+    writeConversationDb(conversationDbPath(roleHome), [
+      toolStep(1, 6, "sunaba", "read_output"),
+    ]);
+    ctx.setMode("denied-mcp");
+
+    const { job } = await agyDispatch(ctx.dispatchOptions({ phase: "implement" }));
+    assert.equal(job.agyDeniedTool, "sunaba/read_output");
+    assert.match(job.error, /mcp\(sunaba\/read_output\)/);
+  });
+
+  it("a read_url denial never opens the conversation database (criterion 3): a home that would throw if opened still dispatches normally", async () => {
+    const roleHome = path.join(ctx.tmp, "agy-home-implement");
+    writeRoleHome(ctx, roleHome);
+    writeKusabiConfig(ctx, { agy: { homes: { implement: roleHome } } });
+    // `conversations` is a regular FILE here, so `<file>/<id>.db` would throw
+    // ENOTDIR on any open attempt.  A non-mcp denial must never try.
+    const convDir = path.join(roleHome, ".gemini", "antigravity-cli", "conversations");
+    fs.writeFileSync(convDir, "not a directory", "utf8");
+    ctx.setMode("denied-read-url");
+
+    const { job } = await agyDispatch(ctx.dispatchOptions({ phase: "implement" }));
+    assert.equal(job.status, "error");
+    assert.equal(job.agyDeniedTool, null);
+    // display_name names the tool; the not-determined sentence would only
+    // have been written by a path that tried the database.
+    assert.match(job.error, /read_url \(ReadUrl\)/);
+    assert.doesNotMatch(job.error, /could not be determined/);
+  });
+
+  it("a read_url denial with a completed last tool step in the DB reports null, never the tool (criterion 3)", async () => {
+    const roleHome = path.join(ctx.tmp, "agy-home-implement");
+    writeRoleHome(ctx, roleHome);
+    writeKusabiConfig(ctx, { agy: { homes: { implement: roleHome } } });
+    // The acceptance fixture: the LAST tool step is a successful
+    // shiori_keyword_search call.  Even if the database WERE consulted the
+    // lookup would report null — so the record must, too.
+    writeConversationDb(conversationDbPath(roleHome), [
+      toolStep(1, 3, "shiori", "shiori_keyword_search"),
+    ]);
+    ctx.setMode("denied-read-url");
+
+    const { job } = await agyDispatch(ctx.dispatchOptions({ phase: "implement" }));
+    assert.equal(job.agyDeniedTool, null);
+    assert.deepEqual(job.agyDeniedActions, ["read_url"]);
+  });
+
+  it("a read_url denial never consults the database: a DENIED tool step in it does not leak into the record", async () => {
+    const roleHome = path.join(ctx.tmp, "agy-home-implement");
+    writeRoleHome(ctx, roleHome);
+    writeKusabiConfig(ctx, { agy: { homes: { implement: roleHome } } });
+    // The misattribution trap: the database's last tool step carries a
+    // denial status.  Consulting it would identify a tool — so the record
+    // staying null proves the classes were checked before any open.
+    writeConversationDb(conversationDbPath(roleHome), [
+      toolStep(1, 7, "sunaba", "sandbox_list_containers"),
+    ]);
+    ctx.setMode("denied-read-url");
+
+    const { job } = await agyDispatch(ctx.dispatchOptions({ phase: "implement" }));
+    assert.equal(job.agyDeniedTool, null);
+  });
+
+  it("an mcp denial whose last tool step completed (status=3) yields null and SAYS so in the error (criterion 4)", async () => {
+    const roleHome = path.join(ctx.tmp, "agy-home-implement");
+    writeRoleHome(ctx, roleHome);
+    writeKusabiConfig(ctx, { agy: { homes: { implement: roleHome } } });
+    writeConversationDb(conversationDbPath(roleHome), [
+      toolStep(1, 3, "sunaba", "sandbox_list_containers"),
+    ]);
+    ctx.setMode("denied-mcp");
+
+    const { job } = await agyDispatch(ctx.dispatchOptions({ phase: "implement" }));
+    assert.equal(job.agyDeniedTool, null);
+    assert.match(job.error, /could not be determined from the conversation record/);
+    // Never a guess: the class is reported, the tool is not invented.
+    assert.doesNotMatch(job.error, /mcp\(sunaba\/sandbox_list_containers\)/);
+  });
+
+  it("a run with NO denied_actions never opens the database, and the record still carries agyDeniedTool null (criterion 5)", async () => {
+    const roleHome = path.join(ctx.tmp, "agy-home-implement");
+    writeRoleHome(ctx, roleHome);
+    writeKusabiConfig(ctx, { agy: { homes: { implement: roleHome } } });
+    const convDir = path.join(roleHome, ".gemini", "antigravity-cli", "conversations");
+    fs.writeFileSync(convDir, "not a directory", "utf8");
+    // `ok` mode: no denied_actions at all.
+    ctx.setMode("ok");
+
+    const { job } = await agyDispatch(ctx.dispatchOptions({ phase: "implement" }));
+    assert.equal(job.status, "completed");
+    assert.equal(job.agyDeniedTool, null);
+    assert.deepEqual(job.agyDeniedActions, []);
+    // The would-throw path was never touched: the dispatch completed with
+    // nothing to identify, exactly as a run with no denials always has.
+  });
+
+  it("an mcp denial with a missing conversation database yields null, no throw, normal dispatch (criterion 6)", async () => {
+    const roleHome = path.join(ctx.tmp, "agy-home-implement");
+    writeRoleHome(ctx, roleHome);
+    writeKusabiConfig(ctx, { agy: { homes: { implement: roleHome } } });
+    // No database under the conversations dir at all.
+    ctx.setMode("denied-mcp");
+
+    const { job } = await agyDispatch(ctx.dispatchOptions({ phase: "implement" }));
+    assert.equal(job.status, "error");
+    assert.equal(job.agyDeniedTool, null);
+    assert.match(job.error, /DENIED/);
+    assert.match(job.error, /could not be determined from the conversation record/);
+  });
+
+  it("an mcp denial with a non-SQLite file at the db path yields null, no throw (criterion 6)", async () => {
+    const roleHome = path.join(ctx.tmp, "agy-home-implement");
+    writeRoleHome(ctx, roleHome);
+    writeKusabiConfig(ctx, { agy: { homes: { implement: roleHome } } });
+    fs.mkdirSync(path.dirname(conversationDbPath(roleHome)), { recursive: true });
+    fs.writeFileSync(conversationDbPath(roleHome), "definitely not sqlite", "utf8");
+    ctx.setMode("denied-mcp");
+
+    const { job } = await agyDispatch(ctx.dispatchOptions({ phase: "implement" }));
+    assert.equal(job.status, "error");
+    assert.equal(job.agyDeniedTool, null);
+  });
+
+  it("an mcp denial with a database that has no steps table yields null, no throw (criterion 6)", async () => {
+    const roleHome = path.join(ctx.tmp, "agy-home-implement");
+    writeRoleHome(ctx, roleHome);
+    writeKusabiConfig(ctx, { agy: { homes: { implement: roleHome } } });
+    const dbPath = conversationDbPath(roleHome);
+    fs.mkdirSync(path.dirname(dbPath), { recursive: true });
+    const db = new DatabaseSync(dbPath);
+    db.exec("CREATE TABLE other (x integer)");
+    db.close();
+    ctx.setMode("denied-mcp");
+
+    const { job } = await agyDispatch(ctx.dispatchOptions({ phase: "implement" }));
+    assert.equal(job.status, "error");
+    assert.equal(job.agyDeniedTool, null);
+    assert.match(job.error, /could not be determined from the conversation record/);
+  });
+
+  it("an earlier failed step followed by a later successful one yields null \u2014 the LAST step governs (criterion 7)", async () => {
+    const roleHome = path.join(ctx.tmp, "agy-home-implement");
+    writeRoleHome(ctx, roleHome);
+    writeKusabiConfig(ctx, { agy: { homes: { implement: roleHome } } });
+    writeConversationDb(conversationDbPath(roleHome), [
+      toolStep(1, 6, "sunaba", "sandbox_list_containers"),
+      toolStep(2, 3, "sunaba", "read_output"),
+    ]);
+    ctx.setMode("denied-mcp");
+
+    const { job } = await agyDispatch(ctx.dispatchOptions({ phase: "implement" }));
+    assert.equal(job.agyDeniedTool, null);
+    assert.match(job.error, /could not be determined from the conversation record/);
+  });
+
+  it("EVERY agy job record carries agyDeniedTool, identified string or null (criterion 8)", async () => {
+    for (const mode of ["ok", "success-empty-payload", "exit", "garbage", "no-result", "denied"]) {
+      ctx.setMode(mode);
+      const { job } = await agyDispatch(ctx.dispatchOptions());
+      assert.ok(Object.hasOwn(job, "agyDeniedTool"), `${mode}: agyDeniedTool`);
+      assert.equal(job.agyDeniedTool, null, `${mode}: agyDeniedTool null`);
+      assert.equal(loadJob(ctx.stateDir, job.id).agyDeniedTool, null, `${mode}: persisted agyDeniedTool`);
+    }
+
+    const oversized = "x".repeat(AGY_MAX_ARG_BYTES + 1);
+    const refused = await agyDispatch(ctx.dispatchOptions({ promptText: oversized }));
+    assert.ok(Object.hasOwn(refused.job, "agyDeniedTool"), "argv-too-large: agyDeniedTool");
+    assert.equal(refused.job.agyDeniedTool, null, "argv-too-large: agyDeniedTool null");
   });
 });
 
