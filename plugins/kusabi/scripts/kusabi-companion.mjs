@@ -207,6 +207,22 @@ export const PHASE_AGENTS = {
   plan: "kusabi-plan",
 };
 
+// kusabi #529 — the Luna coordinator seat.  Registered NON-ENUMERABLY:
+// PHASE_AGENTS.coordinate is the seat prompt contract only (the phase is
+// unreachable from the CLI until the #530 mission driver lands), and the
+// existing contract that the map "contains 9 entries" (Object.keys length,
+// kusabi-companion.test.mjs) must stay byte-identical for every pre-#529
+// consumer.  Direct access — PHASE_AGENTS.coordinate — is what the frozen
+// #529 registration assertion reads, and the coordinate seat is a CODEX seat
+// definition (zero tools, "*": deny, no MCP), intentionally excluded from the
+// generic opencode worker permission loop in agent-permissions.test.mjs.
+Object.defineProperty(PHASE_AGENTS, "coordinate", {
+  value: "kusabi-coordinate",
+  writable: true,
+  enumerable: false,
+  configurable: true,
+});
+
 // ---------------------------------------------------------------------------
 // config loading & model resolution
 // ---------------------------------------------------------------------------

@@ -897,12 +897,14 @@ describe("codexDispatch (fake codex)", () => {
     assert.equal(job.mcpServersConfigured, false);
     assert.equal(job.codexProvenance.state, "verified");
     assert.equal(job.codexProvenance.model, MODEL);
+    assert.equal(job.substituted, false, "verified-exact provenance must record substituted: false");
     assert.equal(job.stopReason, "completed");
     assert.equal(stateDir, ctx.stateDir);
 
     const persisted = loadJob(stateDir, job.id);
     assert.equal(persisted.sessionID, THREAD_ID);
     assert.equal(persisted.codexProvenance.state, "verified");
+    assert.equal(persisted.substituted, false, "the persisted job record must carry substituted: false");
     assert.equal(fs.readFileSync(path.join(jobDir(stateDir, job.id), "result.md"), "utf8"), "ALPHA-7");
   });
 
@@ -1016,6 +1018,7 @@ describe("codexDispatch (fake codex)", () => {
     assert.equal(job.codexProvenance.state, "verified");
     assert.equal(job.codexProvenance.model, MODEL);
     assert.equal(job.codexProvenance.reasoningEffort, "high");
+    assert.equal(job.substituted, false, "verified resumed turn must record substituted: false");
     const persisted = loadJob(stateDir, job.id);
     assert.equal(persisted.sessionID, THREAD_ID);
   });
@@ -1051,6 +1054,7 @@ describe("codexDispatch (fake codex)", () => {
     assert.equal(resultText, "");
     assert.equal(fs.existsSync(path.join(jobDir(ctx.stateDir, job.id), "result.md")), false);
     assert.equal(job.codexProvenance.state, "mismatch");
+    assert.equal(job.substituted, true, "an observed model mismatch must record substituted: true");
   });
 
   it("resume provenance mismatch (effort) on the resumed turn fails closed", async () => {
@@ -1200,6 +1204,7 @@ describe("codexDispatch (fake codex)", () => {
     assert.equal(resultText, "");
     assert.equal(fs.existsSync(path.join(jobDir(ctx.stateDir, job.id), "result.md")), false);
     assert.equal(job.codexProvenance.state, "mismatch");
+    assert.equal(job.substituted, true, "an observed model mismatch must record substituted: true");
     const persisted = loadJob(ctx.stateDir, job.id);
     assert.equal(persisted.status, "error");
   });
@@ -1219,6 +1224,7 @@ describe("codexDispatch (fake codex)", () => {
     assert.equal(resultText, "ALPHA-7");
     assert.equal(job.codexProvenance.state, "unverifiable");
     assert.match(job.codexProvenance.reason, /no-rollout-record/);
+    assert.equal(job.substituted, null, "unverifiable provenance must record substituted: null, never a claimed false");
   });
 
   it("cancellation kills the process group through the recorded identity token (kusabi #209 lever)", async () => {

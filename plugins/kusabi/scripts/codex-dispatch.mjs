@@ -997,6 +997,20 @@ export async function codexDispatch(opts) {
   const codexSandboxEnforcedDenies = deniedToolNames.filter((name) => WRITE_TOOL_NAMES.includes(name));
   const unenforcedDenies = deniedToolNames.filter((name) => !WRITE_TOOL_NAMES.includes(name));
 
+  // The deny map as supplied (null when no tools map was passed at all) and
+  // the truthful tool profile derived from it (kusabi #529 spec 8).  A
+  // no-tools dispatch records `toolDenies: null` and `toolProfile: "no-mcp"`
+  // — the only honest proof that no tools were granted.  When a deny map IS
+  // supplied the profile is "deny-map": the record carries the map and its
+  // unenforced entries and must never be mistaken for proof of no tools (the
+  // codex CLI has no per-job tool-deny flags; the fixed read-only sandbox is
+  // the enforced write boundary).
+  const toolDenies =
+    opts.tools && typeof opts.tools === "object" && Object.keys(opts.tools).length > 0
+      ? opts.tools
+      : null;
+  const toolProfile = toolDenies === null ? "no-mcp" : "deny-map";
+
   // ---- job record (opencode-path shape + backend) ----
   const job = {
     id: newJobId(),
@@ -1031,6 +1045,22 @@ export async function codexDispatch(opts) {
     sandboxPolicy: CODEX_SANDBOX_POLICY,
     mcpServersConfigured: false,
     codexCommandTool: true,
+    // kusabi #529 spec 8: the truthful no-tool record.  `toolProfile:
+    // "no-mcp"` and `toolDenies: null` describe a dispatch with no MCP
+    // servers AND no deny map — the honest proof that no tools were granted.
+    // A supplied deny map flips the profile to "deny-map" and records the
+    // map as `toolDenies`; the unenforced entries ride in
+    // `toolDeniesUnenforced`.  `streamFraming` is "json" because every
+    // invocation passes `--json` (the watchdog treats non-JSON lines as
+    // activity, so nobody reads "no stall" as "structured activity").
+    // `substituted` starts as null (provenance is not yet known) and is set
+    // from the post-run rollout cross-check (kusabi #529 finding 4): false
+    // only when the actual model is verified equal, true for an observed
+    // mismatch, null when provenance is unverifiable — never a claimed value.
+    toolProfile,
+    toolDenies,
+    streamFraming: "json",
+    substituted: null,
     // Filled after the process closes: { state: "verified"|"unverifiable"|
     // "mismatch", ... } — see readRolloutProvenance.
     codexProvenance: null,
@@ -1160,6 +1190,13 @@ export async function codexDispatch(opts) {
   // the original session.
   const provenance = readRolloutProvenance({ codexHome, requestedModel: modelEntry, resumed: resumedSessionId !== null });
   job.codexProvenance = provenance;
+  // `substituted` is set from post-run provenance (kusabi #529 finding 4):
+  // `false` only when the actual model is verified equal to the requested
+  // one, `true` for an observed mismatch, and `null` when provenance is
+  // unverifiable (no rollout / no model field in the rollout) — never a
+  // claimed value.  The fail-closed mismatch handling below is unchanged: a
+  // mismatch is a hard error, no result and no substitute model.
+  job.substituted = provenance.state === "verified" ? false : provenance.state === "mismatch" ? true : null;
 
   // ---- classification (all failure text preserved on the record) ----
   let resultText = "";

@@ -1,8 +1,16 @@
-import { describe, it } from "node:test";
+import { describe, it, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync, readdirSync, existsSync } from "node:fs";
+import * as fs from "node:fs";
 import { join } from "node:path";
+import * as path from "node:path";
 import { fileURLToPath } from "node:url";
+import os from "node:os";
+
+import { PHASE_AGENTS } from "./kusabi-companion.mjs";
+import { codexDispatch } from "./codex-dispatch.mjs";
+import { stateDirFor } from "./state-paths.mjs";
+import { loadJob } from "./job-store.mjs";
 
 // ---------------------------------------------------------------------------
 // Pure exported checker
@@ -206,9 +214,16 @@ const AGENTS_DIR = join(__dirname, "..", "opencode-agents");
 // ---------------------------------------------------------------------------
 
 describe("agent permission allowlists", () => {
-  // R4: Enumerate agent directory dynamically — no hardcoded list.
+  // R4: Enumerate agent directory dynamically — no hardcoded list.  The
+  // kusabi-coordinate.md seat is EXCLUDED: it is a Codex seat definition,
+  // not an opencode worker agent.  The seat grants NO opencode/MCP tools at
+  // all (kusabi #529 — evidence arrives through the envelope/read-only tree,
+  // never through opencode MCP permissions), so the opencode worker
+  // invariants in this loop (read-core + kaiba grants) do not apply to it.
+  // Its contract is asserted by the "#529 — Luna/Sol seat registration"
+  // describe block below.
   const agentFiles = readdirSync(AGENTS_DIR)
-    .filter(f => f.endsWith(".md"))
+    .filter(f => f.endsWith(".md") && f !== "kusabi-coordinate.md")
     .sort();
   const agentCount = agentFiles.length;
 
@@ -670,5 +685,202 @@ describe("test-author and plan agent files", () => {
     ]) {
       assert.notEqual(permission[tool], "allow", `plan must NOT allow ${tool}`);
     }
+  });
+});
+// ---------------------------------------------------------------------------
+// kusabi #529 — Luna/Sol seat contracts.  The exact Codex seats get NO tools
+// and NO MCP: no filesystem mutation, no issue-write, no publish, no
+// network-write — and not even sunaba read tools, because the seat has no
+// container access at all.  Evidence reaches the seat only through the
+// envelope / read-only evidence tree via the Codex no-MCP profile, never
+// through opencode MCP permissions; read_probe is a request the deterministic
+// host driver executes.  The proof of "no tools" is NEVER an unenforced deny
+// list: the codex CLI has no per-tool deny flags, so the honest record is a
+// seat definition whose "*": deny grants zero tools, plus a dispatch record
+// that grants no tools (no MCP servers, read-only sandbox, toolDenies null)
+// with exact requested/actual provenance.
+// ---------------------------------------------------------------------------
+
+describe("kusabi #529 — Luna/Sol seat registration (no-tool seats)", () => {
+  it("registers the coordinate phase agent in PHASE_AGENTS", () => {
+    assert.equal(PHASE_AGENTS.coordinate, "kusabi-coordinate");
+  });
+
+  it("the coordinate seat agent file exists", () => {
+    const seatPath = join(AGENTS_DIR, "kusabi-coordinate.md");
+    assert.ok(existsSync(seatPath), "kusabi-coordinate.md is missing — the Luna seat contract is not defined");
+  });
+
+  it("kusabi-coordinate: the seat grants NO sunaba/MCP tools at all — \"*\": deny is the authority boundary", () => {
+    const seatPath = join(AGENTS_DIR, "kusabi-coordinate.md");
+    const fm = parseFrontmatter(readFileSync(seatPath, "utf8"));
+    assert.ok(fm !== null, "could not parse frontmatter");
+    const permission = fm.permission;
+    assert.ok(permission !== null && typeof permission === "object");
+    // "*": deny is the authority boundary.  The seat is dispatched with no
+    // MCP servers at all, so the definition grants zero tools.
+    assert.equal(Object.keys(permission)[0], "*");
+    assert.equal(permission["*"], "deny");
+    // Zero tools: no entry other than "*" may be "allow" — read tools
+    // included.  A grant of sunaba_read_file_range / search / list / diff /
+    // issue_view would be a container-read capability the seats must not
+    // have; evidence arrives in the prompt / read-only evidence tree.
+    const allowed = Object.entries(permission)
+      .filter(([name]) => name !== "*")
+      .filter(([, value]) => value === "allow")
+      .map(([name]) => name);
+    assert.deepEqual(allowed, [], `coordinate seat must not allow ANY tool, got: ${allowed.join(", ")}`);
+    for (const readTool of [
+      "sunaba_read_file_range",
+      "sunaba_search_in_container",
+      "sunaba_list_files",
+      "sunaba_diff_in_container",
+      "sunaba_issue_view",
+    ]) {
+      assert.notEqual(permission[readTool], "allow", `coordinate seat must NOT be granted ${readTool}`);
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The per-mission codex seat dispatch record: the job must record the no-tool
+// contract honestly (no MCP servers, no tool grants, read-only sandbox,
+// stream framing, substitution flag, exact requested/actual provenance) and
+// must never let an unenforced deny list stand in for "no tools".  The real
+// `codex` binary is never required — CODEX_BIN points at a fake script
+// (cursor-dispatch precedent: "no test may ever require" the real binary).
+// ---------------------------------------------------------------------------
+
+const SEAT_THREAD_ID = "thread-529-seat-0001";
+const SEAT_MODEL = "gpt-5.6-sol";
+
+// The fake body deliberately uses NO template literals and NO `${...}`, so
+// this outer template literal interpolates nothing by accident.
+const FAKE_CODEX_529_TEMPLATE = `#!/usr/bin/env node
+import fs from "node:fs";
+import path from "node:path";
+
+const NL = String.fromCharCode(10);
+const thread = "__SEAT_THREAD_ID__";
+const model = "__SEAT_MODEL__";
+
+function emit(obj) {
+  fs.writeSync(1, JSON.stringify(obj) + NL);
+}
+
+const dir = path.join(process.env.CODEX_HOME, "sessions", thread);
+fs.mkdirSync(dir, { recursive: true });
+const recs = [
+  { timestamp: new Date().toISOString(), type: "session_meta", payload: { id: thread, cwd: process.cwd(), model: model, model_reasoning_effort: "high", approval_policy: "never", sandbox_policy: "read-only", network_policy: "restricted" } },
+  { timestamp: new Date().toISOString(), type: "turn_context", payload: { turn_id: "turn-1", model: model } },
+];
+fs.writeFileSync(path.join(dir, "rollout-1.jsonl"), recs.map(function (r) { return JSON.stringify(r); }).join(NL) + NL);
+
+emit({ type: "thread.started", thread_id: thread });
+emit({ type: "turn.started", turn_id: "turn-1" });
+emit({ type: "item.completed", item: { agent_message: { text: "SEAT-OK" } } });
+emit({ type: "turn.completed", usage: { input_tokens: 1, output_tokens: 1 } });
+process.exit(0);
+`;
+
+function seatDispatchContext() {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-529-seat-"));
+  const binPath = path.join(tmp, "fake-codex-529.mjs");
+  fs.writeFileSync(
+    binPath,
+    FAKE_CODEX_529_TEMPLATE
+      .replaceAll("__SEAT_THREAD_ID__", SEAT_THREAD_ID)
+      .replaceAll("__SEAT_MODEL__", SEAT_MODEL),
+    "utf8",
+  );
+  fs.chmodSync(binPath, 0o755);
+
+  const stateRoot = path.join(tmp, "state");
+  const cwd = path.join(tmp, "cwd");
+  fs.mkdirSync(cwd, { recursive: true });
+
+  const saved = {
+    CODEX_BIN: process.env.CODEX_BIN,
+    KUSABI_STATE_DIR: process.env.KUSABI_STATE_DIR,
+    HOME: process.env.HOME,
+    CODEX_HOME: process.env.CODEX_HOME,
+  };
+  process.env.CODEX_BIN = binPath;
+  process.env.KUSABI_STATE_DIR = stateRoot;
+  process.env.HOME = path.join(tmp, "home");
+  process.env.CODEX_HOME = path.join(tmp, "operator-codex-home");
+
+  const stateDir = stateDirFor(cwd);
+  return {
+    tmp,
+    cwd,
+    stateDir,
+    dispatchOptions(overrides = {}) {
+      return {
+        cwd,
+        kind: "task",
+        title: "seat contract",
+        promptText: "Say the token.",
+        agent: null,
+        phase: null,
+        tools: null,
+        timeoutS: 20,
+        watchdogS: 900,
+        tiers: [["gpt-5.6-luna", "gpt-5.6-sol"]],
+        round: 1,
+        explicitModel: SEAT_MODEL,
+        ...overrides,
+      };
+    },
+    restore() {
+      for (const [key, value] of Object.entries(saved)) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+      fs.rmSync(tmp, { recursive: true, force: true });
+    },
+  };
+}
+
+describe("kusabi #529 — per-mission codex seat dispatch record", () => {
+  let ctx;
+  beforeEach(() => { ctx = seatDispatchContext(); });
+  afterEach(() => { ctx.restore(); });
+
+  it("records the frozen no-tool profile: no MCP, no tool grants, read-only sandbox, framing, substitution flag, exact provenance", async () => {
+    const { job, stateDir } = await codexDispatch(ctx.dispatchOptions());
+    assert.equal(job.status, "completed");
+    // No MCP servers, no tool grants — the honest record, never a deny list.
+    assert.equal(job.toolProfile, "no-mcp");
+    assert.equal(job.mcpServersConfigured, false);
+    assert.equal(job.toolDenies, null);
+    assert.deepEqual(job.toolDeniesUnenforced, []);
+    assert.deepEqual(job.codexSandboxEnforcedDenies, []);
+    // The measured sandbox boundary.
+    assert.equal(job.sandboxPolicy, "read-only");
+    // Exact provenance: requested/actual model + fixed reasoning effort.
+    assert.equal(job.modelEntry, SEAT_MODEL);
+    assert.equal(job.codexProvenance.state, "verified");
+    assert.equal(job.codexProvenance.model, SEAT_MODEL);
+    assert.equal(job.codexProvenance.reasoningEffort, "high");
+    // Stream framing and substitution are recorded, never silent.
+    assert.equal(job.streamFraming, "json");
+    assert.equal(job.substituted, false);
+    // Persisted on the job record, not just the in-memory copy.
+    const persisted = loadJob(stateDir, job.id);
+    assert.equal(persisted.toolProfile, "no-mcp");
+    assert.equal(persisted.streamFraming, "json");
+    assert.equal(persisted.substituted, false);
+    assert.equal(persisted.toolDenies, null);
+  });
+
+  it("an unenforced deny list is recorded as unenforced — never as proof of no tools", async () => {
+    const { job } = await codexDispatch(ctx.dispatchOptions({ tools: { sunaba_copy_project: false } }));
+    assert.equal(job.status, "completed");
+    // A deny list was applied, so the record carries the deny map — it must
+    // NOT claim no tools were granted (toolDenies must not be null).
+    assert.deepEqual(job.toolDenies, { sunaba_copy_project: false });
+    assert.deepEqual(job.toolDeniesUnenforced, ["sunaba_copy_project"]);
+    assert.deepEqual(job.codexSandboxEnforcedDenies, []);
   });
 });

@@ -227,8 +227,16 @@ export function resolveTaskPreflight(cwd, { flags, text }, opts = {}) {
   let phase = null;
   if (flags.phase) {
     phase = flags.phase;
-    if (!PHASE_AGENTS[phase]) {
-      throw new Error(`unknown phase: ${phase}. Use draft|investigate|implement|review|respond|salvage|gofer|test-author|plan`);
+    // `task` dispatches the nine WORKER phases.  PHASE_AGENTS.coordinate
+    // (kusabi #529) is registered NON-enumerably as the Luna seat prompt
+    // contract only -- the phase is unreachable from the CLI until the #530
+    // mission driver deliberately wires it -- so a property-access guard
+    // would wrongly accept it.  Validate against the enumerable keys (the
+    // closed worker-phase set) and derive the error message from the same
+    // list: one source of truth for what the task surface can dispatch.
+    const taskPhases = Object.keys(PHASE_AGENTS);
+    if (!taskPhases.includes(phase)) {
+      throw new Error(`unknown phase: ${phase}. Use ${taskPhases.join("|")}`);
     }
     if (flags.agent) {
       throw new Error("--phase and --agent are mutually exclusive");

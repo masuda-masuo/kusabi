@@ -1,0 +1,33 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://kusabi.local/schemas/coordinator-output.schema.json",
+  "title": "Coordinator output record (Luna seat request)",
+  "description": "One line-oriented request record emitted by the Luna coordinator seat (kusabi #524 §8, #529). The action allow-list is CLOSED: this enum is the single source of truth the parser enforces, and the future mission driver consumes only streams that parse with valid:true. Per-action body fields pass through unvalidated — the driver bounds them, not this schema.",
+  "type": "object",
+  "additionalProperties": true,
+  "required": [
+    "action",
+    "envelope_sha256"
+  ],
+  "properties": {
+    "action": {
+      "type": "string",
+      "enum": [
+        "read_probe",
+        "run_chain",
+        "rework_chain",
+        "consult_sol",
+        "escalate_to_host",
+        "finish"
+      ],
+      "description": "The closed request allow-list of #524 §8. Any other verb — and in particular any verb that publishes, merges, writes an issue, spawns a container, or invokes the CLI — is rejected deterministically and counted as a coordinator error."
+    },
+    "envelope_sha256": {
+      "type": "string",
+      "minLength": 64,
+      "maxLength": 64,
+      "pattern": "^[0-9a-f]{64}$",
+      "description": "64-char lowercase hex SHA-256 of the evidence envelope this request is bound to. A valid hash that is not the current envelope hash is rejected as envelope-mismatch (a request about stale evidence must never execute); a missing or malformed hash is a malformed record. The pattern is the actual regex ^[0-9a-f]{64}$ — evaluated by any JSON Schema validator — so it accepts every lowercase 64-hex hash and rejects uppercase, wrong-length, or non-hex strings; the code-level parser (coordinator-parse.mjs) enforces the same shape at parse time."
+    }
+  }
+}
