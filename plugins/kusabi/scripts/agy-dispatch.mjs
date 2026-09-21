@@ -157,6 +157,7 @@
 import path from "node:path";
 import fs from "node:fs";
 import process from "node:process";
+import { DatabaseSync } from "node:sqlite";
 import { fileURLToPath } from "node:url";
 
 import { firstRoute } from "./cli.mjs";
@@ -841,10 +842,22 @@ export function agyWatchdogSeconds(value) {
  * @param {string} [opts.settingsPath] — the settings.json of the HOME this
  *        run used (the resolved role home, or the ambient one), named in the
  *        denied error so the operator is pointed at the exact file.
+ * @param {string|null} [opts.deniedTool] — `"<server>/<tool>"` when the
+ *        denied MCP tool was identified from the conversation record (kusabi
+ *        #545).  Non-null only when an `mcp` class was among the denials;
+ *        the other classes are fully named by `display_name` and must never
+ *        produce a tool line.  When set, the denied error adds the exact
+ *        `mcp(<deniedTool>)` line to paste into the allowlist.
+ * @param {boolean} [opts.deniedToolUnresolved] — true when an `mcp` class
+ *        was denied but the tool could NOT be identified (conversation
+ *        database missing/unreadable, or its last tool step completed).  The
+ *        denied error then says so EXPLICITLY rather than letting the reader
+ *        assume the class was all there was — an estimate must never be
+ *        presented as an authoritative finding.
  * @returns {{ok: true, text: string, payloadSource: "response"|"structured_output"}
  *          |{ok: false, error: string}}
  */
-export function agyPayload(parsed, { settingsPath } = {}) {
+export function agyPayload(parsed, { settingsPath, deniedTool = null, deniedToolUnresolved = false } = {}) {
   const response = parsed?.response;
   if (typeof response === "string" && response.trim() !== "") {
     return { ok: true, text: response, payloadSource: "response" };
@@ -856,13 +869,24 @@ export function agyPayload(parsed, { settingsPath } = {}) {
   const denied = collectAgyDeniedActions(parsed);
   if (denied.length > 0) {
     const where = settingsPath ?? "<HOME>/.gemini/antigravity-cli/settings.json";
+    // The denial diagnosis, in the shape the operator can act on.  The
+    // paste-ready `mcp(<server>/<tool>)` line is added only when the tool
+    // was actually identified; a class that could not be pinned down is
+    // called out as such instead of being silently dropped.
+    const toolLine =
+      deniedTool !== null
+        ? ` The exact line to paste: mcp(${deniedTool}).`
+        : deniedToolUnresolved
+          ? " The specific tool could not be determined from the conversation record."
+          : "";
     return {
       ok: false,
       error:
         "agy returned no payload and the run was DENIED: headless agy cannot prompt, so the " +
         "tool call(s) that are not allow-listed were auto-denied: " +
-        `${denied.map((d) => d.label).join(", ")}. ` +
-        `Allow them under permissions.allow in ${where} (the permission table this run's HOME used). ` +
+        `${denied.map((d) => d.label).join(", ")}.` +
+        toolLine +
+        ` Allow them under permissions.allow in ${where} (the permission table this run's HOME used). ` +
         `Received: ${describeAgyResult(parsed)}`,
     };
   }
@@ -1256,6 +1280,92 @@ function collectAgyDeniedActions(parsed) {
   return out;
 }
 
+/**
+ * Identify the MCP tool behind an `mcp` denial by reading agy's own
+ * per-conversation SQLite record.
+ *
+ * WHY this exists.  `denied_actions` carries only the action CLASS: for an
+ * MCP call the entry is `{"action":"mcp","display_name":"CallMcpTool"}` —
+ * "one MCP call was denied" is known, *which* tool is not, and `cli.log` does
+ * not name it either (`soft-denying tool confirmation "CallMcpTool" at step
+ * 20`).  The whole point of recording a denial is to fix the allowlist, and
+ * the line to add cannot be derived from any of that.  The name does exist,
+ * as plaintext inside a protobuf BLOB in agy's conversation database:
+ *
+ *   <home>/.gemini/antigravity-cli/conversations/<conversation_id>.db
+ *
+ * whose `steps.step_payload` contains `{"Arguments":{...},"ServerName":
+ * "sunaba","ToolName":"sandbox_list_containers",...}`.  Reading it is the
+ * ONLY way to turn a class into a fixable line.
+ *
+ * WHY "last matching row, status ≠ 3".  The rule was derived from measured
+ * runs (12 conversations, 2026-09): `status` 3 is a COMPLETED step, while a
+ * denied tool step carries 6 or 7.  The LAST tool step is the one that
+ * governs — an earlier failure followed by a later success must report
+ * null, because that later step belongs to a call the model recovered from,
+ * and attributing the denial to it would be a guess.  `status ≠ 3` is
+ * deliberately NOT `status ∈ {6, 7}`: the two observed denial statuses are
+ * the sample we have seen, not an enumeration we can trust the CLI to stop
+ * at, so the rule keys on the one status that is certain (3 = done) rather
+ * than on the ones that merely were observed.
+ *
+ * DEFENSIVE BY CONTRACT.  This is diagnostic enrichment — it must never
+ * break the dispatch.  Every failure — missing file, not a database, no
+ * `steps` table, no matching row, an unreadable BLOB — returns `null`
+ * instead of throwing, and the handle is closed on every path including the
+ * failure paths.  Nothing else in the conversation database is read: not
+ * prompts, not usage, not metadata.  This lookup exists for denial
+ * diagnosis and nothing else.
+ *
+ * @param {object} opts
+ * @param {string} opts.dbPath — the conversation database to read.
+ * @returns {{server: string, tool: string}|null}
+ */
+export function agyDeniedToolFromConversation({ dbPath }) {
+  if (typeof dbPath !== "string" || dbPath === "") return null;
+  let db;
+  try {
+    db = new DatabaseSync(dbPath, { readOnly: true });
+  } catch {
+    // Missing file, not a SQLite database, unreadable — all the same to
+    // the caller: nothing was identified.
+    return null;
+  }
+  try {
+    let rows;
+    try {
+      rows = db.prepare("SELECT idx, status, step_payload FROM steps ORDER BY idx").all();
+    } catch {
+      // No `steps` table (or an unreadable one): nothing to conclude.
+      return null;
+    }
+    let last = null;
+    for (const row of rows) {
+      const raw = row.step_payload;
+      if (raw === null || raw === undefined) continue;
+      // BLOBs come back as Uint8Array; decode as latin1 (each byte is one
+      // character, so the ASCII JSON substring inside the protobuf noise is
+      // preserved verbatim — this is the "find it inside a blob" path).
+      const text =
+        typeof raw === "string" ? raw
+        : raw instanceof Uint8Array ? Buffer.from(raw).toString("latin1")
+        : String(raw);
+      const match = text.match(/"ServerName":"([^"]+)","ToolName":"([^"]+)"/);
+      if (match !== null) {
+        last = { server: match[1], tool: match[2], status: row.status };
+      }
+    }
+    if (last === null) return null;
+    // 3 is a completed step.  The last tool step of a run whose denial is
+    // NOT this call is exactly that shape — reporting its tool would
+    // misattribute the denial (see the "last matching row" note above).
+    if (last.status === 3) return null;
+    return { server: last.server, tool: last.tool };
+  } finally {
+    db.close();
+  }
+}
+
 // =========================================================================
 // process — spawn/IO
 // =========================================================================
@@ -1497,9 +1607,16 @@ export async function agyDispatch(opts) {
     //   agyDeniedActions — tool calls headless agy auto-denied (they were
     //                    not allow-listed); filled from the terminal result,
     //                    [] until then and on every failure before parsing.
+    //   agyDeniedTool   — the MCP tool behind an `mcp` denial, `"<server>/
+    //                    <tool>"` when identified from the conversation
+    //                    record (kusabi #545), null otherwise — including
+    //                    when the classes are all non-`mcp` (display_name
+    //                    already names those, and the database is never
+    //                    consulted for them).
     agyHome,
     agyHomeReason,
     agyDeniedActions: [],
+    agyDeniedTool: null,
     // Whether the run's output shape was enforced by `--json-schema`.
     jsonSchemaEnforced: jsonSchema !== null,
     error: null,
@@ -1566,6 +1683,9 @@ export async function agyDispatch(opts) {
     agyHome,
     agyHomeReason,
     agyDeniedActions: [],
+    // Unknown until the terminal result arrives — null here mirrors the
+    // record's initial value so the trail and the record never disagree.
+    agyDeniedTool: null,
   });
 
   // ---- run: fold the NDJSON stream as it arrives (kusabi #332) ----
@@ -1693,9 +1813,49 @@ export async function agyDispatch(opts) {
       // The tool calls headless agy auto-denied, taken defensively (entries
       // may lack display_name; the field may be absent on older CLIs).
       job.agyDeniedActions = agyDeniedActionNames(parsed);
+      // Denial diagnosis (kusabi #545): an `mcp` class names ONLY the class —
+      // which MCP tool was denied is not in the result, nor in cli.log.  The
+      // name lives as plaintext inside a protobuf BLOB in agy's conversation
+      // database, so when (and ONLY when) `mcp` is among the classes, read
+      // that database and record the tool.  The other classes (read_file,
+      // read_url, command, write_file, browser) are FULLY NAMED by
+      // `display_name`, and the last tool step of such a run belongs to a
+      // successful call — consulting the database for them would misattribute
+      // the denial.  `agyDeniedTool` is the string `<server>/<tool>` when
+      // identified, else null; it is present on every record from the initial
+      // write below, exactly like `agyHome`.  The lookup is defensive: any
+      // database failure yields null and the dispatch proceeds as today — this
+      // is diagnostic enrichment, not a gate, and never changes the terminal
+      // decision.
+      let deniedToolUnresolved = false;
+      if (job.agyDeniedActions.includes("mcp")) {
+        const conversationId = parsed.conversation_id ?? streamAcc.conversationIdFromInit ?? null;
+        const home = agyHome ?? process.env.HOME ?? null;
+        if (conversationId !== null && home !== null) {
+          const dbPath = path.join(
+            home, ".gemini", "antigravity-cli", "conversations", `${conversationId}.db`,
+          );
+          const found = agyDeniedToolFromConversation({ dbPath });
+          if (found !== null) {
+            job.agyDeniedTool = `${found.server}/${found.tool}`;
+          } else {
+            // An mcp class WAS denied but the tool could not be pinned down.
+            // The error must say so rather than let the reader assume the
+            // class was all there was.
+            deniedToolUnresolved = true;
+          }
+        } else {
+          // No conversation id (or no home at all) — nothing to consult.
+          deniedToolUnresolved = true;
+        }
+      }
       // `settingsPath` is the file this run's HOME would consult — named in a
       // denied-run error so the operator is pointed at the exact table.
-      const outcome = agyPayload(parsed, { settingsPath: agySettingsPath });
+      const outcome = agyPayload(parsed, {
+        settingsPath: agySettingsPath,
+        deniedTool: job.agyDeniedTool,
+        deniedToolUnresolved,
+      });
       if (outcome.ok) {
         job.status = "completed";
         job.sessionID = parsed.conversation_id ?? streamAcc.conversationIdFromInit ?? null;
@@ -1739,6 +1899,10 @@ export async function agyDispatch(opts) {
     // The tool calls headless agy auto-denied, as measured on this run's
     // terminal result ([] when none, or when the run never produced one).
     agyDeniedActions: job.agyDeniedActions,
+    // The MCP tool behind an `mcp` denial, when it could be identified from
+    // the conversation record (null otherwise — non-`mcp` denials are fully
+    // named by `display_name` and never consult the database).
+    agyDeniedTool: job.agyDeniedTool,
   });
 
   // Record the closed terminal reason (kusabi #388).  agy finalizes its
