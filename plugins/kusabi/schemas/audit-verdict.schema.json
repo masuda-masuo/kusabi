@@ -1,0 +1,68 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "type",
+    "schema_version",
+    "gate_id",
+    "envelope_sha256",
+    "verdict",
+    "summary"
+  ],
+  "properties": {
+    "type": {
+      "type": "string",
+      "const": "verdict",
+      "description": "Wire discriminator that makes a JSONL line the closing verdict record of the audit stream."
+    },
+    "schema_version": {
+      "type": "integer",
+      "const": 1
+    },
+    "gate_id": {
+      "type": "string",
+      "minLength": 1,
+      "description": "The audit gate this verdict judges, e.g. \"gate-1\".  Bound to the gate the driver is actually evaluating; a verdict naming a different gate is rejected."
+    },
+    "envelope_sha256": {
+      "type": "string",
+      "minLength": 1,
+      "description": "64-char lowercase hex SHA-256 of the evidence envelope this verdict judges.  The exact hex shape and the 64-char bound are enforced by the code-level validator (the generic validator implements no `pattern` keyword)."
+    },
+    "verdict": {
+      "type": "string",
+      "enum": [
+        "clear",
+        "rework",
+        "block"
+      ]
+    },
+    "summary": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Bounded to 500 characters by the code-level validator (the generic validator implements no `maxLength` keyword)."
+    },
+    "block_reason": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Required when `verdict` is \"block\".  Bounded to 200 characters by the code-level validator."
+    },
+    "acknowledgement_required": {
+      "type": "boolean",
+      "description": "Required when `verdict` is \"block\": the veto is not self-overrulable and a human acknowledgement must be recorded before the gate can be reconsidered."
+    }
+  },
+  "if": {
+    "properties": {
+      "verdict": { "const": "block" }
+    },
+    "required": ["verdict"]
+  },
+  "then": {
+    "required": [
+      "block_reason",
+      "acknowledgement_required"
+    ]
+  }
+}

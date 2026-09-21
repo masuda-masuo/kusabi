@@ -1344,3 +1344,61 @@ describe("chain-wait CLI", () => {
     assert.match(result.stdout, /chain-show\|chain-wait\|chain-stats/);
   });
 });
+
+
+// ---------------------------------------------------------------------------
+// sol-blocked terminal recognition (kusabi #524/#528)
+// ---------------------------------------------------------------------------
+
+describe("sol-blocked terminal recognition (kusabi #524/#528)", () => {
+  let tmp;
+  let chainsDir;
+
+  beforeEach(() => {
+    ({ tmp, chainsDir } = makeChainsDir());
+  });
+
+  afterEach(() => {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  });
+
+  it("TERMINAL_DISPOSITIONS contains sol-blocked", () => {
+    assert.ok(TERMINAL_DISPOSITIONS.has("sol-blocked"));
+  });
+
+  it("readChainSnapshot is terminal on a sol-blocked disposition (pre-finalise window)", () => {
+    const dir = makeChainDir(chainsDir, "chain-solblocked");
+    writeControl(dir, runningControl("chain-solblocked"));
+    writeChainJson(dir, {
+      chainId: "chain-solblocked",
+      records: [{ round: 1, disposition: { disposition: "sol-blocked", reason: "Sol audit vetoed the gate: verdict=block" } }],
+    });
+    const snapshot = readChainSnapshot(chainsDir, "chain-solblocked");
+    assert.equal(snapshot.disposition, "sol-blocked");
+    assert.equal(snapshot.terminal, true);
+  });
+
+  it("a sol-blocked disposition with a terminal status stays terminal", () => {
+    const dir = makeChainDir(chainsDir, "chain-solblocked-final");
+    writeControl(dir, { chainId: "chain-solblocked-final", container: "cid-1", status: "completed", round: 1 });
+    writeChainJson(dir, {
+      chainId: "chain-solblocked-final",
+      records: [{ round: 1, disposition: { disposition: "sol-blocked", reason: "mandatory gate, no clearing verdict" } }],
+    });
+    assert.equal(readChainSnapshot(chainsDir, "chain-solblocked-final").terminal, true);
+  });
+
+  it("existing terminal/nonterminal meanings are unchanged", () => {
+    for (const disposition of ["accept", "accept-with-followup", "escalate", "max-rounds", "refused-brief-defect", "sol-blocked"]) {
+      assert.ok(TERMINAL_DISPOSITIONS.has(disposition), disposition);
+    }
+    for (const disposition of ["rework", "strategize"]) {
+      assert.equal(TERMINAL_DISPOSITIONS.has(disposition), false, disposition);
+    }
+    // A rework round in the same record window stays non-terminal.
+    const dir = makeChainDir(chainsDir, "chain-rework-still");
+    writeControl(dir, runningControl("chain-rework-still"));
+    writeChainJson(dir, { chainId: "chain-rework-still", records: [{ round: 1, disposition: { disposition: "rework" } }] });
+    assert.equal(readChainSnapshot(chainsDir, "chain-rework-still").terminal, false);
+  });
+});

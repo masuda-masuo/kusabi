@@ -887,3 +887,207 @@ describe("deriveDisposition brief-syntax defect (kusabi #303)", () => {
     }
   });
 });
+
+
+// deriveDisposition — Sol audit veto (kusabi #524/#528)
+// ---------------------------------------------------------------------------
+// The deterministic audit policy decides WHEN Sol is mandatory; the Sol seat
+// produces the verdict; this row turns a veto into the terminal sol-blocked
+// disposition.  Precedence: refusal → briefSyntaxDefect → oracleViolation
+// → sol-blocked → existing table.
+
+describe("deriveDisposition — Sol audit veto (sol-blocked)", () => {
+  it("a valid `block` verdict yields sol-blocked even on a sampled-only gate", () => {
+    const result = deriveDisposition({
+      verdict: "approve", probesGreen: true, round: 1, maxRounds: 3, repeatedAreas: false,
+      solVerdict: "block", solGateRequired: false,
+    });
+    assert.equal(result.disposition, "sol-blocked");
+    assert.match(result.reason, /verdict=block/);
+    assert.match(result.reason, /human override/);
+  });
+
+  it("a required gate with no valid verdict fails closed (fail-closed, not fail-open)", () => {
+    const result = deriveDisposition({
+      verdict: "approve", probesGreen: true, round: 1, maxRounds: 3, repeatedAreas: false,
+      solVerdict: null, solGateRequired: true,
+    });
+    assert.equal(result.disposition, "sol-blocked");
+    assert.match(result.reason, /mandatory/);
+    assert.match(result.reason, /fails closed/);
+  });
+
+  it("rework is NOT a clearing verdict — a required gate with rework fails closed", () => {
+    const result = deriveDisposition({
+      verdict: "approve", probesGreen: true, round: 1, maxRounds: 3, repeatedAreas: false,
+      solVerdict: "rework", solGateRequired: true,
+    });
+    assert.equal(result.disposition, "sol-blocked");
+    assert.match(result.reason, /verdict="rework"/);
+  });
+
+  it("a required gate with a valid `clear` verdict clears — the existing table decides", () => {
+    const result = deriveDisposition({
+      verdict: "approve", probesGreen: true, round: 1, maxRounds: 3, repeatedAreas: false,
+      solVerdict: "clear", solGateRequired: true,
+    });
+    assert.deepEqual(result, { disposition: "accept" });
+  });
+
+  it("sampled-only Sol FAILURE fails open — no verdict on a non-required gate is not a block", () => {
+    const result = deriveDisposition({
+      verdict: "needs-attention", probesGreen: false, round: 1, maxRounds: 3,
+      repeatedAreas: false, findingSeverities: ["low"],
+      solVerdict: null, solGateRequired: false,
+    });
+    // The existing table routes this as before; the chain is NOT sol-blocked.
+    assert.deepEqual(result, { disposition: "rework", reason: "needs-attention" });
+  });
+
+  it("sampled-only rework is not a block either — only an actual block veto blocks", () => {
+    const result = deriveDisposition({
+      verdict: "approve", probesGreen: true, round: 1, maxRounds: 3, repeatedAreas: false,
+      solVerdict: "rework", solGateRequired: false,
+    });
+    assert.deepEqual(result, { disposition: "accept" });
+  });
+
+  it("precedence: refusal → briefSyntaxDefect → oracleViolation → sol-blocked", () => {
+    const refused = deriveDisposition({
+      verdict: "approve", probesGreen: true, round: 1, maxRounds: 3, repeatedAreas: false,
+      refusal: "## A vs b.mjs", solVerdict: "block", solGateRequired: true,
+    });
+    assert.equal(refused.disposition, "refused-brief-defect");
+
+    const brief = deriveDisposition({
+      verdict: "approve", probesGreen: true, round: 1, maxRounds: 3, repeatedAreas: false,
+      briefSyntaxDefect: "P5: ## Frozen Tests heading present but no entries parsed",
+      solVerdict: "block", solGateRequired: true,
+    });
+    assert.equal(brief.disposition, "refused-brief-defect");
+
+    const oracle = deriveDisposition({
+      verdict: "approve", probesGreen: true, round: 1, maxRounds: 3, repeatedAreas: false,
+      oracleViolation: "P5: frozen — tests/a.test.mjs", solVerdict: "block", solGateRequired: true,
+    });
+    assert.equal(oracle.disposition, "escalate");
+    assert.match(oracle.reason, /oracle violation/);
+  });
+
+  it("sol-blocked preempts the high/critical gate, max-rounds, strategize and every accept/rework row", () => {
+    const rows = [
+      { verdict: "needs-attention", probesGreen: true, findingSeverities: ["high"] },
+      { verdict: "needs-attention", probesGreen: true, round: 3, maxRounds: 3, findingSeverities: ["low"] },
+      { verdict: "needs-attention", probesGreen: true, repeatedAreas: true, strategizeEligible: true },
+      { verdict: "needs-attention", probesGreen: true, findingSeverities: ["low", "medium"] },
+      { verdict: "approve", probesGreen: false },
+      { verdict: "approve", probesGreen: true },
+      { verdict: "needs-attention", probesGreen: false },
+      { verdict: "discard", probesGreen: true },
+      { verdict: "approve-partial", probesGreen: true },
+    ];
+    for (const row of rows) {
+      const result = deriveDisposition({
+        round: 1, maxRounds: 3, repeatedAreas: false,
+        ...row, solVerdict: "block", solGateRequired: false,
+      });
+      assert.equal(result.disposition, "sol-blocked", JSON.stringify(row));
+    }
+  });
+
+  // ---- audit input validation (kusabi #528 repair) ----
+  // The audit inputs are validated BEFORE the precedence table: an unknown,
+  // type-confused, or whitespace-padded `solVerdict` (or a non-boolean
+  // `solGateRequired`) must fail loudly and must NEVER fall through to the
+  // ordinary table, where an approve+green round would be accepted.
+
+  it("an unknown solVerdict fails loudly even on the exact accept-shaped round", () => {
+    // The trap the repair closes: approve + green probes + an unrecognised
+    // verdict would previously sail through to `accept`.
+    assert.throws(
+      () => deriveDisposition({
+        verdict: "approve", probesGreen: true, round: 1, maxRounds: 3, repeatedAreas: false,
+        solVerdict: "maybe", solGateRequired: false,
+      }),
+      /solVerdict must be null or one of clear, rework, block/,
+    );
+    assert.throws(
+      () => deriveDisposition({
+        verdict: "approve", probesGreen: true, round: 1, maxRounds: 3, repeatedAreas: false,
+        solVerdict: "maybe", solGateRequired: true,
+      }),
+      /solVerdict must be null or one of clear, rework, block/,
+    );
+  });
+
+  it("type-confused and whitespace-padded solVerdict values fail loudly, never accept", () => {
+    for (const bad of [3, "CLEAR", " clear ", "", true, ["block"]]) {
+      assert.throws(
+        () => deriveDisposition({
+          verdict: "approve", probesGreen: true, round: 1, maxRounds: 3, repeatedAreas: false,
+          solVerdict: bad,
+        }),
+        /solVerdict must be null or one of clear, rework, block/,
+        JSON.stringify(bad),
+      );
+    }
+  });
+
+  it("solGateRequired must be a boolean when supplied", () => {
+    for (const bad of ["yes", 1, null, "true", {}]) {
+      assert.throws(
+        () => deriveDisposition({
+          verdict: "approve", probesGreen: true, round: 1, maxRounds: 3, repeatedAreas: false,
+          solVerdict: "block", solGateRequired: bad,
+        }),
+        /solGateRequired must be a boolean/,
+        JSON.stringify(bad),
+      );
+    }
+  });
+
+  it("audit input validation runs BEFORE the precedence table — even a refusal cannot mask it", () => {
+    assert.throws(
+      () => deriveDisposition({
+        verdict: "approve", probesGreen: true, round: 1, maxRounds: 3, repeatedAreas: false,
+        refusal: "## A vs b.mjs", solVerdict: "maybe",
+      }),
+      /solVerdict must be null or one of clear, rework, block/,
+    );
+  });
+
+  it("the inert audit spellings never throw and leave every row unchanged", () => {
+    for (const audit of [undefined, { solVerdict: null }, { solGateRequired: false }, { solVerdict: null, solGateRequired: false }]) {
+      const result = deriveDisposition({
+        verdict: "approve", probesGreen: true, round: 1, maxRounds: 3, repeatedAreas: false, ...audit,
+      });
+      assert.deepEqual(result, { disposition: "accept" }, JSON.stringify(audit));
+    }
+  });
+
+  it("regression: absent audit inputs leave every existing row deep-equal, with no new keys", () => {
+    const cases = [
+      { input: { verdict: "approve", probesGreen: true }, expected: { disposition: "accept" } },
+      { input: { verdict: "approve", probesGreen: false }, expected: { disposition: "rework", reason: "deterministic probes failed" } },
+      { input: { verdict: "needs-attention", probesGreen: false, findingSeverities: ["low"] }, expected: { disposition: "rework", reason: "needs-attention" } },
+      { input: { verdict: "needs-attention", probesGreen: true, findingSeverities: ["low", "medium"] }, expected: { disposition: "accept-with-followup", reason: "probes green; remaining findings all minor" } },
+      { input: { verdict: "needs-attention", probesGreen: true, repeatedAreas: true, strategizeEligible: true }, expected: { disposition: "strategize", reason: "same file area flagged twice; structural re-diagnosis before next rework" } },
+      { input: { verdict: "needs-attention", probesGreen: false, round: 3, maxRounds: 3, findingSeverities: ["low"] }, expected: { disposition: "escalate", reason: "max rounds (3) reached without acceptance" } },
+      { input: { verdict: "discard", probesGreen: true }, expected: { disposition: "escalate", reason: "reviewer discarded the work" } },
+      { input: { verdict: "approve-partial", probesGreen: true }, expected: { disposition: "escalate", reason: "approve-partial: unverified items remain" } },
+      { input: { verdict: "approve", probesGreen: false, repeatedAreas: true }, expected: { disposition: "escalate", reason: "deterministic probes failed; same file area flagged for two consecutive rounds" } },
+    ];
+    // Both spellings of "no audit inputs": the parameter absent, and the
+    // explicit inert defaults (null / false).
+    for (const audit of [undefined, { solVerdict: null, solGateRequired: false }]) {
+      for (const row of cases) {
+        const result = deriveDisposition({
+          round: 1, maxRounds: 3, repeatedAreas: false, ...row.input, ...audit,
+        });
+        assert.deepEqual(result, row.expected, `${JSON.stringify(audit)} / ${JSON.stringify(row.input)}`);
+        // No undefined/null keys introduced on old records.
+        assert.deepEqual(Object.keys(result).sort(), Object.keys(row.expected).sort());
+      }
+    }
+  });
+});
