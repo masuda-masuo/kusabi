@@ -929,11 +929,11 @@ describe("metrics-ingest — cursor-usage and missing-dir warnings (#237)", () =
     assert.match(result.stdout, /--cursor-usage-dir <path> \(metrics-ingest: default ~\/\.kusabi\/cursor-usage\)/);
   });
 
-  it("--help enumerates all four backends including cursor", () => {
+  it("--help enumerates all five backends including cursor and codex", () => {
     const result = runCompanion(["--help"]);
     assert.equal(result.status, 0, result.stderr);
-    assert.match(result.stdout, /--backend opencode\|claude\|agy\|cursor/);
-    assert.match(result.stdout, /cursor\/ prefix/);
+    assert.match(result.stdout, /--backend opencode\|claude\|agy\|cursor\|codex/);
+    assert.match(result.stdout, /cursor\/, or codex\/ prefix/);
   });
 
   it("warns when transcript-dir and cursor-usage-dir do not exist, and reports cursor files/sessions/turns", () => {

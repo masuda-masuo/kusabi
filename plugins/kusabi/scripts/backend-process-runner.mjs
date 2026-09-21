@@ -72,6 +72,12 @@ export function killProcessGroup(child) {
  * @param {string} opts.bin — the binary to spawn.
  * @param {string[]} opts.args — command-line arguments.
  * @param {string} opts.cwd — working directory.
+ * @param {object} [opts.env] — extra environment overrides applied on top of
+ *        the parent env for the child (ADDITIVE, never a replacement).  The
+ *        codex backend (kusabi #527) uses this to point HOME and CODEX_HOME
+ *        at a job-owned directory so the child never inherits the operator's
+ *        config/rules/sessions/MCP files.  Spawn-time only; the parent's
+ *        process.env is untouched.
  * @param {string|null} [opts.promptText] — optional prompt to write to stdin.
  *        When present, stdin is a pipe the prompt is written to and closed.
  *        When absent/null, stdin is ignored (the prompt is on argv).
@@ -101,13 +107,15 @@ export function killProcessGroup(child) {
  */
 export function runBackendProcess({
   bin, args, cwd, promptText, timeoutS, watchdogS,
-  onStart, onLine, onWatchdog, parseLine,
+  env, onStart, onLine, onWatchdog, parseLine,
 }) {
   return new Promise((resolve) => {
     const hasStdin = typeof promptText === "string";
     const child = spawn(bin, args, {
       cwd,
-      env: { ...process.env, KUSABI_WORKER_CONTEXT: "1" },
+      // `env` overrides ride on top of the parent env (additive); the only
+      // base marker every backend child carries is KUSABI_WORKER_CONTEXT.
+      env: { ...process.env, KUSABI_WORKER_CONTEXT: "1", ...(env ?? {}) },
       stdio: [hasStdin ? "pipe" : "ignore", "pipe", "pipe"],
       // Own process group (session leader): the timeout/watchdog kill
       // targets the group, so the backend's children die with it.

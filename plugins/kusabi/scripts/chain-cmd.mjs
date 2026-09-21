@@ -61,6 +61,7 @@ import { resolveModelBackend, BUILTIN_DEFAULT_CHAIN } from "./cli.mjs";
 import { CLAUDE_DEFAULT_CHAIN } from "./claude-dispatch.mjs";
 import { AGY_DEFAULT_CHAIN } from "./agy-dispatch.mjs";
 import { CURSOR_DEFAULT_CHAIN, DEFAULT_CURSOR_MODEL } from "./cursor-dispatch.mjs";
+import { CODEX_DEFAULT_CHAIN } from "./codex-dispatch.mjs";
 
 // The companion side of the cycle documented above.
 import {
@@ -519,6 +520,9 @@ export async function runChainLifecycle(cwd, { flags, text, orchestrator }, opts
 function defaultReviewResolution(backend) {
   if (backend === "cursor") {
     return { model: DEFAULT_CURSOR_MODEL, chain: CURSOR_DEFAULT_CHAIN };
+  }
+  if (backend === "codex") {
+    return { model: CODEX_DEFAULT_CHAIN[0][0], chain: CODEX_DEFAULT_CHAIN };
   }
   if (backend === "claude") {
     return { model: CLAUDE_DEFAULT_CHAIN[0][0], chain: CLAUDE_DEFAULT_CHAIN };

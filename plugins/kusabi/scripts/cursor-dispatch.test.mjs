@@ -360,7 +360,7 @@ describe("CLI argument layer", () => {
   });
 
   it("cursor is a member of BACKENDS, not a special case beside it", () => {
-    assert.deepEqual(BACKENDS, ["opencode", "claude", "agy", "cursor"]);
+    assert.deepEqual(BACKENDS, ["opencode", "claude", "agy", "cursor", "codex"]);
   });
 
   it("--backend cursor and --model cursor/<id> reach cursorDispatch", () => {

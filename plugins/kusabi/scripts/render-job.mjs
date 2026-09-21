@@ -1,5 +1,14 @@
 // Job headers and status lines.
 
+// POSIX single-quote shell quoting for a path rendered inside a command an
+// operator runs AS PRINTED.  Single quotes are closed, escaped and reopened
+// (`'` -> `'\''`), so spaces and special characters in a path can never
+// produce a command that silently targets a different directory (kusabi #527
+// finding 1).
+function shellQuoteSingle(value) {
+  return `'${String(value).replace(/'/g, `'\\''`)}'`;
+}
+
 export function durationS(job) {
   if (!job.startedAt) return "?";
   const end = job.finishedAt ? Date.parse(job.finishedAt) : Date.now();
@@ -57,15 +66,55 @@ export function renderHeader(job) {
   // printed "resume is not supported" — #316 removed that limit).
   const isClaude = job.backend === "claude";
   const isAgy = job.backend === "agy";
-  const backendLabel = isClaude ? "claude" : (isAgy ? "agy" : "opencode");
+  const isCodex = job.backend === "codex";
+  const backendLabel = isClaude ? "claude" : (isAgy ? "agy" : (isCodex ? "codex" : "opencode"));
 
   let sessionLine;
   if (isAgy) {
     sessionLine = `session: ${job.sessionID} (continue in agy: \`agy --conversation ${job.sessionID}\`)`;
   } else if (isClaude) {
     sessionLine = `session: ${job.sessionID} (continue in claude: \`claude -p --resume ${job.sessionID}\`)`;
+  } else if (isCodex) {
+    // The codex continuation is `codex exec resume <thread_id>` run under the
+    // job-owned CODEX_HOME (the thread rollout/session state lives there).  The
+    // rendered command is EXECUTABLE AS PRINTED: it sets HOME and CODEX_HOME to
+    // the exact job-owned home the dispatch used (kusabi #527 finding 1).  A
+    // record without the persisted home (pre-#527 or synthetic) prints the
+    // explicit instruction instead of a command that would quietly resume the
+    // wrong thread state.
+    const codexHome = job.codexHome;
+    if (typeof codexHome === "string" && codexHome !== "") {
+      const quoted = shellQuoteSingle(codexHome);
+      sessionLine =
+        `session: ${job.sessionID} (continue in codex: ` +
+        `\`HOME=${quoted} CODEX_HOME=${quoted} codex exec resume ${job.sessionID}\`)`;
+    } else {
+      sessionLine =
+        `session: ${job.sessionID} (continue in codex: ` +
+        `\`codex exec resume ${job.sessionID}\` after setting CODEX_HOME to the job-owned codex home)`;
+    }
   } else {
     sessionLine = `session: ${job.sessionID} (continue in opencode: \`opencode -s ${job.sessionID}\`)`;
+  }
+
+  // Codex provenance rendering (kusabi #527, criterion 9): actual model when
+  // measured, and the fixed reasoning effort.  Only ever shows fields the job
+  // recorded; credential content is never rendered.
+  const codexProvenanceLines = [];
+  if (isCodex) {
+    const prov = job.codexProvenance;
+    if (prov && typeof prov === "object") {
+      if (prov.state === "mismatch") {
+        codexProvenanceLines.push(
+          `provenance MISMATCH: requested ${prov.kind} ${prov.requested}, rollout shows ${prov.actual}`
+        );
+      } else if (prov.state === "unverifiable") {
+        codexProvenanceLines.push(`provenance: unverifiable (${prov.reason ?? "unknown"})`);
+      } else if (prov.state === "verified") {
+        if (prov.model) codexProvenanceLines.push(`actual model: ${prov.model} (verified from rollout)`);
+      }
+    }
+    if (job.reasoningEffort) codexProvenanceLines.push(`reasoning effort: ${job.reasoningEffort}`);
   }
 
   return [
@@ -73,6 +122,7 @@ export function renderHeader(job) {
     sessionLine,
     ...(job.phase ? [`phase: ${job.phase}`] : []),
     ...(routeLine.length ? routeLine : []),
+    ...codexProvenanceLines,
     ...usageLine,
     ...errorLines,
     ...fallbackLines,

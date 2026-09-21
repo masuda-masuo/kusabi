@@ -65,6 +65,7 @@ import { dispatchWithFallback } from "./prompt-execution.mjs";
 import { claudeDispatch, resolveClaudeModel, validateClaudeModel, validateClaudeChain, clampModelDispatch, stopRecordedProcess, CLAUDE_BACKEND } from "./claude-dispatch.mjs";
 import { agyDispatch, resolveAgyModel, validateAgyModel, validateAgyChain, AGY_BACKEND } from "./agy-dispatch.mjs";
 import { cursorDispatch, resolveCursorModel, validateCursorModel, validateCursorChain, CURSOR_BACKEND } from "./cursor-dispatch.mjs";
+import { codexDispatch, resolveCodexModel, validateCodexModel, validateCodexChain, CODEX_BACKEND } from "./codex-dispatch.mjs";
 import { renderJobProgress } from "./kaiba-progress-watch.mjs";
 
 // Re-export so external consumers (tests) that import these functions
@@ -437,7 +438,7 @@ export function briefLintReport({ brief, phase = null, container = null, chain =
 // dispatch backend selection (kusabi #184)
 // ---------------------------------------------------------------------------
 
-export const BACKENDS = ["opencode", "claude", "agy", "cursor"];
+export const BACKENDS = ["opencode", "claude", "agy", "cursor", "codex"];
 
 /**
  * Resolve the dispatch backend from the `--backend` flag.  Resolved ONCE at
@@ -474,6 +475,7 @@ export function backendDispatch(backend) {
   if (backend === CLAUDE_BACKEND) return claudeDispatch;
   if (backend === AGY_BACKEND) return agyDispatch;
   if (backend === CURSOR_BACKEND) return cursorDispatch;
+  if (backend === CODEX_BACKEND) return codexDispatch;
   return dispatchWithFallback;
 }
 
@@ -491,7 +493,7 @@ export function backendDispatch(backend) {
  * @returns {boolean}
  */
 export function backendPinsModel(backend) {
-  return backend === CLAUDE_BACKEND || backend === AGY_BACKEND || backend === CURSOR_BACKEND;
+  return backend === CLAUDE_BACKEND || backend === AGY_BACKEND || backend === CURSOR_BACKEND || backend === CODEX_BACKEND;
 }
 
 /**
@@ -677,6 +679,9 @@ function resolveDispatchBackendForPhase({ flags, phase, config, backendFlag }) {
   if (flagBackend === "cursor" || namedBackend === "cursor") {
     return resolveCursorPhaseDispatch({ flags, phase, config, modelSpec });
   }
+  if (flagBackend === "codex" || namedBackend === "codex") {
+    return resolveCodexPhaseDispatch({ flags, phase, config, modelSpec });
+  }
   if (flagBackend === "opencode" || namedBackend === "opencode") {
     return resolveOpencodePhaseDispatch({ phase, config, modelSpec, namedBackend, flagBackend });
   }
@@ -702,6 +707,9 @@ function resolveDispatchBackendForPhase({ flags, phase, config, backendFlag }) {
       if (startBackend === "cursor") {
         return resolveCursorPhaseDispatch({ flags, phase, config, modelSpec });
       }
+      if (startBackend === "codex") {
+        return resolveCodexPhaseDispatch({ flags, phase, config, modelSpec });
+      }
       throw flagError(
         `--model "${flags.model}" on a mixed capacity ladder that starts on opencode ` +
         `needs provider/model (or a backend-qualified id), not a bare alias`
@@ -715,6 +723,7 @@ function resolveDispatchBackendForPhase({ flags, phase, config, backendFlag }) {
   if (backend === "claude") return resolveClaudePhaseDispatch({ flags, phase, config, modelSpec });
   if (backend === "agy") return resolveAgyPhaseDispatch({ flags, phase, config, modelSpec });
   if (backend === "cursor") return resolveCursorPhaseDispatch({ flags, phase, config, modelSpec });
+  if (backend === "codex") return resolveCodexPhaseDispatch({ flags, phase, config, modelSpec });
   return resolveOpencodePhaseDispatch({ phase, config, modelSpec, namedBackend, flagBackend });
 }
 
@@ -856,6 +865,54 @@ function resolveCursorPhaseDispatch({ flags, phase, config, modelSpec }) {
 }
 
 /**
+ * The codex branch of the decision (kusabi #527) — the same shape as the
+ * cursor branch, one backend over.  Reached whether the identifier named
+ * codex, `--backend codex` forced it, or the phase's chain entries carry the
+ * `codex/` prefix.
+ *
+ * The branch never invents a model: an explicit `--model` must be one exact
+ * seat id (`gpt-5.6-luna` or `gpt-5.6-sol`), and a config chain is validated
+ * with `validateCodexChain` so a mixed chain that routes through this branch
+ * fails loudly at command start (codex does not walk capacity ladders — an
+ * explicit pin is never substituted after a terminal failure).
+ */
+function resolveCodexPhaseDispatch({ flags, phase, config, modelSpec }) {
+  const resolved = resolveCodexModel({ flag: undefined, phase, config });
+  const chain = stripBackendPrefixChain(resolved.chain);
+
+  if (!modelSpec) {
+    if (flags.backend === "codex" && isMixedChain(resolved.chain)) {
+      const chainKey = (phase && config?.models?.phases?.[phase])
+        ? `models.phases.${phase}`
+        : (config?.models?.chain ? "models.chain" : "the built-in default chain");
+      throw new Error(
+        `--backend codex conflicts with the chain of the ${phase ?? "task"} phase ` +
+        `(${chainKey}: ${JSON.stringify(resolved.chain)}) \u2014 an explicit --backend forces every phase ` +
+        `onto that backend; remove --backend codex or point ${chainKey} at codex entries`
+      );
+    }
+    validateCodexChain(chain);
+    const model = resolved.model == null ? undefined : splitRouteBackend(String(resolved.model)).route;
+    if (model != null) validateCodexModel(model);
+    return { dispatch: codexDispatch, backend: "codex", model, explicitModel: null, chain };
+  }
+
+  // With an explicit --model the config chain is never consulted for a model
+  // and must not block startup (kusabi #186).  A :variant suffix or an
+  // unsupported id is rejected up front, attributed to the identifier's own
+  // backend.
+  const model = modelSpec.model;
+  try {
+    validateCodexModel(model);
+  } catch (err) {
+    throw flagError(
+      `--model "${flags.model}" ${modelSpec.backend ? "names" : "resolves on"} the codex backend: ${err.message}`
+    );
+  }
+  return { dispatch: codexDispatch, backend: "codex", model, explicitModel: model, chain };
+}
+
+/**
  * The opencode branch of the decision: `--model` is provider/model syntax
  * (parseModel), chain entries pass through byte-identical.
  */
@@ -898,7 +955,7 @@ function resolveOpencodePhaseDispatch({ phase, config, modelSpec, namedBackend, 
   const resolved = resolveModel({ flag: modelSpec?.model, phase, config });
   let chain = resolved.chain;
   if (namedBackend === "opencode"
-    && (chainNamesBackend(chain, "claude") || chainNamesBackend(chain, "agy") || chainNamesBackend(chain, "cursor"))) {
+    && (chainNamesBackend(chain, "claude") || chainNamesBackend(chain, "agy") || chainNamesBackend(chain, "cursor") || chainNamesBackend(chain, "codex"))) {
     // Only reachable when the identifier chose opencode over a chain native
     // to another backend: those entries are that backend's model ids and
     // must never be walked as opencode routes by the fallback ladder.
@@ -1124,7 +1181,7 @@ async function stopRunningJob(stateDir, job) {
   // path would try to abort a session that does not exist and then report
   // success, which is precisely the false confirmation kusabi #209 exists to
   // prevent.
-  if (backend === CLAUDE_BACKEND || backend === AGY_BACKEND || backend === CURSOR_BACKEND) {
+  if (backend === CLAUDE_BACKEND || backend === AGY_BACKEND || backend === CURSOR_BACKEND || backend === CODEX_BACKEND) {
     return stopSpawnedCliJob(job, backend);
   }
   return stopOpencodeJob(stateDir, job);
@@ -1375,8 +1432,8 @@ function usage() {
     "Flags:",
     "  --read-only, --resume-last",
     "  --base <ref> (review: branch diff base; task: diff base for --phase review --container, rejected elsewhere), --agent <id>, --phase <name> (draft|investigate|implement|review|respond|salvage|gofer|test-author|plan)",
-    "  --model <identifier> (task/chain: the identifier CARRIES its backend and decides it for the phases it pins — claude/<model> (bare alias opus|sonnet|haiku or a full model id; a :variant suffix is rejected) runs those phases on claude, provider/model[:variant] runs them on opencode, and a bare alias with no / names no backend, so the phase keeps its configured backend. The model is always validated against the backend the same identifier chose. A pinned model is the ONLY candidate: no fallback to the configured chain is attempted, so a pinned route that fails terminally ends the dispatch instead of silently running a different model)",
-    "  --backend opencode|claude|agy|cursor (task/chain: force EVERY phase onto that backend; default opencode. Redundant when --model names a backend — a --backend that disagrees with such a --model is a contradiction and is rejected, naming both. With neither, the config chain entries decide: models.phases.<phase> (or models.chain) entries may carry a claude/, agy/, or cursor/ prefix for per-phase backend mixing; one phase's chain must be single-backend. agy resumes via --conversation: --session/--resume-last are accepted when the job store proves the id an agy conversation, and --read-only/--deny are rejected on it. chain-resume accepts --backend/--model only to route a quota-exhausted review seat onto a different backend or model)",
+    "  --model <identifier> (task/chain: the identifier CARRIES its backend and decides it for the phases it pins — claude/<model> (bare alias opus|sonnet|haiku or a full model id; a :variant suffix is rejected) runs those phases on claude, codex/<model> (one of the exact seat ids gpt-5.6-luna or gpt-5.6-sol; a :variant suffix is rejected) runs them on codex, provider/model[:variant] runs them on opencode, and a bare alias with no / names no backend, so the phase keeps its configured backend. The model is always validated against the backend the same identifier chose. A pinned model is the ONLY candidate: no fallback to the configured chain is attempted, so a pinned route that fails terminally ends the dispatch instead of silently running a different model)",
+    "  --backend opencode|claude|agy|cursor|codex (task/chain: force EVERY phase onto that backend; default opencode. Redundant when --model names a backend — a --backend that disagrees with such a --model is a contradiction and is rejected, naming both. With neither, the config chain entries decide: models.phases.<phase> (or models.chain) entries may carry a claude/, agy/, cursor/, or codex/ prefix for per-phase backend mixing; one phase's chain must be single-backend. agy resumes via --conversation: --session/--resume-last are accepted when the job store proves the id an agy conversation, and --read-only/--deny are rejected on it. codex runs every invocation in a fixed read-only sandbox with reasoning effort high: --read-only is accepted, --deny is rejected, and the model must be one of the exact seat ids (gpt-5.6-luna or gpt-5.6-sol). chain-resume accepts --backend/--model only to route a quota-exhausted review seat onto a different backend or model)",
     "  --session <id>, --timeout <s>, --watchdog <s>, --deny <tools>",
     "  --brief-file <path> (task / chain: read the brief from a file; exclusive with inline text)",
     "  --container <cid> (chain/task: container to run deterministic probes in; NOT supported by review)",

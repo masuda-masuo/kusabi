@@ -447,3 +447,63 @@ describe("cmdTaskDetach smoke baseline refusal (kusabi #513)", () => {
     }
   });
 });
+// ---------------------------------------------------------------------------
+// codex backend capability honesty (kusabi #527)
+// --read-only is accepted because every codex invocation runs in the fixed
+// read-only sandbox; a user-supplied --deny cannot be enforced and must be
+// rejected, never recorded as applied.
+// ---------------------------------------------------------------------------
+
+describe("resolveTaskPreflight codex capability honesty", () => {
+  const SIG = "Orchestrator: test-model | session test-session | 2026-09-12";
+  const BRIEF = [SIG, "", "implement the change", "## Smoke", "", "- `npm test`", ""].join("\n");
+
+  function withStateRoot(fn) {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-task-codex-"));
+    const stateRoot = path.join(tmp, "state");
+    fs.mkdirSync(stateRoot, { recursive: true });
+    try {
+      return fn({ tmp, stateRoot });
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  }
+
+  it("--backend codex with --read-only passes preflight (the sandbox is always read-only)", () => {
+    withStateRoot(({ tmp, stateRoot }) => {
+      const pre = resolveTaskPreflight(
+        tmp,
+        { flags: { backend: "codex", readOnly: true }, text: BRIEF },
+        { stateRoot },
+      );
+      assert.equal(pre.backend, "codex");
+      assert.ok(pre.tools);
+    });
+  });
+
+  it("--backend codex with --deny is rejected before dispatch", () => {
+    withStateRoot(({ tmp, stateRoot }) => {
+      assert.throws(
+        () => resolveTaskPreflight(
+          tmp,
+          { flags: { backend: "codex", deny: "bash,write" }, text: BRIEF },
+          { stateRoot },
+        ),
+        /--deny is not supported on the codex backend/,
+      );
+    });
+  });
+
+  it("--backend codex with --read-only AND --deny is rejected for the --deny half", () => {
+    withStateRoot(({ tmp, stateRoot }) => {
+      assert.throws(
+        () => resolveTaskPreflight(
+          tmp,
+          { flags: { backend: "codex", readOnly: true, deny: "task" }, text: BRIEF },
+          { stateRoot },
+        ),
+        /--deny is not supported on the codex backend/,
+      );
+    });
+  });
+});

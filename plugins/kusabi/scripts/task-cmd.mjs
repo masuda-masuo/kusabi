@@ -39,6 +39,7 @@ import { runPrompt, finalizeIncompleteCompletedRun } from "./prompt-execution.mj
 import { translateDenyTools } from "./claude-dispatch.mjs";
 import { AGY_BACKEND } from "./agy-dispatch.mjs";
 import { CURSOR_BACKEND } from "./cursor-dispatch.mjs";
+import { CODEX_BACKEND } from "./codex-dispatch.mjs";
 import {
   parseReviewResult,
   buildReviewRepairPrompt,
@@ -345,6 +346,21 @@ export function resolveTaskPreflight(cwd, { flags, text }, opts = {}) {
       `${flags.readOnly ? "--read-only" : "--deny"} is not supported on the cursor backend — ` +
       "the Cursor CLI has no per-job tool permission flags, so the restriction cannot be applied. " +
       "Run the task on the opencode or claude backend, which enforce it."
+    );
+  }
+  // The codex backend runs EVERY invocation in the fixed read-only sandbox
+  // (`-s read-only`, measured 2026-09-20), so `--read-only` states what the
+  // invocation already enforces and is accepted.  `--deny` is a different
+  // claim: the codex CLI has no per-job tool-deny flags, so a tool-level deny
+  // kusabi cannot enforce must be rejected, never recorded as applied.
+  // Phase-level deny maps from the chain are recorded on the job as
+  // `toolDeniesUnenforced` (codexDispatch), exactly like agy/cursor.
+  if (tools && backend === CODEX_BACKEND && flags.deny) {
+    throw new Error(
+      `--deny is not supported on the codex backend — ` +
+      "the codex CLI has no per-job tool-deny flags, so the restriction cannot be applied. " +
+      "--read-only IS enforced (every codex invocation runs in the fixed read-only sandbox). " +
+      "Run the task on the opencode or claude backend for tool-level denies."
     );
   }
   // ---- dispatch-time brief lint (kusabi #289) ----
