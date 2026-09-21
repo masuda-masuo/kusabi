@@ -54,6 +54,12 @@ export const TERMINAL_DISPOSITIONS = new Set([
   // brief items and stopped without editing.  Terminal like any other decided
   // chain -- the wait reports it, and judging it stays the orchestrator's job.
   "refused-brief-defect",
+  // A Sol audit veto (kusabi #524/#528): a mandatory Sol gate without a
+  // clearing verdict, or a valid Sol `block`, ends the chain.  Unreachable on
+  // default chains -- only a caller that explicitly supplies the audit inputs
+  // can ever produce it.  Terminal like any other decided chain; only a
+  // recorded human override can clear it.
+  "sol-blocked",
 ]);
 
 export const DEFAULT_POLL_INTERVAL_MS = 2_000;

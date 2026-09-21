@@ -2,6 +2,14 @@
 // decisions.  No I/O, no imports from kusabi-companion.mjs.
 
 /**
+ * The audit verdict vocabulary the `solVerdict` input is restricted to
+ * (kusabi #528).  `clear` is the only clearing verdict; `null` means "no
+ * valid verdict exists".  Anything else — type-confused, whitespace-padded,
+ * or unknown — is rejected by deriveDisposition before any row runs.
+ */
+const SOL_VERDICTS = ["clear", "rework", "block"];
+
+/**
  * Pure function: decide which levers to pull for a rework round.
  *
  * Receives evidence from the finished round and returns the tier delta,
@@ -125,9 +133,42 @@ export function deriveReworkStrategy({ reworkCount, strategized, verdict, probes
  *   a P5 (frozen tests) or P6 (collected count) probe failed this round.  Truthy routes the round
  *   to `escalate`; a string additionally NAMES the violation in the reason, which is what puts it
  *   in front of the human on the escalate line.
- * @returns {{ disposition: "accept"|"accept-with-followup"|"strategize"|"rework"|"escalate"|"refused-brief-defect", reason?: string }}
+ * @param {"clear"|"rework"|"block"|null} [opts.solVerdict] — the validated Sol audit verdict
+ *   (kusabi #524/#528).  `null` means "no valid verdict exists" (Sol unavailable or the verdict
+ *   failed validation/binding).  `clear` is the ONLY clearing verdict: `rework` is not clear, and
+ *   a missing verdict is not clear.  A valid `block` is a veto even on a sampled-only gate — the
+ *   sole deliberate fail-open is sampled-only SOL FAILURE (no verdict at all), never an actual
+ *   block.  Absent / null leaves every existing row byte-for-byte unchanged.  Any value other
+ *   than null or exactly `clear | rework | block` (type-confused, whitespace-padded, unknown)
+ *   THROWS before any row runs — it never falls through to the ordinary table.
+ * @param {boolean} [opts.solGateRequired] — whether the Sol audit gate was MANDATORY (the
+ *   policy's `mandatory` flag).  A required gate without a clearing verdict fails closed
+ *   (sol-blocked); a sampled-only gate without a verdict fails open.  Absent / false leaves every
+ *   existing row unchanged.  A supplied non-boolean value THROWS before any row runs.
+ * @returns {{ disposition: "accept"|"accept-with-followup"|"strategize"|"rework"|"escalate"|"refused-brief-defect"|"sol-blocked", reason?: string }}
  */
-export function deriveDisposition({ verdict, probesGreen, round, maxRounds, repeatedAreas, findingSeverities, strategizeEligible, oracleViolation, refusal, briefSyntaxDefect, partialDiagnosis }) {
+export function deriveDisposition({ verdict, probesGreen, round, maxRounds, repeatedAreas, findingSeverities, strategizeEligible, oracleViolation, refusal, briefSyntaxDefect, partialDiagnosis, solVerdict, solGateRequired }) {
+  // ---- audit input validation (kusabi #528 repair) ----
+  // The audit inputs are machine-decided and must be exact.  A type-confused,
+  // whitespace-padded, or unknown `solVerdict` (or a non-boolean
+  // `solGateRequired`) must NEVER fall through to the ordinary table below —
+  // the accept rows could then clear a round a Sol audit never cleared.
+  // Fail loudly, before any row of the precedence table runs.
+  //
+  // Inert spellings stay byte-identical: `solVerdict` undefined/null and
+  // `solGateRequired` undefined/false are the "no audit input" shapes.
+  if (solGateRequired !== undefined && typeof solGateRequired !== "boolean") {
+    throw new Error(
+      `deriveDisposition: solGateRequired must be a boolean, got ${JSON.stringify(solGateRequired)}`,
+    );
+  }
+  if (solVerdict !== undefined && solVerdict !== null && !SOL_VERDICTS.includes(solVerdict)) {
+    throw new Error(
+      `deriveDisposition: solVerdict must be null or one of ${SOL_VERDICTS.join(", ")}, ` +
+        `got ${JSON.stringify(solVerdict)}`,
+    );
+  }
+
   // ---- qualifying refusal (kusabi #293) ----
   // The worker read the brief, found it self-contradictory, named both items
   // and stopped without editing.  Nothing below this line can judge that
@@ -229,6 +270,49 @@ export function deriveDisposition({ verdict, probesGreen, round, maxRounds, repe
       disposition: "escalate",
       reason: "deterministic oracle violation (P5 frozen tests / P6 collected count); " +
         "a human must adjudicate, never an automatic rework" + named,
+    };
+  }
+
+  // ---- Sol audit veto (kusabi #524/#528) ----
+  // The deterministic audit policy decides WHEN Sol is mandatory
+  // (evaluateAuditGate, audit-policy.mjs); the Sol seat produces the verdict;
+  // this row is the only place a veto becomes a disposition.  The driver
+  // passes the policy's `mandatory` flag as `solGateRequired` and the
+  // VALIDATED verdict (normalized to "clear" | "rework" | "block", or null
+  // when no valid verdict exists — Sol unavailable, unparseable, or the
+  // verdict failed envelope/gate binding).
+  //
+  // Two independent block conditions, per the accepted design:
+  //   - a REQUIRED gate without a valid CLEARING verdict fails closed:
+  //     `rework` is not a clearing verdict and a missing verdict is not a
+  //     clearing verdict, so both fail closed — Luna cannot summarize a
+  //     non-clear verdict into a pass for a mandatory gate.
+  //   - a valid `block` veto is a block even on a sampled-only gate.  The
+  //     sole deliberate fail-open (sampling is observability, not a safety
+  //     gate) is sampled-only SOL FAILURE — no verdict at all — never an
+  //     actual block, which Sol genuinely judged.
+  //
+  // Checked AFTER refusal / briefSyntaxDefect / oracleViolation (which keep
+  // precedence) and BEFORE the high/critical severity gate and every rework /
+  // strategize / accept row below.  With no audit inputs (solVerdict null,
+  // solGateRequired false — the defaults) nothing here fires and the existing
+  // table is byte-for-byte unchanged.
+  if (solVerdict === "block") {
+    return {
+      disposition: "sol-blocked",
+      reason: "Sol audit vetoed the gate: verdict=block. A Sol block cannot be summarized away or " +
+        "self-overruled — only a recorded human override can clear it.",
+    };
+  }
+  if (solGateRequired === true && solVerdict !== "clear") {
+    const verdictText = solVerdict === null
+      ? "no valid verdict (Sol unavailable, unparseable, or unbindable)"
+      : `verdict=${JSON.stringify(solVerdict)}`;
+    return {
+      disposition: "sol-blocked",
+      reason: `Sol audit was mandatory and no clearing verdict exists (${verdictText}); the required ` +
+        "gate fails closed — only a `clear` verdict clears a mandatory gate, and a sampled-only " +
+        "Sol failure is the sole deliberate fail-open.",
     };
   }
 
