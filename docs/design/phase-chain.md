@@ -622,6 +622,105 @@ This limitation is deliberate and documented rather than silently claimed as cov
 
 **TTL safety net.** kaiba's 7-day TTL remains the backstop for every row retirement does not reach — the unstampable backends' `NULL` rows, and any stamped row whose terminal save was missed (a process killed before its final write) or whose retire call failed. Retirement is an optimization that makes rows disappear promptly at the authoritative boundary; it is not the mechanism that guarantees cleanup, and no kusabi code assumes a row was retired.
 
+### 3.5.7f luna mission driver (kusabi #530) — opt-in separate mission surface
+
+A luna mission is an opt-in dispatch surface layered on top of the chain
+lifecycle: the `gpt-5.6-luna` coordinator seat proposes bounded actions, and a
+**deterministic driver** — never the coordinator — validates and executes them.
+The mission surface is separate from `chain` in both directions: default
+`chain` / `task` behaviour is byte-identical when luna is not invoked, and no
+mission key ever lands on an ordinary chain record. Inner chains are still
+real chains run through the `runChainLifecycle` seam (`chain-cmd.mjs`, kusabi
+#526), so every preflight/baseline/control behaviour is preserved; the mission
+is the single outer serve owner (`keepServe: true`).
+
+**Authority boundary.** The coordinator seat (`kusabi-coordinate`,
+`codex/gpt-5.6-luna`) grants ZERO tools and no MCP servers (`"*": deny`). Its
+only information path is the immutable evidence envelope (kusabi #529) and the
+read-only evidence tree placed by the driver; its only output is a line-oriented
+JSONL request stream, parsed exclusively through `parseCoordinatorOutput`
+(coordinator-parse.mjs) against the **current** envelope hash. A stream
+containing any malformed, incomplete, unknown, or stale-hash record is never
+partially executable. The closed action enum is the frozen six-verb
+`coordinator-output.schema.json` allow-list: `read_probe`, `run_chain`,
+`rework_chain`, `consult_sol`, `escalate_to_host`, `finish`.
+
+- `read_probe` — mediated by the driver through an allow-listed read-only tool
+  set (`read_file_range`, `search_in_container`, `list_files`); results are
+  recorded and folded back into the next envelope. Luna has no tool or
+  job-spawn authority.
+- `run_chain` / `rework_chain` — bounded attempts through `runChainLifecycle`
+  with a driver-minted `chain-[a-z0-9]+` id and `keepServe: true`. The brief
+  is validated deterministically (a non-empty `## Deliverables` section)
+  before the seam is invoked. `rework_chain` is another bounded attempt
+  carrying prior evidence — never luna-resume or crash reconciliation (#531).
+- `consult_sol` — recorded as a requested consultation/handoff input only; no
+  Sol gate execution in this slice (#531 owns it).
+- `escalate_to_host` — terminal host handoff (disposition `host-handoff`,
+  reason written to `recommendation.md`).
+- `finish` — terminal, with a recommendation from the small closed vocabulary
+  `recommend-accept` / `recommend-escalate`; anything else (e.g. the chain
+  verb `accept`) is counted as a coordinator error and never accepted.
+
+**Budgets.** An explicit mission budget caps chains (`maxChains`, default 3),
+attempts (`maxAttempts`, default 2), probes (`maxProbes`, default 5) and
+consult/coordination requests (`maxConsults`, default 3). A request that
+would exceed a budget terminates the mission `budget-exhausted` and never
+creates another chain or performs another coordinator dispatch. A coordinator
+that cannot produce an executable stream within the bounded attempts budget
+terminates `coordinator-failed`. `maxConsults` is the coordination bound that
+stops a consult-only coordinator: each accepted `consult_sol` consumes one
+slot (the request is recorded, never executed — Sol gates are #531), and the
+request that would exceed the bound terminates `budget-exhausted` with the
+effective bound, the accepted count and the termination reason persisted on
+the mission record (`budget`, `consults`, `terminationReason`) so show/wait
+can explain the termination. The mission never accepts, publishes, merges,
+creates issues or creates containers; its terminal result is a host-facing
+recommendation.
+
+**Probe persistence bound.** Before a probe result is written to
+mission.json, its serialized payload is deterministically capped at
+`PROBE_OUTPUT_MAX_BYTES` (8192 bytes, `luna-driver.mjs`). A payload that fits
+the limit is stored unchanged; a larger payload is reduced to a deterministic
+head+tail splice (the same truncation the evidence envelope applies) with
+explicit `truncated`, exact `omittedBytes`, and `truncation` metadata recorded
+on the persisted probe record — truncation is never silent. This raw-persistence
+bound is independent of the evidence envelope's own payload cap: it is a
+deterministic persistence bound only and executes no Sol gate (#531).
+
+**Seats.** Defaults are exact: coordinator `codex/gpt-5.6-luna`, auditor
+`codex/gpt-5.6-sol`. Any substitution is refused before mission creation
+unless `--allow-substitute` explicitly authorizes it, and an authorized
+substitution is loud in the records (`requested`/`actual`/`substituted: true`)
+and in show/wait output. A non-codex provider is refused outright — the luna
+mode never leaves the codex seats.
+
+**State layout.** Missions live under the kusabi state root in
+`missions/<mission-id>/` — `control.json`, `mission.json` (attempts, bounded
+inner chain ids, coordinator errors, probe results, consult requests, exact
+seat provenance, recommendation, terminal disposition), `evidence/` and
+`attempts/` artifacts, and `recommendation.md` for the terminal handoff.
+Mission ids are validated path segments (`mission-[a-z0-9]+`) before any
+filesystem access; writes are atomic (shared atomic-replace helper); terminal
+disposition is sticky — a terminal mission record can never be overwritten
+with a different disposition.
+
+**CLI surfaces.** `luna --container <cid> --mission-file <path>` (foreground)
+and `luna-detach` (exactly one detached child, mission id minted in the
+parent, printing the exact `kusabi-companion luna-wait <mission-id>` line).
+`luna-wait <mission-id>` is a read-only, SIGTERM-safe pure poll loop over
+mission state; `luna-show <mission-id>` renders seat provenance, attempts and
+inner chains, errors/consults, state and recommendation. Both creating
+commands sit in `JOB_CREATING_SUBCOMMANDS` (the worker-context guard makes
+mission recursion impossible); wait/show are read-only and never start or stop
+the shared serve.
+
+**Single ownership.** Inner chains are sequential, the mission passes
+`keepServe: true`, and mission cleanup stops the shared serve once after all
+inner work — wait/show never touch serve lifecycle. The envelope is refreshed
+after every observable action, so the next coordinator request is bound to
+current evidence and prior outcomes.
+
 ### 3.5.8 metrics store (ingest) — implemented
 
 `metrics-db.mjs`, `transcript-ingest.mjs`, `chain-ingest.mjs`. A durable SQLite digest of two perishable/durable data sources, feeding the token-efficiency work (#83) and brief/outcome correlation work (#81). **Ingest + store only** — the write side lives here; the query/report surface it was built to feed is delivered and documented in §3.5.9.

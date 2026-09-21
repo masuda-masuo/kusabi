@@ -31,6 +31,11 @@ import {
 } from "./chain-ops.mjs";
 // task-cmd (kusabi #437): the `task` and `review` single-shot phase commands.
 import { cmdTask, cmdReview, cmdTaskDetach } from "./task-cmd.mjs";
+// luna-cmd (kusabi #530): the opt-in luna mission surfaces (luna,
+// luna-detach, luna-wait, luna-show).  luna-cmd.mjs is NOT on a cycle with
+// companion: it imports only leaf modules (the mission driver reaches the
+// chain lifecycle seam through a lazy import).
+import { cmdLuna, cmdLunaDetach, cmdLunaWait, cmdLunaShow } from "./luna-cmd.mjs";
 // metrics-cmd (kusabi #443): the look-at-recorded-work command surfaces
 // (chain-stats, metrics-ingest, metrics-report, dashboard). Unlike chain-cmd,
 // chain-ops, and task-cmd, metrics-cmd.mjs is NOT on a cycle with companion:
@@ -1431,6 +1436,10 @@ function usage() {
     "  chain-stats Aggregate every chain record and print a summary (read-only, no LLM)",
     "  task-detach Launch a task in a detached background process and print a runnable task-wait command line (no LLM in launcher)",
     "  task-wait  Block until a task reaches a terminal state, print a one-line digest, exit 0 (read-only, no LLM; safe to SIGTERM at any moment). Non-zero means the WAIT itself failed — unknown job id, nothing appeared under --next, or the task stalled",
+    "  luna       Run an opt-in luna mission: the gpt-5.6-luna coordinator proposes bounded actions, and the deterministic driver validates and executes only the frozen enum (read_probe, run_chain, rework_chain, consult_sol, escalate_to_host, finish) against an immutable evidence envelope. The mission never accepts, publishes, merges, creates issues or creates containers — its terminal result is a host-facing recommendation",
+    "  luna-detach Launch a luna mission in a detached background process and print a runnable luna-wait command line (no LLM in launcher)",
+    "  luna-wait  Block until a NAMED luna mission reaches a terminal state, print a one-line digest, exit 0 (read-only, no LLM, no serve; safe to SIGTERM at any moment). Non-zero means the WAIT itself failed — a mission that never appeared, a malformed mission id, or a stalled mission — never a disposition you dislike",
+    "  luna-show  Print a compact plain-text digest of a luna mission: exact seat provenance/substitution, attempts and inner chain ids, errors/consults, state and recommendation (read-only, no LLM)",
     "  metrics-ingest  Ingest transcripts + Cursor usage + Codex usage + chain records + delegated-job records into a durable SQLite store (read-only source, no LLM)",
     "  metrics-report  Query/report over the SQLite metrics store (read-only, no LLM, never ingests)",
     "  dashboard  Serve a read-only local JSON API over the state root and metrics.db (no LLM, no writes)",
@@ -1462,6 +1471,11 @@ function usage() {
     "  --chain-id <id> (chain / chain-detach: run the chain under this id instead of minting one. The id becomes a path segment under chains/, so it must match chain-[a-z0-9]+ and its directory must not already exist \u2014 a malformed id is refused before any filesystem write. chain-detach hands the SAME id back: the emitted wait line is `chain-wait <id>`, which waits for the chain by name \u2014 no --next, no --since, and no recency race with another orchestrator working the same repo)",
     "  --strategy <name> (chain: strategy for the chain; supported: incremental-tdd — a sequential TDD cycle that slices a requirements file into incremental requirements and runs a test-author → implement → review → rework cycle for each; requires both --requirements-file and --container)",
     "  --requirements-file <path> (chain: path to the requirements file for --strategy incremental-tdd; required when the strategy is incremental-tdd)",
+    "  --mission-file <path> (luna / luna-detach: the mission brief file; required. The mission brief is the outer brief — inner chains get their own brief from the coordinator's run_chain request)",
+    "  --mission-id <id> (luna / luna-detach: run the mission under this id instead of minting one. The id becomes a path segment under missions/, so it must match mission-[a-z0-9]+. luna-detach hands the SAME id back: the emitted wait line is `luna-wait <id>`, which waits for the mission by name — no recency selection)",
+    "  --coordinator-model <provider/model> (luna / luna-detach: the coordinator seat, default codex/gpt-5.6-luna; the luna mode never leaves the codex seats, and a non-default model is refused unless --allow-substitute authorizes it)",
+    "  --auditor-model <provider/model> (luna / luna-detach: the auditor seat, default codex/gpt-5.6-sol; same substitution rule as --coordinator-model)",
+    "  --allow-substitute (luna / luna-detach: explicitly authorize a non-default coordinator/auditor seat. Substitution is loud in mission records and show/wait output — requested and actual models are both recorded)",
     "  --next (chain-wait: wait for a chain to APPEAR and then wait on it, instead of naming one; selects the newest chain that is new since the wait started OR was already there and has not reached a terminal state, so a chain the dispatch created in the moment before the wait started still counts and a chain that finished earlier never does; a preexisting empty directory with no control record and older than --appear-timeout is debris from a dispatch that died before it wrote anything, and is skipped with a stderr note; while the selected chain is still recordless, a newer or same-stamped chain that appears wins instead of the wait stalling on the empty dir (a dir once traded away is never revisited); a dispatch that dies before creating a chain directory exits non-zero here instead of looking finished)",
     "  --since <ISO> (chain-wait --next: only a chain created at or after this stamp counts as the one to wait for, terminal or not — the precise tool, with an explicit chain id, when several chains run in one workspace at once and the default newest-unfinished selection would be ambiguous; while the selected chain has no control record yet, a newer or same-stamped in-window chain that appears wins, same as the default selection)",
     "  --poll-interval <s> (chain-wait: state poll interval, default 2)",
@@ -1499,14 +1513,18 @@ function usage() {
 
 // Subcommands that create a job — they reach runPrompt() or dispatchWithFallback()
 // (which itself calls runPrompt()) directly, or start a chain (which dispatches
-// rounds through the same path). Enumerated from the switch in main() below;
-// every other subcommand only reads or stops existing state.
+// rounds through the same path), or run a luna mission (which dispatches the
+// coordinator through the codex backend and runs inner chains through the
+// chain lifecycle). Enumerated from the switch in main() below; every other
+// subcommand only reads or stops existing state.
 //   task         -> dispatchWithFallback (cmdTask)
 //   review       -> runPrompt            (cmdReview)
 //   salvage      -> runPrompt            (cmdSalvage)
 //   chain        -> dispatchWithFallback via runImplementPhase, per round (cmdChain)
 //   chain-resume -> same as chain, from a saved position (cmdChainResume)
-const JOB_CREATING_SUBCOMMANDS = new Set(["task", "review", "salvage", "chain", "chain-resume", "chainResume", "chain-detach", "chainDetach", "task-detach", "taskDetach"]);
+//   luna         -> runLunaMission (cmdLuna)
+//   luna-detach  -> spawns a detached luna child (cmdLunaDetach)
+const JOB_CREATING_SUBCOMMANDS = new Set(["task", "review", "salvage", "chain", "chain-resume", "chainResume", "chain-detach", "chainDetach", "task-detach", "taskDetach", "luna", "luna-detach", "lunaDetach"]);
 
 async function main() {
   const [subcommand, ...argv] = process.argv.slice(2);
@@ -1582,13 +1600,52 @@ async function main() {
     "chain-detach", "chainDetach",
     "task-wait", "taskWait",
     "task-detach", "taskDetach",
+    "luna-wait", "lunaWait",
   ]);
   if (!waitSubcommands.has(subcommand)) {
     for (const flag of ["next", "poll-interval", "appear-timeout", "progress-timeout"]) {
       if (parsed.flags[flag] !== undefined) {
-        throw new Error(`--${flag} is only supported by chain-wait and chain-detach (got subcommand ${subcommand ?? "(none)"})`);
+        throw new Error(`--${flag} is only supported by chain-wait, chain-detach, task-wait, task-detach and luna-wait (got subcommand ${subcommand ?? "(none)"})`);
       }
     }
+  }
+
+  // The luna mission flags (kusabi #530) are mission-creation decisions; on
+  // any other subcommand they would be silently ignored — reject them out
+  // loud, exactly like --backend and --port above.  The value flags are
+  // stored under their kebab keys, but the boolean --allow-substitute is
+  // stored under the camelCase key parseArgs derives, so it is checked
+  // separately.
+  const lunaCreating = new Set(["luna", "luna-detach", "lunaDetach"]);
+  for (const flag of ["mission-file", "mission-id", "coordinator-model", "auditor-model"]) {
+    if (parsed.flags[flag] !== undefined && !lunaCreating.has(subcommand)) {
+      throw new Error(`--${flag} is only supported by luna and luna-detach (got subcommand ${subcommand ?? "(none)"})`);
+    }
+  }
+  if (parsed.flags.allowSubstitute === true && !lunaCreating.has(subcommand)) {
+    throw new Error(`--allow-substitute is only supported by luna and luna-detach (got subcommand ${subcommand ?? "(none)"})`);
+  }
+  // luna-wait is a NAMED wait only: the --next/--since selectors belong to
+  // chain-wait / task-wait and would be silently ignored by the luna wait
+  // loop (its handler only reads the shared bounds).  Reject them out loud.
+  if (
+    (subcommand === "luna-wait" || subcommand === "lunaWait") &&
+    (parsed.flags.next !== undefined || parsed.flags.since !== undefined)
+  ) {
+    const flag = parsed.flags.next !== undefined ? "next" : "since";
+    throw new Error(
+      `--${flag} is only supported by chain-wait and task-wait — luna-wait waits for a ` +
+      `named mission id only (got subcommand ${subcommand ?? "(none)"})`,
+    );
+  }
+  // --container on the read-only luna surfaces would be silently ignored —
+  // wait/show never start a mission, so a container flag there is a mistake.
+  if (
+    (subcommand === "luna-wait" || subcommand === "lunaWait" ||
+     subcommand === "luna-show" || subcommand === "lunaShow") &&
+    parsed.flags.container !== undefined
+  ) {
+    throw new Error(`--container is only supported by luna and luna-detach (got subcommand ${subcommand ?? "(none)"})`);
   }
 
   if (parsed.flags.port !== undefined && subcommand !== "dashboard") {
@@ -1650,6 +1707,17 @@ async function main() {
     case "task-wait":
     case "taskWait":
       return cmdTaskWait(cwd, parsed);
+    case "luna":
+      return cmdLuna(cwd, parsed);
+    case "luna-detach":
+    case "lunaDetach":
+      return cmdLunaDetach(cwd, parsed);
+    case "luna-wait":
+    case "lunaWait":
+      return cmdLunaWait(cwd, parsed);
+    case "luna-show":
+    case "lunaShow":
+      return cmdLunaShow(cwd, parsed);
     case "chain-stats":
     case "chainStats":
       return cmdChainStats(cwd, parsed);
@@ -1662,7 +1730,7 @@ async function main() {
     case "dashboard":
       return cmdDashboard(cwd, parsed);
     default:
-      throw new Error(`unknown subcommand: ${subcommand ?? "(none)"}. Use setup|task|review|chain|baseline|chain-detach|task-detach|task-wait|chain-resume|chain-show|chain-wait|chain-stats|metrics-ingest|metrics-report|dashboard|chain-cancel|status|result|cancel|serve-stop|install-agents|install-cli|salvage`);
+      throw new Error(`unknown subcommand: ${subcommand ?? "(none)"}. Use setup|task|review|chain|baseline|chain-detach|task-detach|task-wait|chain-resume|chain-show|chain-wait|chain-stats|metrics-ingest|metrics-report|dashboard|chain-cancel|status|result|cancel|serve-stop|install-agents|install-cli|salvage|luna|luna-detach|luna-wait|luna-show`);
   }
 }
 

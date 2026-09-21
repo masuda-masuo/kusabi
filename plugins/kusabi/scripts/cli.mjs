@@ -29,13 +29,13 @@ export function parseArgs(argv) {
       arg === "--auto" || arg === "--read-only" || arg === "--resume-last" ||
       arg === "--wait" || arg === "--background" || arg === "--keep-serve" || arg === "--help" || arg === "-h" ||
       arg === "--force" || arg === "--dry-run" || arg === "--json" || arg === "--cursor-rule" ||
-      arg === "--next" || arg === "--full"
+      arg === "--next" || arg === "--full" || arg === "--allow-substitute"
     ) {
       const key = arg.startsWith("--")
         ? arg.slice(2).replace(/-([a-z])/g, (_, c) => c.toUpperCase())
         : arg.slice(1);
       flags[key] = true;
-    } else if (arg === "--base" || arg === "--model" || arg === "--agent" || arg === "--session" || arg === "--timeout" || arg === "--deny" || arg === "--watchdog" || arg === "--phase" || arg === "--container" || arg === "--prior" || arg === "--max-rounds" || arg === "--brief-file" || arg === "--since" || arg === "--until" || arg === "--compare" || arg === "--transcript-dir" || arg === "--cursor-usage-dir" || arg === "--codex-usage-dir" || arg === "--state-root" || arg === "--db" || arg === "--backend" || arg === "--poll-interval" || arg === "--appear-timeout" || arg === "--progress-timeout" || arg === "--port" || arg === "--strategy" || arg === "--requirements-file" || arg === "--chain-id") {
+    } else if (arg === "--base" || arg === "--model" || arg === "--agent" || arg === "--session" || arg === "--timeout" || arg === "--deny" || arg === "--watchdog" || arg === "--phase" || arg === "--container" || arg === "--prior" || arg === "--max-rounds" || arg === "--brief-file" || arg === "--since" || arg === "--until" || arg === "--compare" || arg === "--transcript-dir" || arg === "--cursor-usage-dir" || arg === "--codex-usage-dir" || arg === "--state-root" || arg === "--db" || arg === "--backend" || arg === "--poll-interval" || arg === "--appear-timeout" || arg === "--progress-timeout" || arg === "--port" || arg === "--strategy" || arg === "--requirements-file" || arg === "--chain-id" || arg === "--mission-file" || arg === "--mission-id" || arg === "--coordinator-model" || arg === "--auditor-model") {
       const flagName = arg.slice(2);
       const val = argv[++i];
       if (val === undefined || (typeof val === "string" && val.startsWith("--"))) {
