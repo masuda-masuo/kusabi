@@ -119,6 +119,37 @@ function makeToolFake(respond = () => ({ status: "ok", output: "canned\n" })) {
   };
 }
 
+/**
+ * A verdict record bound to the envelope the driver handed the Sol seat —
+ * the same deterministic fake pattern as the #531 Luna tests: the fake
+ * mirrors the real seat, it can only judge the envelope it was given, so
+ * gate_id and envelope_sha256 come from input.envelope.
+ */
+const verdictLine = (input, verdict, extra = {}) =>
+  j({
+    type: "verdict",
+    schema_version: 1,
+    gate_id: input.envelope.gate_id,
+    envelope_sha256: input.envelope.envelope_sha256,
+    verdict,
+    summary: `sol:${verdict}`,
+    ...extra,
+  });
+
+const clearSol = (input) => verdictLine(input, "clear");
+
+/** Fake Sol seat: records every dispatch; default handler returns a clear verdict. */
+function makeSol(handler = clearSol) {
+  const calls = [];
+  return {
+    calls,
+    dispatch: async (input) => {
+      calls.push(input);
+      return handler(input);
+    },
+  };
+}
+
 const MISSION_BRIEF = [
   "Orchestrator: gpt-5.6-sol | session luna-review-followup | 2026-09-21",
   "",
@@ -171,6 +202,12 @@ describe("luna review followups (chain-mub3b6fxc819)", () => {
     const coord = makeCoordinator(streams);
     const chain = makeChainFake();
     const tools = makeToolFake();
+    // #531: every gate evaluation dispatches the Sol seat — the fake returns
+    // a schema-valid clear verdict bound to the exact envelope it was given,
+    // so a recommend-accept finish clears its mandatory T11 gate and an
+    // accepted consult_sol clears its additive gate (no real Codex seat is
+    // ever reached from these tests).
+    const sol = makeSol();
     const cleanupCalls = [];
     const guardedServeStop = async (cwdArg, stateDirArg) => {
       cleanupCalls.push({ cwd: cwdArg, stateDir: stateDirArg });
@@ -188,11 +225,12 @@ describe("luna review followups (chain-mub3b6fxc819)", () => {
         coordinatorDispatch: coord.dispatch,
         runChainLifecycle: chain.run,
         callTool: tools.callTool,
+        solDispatch: sol.dispatch,
         guardedServeStop,
         ...(overrides.inject ?? {}),
       },
     });
-    return { driver, coord, chain, tools, cleanupCalls, result };
+    return { driver, coord, chain, tools, sol, cleanupCalls, result };
   }
 
   function readMission() {
@@ -225,6 +263,14 @@ describe("luna review followups (chain-mub3b6fxc819)", () => {
     assert.equal(cleanupCalls[0].stateDir, stateDir);
     const { record } = readMission();
     assert.equal(record.disposition, "recommend-accept");
+    // Under #531 the recommend-accept finish opened the mandatory T11 gate;
+    // the injected clear verdict (bound to the gate envelope) let it proceed
+    // and is recorded, not skipped.
+    assert.ok(Array.isArray(record.auditGates), "the #531 driver must record auditGates");
+    assert.equal(record.auditGates.length, 1);
+    assert.equal(record.auditGates[0].phase, "pre-accept");
+    assert.equal(record.auditGates[0].mandatory, true);
+    assert.equal(record.auditGates[0].verdict, "clear");
   });
 
   it("a mission with no inner chain performs no serve cleanup", async () => {
@@ -423,8 +469,8 @@ describe("luna review followups (chain-mub3b6fxc819)", () => {
   // independent review finding 1 (medium) — consult_sol bounded
   // -------------------------------------------------------------------------
 
-  it("a consult-only coordinator reaches budget-exhausted after maxConsults with bounded dispatches and no Sol execution", async () => {
-    const { coord, chain, tools, cleanupCalls } = await runMission(
+  it("a consult-only coordinator reaches budget-exhausted after maxConsults with bounded dispatches", async () => {
+    const { coord, chain, tools, sol, cleanupCalls } = await runMission(
       [consultStream("a"), consultStream("b"), consultStream("c"), consultStream("d")],
       { input: { budget: { ...DEFAULT_BUDGET, maxConsults: 2 } } },
     );
@@ -432,13 +478,27 @@ describe("luna review followups (chain-mub3b6fxc819)", () => {
     // so the coordinator was dispatched exactly maxConsults + 1 times.
     assert.equal(coord.calls.length, 3, "dispatches must be bounded (maxConsults + 1)");
     assert.equal(chain.calls.length, 0, "no inner chain ran");
-    assert.equal(tools.calls.length, 0, "no tool executed — consult_sol is never executed in this slice");
+    assert.equal(tools.calls.length, 0, "no tool executed by the consult-only mission");
     const { missionDir, control, record } = readMission();
     assert.equal(record.status, "completed");
     assert.equal(control.status, "completed");
     assert.equal(record.disposition, "budget-exhausted");
     assert.equal(record.consults.length, 2, "exactly maxConsults consultations accepted");
-    assert.equal(record.auditGates, undefined, "no audit gate records — Sol is never executed in this slice");
+    // Under #531 every accepted consult_sol opens an ADDITIVE recorded gate,
+    // each cleared by the injected verdict (a consult clear is additive —
+    // it can never be a substitute for a separately mandatory gate).
+    assert.ok(Array.isArray(record.auditGates), "the #531 driver must record auditGates");
+    assert.equal(record.auditGates.length, 2, "one additive recorded gate per accepted consult_sol");
+    assert.deepEqual(
+      record.auditGates.map((g) => g.phase),
+      ["consult", "consult"],
+    );
+    assert.deepEqual(record.auditGates.map((g) => g.verdict), ["clear", "clear"]);
+    for (const gate of record.auditGates) {
+      assert.equal(gate.mandatory, false, "a consult gate is additive, never mandatory");
+      assert.equal(gate.sampled, false, "a requested consult is not a sample");
+    }
+    assert.equal(sol.calls.length, 2, "each accepted consult dispatched the Sol seat exactly once");
     assert.equal(cleanupCalls.length, 0, "no inner chain — no serve cleanup");
     // The clear error/recommendation is persisted for the host.
     const recText = fs.readFileSync(path.join(missionDir, "recommendation.md"), "utf8");
@@ -447,7 +507,7 @@ describe("luna review followups (chain-mub3b6fxc819)", () => {
   });
 
   it("consults within the bound do not terminate the mission", async () => {
-    const { coord } = await runMission([
+    const { coord, sol } = await runMission([
       consultStream("one"),
       consultStream("two"),
       finishStream("recommend-accept"),
@@ -456,6 +516,15 @@ describe("luna review followups (chain-mub3b6fxc819)", () => {
     assert.equal(coord.calls.length, 3);
     assert.equal(record.consults.length, 2);
     assert.equal(record.disposition, "recommend-accept", "a legitimate consult pattern still finishes");
+    // #531: the two accepted consults each opened an additive gate AND the
+    // recommend-accept finish still opened the mandatory T11 gate afterwards
+    // — a consult clear is additive, never a substitute.
+    assert.ok(Array.isArray(record.auditGates), "the #531 driver must record auditGates");
+    assert.equal(record.auditGates.length, 3, "two consult gates + the mandatory pre-accept gate");
+    assert.equal(sol.calls.length, 3, "one Sol seat dispatch per gate");
+    assert.deepEqual(record.auditGates.map((g) => g.phase), ["consult", "consult", "pre-accept"]);
+    assert.equal(record.auditGates[2].mandatory, true, "the finish opens the mandatory T11 gate");
+    assert.equal(record.auditGates[2].verdict, "clear");
   });
 
   it("the effective consult bound, count and termination reason are persisted", async () => {
@@ -468,6 +537,9 @@ describe("luna review followups (chain-mub3b6fxc819)", () => {
     assert.equal(record.budget.maxAttempts, DEFAULT_BUDGET.maxAttempts);
     assert.equal(record.budget.maxProbes, DEFAULT_BUDGET.maxProbes);
     assert.equal(record.consults.length, 2, "the count is persisted (consults array)");
+    // The two accepted consults are also recorded as additive gates.
+    assert.ok(Array.isArray(record.auditGates) && record.auditGates.length === 2,
+      "each persisted accepted consult has a recorded gate");
     assert.match(record.terminationReason, /consult_sol budget exhausted/);
   });
 

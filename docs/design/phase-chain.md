@@ -622,7 +622,7 @@ This limitation is deliberate and documented rather than silently claimed as cov
 
 **TTL safety net.** kaiba's 7-day TTL remains the backstop for every row retirement does not reach — the unstampable backends' `NULL` rows, and any stamped row whose terminal save was missed (a process killed before its final write) or whose retire call failed. Retirement is an optimization that makes rows disappear promptly at the authoritative boundary; it is not the mechanism that guarantees cleanup, and no kusabi code assumes a row was retired.
 
-### 3.5.7f luna mission driver (kusabi #530) — opt-in separate mission surface
+### 3.5.7f luna mission driver (kusabi #530/#531) — opt-in separate mission surface
 
 A luna mission is an opt-in dispatch surface layered on top of the chain
 lifecycle: the `gpt-5.6-luna` coordinator seat proposes bounded actions, and a
@@ -654,8 +654,10 @@ partially executable. The closed action enum is the frozen six-verb
   is validated deterministically (a non-empty `## Deliverables` section)
   before the seam is invoked. `rework_chain` is another bounded attempt
   carrying prior evidence — never luna-resume or crash reconciliation (#531).
-- `consult_sol` — recorded as a requested consultation/handoff input only; no
-  Sol gate execution in this slice (#531 owns it).
+- `consult_sol` — an accepted request opens an ADDITIVE Sol gate (phase
+  `consult`) and is recorded. A consult can never suppress, remove,
+  downgrade, or satisfy a separately mandatory gate — the pre-accept T11
+  gate still fires independently afterwards.
 - `escalate_to_host` — terminal host handoff (disposition `host-handoff`,
   reason written to `recommendation.md`).
 - `finish` — terminal, with a recommendation from the small closed vocabulary
@@ -663,20 +665,21 @@ partially executable. The closed action enum is the frozen six-verb
   verb `accept`) is counted as a coordinator error and never accepted.
 
 **Budgets.** An explicit mission budget caps chains (`maxChains`, default 3),
-attempts (`maxAttempts`, default 2), probes (`maxProbes`, default 5) and
-consult/coordination requests (`maxConsults`, default 3). A request that
+attempts (`maxAttempts`, default 2), probes (`maxProbes`, default 5),
+consult/coordination requests (`maxConsults`, default 3) and consecutive Sol
+rework verdicts (`maxRework`, default 1, #531). A request that
 would exceed a budget terminates the mission `budget-exhausted` and never
 creates another chain or performs another coordinator dispatch. A coordinator
 that cannot produce an executable stream within the bounded attempts budget
 terminates `coordinator-failed`. `maxConsults` is the coordination bound that
 stops a consult-only coordinator: each accepted `consult_sol` consumes one
-slot (the request is recorded, never executed — Sol gates are #531), and the
+slot (and opens its additive gate), and the
 request that would exceed the bound terminates `budget-exhausted` with the
 effective bound, the accepted count and the termination reason persisted on
 the mission record (`budget`, `consults`, `terminationReason`) so show/wait
 can explain the termination. The mission never accepts, publishes, merges,
 creates issues or creates containers; its terminal result is a host-facing
-recommendation.
+recommendation, a host handoff, a Sol block, or a cancellation.
 
 **Probe persistence bound.** Before a probe result is written to
 mission.json, its serialized payload is deterministically capped at
@@ -686,7 +689,7 @@ head+tail splice (the same truncation the evidence envelope applies) with
 explicit `truncated`, exact `omittedBytes`, and `truncation` metadata recorded
 on the persisted probe record — truncation is never silent. This raw-persistence
 bound is independent of the evidence envelope's own payload cap: it is a
-deterministic persistence bound only and executes no Sol gate (#531).
+deterministic persistence bound only.
 
 **Seats.** Defaults are exact: coordinator `codex/gpt-5.6-luna`, auditor
 `codex/gpt-5.6-sol`. Any substitution is refused before mission creation
@@ -695,31 +698,97 @@ substitution is loud in the records (`requested`/`actual`/`substituted: true`)
 and in show/wait output. A non-codex provider is refused outright — the luna
 mode never leaves the codex seats.
 
+**Sol audit gates (kusabi #531).** The deterministic driver, never Luna,
+evaluates audit policy (`evaluateAuditGate`, audit-policy.mjs) at exactly the
+three lifecycle points — PRE-DISPATCH (immediately before executing a
+`run_chain` / `rework_chain` request), POST-CHAIN (after each inner-chain
+terminal result) and PRE-ACCEPT (immediately before finalising a `finish
+recommend-accept` terminal recommendation, the T11 gate) — plus an additive
+gate for each accepted `consult_sol`. A Sol seat is bought at a point ONLY
+when policy marks the gate required (a mandatory trigger), deterministic
+sampling selects it (T12, `input.sampling = { rate, salt }`), or Luna
+requested the consult — no lifecycle point unconditionally buys a seat. The
+terminal mandatory gate applies to approval-shaped `recommend-accept` only;
+`escalate_to_host` and `recommend-escalate` are never gated (a host
+escalation must always be able to write the host recommendation).
+
+Every gate builds its own immutable evidence envelope (`luna-sol-gate.mjs`,
+through the existing audit-envelope contracts) and binds the Sol verdict
+through the existing audit-verdict contracts: a verdict is authoritative
+only when `gate_id` and `envelope_sha256` bind to the exact current gate
+evidence. `clear` proceeds; `rework` permits only bounded `rework_chain`
+followed by a newly evaluated post-chain gate (consecutive rework beyond
+`maxRework` fails closed `sol-blocked`); `block` terminates `sol-blocked` and
+Luna never gets another dispatch to clear it. At a MANDATORY gate, missing /
+unavailable / empty / malformed / ambiguous / evidence-mismatched results
+fail closed to `sol-blocked` (the exact cause is recorded on the gate); only
+sample-only seat unavailability records `audit-sample-skipped` and may
+proceed — the single deliberate fail-open. When the evidence fingerprint
+changes between gates, the stale verdict is ARCHIVED with reason
+`evidence-changed`, excluded from the next envelope's `prior_verdicts`, and
+never deleted or silently reused. Gates are recorded on the mission record
+as `auditGates[]` (`gateId` gate-N sequential per mission, `phase`,
+`verdict`, `disposition`, fail-closed `reason`, `envelopeSha256`, `required`,
+`mandatory`, `sampled`, `triggers`, the embedded `verdictRecord`, and
+`archived`/`archiveReason` when superseded).
+
 **State layout.** Missions live under the kusabi state root in
-`missions/<mission-id>/` — `control.json`, `mission.json` (attempts, bounded
+`missions/<mission-id>/` — `control.json` (status, pid, the `stopRequestedAt` /
+`stopRequestedBy` stop lever), `mission.json` (attempts, bounded
 inner chain ids, coordinator errors, probe results, consult requests, exact
-seat provenance, recommendation, terminal disposition), `evidence/` and
+seat provenance, `auditGates[]`, `overrides[]`, recommendation, terminal
+disposition), `evidence/` and
 `attempts/` artifacts, and `recommendation.md` for the terminal handoff.
 Mission ids are validated path segments (`mission-[a-z0-9]+`) before any
 filesystem access; writes are atomic (shared atomic-replace helper); terminal
 disposition is sticky — a terminal mission record can never be overwritten
 with a different disposition.
 
+**Terminal dispositions.** `recommend-accept`, `recommend-escalate`,
+`coordinator-failed`, `budget-exhausted` and `host-handoff` (all #530) plus
+`sol-blocked` (an uncleared mandatory Sol gate — only a recorded human
+override can reopen it) and `cancelled` (a stop request was honored — no
+seat is dispatched after `stopRequestedAt`). All are terminal for wait/show
+surfaces through `TERMINAL_MISSION_DISPOSITIONS`.
+
 **CLI surfaces.** `luna --container <cid> --mission-file <path>` (foreground)
 and `luna-detach` (exactly one detached child, mission id minted in the
 parent, printing the exact `kusabi-companion luna-wait <mission-id>` line).
 `luna-wait <mission-id>` is a read-only, SIGTERM-safe pure poll loop over
 mission state; `luna-show <mission-id>` renders seat provenance, attempts and
-inner chains, errors/consults, state and recommendation. Both creating
-commands sit in `JOB_CREATING_SUBCOMMANDS` (the worker-context guard makes
+inner chains, errors/consults, gates, state and recommendation.
+`luna-cancel <mission-id>` records the stop request (propagated to live
+inner chains through the existing `requestChainStop` lever; stale chains are
+finalised by its stale-pid branch). `luna-resume <mission-id>` resumes from
+every persisted phase boundary — it refuses while the mission process or a
+recorded Luna/Sol job is genuinely live, settles stale chains/jobs
+deterministically (`luna-reconcile.mjs`, through the existing chain stop
+lever and job-store chokepoint, idempotently), and accepts a matching human
+audit override (`--audit-override <gateId> --audit-override-reason <reason>
+--audit-override-by <actor>`) only for a `sol-blocked` mission — the only
+way a Sol block is reconsidered. The creating commands and `luna-resume`
+sit in `JOB_CREATING_SUBCOMMANDS` (the worker-context guard makes
 mission recursion impossible); wait/show are read-only and never start or stop
-the shared serve.
+the shared serve; cancel/resume are inline state operations that never spawn
+a watcher or waiter process.
 
 **Single ownership.** Inner chains are sequential, the mission passes
 `keepServe: true`, and mission cleanup stops the shared serve once after all
 inner work — wait/show never touch serve lifecycle. The envelope is refreshed
 after every observable action, so the next coordinator request is bound to
 current evidence and prior outcomes.
+
+**Cancellation and resumability.** The driver checks the recorded stop
+request immediately before every coordinator, Sol, and inner-chain dispatch
+and again after an inner chain returns — after `stopRequestedAt` no
+coordinator, auditor, inner-chain, retry, rework, or replacement seat is
+dispatched, including races at inner-chain return boundaries. A cancelled
+mission finalises `cancelled`, cleans the outer serve once, and notifies
+once. The driver is re-entrant: given an existing mission directory it
+continues from the persisted record — evidence and gate numbering continue,
+recorded attempts/chains/probes/consults/verdicts are never re-executed, and
+the terminal notification fires exactly once (one inbox record, one
+deduplicated kaiba agenda row, plus `recommendation.md`).
 
 ### 3.5.8 metrics store (ingest) — implemented
 

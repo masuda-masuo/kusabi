@@ -29,11 +29,19 @@ import path from "node:path";
 import { readJson, writeJson } from "./state-paths.mjs";
 
 /**
- * The host-facing terminal dispositions of kusabi #530.  `recommend-accept`,
- * `recommend-escalate`, `coordinator-failed` and `budget-exhausted` are the
- * required values; `host-handoff` is the narrowly justified additional
- * terminal value for the `escalate_to_host` action (a host handoff is not a
- * recommendation — it hands the request to a human).
+ * The host-facing terminal dispositions of kusabi #530/#531.
+ *
+ * #530 values: `recommend-accept`, `recommend-escalate`, `coordinator-failed`
+ * and `budget-exhausted` are the required values; `host-handoff` is the
+ * narrowly justified additional terminal value for the `escalate_to_host`
+ * action (a host handoff is not a recommendation — it hands the request to
+ * a human).
+ *
+ * #531 values: `sol-blocked` (an uncleared mandatory Sol gate — the audit
+ * veto is terminal and only a recorded human override can reopen the
+ * mission) and `cancelled` (a stop request was honored — no seat is ever
+ * dispatched after stopRequestedAt).  Both are terminal for show/wait
+ * surfaces through this set.
  */
 export const TERMINAL_MISSION_DISPOSITIONS = new Set([
   "recommend-accept",
@@ -41,6 +49,8 @@ export const TERMINAL_MISSION_DISPOSITIONS = new Set([
   "coordinator-failed",
   "budget-exhausted",
   "host-handoff",
+  "sol-blocked",
+  "cancelled",
 ]);
 
 /**
@@ -121,6 +131,83 @@ export function finalizeMissionControl(missionDir, status) {
   writeMissionControl(missionDir, next);
   return next;
 }
+/**
+ * The file-based stop predicate for a mission (kusabi #531): true once a stop
+ * request has been recorded on the control record.  `luna-cancel` writes it;
+ * the driver checks it immediately before every coordinator, Sol, and
+ * inner-chain dispatch and again after an inner chain returns.
+ *
+ * @param {string} missionDir
+ * @returns {boolean}
+ */
+export function missionStopRequested(missionDir) {
+  const control = readMissionControl(missionDir);
+  return !!(control && control.stopRequestedAt);
+}
+
+/**
+ * Re-arm a mission control record for a resumed run (kusabi #531): sets
+ * status back to "running" with the current process pid and records resumedAt
+ * as the recovery trace.  A recorded stop request is deliberately PRESERVED:
+ * a stop is never silently forgotten, and missionStopRequested keys off
+ * stopRequestedAt so a stale stop still cancels the resumed run (luna-resume
+ * settles stop-requested missions to cancelled before the driver is invoked).
+ * Idempotent: re-arming an already-running control merely refreshes
+ * pid/resumedAt.
+ *
+ * @param {string} missionDir
+ * @returns {object|null} the new control record, or null.
+ */
+export function rearmMissionControl(missionDir) {
+  const existing = readMissionControl(missionDir);
+  if (!existing) return null;
+  // A recorded stop request is NEVER silently forgotten: luna-resume settles a
+  // stop-requested mission to cancelled before the driver runs, and the
+  // driver's own stop predicate keys off stopRequestedAt - so a stale stop
+  // still cancels rather than resurrecting a mission against its stop.
+  const next = {
+    ...existing,
+    status: "running",
+    pid: process.pid,
+    finishedAt: undefined,
+    resumedAt: new Date().toISOString(),
+  };
+  writeMissionControl(missionDir, next);
+  return next;
+}
+
+/**
+ * The sanctioned human-override exception to terminal-disposition stickiness
+ * (kusabi #531): after a matching human audit override is recorded on a
+ * sol-blocked mission, the terminal block is cleared so `luna-resume` can
+ * hand the mission back to the driver.  The caller passes the FULL next
+ * record (the override already appended, the blocking gate marked
+ * overridden, disposition null, status running); this writes it verbatim
+ * (bypassing the sticky guard - the override is the one case where a
+ * terminal disposition is legitimately reopened) and re-arms the control.
+ *
+ * Refuses to clear a mission whose disposition is not `sol-blocked` - an
+ * override must never reopen a recommendation the host already received.
+ *
+ * @param {string} missionDir
+ * @param {object} nextRecord - the full next mission record.
+ * @returns {object} the written record.
+ * @throws {Error} when the existing disposition is not sol-blocked.
+ */
+export function clearMissionBlockForOverride(missionDir, nextRecord) {
+  const existing = readMissionRecord(missionDir);
+  if (existing && typeof existing.disposition === "string" && existing.disposition !== "sol-blocked") {
+    throw new Error(
+      `refusing to clear mission block: mission ${existing.missionId ?? path.basename(missionDir)} ` +
+      `has disposition ${existing.disposition}, not sol-blocked - only a sol-blocked mission ` +
+      `can be reopened by a human audit override`,
+    );
+  }
+  writeJson(missionRecordFilePath(missionDir), nextRecord);
+  rearmMissionControl(missionDir);
+  return nextRecord;
+}
+
 
 /**
  * Create a mission directory and its two records (control.json + mission.json).

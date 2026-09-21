@@ -206,3 +206,162 @@ export function notifyChainTerminal(opts) {
 
   return { inboxPath, agendaInserted };
 }
+
+/**
+ * Mission variant of the kaiba agenda insert (kusabi #531): one deduplicated
+ * row per terminal MISSION, keyed on the mission id.  Fail-soft like the
+ * chain variant - a missing/unreadable DB or a missing actions table is a
+ * silent no-op, and an existing open row mentioning the mission id skips the
+ * insert.
+ *
+ * @param {string} dbPath
+ * @param {object} info
+ * @param {string} info.missionId
+ * @param {string} info.status
+ * @param {string|null} info.disposition
+ * @param {string|null} info.container
+ * @param {string} info.cwdLabel
+ * @param {string} info.inboxPath
+ * @param {string} info.author
+ * @param {string} now - ISO timestamp
+ * @returns {boolean}
+ */
+function insertMissionKaibaAgenda(dbPath, info, now) {
+  let db;
+  try {
+    db = new DatabaseSync(dbPath, { open: true, write: true });
+  } catch {
+    return false;
+  }
+  try {
+    const tableCheck = db.prepare(
+      "SELECT name FROM sqlite_master WHERE type='table' AND name='actions'"
+    );
+    const row = tableCheck.get();
+    if (!row) return false;
+
+    const dedup = db.prepare(
+      "SELECT id FROM actions WHERE done_at IS NULL AND content LIKE ?"
+    );
+    const existing = dedup.get(`%${info.missionId}%`);
+    if (existing) return false;
+
+    const posRow = db.prepare(
+      "SELECT MAX(position) AS max_pos FROM actions WHERE done_at IS NULL"
+    ).get();
+    const position = (posRow && posRow.max_pos != null) ? posRow.max_pos + 1.0 : 1.0;
+
+    const disposition = info.disposition ?? "none";
+    const container = info.container ?? "none";
+    const cwdLabel = info.cwdLabel || "unknown";
+    const content =
+      `Inspect ${cwdLabel} ${info.missionId} (status=${info.status}, disposition=${disposition}) ` +
+      `container=${container} - luna-show then adjudicate. inbox=${info.inboxPath}`;
+
+    const insert = db.prepare(
+      "INSERT INTO actions (content, position, author, created_at) VALUES (?, ?, ?, ?)"
+    );
+    insert.run(content, position, info.author, now);
+    return true;
+  } catch {
+    return false;
+  } finally {
+    try { db.close(); } catch { /* best-effort */ }
+  }
+}
+
+/**
+ * Write the inbox file for a terminal mission (kusabi #531).  The file name
+ * is `<missionId>.md`, so repeated finalisation idempotently overwrites the
+ * same single inbox record - a terminal mission never produces more than one.
+ *
+ * @param {string} inboxDir
+ * @param {string} missionId
+ * @param {object} info
+ * @param {string} info.status
+ * @param {string|null} info.disposition
+ * @param {string|null} info.container
+ * @param {string} info.inboxPath
+ * @returns {string} the absolute inbox path.
+ */
+function writeMissionInboxFile(inboxDir, missionId, info) {
+  fs.mkdirSync(inboxDir, { recursive: true });
+  const inboxPath = path.join(inboxDir, `${missionId}.md`);
+  const disposition = info.disposition ?? "none";
+  const container = info.container ?? "none";
+  const body = `# Mission ${missionId} - terminal\n\n` +
+    `- **status**: ${info.status}\n` +
+    `- **disposition**: ${disposition}\n` +
+    `- **container**: ${container}\n` +
+    `- **inbox**: ${info.inboxPath}\n\n` +
+    `## Next steps\n\n` +
+    `Run \`kusabi-companion luna-show ${missionId}\` then inspect the recommendation and adjudicate.\n`;
+  fs.writeFileSync(inboxPath, body, "utf8");
+  return inboxPath;
+}
+
+/**
+ * Notify on a terminal MISSION (kusabi #531), the idempotent mission-terminal
+ * path that preserves chain notification behavior byte-for-byte.
+ *
+ * 1. If KUSABI_CHAIN_NOTIFY=0, skip silently (same opt-out surface).
+ * 2. Write one inbox file at {stateDir}/inbox/{missionId}.md (idempotent
+ *    overwrite - a terminal mission emits exactly one inbox record).
+ * 3. Best-effort kaiba agenda row (deduplicated on the mission id, fail-soft)
+ *    - a terminal mission emits exactly one open agenda row.
+ *
+ * @param {object} opts
+ * @param {string} opts.stateDir
+ * @param {string} opts.missionId
+ * @param {string} opts.disposition - the terminal mission disposition.
+ * @param {string|null} [opts.container]
+ * @param {string} [opts.cwdLabel]
+ * @param {NodeJS.ProcessEnv} [opts.env=process.env]
+ * @param {string} [opts.now]
+ * @returns {{ skipped?: boolean, inboxPath?: string, agendaInserted?: boolean }}
+ */
+export function notifyMissionTerminal(opts) {
+  const {
+    stateDir,
+    missionId,
+    disposition,
+    container = null,
+    cwdLabel = "",
+    env = process.env,
+    now = new Date().toISOString(),
+  } = opts;
+
+  // Opt-out (same surface as chain notification)
+  if (env.KUSABI_CHAIN_NOTIFY === "0") {
+    return { skipped: true };
+  }
+
+  const inboxDir = path.join(stateDir, "inbox");
+  const inboxPath = path.join(inboxDir, `${missionId}.md`);
+
+  try {
+    writeMissionInboxFile(inboxDir, missionId, {
+      status: "completed",
+      disposition,
+      container,
+      inboxPath,
+    });
+  } catch (err) {
+    const msg = err && typeof err === "object" && "message" in err ? err.message : String(err);
+    console.error(`[chain-notify] mission inbox write failed for ${missionId}: ${msg}`);
+  }
+
+  const author = env.KUSABI_AGENDA_AUTHOR || "kusabi";
+  const dbPath = resolveKaibaDbPath(env);
+  const agendaInserted = insertMissionKaibaAgenda(dbPath, {
+    missionId,
+    status: "completed",
+    disposition,
+    container,
+    cwdLabel,
+    inboxPath,
+    author,
+  }, now) === true;
+
+  return { inboxPath, agendaInserted };
+}

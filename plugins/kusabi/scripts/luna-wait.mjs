@@ -95,6 +95,8 @@ export function readMissionSnapshot(missionsDir, missionId) {
     Array.isArray(record?.chains) ? record.chains.length : 0,
     record?.coordinatorErrors ?? 0,
     Array.isArray(record?.consults) ? record.consults.length : 0,
+    Array.isArray(record?.auditGates) ? record.auditGates.length : 0,
+    Array.isArray(record?.overrides) ? record.overrides.length : 0,
     mtimeOf(path.join(missionDir, "control.json")),
     mtimeOf(path.join(missionDir, "mission.json")),
   ]);
