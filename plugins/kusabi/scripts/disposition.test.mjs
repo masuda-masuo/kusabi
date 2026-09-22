@@ -4,6 +4,7 @@ import {
   deriveDisposition,
   deriveReworkStrategy,
 } from "./disposition.mjs";
+import { ORACLE_UNCHECKED } from "./chain-probes.mjs";
 
 // deriveDisposition — all branches
 // ---------------------------------------------------------------------------
@@ -658,6 +659,128 @@ describe("deriveDisposition — oracle violation routing (kusabi #197)", () => {
           round: 1, maxRounds: 3, repeatedAreas: false, oracleViolation: marker, ...row.input,
         });
         assert.deepEqual(result, row.expected, `${JSON.stringify(marker)} / ${JSON.stringify(row.input)}`);
+      }
+    }
+  });
+});
+
+// deriveDisposition — deterministic oracle NOT executed (kusabi #541)
+// ---------------------------------------------------------------------------
+// When the P5/P6 probes never ran, the persisted marker on `oracleViolation`
+// is the ORACLE_UNCHECKED string — evidence that measurement did NOT happen,
+// never a violation of the measured kind.  The flag must escalate, must not
+// claim a measured violation on the refusal / brief-syntax terminals that
+// keep precedence over it, and must not claim the P1-P4 evidence that DID
+// run is absent.
+
+describe("deriveDisposition — oracle unchecked (kusabi #541)", () => {
+  const UNCHECKED = ORACLE_UNCHECKED;
+  const NAMED = "## Frozen tests vs src/foo.test.mjs — the test pins the old output";
+  const DEFECT = "P5: frozen: ## Frozen Tests heading present but no entries parsed";
+
+  it("escalates an unchecked oracle and claims only missing P5/P6 evidence", () => {
+    const result = deriveDisposition({
+      verdict: "approve", probesGreen: true, round: 1, maxRounds: 3,
+      repeatedAreas: false, oracleViolation: UNCHECKED, oracleUnchecked: true,
+    });
+    assert.equal(result.disposition, "escalate");
+    // The reason names the unchecked state and the missing oracle evidence...
+    assert.match(result.reason, /P5\/P6 oracle probes did not execute/);
+    assert.match(result.reason, /UNCHECKED/);
+    assert.match(result.reason, /no P5\/P6 oracle evidence/);
+    // ...and must NOT claim a measured violation, nor that P1-P4 evidence
+    // (which may have run before the throw) is absent.
+    assert.doesNotMatch(result.reason, /deterministic oracle violation was measured/);
+    assert.doesNotMatch(result.reason, /no deterministic acceptance evidence/);
+    assert.doesNotMatch(result.reason, /never an automatic rework/);
+  });
+
+  it("never reworks and never strategizes, whatever the other evidence says", () => {
+    const cases = [
+      { verdict: "approve", probesGreen: false, repeatedAreas: false },
+      { verdict: "approve", probesGreen: true, repeatedAreas: false },
+      { verdict: "needs-attention", probesGreen: false, repeatedAreas: false, findingSeverities: ["high"] },
+      { verdict: "needs-attention", probesGreen: true, repeatedAreas: true, strategizeEligible: true },
+      { verdict: "approve-partial", probesGreen: true, repeatedAreas: false },
+      { verdict: "discard", probesGreen: true, repeatedAreas: false },
+    ];
+    for (const evidence of cases) {
+      const result = deriveDisposition({
+        round: 1, maxRounds: 3, oracleViolation: UNCHECKED, oracleUnchecked: true, ...evidence,
+      });
+      assert.equal(result.disposition, "escalate", JSON.stringify(evidence));
+      assert.match(result.reason, /did not execute/);
+    }
+  });
+
+  it("the flag wins over a (contradictory) measured-violation marker", () => {
+    // In practice the two are mutually exclusive — a throw before P5/P6 is
+    // the only way the flag is set — but if both arrive the flag must win.
+    const result = deriveDisposition({
+      verdict: "approve", probesGreen: true, round: 1, maxRounds: 3,
+      repeatedAreas: false, oracleViolation: "P5: frozen — tests/a.test.mjs", oracleUnchecked: true,
+    });
+    assert.equal(result.disposition, "escalate");
+    assert.match(result.reason, /did not execute/);
+    assert.doesNotMatch(result.reason, /deterministic oracle violation was measured/);
+  });
+
+  it("refusal + unchecked: the terminal reason never claims a measured violation", () => {
+    const result = deriveDisposition({
+      verdict: "approve", probesGreen: false, round: 1, maxRounds: 4,
+      repeatedAreas: false, refusal: NAMED, oracleViolation: UNCHECKED, oracleUnchecked: true,
+    });
+    assert.equal(result.disposition, "refused-brief-defect");
+    assert.match(result.reason, /brief contradicts itself/);
+    // The unchecked state rides along accurately — as missing oracle evidence,
+    // never as a violation of the measured kind, and the sentinel string
+    // itself is never rendered.
+    assert.match(result.reason, /P5\/P6 oracle probes did not execute/);
+    assert.match(result.reason, /no P5\/P6 oracle evidence/);
+    assert.doesNotMatch(result.reason, /deterministic oracle violation was measured/);
+    assert.doesNotMatch(result.reason, /unchecked: P5\/P6 oracle probes did not execute/);
+  });
+
+  it("brief-syntax + unchecked: same boundary — no measured-violation claim", () => {
+    const result = deriveDisposition({
+      verdict: "needs-attention", probesGreen: false, round: 1, maxRounds: 4,
+      repeatedAreas: false, findingSeverities: ["high"], briefSyntaxDefect: DEFECT,
+      oracleViolation: UNCHECKED, oracleUnchecked: true,
+    });
+    assert.equal(result.disposition, "refused-brief-defect");
+    assert.match(result.reason, /brief-syntax defect/);
+    assert.match(result.reason, /P5\/P6 oracle probes did not execute/);
+    assert.match(result.reason, /no P5\/P6 oracle evidence/);
+    assert.doesNotMatch(result.reason, /deterministic oracle violation was measured/);
+  });
+
+  it("a same-round MEASURED violation still appends the measured-violation sentence on refusal", () => {
+    // Guard against over-suppression: the #306 suffix must still render when
+    // the oracle genuinely executed and measured a violation.
+    const result = deriveDisposition({
+      verdict: "approve", probesGreen: false, round: 1, maxRounds: 4,
+      repeatedAreas: false, refusal: NAMED,
+      oracleViolation: "P5: frozen — tests/a.test.mjs", oracleUnchecked: false,
+    });
+    assert.equal(result.disposition, "refused-brief-defect");
+    assert.match(result.reason, /ADDITIONALLY a deterministic oracle violation was measured this same round/);
+    assert.doesNotMatch(result.reason, /did not execute this round/);
+  });
+
+  it("is inert when absent or false — every existing row is unchanged", () => {
+    const rows = [
+      { input: { verdict: "approve", probesGreen: true }, expected: { disposition: "accept" } },
+      { input: { verdict: "approve", probesGreen: false }, expected: { disposition: "rework", reason: "deterministic probes failed" } },
+      { input: { verdict: "needs-attention", probesGreen: false, findingSeverities: ["low"] }, expected: { disposition: "rework", reason: "needs-attention" } },
+      { input: { verdict: "discard", probesGreen: true }, expected: { disposition: "escalate", reason: "reviewer discarded the work" } },
+      { input: { verdict: "approve-partial", probesGreen: true }, expected: { disposition: "escalate", reason: "approve-partial: unverified items remain" } },
+    ];
+    for (const flag of [undefined, false]) {
+      for (const row of rows) {
+        const result = deriveDisposition({
+          round: 1, maxRounds: 3, repeatedAreas: false, oracleUnchecked: flag, ...row.input,
+        });
+        assert.deepEqual(result, row.expected, `${JSON.stringify(flag)} / ${JSON.stringify(row.input)}`);
       }
     }
   });
