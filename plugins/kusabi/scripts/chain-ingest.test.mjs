@@ -1153,3 +1153,121 @@ describe("per-phase backend attribution (kusabi #195)", () => {
     fs.rmSync(stateRoot, { recursive: true, force: true });
   });
 });
+
+// ---------------------------------------------------------------------------
+// kusabi #532 criterion 11 — mission linkage.  Inner chain records gain
+// `missionId` only under Luna mode; a plain chain without it keeps
+// chain.mission_id NULL (the serialization is byte-identical when absent).
+// Also criterion 1's round audit columns (round.audit_verdict /
+// round.audit_blocked / round.audit_shadow_disposition) ingest verbatim
+// from the durable round record and stay NULL when absent.
+// ---------------------------------------------------------------------------
+
+describe("chain.mission_id linkage and round audit columns (kusabi #532 criteria 11 and 1)", () => {
+  it("parseChainRecord preserves chainJson.missionId into chainRow.missionId (Luna-mode inner chain)", () => {
+    const parsed = parseChainRecord({
+      chainId: "chain-inner-1",
+      missionId: "mission-abc",
+      orchestrator: { model: "claude-opus-5", session: "abc12345", date: "2026-09-01" },
+      records: [
+        { round: 1, verdict: "approve", disposition: { disposition: "accept" }, worktreeChanged: true },
+      ],
+    });
+    assert.equal(parsed.chainRow.missionId, "mission-abc");
+  });
+
+  it("parseChainRecord keeps chainRow.missionId null for a plain chain (absent key, never guessed)", () => {
+    const parsed = parseChainRecord({
+      chainId: "chain-plain-1",
+      records: [
+        { round: 1, verdict: "approve", disposition: { disposition: "accept" }, worktreeChanged: true },
+      ],
+    });
+    assert.equal(parsed.chainRow.missionId, null);
+  });
+
+  it("ingestChainDirectory stores chain.mission_id for the Luna inner chain and NULL for the plain chain", () => {
+    const stateRoot = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-532-chainlink-"));
+    const writeChain = (id, extra) => {
+      const dir = path.join(stateRoot, "ws-hash-1", "chains", id);
+      fs.mkdirSync(dir, { recursive: true });
+      fs.writeFileSync(path.join(dir, "chain.json"), JSON.stringify({
+        chainId: id,
+        ...extra,
+        records: [
+          { round: 1, verdict: "approve", disposition: { disposition: "accept" }, worktreeChanged: true },
+        ],
+      }), "utf8");
+    };
+    writeChain("chain-inner-1", { missionId: "mission-abc" });
+    writeChain("chain-plain-1", {});
+
+    const db = openMetricsDb(":memory:");
+    ingestChainDirectory(db, stateRoot);
+
+    const inner = db.prepare("SELECT chain_id, mission_id FROM chain WHERE chain_id = ?").get("chain-inner-1");
+    assert.equal(inner.mission_id, "mission-abc");
+    const plain = db.prepare("SELECT chain_id, mission_id FROM chain WHERE chain_id = ?").get("chain-plain-1");
+    assert.equal(plain.mission_id, null, "a plain chain keeps mission_id NULL — absence is a fact, never false");
+
+    fs.rmSync(stateRoot, { recursive: true, force: true });
+  });
+
+  it("round audit columns ingest verbatim from a durable round record and stay NULL when absent", () => {
+    const parsed = parseChainRecord({
+      chainId: "chain-audit-1",
+      missionId: "mission-abc",
+      records: [
+        {
+          round: 1,
+          verdict: "approve",
+          disposition: { disposition: "accept" },
+          auditVerdict: "clear",
+          auditBlocked: false,
+          auditShadowDisposition: "sol-blocked",
+        },
+        {
+          round: 2,
+          verdict: "approve",
+          disposition: { disposition: "accept" },
+          // a legacy round: no audit fields at all
+        },
+      ],
+    });
+    const rows = parsed.roundRows;
+    assert.equal(rows[0].auditVerdict, "clear");
+    assert.equal(rows[0].auditBlocked, 0, "measured not-blocked is 0, never NULL");
+    assert.equal(rows[0].auditShadowDisposition, "sol-blocked");
+    assert.equal(rows[1].auditVerdict, null, "a legacy round keeps NULL audit fields");
+    assert.equal(rows[1].auditBlocked, null);
+    assert.equal(rows[1].auditShadowDisposition, null);
+  });
+
+  it("round audit columns ingest the rework/block/shadow producer values verbatim (finding 5)", () => {
+    // The exact values the luna driver's post-chain persistence produces:
+    // rework (a demand, not a block), block (measured blocked), and the
+    // no-Sol shadow disposition on a fail-open sampled-only gate.
+    const parsed = parseChainRecord({
+      chainId: "chain-audit-2",
+      missionId: "mission-abc",
+      records: [
+        { round: 1, verdict: "approve", disposition: { disposition: "rework" },
+          auditVerdict: "rework", auditBlocked: false, auditShadowDisposition: "audit-sample-skipped" },
+        { round: 2, verdict: "approve", disposition: { disposition: "sol-blocked" },
+          auditVerdict: "block", auditBlocked: true, auditShadowDisposition: "audit-sample-skipped" },
+        { round: 3, verdict: "approve", disposition: { disposition: "accept" },
+          auditVerdict: null, auditBlocked: false, auditShadowDisposition: "audit-sample-skipped" },
+      ],
+    });
+    const rows = parsed.roundRows;
+    assert.equal(rows[0].auditVerdict, "rework");
+    assert.equal(rows[0].auditBlocked, 0, "rework is a demand \u2014 measured not-blocked");
+    assert.equal(rows[0].auditShadowDisposition, "audit-sample-skipped");
+    assert.equal(rows[1].auditVerdict, "block");
+    assert.equal(rows[1].auditBlocked, 1, "a block verdict is measured blocked");
+    assert.equal(rows[1].auditShadowDisposition, "audit-sample-skipped");
+    assert.equal(rows[2].auditVerdict, null, "a fail-open gate without a verdict stays NULL");
+    assert.equal(rows[2].auditBlocked, 0, "the fail-open is measured not-blocked");
+    assert.equal(rows[2].auditShadowDisposition, "audit-sample-skipped");
+  });
+});

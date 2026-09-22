@@ -503,6 +503,10 @@ export async function runChainLifecycle(cwd, { flags, text, orchestrator }, opts
       resume: null,
       strategy: flags.strategy || null,
       requirementsFile: tddChainState?.requirementsFile ?? null,
+      // Mission linkage (kusabi #532): the owning luna mission's id, present
+      // only when the caller (the luna driver) supplies it — a plain chain
+      // keeps chain.json byte-identical.
+      missionId: flags.missionId ?? null,
     });
   } finally {
     process.removeListener("SIGTERM", onSignal);
@@ -810,6 +814,9 @@ export async function cmdChainResume(cwd, { flags, text }) {
       resume: position,
       strategy: chainJson.strategy ?? null,
       requirementsFile: chainJson.requirementsFile ?? null,
+      // Mission linkage (kusabi #532): carried across a resume from the
+      // stored chain.json so a resumed inner chain keeps its mission link.
+      missionId: chainJson.missionId ?? null,
     });
   } finally {
     process.removeListener("SIGTERM", onSignal);

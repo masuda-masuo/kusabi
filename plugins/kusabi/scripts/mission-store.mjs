@@ -276,6 +276,11 @@ export function createMission(stateDir, { missionId, container, missionFile, pid
     attempts: [],
     chains: [],
     coordinatorErrors: 0,
+    // kusabi #532: the observable-count registers start at a measured zero —
+    // a record with no corrections/interventions is a record that measured
+    // none (never NULL, which would read as "never measured").
+    briefCorrections: 0,
+    hostInterventions: 0,
     consults: [],
     probes: [],
     recommendation: null,

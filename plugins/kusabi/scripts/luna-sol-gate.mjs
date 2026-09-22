@@ -312,6 +312,12 @@ export async function evaluateMissionGate(input) {
   const gateId = `gate-${gateIndex}`;
 
   // ---- policy decision: the ONLY way a gate is required ----
+  // The normalized policy input is recorded on the gate verbatim so the
+  // recorded decision replays offline (kusabi #532 criterion 4) — a replayed
+  // decision is evaluateAuditGate(policyInput) and nothing else.
+  const policySampling = sampling
+    ? { sampling: { missionId, rate: sampling.rate, salt: sampling.salt } }
+    : {};
   let decision;
   if (phase === "consult") {
     // An accepted consult_sol is ADDITIVE: Luna asked for an extra audit, so
@@ -330,7 +336,7 @@ export async function evaluateMissionGate(input) {
       gateId,
       lunaRecommendsAccept: phase === "pre-accept",
       changeScope: {},
-      ...(sampling ? { sampling: { missionId, rate: sampling.rate, salt: sampling.salt } } : {}),
+      ...policySampling,
     });
   }
 
@@ -367,6 +373,35 @@ export async function evaluateMissionGate(input) {
     );
   } catch { /* best-effort: an envelope write must never change the gate decision */ }
 
+  // The normalized policy input this gate was evaluated with, the
+  // consultation origin and the deterministic shadow disposition computed
+  // with solVerdict: null.  The shadow is a counterfactual ONLY (kusabi #532
+  // criterion 4): it never changes live gating, retries, terminal status or
+  // authority.
+  //
+  // A Luna-requested consult gate is NOT a policy decision: it fires on the
+  // synthetic "consult" reason, which evaluateAuditGate cannot reproduce, so
+  // no policyInput is fabricated.  The gate persists policyInput: null — the
+  // explicit non-policy-replayable marker — with its real origin, actual
+  // verdict and shadow outcome.  A policy-evaluated gate persists the exact
+  // object evaluateAuditGate saw, so its recorded decision replays offline.
+  const policyInput =
+    phase === "consult"
+      ? null
+      : { gateId, lunaRecommendsAccept: phase === "pre-accept", changeScope: {}, ...policySampling };
+  const origin =
+    phase === "consult"
+      ? "luna-requested"
+      : decision.mandatory
+        ? "policy-mandated"
+        : "sampled";
+  const shadowDisposition = resolveSolGateSeatFailure({
+    required: true,
+    mandatory: decision.mandatory,
+    sampled: decision.sampled,
+    seatAvailable: false,
+  }).disposition;
+
   const baseGate = {
     gateId,
     phase,
@@ -375,6 +410,9 @@ export async function evaluateMissionGate(input) {
     mandatory: decision.mandatory,
     sampled: decision.sampled,
     triggers: decision.triggers,
+    policyInput,
+    origin,
+    shadowDisposition,
     evidenceFingerprint: fingerprint,
   };
 

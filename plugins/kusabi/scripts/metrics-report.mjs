@@ -1256,6 +1256,7 @@ export function missingStoreReport(dbPath) {
     escalateReviewAxis: emptyEscalateReviewAxis(),
     dispositionSeverity: [],
     reviewPathology: emptyReviewPathology(),
+    missions: emptyMissionsSection(),
   };
 }
 
@@ -1296,6 +1297,10 @@ export function computeReport(db, opts = {}) {
       reviewPathology: emptyReviewPathology(),
       stopReasonBreakdown: { jobs: emptyStopReasonBucket(), rounds: emptyStopReasonBucket() },
       toolStats: emptyToolStatsSection(),
+      // kusabi #532: mission rows are the mission surface's own data — a
+      // store that carries missions but nothing of the legacy tables is not
+      // "no data", and the empty text appends the Missions section.
+      missions: computeMissionsSection(db),
     };
   }
 
@@ -1383,6 +1388,10 @@ export function computeReport(db, opts = {}) {
     byBackend,
     stopReasonBreakdown,
     toolStats,
+    // kusabi #532: the additive Missions section over the mission +
+    // audit_gate tables.  Present on every non-missing report; the renderers
+    // emit its text only when mission rows exist.
+    missions: computeMissionsSection(db),
     ...(cursorSampledOutput ? { cursorSampledOutput } : {}),
   };
 }
@@ -1846,6 +1855,136 @@ function renderBackendSplit(split) {
   return lines;
 }
 
+// ---------------------------------------------------------------------------
+// Missions section (kusabi #532) — the additive mission/audit-gate surface.
+// Sums follow the NULL discipline: only measured (non-null) values
+// contribute, so a store whose missions never recorded cost reports cost as
+// n/a rather than 0 — absent and measured-zero stay different facts.
+// ---------------------------------------------------------------------------
+
+/** The empty Missions shape (missing store, and stores with no mission rows). */
+function emptyMissionsSection() {
+  return {
+    count: 0,
+    gates: 0,
+    rows: [],
+    coordinatorErrors: null,
+    briefCorrections: null,
+    hostInterventions: null,
+    latencySeconds: null,
+    cost: null,
+    tokens: { input: null, output: null, reasoning: null, cacheRead: null, cacheWrite: null },
+    consultationOrigins: { lunaRequested: 0, policyMandated: 0, sampled: 0 },
+  };
+}
+
+/**
+ * Read the mission + audit_gate tables additively.  A store written before
+ * the tables existed (opened read-only) reads zero missions without
+ * crashing — the same tableExists degradation the job section uses.
+ */
+function computeMissionsSection(db) {
+  const missions = tableExists(db, "mission")
+    ? db.prepare("SELECT * FROM mission").all()
+    : [];
+  const gates = tableExists(db, "audit_gate")
+    ? db.prepare("SELECT * FROM audit_gate").all()
+    : [];
+
+  const sumCol = (col) => {
+    let total = null;
+    for (const m of missions) {
+      const v = m[col];
+      if (typeof v === "number") total = (total === null ? 0 : total) + v;
+    }
+    return total;
+  };
+  const tokens = { input: null, output: null, reasoning: null, cacheRead: null, cacheWrite: null };
+  const TOKEN_COLS = [
+    ["input", "tokens_input"],
+    ["output", "tokens_output"],
+    ["reasoning", "tokens_reasoning"],
+    ["cacheRead", "tokens_cache_read"],
+    ["cacheWrite", "tokens_cache_write"],
+  ];
+  for (const m of missions) {
+    for (const [key, col] of TOKEN_COLS) {
+      const v = m[col];
+      if (typeof v === "number") tokens[key] = (tokens[key] === null ? 0 : tokens[key]) + v;
+    }
+  }
+
+  // Consultation origins split exactly as recorded; a gate with no recorded
+  // origin is unknown and is not folded into any bucket.
+  const origins = { lunaRequested: 0, policyMandated: 0, sampled: 0 };
+  const gatesByMission = new Map();
+  for (const g of gates) {
+    if (g.origin === "luna-requested") origins.lunaRequested += 1;
+    else if (g.origin === "policy-mandated") origins.policyMandated += 1;
+    else if (g.origin === "sampled") origins.sampled += 1;
+    const key = g.mission_id;
+    if (!gatesByMission.has(key)) gatesByMission.set(key, 0);
+    gatesByMission.set(key, gatesByMission.get(key) + 1);
+  }
+
+  const rows = missions.map((m) => ({
+    missionId: m.mission_id,
+    status: m.status,
+    coordinatorProvider: m.coordinator_provider,
+    coordinatorModel: m.coordinator_model,
+    coordinatorModelActual: m.coordinator_model_actual,
+    auditorProvider: m.auditor_provider,
+    auditorModel: m.auditor_model,
+    gates: gatesByMission.get(m.mission_id) ?? 0,
+  }));
+
+  return {
+    count: missions.length,
+    gates: gates.length,
+    rows,
+    coordinatorErrors: sumCol("coordinator_errors"),
+    briefCorrections: sumCol("brief_corrections"),
+    hostInterventions: sumCol("host_interventions"),
+    latencySeconds: sumCol("latency_seconds"),
+    cost: sumCol("cost"),
+    tokens,
+    consultationOrigins: origins,
+  };
+}
+
+/**
+ * Render the additive Missions section.  Returns [] — no section at all —
+ * when no mission rows exist, so a store without missions (including a
+ * pre-#532 store whose schema lacks the tables) renders byte-identically to
+ * before.
+ */
+function renderMissionsSection(report) {
+  const section = report.missions;
+  if (!section || section.count === 0) return [];
+  const lines = [`Missions (${fmtCount(section.count)}):`];
+  for (const row of section.rows) {
+    const coord = [row.coordinatorProvider, row.coordinatorModel]
+      .filter((v) => typeof v === "string" && v)
+      .join("/") || "?";
+    lines.push(
+      `  ${row.missionId}  status: ${row.status ?? "unknown"}  coordinator: ${coord}  gates: ${fmtCount(row.gates)}`,
+    );
+  }
+  lines.push(
+    `  totals: coordinator errors ${fmtInt(section.coordinatorErrors)}  brief corrections ${fmtInt(section.briefCorrections)}  ` +
+      `host interventions ${fmtInt(section.hostInterventions)}  latency ${fmtNum(section.latencySeconds)}s  cost ${fmtCost(section.cost)} units`,
+  );
+  lines.push(
+    `  tokens: in ${fmtInt(section.tokens.input)}  out ${fmtInt(section.tokens.output)}  reasoning ${fmtInt(section.tokens.reasoning)}  ` +
+      `cache-read ${fmtInt(section.tokens.cacheRead)}  cache-write ${fmtInt(section.tokens.cacheWrite)}`,
+  );
+  lines.push(
+    `  consultation origins: luna-requested ${fmtCount(section.consultationOrigins.lunaRequested)}  ` +
+      `policy-mandated ${fmtCount(section.consultationOrigins.policyMandated)}  sampled ${fmtCount(section.consultationOrigins.sampled)}`,
+  );
+  return lines;
+}
+
 /**
  * Render a computed report (from `computeReport` or `missingStoreReport`) as
  * plain aligned text.
@@ -1860,6 +1999,15 @@ export function renderReportText(report) {
   if (report.status === "empty") {
     lines.push("");
     lines.push("Store is empty (0 sessions, 0 turns, 0 chains, 0 jobs).");
+    // kusabi #532: a store that carries mission rows but nothing of the
+    // legacy tables appends the Missions section after the empty line — the
+    // pre-#532 text stays byte-identical, and the mission facts are never
+    // hidden behind an "empty" that only describes the legacy tables.
+    const missionLines = renderMissionsSection(report);
+    if (missionLines.length > 0) {
+      lines.push("");
+      lines.push(...missionLines);
+    }
     return lines.join("\n");
   }
 
@@ -1899,6 +2047,13 @@ export function renderReportText(report) {
   if (backendSplitLines.length > 0) {
     lines.push("");
     lines.push(...backendSplitLines);
+  }
+  // kusabi #532: the additive Missions section — emitted only when mission
+  // rows exist, appended after the legacy sections so nothing reflows.
+  const missionLines = renderMissionsSection(report);
+  if (missionLines.length > 0) {
+    lines.push("");
+    lines.push(...missionLines);
   }
   return lines.join("\n");
 }

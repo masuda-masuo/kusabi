@@ -398,3 +398,87 @@ describe("writeReviewRecord", () => {
     assert.doesNotMatch(text, /Final disposition: accepted at round 1/);
   });
 });
+
+// =========================================================================
+// kusabi #532 criterion 11 — mission linkage.  An inner chain record gains
+// `missionId` ONLY under Luna mode (persistChainState called with
+// missionId); a plain chain serialization is byte-identical when the key is
+// absent — the key must never appear as null/false on a plain chain.json.
+// =========================================================================
+
+describe("persistChainState missionId linkage (kusabi #532 criterion 11)", () => {
+  function makeChainDir() {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-532-persist-"));
+    const chainDir = path.join(tmp, "chain-link");
+    fs.mkdirSync(chainDir, { recursive: true });
+    return chainDir;
+  }
+
+  const chainCtx = {
+    chainId: "chain-link",
+    container: "cid-1",
+    model: "fake/model",
+    modelChain: [["fake/model"]],
+    maxRounds: 4,
+    brief: "Implement X.",
+    orchestrator: null,
+    baseSha: "abc123",
+    strategized: false,
+    chainFollowupDraft: null,
+  };
+
+  it("persists missionId on chain.json only when supplied (Luna-mode inner chain)", () => {
+    const chainDir = makeChainDir();
+    const roundRecord = { round: 1, implementJobId: "job-1" };
+    persistChainState({
+      chainDir, round: 1, roundRecord, records: [roundRecord],
+      chainTotals: computeChainTotals([roundRecord]),
+      ...chainCtx,
+      missionId: "mission-abc",
+    });
+    const chainJson = readJson(path.join(chainDir, "chain.json"));
+    assert.equal(chainJson.missionId, "mission-abc");
+  });
+
+  it("a plain chain serialization is byte-identical when missionId is absent (no null/false key)", () => {
+    const chainDirA = makeChainDir();
+    const chainDirB = makeChainDir();
+    const roundA = { round: 1, implementJobId: "job-1" };
+    const roundB = { round: 1, implementJobId: "job-1" };
+    persistChainState({
+      chainDir: chainDirA, round: 1, roundRecord: roundA, records: [roundA],
+      chainTotals: computeChainTotals([roundA]),
+      ...chainCtx,
+    });
+    persistChainState({
+      chainDir: chainDirB, round: 1, roundRecord: roundB, records: [roundB],
+      chainTotals: computeChainTotals([roundB]),
+      ...chainCtx,
+    });
+    const a = fs.readFileSync(path.join(chainDirA, "chain.json"), "utf8");
+    const b = fs.readFileSync(path.join(chainDirB, "chain.json"), "utf8");
+    assert.equal(a, b, "two plain-chain writes must serialize byte-identically");
+    const chainJson = JSON.parse(a);
+    assert.equal("missionId" in chainJson, false, "a plain chain.json must not carry a missionId key at all");
+  });
+
+  it("the missionId key appears only on Luna inner chains, never on a plain chain", () => {
+    const lunaDir = makeChainDir();
+    const plainDir = makeChainDir();
+    const roundRecord = { round: 1, implementJobId: "job-1" };
+    persistChainState({
+      chainDir: lunaDir, round: 1, roundRecord, records: [roundRecord],
+      chainTotals: computeChainTotals([roundRecord]),
+      ...chainCtx, missionId: "mission-abc",
+    });
+    persistChainState({
+      chainDir: plainDir, round: 1, roundRecord, records: [roundRecord],
+      chainTotals: computeChainTotals([roundRecord]),
+      ...chainCtx,
+    });
+    const luna = JSON.parse(fs.readFileSync(path.join(lunaDir, "chain.json"), "utf8"));
+    const plain = JSON.parse(fs.readFileSync(path.join(plainDir, "chain.json"), "utf8"));
+    assert.equal(luna.missionId, "mission-abc");
+    assert.equal("missionId" in plain, false);
+  });
+});

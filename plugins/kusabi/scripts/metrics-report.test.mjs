@@ -1937,3 +1937,134 @@ describe("tool-stats coverage — opencode SSE only (kusabi #384)", () => {
     assert.equal(parsed.toolStats.all.bash.count, 1);
   });
 });
+
+// ---------------------------------------------------------------------------
+// kusabi #532 criterion 8 (store side) — an additive Missions report section
+// over the mission + audit_gate tables.  The section appears ONLY when
+// mission rows exist; a store without missions (including a pre-#532 store
+// whose schema lacks the tables) renders byte-identically to before — the
+// existing sections are never reflowed or reworded by the addition.
+// ---------------------------------------------------------------------------
+
+describe("Missions section (kusabi #532 criteria 2 and 8)", () => {
+  async function addMissionRow(db, overrides = {}) {
+    const { upsertMission } = await import("./metrics-db.mjs");
+    upsertMission(db, {
+      missionId: "mission-abc",
+      workspaceSlug: "ws1",
+      container: "cid-1",
+      status: "completed",
+      startedAt: "2026-09-01T09:00:00.000Z",
+      startedMs: Date.parse("2026-09-01T09:00:00.000Z"),
+      finishedAt: "2026-09-01T11:30:00.000Z",
+      finishedMs: Date.parse("2026-09-01T11:30:00.000Z"),
+      latencySeconds: 9000,
+      coordinatorProvider: "codex",
+      coordinatorModel: "gpt-5.6-luna",
+      coordinatorModelRequested: "gpt-5.6-luna",
+      coordinatorModelActual: "gpt-5.6-luna",
+      coordinatorReasoningEffort: "high",
+      coordinatorSubstituted: 0,
+      auditorProvider: "codex",
+      auditorModel: "gpt-5.6-sol",
+      auditorModelRequested: "gpt-5.6-sol",
+      auditorModelActual: "gpt-5.6-sol",
+      auditorReasoningEffort: "high",
+      auditorSubstituted: 0,
+      coordinatorErrors: 2,
+      briefCorrections: 1,
+      hostInterventions: 0,
+      tokensInput: 1000,
+      tokensOutput: 500,
+      tokensReasoning: 200,
+      tokensCacheRead: 10,
+      tokensCacheWrite: 5,
+      cost: 0.042,
+      disposition: "recommend-accept",
+      recommendation: "recommend-accept",
+      ...overrides,
+    });
+  }
+
+  it("computeReport carries the mission facts when mission rows exist, preserving NULLs", async () => {
+    const db = openMetricsDb(":memory:");
+    await addMissionRow(db);
+    const { upsertAuditGate } = await import("./metrics-db.mjs");
+    upsertAuditGate(db, {
+      gateId: "gate-1",
+      missionId: "mission-abc",
+      phase: "pre-dispatch",
+      origin: "sampled",
+      verdict: "clear",
+      disposition: "verdict-recorded",
+      required: 1,
+      mandatory: 0,
+      sampled: 1,
+      policyInput: JSON.stringify({ gateId: "gate-1" }),
+      shadowDisposition: "audit-sample-skipped",
+    });
+    upsertAuditGate(db, {
+      gateId: "gate-2",
+      missionId: "mission-abc",
+      phase: "pre-accept",
+      origin: "policy-mandated",
+      verdict: "clear",
+      disposition: "verdict-recorded",
+      required: 1,
+      mandatory: 1,
+      sampled: 0,
+      policyInput: JSON.stringify({ gateId: "gate-2", lunaRecommendsAccept: true }),
+      shadowDisposition: "sol-blocked",
+    });
+
+    const report = computeReport(db, { dbPath: ":memory:" });
+    assert.equal(report.missions.count, 1);
+    assert.equal(report.missions.gates, 2);
+    assert.equal(report.missions.coordinatorErrors, 2);
+    assert.equal(report.missions.briefCorrections, 1);
+    assert.equal(report.missions.hostInterventions, 0);
+    assert.equal(report.missions.latencySeconds, 9000);
+    assert.equal(report.missions.cost, 0.042);
+    assert.deepEqual(report.missions.tokens, { input: 1000, output: 500, reasoning: 200, cacheRead: 10, cacheWrite: 5 });
+    // Consultation origins split exactly as recorded: sampled-only gates are
+    // never folded into mandatory ones.
+    assert.deepEqual(report.missions.consultationOrigins, {
+      lunaRequested: 0,
+      policyMandated: 1,
+      sampled: 1,
+    });
+  });
+
+  it("the text report gains the Missions section with the origin split only when mission rows exist", async () => {
+    const emptyDb = openMetricsDb(":memory:");
+    const emptyText = renderReportText(computeReport(emptyDb, { dbPath: ":memory:" }));
+    assert.doesNotMatch(emptyText, /Missions \(/);
+
+    const db = openMetricsDb(":memory:");
+    await addMissionRow(db);
+    const text = renderReportText(computeReport(db, { dbPath: ":memory:" }));
+    assert.match(text, /Missions \(/);
+    assert.match(text, /mission-abc/);
+    assert.match(text, /codex\/gpt-5\.6-luna/);
+    // Additive-only: every line of the empty store's report still appears,
+    // in order, inside the mission store's report — nothing reflowed.
+    const emptyLines = emptyText.split("\n");
+    const fullLines = text.split("\n");
+    let cursor = 0;
+    for (const line of emptyLines) {
+      const found = fullLines.indexOf(line, cursor);
+      assert.ok(found >= 0, `the pre-#532 report line "${line}" must survive in order`);
+      cursor = found + 1;
+    }
+  });
+
+  it("a store written before the mission tables existed degrades: no Missions section, no throw", () => {
+    const db = openMetricsDb(":memory:");
+    db.exec("DROP TABLE mission");
+    db.exec("DROP TABLE audit_gate"); // simulate a pre-#532 metrics.db opened read-only
+    const report = computeReport(db, { dbPath: ":memory:" });
+    assert.equal(report.missions.count, 0, "a pre-#532 store reads zero missions, never crashes");
+    const text = renderReportText(report);
+    assert.doesNotMatch(text, /Missions \(/);
+  });
+});

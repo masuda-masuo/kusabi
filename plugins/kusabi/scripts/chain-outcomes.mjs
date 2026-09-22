@@ -308,6 +308,12 @@ export function renderProviderExhaustedOutcome({ chainId, round, phase, jobError
  * @param {string} opts.baseSha
  * @param {boolean} opts.strategized
  * @param {string|null} [opts.chainFollowupDraft=null]
+ * @param {string|null} [opts.missionId=null] — the owning luna mission's id
+ *        (kusabi #532).  A failed Luna inner chain stays attributable to its
+ *        mission just like a successful one: emitted on the terminal
+ *        chain.json only when supplied, so an ordinary chain stays
+ *        byte-identical.
+ * @param {object|null} [opts.verifyBaseline=null]
  * @returns {{ records: Array, chainState: Object, outcome: string }}
  *   - `records`   — the (mutated) records array with roundRecord present exactly once.
  *   - `chainState` — the object that should be written to chain.json.
@@ -336,6 +342,7 @@ export function handleProviderExhaustion({
   baseSha,
   strategized,
   chainFollowupDraft = null,
+  missionId = null,
   verifyBaseline = null,
 }) {
   // Record the tier after this round
@@ -385,6 +392,10 @@ export function handleProviderExhaustion({
     // Chain-start verify baseline (kusabi #173) — carried on every chain.json
     // write so chain-resume reuses the recorded baseline.
     verifyBaseline,
+    // Mission linkage (kusabi #532): a failed Luna inner chain stays
+    // attributable to its mission, emitted only when supplied; a plain chain
+    // serialization stays byte-identical when the key is absent.
+    ...(missionId ? { missionId } : {}),
   };
 
   // Render outcome

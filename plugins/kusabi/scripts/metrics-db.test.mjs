@@ -787,3 +787,247 @@ describe("upsertCursorSessionCounter / getCursorSessionCounter", () => {
     assert.equal(row.ts, "2026-08-14T10:00:20.000Z");
   });
 });
+
+// ---------------------------------------------------------------------------
+// kusabi #532 criterion 1 — additive mission/audit-gate schema and provenance
+// columns.  An old metrics database migrates WITHOUT losing rows; the new
+// tables/columns exist; legacy values remain NULL (never false or guessed).
+// The new upsert helpers (upsertMission / upsertAuditGate) are loaded
+// dynamically inside the tests so this file keeps loading today.
+// ---------------------------------------------------------------------------
+
+describe("mission + audit_gate tables and provenance columns (kusabi #532 criterion 1)", () => {
+  it("openMetricsDb creates the mission and audit_gate tables on a fresh database", () => {
+    const db = openMetricsDb(":memory:");
+    assert.equal(countRows(db, "mission"), 0);
+    assert.equal(countRows(db, "audit_gate"), 0);
+  });
+
+  it("exposes the new upsert helpers upsertMission / upsertAuditGate", async () => {
+    const mod = await import("./metrics-db.mjs");
+    assert.equal(typeof mod.upsertMission, "function", "the #532 store must expose upsertMission");
+    assert.equal(typeof mod.upsertAuditGate, "function", "the #532 store must expose upsertAuditGate");
+  });
+
+  it("migrates a pre-#532 database additively: new columns appear, old rows keep NULL, no row is lost", () => {
+    const dbPath = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-532-migrate-")), "metrics.db");
+
+    // A database written before #532: the full current schema WITHOUT the
+    // provenance columns and WITHOUT the mission/audit_gate tables.
+    const legacyDb = new DatabaseSync(dbPath);
+    legacyDb.exec(`
+      CREATE TABLE job (
+        job_id TEXT PRIMARY KEY,
+        workspace_slug TEXT,
+        kind TEXT,
+        title TEXT,
+        status TEXT,
+        phase TEXT,
+        backend TEXT,
+        model_entry TEXT,
+        started_at TEXT,
+        started_ms INTEGER,
+        finished_at TEXT,
+        finished_ms INTEGER,
+        duration_seconds REAL,
+        steps INTEGER,
+        stop_reason TEXT,
+        error TEXT,
+        usage_available INTEGER,
+        usage_model TEXT,
+        usage_input INTEGER,
+        usage_output INTEGER,
+        usage_reasoning INTEGER,
+        usage_cache_read INTEGER,
+        usage_cache_write INTEGER,
+        usage_cost REAL
+      );
+      CREATE TABLE chain (
+        chain_id TEXT PRIMARY KEY,
+        workspace_slug TEXT,
+        orch_model TEXT,
+        orch_session TEXT,
+        orch_date TEXT,
+        backend TEXT,
+        base_sha TEXT,
+        model TEXT,
+        model_chain_json TEXT,
+        max_rounds INTEGER,
+        strategized INTEGER,
+        totals_input INTEGER,
+        totals_output INTEGER,
+        totals_reasoning INTEGER,
+        totals_cache_read INTEGER,
+        totals_cache_write INTEGER,
+        totals_cost REAL,
+        brief_text TEXT,
+        brief_chars INTEGER,
+        brief_lines INTEGER,
+        brief_bullets INTEGER,
+        brief_has_deliverables INTEGER,
+        brief_deliverable_count INTEGER,
+        brief_has_smoke INTEGER,
+        brief_smoke_count INTEGER
+      );
+      CREATE TABLE round (
+        chain_id TEXT,
+        round INTEGER,
+        started_at TEXT,
+        started_ms INTEGER,
+        backend TEXT,
+        review_backend TEXT,
+        model_entry TEXT,
+        tier_before INTEGER,
+        tier_after INTEGER,
+        verdict TEXT,
+        verdict_source TEXT,
+        probes_green INTEGER,
+        worktree_changed INTEGER,
+        disposition TEXT,
+        stop_reason TEXT,
+        rework_count INTEGER,
+        review_seat_failures INTEGER,
+        findings_text TEXT,
+        implement_in INTEGER,
+        implement_out INTEGER,
+        implement_cost REAL,
+        review_in INTEGER,
+        review_out INTEGER,
+        review_cost REAL,
+        PRIMARY KEY (chain_id, round)
+      )
+    `);
+    legacyDb.prepare("INSERT INTO job (job_id, status, backend) VALUES (?, ?, ?)")
+      .run("job-legacy", "completed", "codex");
+    legacyDb.prepare("INSERT INTO chain (chain_id, orch_model) VALUES (?, ?)")
+      .run("chain-legacy", "claude-opus-5");
+    legacyDb.prepare("INSERT INTO round (chain_id, round, verdict, disposition) VALUES (?, ?, ?, ?)")
+      .run("chain-legacy", 1, "approve", "accept");
+    if (typeof legacyDb.close === "function") legacyDb.close();
+
+    // Re-opening through openMetricsDb must migrate in place, must not throw,
+    // and must not touch the pre-existing rows' other columns.
+    const db = openMetricsDb(dbPath);
+
+    const legacyJob = db.prepare("SELECT * FROM job WHERE job_id = ?").get("job-legacy");
+    assert.equal(legacyJob.status, "completed");
+    assert.equal(legacyJob.backend, "codex");
+    assert.equal(legacyJob.provider, null, "legacy job rows keep NULL provider, never a guessed value");
+    assert.equal(legacyJob.model_exact, null);
+    assert.equal(legacyJob.reasoning_effort, null);
+    assert.equal(legacyJob.substituted, null);
+
+    const legacyChain = db.prepare("SELECT * FROM chain WHERE chain_id = ?").get("chain-legacy");
+    assert.equal(legacyChain.orch_model, "claude-opus-5");
+    assert.equal(legacyChain.mission_id, null, "a plain chain has no mission link: NULL, never false");
+
+    const legacyRound = db.prepare("SELECT * FROM round WHERE chain_id = ? AND round = 1").get("chain-legacy");
+    assert.equal(legacyRound.verdict, "approve");
+    assert.equal(legacyRound.audit_verdict, null, "legacy rounds keep NULL audit columns");
+    assert.equal(legacyRound.audit_blocked, null);
+    assert.equal(legacyRound.audit_shadow_disposition, null);
+
+    // The new tables exist and are empty after migration.
+    assert.equal(countRows(db, "mission"), 0);
+    assert.equal(countRows(db, "audit_gate"), 0);
+
+    fs.rmSync(path.dirname(dbPath), { recursive: true, force: true });
+  });
+
+  it("openMetricsDb is idempotent on a database that already has the #532 columns", () => {
+    const dbPath = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-532-migrate-")), "metrics.db");
+    openMetricsDb(dbPath);
+    assert.doesNotThrow(() => openMetricsDb(dbPath));
+    fs.rmSync(path.dirname(dbPath), { recursive: true, force: true });
+  });
+
+  it("upsertMission stores a full row and preserves NULL for absent fields", async () => {
+    const { upsertMission } = await import("./metrics-db.mjs");
+    const db = openMetricsDb(":memory:");
+    upsertMission(db, {
+      missionId: "mission-abc",
+      workspaceSlug: "ws1",
+      container: "cid-1",
+      status: "completed",
+      startedAt: "2026-09-01T09:00:00.000Z",
+      startedMs: Date.parse("2026-09-01T09:00:00.000Z"),
+      finishedAt: "2026-09-01T11:30:00.000Z",
+      finishedMs: Date.parse("2026-09-01T11:30:00.000Z"),
+      latencySeconds: 9000,
+      coordinatorProvider: "codex",
+      coordinatorModel: "gpt-5.6-luna",
+      coordinatorModelRequested: "gpt-5.6-luna",
+      coordinatorModelActual: "gpt-5.6-luna",
+      coordinatorReasoningEffort: "high",
+      coordinatorSubstituted: 0,
+      auditorProvider: "codex",
+      auditorModel: "gpt-5.6-sol",
+      auditorModelRequested: "gpt-5.6-sol",
+      auditorModelActual: "gpt-5.6-sol",
+      auditorReasoningEffort: "high",
+      auditorSubstituted: 0,
+      coordinatorErrors: 2,
+      briefCorrections: 1,
+      hostInterventions: 0,
+      tokensInput: 1000,
+      tokensOutput: 500,
+      tokensReasoning: 200,
+      tokensCacheRead: 10,
+      tokensCacheWrite: 5,
+      cost: 0.042,
+      disposition: "recommend-accept",
+      recommendation: "recommend-accept",
+    });
+    assert.equal(countRows(db, "mission"), 1);
+    const row = db.prepare("SELECT * FROM mission WHERE mission_id = ?").get("mission-abc");
+    assert.equal(row.coordinator_provider, "codex");
+    assert.equal(row.coordinator_reasoning_effort, "high");
+    assert.equal(row.host_interventions, 0, "a measured zero stays 0");
+    assert.equal(row.latency_seconds, 9000);
+    assert.equal(row.cost, 0.042);
+
+    // A sparse row (legacy mission) stores NULL for every absent field.
+    upsertMission(db, { missionId: "mission-legacy", status: "completed" });
+    const legacy = db.prepare("SELECT * FROM mission WHERE mission_id = ?").get("mission-legacy");
+    assert.equal(legacy.coordinator_provider, null);
+    assert.equal(legacy.coordinator_errors, null);
+    assert.equal(legacy.brief_corrections, null);
+    assert.equal(legacy.host_interventions, null);
+    assert.equal(legacy.tokens_input, null);
+    assert.equal(legacy.cost, null);
+    assert.equal(legacy.latency_seconds, null);
+    assert.equal(countRows(db, "mission"), 2);
+  });
+
+  it("upsertAuditGate stores one gate row per (gate_id, mission_id) and replaces on re-upsert", async () => {
+    const { upsertAuditGate } = await import("./metrics-db.mjs");
+    const db = openMetricsDb(":memory:");
+    const gate = {
+      gateId: "gate-1",
+      missionId: "mission-abc",
+      phase: "pre-accept",
+      origin: "policy-mandated",
+      verdict: "clear",
+      disposition: "verdict-recorded",
+      reason: null,
+      required: 1,
+      mandatory: 1,
+      sampled: 0,
+      policyInput: JSON.stringify({ gateId: "gate-1" }),
+      shadowDisposition: "sol-blocked",
+      recordedAt: "2026-09-01T09:00:05.000Z",
+    };
+    upsertAuditGate(db, gate);
+    upsertAuditGate(db, gate);
+    assert.equal(countRows(db, "audit_gate"), 1, "re-upsert replaces, never duplicates");
+    const row = db.prepare("SELECT * FROM audit_gate WHERE gate_id = ? AND mission_id = ?").get("gate-1", "mission-abc");
+    assert.equal(row.origin, "policy-mandated");
+    assert.equal(row.shadow_disposition, "sol-blocked");
+
+    upsertAuditGate(db, { gateId: "gate-1", missionId: "mission-abc", phase: "pre-accept", origin: "luna-requested" });
+    const replaced = db.prepare("SELECT origin, verdict FROM audit_gate WHERE gate_id = ? AND mission_id = ?").get("gate-1", "mission-abc");
+    assert.equal(replaced.origin, "luna-requested");
+    assert.equal(replaced.verdict, null, "an absent verdict stays NULL");
+    assert.equal(countRows(db, "audit_gate"), 1);
+  });
+});

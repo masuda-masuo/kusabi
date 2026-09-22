@@ -37,7 +37,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
-import { stateDirFor, readJson } from "./state-paths.mjs";
+import { stateDirFor, readJson, writeJson } from "./state-paths.mjs";
 import { parseCoordinatorOutput } from "./coordinator-parse.mjs";
 
 let driverModule = null;
@@ -656,5 +656,378 @@ describe("luna mission driver (kusabi #530 criteria 4-8)", () => {
     const chainsDir = path.join(stateDir, "chains");
     const created = fs.existsSync(chainsDir) ? fs.readdirSync(chainsDir) : [];
     assert.equal(created.length, 0, "the mission must not create chain state itself — the seam owns chains");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// kusabi #532 criterion 2 (driver side) — the mission record carries the
+// additive observability fields the #532 ingest preserves: exact seat
+// reasoning effort, brief corrections, host interventions, and terminal
+// wall-clock latency.  Absent fields stay absent (NULL at ingest), never
+// guessed.  Token/cost preservation itself is pinned in mission-ingest.
+// ---------------------------------------------------------------------------
+
+describe("mission record observability fields (kusabi #532 criterion 2)", () => {
+  let root;
+  let cwd;
+  let stateDir;
+  let previousStateDir;
+  let missionFile;
+
+  beforeEach(() => {
+    root = makeTemp("kusabi-532-driver-obs-");
+    cwd = path.join(root, "work");
+    fs.mkdirSync(cwd, { recursive: true });
+    missionFile = path.join(root, "mission.md");
+    fs.writeFileSync(missionFile, MISSION_BRIEF, "utf8");
+    previousStateDir = process.env.KUSABI_STATE_DIR;
+    process.env.KUSABI_STATE_DIR = path.join(root, "state");
+    stateDir = stateDirFor(cwd);
+  });
+
+  afterEach(() => {
+    if (previousStateDir === undefined) delete process.env.KUSABI_STATE_DIR;
+    else process.env.KUSABI_STATE_DIR = previousStateDir;
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  async function runMission(streams, overrides = {}) {
+    const driver = await lunaDriver();
+    const coord = makeCoordinator(streams);
+    const chain = makeChainFake();
+    const tools = makeToolFake();
+    const sol = makeSolFake();
+    const input = {
+      cwd,
+      missionFile,
+      brief: MISSION_BRIEF,
+      container: "test-cid",
+      ...DEFAULT_SEATS,
+      allowSubstitute: false,
+      budget: DEFAULT_BUDGET,
+      ...overrides,
+      inject: {
+        coordinatorDispatch: coord.dispatch,
+        runChainLifecycle: chain.run,
+        callTool: tools.callTool,
+        solDispatch: sol.dispatch,
+        ...(overrides.inject ?? {}),
+      },
+    };
+    const result = await driver.runLunaMission(input);
+    return { driver, coord, chain, tools, sol, result, input };
+  }
+
+  function readMission() {
+    const missionsDir = path.join(stateDir, "missions");
+    const ids = fs.readdirSync(missionsDir).filter((n) => n.startsWith("mission-"));
+    assert.equal(ids.length, 1);
+    const missionDir = path.join(missionsDir, ids[0]);
+    return {
+      missionId: ids[0],
+      control: readJson(path.join(missionDir, "control.json")),
+      record: readJson(path.join(missionDir, "mission.json")),
+    };
+  }
+
+  it("records exact seat provenance including reasoning effort for both seats", async () => {
+    await runMission([finishStream("recommend-escalate")]);
+    const { record } = readMission();
+    assert.equal(record.coordinator.provider, "codex");
+    assert.equal(record.coordinator.model, "gpt-5.6-luna");
+    assert.equal(record.coordinator.requested, "gpt-5.6-luna");
+    assert.equal(record.coordinator.actual, "gpt-5.6-luna");
+    assert.equal(record.coordinator.substituted, false);
+    assert.equal(record.coordinator.reasoningEffort, "high", "the coordinator seat must record its reasoning effort");
+    assert.equal(record.auditor.reasoningEffort, "high", "the auditor seat must record its reasoning effort");
+  });
+
+  it("counts a deterministic brief correction alongside the coordinator error (a rejected brief is both)", async () => {
+    const badBrief = "no deliverables section at all";
+    await runMission([runChainStream(badBrief), finishStream("recommend-escalate")]);
+    const { record } = readMission();
+    assert.ok(record.coordinatorErrors >= 1, "the rejected brief is a coordinator error");
+    assert.ok(record.briefCorrections >= 1, "the deterministic pre-flight refusal must be counted as a brief correction");
+    assert.equal(record.briefCorrections, record.coordinatorErrors,
+      "for a pure brief-correction mission the counters agree — nothing is double-counted elsewhere");
+  });
+
+  it("records host interventions for escalate_to_host (explicit, never inferred)", async () => {
+    const escalate = (input) =>
+      j({ action: "escalate_to_host", envelope_sha256: input.envelope.envelope_sha256, reason: "host judgement required" });
+    await runMission([escalate]);
+    const { record } = readMission();
+    assert.equal(record.disposition, "host-handoff");
+    assert.ok(record.hostInterventions >= 1, "an escalate_to_host must be recorded as a host intervention");
+  });
+
+  it("records terminal wall-clock latency: finishedAt and latencySeconds on the terminal record", async () => {
+    await runMission([finishStream("recommend-accept")]);
+    const { record } = readMission();
+    assert.equal(record.disposition, "recommend-accept");
+    assert.equal(typeof record.finishedAt, "string", "a terminal mission must record finishedAt");
+    assert.ok(!Number.isNaN(Date.parse(record.finishedAt)), "finishedAt must be a parseable timestamp");
+    assert.equal(typeof record.latencySeconds, "number");
+    assert.ok(record.latencySeconds >= 0);
+    const expected = (Date.parse(record.finishedAt) - Date.parse(record.startedAt)) / 1000;
+    assert.ok(
+      Math.abs(record.latencySeconds - expected) <= 5,
+      `latencySeconds ${record.latencySeconds} must match the recorded wall clock (${expected}s)`,
+    );
+  });
+});
+// ---------------------------------------------------------------------------
+// kusabi #532 adjudication finding 5 (driver side) — a post-chain Luna gate
+// tied to an inner chain round must PERSIST the actual audit verdict, the
+// blocked state and the no-Sol shadow disposition onto the durable
+// round-N.json (and the chain.json `records` mirror the metrics ingest
+// reads) through the safe read/update/write boundary.  Only when the target
+// round is positively identified; absent/unreadable legacy records stay
+// untouched; the mission gate record stays authoritative.
+// ---------------------------------------------------------------------------
+
+describe("post-chain audit columns persist onto the durable inner chain round (kusabi #532 finding 5)", () => {
+  let root;
+  let cwd;
+  let stateDir;
+  let previousStateDir;
+  let missionFile;
+
+  beforeEach(() => {
+    root = makeTemp("kusabi-532-find5-");
+    cwd = path.join(root, "work");
+    fs.mkdirSync(cwd, { recursive: true });
+    missionFile = path.join(root, "mission.md");
+    fs.writeFileSync(missionFile, MISSION_BRIEF, "utf8");
+    previousStateDir = process.env.KUSABI_STATE_DIR;
+    process.env.KUSABI_STATE_DIR = path.join(root, "state");
+    stateDir = stateDirFor(cwd);
+  });
+
+  afterEach(() => {
+    if (previousStateDir === undefined) delete process.env.KUSABI_STATE_DIR;
+    else process.env.KUSABI_STATE_DIR = previousStateDir;
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  /**
+   * Fake runChainLifecycle that writes REAL durable chain state (chain.json
+   * + round-N.json) under the state dir, like the production seam does, so
+   * the driver's round persistence has a target to hit.  With
+   * `writeState: false` it behaves like the plain recording fake (no chain
+   * files at all \u2014 the missing-target-round case).
+   */
+  function makeChainFakePersisting(writeState = true) {
+    const calls = [];
+    return {
+      calls,
+      run: async (cwdArg, input, opts) => {
+        calls.push({ cwd: cwdArg, input, opts });
+        const id = input?.flags?.["chain-id"];
+        if (writeState === false) return id ? `Chain ${id} completed` : "chain-fake";
+        const chainDir = path.join(stateDir, "chains", id);
+        fs.mkdirSync(chainDir, { recursive: true });
+        const round = calls.length;
+        const record = {
+          round,
+          verdict: "approve",
+          disposition: { disposition: "accept" },
+          worktreeChanged: true,
+          findings: [],
+        };
+        writeJson(path.join(chainDir, `round-${round}.json`), record);
+        writeJson(path.join(chainDir, "chain.json"), { chainId: id, records: [record] });
+        return `Chain ${id} completed`;
+      },
+    };
+  }
+
+  /**
+   * Fake Sol seat that answers by gate PHASE: behavior[phase] is a verdict
+   * string (default "clear") or a function returning/raising the raw result.
+   * The driver must run a gate at every frozen lifecycle point under
+   * sampling rate=1, so phase-keyed verdicts isolate the post-chain gate.
+   */
+  function makeSolFakeByPhase(behavior) {
+    const calls = [];
+    return {
+      calls,
+      dispatch: async (input) => {
+        calls.push(input);
+        const b = behavior[input.gate.phase] ?? "clear";
+        if (typeof b === "function") return b(input);
+        const record = {
+          type: "verdict",
+          schema_version: 1,
+          gate_id: input.envelope.gate_id,
+          envelope_sha256: input.envelope.envelope_sha256,
+          verdict: b,
+          summary: `sol:${b}`,
+        };
+        // The frozen schema demands block_reason + acknowledgement_required
+        // on a block verdict \u2014 without them the gate would fail closed
+        // before the verdict is even bound.
+        if (b === "block") {
+          record.block_reason = "deterministic test block";
+          record.acknowledgement_required = true;
+        }
+        return JSON.stringify(record);
+      },
+    };
+  }
+
+  async function runMission(streams, overrides = {}) {
+    const driver = await lunaDriver();
+    const coord = makeCoordinator(streams);
+    const chain = overrides.chainFake ?? makeChainFakePersisting();
+    const sol = overrides.solFake ?? makeSolFakeByPhase({});
+    const input = {
+      cwd,
+      missionFile,
+      brief: MISSION_BRIEF,
+      container: "test-cid",
+      ...DEFAULT_SEATS,
+      allowSubstitute: false,
+      budget: DEFAULT_BUDGET,
+      sampling: { rate: 1, salt: "v1" },
+      ...overrides.input,
+      inject: {
+        coordinatorDispatch: coord.dispatch,
+        runChainLifecycle: chain.run,
+        callTool: makeToolFake().callTool,
+        solDispatch: sol.dispatch,
+        ...(overrides.inject ?? {}),
+      },
+    };
+    const result = await driver.runLunaMission(input);
+    return { driver, coord, chain, sol, result, input };
+  }
+
+  function readMission() {
+    const missionsDir = path.join(stateDir, "missions");
+    const ids = fs.readdirSync(missionsDir).filter((n) => n.startsWith("mission-"));
+    assert.equal(ids.length, 1);
+    const missionDir = path.join(missionsDir, ids[0]);
+    return { missionId: ids[0], missionDir, record: readJson(path.join(missionDir, "mission.json")) };
+  }
+
+  function readInnerChain(chain) {
+    const id = chain.calls[0].input.flags["chain-id"];
+    const chainDir = path.join(stateDir, "chains", id);
+    return {
+      id,
+      chainDir,
+      roundRecord: readJson(path.join(chainDir, "round-1.json")),
+      chainJson: readJson(path.join(chainDir, "chain.json")),
+    };
+  }
+
+  it("a clear post-chain gate persists auditVerdict/auditBlocked/auditShadowDisposition onto the durable round (finding 5)", async () => {
+    const chain = makeChainFakePersisting();
+    await runMission([runChainStream(VALID_RUN_CHAIN_BRIEF), finishStream("recommend-accept")], {
+      chainFake: chain,
+      solFake: makeSolFakeByPhase({ "post-chain": "clear" }),
+    });
+    const { record } = readMission();
+    assert.equal(record.disposition, "recommend-accept");
+
+    const { roundRecord, chainJson } = readInnerChain(chain);
+    assert.equal(roundRecord.auditVerdict, "clear", "the actual audit verdict is persisted");
+    assert.equal(roundRecord.auditBlocked, false, "a cleared gate measured not-blocked");
+    assert.equal(roundRecord.auditShadowDisposition, "audit-sample-skipped",
+      "the no-Sol shadow disposition (sampled-only gate) is persisted");
+    // The chain.json records mirror (the array the metrics ingest reads)
+    // carries the exact same columns.
+    assert.equal(chainJson.records[0].auditVerdict, "clear");
+    assert.equal(chainJson.records[0].auditBlocked, false);
+    assert.equal(chainJson.records[0].auditShadowDisposition, "audit-sample-skipped");
+    // The mission gate record stays authoritative and untouched by the mirror.
+    const postGate = record.auditGates.find((g) => g.phase === "post-chain");
+    assert.ok(postGate, "the post-chain gate is recorded on the mission record");
+    assert.equal(postGate.verdict, "clear");
+    assert.equal(postGate.shadowDisposition, "audit-sample-skipped");
+  });
+
+  it("a rework post-chain gate persists auditVerdict rework without blocking the round (finding 5)", async () => {
+    const chain = makeChainFakePersisting();
+    await runMission([runChainStream(VALID_RUN_CHAIN_BRIEF), finishStream("recommend-accept")], {
+      chainFake: chain,
+      solFake: makeSolFakeByPhase({ "post-chain": "rework" }),
+    });
+    const { record } = readMission();
+    assert.equal(record.disposition, "recommend-accept", "a bounded rework continues to a later valid finish");
+    const { roundRecord } = readInnerChain(chain);
+    assert.equal(roundRecord.auditVerdict, "rework", "the rework verdict is persisted");
+    assert.equal(roundRecord.auditBlocked, false, "rework is a demand, not a block");
+    assert.equal(roundRecord.auditShadowDisposition, "audit-sample-skipped");
+  });
+
+  it("a block post-chain gate persists auditVerdict block and the blocked state, and terminates sol-blocked (finding 5)", async () => {
+    const chain = makeChainFakePersisting();
+    await runMission([runChainStream(VALID_RUN_CHAIN_BRIEF)], {
+      chainFake: chain,
+      solFake: makeSolFakeByPhase({ "post-chain": "block" }),
+    });
+    const { record } = readMission();
+    assert.equal(record.disposition, "sol-blocked");
+    const { roundRecord, chainJson } = readInnerChain(chain);
+    assert.equal(roundRecord.auditVerdict, "block", "the block verdict is persisted");
+    assert.equal(roundRecord.auditBlocked, true, "the blocked state is persisted as measured-blocked");
+    assert.equal(roundRecord.auditShadowDisposition, "audit-sample-skipped");
+    assert.equal(chainJson.records[0].auditBlocked, true);
+  });
+
+  it("a fail-open sampled-only post-chain gate (Sol unavailable) persists the shadow trace without blocking (finding 5)", async () => {
+    const chain = makeChainFakePersisting();
+    await runMission([runChainStream(VALID_RUN_CHAIN_BRIEF), finishStream("recommend-accept")], {
+      chainFake: chain,
+      solFake: makeSolFakeByPhase({
+        "post-chain": () => { throw new Error("seat unavailable"); },
+      }),
+    });
+    const { record } = readMission();
+    assert.equal(record.disposition, "recommend-accept", "a sampled-only unavailability is the single fail-open");
+    const { roundRecord } = readInnerChain(chain);
+    assert.equal(roundRecord.auditVerdict, null, "no authoritative verdict was recorded");
+    assert.equal(roundRecord.auditBlocked, false, "the fail-open is not a block");
+    assert.equal(roundRecord.auditShadowDisposition, "audit-sample-skipped",
+      "the no-Sol shadow disposition is the fail-open trace");
+  });
+
+  it("a missing target round leaves the durable records untouched \u2014 no chain state written by the seam (finding 5)", async () => {
+    const chain = makeChainFakePersisting(false); // the seam writes NO chain files
+    await runMission([runChainStream(VALID_RUN_CHAIN_BRIEF), finishStream("recommend-accept")], {
+      chainFake: chain,
+    });
+    const { record } = readMission();
+    assert.equal(record.disposition, "recommend-accept", "the mission completes normally");
+    const chainsDir = path.join(stateDir, "chains");
+    const created = fs.existsSync(chainsDir) ? fs.readdirSync(chainsDir) : [];
+    assert.equal(created.length, 0, "no chain state exists \u2014 nothing to mutate");
+  });
+
+  it("a missing target round leaves the durable records untouched \u2014 chain.json without the round file (finding 5)", async () => {
+    const chain = makeChainFakePersisting();
+    const originalRun = chain.run.bind(chain);
+    chain.run = async (cwdArg, input, opts) => {
+      const result = await originalRun(cwdArg, input, opts);
+      // Remove the round-N.json the fake wrote: the terminal record exists on
+      // chain.json but the round file is absent \u2014 the persistence must leave
+      // everything untouched rather than guess.
+      const id = input?.flags?.["chain-id"];
+      fs.rmSync(path.join(stateDir, "chains", id, "round-1.json"), { force: true });
+      return result;
+    };
+    await runMission([runChainStream(VALID_RUN_CHAIN_BRIEF), finishStream("recommend-accept")], {
+      chainFake: chain,
+    });
+    const { record } = readMission();
+    assert.equal(record.disposition, "recommend-accept");
+    const { roundRecord, chainJson } = readInnerChain(chain);
+    assert.equal(roundRecord, null, "the absent round file stays absent");
+    assert.equal(chainJson.records[0].auditVerdict, undefined,
+      "chain.json's records are not mutated when the round file cannot be read");
+    assert.equal(chainJson.records[0].auditBlocked, undefined);
+    assert.equal(chainJson.records[0].auditShadowDisposition, undefined);
   });
 });

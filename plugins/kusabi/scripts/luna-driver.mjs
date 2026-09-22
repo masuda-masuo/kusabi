@@ -75,7 +75,7 @@
 
 import fs from "node:fs";
 import path from "node:path";
-import { stateDirFor, writeJson } from "./state-paths.mjs";
+import { stateDirFor, readJson, writeJson } from "./state-paths.mjs";
 import { parseCoordinatorOutput } from "./coordinator-parse.mjs";
 import { buildAuditEnvelope, truncateEvidenceText } from "./audit-envelope.mjs";
 import { hasSectionHeading, parseDeliverables } from "./brief-parsing.mjs";
@@ -156,7 +156,17 @@ export function resolveMissionSeat(requested, def, role, allowSubstitute) {
       `loud in mission records and output.`,
     );
   }
-  return { provider, model, requested: def.model, actual: model, substituted };
+  // kusabi #532: exact seat provenance carries the reasoning effort (the
+  // codex seat's configured effort, defaulting to "high" for the luna mode);
+  // an explicit input value is preserved verbatim, never overwritten.
+  return {
+    provider,
+    model,
+    requested: def.model,
+    actual: model,
+    substituted,
+    reasoningEffort: requested?.reasoningEffort ?? "high",
+  };
 }
 
 /**
@@ -515,6 +525,36 @@ export async function runLunaMission(input) {
     };
     saveMissionRecord(missionDir, record);
   };
+  // A deterministic pre-flight refusal of a Luna-authored brief is BOTH a
+  // coordinator error and a brief correction (kusabi #532 criterion 2): the
+  // counters agree by construction — one refusal, one of each — so a
+  // pure-brief-correction mission never double-counts elsewhere.
+  const recordBriefCorrection = (detail) => {
+    record = {
+      ...record,
+      coordinatorErrors: (record.coordinatorErrors ?? 0) + 1,
+      briefCorrections: (record.briefCorrections ?? 0) + 1,
+      coordinatorErrorsDetails: [
+        ...(Array.isArray(record.coordinatorErrorsDetails) ? record.coordinatorErrorsDetails : []),
+        { at: new Date().toISOString(), detail },
+      ],
+    };
+    saveMissionRecord(missionDir, record);
+  };
+  // Only interventions the system can OBSERVE are recorded (kusabi #532
+  // criterion 2): escalate_to_host, overrides, and explicit manifest entries.
+  // Manual container work is never inferred.
+  const recordHostIntervention = (detail) => {
+    record = {
+      ...record,
+      hostInterventions: (record.hostInterventions ?? 0) + 1,
+      hostInterventionDetails: [
+        ...(Array.isArray(record.hostInterventionDetails) ? record.hostInterventionDetails : []),
+        { at: new Date().toISOString(), detail },
+      ],
+    };
+    saveMissionRecord(missionDir, record);
+  };
   const recordProbe = (req, output) => {
     const capped = capProbeOutput(output);
     record = {
@@ -566,6 +606,50 @@ export async function runLunaMission(input) {
   const recordGates = (gates) => {
     record = { ...record, auditGates: gates };
     saveMissionRecord(missionDir, record);
+  };
+
+  /**
+   * Mirror a fired post-chain gate's audit columns onto the durable inner
+   * chain round the gate judged (kusabi #532 adjudication finding 5).  The
+   * round record lives in TWO durable mirrors \u2014 `round-<N>.json` and the
+   * terminal entry of `chain.json`'s `records` array (the array the metrics
+   * ingest reads) \u2014 and both are updated through the existing safe
+   * read/update/write boundary (readJson / atomic writeJson).  The mission
+   * gate record stays authoritative; this is a best-effort mirror that never
+   * changes the gate decision.
+   *
+   * Only when the target round is POSITIVELY identified: the chain's
+   * terminal record must be an object with a numeric `round`, and both
+   * `chain.json` and the `round-<N>.json` file must exist and parse.
+   * Absent or unreadable legacy records are left untouched.
+   */
+  const persistRoundAuditColumns = ({ chainId, gate, outcome }) => {
+    if (!gate || typeof gate !== "object") return;
+    const chainDir = path.join(stateDir, "chains", chainId);
+    const chainJson = readJson(path.join(chainDir, "chain.json"));
+    if (!chainJson || typeof chainJson !== "object") return;
+    const records = Array.isArray(chainJson.records) ? chainJson.records : [];
+    const terminal = records[records.length - 1];
+    if (!terminal || typeof terminal !== "object" || typeof terminal.round !== "number") return;
+    const roundRecord = readJson(path.join(chainDir, `round-${terminal.round}.json`));
+    if (!roundRecord || typeof roundRecord !== "object") return;
+
+    const auditColumns = {
+      auditVerdict: typeof gate.verdict === "string" ? gate.verdict : null,
+      auditBlocked: outcome === "sol-blocked" || outcome === "block",
+      auditShadowDisposition:
+        typeof gate.shadowDisposition === "string" ? gate.shadowDisposition : null,
+    };
+    writeJson(path.join(chainDir, `round-${terminal.round}.json`), {
+      ...roundRecord,
+      ...auditColumns,
+    });
+    writeJson(path.join(chainDir, "chain.json"), {
+      ...chainJson,
+      records: records.map((r, i) =>
+        i === records.length - 1 ? { ...r, ...auditColumns } : r,
+      ),
+    });
   };
 
   /**
@@ -713,7 +797,7 @@ export async function runLunaMission(input) {
             break mainLoop;
           }
           if (!validChainBrief(req.brief)) {
-            recordError(`${req.action} refused: the inner chain brief fails deterministic validation`);
+            recordBriefCorrection(`${req.action} refused: the inner chain brief fails deterministic validation`);
             continue;
           }
           // PRE-DISPATCH GATE: the deterministic driver, never Luna, decides
@@ -747,7 +831,10 @@ export async function runLunaMission(input) {
             chainOutput = await runChainLifecycle(
               cwd,
               {
-                flags: { container, "chain-id": chainId, keepServe: true },
+                // The inner chain is linked to the mission (kusabi #532
+                // criterion 11): missionId is emitted on chain.json only in
+                // Luna mode — plain chains never carry the key.
+                flags: { container, "chain-id": chainId, keepServe: true, missionId },
                 text: req.brief,
                 orchestrator: null,
               },
@@ -772,6 +859,12 @@ export async function runLunaMission(input) {
           }
           // POST-CHAIN GATE: after each inner-chain terminal result.
           const post = await runGate({ phase: "post-chain", reason: null });
+          // The gate judged THIS inner chain: mirror its audit columns onto
+          // the durable round the chain just completed (best-effort \u2014 a
+          // missing/unreadable legacy round stays untouched; the mission gate
+          // record remains authoritative).  Runs before any outcome branch so
+          // clear / rework / block / fail-closed all leave the same trace.
+          persistRoundAuditColumns({ chainId, gate: post.gate, outcome: post.outcome });
           if (post.outcome === "cancelled") {
             outcome = { disposition: "cancelled", recommendation: null, handoffReason: null, reason: "stop requested" };
             break mainLoop;
@@ -818,7 +911,11 @@ export async function runLunaMission(input) {
         case "escalate_to_host": {
           // A host escalation is NOT approval-shaped — it is never held
           // behind an approval gate (escalate_to_host must always be able to
-          // write the host recommendation).
+          // write the host recommendation).  The handoff IS an observed host
+          // intervention and is recorded explicitly (kusabi #532 criterion 2).
+          recordHostIntervention(
+            `escalate_to_host: ${req.reason ?? "host judgement required"}`,
+          );
           outcome = {
             disposition: "host-handoff",
             recommendation: null,
@@ -876,12 +973,26 @@ export async function runLunaMission(input) {
 
   // ---- terminal finalisation (sticky by construction: it happens once) ----
   const terminationReason = outcome.handoffReason ?? outcome.reason ?? null;
+  // Terminal wall-clock timing (kusabi #532 criterion 2): finishedAt is set
+  // on terminal completion, and latencySeconds is the recorded wall clock
+  // (finishedAt − startedAt); only when the durable startedAt is parseable
+  // — a record without one gets finishedAt but never a fabricated latency.
+  const finishedAt = new Date().toISOString();
+  let latencySeconds;
+  if (typeof record.startedAt === "string" && record.startedAt) {
+    const startedMs = Date.parse(record.startedAt);
+    if (Number.isFinite(startedMs)) {
+      latencySeconds = (Date.parse(finishedAt) - startedMs) / 1000;
+    }
+  }
   record = {
     ...record,
     status: "completed",
     disposition: outcome.disposition,
     recommendation: outcome.recommendation,
     terminationReason,
+    finishedAt,
+    ...(latencySeconds !== undefined ? { latencySeconds } : {}),
   };
   saveMissionRecord(missionDir, record);
   finalizeMissionControl(missionDir, outcome.disposition === "cancelled" ? "cancelled" : "completed");

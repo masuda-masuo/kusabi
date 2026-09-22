@@ -89,7 +89,11 @@ CREATE TABLE IF NOT EXISTS chain (
   brief_has_deliverables INTEGER,
   brief_deliverable_count INTEGER,
   brief_has_smoke INTEGER,
-  brief_smoke_count INTEGER
+  brief_smoke_count INTEGER,
+  -- kusabi #532: the mission id of the luna mission that owns this inner
+  -- chain.  Emitted only under Luna mode (persistChainState with missionId);
+  -- a plain chain keeps NULL — absence is a fact, never false.
+  mission_id TEXT
 );
 -- orch_model / orch_date are stratification keys, not incidental metadata
 -- (see docs/design/phase-chain.md 3.5.8 — orchestrator model is perfectly
@@ -140,6 +144,14 @@ CREATE TABLE IF NOT EXISTS round (
   review_in INTEGER,
   review_out INTEGER,
   review_cost REAL,
+  -- kusabi #532: the round's live Sol audit-gate record, ingested verbatim
+  -- from the durable round record.  audit_verdict / audit_shadow_disposition
+  -- are TEXT and stay NULL when the round predates the field;
+  -- audit_blocked is three-valued (0 = measured not-blocked, 1 = blocked,
+  -- NULL = never recorded).
+  audit_verdict TEXT,
+  audit_blocked INTEGER,
+  audit_shadow_disposition TEXT,
   PRIMARY KEY (chain_id, round)
 );
 
@@ -195,7 +207,14 @@ CREATE TABLE IF NOT EXISTS job (
   usage_reasoning INTEGER,
   usage_cache_read INTEGER,
   usage_cache_write INTEGER,
-  usage_cost REAL
+  usage_cost REAL,
+  -- kusabi #532: exact seat provenance for the invocation that produced the
+  -- job, stored verbatim; absent on records written before the columns
+  -- existed (NULL, never a guessed default).
+  provider TEXT,
+  model_exact TEXT,
+  reasoning_effort TEXT,
+  substituted INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_job_started_ms ON job(started_ms);
 
@@ -226,6 +245,68 @@ CREATE TABLE IF NOT EXISTS cursor_session_counter (
   session_id TEXT PRIMARY KEY,
   total_output_tokens INTEGER,
   ts TEXT
+);
+
+-- kusabi #532: luna mission rows.  A mission is a luna-arm dispatch surface
+-- (coordinator + auditor codex seats, exact provenance, timings, tokens and
+-- host-facing recommendation).  Every value is stored verbatim; an absent
+-- field is SQL NULL, never coerced to 0 or to a guessed value (the existing
+-- three-state discipline).
+CREATE TABLE IF NOT EXISTS mission (
+  mission_id TEXT PRIMARY KEY,
+  workspace_slug TEXT,
+  container TEXT,
+  status TEXT,
+  started_at TEXT,
+  started_ms INTEGER,
+  finished_at TEXT,
+  finished_ms INTEGER,
+  latency_seconds REAL,
+  coordinator_provider TEXT,
+  coordinator_model TEXT,
+  coordinator_model_requested TEXT,
+  coordinator_model_actual TEXT,
+  coordinator_reasoning_effort TEXT,
+  coordinator_substituted INTEGER,
+  auditor_provider TEXT,
+  auditor_model TEXT,
+  auditor_model_requested TEXT,
+  auditor_model_actual TEXT,
+  auditor_reasoning_effort TEXT,
+  auditor_substituted INTEGER,
+  coordinator_errors INTEGER,
+  brief_corrections INTEGER,
+  host_interventions INTEGER,
+  tokens_input INTEGER,
+  tokens_output INTEGER,
+  tokens_reasoning INTEGER,
+  tokens_cache_read INTEGER,
+  tokens_cache_write INTEGER,
+  cost REAL,
+  disposition TEXT,
+  recommendation TEXT
+);
+
+-- kusabi #532: one row per recorded Sol audit gate of a mission.  The gate
+-- carries its consultation origin, verdict, disposition, the normalized
+-- policyInput it was evaluated with (JSON, replayable verbatim) and the
+-- deterministic shadow disposition computed with solVerdict: null — an
+-- observational counterfactual that never changes live gating.
+CREATE TABLE IF NOT EXISTS audit_gate (
+  gate_id TEXT,
+  mission_id TEXT,
+  phase TEXT,
+  origin TEXT,
+  verdict TEXT,
+  disposition TEXT,
+  reason TEXT,
+  required INTEGER,
+  mandatory INTEGER,
+  sampled INTEGER,
+  policy_input TEXT,
+  shadow_disposition TEXT,
+  recorded_at TEXT,
+  PRIMARY KEY (gate_id, mission_id)
 );
 `;
 
@@ -299,6 +380,17 @@ export function openMetricsDb(dbPath) {
   // NULL, which the report surfaces as "unknown" / absent, never as completed.
   ensureColumn(db, "round", "stop_reason", "TEXT");
   ensureColumn(db, "job", "stop_reason", "TEXT");
+  // Migrations for databases created before the #532 provenance columns and
+  // mission linkage existed.  Old rows keep NULL — absence is a fact, never
+  // false or a guessed default (the three-state discipline).
+  ensureColumn(db, "job", "provider", "TEXT");
+  ensureColumn(db, "job", "model_exact", "TEXT");
+  ensureColumn(db, "job", "reasoning_effort", "TEXT");
+  ensureColumn(db, "job", "substituted", "INTEGER");
+  ensureColumn(db, "chain", "mission_id", "TEXT");
+  ensureColumn(db, "round", "audit_verdict", "TEXT");
+  ensureColumn(db, "round", "audit_blocked", "INTEGER");
+  ensureColumn(db, "round", "audit_shadow_disposition", "TEXT");
   return db;
 }
 
@@ -476,13 +568,13 @@ export function upsertChain(db, row) {
        model_chain_json, max_rounds, strategized,
        totals_input, totals_output, totals_reasoning, totals_cache_read, totals_cache_write, totals_cost,
        brief_text, brief_chars, brief_lines, brief_bullets,
-       brief_has_deliverables, brief_deliverable_count, brief_has_smoke, brief_smoke_count)
+       brief_has_deliverables, brief_deliverable_count, brief_has_smoke, brief_smoke_count, mission_id)
     VALUES
       ($chainId, $workspaceSlug, $orchModel, $orchSession, $orchDate, $backend, $baseSha, $model,
        $modelChainJson, $maxRounds, $strategized,
        $totalsInput, $totalsOutput, $totalsReasoning, $totalsCacheRead, $totalsCacheWrite, $totalsCost,
        $briefText, $briefChars, $briefLines, $briefBullets,
-       $briefHasDeliverables, $briefDeliverableCount, $briefHasSmoke, $briefSmokeCount)
+       $briefHasDeliverables, $briefDeliverableCount, $briefHasSmoke, $briefSmokeCount, $missionId)
   `).run({
     chainId: row.chainId,
     workspaceSlug: row.workspaceSlug ?? null,
@@ -512,6 +604,9 @@ export function upsertChain(db, row) {
     briefDeliverableCount: row.briefDeliverableCount ?? null,
     briefHasSmoke: row.briefHasSmoke ?? null,
     briefSmokeCount: row.briefSmokeCount ?? null,
+    // Mission linkage (kusabi #532): the owning luna mission's id, or NULL
+    // for a plain chain — absence is a fact, never false.
+    missionId: row.missionId ?? null,
   });
 }
 
@@ -528,11 +623,13 @@ export function upsertRound(db, row) {
     INSERT OR REPLACE INTO round
       (chain_id, round, started_at, started_ms, backend, review_backend, model_entry, tier_before, tier_after,
        verdict, verdict_source, probes_green, worktree_changed, disposition, rework_count, review_seat_failures, findings_text,
-       implement_in, implement_out, implement_cost, review_in, review_out, review_cost, stop_reason)
+       implement_in, implement_out, implement_cost, review_in, review_out, review_cost, stop_reason,
+       audit_verdict, audit_blocked, audit_shadow_disposition)
     VALUES
       ($chainId, $round, $startedAt, $startedMs, $backend, $reviewBackend, $modelEntry, $tierBefore, $tierAfter,
        $verdict, $verdictSource, $probesGreen, $worktreeChanged, $disposition, $reworkCount, $reviewSeatFailures, $findingsText,
-       $implementIn, $implementOut, $implementCost, $reviewIn, $reviewOut, $reviewCost, $stopReason)
+       $implementIn, $implementOut, $implementCost, $reviewIn, $reviewOut, $reviewCost, $stopReason,
+       $auditVerdict, $auditBlocked, $auditShadowDisposition)
   `).run({
     chainId: row.chainId,
     round: row.round,
@@ -581,6 +678,13 @@ export function upsertRound(db, row) {
     // record predates the field.  Consumers fail closed on any value outside
     // the closed set / "unknown".
     stopReason: row.stopReason ?? null,
+    // Round-level Sol audit record (kusabi #532): the live gate's verdict,
+    // blocked flag and shadow disposition, ingested verbatim from the durable
+    // round record — NULL when the round predates the field.  auditBlocked
+    // keeps measured 0 distinct from absent NULL.
+    auditVerdict: row.auditVerdict ?? null,
+    auditBlocked: row.auditBlocked ?? null,
+    auditShadowDisposition: row.auditShadowDisposition ?? null,
   });
 }
 
@@ -657,13 +761,15 @@ export function upsertJob(db, row) {
        started_at, started_ms, finished_at, finished_ms, duration_seconds,
        steps, error, usage_available, usage_model,
        usage_input, usage_output, usage_reasoning,
-       usage_cache_read, usage_cache_write, usage_cost, stop_reason)
+       usage_cache_read, usage_cache_write, usage_cost, stop_reason,
+       provider, model_exact, reasoning_effort, substituted)
     VALUES
       ($jobId, $workspaceSlug, $kind, $title, $status, $phase, $backend, $modelEntry,
        $startedAt, $startedMs, $finishedAt, $finishedMs, $durationSeconds,
        $steps, $error, $usageAvailable, $usageModel,
        $usageInput, $usageOutput, $usageReasoning,
-       $usageCacheRead, $usageCacheWrite, $usageCost, $stopReason)
+       $usageCacheRead, $usageCacheWrite, $usageCost, $stopReason,
+       $provider, $modelExact, $reasoningEffort, $substituted)
   `).run({
     jobId: row.jobId,
     workspaceSlug: row.workspaceSlug ?? null,
@@ -694,6 +800,13 @@ export function upsertJob(db, row) {
     // job record predates the field.  Consumers fail closed on any value
     // outside the closed set / "unknown".
     stopReason: row.stopReason ?? null,
+    // Exact seat provenance (kusabi #532): the invocation's provider, exact
+    // model, reasoning effort and substitution state, stored verbatim —
+    // absent on records written before the columns existed.
+    provider: row.provider ?? null,
+    modelExact: row.modelExact ?? null,
+    reasoningEffort: row.reasoningEffort ?? null,
+    substituted: row.substituted ?? null,
   });
 }
 
@@ -829,4 +942,113 @@ export function getTurn(db, requestId) {
 
 export function countRows(db, table) {
   return db.prepare(`SELECT COUNT(*) as c FROM ${table}`).get().c;
+}
+// ---------------------------------------------------------------------------
+// mission — kusabi #532: one row per luna mission (the mission record written
+// by mission-store.mjs createMission plus the #532 additive fields).
+// ---------------------------------------------------------------------------
+
+/**
+ * Upsert one mission row.  Every field is stored verbatim with the NULL
+ * discipline: an absent field stores NULL, a measured 0 stays 0 (e.g.
+ * host_interventions: 0 is a fact, never coerced to NULL).
+ *
+ * @param {import("node:sqlite").DatabaseSync} db
+ * @param {object} row
+ */
+export function upsertMission(db, row) {
+  db.prepare(`
+    INSERT OR REPLACE INTO mission
+      (mission_id, workspace_slug, container, status,
+       started_at, started_ms, finished_at, finished_ms, latency_seconds,
+       coordinator_provider, coordinator_model, coordinator_model_requested,
+       coordinator_model_actual, coordinator_reasoning_effort, coordinator_substituted,
+       auditor_provider, auditor_model, auditor_model_requested,
+       auditor_model_actual, auditor_reasoning_effort, auditor_substituted,
+       coordinator_errors, brief_corrections, host_interventions,
+       tokens_input, tokens_output, tokens_reasoning, tokens_cache_read, tokens_cache_write,
+       cost, disposition, recommendation)
+    VALUES
+      ($missionId, $workspaceSlug, $container, $status,
+       $startedAt, $startedMs, $finishedAt, $finishedMs, $latencySeconds,
+       $coordinatorProvider, $coordinatorModel, $coordinatorModelRequested,
+       $coordinatorModelActual, $coordinatorReasoningEffort, $coordinatorSubstituted,
+       $auditorProvider, $auditorModel, $auditorModelRequested,
+       $auditorModelActual, $auditorReasoningEffort, $auditorSubstituted,
+       $coordinatorErrors, $briefCorrections, $hostInterventions,
+       $tokensInput, $tokensOutput, $tokensReasoning, $tokensCacheRead, $tokensCacheWrite,
+       $cost, $disposition, $recommendation)
+  `).run({
+    missionId: row.missionId,
+    workspaceSlug: row.workspaceSlug ?? null,
+    container: row.container ?? null,
+    status: row.status ?? null,
+    startedAt: row.startedAt ?? null,
+    startedMs: row.startedMs ?? null,
+    finishedAt: row.finishedAt ?? null,
+    finishedMs: row.finishedMs ?? null,
+    latencySeconds: row.latencySeconds ?? null,
+    coordinatorProvider: row.coordinatorProvider ?? null,
+    coordinatorModel: row.coordinatorModel ?? null,
+    coordinatorModelRequested: row.coordinatorModelRequested ?? null,
+    coordinatorModelActual: row.coordinatorModelActual ?? null,
+    coordinatorReasoningEffort: row.coordinatorReasoningEffort ?? null,
+    coordinatorSubstituted: row.coordinatorSubstituted ?? null,
+    auditorProvider: row.auditorProvider ?? null,
+    auditorModel: row.auditorModel ?? null,
+    auditorModelRequested: row.auditorModelRequested ?? null,
+    auditorModelActual: row.auditorModelActual ?? null,
+    auditorReasoningEffort: row.auditorReasoningEffort ?? null,
+    auditorSubstituted: row.auditorSubstituted ?? null,
+    coordinatorErrors: row.coordinatorErrors ?? null,
+    briefCorrections: row.briefCorrections ?? null,
+    hostInterventions: row.hostInterventions ?? null,
+    tokensInput: row.tokensInput ?? null,
+    tokensOutput: row.tokensOutput ?? null,
+    tokensReasoning: row.tokensReasoning ?? null,
+    tokensCacheRead: row.tokensCacheRead ?? null,
+    tokensCacheWrite: row.tokensCacheWrite ?? null,
+    cost: row.cost ?? null,
+    disposition: row.disposition ?? null,
+    recommendation: row.recommendation ?? null,
+  });
+}
+
+// ---------------------------------------------------------------------------
+// audit_gate — kusabi #532: one row per recorded Sol audit gate of a mission.
+// ---------------------------------------------------------------------------
+
+/**
+ * Upsert one audit-gate row (primary key (gate_id, mission_id), so a
+ * re-upsert replaces instead of duplicating).  The normalized policyInput is
+ * stored as JSON verbatim so the recorded decision replays offline; the
+ * shadow_disposition is the deterministic counterfactual computed with
+ * solVerdict: null.  An absent field stays NULL.
+ *
+ * @param {import("node:sqlite").DatabaseSync} db
+ * @param {object} row
+ */
+export function upsertAuditGate(db, row) {
+  db.prepare(`
+    INSERT OR REPLACE INTO audit_gate
+      (gate_id, mission_id, phase, origin, verdict, disposition, reason,
+       required, mandatory, sampled, policy_input, shadow_disposition, recorded_at)
+    VALUES
+      ($gateId, $missionId, $phase, $origin, $verdict, $disposition, $reason,
+       $required, $mandatory, $sampled, $policyInput, $shadowDisposition, $recordedAt)
+  `).run({
+    gateId: row.gateId,
+    missionId: row.missionId,
+    phase: row.phase ?? null,
+    origin: row.origin ?? null,
+    verdict: row.verdict ?? null,
+    disposition: row.disposition ?? null,
+    reason: row.reason ?? null,
+    required: row.required ?? null,
+    mandatory: row.mandatory ?? null,
+    sampled: row.sampled ?? null,
+    policyInput: row.policyInput ?? null,
+    shadowDisposition: row.shadowDisposition ?? null,
+    recordedAt: row.recordedAt ?? null,
+  });
 }

@@ -57,7 +57,7 @@ export function persistChainState({
   reworkModel = null, reworkModelChain = null, reworkBackend = null,
   maxRounds, brief, orchestrator, records, baseSha, chainTotals,
   strategized, chainFollowupDraft, interrupted = false, verifyBaseline = null,
-  strategy = null, requirementsFile = null,
+  strategy = null, requirementsFile = null, missionId = null,
 }) {
   if (interrupted) {
     roundRecord.interrupted = true;
@@ -111,6 +111,10 @@ export function persistChainState({
     // Incremental TDD strategy (kusabi #502): strategy and requirements file
     // persisted on chain.json so chain-show renders strategy info.
     ...(strategy ? { strategy, requirementsFile } : {}),
+    // Mission linkage (kusabi #532): the owning luna mission's id, emitted
+    // ONLY under Luna mode.  A plain chain serialization is byte-identical
+    // when the key is absent — it must never appear as null/false.
+    ...(missionId ? { missionId } : {}),
   });
 }
 

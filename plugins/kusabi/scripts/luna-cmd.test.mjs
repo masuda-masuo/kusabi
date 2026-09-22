@@ -426,3 +426,103 @@ describe("luna CLI surfaces (kusabi #530 criteria 1, 2, 9, 10)", () => {
     assert.deepEqual(parseArgs(["--container", "cid"]), { flags: { container: "cid" }, text: "" });
   });
 });
+
+// ---------------------------------------------------------------------------
+// kusabi #532 criteria 3 and 10 — the mission show surface stays additive:
+// a pre-#532 mission record renders byte-identically to the legacy digest,
+// and a #532 record gains the provenance banner + recorded gate
+// consultation origins without losing any legacy line.
+// ---------------------------------------------------------------------------
+
+describe("mission show observability digest (kusabi #532 criteria 3 and 10)", () => {
+  let root;
+  let cwd;
+  let previousStateDir;
+  let stateDir;
+
+  beforeEach(() => {
+    root = makeTemp("kusabi-532-luna-show-");
+    cwd = path.join(root, "work");
+    fs.mkdirSync(cwd, { recursive: true });
+    previousStateDir = process.env.KUSABI_STATE_DIR;
+    process.env.KUSABI_STATE_DIR = path.join(root, "state");
+    stateDir = stateDirFor(cwd);
+  });
+
+  afterEach(() => {
+    if (previousStateDir === undefined) delete process.env.KUSABI_STATE_DIR;
+    else process.env.KUSABI_STATE_DIR = previousStateDir;
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  function writeMission(id, record) {
+    const missionDir = path.join(stateDir, "missions", id);
+    fs.mkdirSync(missionDir, { recursive: true });
+    writeJson(path.join(missionDir, "control.json"), { missionId: id, pid: 1, status: "completed" });
+    writeJson(path.join(missionDir, "mission.json"), record);
+    return missionDir;
+  }
+
+  const legacyRecord = (id) => ({
+    missionId: id,
+    container: "test-cid",
+    status: "completed",
+    disposition: "recommend-accept",
+    recommendation: "recommend-accept",
+    coordinator: { provider: "codex", model: "gpt-5.6-luna", requested: "gpt-5.6-luna", actual: "gpt-5.6-luna", substituted: false },
+    auditor: { provider: "codex", model: "gpt-5.6-sol", substituted: false },
+    attempts: [{ index: 1, chainId: "chain-show1", status: "completed" }],
+    chains: ["chain-show1"],
+    coordinatorErrors: 0,
+  });
+
+  it("a pre-#532 record renders byte-identically to the legacy digest (existing luna-show unchanged)", async () => {
+    const mod = await lunaCmd();
+    writeMission("mission-legacyshow", legacyRecord("mission-legacyshow"));
+    const snapshot = (await import("./luna-wait.mjs")).readMissionSnapshot(
+      path.join(stateDir, "missions"),
+      "mission-legacyshow",
+    );
+    const legacyDigest = mod.renderMissionShow(snapshot);
+    const text = await mod.cmdLunaShow(cwd, { flags: {}, text: "mission-legacyshow" });
+    assert.equal(text, legacyDigest, "a legacy mission must render exactly as before #532");
+  });
+
+  it("a #532 record renders the provenance banner and the recorded gate consultation origins, additively", async () => {
+    const mod = await lunaCmd();
+    const record = legacyRecord("mission-obsshow");
+    record.coordinator.reasoningEffort = "high";
+    record.auditor.reasoningEffort = "high";
+    record.auditGates = [
+      { gateId: "gate-1", phase: "pre-dispatch", origin: "sampled", verdict: "clear", disposition: "verdict-recorded", shadowDisposition: "audit-sample-skipped" },
+      { gateId: "gate-2", phase: "pre-accept", origin: "policy-mandated", verdict: "clear", disposition: "verdict-recorded", shadowDisposition: "sol-blocked" },
+    ];
+    writeMission("mission-obsshow", record);
+
+    const text = await mod.cmdLunaShow(cwd, { flags: {}, text: "mission-obsshow" });
+    // Legacy lines survive.
+    assert.match(text, /Coordinator seat: codex\/gpt-5\.6-luna \(substituted: false\)/);
+    assert.match(text, /chain-show1/);
+    // The #532 provenance banner is appended: reasoning effort per seat and
+    // the recorded consultation origins of every gate.
+    assert.match(text, /reasoning effort: high/);
+    assert.match(text, /gate-1/);
+    assert.match(text, /gate-2/);
+    assert.match(text, /sampled/);
+    assert.match(text, /policy-mandated/);
+  });
+
+  it("luna-show stays read-only for #532 records: rendering never writes mission state", async () => {
+    const mod = await lunaCmd();
+    const missionDir = writeMission("mission-readonlyshow", legacyRecord("mission-readonlyshow"));
+    const filesBefore = () =>
+      fs.readdirSync(missionDir, { recursive: true })
+        .map((f) => path.join(missionDir, f))
+        .filter((p) => fs.statSync(p).isFile())
+        .sort();
+    const before = filesBefore();
+    await mod.cmdLunaShow(cwd, { flags: {}, text: "mission-readonlyshow" });
+    const after = filesBefore();
+    assert.deepEqual(after, before, "a read-only digest must not create, delete or rewrite mission state");
+  });
+});
