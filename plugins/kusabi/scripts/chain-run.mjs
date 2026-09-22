@@ -36,6 +36,7 @@ import {
   runFrozenProbe,
   runCollectedProbe,
   summariseOracleViolations,
+  ORACLE_UNCHECKED,
 } from "./chain-probes.mjs";
 import {
   collectChangeScope,
@@ -300,8 +301,18 @@ export async function runImplementPhase({
  *
  * Returns probe results and side data needed by the review phase, plus
  * `oracleViolation` — the P5/P6 marker that routes the round to `escalate`
- * (kusabi #197).  It is `false` when no oracle probe was violated, and a
- * string naming every violation when one was.
+ * (kusabi #197).  It is `false` when the oracle probes executed and none was
+ * violated, a string naming every violation when one was, and
+ * `ORACLE_UNCHECKED` when the oracle probes did not execute at all (kusabi
+ * #541).  The companion `oracleUnchecked` boolean carries the last case into
+ * the disposition boundary separately from the marker string.
+ *
+ * The auxiliary `collectChangeScope` runs in its OWN try/catch, isolated
+ * from the P1–P6 block (kusabi #541): change scope is review CONTEXT, not a
+ * deterministic acceptance gate, so a collection failure must never starve
+ * the gates that decide the round.  Its failure is recorded as a named
+ * failed diagnostic, never as a substitute for a P1–P6 result, and
+ * `changeScope` stays null.
  */
 export async function runProbePhase({ baseSha, container, brief, callTool, worktreeBaseline, verifyBaseline }) {
   const chainDeliverables = parseDeliverables(brief);
@@ -315,16 +326,35 @@ export async function runProbePhase({ baseSha, container, brief, callTool, workt
   let chainStatusTruncation = null;
   let changeScope = null;
 
-  try {
-    if (baseSha) {
+  // ---- auxiliary change-scope collection (review context, kusabi #541) ----
+  // Deliberately OUTSIDE the P1–P6 try block below.  `changeScope` is review
+  // input, not an acceptance gate: when its injection, execution, parsing or
+  // contract validation throws (the sunaba #915 incidents: 5 of 142 measured
+  // September rounds, two chains continued past gates that never ran), the
+  // failure must not skip P1–P6.  It is preserved as a NAMED failed
+  // diagnostic distinct from the six deterministic probes, and no synthetic
+  // change set is fabricated: a base SHA that needed collection leaves
+  // `changeScope` null — there is deliberately no porcelain fallback, and
+  // the review proceeds with the explicit "unavailable" diagnostic visible
+  // while the acceptance gates come from the real P1–P6 results below.
+  if (baseSha) {
+    try {
       changeScope = await collectChangeScope({
         callTool,
         container,
         base: baseSha,
         head: "HEAD",
       });
+    } catch (changeScopeErr) {
+      probeResults.push({
+        probe: "change-scope (review context)",
+        passed: false,
+        detail: "change-scope collection failed: " + String(changeScopeErr?.message ?? changeScopeErr),
+      });
     }
+  }
 
+  try {
     const p1Result = await runHeadCleanProbe({ baseSha, callTool, container, sourceLabel: "chain" });
     probeResults.push(p1Result);
 
@@ -384,7 +414,16 @@ export async function runProbePhase({ baseSha, container, brief, callTool, workt
     });
     probeResults.push(p6Result);
 
-    probesGreen = probeResults.every(function (p) { return p.passed; });
+    // Gate truth comes ONLY from the six deterministic probes P1\u2013P6 (kusabi
+    // #541 F1): the change-scope diagnostic recorded above is review CONTEXT,
+    // never an acceptance gate, so a failed auxiliary collection must never
+    // flip probesGreen.  All six must be present AND passing; a sequence that
+    // stopped early (fewer than six) is not green either.
+    const deterministicResults = probeResults.filter(function (p) {
+      return p && /^P[1-6]:/.test(p.probe);
+    });
+    probesGreen = deterministicResults.length === 6
+      && deterministicResults.every(function (p) { return p.passed; });
   } catch (probeErr) {
     probeResults.push({ probe: "sunaba-rpc", passed: false, detail: String(probeErr) });
     probesGreen = false;
@@ -394,6 +433,24 @@ export async function runProbePhase({ baseSha, container, brief, callTool, workt
   // empty strings, never errors).
   const baseCtx = await collectContainerBaseContext(callTool, container);
 
+// Did the P5/P6 oracle probes actually run this round?  Both are PURE (P5
+  // reads the change set P3 computed, P6 reads the count P2 measured), so
+  // they execute exactly when the P1–P6 sequence above reached them — a
+  // throw anywhere in P1–P4 means neither did.  The pair counts as executed
+  // only when BOTH results are present (kusabi #541 F2): a
+  // P5-result/P6-throw (or the reverse) leaves PARTIAL evidence whose other
+  // half never measured — never "checked and clean".  A partial pair
+  // persists the unchecked marker and flag so the disposition boundary
+  // routes it as unchecked.  The distinction is the whole point of kusabi
+  // #541: an unchecked oracle must persist a value that can never be
+  // confused with "checked and clean", and the disposition boundary must see
+  // the unchecked state as its own condition rather than as a violation of
+  // the measured kind.
+  const oracleExecuted =
+    probeResults.some(function (p) { return p && p.probe === "P5: frozen"; })
+    && probeResults.some(function (p) { return p && p.probe === "P6: collected"; });
+  const oracleViolationSummary = summariseOracleViolations(probeResults);
+
   return {
     probesGreen, probeResults, chainChangedPaths, chainNewlyChanged,
     chainStatusObserved, chainStatusOutput,
@@ -401,10 +458,21 @@ export async function runProbePhase({ baseSha, container, brief, callTool, workt
     chainUntracked: baseCtx.chainUntracked,
     chainTruncation: { ...baseCtx.chainTruncation, status: chainStatusTruncation },
     worktreeChanged,
-    // A probe-phase exception is not an oracle violation: it means the round
-    // could not be measured, which probesGreen=false already routes.  Only a
-    // P5/P6 result that actually fired sets this.
-    oracleViolation: summariseOracleViolations(probeResults),
+    // Three distinct states (kusabi #541): `false` — the oracle probes
+    // executed and found no violation; a string — a NAMED violation; and
+    // ORACLE_UNCHECKED — the oracle probes never executed.  A probe-phase
+    // exception is not itself a violation: it means the round could not be
+    // measured, which the unchecked marker and probesGreen=false together
+    // route.  Only a P5/P6 result that actually fired sets the string form.
+    oracleViolation: oracleViolationSummary !== false
+      ? oracleViolationSummary
+      : (oracleExecuted ? false : ORACLE_UNCHECKED),
+    // True exactly when the oracle probes did not execute (kusabi #541): the
+    // round carries no deterministic acceptance evidence from the oracle, so
+    // the disposition boundary must terminate/escalate it rather than rework
+    // or strategize.  Separate from the marker string so the escalate reason
+    // is accurate and the violation marker keeps its existing meaning.
+    oracleUnchecked: !oracleExecuted,
     changeScope,
   };
 }

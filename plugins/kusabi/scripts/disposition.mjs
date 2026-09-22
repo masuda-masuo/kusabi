@@ -133,6 +133,15 @@ export function deriveReworkStrategy({ reworkCount, strategized, verdict, probes
  *   a P5 (frozen tests) or P6 (collected count) probe failed this round.  Truthy routes the round
  *   to `escalate`; a string additionally NAMES the violation in the reason, which is what puts it
  *   in front of the human on the escalate line.
+ * @param {boolean} [opts.oracleUnchecked] — the P5/P6 oracle probes did NOT execute this round
+ *   (kusabi #541): a probe-phase exception stopped the sequence before them, so the worktree's
+ *   frozen/collected state is UNCHECKED and the round records no P5/P6 oracle acceptance evidence
+ *   from the oracle (P1-P4 evidence that DID run is untouched).  Truthy routes the round to the
+ *   terminal `escalate`, checked BEFORE the oracle
+ *   row so the unchecked marker string (persisted on `oracleViolation`) is never mislabelled as a
+ *   violation of the measured kind — and so an evidence-free round can never buy a `rework` or
+ *   `strategize` round against gates that judged nothing.  Absent / false leaves every existing row
+ *   unchanged.
  * @param {"clear"|"rework"|"block"|null} [opts.solVerdict] — the validated Sol audit verdict
  *   (kusabi #524/#528).  `null` means "no valid verdict exists" (Sol unavailable or the verdict
  *   failed validation/binding).  `clear` is the ONLY clearing verdict: `rework` is not clear, and
@@ -147,7 +156,7 @@ export function deriveReworkStrategy({ reworkCount, strategized, verdict, probes
  *   existing row unchanged.  A supplied non-boolean value THROWS before any row runs.
  * @returns {{ disposition: "accept"|"accept-with-followup"|"strategize"|"rework"|"escalate"|"refused-brief-defect"|"sol-blocked", reason?: string }}
  */
-export function deriveDisposition({ verdict, probesGreen, round, maxRounds, repeatedAreas, findingSeverities, strategizeEligible, oracleViolation, refusal, briefSyntaxDefect, partialDiagnosis, solVerdict, solGateRequired }) {
+export function deriveDisposition({ verdict, probesGreen, round, maxRounds, repeatedAreas, findingSeverities, strategizeEligible, oracleViolation, oracleUnchecked, refusal, briefSyntaxDefect, partialDiagnosis, solVerdict, solGateRequired }) {
   // ---- audit input validation (kusabi #528 repair) ----
   // The audit inputs are machine-decided and must be exact.  A type-confused,
   // whitespace-padded, or unknown `solVerdict` (or a non-boolean
@@ -195,6 +204,13 @@ export function deriveDisposition({ verdict, probesGreen, round, maxRounds, repe
   // this chain and would never resurface on its own.  When the oracle marker
   // is also set, the terminal reason appends it instead of dropping it
   // (kusabi #306; the worker-refusal sibling was flagged in the same review).
+  //
+  // kusabi #541: the unchecked marker string persisted on `oracleViolation`
+  // (ORACLE_UNCHECKED) is evidence that P5/P6 did NOT execute, never a
+  // violation of the measured kind.  The refusal / brief-syntax rows keep
+  // precedence over the unchecked row, so when the oracle is unchecked the
+  // unchecked state rides onto THOSE terminal reasons instead — rendered
+  // accurately as missing oracle evidence, never as a measured violation.
   const oracleNamed = typeof oracleViolation === "string" && oracleViolation.trim() !== ""
     ? " — " + oracleViolation.trim()
     : "";
@@ -203,12 +219,19 @@ export function deriveDisposition({ verdict, probesGreen, round, maxRounds, repe
       "; review it before re-dispatching — the evidence dies with this chain (a fresh chain starts " +
       "from a clean worktree and re-baselines the collected count), so it will not resurface on its own."
     : "";
+  const uncheckedSuffix = oracleUnchecked === true
+    ? " ADDITIONALLY the P5/P6 oracle probes did not execute this round — the worktree's frozen/collected " +
+      "state is UNCHECKED and the round recorded no P5/P6 oracle evidence; review it before re-dispatching — " +
+      "the evidence dies with this chain (a fresh chain starts from a clean worktree and re-baselines the " +
+      "collected count), so it will not resurface on its own."
+    : "";
+  const oracleStateSuffix = oracleUnchecked === true ? uncheckedSuffix : oracleSuffix;
 
   if (refused) {
     const named = typeof refusal === "string" ? " — " + refusal.trim() : "";
     return {
       disposition: "refused-brief-defect",
-      reason: "worker refused: the brief contradicts itself, no implementation satisfies both items" + named + oracleSuffix,
+      reason: "worker refused: the brief contradicts itself, no implementation satisfies both items" + named + oracleStateSuffix,
     };
   }
 
@@ -244,7 +267,32 @@ export function deriveDisposition({ verdict, probesGreen, round, maxRounds, repe
       reason: "brief-syntax defect: a probe reads a brief section that declares nothing" + named +
         ". The probe's input is the brief, not the worktree, so no worker edit can turn it green " +
         "and no rework is winnable; this is the brief author's defect, not the worker's. " +
-        "Fix the brief and re-dispatch." + oracleSuffix,
+        "Fix the brief and re-dispatch." + oracleStateSuffix,
+    };
+  }
+
+  // ---- deterministic oracle NOT executed (kusabi #541) ----
+  // The P5/P6 oracle probes did not run this round: a probe-phase exception
+  // (container/RPC failure) stopped the sequence before them, so the
+  // worktree's frozen/collected state is UNCHECKED and the round records no
+  // P5/P6 oracle evidence.  P1-P4 evidence that DID run is untouched — the
+  // reason below claims only that the oracle measured nothing, never that
+  // the round is evidence-free.  probesGreen=false then means "not measured",
+  // not "something failed", so the ordinary rework/strategize rows would
+  // dispatch the implementer back against gates that never judged this
+  // worktree — and the oracle's human-attention promise (kusabi #197) would
+  // silently lapse exactly as it did in the #541 incidents (two chains
+  // continued past gates that never ran).  Escalate, BEFORE the oracle row:
+  // the unchecked marker string persisted on `oracleViolation` is evidence
+  // that measurement did not happen, never a violation of the measured kind,
+  // and a human must see the round.  The worker's refusal and the brief-syntax
+  // rows above keep precedence (they name more specific defects).
+  if (oracleUnchecked === true) {
+    return {
+      disposition: "escalate",
+      reason: "P5/P6 oracle probes did not execute: the worktree's frozen/collected state is UNCHECKED " +
+        "and the round recorded no P5/P6 oracle evidence, so neither rework nor strategize " +
+        "may continue; a human decides",
     };
   }
 

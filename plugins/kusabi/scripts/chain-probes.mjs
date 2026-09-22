@@ -771,6 +771,23 @@ export function runCollectedProbe({ collected, baselineCollected }) {
 }
 
 /**
+ * The persisted P5/P6 oracle marker has three distinct meanings (kusabi
+ * #541): `false` — the oracle probes EXECUTED and found no violation; a
+ * string — a named violation (see summariseOracleViolations); and
+ * ORACLE_UNCHECKED — the oracle probes did NOT execute, so nothing was
+ * measured.  The third value must never collapse into the first: an
+ * unchecked round persisting `false` reads as "checked, clean" to every
+ * consumer, which is exactly the confusion the #541 defect produced (an
+ * evidence-free round carried a clean false and could continue through
+ * rework/strategize).  Consumers that route on the marker keep routing on
+ * the same values; the unchecked state additionally travels as the
+ * separate boolean `oracleUnchecked` so the disposition boundary can name
+ * it accurately instead of mislabelling it as a violation.
+ */
+export const ORACLE_UNCHECKED =
+  "unchecked: P5/P6 oracle probes did not execute; the round's frozen/collected state was never measured";
+
+/**
  * Summarise the round's oracle violations into the single input
  * `deriveDisposition` routes on.
  *

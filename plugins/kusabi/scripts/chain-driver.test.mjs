@@ -4908,10 +4908,12 @@ describe("runChainDriver quota-exhausted review (kusabi #373)", () => {
 // ---------------------------------------------------------------------------
 // runChainDriver — change-scope fail-closed through the real driver path (kusabi #379)
 // ---------------------------------------------------------------------------
-// Empty stdout / non-zero exit from change-scope.mjs must fail the probe phase
-// closed: no changeScope is persisted, and the review prompt is not given a
-// fabricated authoritative scope. These go through runChainDriver (not an
-// isolated runProbePhase mock).
+// Empty stdout / non-zero exit from change-scope.mjs fails closed regarding
+// change scope: no changeScope is persisted (stays null), and the review prompt
+// is not given a fabricated authoritative scope. Because change-scope collection
+// is auxiliary review context, deterministic P1-P6 gates still run; with all six
+// passing, probesGreen is true (kusabi #541). These go through runChainDriver
+// (not an isolated runProbePhase mock).
 
 describe("runChainDriver change-scope fail-closed (kusabi #379)", () => {
   const BRIEF = "Implement X.\n\n## Deliverables\n- src/real.js\n";
@@ -4990,12 +4992,12 @@ describe("runChainDriver change-scope fail-closed (kusabi #379)", () => {
     return { tmp, chainDir, text, dispatch };
   }
 
-  it("empty change-scope stdout fails the round closed: no changeScope persisted, review has no fabricated scope", async () => {
+  it("empty change-scope stdout fails closed on scope: no changeScope persisted, review has no fabricated scope", async () => {
     const { tmp, chainDir, dispatch } = await runWith({ output: "" });
     try {
       const round1 = readJson(path.join(chainDir, "round-1.json"));
       assert.equal(round1.changeScope, null);
-      assert.equal(round1.probesGreen, false);
+      assert.equal(round1.probesGreen, true);
       const rpc = round1.probeResults.find((p) => p.passed === false);
       assert.ok(rpc, "must record a failed probe");
       assert.match(String(rpc.detail), /change-scope produced empty output/);
@@ -5012,7 +5014,7 @@ describe("runChainDriver change-scope fail-closed (kusabi #379)", () => {
     }
   });
 
-  it("non-zero change-scope exit fails the round closed: no changeScope persisted, review has no fabricated scope", async () => {
+  it("non-zero change-scope exit fails closed on scope: no changeScope persisted, review has no fabricated scope", async () => {
     const { tmp, chainDir, dispatch } = await runWith({
       exit_code: 1,
       stderr: "change-scope: base ref not found\n",
@@ -5021,7 +5023,7 @@ describe("runChainDriver change-scope fail-closed (kusabi #379)", () => {
     try {
       const round1 = readJson(path.join(chainDir, "round-1.json"));
       assert.equal(round1.changeScope, null);
-      assert.equal(round1.probesGreen, false);
+      assert.equal(round1.probesGreen, true);
       const rpc = round1.probeResults.find((p) => p.passed === false);
       assert.ok(rpc, "must record a failed probe");
       assert.match(String(rpc.detail), /change-scope failed with exit code 1/);
@@ -5035,6 +5037,218 @@ describe("runChainDriver change-scope fail-closed (kusabi #379)", () => {
       }
     } finally {
       fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// runChainDriver — probe-gate survival on collectChangeScope failure (kusabi #541)
+// ---------------------------------------------------------------------------
+// collectChangeScope used to run at the top of the SAME try block as P1-P6:
+// when change-scope injection or execution threw, P1-P6 never ran, the
+// round's oracleViolation persisted as a clean false, and the chain could
+// continue with rework or strategize despite having no deterministic gate
+// evidence at all.  These tests drive the real driver (real runProbePhase,
+// real collectChangeScope) through both halves of the fix: the P1-P6 probes
+// must survive a change-scope throw (and the failure must stay visible as a
+// failed diagnostic, never a substitute for a P1-P6 result), and a round
+// with no executable P1-P6 probe must fail closed instead of reworking.
+
+describe("runChainDriver probe-gate survival on collectChangeScope failure (kusabi #541)", () => {
+  const BRIEF = "Implement X.\n\n## Deliverables\n- src/real.js\n";
+  const GREEN_VERIFY = {
+    gate_passed: true, lint: [], types: [],
+    tests: { full: { status: "ok", passed: 10, total: 10 } },
+  };
+  const SIX_PROBES = [
+    "P1: HEAD clean", "P2: verify gate", "P3: deliverables",
+    "P4: smoke", "P5: frozen", "P6: collected",
+  ];
+
+  // changeScopeFault: "inject" makes the copy_file injection throw;
+  // "exec-empty" makes the script return empty stdout (both throw inside
+  // collectChangeScope).  probeFault: "p1" makes P1's first container call
+  // (git rev-parse HEAD) throw, so no P1-P6 probe can record a result.
+  function callToolForDriver({ changeScopeFault, probeFault } = {}) {
+    const verifyCalls = [];
+    const fn = async (toolName, params) => {
+      if (toolName === "copy_file") {
+        if (changeScopeFault === "inject") {
+          throw new Error("copy_file failed: connection refused");
+        }
+        return { output: "" };
+      }
+      if (toolName === "verify_in_container") {
+        verifyCalls.push(params);
+        return GREEN_VERIFY;
+      }
+      if (toolName !== "sandbox_exec") return { output: "" };
+      const cmd = params.commands?.[0] ?? params.argv?.join(" ") ?? "";
+      if (cmd.includes("change-scope.mjs")) {
+        if (changeScopeFault === "exec-empty") return { output: "" };
+        return {
+          output: JSON.stringify({
+            formatVersion: 1,
+            repositoryRoot: "/workspace",
+            input: { base: "abc123", head: "HEAD" },
+            resolved: { baseSha: "abc123", headSha: "abc123", mergeBaseSha: "abc123" },
+            paths: { committed: [], staged: [], unstaged: [], untracked: [] },
+          }),
+        };
+      }
+      if (cmd.startsWith("cd /workspace &&") && cmd.includes("TMPIDX=")) {
+        return { output: "ERROR_NO_INDEX\n" };
+      }
+      if (cmd === "git rev-parse HEAD") {
+        if (probeFault === "p1") {
+          throw new Error("sandbox_exec failed: connection refused");
+        }
+        return { output: "abc123\n" };
+      }
+      if (cmd === "git status --porcelain") return { output: " M src/real.js\n" };
+      if (cmd === "git log --oneline -5") return { output: "abc123 latest\n" };
+      if (cmd === "git ls-files --others --exclude-standard") return { output: "" };
+      return { output: "" };
+    };
+    fn.verifyCalls = verifyCalls;
+    return fn;
+  }
+
+  function recordingDispatch() {
+    const calls = [];
+    const dispatch = async (opts) => {
+      calls.push(opts);
+      if (opts.kind === "review") {
+        return {
+          job: {
+            id: "job-rev-1", status: "completed", modelEntry: "fake/review",
+            modelVariant: null, fallbacks: null, sessionID: "sess-rev",
+            usage: null, error: null,
+          },
+          resultText: JSON.stringify({ schema_version: 1, verdict: "approve", findings: [], summary: "ok", next_steps: [] }),
+        };
+      }
+      return {
+        job: {
+          id: "job-imp-1", status: "completed", modelEntry: "fake/model",
+          modelVariant: null, fallbacks: null, sessionID: "sess-imp-1",
+          usage: null, error: null,
+        },
+        resultText: "implemented",
+      };
+    };
+    dispatch.calls = calls;
+    return dispatch;
+  }
+
+  async function runChainOnce({ changeScopeFault, probeFault } = {}) {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-541-"));
+    const chainId = "chain-541-" + (changeScopeFault ?? "ok") + "-" + (probeFault ?? "ok");
+    const chainDir = path.join(tmp, "chains", chainId);
+    fs.mkdirSync(chainDir, { recursive: true });
+    writeChainControl(chainDir, {
+      chainId, container: "cid-541", pid: process.pid,
+      status: "running", round: 0, startedAt: new Date().toISOString(),
+    });
+    const callTool = callToolForDriver({ changeScopeFault, probeFault });
+    const dispatch = recordingDispatch();
+    await runChainDriver({
+      cwd: tmp, stateDir: tmp, chainDir, chainId, container: "cid-541",
+      model: "fake/model", modelChain: [["fake/model"]], maxRounds: 4,
+      brief: BRIEF, orchestrator: null, baseSha: "abc123", worktreeBaseline: null,
+      verifyBaseline: { captured: true, gate_passed: true, lint: 0, types: 0, collected: 10, raw: {} },
+      callTool,
+      dispatchWithFallback: dispatch,
+      keepServe: true,
+      signalReceived: () => false,
+      resume: null,
+    });
+    return { tmp, chainDir, callTool, round1: readJson(path.join(chainDir, "round-1.json")) };
+  }
+
+  // The survival half of kusabi #541 (spec items 1 + 2): a change-scope throw
+  // must not starve the gate — all six P1-P6 results are recorded (P2 = the
+  // verify run), and the failed auxiliary collection stays visible as a
+  // failed diagnostic result that is NOT one of the six.
+  function assertProbeGateSurvived(round1, callTool) {
+    assert.deepEqual(
+      round1.probeResults.filter((p) => SIX_PROBES.includes(p.probe)).map((p) => p.probe),
+      SIX_PROBES,
+      "P1-P6 must all be recorded, in order, after change-scope fails",
+    );
+    const p2 = round1.probeResults.find((p) => p.probe === "P2: verify gate");
+    assert.equal(p2 && p2.passed, true, "P2 (verify_in_container) must run and pass");
+    assert.ok(callTool.verifyCalls.length >= 1, "verify_in_container must actually be invoked");
+    assert.equal(round1.changeScope, null, "the failed collection must not be fabricated");
+    const failed = round1.probeResults.filter((p) => p.passed === false);
+    assert.ok(failed.length >= 1, "the change-scope failure must stay visible");
+    const diagnostic = failed.find((p) => !SIX_PROBES.includes(p.probe));
+    assert.ok(diagnostic, "the failed diagnostic must not be substituted for a P1-P6 result");
+    assert.match(String(diagnostic.detail), /change-scope/);
+  }
+
+  it("collectChangeScope failure still runs P1-P6 — injection throws (kusabi #541)", async () => {
+    const { tmp, round1, callTool } = await runChainOnce({ changeScopeFault: "inject" });
+    try {
+      assertProbeGateSurvived(round1, callTool);
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("collectChangeScope failure still runs P1-P6 — execution throws (kusabi #541)", async () => {
+    const { tmp, round1, callTool } = await runChainOnce({ changeScopeFault: "exec-empty" });
+    try {
+      assertProbeGateSurvived(round1, callTool);
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("a round with no executable P1-P6 probe must not continue via rework or strategize (kusabi #541)", async () => {
+    // The probe layer is down for the change-scope injection AND for P1's
+    // first container call, so the round records no P1-P6 result at all —
+    // the exact shape the pre-fix defect produced (probeResults = the
+    // sunaba-rpc catch).  The chain must fail closed, not rework.
+    const { tmp, round1 } = await runChainOnce({ changeScopeFault: "inject", probeFault: "p1" });
+    try {
+      assert.ok(
+        round1.probeResults.every((p) => !/^P[1-6]:/.test(p.probe)),
+        "fixture sanity: no P1-P6 result was recorded this round",
+      );
+      assert.equal(round1.probesGreen, false);
+      assert.ok(
+        TERMINAL_DISPOSITIONS.has(round1.disposition.disposition),
+        "a round with no gate evidence must end the chain, got: " + round1.disposition.disposition,
+      );
+      assert.notEqual(round1.disposition.disposition, "rework");
+      assert.notEqual(round1.disposition.disposition, "strategize");
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("persisted oracle state distinguishes unexecuted oracle probes from executed-with-no-violation (kusabi #541)", async () => {
+    const healthy = await runChainOnce({});
+    const unexecuted = await runChainOnce({ changeScopeFault: "inject", probeFault: "p1" });
+    try {
+      assert.equal(
+        healthy.round1.oracleViolation,
+        false,
+        "oracle probes executed and found no violation → the clean false value",
+      );
+      assert.ok(
+        unexecuted.round1.oracleViolation !== false,
+        "oracle probes not executed must not persist as a clean false",
+      );
+      assert.notEqual(
+        unexecuted.round1.oracleViolation,
+        healthy.round1.oracleViolation,
+        "the persisted oracle state must distinguish the two cases",
+      );
+    } finally {
+      fs.rmSync(healthy.tmp, { recursive: true, force: true });
+      fs.rmSync(unexecuted.tmp, { recursive: true, force: true });
     }
   });
 });

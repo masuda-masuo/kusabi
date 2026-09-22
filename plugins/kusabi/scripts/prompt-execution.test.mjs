@@ -2120,13 +2120,13 @@ describe("spawned CLI exit propagation (kusabi #484 follow-up)", () => {
 
   it("a spawned task that fails through the real CLI boundary exits nonzero", () => {
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-484-spawned-"));
+    const stateRoot = path.join(tmp, "state");
+    const cwd = path.join(tmp, "cwd");
     try {
       const binPath = path.join(tmp, "fake-serve.mjs");
       fs.writeFileSync(binPath, spawnedFakeServeSource({ firstError: SPAWNED_401 }), "utf8");
       fs.chmodSync(binPath, 0o755);
 
-      const stateRoot = path.join(tmp, "state");
-      const cwd = path.join(tmp, "cwd");
       fs.mkdirSync(cwd, { recursive: true });
       fs.mkdirSync(stateRoot, { recursive: true });
       fs.writeFileSync(
@@ -2156,6 +2156,26 @@ describe("spawned CLI exit propagation (kusabi #484 follow-up)", () => {
       // The failure text must appear on stdout (commandOutcome -> stdout).
       assert.match(result.stdout, /401/);
     } finally {
+      // The CLI starts a DETACHED `opencode serve` (ensureServer) that
+      // survives the CLI process by design (it is meant to be reused by
+      // later commands).  This test's state root is throwaway, so the
+      // leftover serve must be killed or every full-suite run leaks a
+      // process that lives forever (the fake serve keeps its event loop
+      // open with setInterval) — enough accumulated leaks exhaust the
+      // container's PID ceiling and stall the suite.
+      const savedStateDir = process.env.KUSABI_STATE_DIR;
+      process.env.KUSABI_STATE_DIR = stateRoot;
+      let servePid = null;
+      try {
+        const rec = JSON.parse(fs.readFileSync(path.join(stateDirFor(cwd), "server.json"), "utf8"));
+        servePid = rec.pid ?? null;
+      } catch { /* no serve was recorded — nothing to kill */ } finally {
+        if (savedStateDir === undefined) delete process.env.KUSABI_STATE_DIR;
+        else process.env.KUSABI_STATE_DIR = savedStateDir;
+      }
+      if (servePid) {
+        try { process.kill(servePid, "SIGKILL"); } catch { /* already gone */ }
+      }
       fs.rmSync(tmp, { recursive: true, force: true });
     }
   });

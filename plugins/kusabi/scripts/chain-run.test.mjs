@@ -12,6 +12,8 @@ import {
 import {
   resolveReworkScope,
 } from "./chain-rework.mjs";
+import { ORACLE_UNCHECKED } from "./chain-probes.mjs";
+import { deriveDisposition } from "./disposition.mjs";
 
 const PLUGIN_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -1336,5 +1338,225 @@ describe("change-scope wiring into probe phase (kusabi #379)", () => {
       !executed.some((e) => e.cmd.includes("plugins/kusabi/scripts/change-scope.mjs")),
       "must not exec old relative path as a fallback",
     );
+  });
+});
+
+// =========================================================================
+// kusabi #541 — change-scope auxiliary isolation and partial oracle
+// =========================================================================
+
+describe("auxiliary change-scope isolation and partial oracle (kusabi #541)", () => {
+  it("change-scope injection failure records diagnostic, leaves changeScope null, and keeps probesGreen over passing P1-P6", async () => {
+    const executed = [];
+    const callTool = async (toolName, params) => {
+      if (toolName === "copy_file") {
+        throw new Error("copy_file failed: connection refused");
+      }
+      if (toolName === "verify_in_container") {
+        return {
+          gate_passed: true,
+          lint: [],
+          types: [],
+          tests: { full: { status: "ok", passed: 10, total: 10 } },
+          collected: 10,
+        };
+      }
+      if (toolName !== "sandbox_exec") return { output: "" };
+      const cmd = params.commands?.[0] ?? params.argv?.join(" ") ?? "";
+      executed.push({ cmd, argv: params.argv, commands: params.commands });
+      if (cmd === "git rev-parse HEAD") return { output: "base-sha-123\n" };
+      if (cmd === "git status --porcelain") return { output: " M src/foo.js\n" };
+      if (cmd === "git ls-files --others --exclude-standard") return { output: "" };
+      return { output: "" };
+    };
+
+    const result = await runProbePhase({
+      baseSha: "base-sha-123",
+      container: "cid-aux-inject-fail",
+      brief: "## Deliverables\n\n- `src/foo.js`\n",
+      callTool,
+      verifyBaseline: { captured: true, gate_passed: true, lint: 0, types: 0, collected: 10, raw: {} },
+    });
+
+    // 1. Failed named change-scope diagnostic remains in probeResults
+    const diagnostic = result.probeResults.find((p) => p.probe === "change-scope (review context)");
+    assert.ok(diagnostic, "failed named change-scope diagnostic must remain in probeResults");
+    assert.equal(diagnostic.passed, false);
+    assert.match(diagnostic.detail, /change-scope collection failed/);
+    assert.match(diagnostic.detail, /copy_file failed: connection refused/);
+
+    // 2. changeScope === null and no synthetic fallback scope is produced
+    assert.equal(result.changeScope, null, "changeScope must be null on injection failure");
+
+    // 3. All six P1-P6 results exist and pass
+    const deterministic = result.probeResults.filter((p) => /^P[1-6]:/.test(p.probe));
+    assert.equal(deterministic.length, 6, "all six P1-P6 results must exist");
+    assert.deepEqual(
+      deterministic.map((p) => p.probe),
+      ["P1: HEAD clean", "P2: verify gate", "P3: deliverables", "P4: smoke", "P5: frozen", "P6: collected"],
+    );
+    assert.ok(deterministic.every((p) => p.passed), "all six P1-P6 results must pass");
+
+    // 4. probesGreen === true despite the auxiliary diagnostic
+    assert.equal(result.probesGreen, true, "probesGreen must be true when all deterministic probes pass");
+
+    // 5. Downstream boundary: approve + green deterministic gates must not become rework/strategize
+    const disposition = deriveDisposition({
+      verdict: "approve",
+      probesGreen: result.probesGreen,
+      round: 1,
+      maxRounds: 4,
+      repeatedAreas: false,
+      findingSeverities: [],
+      strategizeEligible: true,
+      oracleViolation: result.oracleViolation,
+      oracleUnchecked: result.oracleUnchecked,
+    });
+    assert.equal(disposition.disposition, "accept", "downstream disposition must accept");
+    assert.notEqual(disposition.disposition, "rework");
+    assert.notEqual(disposition.disposition, "strategize");
+  });
+
+  it("change-scope execution failure records diagnostic, leaves changeScope null, and keeps probesGreen over passing P1-P6", async () => {
+    const callTool = async (toolName, params) => {
+      if (toolName === "copy_file") {
+        return { output: "" };
+      }
+      if (toolName === "verify_in_container") {
+        return {
+          gate_passed: true,
+          lint: [],
+          types: [],
+          tests: { full: { status: "ok", passed: 10, total: 10 } },
+          collected: 10,
+        };
+      }
+      if (toolName !== "sandbox_exec") return { output: "" };
+      const cmd = params.commands?.[0] ?? params.argv?.join(" ") ?? "";
+      if (cmd.includes("change-scope.mjs")) {
+        return { exit_code: 1, stderr: "change-scope: failed to resolve base\n", output: "change-scope: failed to resolve base\n" };
+      }
+      if (cmd === "git rev-parse HEAD") return { output: "base-sha-123\n" };
+      if (cmd === "git status --porcelain") return { output: " M src/foo.js\n" };
+      if (cmd === "git ls-files --others --exclude-standard") return { output: "" };
+      return { output: "" };
+    };
+
+    const result = await runProbePhase({
+      baseSha: "base-sha-123",
+      container: "cid-aux-exec-fail",
+      brief: "## Deliverables\n\n- `src/foo.js`\n",
+      callTool,
+      verifyBaseline: { captured: true, gate_passed: true, lint: 0, types: 0, collected: 10, raw: {} },
+    });
+
+    const diagnostic = result.probeResults.find((p) => p.probe === "change-scope (review context)");
+    assert.ok(diagnostic, "failed named change-scope diagnostic must remain in probeResults");
+    assert.equal(diagnostic.passed, false);
+    assert.match(diagnostic.detail, /change-scope collection failed/);
+    assert.match(diagnostic.detail, /exit code 1/);
+
+    assert.equal(result.changeScope, null, "changeScope must be null on execution failure");
+
+    const deterministic = result.probeResults.filter((p) => /^P[1-6]:/.test(p.probe));
+    assert.equal(deterministic.length, 6, "all six P1-P6 results must exist");
+    assert.ok(deterministic.every((p) => p.passed), "all six P1-P6 results must pass");
+    assert.equal(result.probesGreen, true, "probesGreen must be true despite auxiliary diagnostic");
+
+    const disposition = deriveDisposition({
+      verdict: "approve",
+      probesGreen: result.probesGreen,
+      round: 1,
+      maxRounds: 4,
+      repeatedAreas: false,
+      findingSeverities: [],
+      strategizeEligible: true,
+      oracleViolation: result.oracleViolation,
+      oracleUnchecked: result.oracleUnchecked,
+    });
+    assert.equal(disposition.disposition, "accept");
+    assert.notEqual(disposition.disposition, "rework");
+    assert.notEqual(disposition.disposition, "strategize");
+  });
+
+  it("runProbePhase: partial oracle (P5 present but P6 throws) yields oracleUnchecked=true and ORACLE_UNCHECKED, never checked-clean false", async () => {
+    const callTool = async (toolName, params) => {
+      if (toolName === "copy_file") return { output: "" };
+      if (toolName === "verify_in_container") {
+        return {
+          gate_passed: true,
+          lint: [],
+          types: [],
+          tests: { full: { status: "ok", passed: 10, total: 10 } },
+          collected: 10,
+        };
+      }
+      if (toolName !== "sandbox_exec") return { output: "" };
+      const cmd = params.commands?.[0] ?? params.argv?.join(" ") ?? "";
+      if (cmd.includes("change-scope.mjs")) {
+        return {
+          output: JSON.stringify({
+            formatVersion: 1,
+            repositoryRoot: "/workspace",
+            input: { base: "base-sha-123", head: "HEAD" },
+            resolved: { baseSha: "base-sha-123", headSha: "base-sha-123", mergeBaseSha: "base-sha-123" },
+            paths: { committed: [], staged: [], unstaged: [], untracked: [] },
+          }),
+        };
+      }
+      if (cmd === "git rev-parse HEAD") return { output: "base-sha-123\n" };
+      if (cmd === "git status --porcelain") return { output: " M src/foo.js\n" };
+      if (cmd === "git ls-files --others --exclude-standard") return { output: "" };
+      return { output: "" };
+    };
+
+    const faultyVerifyBaseline = {
+      captured: true,
+      gate_passed: true,
+      lint: 0,
+      types: 0,
+      get collected() {
+        throw new Error("simulated P6 baseline count read error");
+      },
+      raw: {},
+    };
+
+    const result = await runProbePhase({
+      baseSha: "base-sha-123",
+      container: "cid-partial-oracle",
+      brief: "## Deliverables\n\n- `src/foo.js`\n",
+      callTool,
+      verifyBaseline: faultyVerifyBaseline,
+    });
+
+    // P5 executed and passed
+    const p5 = result.probeResults.find((p) => p.probe === "P5: frozen");
+    assert.ok(p5, "P5 must exist in probeResults");
+    assert.equal(p5.passed, true);
+
+    // P6 never recorded a result (the throw occurred before push)
+    const p6 = result.probeResults.find((p) => p.probe === "P6: collected");
+    assert.equal(p6, undefined, "P6 must not exist in probeResults");
+
+    // Partial oracle must NOT be considered executed, so oracleUnchecked=true
+    assert.equal(result.oracleUnchecked, true, "oracleUnchecked must be true when P6 did not run");
+    assert.equal(result.oracleViolation, ORACLE_UNCHECKED, "oracleViolation must be ORACLE_UNCHECKED");
+    assert.notEqual(result.oracleViolation, false, "oracleViolation must never be false (checked-clean)");
+
+    // Downstream disposition escalates as unchecked, never accept/rework/strategize
+    const disposition = deriveDisposition({
+      verdict: "approve",
+      probesGreen: result.probesGreen,
+      round: 1,
+      maxRounds: 4,
+      repeatedAreas: false,
+      findingSeverities: [],
+      strategizeEligible: true,
+      oracleViolation: result.oracleViolation,
+      oracleUnchecked: result.oracleUnchecked,
+    });
+    assert.equal(disposition.disposition, "escalate");
+    assert.match(disposition.reason, /P5\/P6 oracle probes did not execute/);
+    assert.match(disposition.reason, /UNCHECKED/);
   });
 });

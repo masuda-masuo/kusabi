@@ -903,6 +903,12 @@ export async function runChainDriver({
           // replacement review seat approves it.  Old records have no field;
           // absent reads as "no violation recorded", which is what it was.
           oracleViolation: roundRecord.oracleViolation ?? false,
+          // The oracle-unchecked flag (kusabi #541) is recorded truth like
+          // the marker: a round whose P5/P6 probes never executed must still
+          // terminate/escalate on resume instead of reworking — the gates
+          // judged nothing, and a replacement review seat changes that.
+          // Old records have no field; absent reads as "oracle executed".
+          oracleUnchecked: roundRecord.oracleUnchecked ?? false,
           chainChangedPaths: reviewCtx.chainChangedPaths,
           chainNewlyChanged: reviewCtx.chainNewlyChanged,
           chainStatusObserved: reviewCtx.chainStatusObserved,
@@ -1118,6 +1124,12 @@ export async function runChainDriver({
       // probe truth: a review-resume of this round reads it back, so a frozen
       // edit cannot be forgotten by the round that carried it.
       roundRecord.oracleViolation = probeResult.oracleViolation;
+      // The oracle-unchecked flag (kusabi #541) is persisted beside it: a
+      // round whose P5/P6 probes never executed must not read as "oracle
+      // checked, clean" on resume — the recorded marker already carries the
+      // distinct ORACLE_UNCHECKED value, and this boolean is what lets the
+      // disposition boundary name the unchecked state accurately.
+      roundRecord.oracleUnchecked = probeResult.oracleUnchecked ?? false;
 
       // ---- stop check: a stop requested during implement must not buy a
       // review job, and must not leave the container busy while the

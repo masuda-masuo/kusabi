@@ -10,6 +10,7 @@ import { runChainDriver } from "./chain-driver.mjs";
 import { finishRound } from "./chain-finish.mjs";
 import { handleProviderExhaustion } from "./chain-outcomes.mjs";
 import { readJson } from "./state-paths.mjs";
+import { ORACLE_UNCHECKED } from "./chain-probes.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -374,6 +375,348 @@ describe("provider-exhaustion mission linkage (kusabi #532)", () => {
       assert.equal(chainJson.missionId, "mission-abc",
         "a Luna inner chain that exhausts at strategize keeps its mission attribution");
       assert.equal(chainJson.records.length, 2);
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+});
+// =========================================================================
+// kusabi #541 — review-resume accept revalidation with an UNCHECKED oracle.
+// The driver threads the recorded `oracleUnchecked` flag into the
+// review-resume probeCtx (roundRecord.oracleUnchecked ?? false); finishRound's
+// lazy accept re-validation re-measures the oracle on the CURRENT worktree
+// and hands the FRESH flag to the re-derivation.  These tests drive
+// finishRound through both boundaries: a re-validation whose probes die
+// before P5/P6 must escalate with an accurate "unchecked" reason and persist
+// the flag, and a RECORDED unchecked flag must reach the resumed disposition
+// unchanged.  The recorded marker shape the #541 driver tests use (absent /
+// default-false) never enters accept revalidation, which is the gap these
+// tests close.
+// =========================================================================
+
+describe("review-resume revalidation with an unchecked oracle (kusabi #541)", () => {
+  const BRIEF = CHAIN_BRIEF;
+  const UNCHECKED = ORACLE_UNCHECKED;
+
+  // The review-resume shape the driver builds (chain-driver.mjs): probeCtx
+  // carries RECORDED truth (probesFromRecord=true) and the review re-runs
+  // inside finishRound.  Records start empty because the resumed round is the
+  // first record of this run.
+  function reviewResumeCtx({ tmp, chainDir, dispatch, callTool, effectiveVerifyBaseline = null }) {
+    return {
+      chainDir, chainId: "chain-541-reval", container: "cid-541", cwd: tmp,
+      model: "fake/model", modelChain: [["fake/model"]], maxRounds: 4,
+      brief: BRIEF, orchestrator: null, callTool,
+      flagsModel: null, reviewFlagsModel: null,
+      effectiveReviewChain: [["fake/review"]], effectiveBaseSha: "abc123",
+      effectiveVerifyBaseline,
+      reviewModel: "fake/review", reviewModelChain: [["fake/review"]],
+      reworkModel: null, reworkModelChain: null, reworkBackend: null,
+      reviewDispatch: dispatch, injectedDispatch: dispatch,
+      reworkTierCount: 1,
+      records: [], strategized: false, reworkCount: 0, currentTierIndex: 0,
+    };
+  }
+
+  function approvingReviewDispatch() {
+    const calls = [];
+    const dispatch = async (opts) => {
+      calls.push(opts);
+      if (opts.kind === "review") {
+        return {
+          job: {
+            id: "job-rev-1", status: "completed", modelEntry: "fake/review",
+            modelVariant: null, fallbacks: null, sessionID: "sess-rev-1",
+            usage: { available: true, input: 1, output: 1, reasoning: 0, cacheRead: 0, cacheWrite: 0, cost: 0.01 },
+            error: null,
+          },
+          resultText: JSON.stringify({ schema_version: 1, verdict: "approve", findings: [], summary: "ok", next_steps: [] }),
+        };
+      }
+      throw new Error("unexpected dispatch kind: " + opts.kind);
+    };
+    dispatch.calls = calls;
+    return dispatch;
+  }
+
+  // Revalidation probe phase: P1 records HEAD-matches-base, then P2's verify
+  // call throws — the P1-P4 sequence dies at P2, so P5/P6 never execute and
+  // the run reports the ORACLE_UNCHECKED marker with oracleUnchecked=true.
+  // P1 passing before the throw is deliberate: the escalate reason must not
+  // claim that P1-P4 evidence is absent.
+  function revalidationDiesAtP2CallTool() {
+    return async (toolName, params) => {
+      if (toolName === "verify_in_container") {
+        throw new Error("verify_in_container failed: connection refused");
+      }
+      if (toolName !== "sandbox_exec") return { output: "" };
+      const cmd = params?.commands?.[0] ?? params?.argv?.join(" ") ?? "";
+      if (cmd === "git rev-parse HEAD") return { output: "abc123\n" };
+      if (cmd === "git status --porcelain") return { output: " M src/foo.js\n" };
+      if (cmd === "git diff") return { output: "diff --git a/src/foo.js b/src/foo.js\n" };
+      return { output: "" };
+    };
+  }
+
+  function resumedRoundRecord() {
+    return {
+      round: 1,
+      reworkScope: "full",
+      resumeMethod: { type: "continue_session" },
+    };
+  }
+
+  function revalidationPassesP1P4CallTool() {
+    return async (toolName, params) => {
+      if (toolName === "verify_in_container") {
+        return {
+          gate_passed: true,
+          lint: [],
+          types: [],
+          tests: { full: { status: "ok", passed: 10, total: 10 } },
+          collected: 10,
+        };
+      }
+      if (toolName !== "sandbox_exec") return { output: "" };
+      const cmd = params?.commands?.[0] ?? params?.argv?.join(" ") ?? "";
+      if (cmd === "git rev-parse HEAD") return { output: "abc123\n" };
+      if (cmd === "git status --porcelain") return { output: " M src/foo.js\n" };
+      if (cmd === "git diff") return { output: "diff --git a/src/foo.js b/src/foo.js\n" };
+      return { output: "" };
+    };
+  }
+
+  async function runResume({ roundRecord, probeCtx, callTool, effectiveVerifyBaseline = null }) {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-541-reval-"));
+    const chainDir = path.join(tmp, "chains", "chain-541-reval");
+    fs.mkdirSync(chainDir, { recursive: true });
+    writeChainControl(chainDir, {
+      chainId: "chain-541-reval", container: "cid-541", pid: process.pid,
+      status: "running", round: 0, startedAt: new Date().toISOString(),
+    });
+    const dispatch = approvingReviewDispatch();
+    const ctx = reviewResumeCtx({ tmp, chainDir, dispatch, callTool, effectiveVerifyBaseline });
+    const result = await finishRound({
+      round: 1, roundRecord, previousRecord: null, probeCtx,
+      implementRefusal: null, reworkScope: "full",
+    }, ctx);
+    return { tmp, chainDir, result, roundRecord };
+  }
+
+  it("a review-resumed accept whose re-validation dies before P5/P6 escalates as unchecked and persists the flag", async () => {
+    // Recorded truth: green probes, oracle executed and clean — the exact
+    // accept shape the four #541 driver tests never enter.  The re-validation
+    // re-measures it on the current worktree and dies at P2 (before P5/P6).
+    const roundRecord = resumedRoundRecord();
+    const probeCtx = {
+      probesGreen: true,
+      probesFromRecord: true,
+      oracleViolation: false,
+      oracleUnchecked: false,
+      chainChangedPaths: ["src/foo.js"],
+      chainNewlyChanged: ["src/foo.js"],
+      chainStatusObserved: true,
+      chainStatusOutput: " M src/foo.js\n",
+      chainBaseLog: "abc123 latest change\n",
+      chainDeliverables: ["src/foo.js"],
+      chainUntracked: [],
+      chainTruncation: null,
+      worktreeChanged: true,
+      changeScope: { added: [], deleted: [], modified: ["src/foo.js"] },
+    };
+    const { tmp, result, roundRecord: rr } = await runResume({
+      roundRecord, probeCtx, callTool: revalidationDiesAtP2CallTool(),
+    });
+    try {
+      assert.equal(result.done, true);
+      // Terminal unchecked escalation with an accurate reason: missing P5/P6
+      // oracle evidence, never a measured violation and never absent P1-P4
+      // evidence (P1 did run and passed before the throw).
+      assert.equal(rr.disposition.disposition, "escalate");
+      assert.match(rr.disposition.reason, /P5\/P6 oracle probes did not execute/);
+      assert.match(rr.disposition.reason, /UNCHECKED/);
+      assert.match(rr.disposition.reason, /no P5\/P6 oracle evidence/);
+      assert.doesNotMatch(rr.disposition.reason, /deterministic oracle violation was measured/);
+      assert.doesNotMatch(rr.disposition.reason, /no deterministic acceptance evidence/);
+      // Persisted flag and marker on the record.
+      assert.equal(rr.oracleUnchecked, true);
+      assert.equal(rr.oracleViolation, UNCHECKED);
+      // The outcome text the orchestrator sees carries the same reason.
+      assert.match(result.text, /P5\/P6 oracle probes did not execute/);
+      assert.doesNotMatch(result.text, /deterministic oracle violation was measured/);
+      // The re-validation itself is recorded (kusabi #262) with the RECORDED
+      // truth preserved on the note while the live field carries the fresh
+      // measurement.
+      assert.ok(rr.probesRevalidated, "the accept re-validation must be recorded");
+      assert.equal(rr.probesRevalidated.oracleUnchecked, false,
+        "the recorded flag is preserved on the revalidation note");
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("a recorded oracleUnchecked=true reaches the review-resume disposition unchanged", async () => {
+    // The interrupted round's P5/P6 never executed: the record carries the
+    // ORACLE_UNCHECKED marker AND the flag.  On resume the first derivation
+    // must already escalate as unchecked — the flag is never lost or flipped,
+    // and no re-validation is bought for a terminal disposition.
+    const roundRecord = resumedRoundRecord();
+    roundRecord.oracleViolation = UNCHECKED;
+    roundRecord.oracleUnchecked = true;
+    const probeCtx = {
+      probesGreen: false,
+      probesFromRecord: true,
+      oracleViolation: UNCHECKED,
+      oracleUnchecked: true,
+      chainChangedPaths: ["src/foo.js"],
+      chainNewlyChanged: ["src/foo.js"],
+      chainStatusObserved: true,
+      chainStatusOutput: " M src/foo.js\n",
+      chainBaseLog: "abc123 latest change\n",
+      chainDeliverables: ["src/foo.js"],
+      chainUntracked: [],
+      chainTruncation: null,
+      worktreeChanged: true,
+      changeScope: { added: [], deleted: [], modified: ["src/foo.js"] },
+    };
+    const { tmp, result, roundRecord: rr } = await runResume({
+      roundRecord, probeCtx, callTool: revalidationDiesAtP2CallTool(),
+    });
+    try {
+      assert.equal(result.done, true);
+      assert.equal(rr.disposition.disposition, "escalate");
+      assert.match(rr.disposition.reason, /P5\/P6 oracle probes did not execute/);
+      assert.match(rr.disposition.reason, /no P5\/P6 oracle evidence/);
+      assert.doesNotMatch(rr.disposition.reason, /deterministic oracle violation was measured/);
+      // The flag reaches the disposition UNCHANGED, and the marker string is
+      // not rendered as a violation.
+      assert.equal(rr.oracleUnchecked, true);
+      assert.equal(rr.oracleViolation, UNCHECKED);
+      // No re-validation was bought: the disposition was never accept-family.
+      assert.equal(rr.probesRevalidated, undefined);
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("a review-resumed accept whose re-validation reaches P5 but P6 throws escalates as unchecked and persists the flag", async () => {
+    // Revalidation reaches P5 and records it, then P6 throws while reading
+    // the verify baseline collected count.  Partial evidence (P5 present, P6
+    // absent) must NOT count as oracleExecuted — it must persist
+    // ORACLE_UNCHECKED with oracleUnchecked=true and escalate as unchecked,
+    // never checked-clean false.
+    const roundRecord = resumedRoundRecord();
+    const probeCtx = {
+      probesGreen: true,
+      probesFromRecord: true,
+      oracleViolation: false,
+      oracleUnchecked: false,
+      chainChangedPaths: ["src/foo.js"],
+      chainNewlyChanged: ["src/foo.js"],
+      chainStatusObserved: true,
+      chainStatusOutput: " M src/foo.js\n",
+      chainBaseLog: "abc123 latest change\n",
+      chainDeliverables: ["src/foo.js"],
+      chainUntracked: [],
+      chainTruncation: null,
+      worktreeChanged: true,
+      changeScope: { added: [], deleted: [], modified: ["src/foo.js"] },
+    };
+    let throwsRemaining = 1;
+    const effectiveVerifyBaseline = {
+      captured: true,
+      gate_passed: true,
+      lint: 0,
+      types: 0,
+      get collected() {
+        if (throwsRemaining > 0) {
+          throwsRemaining--;
+          throw new Error("simulated P6 baseline count read failure");
+        }
+        return 10;
+      },
+      raw: {},
+    };
+    const { tmp, result, roundRecord: rr } = await runResume({
+      roundRecord,
+      probeCtx,
+      callTool: revalidationPassesP1P4CallTool(),
+      effectiveVerifyBaseline,
+    });
+    try {
+      assert.equal(result.done, true);
+      assert.equal(rr.disposition.disposition, "escalate");
+      assert.match(rr.disposition.reason, /P5\/P6 oracle probes did not execute/);
+      assert.match(rr.disposition.reason, /UNCHECKED/);
+      assert.match(rr.disposition.reason, /no P5\/P6 oracle evidence/);
+      assert.doesNotMatch(rr.disposition.reason, /deterministic oracle violation was measured/);
+      assert.doesNotMatch(rr.disposition.reason, /no deterministic acceptance evidence/);
+
+      // Persisted flag and marker on the record
+      assert.equal(rr.oracleUnchecked, true);
+      assert.equal(rr.oracleViolation, UNCHECKED);
+      assert.notEqual(rr.oracleViolation, false, "must never be checked-clean false");
+
+      // Verify probe results recorded in revalidation: P5 present, P6 absent
+      assert.ok(rr.probeResults.some((p) => p && p.probe === "P5: frozen"), "P5 must be recorded");
+      assert.ok(!rr.probeResults.some((p) => p && p.probe === "P6: collected"), "P6 must not be recorded");
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("finishRound accepts an approving review over green deterministic gates even when change-scope collection failed", async () => {
+    // Downstream boundary: a normal round where change-scope collection failed,
+    // but all six deterministic P1-P6 probes passed and reviewer approves.
+    // The round must accept and never become rework or strategize.
+    const roundRecord = {
+      round: 1,
+      reworkScope: "full",
+    };
+    const probeResults = [
+      { probe: "change-scope (review context)", passed: false, detail: "change-scope collection failed: inject error" },
+      { probe: "P1: HEAD clean", passed: true },
+      { probe: "P2: verify gate", passed: true },
+      { probe: "P3: deliverables", passed: true },
+      { probe: "P4: smoke", passed: true },
+      { probe: "P5: frozen", passed: true },
+      { probe: "P6: collected", passed: true },
+    ];
+    const probeCtx = {
+      probesGreen: true,
+      probesFromRecord: false,
+      oracleViolation: false,
+      oracleUnchecked: false,
+      changeScope: null,
+      probeResults,
+      chainChangedPaths: ["src/foo.js"],
+      chainNewlyChanged: ["src/foo.js"],
+      chainStatusObserved: true,
+      chainStatusOutput: " M src/foo.js\n",
+      chainBaseLog: "abc123 latest change\n",
+      chainDeliverables: ["src/foo.js"],
+      chainUntracked: "",
+      chainTruncation: null,
+      worktreeChanged: true,
+    };
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-541-scope-"));
+    const chainDir = path.join(tmp, "chains", "chain-541-scope");
+    fs.mkdirSync(chainDir, { recursive: true });
+    writeChainControl(chainDir, {
+      chainId: "chain-541-scope", container: "cid-541", pid: process.pid,
+      status: "running", round: 0, startedAt: new Date().toISOString(),
+    });
+    const dispatch = approvingReviewDispatch();
+    const ctx = reviewResumeCtx({ tmp, chainDir, dispatch, callTool: async () => ({ output: "" }) });
+    try {
+      const result = await finishRound({
+        round: 1, roundRecord, previousRecord: null, probeCtx,
+        implementRefusal: null, reworkScope: "full",
+      }, ctx);
+      assert.equal(result.done, true);
+      assert.equal(roundRecord.disposition.disposition, "accept");
+      assert.notEqual(roundRecord.disposition.disposition, "rework");
+      assert.notEqual(roundRecord.disposition.disposition, "strategize");
     } finally {
       fs.rmSync(tmp, { recursive: true, force: true });
     }

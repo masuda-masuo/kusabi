@@ -51,6 +51,7 @@ import {
   runFrozenProbe,
   runCollectedProbe,
   summariseOracleViolations,
+  ORACLE_UNCHECKED,
 } from "./chain-probes.mjs";
 
 /**
@@ -272,15 +273,38 @@ async function runRevalidationProbePhase({ baseSha, container, brief, callTool, 
   } catch (probeErr) {
     probeResults.push({ probe: "sunaba-rpc", passed: false, detail: String(probeErr) });
   }
+
+// Did the P5/P6 oracle probes actually run this run?  Both are PURE, so
+  // they execute exactly when the sequence above reached them — a throw
+  // anywhere before them means neither did.  The pair counts as executed
+  // only when BOTH results are present (kusabi #541 F2): a
+  // P5-result/P6-throw leaves PARTIAL evidence whose other half never
+  // measured — never "checked and clean" — and the partial pair must
+  // persist the unchecked marker and flag exactly like a pair that never
+  // ran.  Same three-state marker as the round's own runProbePhase (kusabi
+  // #541): an unchecked oracle must never persist as the "checked, clean"
+  // false.
+  const oracleExecuted =
+    probeResults.some(function (p) { return p && p.probe === "P5: frozen"; })
+    && probeResults.some(function (p) { return p && p.probe === "P6: collected"; });
+  const oracleViolationSummary = summariseOracleViolations(probeResults);
+
   return {
     probesGreen: probeResults.every(function (p) { return p.passed; }),
     probeResults,
     worktreeChanged,
     // Measured on the CURRENT worktree, so it supersedes the recorded marker
     // in the re-derivation (kusabi #197 follow-up).  A probe-phase exception
-    // is not a violation — only a P5/P6 result that actually fired sets this,
-    // exactly as in runProbePhase.
-    oracleViolation: summariseOracleViolations(probeResults),
+    // is not a violation — only a P5/P6 result that actually fired sets the
+    // string form; when neither fired the marker is ORACLE_UNCHECKED, exactly
+    // as in runProbePhase.
+    oracleViolation: oracleViolationSummary !== false
+      ? oracleViolationSummary
+      : (oracleExecuted ? false : ORACLE_UNCHECKED),
+    // Companion to the marker: true when the oracle probes did not execute,
+    // so the re-derivation routes the unchecked state accurately (kusabi
+    // #541) instead of mislabelling it as a violation.
+    oracleUnchecked: !oracleExecuted,
   };
 }
 
@@ -547,7 +571,15 @@ export async function finishRound(
   // that landed AFTER the stop/escalate is invisible to the recorded marker
   // — it is exactly what the re-validation exists to catch.
   const recordedOracleViolation = probeCtx.oracleViolation ?? false;
-  const deriveWith = function (green, oracleViolation) {
+  // The oracle-unchecked flag (kusabi #541) is probe truth like the marker,
+  // so it travels through the same deriveWith closure: the recorded value
+  // decides the first derivation, and the re-validation hands over its FRESH
+  // value for the second (exactly as the marker does) — an accept-revalidation
+  // run whose own probes die before P5/P6 must escalate with an accurate
+  // reason, not misread its ORACLE_UNCHECKED marker as a violation.  Old
+  // records have no field; absent reads as "oracle executed".
+  const recordedOracleUnchecked = probeCtx.oracleUnchecked ?? false;
+  const deriveWith = function (green, oracleViolation, oracleUnchecked = recordedOracleUnchecked) {
     return deriveDisposition({
       verdict: chainVerdict || "needs-attention",
       probesGreen: green,
@@ -557,6 +589,11 @@ export async function finishRound(
       findingSeverities,
       strategizeEligible: !strategized,
       oracleViolation,
+      // Whether the P5/P6 oracle probes executed is probe truth: it moves
+      // with the marker through the closure — recorded value on the first
+      // derivation, the fresh value on the accept re-validation (kusabi
+      // #541).
+      oracleUnchecked,
       // A qualifying refusal (kusabi #293) is fixed for the round: it is
       // measured from the change set and the report, neither of which the
       // re-validation below re-measures, so both derivations see the same
@@ -612,6 +649,9 @@ export async function finishRound(
       // recorded probe results (kusabi #197 follow-up): the live field now
       // carries the freshly measured one.
       oracleViolation: recordedOracleViolation,
+      // Same preservation for the oracle-unchecked flag (kusabi #541): the
+      // live field carries the fresh measurement below.
+      oracleUnchecked: recordedOracleUnchecked,
     };
     probesGreen = fresh.probesGreen;
     roundRecord.probesGreen = fresh.probesGreen;
@@ -619,6 +659,9 @@ export async function finishRound(
     // The live marker is the fresh measurement, so a later reader (a second
     // review-resume of this round) reads what the current worktree said.
     roundRecord.oracleViolation = fresh.oracleViolation;
+    // The live unchecked flag follows the same rule: the fresh run decides
+    // whether the oracle probes executed, and a later reader sees that.
+    roundRecord.oracleUnchecked = fresh.oracleUnchecked ?? false;
     // Overwrite a live record field only with an actually measured value.
     // This run carries no worktree baseline (see runRevalidationProbePhase),
     // so P3 cannot measure worktreeChanged — it is null.  A recorded true
@@ -630,8 +673,11 @@ export async function finishRound(
     // disposition of a round with red probes, exactly as a normal round
     // would derive it; the accept never finalises.  A fresh P5/P6 violation
     // escalates the resumed round the same way it escalates a normal one
-    // (kusabi #197 follow-up), so the marker handed over is the fresh one.
-    disposition = deriveWith(probesGreen, fresh.oracleViolation);
+    // (kusabi #197 follow-up), so the marker handed over is the fresh one —
+    // and a fresh unchecked oracle (the re-run's probes threw before P5/P6,
+    // kusabi #541) hands over the fresh unchecked flag so it escalates with
+    // an accurate reason instead of being misread as a violation.
+    disposition = deriveWith(probesGreen, fresh.oracleViolation, fresh.oracleUnchecked ?? false);
   }
   if (roundRecord.reviewJobFailure?.kind === "quota-exhaustion") {
     disposition = {
