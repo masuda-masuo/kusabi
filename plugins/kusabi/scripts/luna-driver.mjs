@@ -300,7 +300,7 @@ export function capProbeOutput(output) {
  * evidence path.
  */
 async function realCoordinatorDispatch({ cwd, missionId, brief, envelope, coordinator }) {
-  const { codexDispatch } = await import("./codex-dispatch.mjs");
+  const { codexDispatch, assertCodexDispatchSucceeded } = await import("./codex-dispatch.mjs");
   const prompt = [
     `You are the Luna coordinator seat for kusabi mission ${missionId}.`,
     `The current immutable evidence envelope hash is ${envelope.envelope_sha256}.`,
@@ -314,7 +314,7 @@ async function realCoordinatorDispatch({ cwd, missionId, brief, envelope, coordi
     `Answer with line-oriented JSON request records, one per line, each with ` +
       `action and envelope_sha256 set to ${envelope.envelope_sha256}.`,
   ].join("\n");
-  const { resultText } = await codexDispatch({
+  const result = await codexDispatch({
     cwd,
     kind: "luna-mission",
     title: `luna mission ${missionId}: coordinator dispatch`,
@@ -328,7 +328,13 @@ async function realCoordinatorDispatch({ cwd, missionId, brief, envelope, coordi
     timeoutS: null,
     watchdogS: null,
   });
-  return resultText;
+  // Fail closed: a resolved FAILED codex job is a dispatch failure, never an
+  // empty stream.  The driver catch records it as a coordinator dispatch
+  // failure naming job id/status/error; it must never be routed through
+  // parseCoordinatorOutput (which would emit the misleading "incomplete 0
+  // rejected, 0 malformed" empty-stream label from the incident).
+  assertCodexDispatchSucceeded(result, "coordinator");
+  return result.resultText;
 }
 
 /**

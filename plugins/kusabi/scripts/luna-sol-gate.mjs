@@ -223,7 +223,7 @@ export function buildGateEnvelope({
  * reconciliation can attribute seat jobs to the mission.
  */
 export async function realSolDispatch({ cwd, missionId, envelope, gate, auditor }) {
-  const { codexDispatch } = await import("./codex-dispatch.mjs");
+  const { codexDispatch, assertCodexDispatchSucceeded } = await import("./codex-dispatch.mjs");
   const prompt = [
     `You are the Sol auditor seat for kusabi mission ${missionId}, audit gate ${gate.gateId} (phase: ${gate.phase}).`,
     `The current immutable evidence envelope hash is ${envelope.envelope_sha256}.`,
@@ -235,7 +235,7 @@ export async function realSolDispatch({ cwd, missionId, envelope, gate, auditor 
       `verdict record with type "verdict", schema_version 1, gate_id "${gate.gateId}", ` +
       `envelope_sha256 "${envelope.envelope_sha256}", and verdict one of clear | rework | block.`,
   ].join("\n");
-  const { resultText } = await codexDispatch({
+  const result = await codexDispatch({
     cwd,
     kind: "luna-audit",
     title: `luna mission ${missionId}: audit ${gate.gateId}`,
@@ -249,7 +249,12 @@ export async function realSolDispatch({ cwd, missionId, envelope, gate, auditor 
     timeoutS: null,
     watchdogS: null,
   });
-  return resultText;
+  // Fail closed (shared with the coordinator seam): a resolved FAILED codex
+  // job is a dispatch/audit-seat failure and THROWS with the job
+  // id/status/error — the gate then classifies it "unavailable", never
+  // "empty" (an empty verdict-stream label that hides the seat failure).
+  assertCodexDispatchSucceeded(result, `audit ${gate.gateId}`);
+  return result.resultText;
 }
 
 /**

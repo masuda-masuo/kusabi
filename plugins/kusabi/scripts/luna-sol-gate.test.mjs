@@ -843,3 +843,195 @@ describe("live gate durability (kusabi #532 criterion 4)", () => {
       "no live field may claim the counterfactual block");
   });
 });
+// ---------------------------------------------------------------------------
+// realSolDispatch failure propagation (criterion 5 / criterion 7)
+// ---------------------------------------------------------------------------
+//
+// The production Sol seam is realSolDispatch.  The tests below point CODEX_BIN
+// at a fake `codex` that RESOLVES its job either failed (nonzero exit) or
+// completed with a non-empty but syntactically invalid verdict payload, and
+// pin the fail-closed distinction:
+//   - a resolved FAILED codex job must THROW from realSolDispatch with the job
+//     id/status/error, and a mandatory gate over the real seam must classify
+//     it as a dispatch/audit-seat failure (reason "unavailable") - never as an
+//     empty verdict stream (reason "empty");
+//   - a genuine COMPLETED job whose non-empty terminal message is not a
+//     verdict stream resolves as a stream and the gate classifies it as a
+//     PARSER failure ("missing"), never as a dispatch failure.  (A process
+//     with NO terminal assistant message is job.status "error" by fail-closed
+//     contract; that blank-stream case is NOT a completed job and is never
+//     tested here as one.)
+
+const REAL_SOL_FAKE_CODEX_TEMPLATE = `#!/usr/bin/env node
+import fs from "node:fs";
+const mode = process.env.FAKE_CODEX_MODE ?? "exit-3";
+const emit = (obj) => fs.writeSync(1, JSON.stringify(obj) + "\\n");
+if (mode === "exit-3") {
+  fs.writeSync(2, "codex: crashed\\n");
+  process.exit(3);
+} else if (mode === "invalid") {
+  emit({ type: "thread.started", thread_id: "__THREAD__" });
+  emit({ type: "item.completed", item: { type: "agent_message", text: "not a verdict record" } });
+  emit({ type: "turn.completed", usage: {} });
+  process.exit(0);
+}
+process.exit(0);
+`;
+
+function realSolFakeCodexContext(mode) {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-sol-fake-codex-"));
+  const binPath = path.join(tmp, "fake-codex.mjs");
+  fs.writeFileSync(binPath, REAL_SOL_FAKE_CODEX_TEMPLATE, "utf8");
+  fs.chmodSync(binPath, 0o755);
+  const saved = {
+    CODEX_BIN: process.env.CODEX_BIN,
+    KUSABI_STATE_DIR: process.env.KUSABI_STATE_DIR,
+    FAKE_CODEX_MODE: process.env.FAKE_CODEX_MODE,
+    HOME: process.env.HOME,
+    CODEX_HOME: process.env.CODEX_HOME,
+  };
+  process.env.CODEX_BIN = binPath;
+  process.env.FAKE_CODEX_MODE = mode;
+  process.env.KUSABI_STATE_DIR = path.join(tmp, "state");
+  process.env.HOME = path.join(tmp, "home");
+  process.env.CODEX_HOME = path.join(tmp, "operator-codex-home");
+  fs.mkdirSync(process.env.HOME, { recursive: true });
+  fs.mkdirSync(process.env.CODEX_HOME, { recursive: true });
+  const cwd = path.join(tmp, "work");
+  fs.mkdirSync(cwd, { recursive: true });
+  return {
+    tmp,
+    cwd,
+    stateDir: stateDirFor(cwd),
+    setMode(next) { process.env.FAKE_CODEX_MODE = next; },
+    restore() {
+      for (const [key, value] of Object.entries(saved)) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+      fs.rmSync(tmp, { recursive: true, force: true });
+    },
+  };
+}
+
+describe("realSolDispatch failure propagation (criterion 5/7)", () => {
+  let ctx;
+
+  beforeEach(() => {
+    ctx = realSolFakeCodexContext("exit-3");
+  });
+
+  afterEach(() => {
+    ctx.restore();
+  });
+
+  function codexJobRecords() {
+    const jobsDir = path.join(ctx.stateDir, "jobs");
+    if (!fs.existsSync(jobsDir)) return [];
+    return fs
+      .readdirSync(jobsDir)
+      .filter((n) => n.startsWith("job-"))
+      .map((id) => ({ id, job: readJson(path.join(jobsDir, id, "job.json")) }));
+  }
+
+  function solDispatchArgs(overrides = {}) {
+    return {
+      cwd: ctx.cwd,
+      missionId: "mission-aaaaaaaa",
+      envelope: { envelope_sha256: "e".repeat(64) },
+      gate: { gateId: "gate-1", phase: "pre-dispatch" },
+      auditor: { provider: "codex", model: "gpt-5.6-sol" },
+      ...overrides,
+    };
+  }
+
+  it("a resolved failed codex job THROWS from realSolDispatch with the job id/status/error, never a silent empty stream", async () => {
+    ctx.setMode("exit-3");
+    const { realSolDispatch } = await import("./luna-sol-gate.mjs");
+    await assert.rejects(
+      () => realSolDispatch(solDispatchArgs()),
+      (err) => {
+        const msg = String(err?.message ?? "");
+        const jobRecords = codexJobRecords();
+        assert.ok(jobRecords.length >= 1, "the real dispatch must have created a codex job record");
+        const job = jobRecords[jobRecords.length - 1].job;
+        assert.notEqual(job.status, "completed", "the fake codex job must be a resolved FAILED job");
+        assert.ok(msg.includes(job.id), `the thrown dispatch error must name the codex job id (${job.id}): ${msg}`);
+        assert.ok(msg.includes(job.status), `the thrown dispatch error must name the job status (${job.status}): ${msg}`);
+        assert.ok(msg.includes(job.error), "the thrown dispatch error must carry the underlying job error");
+        return true;
+      },
+    );
+  });
+
+  it("a mandatory gate over the real Sol seam classifies a failed codex job as a dispatch failure (unavailable), never as an empty verdict stream", async () => {
+    ctx.setMode("exit-3");
+    const { evaluateMissionGate, realSolDispatch } = await import("./luna-sol-gate.mjs");
+    const missionDir = path.join(ctx.stateDir, "missions", "mission-aaaaaaaa");
+    fs.mkdirSync(missionDir, { recursive: true });
+    const result = await evaluateMissionGate({
+      cwd: ctx.cwd,
+      missionId: "mission-aaaaaaaa",
+      missionDir,
+      brief: "Sol dispatch-failure classification",
+      container: "test-cid",
+      auditor: { provider: "codex", model: "gpt-5.6-sol" },
+      allowSubstitute: false,
+      sampling: null,
+      phase: "pre-accept",
+      reason: null,
+      record: {},
+      solDispatch: realSolDispatch,
+      stopRequested: () => false,
+      maxRework: 1,
+    });
+    assert.equal(result.fired, true, "the pre-accept T11 gate must fire");
+    assert.equal(result.outcome, "sol-blocked");
+    assert.ok(result.gate, "a fired gate must carry its record");
+    assert.equal(
+      result.gate.reason,
+      "unavailable",
+      "a failed codex job is a dispatch/audit-seat failure, never parsed as an empty verdict stream",
+    );
+    assert.notEqual(result.gate.reason, "empty");
+  });
+
+  it("a genuine completed job with non-empty invalid verdict content resolves as a stream and stays a parser failure, never a dispatch failure (criterion 7)", async () => {
+    ctx.setMode("invalid");
+    const { evaluateMissionGate, realSolDispatch } = await import("./luna-sol-gate.mjs");
+    const text = await realSolDispatch(solDispatchArgs());
+    assert.equal(typeof text, "string", "a completed job must resolve to its stream text, never throw");
+    assert.equal(text.trim(), "not a verdict record", "the non-empty invalid terminal message is the stream text");
+    const jobRecords = codexJobRecords();
+    assert.ok(jobRecords.length >= 1, "the real dispatch must have created a codex job record");
+    assert.equal(
+      jobRecords[jobRecords.length - 1].job.status,
+      "completed",
+      "a non-empty terminal message genuinely completes the job",
+    );
+    // The gate classifies the invalid CONTENT as a parser failure ("missing"),
+    // never as a dispatch failure ("unavailable").
+    const missionDir = path.join(ctx.stateDir, "missions", "mission-aaaaaaaa");
+    fs.mkdirSync(missionDir, { recursive: true });
+    const result = await evaluateMissionGate({
+      cwd: ctx.cwd,
+      missionId: "mission-aaaaaaaa",
+      missionDir,
+      brief: "Sol invalid-verdict-content classification",
+      container: "test-cid",
+      auditor: { provider: "codex", model: "gpt-5.6-sol" },
+      allowSubstitute: false,
+      sampling: null,
+      phase: "pre-accept",
+      reason: null,
+      record: {},
+      solDispatch: realSolDispatch,
+      stopRequested: () => false,
+      maxRework: 1,
+    });
+    assert.equal(result.fired, true, "the pre-accept T11 gate must fire");
+    assert.equal(result.outcome, "sol-blocked");
+    assert.equal(result.gate.reason, "missing", "invalid verdict content is a stream/parser failure, never a dispatch failure");
+    assert.notEqual(result.gate.reason, "unavailable");
+  });
+});
