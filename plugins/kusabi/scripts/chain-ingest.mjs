@@ -183,6 +183,10 @@ export function parseChainRecord(chainJson, ctx = {}) {
     orchSession: orchestrator && typeof orchestrator.session === "string" ? orchestrator.session : null,
     orchDate: orchestrator && typeof orchestrator.date === "string" ? orchestrator.date : null,
     backend: chainBackend,
+    // Mission linkage (kusabi #532): the owning luna mission's id, present
+    // only on Luna-mode inner chains.  A plain chain without the key stores
+    // NULL — absence is a fact, never false.
+    missionId: typeof chainJson.missionId === "string" ? chainJson.missionId : null,
     baseSha: typeof chainJson.baseSha === "string" ? chainJson.baseSha : null,
     model: modelRouteString(chainJson.model),
     modelChainJson: Array.isArray(chainJson.modelChain) ? JSON.stringify(chainJson.modelChain) : null,
@@ -292,6 +296,14 @@ export function parseChainRecord(chainJson, ctx = {}) {
       reviewIn: usageFieldSum("input", reviewUsages),
       reviewOut: usageFieldSum("output", reviewUsages),
       reviewCost: usageFieldSum("cost", reviewUsages),
+      // Round-level Sol audit record (kusabi #532), ingested verbatim from the
+      // durable round record.  auditVerdict / auditShadowDisposition stay NULL
+      // on legacy rounds; auditBlocked is three-valued (0 = measured
+      // not-blocked, 1 = blocked, NULL = never recorded).
+      auditVerdict: typeof rec.auditVerdict === "string" ? rec.auditVerdict : null,
+      auditBlocked: toBoolInt(rec.auditBlocked),
+      auditShadowDisposition:
+        typeof rec.auditShadowDisposition === "string" ? rec.auditShadowDisposition : null,
     });
 
     // Generational gap (hazard 3): prefer full `findings` objects

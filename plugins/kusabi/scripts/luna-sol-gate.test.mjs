@@ -654,3 +654,192 @@ describe("luna Sol gates (kusabi #531 criteria 1, 2, 3, 7, 8, 9, 10)", () => {
     assert.equal(sol.calls.length, 2);
   });
 });
+
+// ---------------------------------------------------------------------------
+// kusabi #532 criterion 4 — live gate durability.  Every recorded gate must
+// store the normalized policyInput it was evaluated with, the actual
+// decision/verdict, its consultation origin ("luna-requested" |
+// "policy-mandated" | "sampled") and a deterministic shadow disposition
+// computed with solVerdict: null.  The shadow is a counterfactual ONLY: it
+// never changes the live mission disposition or the live policy.
+// ---------------------------------------------------------------------------
+
+describe("live gate durability (kusabi #532 criterion 4)", () => {
+  let root;
+  let cwd;
+  let stateDir;
+  let previousStateDir;
+  let missionFile;
+
+  beforeEach(() => {
+    root = makeTemp("kusabi-532-gate-durability-");
+    cwd = path.join(root, "work");
+    fs.mkdirSync(cwd, { recursive: true });
+    missionFile = path.join(root, "mission.md");
+    fs.writeFileSync(missionFile, MISSION_BRIEF, "utf8");
+    previousStateDir = process.env.KUSABI_STATE_DIR;
+    process.env.KUSABI_STATE_DIR = path.join(root, "state");
+    stateDir = stateDirFor(cwd);
+  });
+
+  afterEach(() => {
+    if (previousStateDir === undefined) delete process.env.KUSABI_STATE_DIR;
+    else process.env.KUSABI_STATE_DIR = previousStateDir;
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  async function runMission(streams, { solDispatch = clearSol, sampling = null } = {}) {
+    const driver = await lunaDriver();
+    const coord = makeCoordinator(streams);
+    const chain = makeChainFake();
+    const tools = makeToolFake();
+    const sol = makeSol(solDispatch);
+    const notify = makeNotify();
+    const input = {
+      cwd,
+      missionFile,
+      brief: MISSION_BRIEF,
+      container: "test-cid",
+      ...DEFAULT_SEATS,
+      allowSubstitute: false,
+      budget: { ...DEFAULT_BUDGET },
+      ...(sampling ? { sampling } : {}),
+      inject: {
+        coordinatorDispatch: coord.dispatch,
+        runChainLifecycle: chain.run,
+        callTool: tools.callTool,
+        solDispatch: sol.dispatch,
+        notifyMissionTerminal: notify.dispatch,
+        guardedServeStop: async () => {},
+      },
+    };
+    const result = await driver.runLunaMission(input);
+    return { driver, coord, chain, sol, notify, result };
+  }
+
+  function readMission() {
+    const missionsDir = path.join(stateDir, "missions");
+    const ids = fs.readdirSync(missionsDir).filter((n) => n.startsWith("mission-"));
+    assert.equal(ids.length, 1);
+    const missionDir = path.join(missionsDir, ids[0]);
+    return {
+      missionId: ids[0],
+      record: readJson(path.join(missionDir, "mission.json")),
+    };
+  }
+
+  it("every recorded gate stores the normalized policyInput that reproduces its recorded decision", async () => {
+    await runMission(
+      [runChainStream(VALID_RUN_CHAIN_BRIEF), finishStream("recommend-accept")],
+      { sampling: SAMPLED },
+    );
+    const { record, missionId } = readMission();
+    const g = record.auditGates;
+    assert.equal(g.length, 3);
+
+    const { evaluateAuditGate } = await import("./audit-policy.mjs");
+    for (const gate of g) {
+      assert.ok(gate.policyInput && typeof gate.policyInput === "object",
+        `gate ${gate.gateId} must record its normalized policyInput`);
+      assert.equal(gate.policyInput.gateId, gate.gateId);
+      // The recorded input REPLAYS to the recorded decision — the single
+      // decision source stays evaluateAuditGate.
+      const replayed = evaluateAuditGate(gate.policyInput);
+      assert.equal(replayed.required, gate.required, `${gate.gateId}: policyInput must reproduce required`);
+      assert.equal(replayed.mandatory, gate.mandatory, `${gate.gateId}: policyInput must reproduce mandatory`);
+      assert.equal(replayed.sampled, gate.sampled, `${gate.gateId}: policyInput must reproduce sampled`);
+      assert.deepEqual(
+        replayed.triggers.map((t) => t.id),
+        gate.triggers.map((t) => t.id),
+        `${gate.gateId}: policyInput must reproduce the trigger set`,
+      );
+    }
+    // The pre-accept gate's input carries the T11 signal.
+    assert.equal(g[2].policyInput.lunaRecommendsAccept, true);
+    // Sampling is recorded with the durable subject id (the mission id).
+    for (const gate of g) {
+      assert.equal(gate.policyInput.sampling.missionId, missionId);
+      assert.equal(gate.policyInput.sampling.rate, 1);
+      assert.equal(gate.policyInput.sampling.salt, "v1");
+    }
+  });
+
+  it("records the consultation origin: luna-requested for consult, policy-mandated when mandatory, sampled when T12-only", async () => {
+    // Sampled mission ending recommend-accept: gate-1/-2 fire ONLY via T12
+    // (sampled), gate-3 is the mandatory T11 gate (policy-mandated).
+    await runMission(
+      [runChainStream(VALID_RUN_CHAIN_BRIEF), finishStream("recommend-accept")],
+      { sampling: SAMPLED },
+    );
+    const { record: sampledRecord } = readMission();
+    const phases = sampledRecord.auditGates.map((x) => [x.phase, x.origin]);
+    assert.deepEqual(phases, [
+      ["pre-dispatch", "sampled"],
+      ["post-chain", "sampled"],
+      ["pre-accept", "policy-mandated"],
+    ]);
+    fs.rmSync(path.join(stateDir, "missions"), { recursive: true, force: true });
+
+    // Consult mission: the additive gate is Luna-requested.
+    await runMission(
+      [consultStream("additional audit requested by coordinator"), finishStream("recommend-escalate")],
+      { sampling: UNSAMPLED },
+    );
+    const { record: consultRecord } = readMission();
+    assert.equal(consultRecord.auditGates.length, 1);
+    const consultGate = consultRecord.auditGates[0];
+    assert.equal(consultGate.phase, "consult");
+    assert.equal(consultGate.origin, "luna-requested");
+    // A consult gate is NOT a policy decision (kusabi #532 adjudication): it
+    // fires on the synthetic "consult" reason, so no replayable policyInput
+    // is fabricated — the recorded field is explicitly null, while the real
+    // origin/verdict/shadow outcome are all preserved.
+    assert.equal(consultGate.policyInput, null,
+      "a Luna-requested consult gate must not fabricate a policy decision");
+    assert.equal(consultGate.verdict, "clear");
+    // With solVerdict: null the seat is unavailable; a required gate that is
+    // neither mandatory nor sampled still fails closed (the invariant-shaped
+    // rule) — the shadow is sol-blocked, never audit-sample-skipped.
+    assert.equal(consultGate.shadowDisposition, "sol-blocked");
+  });
+
+  it("records a deterministic shadow disposition computed with solVerdict: null", async () => {
+    const { resolveSolGateSeatFailure } = await import("./audit-envelope.mjs");
+    await runMission(
+      [runChainStream(VALID_RUN_CHAIN_BRIEF), finishStream("recommend-accept")],
+      { sampling: SAMPLED },
+    );
+    const { record } = readMission();
+    for (const gate of record.auditGates) {
+      const expected = resolveSolGateSeatFailure({
+        required: true,
+        mandatory: gate.mandatory,
+        sampled: gate.sampled,
+        seatAvailable: false,
+      }).disposition;
+      assert.equal(gate.shadowDisposition, expected,
+        `${gate.gateId} (mandatory=${gate.mandatory}, sampled=${gate.sampled}) must shadow to ${expected}`);
+    }
+    // The mandatory pre-accept gate shadows sol-blocked; the sampled-only
+    // gates shadow audit-sample-skipped.
+    assert.equal(record.auditGates[0].shadowDisposition, "audit-sample-skipped");
+    assert.equal(record.auditGates[2].shadowDisposition, "sol-blocked");
+  });
+
+  it("the shadow is a counterfactual only: it never changes the live mission disposition (frozen boundary)", async () => {
+    await runMission(
+      [runChainStream(VALID_RUN_CHAIN_BRIEF), finishStream("recommend-accept")],
+      { sampling: SAMPLED },
+    );
+    const { record } = readMission();
+    // The recorded gate verdicts are clear, the shadow of the mandatory
+    // gate is sol-blocked — yet the LIVE mission disposition must remain
+    // recommend-accept.  The shadow never feeds the driver's outcome.
+    assert.deepEqual(record.auditGates.map((x) => x.verdict), ["clear", "clear", "clear"]);
+    assert.equal(record.auditGates[2].shadowDisposition, "sol-blocked");
+    assert.equal(record.disposition, "recommend-accept",
+      "the recorded shadow must not leak into the live mission disposition");
+    assert.doesNotMatch(JSON.stringify(record), /"disposition":"sol-blocked"/,
+      "no live field may claim the counterfactual block");
+  });
+});

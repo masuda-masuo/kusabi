@@ -353,7 +353,7 @@ export async function runTddExecutor({
   dispatchWithFallback: _dispatch, backend, modelChain, baseSha,
   worktreeBaseline, verifyBaseline, model, maxRounds, brief,
   orchestrator, records, signalReceived = () => false,
-  strategy = null, requirementsFile = null,
+  strategy = null, requirementsFile = null, missionId = null,
 }) {
   let session = null;
   let provenance = null;
@@ -427,6 +427,7 @@ export async function runTddExecutor({
           baseSha, chainTotals: computeChainTotals(roundRecords),
           strategized: false, chainFollowupDraft: null,
           strategy, requirementsFile,
+          ...(missionId ? { missionId } : {}),
         });
         updateChainControlRound({ chainDir, round });
         tddState.nextRound += 1;
@@ -524,6 +525,7 @@ export async function runTddExecutor({
         baseSha, chainTotals: computeChainTotals(roundRecords),
         strategized: false, chainFollowupDraft: null,
         strategy, requirementsFile,
+        ...(missionId ? { missionId } : {}),
       });
       updateChainControlRound({ chainDir, round: testAuthorRound });
       tddState.nextRound += 1;
@@ -615,6 +617,7 @@ export async function runTddExecutor({
         baseSha, chainTotals: computeChainTotals(roundRecords),
         strategized: false, chainFollowupDraft: null,
         strategy, requirementsFile,
+        ...(missionId ? { missionId } : {}),
       });
       updateChainControlRound({ chainDir, round: implementRound });
       tddState.nextRound += 1;
@@ -710,7 +713,7 @@ export async function runChainDriver({
   reworkDispatchWithFallback = null,
   initialSession, flagsModel = null, reviewFlagsModel = null, signalReceived = () => false,
   keepServe = false, resume = null, sessionProvenance = null,
-  strategy = null, requirementsFile = null,
+  strategy = null, requirementsFile = null, missionId = null,
 }) {
   // Per-phase dispatch (kusabi #192): the review phase dispatches through its
   // own backend-specific dispatch unless the caller threads a single one
@@ -772,7 +775,7 @@ export async function runChainDriver({
         stateDir, model, maxRounds, brief, orchestrator,
         records: resume ? (resume.records ?? []) : [],
         signalReceived,
-        strategy, requirementsFile,
+        strategy, requirementsFile, missionId,
       });
     } finally {
       if (!keepServe) {
@@ -807,6 +810,11 @@ export async function runChainDriver({
     reviewDispatch, injectedDispatch,
     reworkTierCount: effectiveTierCount(effectiveReworkChain, effectiveReworkBackend),
     strategy, requirementsFile,
+    // Mission linkage (kusabi #532): the owning luna mission's id, threaded
+    // through the ordinary (non-TDD) round loop's finishRound persistence so
+    // a normally completed Luna inner chain writes it; plain chains carry
+    // null and stay byte-identical.
+    missionId,
     // Mutable cross-round state (owned by the loop, mutated by finishRound)
     records,
     strategized: resume ? resume.strategized : false,
@@ -1129,6 +1137,7 @@ export async function runChainDriver({
           interrupted: true,
           verifyBaseline: effectiveVerifyBaseline,
           strategy, requirementsFile,
+          ...(missionId ? { missionId } : {}),
         });
         finalizeChainControl({ chainDir, status: "cancelled", round });
         const text = `Chain ${chainId} cancelled during round ${round} (stop requested after probes, before review). Progress preserved — resume with chain-resume ${chainId}.`;

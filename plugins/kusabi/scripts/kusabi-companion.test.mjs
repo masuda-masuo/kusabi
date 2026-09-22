@@ -5817,4 +5817,188 @@ describe("incremental-TDD help flags (kusabi #505)", () => {
   });
 });
 
+// ---------------------------------------------------------------------------
+// kusabi #532 criterion 10 — a read-only evaluation CLI surface that replays
+// a named durable mission or plain chain from durable records alone and
+// reports a manifest.  Invalid arguments fail BEFORE dispatch; the existing
+// luna*, chain and metrics commands remain unchanged and reachable.
+//
+// Frozen surface:
+//   kusabi-companion evaluation <missionId|chainId> [--sample-rate <0..1>]
+//       [--salt <string>]
+//     Read-only: nothing is written, spawned or dispatched.  The subject id
+//     is auto-detected from its shape (mission-* -> mission replay,
+//     chain-* -> plain-chain replay).  Output names the subject and the
+//     replayed gate results; when a recorded gate's policyInput is missing
+//     the replay skips it with an explicit reason (never a guess).
+//   Invalid arguments fail before dispatch:
+//     - no subject id           -> usage error naming evaluation
+//     - --sample-rate/--salt on any other subcommand -> rejected out loud
+//     - --container on evaluation -> rejected (a read-only surface never
+//       names a container, mirroring luna-wait)
+//   The surface is read-only like status/luna-wait: allowed under
+//   KUSABI_WORKER_CONTEXT (never a job-creating subcommand).
+// ---------------------------------------------------------------------------
+
+describe("evaluation CLI surface (kusabi #532 criterion 10)", () => {
+  const COMPANION_SCRIPT = path.join(import.meta.dirname, "kusabi-companion.mjs");
+  let tmpDir;
+  let stateRoot;
+
+  beforeEach(() => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-532-eval-"));
+    stateRoot = path.join(tmpDir, "state");
+  });
+
+  afterEach(() => {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  function runCompanion(args, env = {}) {
+    return spawnSync(process.execPath, [COMPANION_SCRIPT, ...args], {
+      cwd: tmpDir,
+      encoding: "utf8",
+      env: { ...process.env, KUSABI_STATE_DIR: stateRoot, ...env },
+      timeout: 30_000,
+    });
+  }
+
+  function writeMission(id) {
+    const missionDir = path.join(stateRoot, "ws-hash-1", "missions", id);
+    fs.mkdirSync(missionDir, { recursive: true });
+    fs.writeFileSync(path.join(missionDir, "control.json"), JSON.stringify({
+      missionId: id,
+      pid: 1,
+      status: "completed",
+      finishedAt: "2026-09-01T11:30:00.000Z",
+    }), "utf8");
+    fs.writeFileSync(path.join(missionDir, "mission.json"), JSON.stringify({
+      missionId: id,
+      container: "cid-1",
+      status: "completed",
+      disposition: "recommend-accept",
+      coordinator: { provider: "codex", model: "gpt-5.6-luna", requested: "gpt-5.6-luna", actual: "gpt-5.6-luna", substituted: false, reasoningEffort: "high" },
+      auditor: { provider: "codex", model: "gpt-5.6-sol", requested: "gpt-5.6-sol", actual: "gpt-5.6-sol", substituted: false, reasoningEffort: "high" },
+      coordinatorErrors: 2,
+      startedAt: "2026-09-01T09:00:00.000Z",
+      finishedAt: "2026-09-01T11:30:00.000Z",
+      auditGates: [{
+        gateId: "gate-1",
+        phase: "pre-accept",
+        origin: "policy-mandated",
+        verdict: "clear",
+        disposition: "verdict-recorded",
+        required: true,
+        mandatory: true,
+        sampled: false,
+        triggers: [{ id: "T11", detail: "Luna recommends accept" }],
+        policyInput: {
+          gateId: "gate-1",
+          lunaRecommendsAccept: true,
+          changeScope: { added: [], deleted: [], modified: [] },
+          sampling: null,
+        },
+        shadowDisposition: "sol-blocked",
+      }],
+    }), "utf8");
+    return missionDir;
+  }
+
+  it("evaluation replays a named durable mission from durable records alone and reports a manifest", () => {
+    const missionDir = writeMission("mission-eval1");
+    const before = () =>
+      fs.readdirSync(missionDir, { recursive: true })
+        .map((f) => path.join(missionDir, f))
+        .filter((p) => fs.statSync(p).isFile())
+        .sort();
+
+    const result = runCompanion(["evaluation", "mission-eval1"]);
+    assert.equal(result.status, 0, `evaluation failed: ${result.stdout} ${result.stderr}`);
+    assert.match(result.stdout, /mission-eval1/, "the manifest names the replayed subject");
+    assert.match(result.stdout, /manifest|evaluation/i);
+    assert.match(result.stdout, /gate-1/, "the recorded gate is replayed and reported");
+    assert.match(result.stdout, /policy-mandated/, "the recorded consultation origin is reported");
+
+    // Read-only: the durable mission state is untouched by the replay.
+    assert.deepEqual(before(), before(), "replay must not modify the durable mission state");
+  });
+
+  it("evaluation replays a named plain chain (chain-* subject) from durable records alone", () => {
+    const chainDir = path.join(stateRoot, "ws-hash-1", "chains", "chain-eval1");
+    fs.mkdirSync(chainDir, { recursive: true });
+    fs.writeFileSync(path.join(chainDir, "chain.json"), JSON.stringify({
+      chainId: "chain-eval1",
+      orchestrator: { model: "claude-opus-5", session: "abc12345", date: "2026-09-01" },
+      records: [
+        {
+          round: 1,
+          verdict: "approve",
+          disposition: { disposition: "escalate" },
+          reworkCount: 1,
+          worktreeChanged: true,
+          findings: [{ severity: "high", title: "Premise unverified", file: "src/x.mjs" }],
+        },
+      ],
+    }), "utf8");
+
+    const result = runCompanion(["evaluation", "chain-eval1"]);
+    assert.equal(result.status, 0, `evaluation failed: ${result.stdout} ${result.stderr}`);
+    assert.match(result.stdout, /chain-eval1/, "the manifest names the replayed plain chain");
+    // The derived durable input must fire the mandatory triggers the chain
+    // records actually support (T8 rework, T9 high finding, T10 escalate).
+    assert.match(result.stdout, /T8|T9|T10/);
+  });
+
+  it("invalid arguments fail before dispatch: no id is a usage error", () => {
+    const result = runCompanion(["evaluation"]);
+    assert.notEqual(result.status, 0);
+    assert.match(result.stdout, /evaluation/);
+    assert.match(result.stdout, /mission id|chain id|subject/i);
+  });
+
+  it("evaluation-specific flags are rejected out loud on any other subcommand", () => {
+    const other = runCompanion(["status", "--sample-rate", "0.2"]);
+    assert.notEqual(other.status, 0);
+    assert.match(other.stdout, /--sample-rate is only supported by evaluation/);
+
+    const otherSalt = runCompanion(["chain-show", "--salt", "v1"]);
+    assert.notEqual(otherSalt.status, 0);
+    assert.match(otherSalt.stdout, /--salt is only supported by evaluation/);
+  });
+
+  it("--container is rejected on the read-only evaluation surface", () => {
+    const result = runCompanion(["evaluation", "mission-eval1", "--container", "cid-1"]);
+    assert.notEqual(result.status, 0);
+    assert.match(result.stdout, /--container is only supported by/);
+  });
+
+  it("the evaluation surface is read-only: allowed under KUSABI_WORKER_CONTEXT, failing on its own validation", () => {
+    const result = runCompanion(["evaluation"], { KUSABI_WORKER_CONTEXT: "1" });
+    assert.notEqual(result.status, 0, "missing id still fails");
+    assert.doesNotMatch(result.stdout, /worker context/i, "a read-only surface must never be a job-creating refusal");
+  });
+
+  it("existing luna*, chain and metrics commands remain reachable and unchanged", () => {
+    // luna-wait still refuses a missing mission id with its own usage error.
+    const lunaWait = runCompanion(["luna-wait"]);
+    assert.notEqual(lunaWait.status, 0);
+    assert.match(lunaWait.stdout, /mission id/i);
+
+    // metrics-report on a missing store still returns the missing-store text.
+    const metrics = runCompanion(["metrics-report", "--db", path.join(tmpDir, "absent.db")]);
+    assert.equal(metrics.status, 0);
+    assert.match(metrics.stdout, /Metrics store not found/);
+
+    // chain-show still refuses a missing chain id with its own usage error.
+    const chainShow = runCompanion(["chain-show"]);
+    assert.notEqual(chainShow.status, 0);
+    assert.match(chainShow.stdout, /no chains directory found/);
+
+    // An unknown subcommand still fails with the unchanged dispatch error.
+    const unknown = runCompanion(["frobnicate"]);
+    assert.notEqual(unknown.status, 0);
+    assert.match(unknown.stdout, /unknown subcommand: frobnicate/);
+  });
+});
+
 

@@ -655,6 +655,61 @@ describe("runChainDriver resume", () => {
     fs.rmSync(tmp, { recursive: true, force: true });
   });
 
+  // ---- kusabi #532: a normally completed non-TDD Luna inner chain persists
+  // its mission link through the ordinary round loop's finishRound
+  // persistence; an ordinary chain omits the key (byte-identical). ----
+  it("a normally completed non-TDD Luna inner chain persists missionId; an ordinary chain omits the key", async () => {
+    async function runFreshChainWith({ missionId }) {
+      const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-532-missionid-"));
+      const chainDir = path.join(tmp, "chains", "chain-mid");
+      fs.mkdirSync(chainDir, { recursive: true });
+      writeChainControl(chainDir, {
+        chainId: "chain-mid", container: "cid-1", pid: process.pid,
+        status: "running", round: 0, startedAt: new Date().toISOString(),
+      });
+      const dispatch = makeFakeDispatch(); // review approves round 1
+      const text = await runChainDriver({
+        cwd: tmp, stateDir: tmp, chainDir, chainId: "chain-mid", container: "cid-1",
+        model: "fake/model", modelChain: [["fake/model"]], maxRounds: 1,
+        brief: BRIEF, orchestrator: null, baseSha: "abc123", worktreeBaseline: null,
+        callTool: fakeResumeCallTool(),
+        dispatchWithFallback: dispatch,
+        keepServe: true,
+        signalReceived: () => false,
+        resume: null,
+        // The luna driver threads the owning mission id; a plain chain omits it.
+        ...(missionId ? { missionId } : {}),
+      });
+      return { tmp, chainDir, text };
+    }
+
+    // Luna inner chain: the standard (non-TDD) loop accepts and chain.json
+    // carries the mission link from BOTH the normal finishRound persist and
+    // the terminal record.
+    const luna = await runFreshChainWith({ missionId: "mission-abc" });
+    try {
+      assert.match(luna.text, /accepted at round 1/);
+      const lunaChainJson = readJson(path.join(luna.chainDir, "chain.json"));
+      assert.equal(lunaChainJson.missionId, "mission-abc",
+        "a normally completed Luna inner chain must persist its mission link");
+      assert.equal(lunaChainJson.records[0].implementJobId, "job-imp-1");
+    } finally {
+      fs.rmSync(luna.tmp, { recursive: true, force: true });
+    }
+
+    // Ordinary chain: same loop, no missionId option — the key must not
+    // appear at all (a null/false key would change the serialization).
+    const plain = await runFreshChainWith({ missionId: null });
+    try {
+      assert.match(plain.text, /accepted at round 1/);
+      const plainChainJson = readJson(path.join(plain.chainDir, "chain.json"));
+      assert.equal("missionId" in plainChainJson, false,
+        "a plain chain.json must not carry a missionId key at all");
+    } finally {
+      fs.rmSync(plain.tmp, { recursive: true, force: true });
+    }
+  });
+
   // ---- replacement review seat: loud refusal on an empty change set
   // (kusabi #248 follow-up) ----
   // A seat-replacement resume whose container no longer holds the round's

@@ -397,7 +397,13 @@ export async function cmdLunaShow(cwd, { text }) {
   if (!snapshot.exists) {
     throw new Error(`mission not found: ${missionId}`);
   }
-  return renderMissionShow(snapshot);
+  // kusabi #532 criterion 3: the additive mission digest — the legacy
+  // mission-show lines stay byte-identical, and a #532 record gains the
+  // provenance banner + recorded gate consultation origins.  Lazy import so
+  // render-mission.mjs (which imports renderMissionShow from here) never
+  // forms a static cycle.
+  const { renderMissionDigest } = await import("./render-mission.mjs");
+  return renderMissionDigest(snapshot);
 }
 
 
