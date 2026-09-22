@@ -382,14 +382,28 @@ export function codexThreadIdFromEvent(evt) {
 
 /**
  * Extract assistant text from an `item.completed` event.
- * MEASURED shape: `item.agent_message.text`.
+ *
+ * Two measured shapes:
+ *   - CURRENT flat shape (live codex-cli 0.154.0, incident
+ *     mission-mucn5qb2a76e2095): `item.type === "agent_message"` with the
+ *     terminal text on `item.text`.
+ *   - LEGACY nested shape (the previously measured contract):
+ *     `item.agent_message.text`.
+ *
+ * Non-agent items (tool_call, custom_tool_call, ...) and malformed shapes
+ * contribute no text and never throw.
  *
  * @param {object} evt
  * @returns {string}
  */
 export function codexAssistantTextFromEvent(evt) {
-  const text = evt?.item?.agent_message?.text;
-  return typeof text === "string" ? text : "";
+  const item = evt?.item;
+  if (!item || typeof item !== "object") return "";
+  if (item.type === "agent_message" && typeof item.text === "string") {
+    return item.text;
+  }
+  const legacy = item.agent_message?.text;
+  return typeof legacy === "string" ? legacy : "";
 }
 
 /**
@@ -501,6 +515,30 @@ export function describeCodexResult(value) {
     text = String(value);
   }
   return text.length > 500 ? `${text.slice(0, 500)}…` : text;
+}
+
+/**
+ * Fail-closed check on a RESOLVED codexDispatch result: a job that did not
+ * reach status "completed" is a dispatch/seat failure, never an empty
+ * stream.  The Luna coordinator and Sol audit seams share this check so a
+ * failed Codex job surfaces as a dispatch/audit-seat failure naming the job
+ * id, status and recorded error — it must never be parsed as an empty
+ * coordinator/verdict stream (the mission-mucn5qb2a76e2095 mislabel).
+ *
+ * Throws when the job is not completed; otherwise returns the result
+ * unchanged so the caller keeps the public `{ job, resultText, stateDir }`
+ * contract.
+ *
+ * @param {{ job: object, resultText: string, stateDir: string }} result
+ * @param {string} [label] — the caller's slot name for the error message.
+ * @returns {{ job: object, resultText: string, stateDir: string }}
+ */
+export function assertCodexDispatchSucceeded({ job, resultText, stateDir }, label = "codex") {
+  if (job?.status === "completed") return { job, resultText, stateDir };
+  const id = job?.id ?? "unknown";
+  const status = job?.status ?? "unknown";
+  const error = job?.error ?? "no error recorded";
+  throw new Error(`codex dispatch failed (${label}): job ${id} resolved ${status}: ${error}`);
 }
 
 // =========================================================================

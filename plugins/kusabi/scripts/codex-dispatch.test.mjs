@@ -200,6 +200,14 @@ if (mode === "exit") {
   emit({ type: "item.completed", item: { agent_message: { text: "{\\"verdict\\":\\"approve\\"}" } } });
   emit({ type: "turn.completed", usage: { input_tokens: 1, output_tokens: 1 } });
   process.exit(0);
+} else if (mode === "flat") {
+  writeRollout(model, "high");
+  emit({ type: "thread.started", thread_id: thread });
+  emit({ type: "turn.started", turn_id: "turn-1" });
+  emit({ type: "item.completed", item: { type: "agent_message", text: JSON.stringify({ action: "read_probe", envelope_sha256: "deadbeef", tool: "read_file_range", path: "evidence/probes.json" }) } });
+  emit({ type: "item.completed", item: { type: "tool_call", id: "t1", input: {} } });
+  emit({ type: "turn.completed", usage: usage });
+  process.exit(0);
 } else {
 writeRollout(model, "high");
 emit({ type: "thread.started", thread_id: thread });
@@ -476,6 +484,34 @@ describe("codex stream parsing", () => {
       "ALPHA-7",
     );
     assert.equal(codexAssistantTextFromEvent({ type: "item.completed", item: {} }), "");
+  });
+
+  it("extracts assistant text from the CURRENT flat item.completed shape and keeps the legacy nested shape", () => {
+    // The live Codex CLI event shape (incident mission-mucn5qb2a76e2095):
+    // item.type === "agent_message" with the terminal text on item.text.
+    assert.equal(
+      codexAssistantTextFromEvent({ type: "item.completed", item: { type: "agent_message", text: "ALPHA-7" } }),
+      "ALPHA-7",
+    );
+    // The previously measured nested shape remains part of the contract.
+    assert.equal(
+      codexAssistantTextFromEvent({ type: "item.completed", item: { agent_message: { text: "ALPHA-7" } } }),
+      "ALPHA-7",
+    );
+    // Non-agent items never contribute text.
+    assert.equal(codexAssistantTextFromEvent({ type: "item.completed", item: { type: "tool_call", id: "t1" } }), "");
+    assert.equal(codexAssistantTextFromEvent({ type: "item.completed", item: {} }), "");
+  });
+
+  it("non-agent item.completed events contribute no assistant text; malformed shapes stay non-throwing", () => {
+    const acc = initCodexStreamAccumulator();
+    applyCodexStreamEvent(acc, { type: "item.completed", item: { type: "tool_call", id: "t1" } });
+    applyCodexStreamEvent(acc, { type: "item.completed", item: { type: "agent_message", text: "ALPHA" } });
+    applyCodexStreamEvent(acc, { type: "item.completed", item: { type: "custom_tool_call", id: "t2" } });
+    assert.equal(acc.steps, 3, "every completed item still counts as one step");
+    assert.equal(acc.assistantText, "ALPHA", "only the flat agent_message item contributes text");
+    assert.doesNotThrow(() => applyCodexStreamEvent(acc, { type: "item.completed", item: null }));
+    assert.doesNotThrow(() => applyCodexStreamEvent(acc, { type: "item.completed", item: { type: "agent_message", text: 42 } }));
   });
 
   it("fold accumulates thread id, assistant text (both framings), steps, and usage", () => {
@@ -906,6 +942,23 @@ describe("codexDispatch (fake codex)", () => {
     assert.equal(persisted.codexProvenance.state, "verified");
     assert.equal(persisted.substituted, false, "the persisted job record must carry substituted: false");
     assert.equal(fs.readFileSync(path.join(jobDir(stateDir, job.id), "result.md"), "utf8"), "ALPHA-7");
+  });
+
+  it("regression: the exact live flat item.completed shape (item.type agent_message, item.text) completes the job with the extracted text", async () => {
+    // The live Codex CLI emits the terminal assistant text as
+    // item.completed with item: { type: "agent_message", text } (the shape
+    // that broke mission-mucn5qb2a76e2095).  This fixture must complete the
+    // job exactly like the nested shape does.
+    ctx.setMode("flat");
+    const { job, resultText, stateDir } = await codexDispatch(ctx.dispatchOptions());
+    assert.equal(job.status, "completed");
+    assert.equal(job.stats.steps, 2, "the flat agent_message item and the tool item each count one step");
+    const readProbe = { action: "read_probe", envelope_sha256: "deadbeef", tool: "read_file_range", path: "evidence/probes.json" };
+    assert.equal(resultText, JSON.stringify(readProbe), "the flat item.text payload is the dispatched result");
+    assert.equal(job.sessionID, THREAD_ID);
+    const persisted = loadJob(stateDir, job.id);
+    assert.equal(persisted.status, "completed");
+    assert.equal(fs.readFileSync(path.join(jobDir(stateDir, job.id), "result.md"), "utf8"), JSON.stringify(readProbe));
   });
 
   it("persists the job-owned codex home and renders a continuation targeting the SAME home the dispatch used", async () => {

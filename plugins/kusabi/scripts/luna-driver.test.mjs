@@ -1031,3 +1031,180 @@ describe("post-chain audit columns persist onto the durable inner chain round (k
     assert.equal(chainJson.records[0].auditShadowDisposition, undefined);
   });
 });
+// ---------------------------------------------------------------------------
+// coordinator dispatch failure propagation through the REAL codex seam
+// (criterion 4 / criterion 7)
+// ---------------------------------------------------------------------------
+//
+// The production coordinator seam is realCoordinatorDispatch (the default
+// when inject.coordinatorDispatch is absent).  The tests below point CODEX_BIN
+// at a fake `codex` that RESOLVES its job either failed (nonzero exit) or
+// completed with a non-empty but syntactically invalid coordinator payload,
+// and assert what the mission record does with each:
+//   - a resolved FAILED codex job must surface as a coordinator dispatch
+//     failure naming job id/status/error, and must NEVER be routed through
+//     parseCoordinatorOutput ("coordinator stream invalid" / "0 rejected, 0
+//     malformed" is the misleading empty-stream label from the incident);
+//   - a genuine COMPLETED job whose non-empty terminal message is NOT a
+//     valid coordinator stream stays a stream-parse problem (invalid
+//     stream), not a dispatch failure.  (A process with NO terminal
+//     assistant message is job.status "error" by fail-closed contract; that
+//     blank-stream case is NOT a completed job and is never tested here as
+//     one.)
+
+const FAKE_CODEX_TEMPLATE = `#!/usr/bin/env node
+import fs from "node:fs";
+const mode = process.env.FAKE_CODEX_MODE ?? "exit-3";
+const emit = (obj) => fs.writeSync(1, JSON.stringify(obj) + "\\n");
+if (mode === "exit-3") {
+  fs.writeSync(2, "codex: crashed\\n");
+  process.exit(3);
+} else if (mode === "invalid") {
+  emit({ type: "thread.started", thread_id: "__THREAD__" });
+  emit({ type: "item.completed", item: { type: "agent_message", text: "this is not a valid coordinator stream" } });
+  emit({ type: "turn.completed", usage: {} });
+  process.exit(0);
+}
+process.exit(0);
+`;
+
+function fakeCodexContext(mode) {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-luna-fake-codex-"));
+  const binPath = path.join(tmp, "fake-codex.mjs");
+  fs.writeFileSync(binPath, FAKE_CODEX_TEMPLATE, "utf8");
+  fs.chmodSync(binPath, 0o755);
+  const saved = {
+    CODEX_BIN: process.env.CODEX_BIN,
+    KUSABI_STATE_DIR: process.env.KUSABI_STATE_DIR,
+    FAKE_CODEX_MODE: process.env.FAKE_CODEX_MODE,
+    HOME: process.env.HOME,
+    CODEX_HOME: process.env.CODEX_HOME,
+  };
+  process.env.CODEX_BIN = binPath;
+  process.env.FAKE_CODEX_MODE = mode;
+  process.env.KUSABI_STATE_DIR = path.join(tmp, "state");
+  process.env.HOME = path.join(tmp, "home");
+  process.env.CODEX_HOME = path.join(tmp, "operator-codex-home");
+  fs.mkdirSync(process.env.HOME, { recursive: true });
+  fs.mkdirSync(process.env.CODEX_HOME, { recursive: true });
+  const cwd = path.join(tmp, "work");
+  fs.mkdirSync(cwd, { recursive: true });
+  return {
+    tmp,
+    cwd,
+    stateDir: stateDirFor(cwd),
+    setMode(next) { process.env.FAKE_CODEX_MODE = next; },
+    restore() {
+      for (const [key, value] of Object.entries(saved)) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+      fs.rmSync(tmp, { recursive: true, force: true });
+    },
+  };
+}
+
+describe("coordinator dispatch failure propagation through the real codex seam (criterion 4/7)", () => {
+  let ctx;
+  let cwd;
+  let stateDir;
+  let missionFile;
+
+  beforeEach(() => {
+    ctx = fakeCodexContext("exit-3");
+    cwd = ctx.cwd;
+    stateDir = ctx.stateDir;
+    missionFile = path.join(ctx.tmp, "mission.md");
+    fs.writeFileSync(missionFile, MISSION_BRIEF, "utf8");
+  });
+
+  afterEach(() => {
+    ctx.restore();
+  });
+
+  // Run the mission with the REAL coordinator dispatch (no
+  // inject.coordinatorDispatch); every other seam is faked.
+  async function runRealCoordinatorMission() {
+    const driver = await lunaDriver();
+    const chain = makeChainFake();
+    const tools = makeToolFake();
+    const sol = makeSolFake();
+    const notifications = [];
+    const result = await driver.runLunaMission({
+      cwd,
+      missionFile,
+      brief: MISSION_BRIEF,
+      container: "test-cid",
+      ...DEFAULT_SEATS,
+      allowSubstitute: false,
+      budget: DEFAULT_BUDGET,
+      inject: {
+        runChainLifecycle: chain.run,
+        callTool: tools.callTool,
+        solDispatch: sol.dispatch,
+        notifyMissionTerminal: async (info) => { notifications.push(info); },
+        guardedServeStop: async () => {},
+      },
+    });
+    return { driver, chain, tools, sol, notifications, result };
+  }
+
+  function readMissionRecord() {
+    const missionsDir = path.join(stateDir, "missions");
+    const ids = fs.existsSync(missionsDir)
+      ? fs.readdirSync(missionsDir).filter((n) => n.startsWith("mission-"))
+      : [];
+    assert.equal(ids.length, 1, `exactly one mission dir expected in ${missionsDir}, got ${ids.join(",")}`);
+    const missionDir = path.join(missionsDir, ids[0]);
+    return {
+      missionId: ids[0],
+      missionDir,
+      control: readJson(path.join(missionDir, "control.json")),
+      record: readJson(path.join(missionDir, "mission.json")),
+    };
+  }
+
+  function codexJobRecords() {
+    const jobsDir = path.join(stateDir, "jobs");
+    if (!fs.existsSync(jobsDir)) return [];
+    return fs
+      .readdirSync(jobsDir)
+      .filter((n) => n.startsWith("job-"))
+      .map((id) => ({ id, job: readJson(path.join(jobsDir, id, "job.json")) }));
+  }
+
+  it("a resolved failed codex job is recorded as a coordinator dispatch failure naming job id/status/error, never as an invalid stream", async () => {
+    const { notifications } = await runRealCoordinatorMission();
+    const { record } = readMissionRecord();
+    assert.equal(record.disposition, "coordinator-failed");
+
+    const jobRecords = codexJobRecords();
+    assert.ok(jobRecords.length >= 1, "the real dispatch must have created a codex job record");
+    const job = jobRecords[jobRecords.length - 1].job;
+    assert.notEqual(job.status, "completed", "the fake codex job must be a resolved FAILED job");
+    assert.ok(job.error && job.error.includes("codex exited with code 3"), "job.error must carry the exit failure");
+
+    const details = (record.coordinatorErrorsDetails ?? []).map((d) => d.detail).join("\n");
+    assert.match(details, /coordinator dispatch failed/, "the driver catch must name a dispatch failure");
+    assert.ok(details.includes(job.id), `the persisted error must name the codex job id (${job.id}): ${details}`);
+    assert.ok(details.includes(job.status), `the persisted error must name the job status (${job.status}): ${details}`);
+    assert.ok(details.includes(job.error), "the persisted error must carry the underlying job error");
+    assert.doesNotMatch(details, /coordinator stream invalid/, "a dispatch failure must never be routed through parseCoordinatorOutput");
+    assert.doesNotMatch(details, /0 rejected, 0 malformed/, "the misleading empty-stream message must not be emitted");
+    assert.equal(notifications.length, 1, "exactly one terminal notification");
+  });
+
+  it("a genuine completed job with non-empty invalid coordinator content stays a stream-parse problem, never a dispatch failure (criterion 7)", async () => {
+    ctx.setMode("invalid");
+    await runRealCoordinatorMission();
+    const { record } = readMissionRecord();
+    const jobRecords = codexJobRecords();
+    assert.ok(jobRecords.length >= 1, "the real dispatch must have created a codex job record");
+    const job = jobRecords[jobRecords.length - 1].job;
+    assert.equal(job.status, "completed", "a non-empty terminal message genuinely completes the job");
+    assert.equal(job.error, null, "a completed job carries no dispatch error");
+    const details = (record.coordinatorErrorsDetails ?? []).map((d) => d.detail).join("\n");
+    assert.doesNotMatch(details, /coordinator dispatch failed/, "a completed job must never be labeled a dispatch failure");
+    assert.match(details, /coordinator stream invalid/, "syntactically invalid coordinator content is a stream-parse failure, not a dispatch failure");
+  });
+});
