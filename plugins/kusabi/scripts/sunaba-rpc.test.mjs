@@ -42,12 +42,48 @@ describe("sunaba-rpc allowlist", () => {
 
   it("allows all tools in the allowlist", async () => {
     const { callTool } = await import("./sunaba-rpc.mjs");
-    for (const tool of ["verify_in_container", "sandbox_exec", "checkpoint", "checkpoint_list", "copy_file"]) {
+    for (const tool of [
+      "verify_in_container",
+      "sandbox_exec",
+      "checkpoint",
+      "checkpoint_list",
+      "copy_file",
+      "read_file_range",
+      "search_in_container",
+      "list_files",
+    ]) {
       try {
         await callTool(tool, {});
       } catch (err) {
         assert.ok(!err.message.includes("not in the allowed list"), `${tool} should be allowed`);
       }
+    }
+  });
+
+  it("allows exactly the three read-only Luna probe tools and no other tool", async () => {
+    const { callTool } = await import("./sunaba-rpc.mjs");
+    // The luna mission driver's mediated read_probe allow-list is exactly
+    // these three read-only tools (kusabi #530) — they must pass the bridge.
+    for (const tool of ["read_file_range", "search_in_container", "list_files"]) {
+      try {
+        await callTool(tool, { container_id: "cid", path: "x" });
+      } catch (err) {
+        assert.ok(!err.message.includes("not in the allowed list"), `${tool} must be allowed`);
+      }
+    }
+    // Nothing with write/exec/other authority joins them: arbitrary and
+    // write-shaped tools stay structurally uncallable.
+    for (const tool of [
+      "publish",
+      "merge",
+      "edit_file",
+      "write_file",
+      "transform_file",
+      "sunaba_copy_project",
+      "sunaba_copy_file",
+      "checkpoint_restore",
+    ]) {
+      await assert.rejects(() => callTool(tool, {}), /not in the allowed list/);
     }
   });
 

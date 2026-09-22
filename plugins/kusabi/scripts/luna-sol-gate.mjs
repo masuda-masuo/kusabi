@@ -42,6 +42,7 @@ import {
   bindAuditVerdict,
   AUDIT_VERDICTS,
 } from "./audit-verdict.mjs";
+import { renderSolContract } from "./luna-prompt.mjs";
 
 /** The gate phases the frozen #531 vocabulary names. */
 export const GATE_PHASES = ["pre-dispatch", "post-chain", "pre-accept", "consult"];
@@ -230,6 +231,14 @@ export async function realSolDispatch({ cwd, missionId, envelope, gate, auditor 
     ``,
     `Mission evidence envelope:`,
     JSON.stringify(envelope, null, 2),
+    ``,
+    // The runtime-rendered verdict contract (derived from
+    // schemas/audit-verdict.schema.json): the required common fields
+    // (including `summary`) and the block-only fields (`block_reason` +
+    // `acknowledgement_required`).  This is the same contract the post-hoc
+    // validator and the fail-closed gate enforce — the seat can only ever
+    // see the contract, never a hand-written copy.
+    renderSolContract(),
     ``,
     `Answer with line-oriented JSON records: any finding records, then exactly one ` +
       `verdict record with type "verdict", schema_version 1, gate_id "${gate.gateId}", ` +
