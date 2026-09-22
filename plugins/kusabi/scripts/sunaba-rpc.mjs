@@ -10,6 +10,12 @@
 // This is a deliberate design invariant: publish and issue write are
 // structurally uncallable from here.  checkpoint_restore was removed
 // in issue #114 — the chain never rolls the worktree back.
+//
+// kusabi #530 follow-up (mission-mucv2fzt47784ba9): the three read-only
+// Luna probe tools (read_file_range, search_in_container, list_files) were
+// added so the deterministic mission driver's mediated read_probe requests
+// reach the real bridge in production.  They are READ-ONLY — nothing with
+// write or exec authority was added.
 
 import { fileURLToPath } from "node:url";
 import process from "node:process";
@@ -24,6 +30,12 @@ const ALLOWED_TOOLS = new Set([
   "checkpoint",
   "checkpoint_list",
   "copy_file",
+  // The exact read-only probe tools the luna mission driver mediates for the
+  // gpt-5.6-luna coordinator seat (kusabi #530).  Nothing else is added: the
+  // write/exec authority boundary above is unchanged.
+  "read_file_range",
+  "search_in_container",
+  "list_files",
 ]);
 
 // 127.0.0.1 (not "localhost"): node fetch may resolve localhost to ::1 while

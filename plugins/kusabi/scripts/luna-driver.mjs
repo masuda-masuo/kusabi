@@ -80,6 +80,7 @@ import { parseCoordinatorOutput } from "./coordinator-parse.mjs";
 import { buildAuditEnvelope, truncateEvidenceText } from "./audit-envelope.mjs";
 import { hasSectionHeading, parseDeliverables } from "./brief-parsing.mjs";
 import { mintChainId } from "./chain-phases.mjs";
+import { loadCoordinatorSchema, renderCoordinatorContract } from "./luna-prompt.mjs";
 import {
   mintMissionId,
   assertMissionIdShape,
@@ -118,15 +119,62 @@ export const PROBE_OUTPUT_MAX_BYTES = 8192;
  * The small closed vocabulary a `finish` recommendation is validated against.
  * `accept` (the chain verb) is deliberately not here — the mission's terminal
  * result is a recommendation, never an acceptance.
+ *
+ * Derived from the canonical `properties.recommendation.enum` of
+ * schemas/coordinator-output.schema.json (the same enum the prompt renderer
+ * states), so the driver, the schema, and the rendered prompt can never
+ * drift apart (frozen by the schema/driver drift tests).
  */
-export const RECOMMENDATION_VOCABULARY = new Set(["recommend-accept", "recommend-escalate"]);
+export const RECOMMENDATION_VOCABULARY = new Set(loadCoordinatorSchema().properties.recommendation.enum);
 
 /**
  * The allow-listed read-only probe tools the driver mediates `read_probe`
  * through.  Nothing here can spawn a job, write a file, or run an arbitrary
  * command — the coordinator has no tool or job-spawn authority.
+ *
+ * Derived from the canonical `properties.tool.enum` of
+ * schemas/coordinator-output.schema.json (the same enum the prompt renderer
+ * states), so the driver, the schema, and the rendered prompt can never
+ * drift apart (frozen by the schema/driver drift tests).
  */
-export const PROBE_TOOL_ALLOWLIST = new Set(["read_file_range", "search_in_container", "list_files"]);
+export const PROBE_TOOL_ALLOWLIST = new Set(loadCoordinatorSchema().properties.tool.enum);
+
+/**
+ * The per-tool TOP-LEVEL request fields the driver REQUIRES before any probe
+ * tool call, derived from the canonical schema's `probe_tools.<tool>.required`
+ * (the same entries the prompt renderer states per tool).  Deriving keeps
+ * schema, driver, and rendered prompt from drifting apart (frozen by the
+ * probe_tools drift tests).
+ */
+export const PROBE_REQUIRED_FIELDS = Object.fromEntries(
+  Object.entries(loadCoordinatorSchema().probe_tools.properties).map(([tool, entry]) => [
+    tool,
+    [...entry.required],
+  ]),
+);
+
+/**
+ * The required top-level request fields of `req.tool` that the request fails
+ * to carry.  A required field must be a non-empty string — whitespace-only
+ * content counts as empty, so a search without a real `pattern` fails closed
+ * at the driver boundary BEFORE any tool call (the driver never fabricates a
+ * value, and `probeArgsFor` never receives a request that failed this check).
+ *
+ * Returns [] for a valid request and for an unknown tool (the allow-list
+ * check runs first, so an unlisted tool is refused before this is consulted).
+ *
+ * @param {object} req — the parsed read_probe request body.
+ * @returns {string[]} the required fields that are missing, empty, or
+ *         whitespace-only.
+ */
+export function probeRequestMissingFields(req) {
+  const tool = req?.tool;
+  const required = PROBE_REQUIRED_FIELDS[tool] ?? [];
+  return required.filter((field) => {
+    const value = req[field];
+    return typeof value !== "string" || value.trim() === "";
+  });
+}
 
 /**
  * Resolve a requested seat against its default, refusing substitution unless
@@ -255,11 +303,23 @@ function buildEvidenceEnvelope({ missionId, missionDir, brief, container, coordi
 /**
  * The probe args handed to the callTool seam for a mediated read_probe.
  * The container id is always supplied by the driver — Luna never names it.
+ *
+ * The caller must have validated the request first (probeRequestMissingFields
+ * against PROBE_REQUIRED_FIELDS), so no value is fabricated here: a required
+ * top-level request field maps straight to its schema-declared call argument
+ * (the per-tool mapping is pinned by the probe_tools drift tests against
+ * `probe_tools.<tool>.call_args`).  The fallback branch is unreachable
+ * defensive code (the tool allow-list check runs before this is ever called).
+ *
+ * @param {string} tool
+ * @param {string} container
+ * @param {object} req — the validated read_probe request body.
+ * @returns {object} the callTool arguments.
  */
-function probeArgsFor(tool, container, req) {
+export function probeArgsFor(tool, container, req) {
   if (tool === "read_file_range") return { container_id: container, file_path: req.path };
-  if (tool === "search_in_container") return { container_id: container, pattern: req.pattern ?? "", path: req.path ?? "" };
-  if (tool === "list_files") return { container_id: container, path: req.path ?? "/workspace" };
+  if (tool === "search_in_container") return { container_id: container, pattern: req.pattern, path: req.path };
+  if (tool === "list_files") return { container_id: container, path: req.path };
   return { container_id: container, ...req };
 }
 
@@ -310,6 +370,15 @@ async function realCoordinatorDispatch({ cwd, missionId, brief, envelope, coordi
     ``,
     `Current evidence envelope:`,
     JSON.stringify(envelope, null, 2),
+    ``,
+    // The runtime-rendered request contract (derived from
+    // schemas/coordinator-output.schema.json): the exact per-action body
+    // fields, the probe tool enum and per-tool arguments, the inner-chain
+    // brief requirement, the finish recommendation vocabulary, the
+    // one-record-per-line framing, and the envelope hash binding.  This is
+    // the same contract the deterministic driver enforces — the seat can
+    // only ever see the contract, never a hand-written copy.
+    renderCoordinatorContract(),
     ``,
     `Answer with line-oriented JSON request records, one per line, each with ` +
       `action and envelope_sha256 set to ${envelope.envelope_sha256}.`,
@@ -780,6 +849,18 @@ export async function runLunaMission(input) {
           }
           if (!PROBE_TOOL_ALLOWLIST.has(req.tool)) {
             recordError(`read_probe refused: tool "${req.tool}" is not on the driver allow-list`);
+            continue;
+          }
+          // Per-tool required-field enforcement AT THE DRIVER BOUNDARY, before
+          // any tool call: a probe missing a required top-level field — in
+          // particular a search without a non-empty, non-whitespace `pattern`
+          // — is refused fail-closed and never reaches the seam.  The driver
+          // never fabricates a missing value.
+          const missingFields = probeRequestMissingFields(req);
+          if (missingFields.length > 0) {
+            recordError(
+              `read_probe refused: ${req.tool} requires ${missingFields.map((f) => `a non-empty \`${f}\``).join(" and ")}`,
+            );
             continue;
           }
           let output;

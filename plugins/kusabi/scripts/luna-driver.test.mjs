@@ -1208,3 +1208,514 @@ describe("coordinator dispatch failure propagation through the real codex seam (
     assert.match(details, /coordinator stream invalid/, "syntactically invalid coordinator content is a stream-parse failure, not a dispatch failure");
   });
 });
+// ---------------------------------------------------------------------------
+// prompt-contract criteria 3, 4, 5, 6: schema/driver enum drift, one valid
+// request per action, the observed malformed probe records, and the probe
+// argument surface.
+// ---------------------------------------------------------------------------
+//
+// The prompt fix must not change the deterministic driver: the driver's
+// closed enums stay equal to the schema (criterion 3), every action still
+// accepts one valid request and reaches its intended branch (criterion 4),
+// the two observed probe:{paths:[...]} records stay refused and the tool
+// allow-list is not weakened (criterion 5), and the probe argument surface
+// stays bounded to the existing tool args with a non-empty pattern required
+// for search (criterion 6).
+
+const { COORDINATOR_ACTIONS } = await import("./coordinator-parse.mjs");
+
+function coordinatorSchema() {
+  return JSON.parse(
+    fs.readFileSync(new URL("../schemas/coordinator-output.schema.json", import.meta.url), "utf8"),
+  );
+}
+
+/** A fresh temp mission environment; restore() reverts env + removes files. */
+function missionEnv(prefix) {
+  const root = makeTemp(prefix);
+  const cwd = path.join(root, "work");
+  fs.mkdirSync(cwd, { recursive: true });
+  const missionFile = path.join(root, "mission.md");
+  fs.writeFileSync(missionFile, MISSION_BRIEF, "utf8");
+  const previousStateDir = process.env.KUSABI_STATE_DIR;
+  process.env.KUSABI_STATE_DIR = path.join(root, "state");
+  const stateDir = stateDirFor(cwd);
+  return {
+    root,
+    cwd,
+    missionFile,
+    stateDir,
+    restore() {
+      if (previousStateDir === undefined) delete process.env.KUSABI_STATE_DIR;
+      else process.env.KUSABI_STATE_DIR = previousStateDir;
+      fs.rmSync(root, { recursive: true, force: true });
+    },
+  };
+}
+
+/** Run the driver over one canned stream and return every fake plus the record. */
+async function runWithFakes(env, streams, toolsOverride = null) {
+  const driver = await lunaDriver();
+  const coord = makeCoordinator(streams);
+  const chain = makeChainFake();
+  const tools = toolsOverride ?? makeToolFake();
+  const sol = makeSolFake();
+  const notifications = [];
+  const result = await driver.runLunaMission({
+    cwd: env.cwd,
+    missionFile: env.missionFile,
+    brief: MISSION_BRIEF,
+    container: "test-cid",
+    ...DEFAULT_SEATS,
+    allowSubstitute: false,
+    budget: DEFAULT_BUDGET,
+    inject: {
+      coordinatorDispatch: coord.dispatch,
+      runChainLifecycle: chain.run,
+      callTool: tools.callTool,
+      solDispatch: sol.dispatch,
+      notifyMissionTerminal: async (info) => { notifications.push(info); },
+      guardedServeStop: async () => {},
+    },
+  });
+  const missionsDir = path.join(env.stateDir, "missions");
+  const id = fs.readdirSync(missionsDir).find((n) => n.startsWith("mission-"));
+  const record = readJson(path.join(missionsDir, id, "mission.json"));
+  return { driver, coord, chain, tools, sol, notifications, result, record };
+}
+
+describe("schema/driver enum drift (prompt-contract criterion 3)", () => {
+  it("the driver's probe tool allow-list equals the schema's probe-tool enum (properties.tool.enum)", async () => {
+    const driver = await lunaDriver();
+    const schema = coordinatorSchema();
+    const toolEnum = schema.properties?.tool?.enum;
+    assert.ok(
+      Array.isArray(toolEnum),
+      "coordinator-output.schema.json must define properties.tool.enum (the probe tool allow-list) as the canonical enum",
+    );
+    assert.deepEqual([...driver.PROBE_TOOL_ALLOWLIST].sort(), [...toolEnum].sort());
+  });
+
+  it("the driver's finish recommendation vocabulary equals the schema's recommendation enum (properties.recommendation.enum)", async () => {
+    const driver = await lunaDriver();
+    const schema = coordinatorSchema();
+    const recommendationEnum = schema.properties?.recommendation?.enum;
+    assert.ok(
+      Array.isArray(recommendationEnum),
+      "coordinator-output.schema.json must define properties.recommendation.enum (the finish recommendation vocabulary) as the canonical enum",
+    );
+    assert.deepEqual([...driver.RECOMMENDATION_VOCABULARY].sort(), [...recommendationEnum].sort());
+  });
+
+  it("the schema's action enum is exactly the closed list the driver executes", () => {
+    const schema = coordinatorSchema();
+    assert.deepEqual(schema.properties.action.enum, COORDINATOR_ACTIONS);
+    assert.deepEqual(COORDINATOR_ACTIONS, [
+      "read_probe",
+      "run_chain",
+      "rework_chain",
+      "consult_sol",
+      "escalate_to_host",
+      "finish",
+    ]);
+  });
+});
+
+describe("one valid request per coordinator action (prompt-contract criterion 4)", () => {
+  let env;
+
+  beforeEach(() => {
+    env = missionEnv("kusabi-luna-prompt-action-");
+  });
+
+  afterEach(() => {
+    env.restore();
+  });
+
+  const ACTION_CASES = {
+    read_probe: {
+      stream: (input) => stream(
+        line("read_probe", input.envelope.envelope_sha256, { tool: "read_file_range", path: "plugins/kusabi/scripts/luna-driver.mjs" }),
+        line("finish", input.envelope.envelope_sha256, { recommendation: "recommend-escalate" }),
+      ),
+      assert: ({ tools, record, result }) => {
+        assert.equal(tools.calls.length, 1, "the read_probe must reach the callTool seam");
+        assert.equal(tools.calls[0].name, "read_file_range");
+        assert.equal(record.probes.length, 1);
+        assert.equal(record.probes[0].tool, "read_file_range");
+        assert.match(result, /disposition=recommend-escalate/, "the trailing finish must terminate");
+      },
+    },
+    run_chain: {
+      stream: (input) => stream(
+        line("run_chain", input.envelope.envelope_sha256, { brief: VALID_RUN_CHAIN_BRIEF }),
+        line("finish", input.envelope.envelope_sha256, { recommendation: "recommend-escalate" }),
+      ),
+      assert: ({ chain, record }) => {
+        assert.equal(chain.calls.length, 1, "the run_chain must reach the runChainLifecycle seam");
+        assert.equal(record.attempts.length, 1);
+        assert.equal(record.attempts[0].kind, "run_chain");
+        assert.equal(record.chains.length, 1);
+      },
+    },
+    rework_chain: {
+      stream: (input) => stream(
+        line("rework_chain", input.envelope.envelope_sha256, { brief: VALID_RUN_CHAIN_BRIEF }),
+        line("finish", input.envelope.envelope_sha256, { recommendation: "recommend-escalate" }),
+      ),
+      assert: ({ chain, record }) => {
+        assert.equal(chain.calls.length, 1, "the rework_chain must reach the runChainLifecycle seam");
+        assert.equal(record.attempts.length, 1);
+        assert.equal(record.attempts[0].kind, "rework_chain");
+      },
+    },
+    consult_sol: {
+      stream: (input) => stream(
+        line("consult_sol", input.envelope.envelope_sha256, { reason: "extra audit" }),
+        line("finish", input.envelope.envelope_sha256, { recommendation: "recommend-escalate" }),
+      ),
+      assert: ({ sol, record }) => {
+        assert.equal(sol.calls.length, 1, "an accepted consult_sol opens its additive Sol gate");
+        assert.equal(record.consults.length, 1);
+        assert.equal(record.consults[0].reason, "extra audit");
+      },
+    },
+    escalate_to_host: {
+      stream: (input) => stream(
+        line("escalate_to_host", input.envelope.envelope_sha256, { reason: "host judgement required" }),
+      ),
+      assert: ({ record, result }) => {
+        assert.equal(record.disposition, "host-handoff");
+        assert.equal(record.hostInterventions, 1);
+        assert.match(result, /disposition=host-handoff/);
+      },
+    },
+    finish: {
+      stream: (input) => stream(
+        line("finish", input.envelope.envelope_sha256, { recommendation: "recommend-escalate" }),
+      ),
+      assert: ({ record }) => {
+        assert.equal(record.disposition, "recommend-escalate");
+        assert.equal(record.recommendation, "recommend-escalate");
+      },
+    },
+  };
+
+  for (const action of COORDINATOR_ACTIONS) {
+    it(`a valid ${action} request is accepted and reaches its intended branch (criterion 4)`, async () => {
+      const entry = ACTION_CASES[action];
+      assert.ok(entry, `test case missing for schema action "${action}"`);
+      const { chain, tools, sol, record, result } = await runWithFakes(env, [entry.stream]);
+      entry.assert({ chain, tools, sol, record, result });
+      assert.ok(record.disposition, `the mission must reach a terminal disposition after a ${action}`);
+    });
+  }
+});
+
+describe("the observed malformed read_probe records stay refused (prompt-contract criterion 5)", () => {
+  let env;
+
+  beforeEach(() => {
+    env = missionEnv("kusabi-luna-prompt-probe-");
+  });
+
+  afterEach(() => {
+    env.restore();
+  });
+
+  it("two probe:{paths:[...]} records are refused with tool \"undefined\", never translated or accepted", async () => {
+    const observedRecord = (hash) =>
+      j({ action: "read_probe", envelope_sha256: hash, probe: { paths: ["plugins/kusabi/scripts/luna-driver.mjs"] } });
+    const { driver, tools, record, result } = await runWithFakes(env, [
+      (input) => stream(
+        observedRecord(input.envelope.envelope_sha256),
+        observedRecord(input.envelope.envelope_sha256),
+      ),
+    ]);
+    assert.equal(tools.calls.length, 0, "a malformed probe must never reach the callTool seam");
+    assert.equal(record.probes.length, 0, "a malformed probe must never be recorded");
+    assert.equal(record.coordinatorErrors, 2, "each malformed probe is refused and counted");
+    const details = (record.coordinatorErrorsDetails ?? []).map((d) => d.detail);
+    assert.deepEqual(details, [
+      'read_probe refused: tool "undefined" is not on the driver allow-list',
+      'read_probe refused: tool "undefined" is not on the driver allow-list',
+    ]);
+    assert.equal(record.disposition, "coordinator-failed");
+    assert.match(result, /disposition=coordinator-failed/);
+    assert.deepEqual(
+      [...driver.PROBE_TOOL_ALLOWLIST].sort(),
+      ["list_files", "read_file_range", "search_in_container"].sort(),
+      "the fix must not weaken the tool allow-list",
+    );
+  });
+});
+
+describe("read_probe argument surface (prompt-contract criterion 6)", () => {
+  let env;
+
+  beforeEach(() => {
+    env = missionEnv("kusabi-luna-prompt-args-");
+  });
+
+  afterEach(() => {
+    env.restore();
+  });
+
+  it("valid probes for read_file_range, search_in_container, list_files pass the existing argument surface to the seam", async () => {
+    const { tools, record, result } = await runWithFakes(env, [
+      (input) => stream(
+        line("read_probe", input.envelope.envelope_sha256, { tool: "read_file_range", path: "plugins/kusabi/scripts/luna-driver.mjs" }),
+        line("read_probe", input.envelope.envelope_sha256, { tool: "search_in_container", pattern: "runLunaMission", path: "plugins/kusabi" }),
+        line("read_probe", input.envelope.envelope_sha256, { tool: "list_files", path: "plugins/kusabi/scripts" }),
+        line("finish", input.envelope.envelope_sha256, { recommendation: "recommend-escalate" }),
+      ),
+    ]);
+    assert.deepEqual(tools.calls, [
+      { name: "read_file_range", args: { container_id: "test-cid", file_path: "plugins/kusabi/scripts/luna-driver.mjs" } },
+      { name: "search_in_container", args: { container_id: "test-cid", pattern: "runLunaMission", path: "plugins/kusabi" } },
+      { name: "list_files", args: { container_id: "test-cid", path: "plugins/kusabi/scripts" } },
+    ]);
+    assert.equal(record.probes.length, 3);
+    assert.deepEqual(record.probes.map((p) => p.tool), ["read_file_range", "search_in_container", "list_files"]);
+    assert.match(result, /disposition=recommend-escalate/);
+  });
+
+  it("search_in_container requires a non-empty pattern: an empty-pattern search is never a successful probe", async () => {
+    const tools = makeToolFake();
+    // Mirror the real search tool's missing-argument contract at the seam: a
+    // search without a pattern cannot execute.
+    tools.callTool = async (name, args) => {
+      tools.calls.push({ name, args });
+      if (name === "search_in_container" && !args.pattern) {
+        throw new Error("search_in_container: pattern is a required argument");
+      }
+      return { status: "ok", output: "canned\n" };
+    };
+    const { record, result } = await runWithFakes(env, [
+      (input) => stream(
+        line("read_probe", input.envelope.envelope_sha256, { tool: "search_in_container", path: "plugins/kusabi" }),
+      ),
+    ], tools);
+    assert.equal(record.probes.length, 0, "an empty-pattern search must never be recorded as a successful probe");
+    assert.ok(
+      record.coordinatorErrors >= 1,
+      "the empty-pattern search must be a coordinator error (refused or failed)",
+    );
+    for (const call of tools.calls) {
+      assert.equal(call.args.pattern, "", "the driver must never fabricate a non-empty pattern");
+    }
+    assert.match(result, /disposition=coordinator-failed/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// review finding 2: search pattern enforcement at the driver boundary.  A
+// missing, empty, or whitespace-only `pattern` must be refused by the Luna
+// driver BEFORE any tool call — fail-closed must not depend on a tool-side
+// fake (the real search tool accepts empty patterns).
+// ---------------------------------------------------------------------------
+
+describe("search pattern enforcement at the driver boundary (review finding 2)", () => {
+  let env;
+
+  beforeEach(() => {
+    env = missionEnv("kusabi-luna-prompt-pattern-");
+  });
+
+  afterEach(() => {
+    env.restore();
+  });
+
+  it("missing, empty, and whitespace-only search patterns are refused before any tool call", async () => {
+    const tools = makeToolFake();
+    const { record, result } = await runWithFakes(env, [
+      (input) => stream(
+        line("read_probe", input.envelope.envelope_sha256, { tool: "search_in_container", path: "plugins/kusabi" }),
+        line("read_probe", input.envelope.envelope_sha256, { tool: "search_in_container", pattern: "", path: "plugins/kusabi" }),
+        line("read_probe", input.envelope.envelope_sha256, { tool: "search_in_container", pattern: "   ", path: "plugins/kusabi" }),
+      ),
+    ], tools);
+    assert.equal(tools.calls.length, 0, "a refused search must never reach the tool seam");
+    assert.equal(record.probes.length, 0, "a refused search must never be recorded as a successful probe");
+    assert.ok(record.coordinatorErrors >= 3, "each refused search is a coordinator error");
+    const details = (record.coordinatorErrorsDetails ?? []).map((d) => d.detail);
+    for (const detail of details) {
+      assert.match(
+        detail,
+        /read_probe refused: search_in_container requires a non-empty `pattern`/,
+        "the refusal must name the missing pattern at the driver boundary",
+      );
+    }
+    assert.match(result, /disposition=coordinator-failed/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// review finding 3: probe_tools schema drift.  The schema's
+// `probe_tools.<tool>.call_args` and `required` are canonical; these drift
+// tests pin them against the driver's ACTUAL request-to-callTool mapping
+// (probeArgsFor) and the fields the driver really enforces before any tool
+// call (PROBE_REQUIRED_FIELDS / probeRequestMissingFields).  Every schema
+// field below is authoritative — none is dead canonical data.
+// ---------------------------------------------------------------------------
+
+describe("probe_tools schema drift (review finding 3)", () => {
+  it("probeArgsFor's per-tool callTool argument names equal the schema's probe_tools.<tool>.call_args", async () => {
+    const driver = await lunaDriver();
+    const schema = coordinatorSchema();
+    for (const [tool, entry] of Object.entries(schema.probe_tools.properties)) {
+      const req = Object.fromEntries(entry.required.map((f) => [f, "sample"]));
+      const args = driver.probeArgsFor(tool, "test-cid", req);
+      const argNames = Object.keys(args).filter((k) => k !== "container_id").sort();
+      assert.deepEqual(
+        argNames,
+        [...entry.call_args].sort(),
+        `${tool}: the driver's actual callTool argument names must equal the schema's call_args`,
+      );
+    }
+  });
+
+  it("the driver enforces exactly the schema's probe_tools.<tool>.required fields before any tool call", async () => {
+    const driver = await lunaDriver();
+    const schema = coordinatorSchema();
+    for (const [tool, entry] of Object.entries(schema.probe_tools.properties)) {
+      assert.deepEqual(
+        driver.PROBE_REQUIRED_FIELDS[tool],
+        entry.required,
+        `${tool}: the driver's enforced required fields must equal the schema's required`,
+      );
+      const full = { tool, ...Object.fromEntries(entry.required.map((f) => [f, "sample"])) };
+      assert.deepEqual(driver.probeRequestMissingFields(full), [], `${tool}: a complete request must validate`);
+      for (const field of entry.required) {
+        const dropped = {
+          tool,
+          ...Object.fromEntries(entry.required.filter((f) => f !== field).map((f) => [f, "sample"])),
+        };
+        const missing = driver.probeRequestMissingFields(dropped);
+        assert.ok(missing.includes(field), `${tool}: dropping ${field} must be reported as missing`);
+      }
+    }
+    // Whitespace-only content is empty: a search with "   " as pattern is
+    // refused; a non-empty pattern validates.
+    assert.deepEqual(
+      driver.probeRequestMissingFields({ tool: "search_in_container", pattern: "   ", path: "x" }),
+      ["pattern"],
+      "a whitespace-only pattern must be reported missing",
+    );
+    assert.deepEqual(
+      driver.probeRequestMissingFields({ tool: "search_in_container", pattern: "runLunaMission", path: "x" }),
+      [],
+      "a non-empty pattern validates",
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// review finding 1: production-seam regression.  `runLunaMission`'s DEFAULT
+// callTool seam is the real sunaba-rpc.mjs bridge; a valid read_probe stream
+// must reach it and dispatch exactly the requested read-only tools.  No fake
+// callTool is injected — globalThis.fetch is stubbed to answer the real MCP
+// handshake so the production bridge code (allow-list + transport) runs
+// unchanged.  On pristine main this test fails: the bridge rejected every
+// probe tool with "not in the allowed list".
+// ---------------------------------------------------------------------------
+
+describe("production seam: the real sunaba-rpc bridge dispatches read_probe (review finding 1)", () => {
+  let env;
+  let originalFetch;
+
+  beforeEach(() => {
+    env = missionEnv("kusabi-luna-rpc-bridge-");
+    originalFetch = globalThis.fetch;
+  });
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+    env.restore();
+  });
+
+  /**
+   * Run a mission through the REAL sunaba-rpc callTool seam (no
+   * inject.callTool) with globalThis.fetch stubbed to answer the full MCP
+   * handshake (initialize -> notifications/initialized -> tools/call) and to
+   * record every tools/call dispatch (tool name + arguments).
+   */
+  async function runThroughRealBridge(streams) {
+    const driver = await lunaDriver();
+    const coord = makeCoordinator(streams);
+    const chain = makeChainFake();
+    const sol = makeSolFake();
+    const notifications = [];
+    const dispatched = [];
+    let fetchCount = 0;
+    globalThis.fetch = async (url, init) => {
+      fetchCount += 1;
+      const phase = fetchCount % 3; // 1 = initialize, 2 = notification, 0 = tools/call
+      if (phase === 1) {
+        return {
+          ok: true,
+          headers: { get: (h) => (h === "mcp-session-id" ? "sess-test" : null) },
+          body: { cancel: async () => {} },
+        };
+      }
+      if (phase === 2) {
+        return {
+          ok: true,
+          headers: { get: () => null },
+          body: { cancel: async () => {} },
+        };
+      }
+      const req = JSON.parse(init.body);
+      dispatched.push({ name: req.params.name, arguments: req.params.arguments });
+      const sse = [
+        'data: {"jsonrpc":"2.0","id":3,"result":{"content":[{"type":"text","text":"{\\"output\\":\\"probe result\\n\\"}"}]}}',
+      ].join("\n");
+      return {
+        ok: true,
+        headers: { get: () => null },
+        text: async () => sse,
+      };
+    };
+    const result = await driver.runLunaMission({
+      cwd: env.cwd,
+      missionFile: env.missionFile,
+      brief: MISSION_BRIEF,
+      container: "test-cid",
+      ...DEFAULT_SEATS,
+      allowSubstitute: false,
+      budget: DEFAULT_BUDGET,
+      inject: {
+        coordinatorDispatch: coord.dispatch,
+        runChainLifecycle: chain.run,
+        solDispatch: sol.dispatch,
+        notifyMissionTerminal: async (info) => { notifications.push(info); },
+        guardedServeStop: async () => {},
+        // NOTE: no callTool — the driver's default seam is the REAL
+        // sunaba-rpc.mjs callTool, the production bridge under test.
+      },
+    });
+    const missionsDir = path.join(env.stateDir, "missions");
+    const id = fs.readdirSync(missionsDir).find((n) => n.startsWith("mission-"));
+    const record = readJson(path.join(missionsDir, id, "mission.json"));
+    return { driver, coord, chain, sol, notifications, dispatched, result, record };
+  }
+
+  it("a valid read_probe stream reaches the real bridge, which dispatches exactly the requested read-only tools", async () => {
+    const { dispatched, record, result } = await runThroughRealBridge([
+      (input) => stream(
+        line("read_probe", input.envelope.envelope_sha256, { tool: "read_file_range", path: "plugins/kusabi/scripts/luna-driver.mjs" }),
+        line("read_probe", input.envelope.envelope_sha256, { tool: "search_in_container", pattern: "runLunaMission", path: "plugins/kusabi" }),
+        line("read_probe", input.envelope.envelope_sha256, { tool: "list_files", path: "plugins/kusabi/scripts" }),
+        line("finish", input.envelope.envelope_sha256, { recommendation: "recommend-escalate" }),
+      ),
+    ]);
+    assert.deepEqual(dispatched, [
+      { name: "read_file_range", arguments: { container_id: "test-cid", file_path: "plugins/kusabi/scripts/luna-driver.mjs" } },
+      { name: "search_in_container", arguments: { container_id: "test-cid", pattern: "runLunaMission", path: "plugins/kusabi" } },
+      { name: "list_files", arguments: { container_id: "test-cid", path: "plugins/kusabi/scripts" } },
+    ]);
+    assert.equal(record.probes.length, 3, "all three probes must be recorded from the real bridge output");
+    assert.deepEqual(record.probes.map((p) => p.tool), ["read_file_range", "search_in_container", "list_files"]);
+    assert.match(result, /disposition=recommend-escalate/);
+  });
+});

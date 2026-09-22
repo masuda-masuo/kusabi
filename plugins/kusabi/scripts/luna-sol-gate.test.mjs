@@ -1035,3 +1035,148 @@ describe("realSolDispatch failure propagation (criterion 5/7)", () => {
     assert.notEqual(result.gate.reason, "unavailable");
   });
 });
+// ---------------------------------------------------------------------------
+// prompt-contract criterion 7: the Sol verdict record contract — summary
+// (required common), block_reason + acknowledgement_required (block-only) —
+// through the post-hoc validator and the fail-closed gate.
+// ---------------------------------------------------------------------------
+//
+// The rendered Sol contract (pinned in luna-prompt.test.mjs) must match what
+// the post-hoc validator and the gate actually enforce: valid allow/block
+// verdicts satisfy both, and verdicts missing required fields stay
+// malformed/blocked.
+
+const { validateAuditVerdict } = await import("./audit-verdict.mjs");
+
+describe("Sol verdict record contract (prompt-contract criterion 7)", () => {
+  let root;
+  let cwd;
+  let stateDir;
+  let previousStateDir;
+  let missionFile;
+
+  beforeEach(() => {
+    root = makeTemp("kusabi-sol-contract-");
+    cwd = path.join(root, "work");
+    fs.mkdirSync(cwd, { recursive: true });
+    missionFile = path.join(root, "mission.md");
+    fs.writeFileSync(missionFile, MISSION_BRIEF, "utf8");
+    previousStateDir = process.env.KUSABI_STATE_DIR;
+    process.env.KUSABI_STATE_DIR = path.join(root, "state");
+    stateDir = stateDirFor(cwd);
+  });
+
+  afterEach(() => {
+    if (previousStateDir === undefined) delete process.env.KUSABI_STATE_DIR;
+    else process.env.KUSABI_STATE_DIR = previousStateDir;
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  /** Run a mission with the given coordinator streams and Sol handler. */
+  async function runMission(streams, solDispatch) {
+    const driver = await lunaDriver();
+    const coord = makeCoordinator(streams);
+    const chain = makeChainFake();
+    const tools = makeToolFake();
+    const sol = makeSol(solDispatch);
+    const notify = makeNotify();
+    const result = await driver.runLunaMission({
+      cwd,
+      missionFile,
+      brief: MISSION_BRIEF,
+      container: "test-cid",
+      ...DEFAULT_SEATS,
+      allowSubstitute: false,
+      budget: { ...DEFAULT_BUDGET },
+      inject: {
+        coordinatorDispatch: coord.dispatch,
+        runChainLifecycle: chain.run,
+        callTool: tools.callTool,
+        solDispatch: sol.dispatch,
+        notifyMissionTerminal: notify.dispatch,
+        guardedServeStop: async () => {},
+      },
+    });
+    const missionsDir = path.join(stateDir, "missions");
+    const id = fs.readdirSync(missionsDir).find((n) => n.startsWith("mission-"));
+    const record = readJson(path.join(missionsDir, id, "mission.json"));
+    return { driver, sol, notify, result, record };
+  }
+
+  const verdictBase = (overrides = {}) => ({
+    type: "verdict",
+    schema_version: 1,
+    gate_id: "gate-1",
+    envelope_sha256: "b".repeat(64),
+    verdict: "clear",
+    summary: "sol:clear",
+    ...overrides,
+  });
+
+  it("a valid allow (clear) verdict with a summary validates", () => {
+    const { valid, errors } = validateAuditVerdict(verdictBase());
+    assert.equal(valid, true, JSON.stringify(errors));
+  });
+
+  it("a valid block verdict with summary + block_reason + acknowledgement_required validates", () => {
+    const block = verdictBase({
+      verdict: "block",
+      block_reason: "wrong_premise",
+      acknowledgement_required: true,
+      summary: "Premise unsupported",
+    });
+    const { valid, errors } = validateAuditVerdict(block);
+    assert.equal(valid, true, JSON.stringify(errors));
+  });
+
+  const MISSING_FIELD_CASES = [
+    {
+      name: "a clear verdict without summary",
+      record: { type: "verdict", schema_version: 1, gate_id: "gate-1", envelope_sha256: "b".repeat(64), verdict: "clear" },
+    },
+    {
+      name: "a clear verdict with an empty summary",
+      record: { type: "verdict", schema_version: 1, gate_id: "gate-1", envelope_sha256: "b".repeat(64), verdict: "clear", summary: "" },
+    },
+    {
+      name: "a block verdict without block_reason",
+      record: { type: "verdict", schema_version: 1, gate_id: "gate-1", envelope_sha256: "b".repeat(64), verdict: "block", acknowledgement_required: true, summary: "x" },
+    },
+    {
+      name: "a block verdict without acknowledgement_required",
+      record: { type: "verdict", schema_version: 1, gate_id: "gate-1", envelope_sha256: "b".repeat(64), verdict: "block", block_reason: "x", summary: "x" },
+    },
+  ];
+  for (const c of MISSING_FIELD_CASES) {
+    it(`${c.name} stays malformed`, () => {
+      const { valid } = validateAuditVerdict(c.record);
+      assert.equal(valid, false, `a verdict missing required fields must not validate: ${c.name}`);
+    });
+  }
+
+  it("a valid block verdict satisfies the post-hoc validator and terminates the mission sol-blocked", async () => {
+    const { record, result } = await runMission([finishStream("recommend-accept")], blockSol);
+    assert.equal(record.disposition, "sol-blocked");
+    assert.match(result, /disposition=sol-blocked/);
+    const gates = record.auditGates ?? [];
+    assert.equal(gates.length, 1);
+    assert.equal(gates[0].verdict, "block");
+    assert.equal(gates[0].disposition, "verdict-recorded");
+  });
+
+  it("a block verdict missing required fields stays malformed at the gate and fails closed sol-blocked", async () => {
+    const noBlockReason = (input) => verdictLine(input, "block", { block_reason: undefined });
+    const { record } = await runMission([finishStream("recommend-accept")], noBlockReason);
+    assert.equal(record.disposition, "sol-blocked");
+    const gates = record.auditGates ?? [];
+    assert.equal(gates[0].reason, "malformed", "a verdict missing required fields is a parser/validation failure");
+  });
+
+  it("a clear verdict missing summary stays malformed at the gate and fails closed sol-blocked", async () => {
+    const noSummary = (input) => verdictLine(input, "clear", { summary: undefined });
+    const { record } = await runMission([finishStream("recommend-accept")], noSummary);
+    assert.equal(record.disposition, "sol-blocked");
+    const gates = record.auditGates ?? [];
+    assert.equal(gates[0].reason, "malformed");
+  });
+});
