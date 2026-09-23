@@ -78,7 +78,7 @@ import path from "node:path";
 import { stateDirFor, readJson, writeJson } from "./state-paths.mjs";
 import { parseCoordinatorOutput } from "./coordinator-parse.mjs";
 import { buildAuditEnvelope, truncateEvidenceText } from "./audit-envelope.mjs";
-import { hasSectionHeading, parseDeliverables } from "./brief-parsing.mjs";
+import { hasSectionHeading, parseDeliverables, stampInnerBriefSignature, parseOrchestratorSignature } from "./brief-parsing.mjs";
 import { mintChainId } from "./chain-phases.mjs";
 import {
   loadCoordinatorSchema,
@@ -234,6 +234,60 @@ export function resolveMissionSeat(requested, def, role, allowSubstitute) {
 export function validChainBrief(brief) {
   if (typeof brief !== "string" || brief === "") return false;
   return hasSectionHeading(brief, "Deliverables") && parseDeliverables(brief).length > 0;
+}
+
+// The cheap downstream brief validators the pre-seam refusal reuses — the
+// SAME functions the chain dispatch runs before any job or chain state
+// exists (kusabi #289/#302/#386 lint and kusabi #250/#302 smoke), so a brief
+// the mission refuses could never have dispatched downstream either.  Both
+// modules are heavy command modules; they are loaded lazily like every other
+// command surface this driver reaches (codex-dispatch, chain-cmd, ...), so
+// the mission driver itself never pays their static import cost.
+let _briefValidators = null;
+async function briefValidators() {
+  if (_briefValidators === null) {
+    const [companion, guards] = await Promise.all([
+      import("./kusabi-companion.mjs"),
+      import("./chain-brief-guards.mjs"),
+    ]);
+    _briefValidators = {
+      briefLintReport: companion.briefLintReport,
+      smokeViolationReport: guards.smokeViolationReport,
+    };
+  }
+  return _briefValidators;
+}
+
+/**
+ * The precise refusal detail for a STAMPED inner-chain brief that fails the
+ * deterministic pre-seam validation, or null when it is clean.
+ *
+ * Decision 5: before any chain state or seam call, the driver reuses the
+ * same cheap downstream parse/lint/smoke validators — briefLintReport (the
+ * #289/#302/#386 dispatch lint: a non-empty `## Deliverables`, zero-entry
+ * `## Smoke` / `## Frozen Tests` headings, and Frozen Tests path-only
+ * entries) and smokeViolationReport (the #250 lossy-command / no-entries
+ * smoke violations).  The container is passed so the implement-phase
+ * container-source rule cannot fire — the mission already resolved the
+ * container the inner chain runs in, so that rule is the outer dispatch's to
+ * enforce, not the inner brief's.  The signature rule cannot fire either:
+ * this runs on the STAMPED brief, which by construction carries the
+ * canonical line 1.
+ *
+ * Purely a read of the brief text: no smoke command is pre-run and
+ * smokeBaselineReport is never duplicated (the downstream baseline keeps its
+ * own execution at dispatch).
+ *
+ * @param {string} brief       The STAMPED inner-chain brief text.
+ * @param {string} container   The mission's container id.
+ * @returns {Promise<string|null>}
+ */
+async function innerBriefValidationReport(brief, container) {
+  const { briefLintReport, smokeViolationReport } = await briefValidators();
+  const lint = briefLintReport({ brief, phase: null, container, chain: true });
+  const smoke = smokeViolationReport(brief);
+  if (lint === null && smoke === null) return null;
+  return [lint, smoke].filter(Boolean).join("\n");
 }
 
 /**
@@ -1032,8 +1086,37 @@ export async function runLunaMission(input) {
             outcome = { disposition: "budget-exhausted", recommendation: null, handoffReason: null };
             break mainLoop;
           }
-          if (!validChainBrief(req.brief)) {
-            recordBriefCorrection(`${req.action} refused: the inner chain brief fails deterministic validation`);
+          // Deterministic inner-brief signature (decisions 1-3): before every
+          // run_chain / rework_chain the driver owns the metadata — it strips
+          // any `Orchestrator:` line in the first five lines of the inner
+          // brief and prepends exactly one canonical line 1.  The canonical
+          // values are resolved here, never computed by the stamper: model =
+          // the ACTUAL coordinator seat (the persisted record's on resume,
+          // never the requested/default spelling), session = this mission id,
+          // date = the UTC YYYY-MM-DD of THIS dispatch (inject.now when
+          // provided, the current clock by default).  The stamped text is
+          // what the seam receives and what the parsed `orchestrator`
+          // attribution is read back from.
+          const stampModel = record?.coordinator?.actual ?? coordinator.actual;
+          const stampNow =
+            typeof inject.now === "function" ? inject.now() : new Date();
+          const stampDate = new Date(stampNow).toISOString().slice(0, 10);
+          const stampedBrief = stampInnerBriefSignature(req.brief ?? "", {
+            model: stampModel,
+            session: missionId,
+            date: stampDate,
+          });
+          if (!validChainBrief(stampedBrief) || (await innerBriefValidationReport(stampedBrief, container)) !== null) {
+            // Decision 5: the pre-seam refusal is a BRIEF CORRECTION \u2014 one
+            // precise defect named (never a generic message), no chain state
+            // and no seam call.  The stamping above is metadata enrichment
+            // only and never repairs the semantic defect (decision 6).
+            const report = await innerBriefValidationReport(stampedBrief, container);
+            const detail =
+              report === null
+                ? `${req.action} refused: the inner chain brief fails deterministic validation`
+                : `${req.action} refused: the inner chain brief fails deterministic validation\n${report}`;
+            recordBriefCorrection(detail);
             continue;
           }
           // PRE-DISPATCH GATE: the deterministic driver, never Luna, decides
@@ -1071,8 +1154,13 @@ export async function runLunaMission(input) {
                 // criterion 11): missionId is emitted on chain.json only in
                 // Luna mode — plain chains never carry the key.
                 flags: { container, "chain-id": chainId, keepServe: true, missionId },
-                text: req.brief,
-                orchestrator: null,
+                // Decision 3: the seam receives the STAMPED brief (canonical
+                // line 1, never the raw Luna-authored text) and the parsed
+                // canonical signature as a non-null `orchestrator`
+                // attribution, so inner-chain attribution matches the
+                // stamped brief exactly.
+                text: stampedBrief,
+                orchestrator: parseOrchestratorSignature(stampedBrief),
               },
               {},
             );

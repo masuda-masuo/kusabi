@@ -155,5 +155,31 @@
         ]
       }
     }
+  },
+  "inner_brief": {
+    "type": "object",
+    "description": "The schema-owned contract for the inner-chain brief (run_chain / rework_chain `brief`). Five frozen rules the deterministic driver enforces before any chain work starts; the coordinator prompt renderer (renderCoordinatorContract) states every rule's description verbatim from this section, so the schema and the prompt can never drift apart.",
+    "properties": {
+      "signature": {
+        "type": "string",
+        "description": "Signature ownership: the deterministic driver owns the inner-brief signature. Luna must not invent an `Orchestrator:` line \u2014 the driver strips any `Orchestrator:` line in the first five lines and prepends exactly one canonical line 1 (model = the actual coordinator seat, session = the mission id, date = the dispatch's UTC day)."
+      },
+      "deliverables": {
+        "type": "string",
+        "description": "Deliverables: a run_chain / rework_chain brief requires a non-empty `## Deliverables` section \u2014 a brief without one, or with a heading that parses to zero entries, is refused before any chain work starts."
+      },
+      "smoke": {
+        "type": "string",
+        "description": "Smoke: the `## Smoke` commands must be backtick-quoted bullets or fenced code-block lines, and an empty `## Smoke` heading is refused. A `baseline-red` annotation declares an entry expected to fail on the unmodified checkout \u2014 a measured mismatch there is the annotation doing its job."
+      },
+      "frozen_tests": {
+        "type": "string",
+        "description": "Frozen Tests: each `## Frozen Tests` entry is the path alone (a path-only entry) \u2014 leftover prose outside the path token is invisible to the P5 frozen oracle and is refused."
+      },
+      "empty_headings": {
+        "type": "string",
+        "description": "Empty headings: an empty section must omit its heading \u2014 a `## Deliverables`, `## Smoke`, or `## Frozen Tests` heading that parses to zero entries is refused; absence is fine, emptiness is not."
+      }
+    }
   }
 }

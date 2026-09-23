@@ -329,9 +329,41 @@ describe("luna mission driver (kusabi #530 criteria 4-8)", () => {
     ]);
     const { control, record, missionDir } = readMission();
 
-    // The seam was used exactly once, with the brief and container of the request.
+    // The seam was used exactly once, with the STAMPED brief and container of
+    // the request.  Canonical stamping (deterministic inner-brief signature,
+    // decisions 1-3): the seam receives exactly one canonical `Orchestrator:`
+    // line as line 1 \u2014 model = the actual coordinator seat, session = the
+    // mission id, date = the dispatch's UTC day \u2014 and the original content
+    // byte-stable after the removed first-five signature, NEVER the raw
+    // Luna-authored text.  The parsed orchestrator attribution is non-null
+    // and matches the stamped line.
     assert.equal(chain.calls.length, 1, "runChainLifecycle must be called exactly once");
-    assert.equal(chain.calls[0].input.text, VALID_RUN_CHAIN_BRIEF);
+    const stampedText = chain.calls[0].input.text;
+    const stampedLines = stampedText.split("\n");
+    assert.equal(
+      stampedLines.length,
+      VALID_RUN_CHAIN_BRIEF.split("\n").length,
+      "stamping replaces the stripped signature line with the canonical line \u2014 no other line is added or dropped",
+    );
+    assert.equal(
+      stampedLines.slice(0, 5).filter((l) => l.trim().startsWith("Orchestrator:")).length,
+      1,
+      "exactly one canonical first-line signature expected",
+    );
+    assert.match(
+      stampedLines[0],
+      /^Orchestrator: gpt-5.6-luna \| session mission-[a-z0-9]+ \| \d{4}-\d{2}-\d{2}$/,
+      "the seam must receive exactly one canonical signature as line 1",
+    );
+    assert.equal(
+      stampedLines.slice(1).join("\n"),
+      VALID_RUN_CHAIN_BRIEF.split("\n").slice(1).join("\n"),
+      "remaining content must be byte-stable apart from the removed first-five signature and the leading insertion",
+    );
+    assert.ok(chain.calls[0].input.orchestrator, "the seam must receive a non-null parsed orchestrator attribution");
+    assert.equal(chain.calls[0].input.orchestrator.model, "gpt-5.6-luna");
+    assert.equal(chain.calls[0].input.orchestrator.session, record.missionId, "the canonical session must be the mission id");
+    assert.match(chain.calls[0].input.orchestrator.date, /^\d{4}-\d{2}-\d{2}$/, "the canonical date must be a UTC YYYY-MM-DD dispatch date");
     assert.equal(chain.calls[0].input.flags.container, "test-cid");
     assert.equal(chain.calls[0].input.flags.keepServe, true, "the mission owns serve lifecycle (keepServe)");
     const chainId = chain.calls[0].input.flags["chain-id"];
