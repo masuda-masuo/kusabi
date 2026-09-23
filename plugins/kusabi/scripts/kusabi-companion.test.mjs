@@ -4435,6 +4435,119 @@ describe("brief lint and container delivery (kusabi #289)", () => {
       assert.equal(briefLintReport({ brief, phase: "implement", container: "cid-1" }), null);
     });
 
+    // ---- Deliverables / Frozen Tests overlap ----
+    it("refuses a brief when a file appears in both Deliverables and Frozen Tests (A1)", () => {
+      const brief = [
+        "# Task", "", SIGNATURE, "",
+        "## Deliverables", "",
+        "- src/a.mjs",
+        "- test/a.test.mjs", "",
+        "## Frozen Tests", "",
+        "- test/a.test.mjs", "",
+      ].join("\n");
+      const report = briefLintReport({ brief, phase: "implement", container: "cid-1" });
+      assert.ok(report, "overlap must be refused");
+      assert.match(report, /brief rejected before dispatch/);
+      assert.match(report, /`test\/a\.test\.mjs` is listed under both `## Deliverables` and `## Frozen Tests`/);
+      assert.ok(report.includes("Deliverables"));
+      assert.ok(report.includes("the deliverables probe needs it changed while P5 fails any change to it so no worker can win"));
+      assert.ok(report.includes("Frozen Tests lists only existing tests the worker must not modify; a test file the worker is expected to write or edit belongs in Deliverables only."));
+    });
+
+    it("reports one bullet per overlapping path when multiple paths overlap (A1)", () => {
+      const brief = [
+        "# Task", "", SIGNATURE, "",
+        "## Deliverables", "",
+        "- test/a.test.mjs",
+        "- test/b.test.mjs", "",
+        "## Frozen Tests", "",
+        "- test/a.test.mjs",
+        "- test/b.test.mjs", "",
+      ].join("\n");
+      const report = briefLintReport({ brief, phase: "implement", container: "cid-1" });
+      assert.ok(report);
+      assert.match(report, /brief rejected before dispatch: 2 required brief items are missing/);
+      assert.ok(report.includes("`test/a.test.mjs` is listed under both `## Deliverables` and `## Frozen Tests`"));
+      assert.ok(report.includes("`test/b.test.mjs` is listed under both `## Deliverables` and `## Frozen Tests`"));
+    });
+
+    it("detects overlap when Deliverables has a leading ./ (A2)", () => {
+      const brief = [
+        "# Task", "", SIGNATURE, "",
+        "## Deliverables", "",
+        "- ./src/a.mjs",
+        "- ./test/a.test.mjs", "",
+        "## Frozen Tests", "",
+        "- test/a.test.mjs", "",
+      ].join("\n");
+      const report = briefLintReport({ brief, phase: "implement", container: "cid-1" });
+      assert.ok(report, "overlap with leading ./ in Deliverables must be detected");
+      assert.ok(report.includes("a.test.mjs"));
+      assert.ok(report.includes("Deliverables"));
+    });
+
+    it("detects overlap when Frozen Tests has a leading ./ (A2)", () => {
+      const brief = [
+        "# Task", "", SIGNATURE, "",
+        "## Deliverables", "",
+        "- src/a.mjs",
+        "- test/a.test.mjs", "",
+        "## Frozen Tests", "",
+        "- ./test/a.test.mjs", "",
+      ].join("\n");
+      const report = briefLintReport({ brief, phase: "implement", container: "cid-1" });
+      assert.ok(report, "overlap with leading ./ in Frozen Tests must be detected");
+      assert.ok(report.includes("test/a.test.mjs"));
+      assert.ok(report.includes("Deliverables"));
+    });
+
+    it("returns null when Deliverables and Frozen Tests are disjoint (A3)", () => {
+      const brief = [
+        "# Task", "", SIGNATURE, "",
+        "## Deliverables", "",
+        "- src/a.mjs", "",
+        "## Frozen Tests", "",
+        "- test/a.test.mjs", "",
+      ].join("\n");
+      assert.equal(briefLintReport({ brief, phase: "implement", container: "cid-1" }), null);
+    });
+
+    it("returns null when Frozen Tests heading is absent (A3)", () => {
+      const brief = [
+        "# Task", "", SIGNATURE, "",
+        "## Deliverables", "",
+        "- src/a.mjs",
+        "- test/a.test.mjs", "",
+      ].join("\n");
+      assert.equal(briefLintReport({ brief, phase: "implement", container: "cid-1" }), null);
+    });
+
+    it("leaves an ad-hoc task (no --phase, no chain) with overlapping paths alone (A4)", () => {
+      const brief = [
+        "# Task", "",
+        "## Deliverables", "",
+        "- test/a.test.mjs", "",
+        "## Frozen Tests", "",
+        "- test/a.test.mjs", "",
+      ].join("\n");
+      assert.equal(briefLintReport({ brief }), null);
+    });
+
+    it("refuses the overlap on a chain dispatch too", () => {
+      const brief = [
+        "# Task", "", SIGNATURE, "",
+        "## Deliverables", "",
+        "- src/a.mjs",
+        "- test/a.test.mjs", "",
+        "## Frozen Tests", "",
+        "- test/a.test.mjs", "",
+      ].join("\n");
+      const report = briefLintReport({ brief, container: "cid-1", chain: true });
+      assert.ok(report, "the chain path runs the same overlap check");
+      assert.ok(report.includes("test/a.test.mjs"));
+      assert.ok(report.includes("Deliverables"));
+    });
+
     // ---- Premises shape and guard & /tmp evidence (kusabi #536) ----
     it("refuses a premise with no measured: field alone, naming line number, claim, and missing piece", () => {
       const brief = [

@@ -9,7 +9,7 @@
 
 import { parseArgs, resolveModel, validateChainEntries, splitRouteBackend, resolveChainBackend, stripBackendPrefixChain, resolveModelBackend, chainNamesBackend, isMixedChain } from "./cli.mjs";
 import { renderJobLine, renderHeader } from "./render.mjs";
-import { hasSectionHeading, parseDeliverables, parseOrchestratorSignature, zeroEntrySections, findFrozenQualifierItems, parsePremises, presentHeadings, sectionText, parseSmoke } from "./brief-parsing.mjs";
+import { hasSectionHeading, parseDeliverables, parseFrozenTests, parseOrchestratorSignature, zeroEntrySections, findFrozenQualifierItems, parsePremises, presentHeadings, sectionText, parseSmoke } from "./brief-parsing.mjs";
 import { cmdInstallCli, diagnoseCompanionShim, formatShimSetupLine } from "./install-cli.mjs";
 // Exit path only (kusabi #243); its own module since kusabi #277 so that the
 // test children exercising it do not import everything above.
@@ -437,6 +437,29 @@ export function briefLintReport({ brief, phase = null, container = null, chain =
         "different file if they must be frozen; if the path must stay frozen, the entry is the " +
         "path alone, with no 但し書き."
       );
+    }
+  }
+
+  // ---- Deliverables / Frozen Tests overlap ----
+  if (chain || phase) {
+    const stripDotSlash = (p) => (p.startsWith("./") ? p.slice(2) : p);
+    const deliverables = parseDeliverables(brief);
+    const frozenTests = parseFrozenTests(brief);
+    if (deliverables.length > 0 && frozenTests.length > 0) {
+      const frozenNorm = new Set(frozenTests.map(stripDotSlash));
+      const seen = new Set();
+      for (const d of deliverables) {
+        const norm = stripDotSlash(d);
+        if (frozenNorm.has(norm) && !seen.has(norm)) {
+          seen.add(norm);
+          problems.push(
+            `  - \`${d}\` is listed under both \`## Deliverables\` and \`## Frozen Tests\`: ` +
+            "the deliverables probe needs it changed while P5 fails any change to it so no worker can win. " +
+            "Frozen Tests lists only existing tests the worker must not modify; a test file the worker is " +
+            "expected to write or edit belongs in Deliverables only."
+          );
+        }
+      }
     }
   }
 

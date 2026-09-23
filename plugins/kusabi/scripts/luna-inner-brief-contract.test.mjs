@@ -51,7 +51,7 @@ const RULE_SEMANTICS = {
   ],
   deliverables: [/Deliverables/],
   smoke: [/Smoke/, /baseline-red/],
-  frozen_tests: [/Frozen Tests/, /\bpath\b/],
+  frozen_tests: [/Frozen Tests/, /\bpath\b/, /Deliverables/, /(must not|never|may not)/],
   empty_headings: [/empty/, /(omit|omission|without|drop|absent)/],
 };
 
@@ -108,5 +108,9 @@ describe("the schema-owned inner_brief contract and its prompt rendering (decisi
           `(drift: the prompt would not follow a schema edit): "${description.slice(0, 120)}..."`,
       );
     }
+    const frozenLine = rendered.split("\n").find((x) => x.startsWith("- Frozen Tests"));
+    assert.ok(frozenLine, "rendered contract must contain a - Frozen Tests line");
+    assert.match(frozenLine, /Deliverables/);
+    assert.match(frozenLine, /(must not|never|may not)/i);
   });
 });
