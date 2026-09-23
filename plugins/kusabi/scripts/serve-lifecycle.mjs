@@ -5,7 +5,7 @@ import fs from "node:fs";
 import process from "node:process";
 import { spawn } from "node:child_process";
 import crypto from "node:crypto";
-import { stateDirFor, readJson, writeJson } from "./state-paths.mjs";
+import { stateDirFor, readJson, writeJson, kusabiOpencodeConfigHome } from "./state-paths.mjs";
 
 const SERVER_READY_TIMEOUT_MS = 20_000;
 
@@ -47,7 +47,12 @@ export function authHeader(server) {
 // when it sees the marker, closing the path the #136 fork bomb used to
 // re-invoke itself from inside a worker's own bash.
 export function buildServeEnv(baseEnv, password, stateDir) {
-  const env = { ...baseEnv, OPENCODE_SERVER_PASSWORD: password, KUSABI_WORKER_CONTEXT: "1" };
+  const env = {
+    ...baseEnv,
+    OPENCODE_SERVER_PASSWORD: password,
+    KUSABI_WORKER_CONTEXT: "1",
+    XDG_CONFIG_HOME: kusabiOpencodeConfigHome(),
+  };
   // The serve's own state dir is stamped as well, so a live process can be
   // attributed back to the state dir that should name it in server.json —
   // reapOrphanedServes() reads this marker to find serves no record names.

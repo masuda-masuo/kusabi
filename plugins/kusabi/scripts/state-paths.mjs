@@ -18,6 +18,12 @@ export function stateRoot(homeDir) {
   return newDir;
 }
 
+export function kusabiOpencodeConfigHome() {
+  const env = process.env.KUSABI_OPENCODE_CONFIG_HOME;
+  if (env && env.length > 0) return env;
+  return path.join(stateRoot(), "opencode-config");
+}
+
 export function stateDirFor(cwd) {
   const hash = crypto.createHash("sha256").update(cwd).digest("hex").slice(0, 12);
   const dir = path.join(stateRoot(), hash);
