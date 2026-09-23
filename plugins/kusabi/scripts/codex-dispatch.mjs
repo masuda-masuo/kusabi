@@ -37,8 +37,8 @@
 //       "cache_write_input_tokens":…,"output_tokens":…}, ...}
 //
 // `thread.started.thread_id` is the thread/session id the job records as
-// sessionID.  Terminal assistant text is the accumulated
-// `item.completed.item.agent_message.text`.  `--output-schema` returns the
+// sessionID.  Terminal assistant text is the LAST
+// `item.completed.item.agent_message.text` (earlier ones are commentary).  `--output-schema` returns the
 // terminal JSON text in that SAME agent-message item, so extraction is
 // identical for both framings; only the argv differs.
 //
@@ -458,8 +458,14 @@ export function applyCodexStreamEvent(acc, evt, now = new Date().toISOString()) 
       if (id) acc.threadId = id;
     } else if (type === "item.completed") {
       acc.steps += 1;
+      // The LAST agent message is the answer; earlier ones are commentary.
+      // A turn can complete several agent_message items (phase commentary
+      // before tool calls, then final_answer); concatenating them glued
+      // three JSONL batches together with no separator and the coordinator
+      // parser refused the whole stream as truncated (mission-mudmmnaub60f0b20,
+      // job-mudmn0ba8267: 481 + 555 + 555 = the 1591 assistantChars recorded).
       const text = codexAssistantTextFromEvent(evt);
-      if (text) acc.assistantText += text;
+      if (text) acc.assistantText = text;
     } else if (type === "turn.completed") {
       acc.usageEvent = evt;
     }

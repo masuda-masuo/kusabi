@@ -174,8 +174,8 @@ if (mode === "exit") {
   // evidence in the rollout; the known thread id must still be recorded.
   writeResumeRollout(model, model, "high");
   emit({ type: "turn.started", turn_id: "turn-2" });
-  emit({ type: "item.completed", item: { agent_message: { text: "ALPHA" } } });
-  emit({ type: "item.completed", item: { agent_message: { text: "-7" } } });
+  emit({ type: "item.completed", item: { agent_message: { text: "checking the brief first" } } }); // commentary: must not reach the result
+  emit({ type: "item.completed", item: { agent_message: { text: "ALPHA-7" } } });
   emit({ type: "turn.completed", usage: usage });
   process.exit(0);
 } else if (mode === "resume-mismatch-model") {
@@ -212,8 +212,8 @@ if (mode === "exit") {
 writeRollout(model, "high");
 emit({ type: "thread.started", thread_id: thread });
 emit({ type: "turn.started", turn_id: "turn-1" });
-emit({ type: "item.completed", item: { agent_message: { text: "ALPHA" } } });
-emit({ type: "item.completed", item: { agent_message: { text: "-7" } } });
+emit({ type: "item.completed", item: { agent_message: { text: "checking the brief first" } } }); // commentary: must not reach the result
+emit({ type: "item.completed", item: { agent_message: { text: "ALPHA-7" } } });
 emit({ type: "turn.completed", usage: usage });
 process.exit(0);
 }
@@ -525,10 +525,35 @@ describe("codex stream parsing", () => {
       usage: { input_tokens: 10543, cached_input_tokens: 5376, cache_write_input_tokens: 0, output_tokens: 34 },
     });
     assert.equal(acc.threadId, THREAD_ID);
-    assert.equal(acc.assistantText, "ALPHA-7");
+    // The last agent message wins; earlier ones are commentary (see the
+    // multi-message regression test below).
+    assert.equal(acc.assistantText, "-7");
     assert.equal(acc.steps, 2);
     assert.equal(acc.events, 5);
     assert.equal(acc.usageEvent.type, "turn.completed");
+  });
+
+  it("a turn with commentary messages before the final answer yields ONLY the final answer (mission-mudmmnaub60f0b20)", async () => {
+    // Measured shape of the incident: two commentary agent messages (the
+    // second a draft of the batch, the first cut off mid-record) and then
+    // the final answer.  Concatenating them produced `}{` joins and a
+    // truncated record, so the coordinator parser refused the whole batch.
+    const { parseCoordinatorOutput } = await import("./coordinator-parse.mjs");
+    const hash = "e".repeat(64);
+    const rec = (p, withTool = true) =>
+      JSON.stringify(withTool
+        ? { action: "read_probe", envelope_sha256: hash, tool: "read_file_range", path: p }
+        : { action: "read_probe", envelope_sha256: hash });
+    const commentary1 = [rec("a.mjs"), rec("b.mjs"), rec("", false)].join("\n");
+    const final = [rec("a.mjs"), rec("b.mjs"), rec("SKILL.md")].join("\n");
+    const acc = initCodexStreamAccumulator();
+    applyCodexStreamEvent(acc, { type: "item.completed", item: { type: "agent_message", text: commentary1 } });
+    applyCodexStreamEvent(acc, { type: "item.completed", item: { type: "agent_message", text: final } });
+    applyCodexStreamEvent(acc, { type: "item.completed", item: { type: "agent_message", text: final } });
+    assert.equal(acc.assistantText, final);
+    const parsed = parseCoordinatorOutput(acc.assistantText, { envelopeSha256: hash });
+    assert.equal(parsed.valid, true, JSON.stringify(parsed.errors));
+    assert.equal(parsed.requests.length, 3);
   });
 
   it("malformed events never throw", () => {
