@@ -319,10 +319,12 @@ const IMPLEMENT_ALLOWED_TOOLS = [
   // kaiba (kusabi #279, #391): the shared conclusion store: recall +
   // progress; remember never.  The implementer reads conclusions, records
   // in-flight progress notes, and reports durable facts in its final
-  // report for the orchestrator to file.  Both tool definitions ride in
+  // report for the orchestrator to file.  agenda only LISTS the shared
+  // queue (editing it is the orchestrator's).  The tool definitions ride in
   // every turn's context regardless — --allowedTools is a runtime guard,
   // not a context filter — and that cost is accepted deliberately.
   "mcp__kaiba__recall",
+  "mcp__kaiba__agenda",
   "mcp__kaiba__progress",
   "Skill", // mirrors `skill: kusabi-*: allow` in kusabi-implement.md
 ];
@@ -341,8 +343,10 @@ const REVIEW_ALLOWED_TOOLS = [
   // kaiba (kusabi #279, #391): the shared conclusion store: recall +
   // progress; remember never.  The reviewer is an inspected phase too:
   // it reads conclusions, records in-flight progress notes, and durable
-  // facts go in the review output for the orchestrator to file.
+  // facts go in the review output for the orchestrator to file.  agenda
+  // only LISTS the shared queue.
   "mcp__kaiba__recall",
+  "mcp__kaiba__agenda",
   "mcp__kaiba__progress",
 ];
 

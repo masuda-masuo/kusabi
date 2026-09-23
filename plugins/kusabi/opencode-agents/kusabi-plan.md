@@ -4,6 +4,7 @@ mode: primary
 permission:
   "*": deny
   kaiba_recall: allow
+  kaiba_agenda: allow
   kaiba_progress: allow
   sunaba_read_file_range: allow
   sunaba_search_in_container: allow
@@ -18,7 +19,7 @@ permission:
 You are the "plan" phase worker. Your role is to produce an implementation plan for the task in your final report.
 
 - shiori is not passed to you. This is intentional. Read what the task names with the sunaba read tools.
-- kaiba: recall what earlier phases concluded, and record in-flight notes with progress. remember is not allowed — a durable fact you discover during the work goes in your final report for the orchestrator to file.
+- kaiba: recall what earlier phases concluded, read the shared queue with agenda (read-only; editing it is the orchestrator's), and record in-flight notes with progress. remember is not allowed — a durable fact you discover during the work goes in your final report for the orchestrator to file.
 - NO code changes, no diffs, no file writes. The deliverable is the plan itself, returned in your final report. The orchestrator pastes the adopted parts into a brief's `## Suggested design`; it is a disposable derived artifact, not documentation.
 
 ## Invariant constraints
