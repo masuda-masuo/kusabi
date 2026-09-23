@@ -42,7 +42,7 @@ import {
   bindAuditVerdict,
   AUDIT_VERDICTS,
 } from "./audit-verdict.mjs";
-import { renderSolContract, renderBriefCorrections } from "./luna-prompt.mjs";
+import { renderSolContract, renderBriefCorrections, renderEvidenceContents } from "./luna-prompt.mjs";
 
 /** The gate phases the frozen #531 vocabulary names. */
 export const GATE_PHASES = ["pre-dispatch", "post-chain", "pre-accept", "consult"];
@@ -153,6 +153,19 @@ function missionLedgerText(record) {
 }
 
 /**
+ * Deterministic serialization of probe output for evidence items:
+ * returns string output unchanged, null/undefined as "", and JSON.stringify(output, null, 2) otherwise.
+ *
+ * @param {unknown} output
+ * @returns {string}
+ */
+export function probeEvidenceText(output) {
+  if (output === null || output === undefined) return "";
+  if (typeof output === "string") return output;
+  return JSON.stringify(output, null, 2);
+}
+
+/**
  * The immutable evidence items a gate judges - the same evidence surface the
  * coordinator envelope binds (brief + worker reports + probe raws + ledger),
  * so the gate and the coordinator are bound to the same current evidence.
@@ -175,7 +188,7 @@ export function missionEvidenceItems({ brief, record }) {
     items.push({
       role: "probe_raw",
       source: `probe-${i}`,
-      content: String(probe.output ?? ""),
+      content: probeEvidenceText(probe.output),
       path: `evidence/probe-${i}.txt`,
     });
   });
@@ -236,14 +249,18 @@ export function buildGateEnvelope({
  * job-identification pattern `luna mission <mission-id>: ...` so
  * reconciliation can attribute seat jobs to the mission.
  */
-export async function realSolDispatch({ cwd, missionId, envelope, gate, auditor }) {
+export async function realSolDispatch({ cwd, missionId, missionDir, envelope, gate, auditor }) {
   const { codexDispatch, assertCodexDispatchSucceeded } = await import("./codex-dispatch.mjs");
+  const evidenceContents = renderEvidenceContents(envelope, missionDir);
   const prompt = [
     `You are the Sol auditor seat for kusabi mission ${missionId}, audit gate ${gate.gateId} (phase: ${gate.phase}).`,
     `The current immutable evidence envelope hash is ${envelope.envelope_sha256}.`,
     ``,
     `Mission evidence envelope:`,
     JSON.stringify(envelope, null, 2),
+    ``,
+    `Evidence contents (bound by the envelope hash above):`,
+    evidenceContents,
     ``,
     // The runtime-rendered verdict contract (derived from
     // schemas/audit-verdict.schema.json): the required common fields

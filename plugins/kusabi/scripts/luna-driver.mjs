@@ -87,6 +87,7 @@ import {
   renderRemainingBudget,
   renderBriefCorrections,
   sanitizeBriefCorrectionDetail,
+  renderEvidenceContents,
 } from "./luna-prompt.mjs";
 import {
   mintMissionId,
@@ -99,7 +100,7 @@ import {
   rearmMissionControl,
   TERMINAL_MISSION_DISPOSITIONS,
 } from "./mission-store.mjs";
-import { evaluateMissionGate, realSolDispatch } from "./luna-sol-gate.mjs";
+import { evaluateMissionGate, realSolDispatch, probeEvidenceText } from "./luna-sol-gate.mjs";
 
 /** The exact default seats of #530: coordinator codex/gpt-5.6-luna, auditor codex/gpt-5.6-sol. */
 export const DEFAULT_COORDINATOR_SEAT = { provider: "codex", model: "gpt-5.6-luna" };
@@ -343,7 +344,7 @@ function buildEvidenceEnvelope({ missionId, missionDir, brief, container, coordi
     items.push({
       role: "probe_raw",
       source: `probe-${i}`,
-      content: String(probe.output ?? ""),
+      content: probeEvidenceText(probe.output),
       path: `evidence/probe-${i}.txt`,
     });
   });
@@ -433,8 +434,9 @@ export function capProbeOutput(output) {
  * kusabi-coordinate agent grants zero tools; the envelope is the only
  * evidence path.
  */
-async function realCoordinatorDispatch({ cwd, missionId, brief, envelope, coordinator, record }) {
+async function realCoordinatorDispatch({ cwd, missionId, missionDir, brief, envelope, coordinator, record }) {
   const { codexDispatch, assertCodexDispatchSucceeded } = await import("./codex-dispatch.mjs");
+  const evidenceContents = renderEvidenceContents(envelope, missionDir);
   // The bounded inner-brief correction feedback (kusabi #553 follow-up): the
   // deterministic validator detail for every previously refused inner brief
   // (last <=3 unique details, C0-sanitized, <=1200 UTF-8 bytes each),
@@ -460,6 +462,9 @@ async function realCoordinatorDispatch({ cwd, missionId, brief, envelope, coordi
     ``,
     `Current evidence envelope:`,
     JSON.stringify(envelope, null, 2),
+    ``,
+    `Evidence contents (bound by the envelope hash above):`,
+    evidenceContents,
     ``,
     // The current REMAINING deterministic budget (decision 6): computed from
     // the persisted mission record plus its canonical effective budget on
