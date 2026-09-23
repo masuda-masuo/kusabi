@@ -9,6 +9,7 @@ import {
   waitForTask,
   TaskWaitError,
   readTaskSnapshot,
+  jobDirCreatedAt,
 } from "./task-wait.mjs";
 
 const COMPANION_SCRIPT = path.join(import.meta.dirname, "kusabi-companion.mjs");
@@ -351,7 +352,12 @@ describe("task-wait --next appearance and selection", () => {
       finishedAt: "2026-09-01T00:05:00.000Z",
     });
 
-    const sinceIso = new Date().toISOString();
+    // The selector compares the job DIRECTORY stamp (not startedAt) against
+    // --since, inclusively.  Taking --since from the clock right after the
+    // write can land in the same millisecond as the older dir (kusabi #533),
+    // so derive it from that dir's own stamp and step strictly past it.
+    const olderStamp = jobDirCreatedAt(workspaceStateDir, olderJobId);
+    const sinceIso = new Date(Math.floor(olderStamp) + 1).toISOString();
     const env = { ...process.env };
     delete env.KUSABI_WORKER_CONTEXT;
     env.KUSABI_STATE_DIR = stateRootDir;
