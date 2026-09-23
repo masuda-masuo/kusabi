@@ -42,7 +42,7 @@ import {
   bindAuditVerdict,
   AUDIT_VERDICTS,
 } from "./audit-verdict.mjs";
-import { renderSolContract } from "./luna-prompt.mjs";
+import { renderSolContract, renderBriefCorrections } from "./luna-prompt.mjs";
 
 /** The gate phases the frozen #531 vocabulary names. */
 export const GATE_PHASES = ["pre-dispatch", "post-chain", "pre-accept", "consult"];
@@ -128,15 +128,28 @@ export function activePriorVerdicts(gates, fingerprint) {
     .map((g) => ({ gate_id: g.gateId, verdict: g.verdict, envelope_sha256: g.envelopeSha256 }));
 }
 
-/** The mission-ledger evidence text shared by every mission envelope. */
+/**
+ * The mission-ledger evidence text shared by every mission envelope.
+ *
+ * The bounded brief-correction feedback (kusabi #553 follow-up) rides on the
+ * ledger CONDITIONALLY: `briefCorrections` appears only when the record has
+ * at least one rendered correction, so a clean mission's Sol ledger stays
+ * byte-identical to the pre-change canonical ledger.  The rendered text is
+ * the SAME deterministic text the driver ledger embeds (both derive it from
+ * renderBriefCorrections), so the two seats see identical correction
+ * feedback.
+ */
 function missionLedgerText(record) {
-  return JSON.stringify({
+  const ledger = {
     attempts: Array.isArray(record.attempts) ? record.attempts.length : 0,
     chains: Array.isArray(record.chains) ? record.chains : [],
     probes: Array.isArray(record.probes) ? record.probes.length : 0,
     consults: Array.isArray(record.consults) ? record.consults.length : 0,
     coordinatorErrors: record.coordinatorErrors ?? 0,
-  });
+  };
+  const corrections = renderBriefCorrections(record ?? {});
+  if (corrections !== "") ledger.briefCorrections = corrections;
+  return JSON.stringify(ledger);
 }
 
 /**

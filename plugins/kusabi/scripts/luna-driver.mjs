@@ -85,6 +85,8 @@ import {
   renderCoordinatorContract,
   remainingMissionBudget,
   renderRemainingBudget,
+  renderBriefCorrections,
+  sanitizeBriefCorrectionDetail,
 } from "./luna-prompt.mjs";
 import {
   mintMissionId,
@@ -293,9 +295,15 @@ async function innerBriefValidationReport(brief, container) {
 /**
  * The mission ledger, persisted as evidence so the next envelope hash changes
  * after any observable action (attempts, probes, consults, errors).
+ *
+ * The bounded brief-correction feedback (kusabi #553 follow-up) rides on the
+ * ledger CONDITIONALLY: `briefCorrections` appears only when the record has
+ * at least one rendered correction, so a clean mission's ledger stays
+ * byte-identical to the pre-change canonical ledger (no extra field, no
+ * extra text).
  */
 function missionLedgerText(record) {
-  return JSON.stringify({
+  const ledger = {
     attempts: Array.isArray(record.attempts) ? record.attempts.length : 0,
     chains: Array.isArray(record.chains) ? record.chains : [],
     probes: Array.isArray(record.probes) ? record.probes.length : 0,
@@ -305,7 +313,10 @@ function missionLedgerText(record) {
     // record + its canonical budget is the single source of budget truth, so
     // the ledger exposes max − persisted usage on every dispatch/resume.
     remaining: remainingMissionBudget(record),
-  });
+  };
+  const corrections = renderBriefCorrections(record ?? {});
+  if (corrections !== "") ledger.briefCorrections = corrections;
+  return JSON.stringify(ledger);
 }
 
 /**
@@ -424,6 +435,22 @@ export function capProbeOutput(output) {
  */
 async function realCoordinatorDispatch({ cwd, missionId, brief, envelope, coordinator, record }) {
   const { codexDispatch, assertCodexDispatchSucceeded } = await import("./codex-dispatch.mjs");
+  // The bounded inner-brief correction feedback (kusabi #553 follow-up): the
+  // deterministic validator detail for every previously refused inner brief
+  // (last <=3 unique details, C0-sanitized, <=1200 UTF-8 bytes each),
+  // rendered ONLY when a correction exists — a clean mission's prompt stays
+  // byte-identical to today.  The rendered text is driver-generated validator
+  // output only: arbitrary coordinator error text, probe output, tool output
+  // and exception messages never reach the seat.
+  const correctionsText = renderBriefCorrections(record ?? {});
+  // The whole section — including its TRAILING blank line — is conditional:
+  // a clean mission (no corrections) spreads nothing, so its prompt stays
+  // BYTE-IDENTICAL to the pre-change prompt (the review finding); a
+  // corrected mission gets the section framed by a blank line on each side.
+  const correctionsSection =
+    correctionsText !== ""
+      ? [`Brief corrections from the previous dispatch:`, ``, correctionsText, ``]
+      : [];
   const prompt = [
     `You are the Luna coordinator seat for kusabi mission ${missionId}.`,
     `The current immutable evidence envelope hash is ${envelope.envelope_sha256}.`,
@@ -442,6 +469,15 @@ async function realCoordinatorDispatch({ cwd, missionId, brief, envelope, coordi
     // atomically by the driver preflight).
     renderRemainingBudget(record ?? {}),
     ``,
+    // The bounded inner-brief correction feedback (kusabi #553 follow-up):
+    // the deterministic validator detail for every previously refused inner
+    // brief (last <=3 unique details, C0-sanitized, <=1200 UTF-8 bytes each),
+    // rendered ONLY when a correction exists — a clean mission's prompt stays
+    // byte-identical to the pre-change prompt.  The rendered text is
+    // driver-generated validator output only: arbitrary coordinator error
+    // text, probe output, tool output and exception messages never reach the
+    // seat.
+    ...correctionsSection,
     // The runtime-rendered request contract (derived from
     // schemas/coordinator-output.schema.json): the exact per-action body
     // fields, the probe tool enum and per-tool arguments, the inner-chain
@@ -782,15 +818,27 @@ export async function runLunaMission(input) {
   // A deterministic pre-flight refusal of a Luna-authored brief is BOTH a
   // coordinator error and a brief correction (kusabi #532 criterion 2): the
   // counters agree by construction — one refusal, one of each — so a
-  // pure-brief-correction mission never double-counts elsewhere.
-  const recordBriefCorrection = (detail) => {
+  // pure-brief-correction mission never double-counts elsewhere.  The
+  // correction is ALSO persisted as a structured `briefCorrectionsDetails`
+  // entry carrying the timestamp, the ORIGINAL coordinator action and the
+  // deterministic validator detail (sanitized + bounded by the shared
+  // luna-prompt transform, so the persisted record and the rendered feedback
+  // can never disagree), which the bounded renderer exposes to the next
+  // coordinator turn (kusabi #553 follow-up).
+  const recordBriefCorrection = (action, detail) => {
+    const sanitized = sanitizeBriefCorrectionDetail(detail);
+    const at = new Date().toISOString();
     record = {
       ...record,
       coordinatorErrors: (record.coordinatorErrors ?? 0) + 1,
       briefCorrections: (record.briefCorrections ?? 0) + 1,
       coordinatorErrorsDetails: [
         ...(Array.isArray(record.coordinatorErrorsDetails) ? record.coordinatorErrorsDetails : []),
-        { at: new Date().toISOString(), detail },
+        { at, detail: sanitized },
+      ],
+      briefCorrectionsDetails: [
+        ...(Array.isArray(record.briefCorrectionsDetails) ? record.briefCorrectionsDetails : []),
+        { at, action, detail: sanitized },
       ],
     };
     saveMissionRecord(missionDir, record);
@@ -1116,7 +1164,7 @@ export async function runLunaMission(input) {
               report === null
                 ? `${req.action} refused: the inner chain brief fails deterministic validation`
                 : `${req.action} refused: the inner chain brief fails deterministic validation\n${report}`;
-            recordBriefCorrection(detail);
+            recordBriefCorrection(req.action, detail);
             continue;
           }
           // PRE-DISPATCH GATE: the deterministic driver, never Luna, decides
