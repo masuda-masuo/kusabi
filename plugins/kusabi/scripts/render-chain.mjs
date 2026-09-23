@@ -105,6 +105,27 @@ export function probeVerdictLabel(probe) {
 }
 
 /**
+ * Format the quota line for chain-show (kusabi #373, #453).
+ *
+ * @param {object|null|undefined} failure
+ * @returns {string}
+ */
+export function formatQuotaLine(failure) {
+  if (!failure || typeof failure !== "object") return "";
+  const pool = failure.quota === "free-tier"
+    ? "free-tier pool"
+    : failure.quota === "individual"
+      ? "individual pool"
+      : failure.quota
+        ? failure.quota + " pool"
+        : "pool";
+  const reset = failure.reset
+    ? (/^\d/.test(String(failure.reset)) ? "; resets in " + failure.reset : "; resets " + failure.reset)
+    : "";
+  return `quota: ${failure.backend || "provider"} ${pool} exhausted${reset}`;
+}
+
+/**
  * Resolve the status label for a chain by combining the control record
  * (explicit lifecycle status) with the round-derived disposition when the
  * control record is absent (old chains from before stop-lever).
@@ -340,21 +361,16 @@ export function renderChainShow(chain, rounds, unreadable = [], control = null, 
       lines.push(`  disposition: ${disp}${reasonNote}`);
     }
 
-    // Quota exhaustion is a job fact, not an unreadable verdict (kusabi #373).
+    // Quota exhaustion is a job fact, not an unreadable verdict (kusabi #373, #453).
     // chain-show must name the empty pool without opening job.json.
+    if (round.implementJobFailure && round.implementJobFailure.kind === "quota-exhaustion") {
+      lines.push(`  ${formatQuotaLine(round.implementJobFailure)}`);
+    }
+    if (round.implementJobError) {
+      lines.push(`  implement job error: ${round.implementJobError}`);
+    }
     if (round.reviewJobFailure && round.reviewJobFailure.kind === "quota-exhaustion") {
-      const failure = round.reviewJobFailure;
-      const pool = failure.quota === "free-tier"
-        ? "free-tier pool"
-        : failure.quota === "individual"
-          ? "individual pool"
-          : failure.quota
-            ? failure.quota + " pool"
-            : "pool";
-      const reset = failure.reset
-        ? (/^\d/.test(String(failure.reset)) ? "; resets in " + failure.reset : "; resets " + failure.reset)
-        : "";
-      lines.push(`  quota: ${failure.backend || "provider"} ${pool} exhausted${reset}`);
+      lines.push(`  ${formatQuotaLine(round.reviewJobFailure)}`);
     }
     if (round.reviewJobError) {
       lines.push(`  review job error: ${round.reviewJobError}`);

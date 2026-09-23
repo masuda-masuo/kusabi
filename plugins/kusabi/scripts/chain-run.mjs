@@ -243,6 +243,12 @@ export async function runImplementPhase({
   const reportedSession = job.sessionID ?? (isResumingRound ? resolvedSession : null);
   const reportedProvenance = job.sessionID ? backend : (isResumingRound ? resolvedSessionProvenance : null);
 
+  // Structured terminal-failure classification (kusabi #215 / #453): null for
+  // generic failures; { kind: "quota-exhaustion", ... } when the dispatch
+  // classified the terminal payload.  Stamped on roundRecord when present
+  // (kusabi #453) so chain-show and chain-resume can read it without opening job.json.
+  const implementJobFailure = job.failure || classifyDispatchQuotaExhaustion(job.error) || null;
+
   return {
     roundRecord: {
       round,
@@ -260,6 +266,9 @@ export async function runImplementPhase({
       // status error must be distinguishable without opening job.json.  Written
       // only when present so a healthy round's record is unchanged.
       ...(job.error ? { implementJobError: job.error } : {}),
+      // Structured terminal-failure classification (kusabi #453): stamped on
+      // the round record only when present, so a healthy round's record is unchanged.
+      ...(implementJobFailure ? { implementJobFailure } : {}),
       // The parsed refusal descriptor, stamped at parse time (see above);
       // null when the report carried no block -- the ordinary case.  The
       // caller still decides what it means: whether a refusal is genuine
@@ -285,7 +294,7 @@ export async function runImplementPhase({
     // classified the terminal payload.  The chain's provider-exhaustion
     // renderer uses it to show the classification instead of the generic
     // capacity advice.
-    implementJobFailure: job.failure || classifyDispatchQuotaExhaustion(job.error) || null,
+    implementJobFailure,
     // The parsed refusal block (kusabi #293), or null when the report carried
     // none -- the ordinary case.  The caller decides what it means; whether a
     // refusal is genuine depends on the change set, which this phase has not
