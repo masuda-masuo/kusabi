@@ -258,3 +258,94 @@ export function renderRemainingBudget(record = {}) {
     `- remaining consults: ${r.consults}`,
   ].join("\n");
 }
+
+// ---------------------------------------------------------------------------
+// bounded brief-correction feedback (kusabi #553 follow-up)
+// ---------------------------------------------------------------------------
+
+/**
+ * The bounded inner-brief correction feedback surface (kusabi #553 follow-up):
+ * after a pre-seam refusal of a Luna-authored inner-chain brief, the driver
+ * persists structured `briefCorrectionsDetails` entries and the NEXT
+ * coordinator turn must see WHY the brief was refused — otherwise Luna
+ * repeats the malformed brief (the empty-`## Frozen Tests` incident after PR
+ * #553: the heading was correctly refused pre-seam, but its deterministic
+ * correction was never shown to the next coordinator turn).
+ *
+ * The renderer is pure and deterministic (no I/O, no clock, no randomness)
+ * and reads ONLY `briefCorrectionsDetails` (criterion 4): arbitrary
+ * coordinator error text, probe output, tool output and exception messages
+ * are never rendered — correction detail is driver-generated validator
+ * output only.
+ *
+ * The bounded window (criterion 2):
+ *   - an entry is `{ at, action, detail }`; an entry without a usable
+ *     non-empty string `detail` contributes nothing;
+ *   - unique-by-detail keeps the LAST occurrence of each distinct detail
+ *     (older duplicates are the stale ones the window must drop) and the
+ *     remaining window renders in record order;
+ *   - "last <=3" keeps the three most recent unique details;
+ *   - every rendered correction is bounded to BRIEF_CORRECTION_MAX_BYTES
+ *     UTF-8 bytes (truncation never splits a code point) and C0 control
+ *     characters are stripped while useful line breaks (`\n`) are preserved;
+ *   - the output is the empty string when there are no corrections.
+ *
+ * @param {object} [record] — the persisted mission record.
+ * @returns {string} the rendered corrections text, or "" when none.
+ */
+export const BRIEF_CORRECTION_MAX_ITEMS = 3;
+
+/** The per-correction UTF-8 byte bound of the bounded feedback window. */
+export const BRIEF_CORRECTION_MAX_BYTES = 1200;
+
+/**
+ * Sanitize one correction detail deterministically: strip every C0 control
+ * character except `\n` (so a `\r\n` line break normalizes to the preserved
+ * `\n`), then bound the result to BRIEF_CORRECTION_MAX_BYTES UTF-8 bytes
+ * without ever splitting a code point.  The SAME transform is applied when
+ * the driver persists a correction and when the renderer exposes it, so the
+ * persisted record and the rendered feedback can never disagree.
+ *
+ * @param {unknown} detail — the raw validator detail (string coercion).
+ * @returns {string} the sanitized, bounded detail.
+ */
+export function sanitizeBriefCorrectionDetail(detail) {
+  const text = String(detail ?? "");
+  const sanitized = text.replace(/[\x00-\x1f]/g, (ch) => (ch === "\n" ? "\n" : ""));
+  const buf = Buffer.from(sanitized, "utf8");
+  if (buf.length <= BRIEF_CORRECTION_MAX_BYTES) return sanitized;
+  // Walk back from the bound to a UTF-8 code-point boundary: a continuation
+  // byte is 0b10xxxxxx, so stopping at a non-continuation byte never splits a
+  // code point.
+  let end = BRIEF_CORRECTION_MAX_BYTES;
+  while (end > 0 && (buf[end] & 0xc0) === 0x80) end -= 1;
+  return buf.subarray(0, end).toString("utf8");
+}
+
+/**
+ * Render the bounded brief-correction feedback text from a mission record,
+ * or the empty string when there is nothing to render.  See the module-level
+ * comment above for the frozen window semantics.
+ *
+ * @param {object} [record] — the persisted mission record.
+ * @returns {string}
+ */
+export function renderBriefCorrections(record = {}) {
+  const details = record?.briefCorrectionsDetails;
+  if (!Array.isArray(details)) return "";
+  const usable = [];
+  for (const entry of details) {
+    if (!entry || typeof entry !== "object" || typeof entry.detail !== "string") continue;
+    if (entry.detail.trim() === "") continue;
+    usable.push(entry.detail);
+  }
+  if (usable.length === 0) return "";
+  // unique-by-detail: keep the LAST occurrence of each distinct detail (the
+  // last-occurrence indices are the record-order of the kept window).
+  const lastIndexOf = new Map();
+  usable.forEach((detail, i) => lastIndexOf.set(detail, i));
+  const unique = [...lastIndexOf.values()].sort((a, b) => a - b).map((i) => usable[i]);
+  // last <=3 unique details, rendered in record order.
+  const window = unique.slice(-BRIEF_CORRECTION_MAX_ITEMS);
+  return window.map(sanitizeBriefCorrectionDetail).join("\n\n");
+}
