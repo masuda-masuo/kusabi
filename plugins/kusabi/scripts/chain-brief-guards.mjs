@@ -279,13 +279,13 @@ const SMOKE_HEAD_MOVE_HEADER =
   "dispatched: no job and no round state exist. Make the smoke command leave HEAD alone — no " +
   "commit, no checkout, no reset — or prepare a container it cannot move, then re-run.";
 
-// The same refusal when the guard cannot see: the smoke passed, but whether it
-// left the worktree and HEAD unchanged could not be verified.  Refusing on an
+// The same refusal when the guard cannot see: whether the smoke left the
+// worktree and HEAD unchanged could not be verified.  Refusing on an
 // unverifiable measurement, not silently passing, is the fail-closed stance the
 // smoke probe itself takes (an unobservable exit code is a red baseline, not a
 // skipped one).
 const SMOKE_DIRT_UNVERIFIABLE_HEADER =
-  "dispatch refused: the declared ## Smoke passed, but whether it left the worktree and HEAD " +
+  "dispatch refused: whether the declared ## Smoke left the worktree and HEAD " +
   "unchanged could not be verified (kusabi #292). Nothing was dispatched: no job and no round " +
   "state exist. The worktree and HEAD must be proven unchanged before the worker is handed the " +
   "container; check the container by hand and re-run.";
