@@ -51,6 +51,17 @@ Place machine-read sections (`Deliverables`, `Smoke`, `Frozen Tests`) first.
 - **Every Smoke line states the criterion or boundary it proves, the expected exit/result, and whether it was measured on pristine HEAD.** Reasons may be nearby prose (a prose line or a backtick-less bullet — parseSmoke skips both) or trailing prose, so long as parser syntax holds. Trailing prose on a command line must contain neither extra backticks nor a bare `exit N` token: the first backtick pair is the command (an extra backtick triggers the lossy-command refusal), and the first bare `exit <N>` after the closing backtick becomes the expected-exit annotation — expected exit belongs only in the `exit <N>` annotation.
 - **When behaviour is the point, include at least one end-to-end behavioural/contract boundary probe** that exercises the changed behaviour (wrong input, edge case, exit-code contract). A broad suite alone is insufficient.
 
+### Premises
+- **`## Premises` records facts the brief relies on.** Sample size and measurement source stay visible next to the claim rather than buried in `## Spec` prose, so a claim measured on a small sample cannot masquerade as an established rule.
+- **Canonical bullet shape**: `- claim — measured: source, scope, number — guard: <heading/criterion>`. Fields are separated by an em dash `—` or ` -- `.
+- **Every premise must carry its sample size and a guard.** The dispatch-time lint refuses a premise with no `measured:` field, a `measured:` field with no digit, or a `guard:` that does not name any present `## ` heading (excluding `Premises` itself). A premise with no number hides its sample size; a premise with no guard is a bet on the whole round. When false, the guard is what makes the round recoverable.
+- **Evidence files under `/tmp` must prove themselves in `## Smoke`.** Any evidence path under `/tmp` named in `## Workplace` must be read by at least one `## Smoke` command (e.g. a non-empty check); the dispatch lint refuses a brief where none does. The check needs no implementation, so the dispatch-time smoke baseline then refuses unusable evidence before a round is spent (the incident: an empty SQLite file whose content lived in the uncopied `-wal` sidecar). Example Smoke line:
+
+  ```
+  python -c "import sqlite3;assert sqlite3.connect('/tmp/cursor-store-sample/store.db').execute('select count(*) from blobs').fetchone()[0]>0"
+  ```
+- **Optional section**: Omit `## Premises` when there are no premises; an empty heading is refused by dispatch lint.
+
 ### Frozen Tests
 - **If nothing is frozen, omit the `## Frozen Tests` heading — never write `(none)` under it.** A machine-read heading followed by prose parses to zero entries, failing P5 with "heading present but no entries parsed" every round. Dispatch refuses such briefs outright.
 - If acceptance criteria state new concrete I/O (bug repro, parser case, API contract) and no existing test covers it, dispatch `test-author` pre-phase first to manufacture tests + `baseline-red` smoke. Omit heading when criteria are structural or judgment-based.

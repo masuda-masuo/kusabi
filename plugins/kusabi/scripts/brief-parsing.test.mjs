@@ -15,6 +15,8 @@ import {
   PARSED_BRIEF_SECTIONS,
   zeroEntrySections,
   briefSyntaxDefectSummary,
+  parsePremises,
+  sectionText,
 } from "./brief-parsing.mjs";
 
 // parseOrchestratorSignature
@@ -1065,5 +1067,150 @@ describe("findFrozenQualifierItems", () => {
   it("parseFrozenTests on a pre-path bullet still returns the path array (lint only)", () => {
     const brief = "## Frozen Tests\n\n- do not weaken `tests/test_style.py`\n";
     assert.deepEqual(parseFrozenTests(brief), ["tests/test_style.py"]);
+  });
+});
+
+// parsePremises (kusabi #536)
+// ---------------------------------------------------------------------------
+
+describe("parsePremises", () => {
+  it("parses em dash separated premise with all fields", () => {
+    const brief =
+      "## Premises\n" +
+      "- store and transcript names agree — measured: host sqlite over all 163 sessions, 163/163 — guard: Acceptance criteria 3\n";
+    const result = parsePremises(brief);
+    assert.equal(result.length, 1);
+    assert.deepEqual(result[0], {
+      raw: "- store and transcript names agree — measured: host sqlite over all 163 sessions, 163/163 — guard: Acceptance criteria 3",
+      lineNumber: 2,
+      claim: "store and transcript names agree",
+      measured: "measured: host sqlite over all 163 sessions, 163/163",
+      guard: "guard: Acceptance criteria 3",
+    });
+  });
+
+  it("parses -- separated premise with all fields", () => {
+    const brief =
+      "## Premises\n" +
+      "- store and transcript names agree -- measured: host sqlite over all 163 sessions, 163/163 -- guard: Acceptance criteria 3\n";
+    const result = parsePremises(brief);
+    assert.equal(result.length, 1);
+    assert.equal(result[0].claim, "store and transcript names agree");
+    assert.equal(result[0].measured, "measured: host sqlite over all 163 sessions, 163/163");
+    assert.equal(result[0].guard, "guard: Acceptance criteria 3");
+  });
+
+  it("sets missing fields to null", () => {
+    const brief =
+      "## Premises\n" +
+      "- claim only\n" +
+      "- claim with measured only — measured: 100 sessions\n" +
+      "- claim with guard only — guard: Smoke\n";
+    const result = parsePremises(brief);
+    assert.equal(result.length, 3);
+    assert.deepEqual(result[0], {
+      raw: "- claim only",
+      lineNumber: 2,
+      claim: "claim only",
+      measured: null,
+      guard: null,
+    });
+    assert.deepEqual(result[1], {
+      raw: "- claim with measured only — measured: 100 sessions",
+      lineNumber: 3,
+      claim: "claim with measured only",
+      measured: "measured: 100 sessions",
+      guard: null,
+    });
+    assert.deepEqual(result[2], {
+      raw: "- claim with guard only — guard: Smoke",
+      lineNumber: 4,
+      claim: "claim with guard only",
+      measured: null,
+      guard: "guard: Smoke",
+    });
+  });
+
+  it("parses numbered items", () => {
+    const brief =
+      "## Premises\n" +
+      "1. first claim — measured: 10/10 — guard: Acceptance criteria 1\n" +
+      "2) second claim -- measured: 20/20 -- guard: Smoke\n";
+    const result = parsePremises(brief);
+    assert.equal(result.length, 2);
+    assert.equal(result[0].claim, "first claim");
+    assert.equal(result[0].measured, "measured: 10/10");
+    assert.equal(result[0].guard, "guard: Acceptance criteria 1");
+    assert.equal(result[1].claim, "second claim");
+    assert.equal(result[1].measured, "measured: 20/20");
+    assert.equal(result[1].guard, "guard: Smoke");
+  });
+
+  it("ignores code-block items", () => {
+    const brief =
+      "## Premises\n" +
+      "```\n" +
+      "- code block item — measured: 1 — guard: Smoke\n" +
+      "```\n" +
+      "- bullet item — measured: 2 — guard: Smoke\n";
+    const result = parsePremises(brief);
+    assert.equal(result.length, 1);
+    assert.equal(result[0].claim, "bullet item");
+  });
+
+  it("returns [] when section is absent or empty", () => {
+    assert.deepEqual(parsePremises("## Deliverables\n- a.js\n"), []);
+    assert.deepEqual(parsePremises(""), []);
+    assert.deepEqual(parsePremises(null), []);
+    assert.deepEqual(parsePremises(undefined), []);
+  });
+});
+
+// sectionText (kusabi #536)
+// ---------------------------------------------------------------------------
+
+describe("sectionText", () => {
+  it("returns raw text when section is present", () => {
+    const brief = "## Workplace\nevidence copied to /tmp/store.db\ncontainer c1";
+    assert.equal(sectionText(brief, "Workplace"), "evidence copied to /tmp/store.db\ncontainer c1");
+  });
+
+  it("returns null when section is absent", () => {
+    const brief = "## Deliverables\n- a.js\n";
+    assert.equal(sectionText(brief, "Workplace"), null);
+    assert.equal(sectionText("", "Workplace"), null);
+    assert.equal(sectionText(null, "Workplace"), null);
+    assert.equal(sectionText(undefined, "Workplace"), null);
+  });
+
+  it("stops at next heading", () => {
+    const brief =
+      "## Workplace\n" +
+      "evidence copied to /tmp/store.db\n" +
+      "## Acceptance criteria\n" +
+      "all green\n";
+    assert.equal(sectionText(brief, "Workplace"), "evidence copied to /tmp/store.db");
+  });
+
+  it("ignores a ## inside a code fence", () => {
+    const brief =
+      "## Workplace\n" +
+      "evidence copied to /tmp/store.db\n" +
+      "```\n" +
+      "## Not a real heading\n" +
+      "code content\n" +
+      "```\n" +
+      "still in workplace\n" +
+      "## Acceptance criteria\n" +
+      "all green\n";
+    assert.equal(
+      sectionText(brief, "Workplace"),
+      "evidence copied to /tmp/store.db\n```\n## Not a real heading\ncode content\n```\nstill in workplace",
+    );
+  });
+
+  it("recognises heading with annotations (word-boundary prefix match)", () => {
+    const brief = "## Workplace (container c1)\nevidence path /tmp/foo\n## Next\nend\n";
+    assert.equal(sectionText(brief, "Workplace"), "evidence path /tmp/foo");
   });
 });

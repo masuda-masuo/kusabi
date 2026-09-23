@@ -9,7 +9,7 @@
 
 import { parseArgs, resolveModel, validateChainEntries, splitRouteBackend, resolveChainBackend, stripBackendPrefixChain, resolveModelBackend, chainNamesBackend, isMixedChain } from "./cli.mjs";
 import { renderJobLine, renderHeader } from "./render.mjs";
-import { hasSectionHeading, parseDeliverables, parseOrchestratorSignature, zeroEntrySections, findFrozenQualifierItems } from "./brief-parsing.mjs";
+import { hasSectionHeading, parseDeliverables, parseOrchestratorSignature, zeroEntrySections, findFrozenQualifierItems, parsePremises, presentHeadings, sectionText, parseSmoke } from "./brief-parsing.mjs";
 import { cmdInstallCli, diagnoseCompanionShim, formatShimSetupLine } from "./install-cli.mjs";
 // Exit path only (kusabi #243); its own module since kusabi #277 so that the
 // test children exercising it do not import everything above.
@@ -437,6 +437,72 @@ export function briefLintReport({ brief, phase = null, container = null, chain =
         "different file if they must be frozen; if the path must stay frozen, the entry is the " +
         "path alone, with no 但し書き."
       );
+    }
+  }
+
+  // ---- Premises shape and guard (kusabi #536) ----
+  if (chain || phase) {
+    if (hasSectionHeading(brief, "Premises")) {
+      const premises = parsePremises(brief);
+      if (premises.length === 0) {
+        problems.push(
+          "  - `## Premises` is present but parses to zero entries: heading present but no entries; " +
+          "delete the heading if there are no premises (kusabi #536)."
+        );
+      } else {
+        const headings = presentHeadings(brief)
+          .map((h) => h.replace(/\s*\(.*?\)$/, "").trim())
+          .filter((h) => h.toLowerCase() !== "premises" && h.length > 0);
+
+        for (const item of premises) {
+          const itemFlaws = [];
+          if (!item.measured) {
+            itemFlaws.push("no `measured:` field (a premise with no number hides its sample size)");
+          } else if (!/\d/.test(item.measured)) {
+            itemFlaws.push("`measured:` contains no digit (a premise must carry its sample size / count; a premise with no number hides its sample size)");
+          }
+          if (!item.guard) {
+            itemFlaws.push("no `guard:` field (a premise with no guard is a bet on the whole round)");
+          } else {
+            const hasMatchingHeading = headings.some((h) => item.guard.toLowerCase().includes(h.toLowerCase()));
+            if (!hasMatchingHeading) {
+              itemFlaws.push("`guard:` does not name any `## ` heading that exists in the brief (a premise with no guard is a bet on the whole round)");
+            }
+          }
+          if (itemFlaws.length > 0) {
+            problems.push(
+              `  - \`## Premises\` item on line ${item.lineNumber} ("${item.claim}"): ${itemFlaws.join("; ")} (kusabi #536).`
+            );
+          }
+        }
+      }
+    }
+  }
+
+  // ---- /tmp evidence must be read by Smoke (kusabi #536) ----
+  if (chain || phase) {
+    const workplaceText = sectionText(brief, "Workplace");
+    if (workplaceText) {
+      const rawMatches = workplaceText.match(/\/tmp\/[^\s`'"\),]+/g) || [];
+      const distinctPaths = new Set();
+      for (const m of rawMatches) {
+        const cleaned = m.replace(/[.\/]$/, "");
+        if (cleaned) {
+          distinctPaths.add(cleaned);
+        }
+      }
+      const smokeEntries = parseSmoke(brief);
+      for (const evidencePath of distinctPaths) {
+        const covered = smokeEntries.some((e) => e.command && e.command.includes(evidencePath));
+        if (!covered) {
+          problems.push(
+            `  - evidence path \`${evidencePath}\` named in \`## Workplace\` has no reading \`## Smoke\` entry: ` +
+            "evidence shipped into the container must prove itself through a Smoke line that reads it " +
+            "(e.g. a non-empty check), so the dispatch-time baseline refuses unusable evidence " +
+            "(kusabi #536; the empty-SQLite incident)."
+          );
+        }
+      }
     }
   }
 

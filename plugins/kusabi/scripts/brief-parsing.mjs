@@ -123,6 +123,93 @@ export function hasSectionHeading(briefText, headingName) {
   return headingFound;
 }
 
+/**
+ * Return the raw text of a named `## ` section (all lines between its heading
+ * and the next `## ` heading), or null when the section is absent.
+ *
+ * Uses the same heading-matching (word-boundary prefix match, case-sensitive)
+ * and code-fence tracking rules as parseSectionItems.
+ *
+ * @param {string|null|undefined} briefText
+ * @param {string}                headingName
+ * @returns {string|null}
+ */
+export function sectionText(briefText, headingName) {
+  if (!briefText || typeof briefText !== "string") return null;
+
+  const lines = briefText.split("\n");
+  let inSection = false;
+  let headingFound = false;
+  let inCodeBlock = false;
+  const sectionLines = [];
+
+  for (let li = 0; li < lines.length; li++) {
+    const line = lines[li];
+    const trimmed = line.trim();
+
+    if (trimmed.startsWith("```")) {
+      inCodeBlock = !inCodeBlock;
+      if (inSection) {
+        sectionLines.push(line);
+      }
+      continue;
+    }
+
+    if (!inCodeBlock && trimmed.startsWith("## ")) {
+      const heading = trimmed.slice(3).trim();
+      const isHeading =
+        heading === headingName ||
+        (heading.startsWith(headingName) && !/[A-Za-z0-9_]/.test(heading[headingName.length]));
+      if (isHeading) {
+        inSection = true;
+        headingFound = true;
+        continue;
+      }
+      if (inSection) break;
+      continue;
+    }
+
+    if (inSection) {
+      sectionLines.push(line);
+    }
+  }
+
+  if (!headingFound) return null;
+  return sectionLines.join("\n");
+}
+
+/**
+ * Extract all `## ` section headings present in briefText outside code blocks.
+ *
+ * @param {string|null|undefined} briefText
+ * @returns {string[]}
+ */
+export function presentHeadings(briefText) {
+  if (!briefText || typeof briefText !== "string") return [];
+  const lines = briefText.split("\n");
+  let inCodeBlock = false;
+  const headings = [];
+
+  for (let li = 0; li < lines.length; li++) {
+    const line = lines[li];
+    const trimmed = line.trim();
+
+    if (trimmed.startsWith("```")) {
+      inCodeBlock = !inCodeBlock;
+      continue;
+    }
+
+    if (!inCodeBlock && trimmed.startsWith("## ")) {
+      const heading = trimmed.slice(3).trim();
+      if (heading) {
+        headings.push(heading);
+      }
+    }
+  }
+
+  return headings;
+}
+
 // ---------------------------------------------------------------------------
 // parsePathSection — shared path-item extractor behind parseDeliverables and
 // parseFrozenTests.
@@ -312,6 +399,58 @@ export function parseSmoke(briefText) {
     }
   }
   return entries;
+}
+
+// ---------------------------------------------------------------------------
+// parsePremises — parse optional `## Premises` section (kusabi #536)
+// ---------------------------------------------------------------------------
+
+/**
+ * Parse an optional `## Premises` section from briefText.
+ *
+ * Each bullet or numbered item represents a premise that the brief relies on.
+ * Code-block items are ignored.
+ *
+ * Fields are separated by an em dash `—` (U+2014) or ` -- `:
+ *  - First segment: claim
+ *  - Segment starting with `measured:` (case-insensitive): measurement
+ *  - Segment starting with `guard:` (case-insensitive): guard reference
+ * Missing fields are null. Everything is trimmed.
+ *
+ * @param {string|null|undefined} briefText
+ * @returns {Array<{raw: string, lineNumber: number, claim: string, measured: string|null, guard: string|null}>}
+ */
+export function parsePremises(briefText) {
+  const { items } = parseSectionItems(briefText, "Premises");
+  const result = [];
+
+  for (const item of items) {
+    if (item.source === "code-block") continue;
+
+    const segments = item.content.split(/\s*—\s*|\s+--\s+/);
+    const claim = segments[0] ? segments[0].trim() : "";
+    let measured = null;
+    let guard = null;
+
+    for (let i = 1; i < segments.length; i++) {
+      const seg = segments[i].trim();
+      if (/^measured:/i.test(seg)) {
+        measured = seg;
+      } else if (/^guard:/i.test(seg)) {
+        guard = seg;
+      }
+    }
+
+    result.push({
+      raw: item.raw,
+      lineNumber: item.lineNumber,
+      claim,
+      measured,
+      guard,
+    });
+  }
+
+  return result;
 }
 
 // ---------------------------------------------------------------------------

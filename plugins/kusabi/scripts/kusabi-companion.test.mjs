@@ -4427,6 +4427,151 @@ describe("brief lint and container delivery (kusabi #289)", () => {
       ].join("\n");
       assert.equal(briefLintReport({ brief, phase: "implement", container: "cid-1" }), null);
     });
+
+    // ---- Premises shape and guard & /tmp evidence (kusabi #536) ----
+    it("refuses a premise with no measured: field alone, naming line number, claim, and missing piece", () => {
+      const brief = [
+        "# Task", "", SIGNATURE, "", DELIVERABLES,
+        "## Workplace", "", "Container `cid-1`.", "",
+        "## Acceptance criteria", "", "- ok", "",
+        "## Premises", "",
+        "- store and transcript names agree — guard: Acceptance criteria 1", "",
+      ].join("\n");
+      const report = briefLintReport({ brief, phase: "implement", container: "cid-1" });
+      assert.ok(report);
+      assert.match(report, /## Premises/);
+      assert.match(report, /line \d+/);
+      assert.match(report, /store and transcript names agree/);
+      assert.match(report, /no `measured:` field/);
+      assert.match(report, /a premise with no number hides its sample size/);
+    });
+
+    it("refuses a premise whose measured: contains no digit alone", () => {
+      const brief = [
+        "# Task", "", SIGNATURE, "", DELIVERABLES,
+        "## Workplace", "", "Container `cid-1`.", "",
+        "## Acceptance criteria", "", "- ok", "",
+        "## Premises", "",
+        "- store and transcript names agree — measured: host sqlite none — guard: Acceptance criteria 1", "",
+      ].join("\n");
+      const report = briefLintReport({ brief, phase: "implement", container: "cid-1" });
+      assert.ok(report);
+      assert.match(report, /## Premises/);
+      assert.match(report, /line \d+/);
+      assert.match(report, /store and transcript names agree/);
+      assert.match(report, /contains no digit/);
+      assert.match(report, /a premise must carry its sample size \/ count/);
+    });
+
+    it("refuses a premise with no guard: field alone", () => {
+      const brief = [
+        "# Task", "", SIGNATURE, "", DELIVERABLES,
+        "## Workplace", "", "Container `cid-1`.", "",
+        "## Acceptance criteria", "", "- ok", "",
+        "## Premises", "",
+        "- store and transcript names agree — measured: host sqlite 163 sessions", "",
+      ].join("\n");
+      const report = briefLintReport({ brief, phase: "implement", container: "cid-1" });
+      assert.ok(report);
+      assert.match(report, /## Premises/);
+      assert.match(report, /line \d+/);
+      assert.match(report, /store and transcript names agree/);
+      assert.match(report, /no `guard:` field/);
+      assert.match(report, /a premise with no guard is a bet on the whole round/);
+    });
+
+    it("refuses a premise whose guard: does not name an existing ## heading in the brief", () => {
+      const brief = [
+        "# Task", "", SIGNATURE, "", DELIVERABLES,
+        "## Workplace", "", "Container `cid-1`.", "",
+        "## Acceptance criteria", "", "- ok", "",
+        "## Premises", "",
+        "- store and transcript names agree — measured: 163 sessions — guard: Nonexistent section 1", "",
+      ].join("\n");
+      const report = briefLintReport({ brief, phase: "implement", container: "cid-1" });
+      assert.ok(report);
+      assert.match(report, /## Premises/);
+      assert.match(report, /line \d+/);
+      assert.match(report, /store and transcript names agree/);
+      assert.match(report, /does not name any `## ` heading/);
+      assert.match(report, /a premise with no guard is a bet on the whole round/);
+    });
+
+    it("refuses a ## Premises heading that parses to zero entries (2a)", () => {
+      const brief = [
+        "# Task", "", SIGNATURE, "", DELIVERABLES,
+        "## Workplace", "", "Container `cid-1`.", "",
+        "## Acceptance criteria", "", "- ok", "",
+        "## Premises", "",
+        "(none for this task)", "",
+      ].join("\n");
+      const report = briefLintReport({ brief, phase: "implement", container: "cid-1" });
+      assert.ok(report);
+      assert.match(report, /## Premises/);
+      assert.match(report, /parses to zero entries/);
+      assert.match(report, /delete the heading if there are no premises/);
+    });
+
+    it("passes a brief with a fully valid premise", () => {
+      const brief = [
+        "# Task", "", SIGNATURE, "", DELIVERABLES,
+        "## Workplace", "", "Container `cid-1`.", "",
+        "## Acceptance criteria", "", "- ok", "",
+        "## Premises", "",
+        "- store and transcript names agree — measured: host sqlite over all 163 sessions, 163/163 — guard: Acceptance criteria 1", "",
+      ].join("\n");
+      assert.equal(briefLintReport({ brief, phase: "implement", container: "cid-1" }), null);
+    });
+
+    it("passes a brief without ## Premises (Premises is optional)", () => {
+      const brief = [
+        "# Task", "", SIGNATURE, "", DELIVERABLES,
+        "## Workplace", "", "Container `cid-1`.", "",
+        "## Acceptance criteria", "", "- ok", "",
+      ].join("\n");
+      assert.equal(briefLintReport({ brief, phase: "implement", container: "cid-1" }), null);
+    });
+
+    it("refuses a /tmp path in Workplace with no reading Smoke, naming the path", () => {
+      const brief = [
+        "# Task", "", SIGNATURE, "", DELIVERABLES,
+        "## Workplace", "", "evidence copied to /tmp/sample/store.db", "",
+        "## Acceptance criteria", "", "- ok", "",
+      ].join("\n");
+      const report = briefLintReport({ brief, phase: "implement", container: "cid-1" });
+      assert.ok(report);
+      assert.match(report, /\/tmp\/sample\/store\.db/);
+      assert.match(report, /evidence shipped into the container must prove itself/);
+    });
+
+    it("passes a /tmp path in Workplace when read by a Smoke entry", () => {
+      const brief = [
+        "# Task", "", SIGNATURE, "", DELIVERABLES,
+        "## Smoke", "", "- `test -s /tmp/sample/store.db` exit 0", "",
+        "## Workplace", "", "evidence copied to /tmp/sample/store.db", "",
+        "## Acceptance criteria", "", "- ok", "",
+      ].join("\n");
+      assert.equal(briefLintReport({ brief, phase: "implement", container: "cid-1" }), null);
+    });
+
+    it("does not refuse a /tmp path mentioned only outside Workplace", () => {
+      const brief = [
+        "# Task", "", SIGNATURE, "", DELIVERABLES,
+        "## Workplace", "", "Container `cid-1`.", "",
+        "## Spec", "", "temporary logs were in /tmp/sample/debug.log", "",
+        "## Acceptance criteria", "", "- ok", "",
+      ].join("\n");
+      assert.equal(briefLintReport({ brief, phase: "implement", container: "cid-1" }), null);
+    });
+
+    it("leaves an ad-hoc task with no phase and no chain alone, even with invalid premise and unread /tmp path", () => {
+      const brief = [
+        "quick ad-hoc task", "",
+        "## Workplace", "", "/tmp/unverified.db", "",
+        "## Premises", "", "- unverified premise", "",
+      ].join("\n");
+      assert.equal(briefLintReport({ brief }), null);
+    });
   });
 
   describe("withContainerWorkspace", () => {
