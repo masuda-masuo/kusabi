@@ -48,6 +48,59 @@ const BASE_HEADERS = {
   "accept": "application/json, text/event-stream",
 };
 
+const DEFAULT_HANDSHAKE_TIMEOUT_MS = 30_000;
+const DEFAULT_CALL_TIMEOUT_MS = 1_800_000;
+
+function resolveTimeoutMs(envName, fallback) {
+  const v = Number(process.env[envName]);
+  return Number.isInteger(v) && v > 0 ? v : fallback;
+}
+
+function resolveCallTimeoutMs(opts) {
+  if (typeof opts === "number" && Number.isInteger(opts) && opts > 0) {
+    return opts;
+  }
+  if (opts && typeof opts === "object" && opts.timeoutMs !== undefined) {
+    const v = Number(opts.timeoutMs);
+    if (Number.isInteger(v) && v > 0) {
+      return v;
+    }
+  }
+  return resolveTimeoutMs("KUSABI_SUNABA_CALL_TIMEOUT_MS", DEFAULT_CALL_TIMEOUT_MS);
+}
+
+function isTimeoutOrAbortError(err) {
+  if (!err) return false;
+  if (err.name === "TimeoutError" || err.name === "AbortError") return true;
+  if (err.cause && typeof err.cause === "object") {
+    if (err.cause.name === "TimeoutError" || err.cause.name === "AbortError") return true;
+  }
+  return false;
+}
+
+function translateTimeout(err, step, ms, endpoint) {
+  if (err?.code === "SUNABA_RPC_TIMEOUT") {
+    return err;
+  }
+  if (isTimeoutOrAbortError(err)) {
+    const error = new Error(
+      `sunaba-rpc: ${step} timed out after ${ms} ms (${endpoint}) — the sunaba daemon accepted the connection but did not answer`,
+    );
+    error.code = "SUNABA_RPC_TIMEOUT";
+    return error;
+  }
+  return err;
+}
+
+async function boundedFetch(step, endpoint, init, ms) {
+  const signal = init.signal ?? AbortSignal.timeout(ms);
+  try {
+    return await fetch(endpoint, { ...init, signal });
+  } catch (err) {
+    throw translateTimeout(err, step, ms, endpoint);
+  }
+}
+
 // ---------------------------------------------------------------------------
 // JSON-RPC helpers
 // ---------------------------------------------------------------------------
@@ -185,7 +238,7 @@ function unwrapResult(result) {
  * 2. POST /mcp with {"method":"notifications/initialized",...} (no response expected)
  * 3. POST /mcp with {"method":"tools/call",...} → parse SSE, return result
  */
-export async function callTool(toolName, args = {}) {
+export async function callTool(toolName, args = {}, opts = {}) {
   if (!ALLOWED_TOOLS.has(toolName)) {
     throw new Error(
       `sunaba-rpc: tool "${toolName}" is not in the allowed list. ` +
@@ -203,6 +256,11 @@ export async function callTool(toolName, args = {}) {
   }
 
   const endpoint = process.env.KUSABI_SUNABA_URL || DEFAULT_ENDPOINT;
+  const handshakeTimeoutMs = resolveTimeoutMs(
+    "KUSABI_SUNABA_HANDSHAKE_TIMEOUT_MS",
+    DEFAULT_HANDSHAKE_TIMEOUT_MS,
+  );
+  const callTimeoutMs = resolveCallTimeoutMs(opts);
 
   // ------ Phase 1: initialize ------
   const initReq = jsonRpcRequest("initialize", {
@@ -211,13 +269,14 @@ export async function callTool(toolName, args = {}) {
     clientInfo: { name: "kusabi-companion", version: "1.0.0" },
   });
 
-  const initRes = await fetch(endpoint, {
+  const initRes = await boundedFetch("initialize", endpoint, {
     method: "POST",
     headers: BASE_HEADERS,
     body: JSON.stringify(initReq),
-  });
+  }, handshakeTimeoutMs);
 
   if (!initRes.ok) {
+    await initRes.body?.cancel().catch(() => {});
     throw new Error(
       `sunaba-rpc: initialize failed (HTTP ${initRes.status})`,
     );
@@ -225,6 +284,7 @@ export async function callTool(toolName, args = {}) {
 
   const sessionId = initRes.headers.get("mcp-session-id");
   if (!sessionId) {
+    await initRes.body?.cancel().catch(() => {});
     throw new Error(
       "sunaba-rpc: initialize response missing mcp-session-id header",
     );
@@ -232,7 +292,7 @@ export async function callTool(toolName, args = {}) {
 
   // Parse initialize result (may be SSE or direct JSON; we only need the
   // session-id from the header, but drain the body to keep the connection healthy).
-  await initRes.body?.cancel();
+  await initRes.body?.cancel().catch(() => {});
 
   // ------ Phase 2: notifications/initialized (fire-and-forget) ------
   const notifReq = jsonRpcRequest("notifications/initialized", {});
@@ -240,30 +300,39 @@ export async function callTool(toolName, args = {}) {
   // We strip it here to comply with the spec (notifications are id-less).
   delete notifReq.id;
 
-  const notifRes = await fetch(endpoint, {
+  const notifRes = await boundedFetch("notifications/initialized", endpoint, {
     method: "POST",
     headers: { ...BASE_HEADERS, "mcp-session-id": sessionId },
     body: JSON.stringify(notifReq),
-  });
+  }, handshakeTimeoutMs);
   // Drain body (notifications produce no meaningful response body).
-  await notifRes.body?.cancel();
+  await notifRes.body?.cancel().catch(() => {});
 
   // ------ Phase 3: tools/call ------
   const toolReq = jsonRpcRequest("tools/call", { name: toolName, arguments: args });
 
-  const toolRes = await fetch(endpoint, {
+  const callSignal = AbortSignal.timeout(callTimeoutMs);
+  const toolRes = await boundedFetch(`tools/call ${toolName}`, endpoint, {
     method: "POST",
     headers: { ...BASE_HEADERS, "mcp-session-id": sessionId },
     body: JSON.stringify(toolReq),
-  });
+    signal: callSignal,
+  }, callTimeoutMs);
 
   if (!toolRes.ok) {
+    await toolRes.body?.cancel().catch(() => {});
     throw new Error(
       `sunaba-rpc: tools/call failed (HTTP ${toolRes.status})`,
     );
   }
 
-  const body = await toolRes.text();
+  let body;
+  try {
+    body = await toolRes.text();
+  } catch (err) {
+    throw translateTimeout(err, `tools/call ${toolName}`, callTimeoutMs, endpoint);
+  }
+
   const raw = parseSseResponse(body);
   return unwrapResult(raw);
 }
@@ -272,16 +341,16 @@ export async function callTool(toolName, args = {}) {
 // convenience wrappers (used by the companion's non-LLM pipeline)
 // ---------------------------------------------------------------------------
 
-export async function verifyInContainer(args = {}) {
-  return callTool("verify_in_container", args);
+export async function verifyInContainer(args = {}, opts = {}) {
+  return callTool("verify_in_container", args, opts);
 }
 
-export async function sandboxExec(args = {}) {
-  return callTool("sandbox_exec", args);
+export async function sandboxExec(args = {}, opts = {}) {
+  return callTool("sandbox_exec", args, opts);
 }
 
 // Exported for testing
-export { unwrapResult, parseSseResponse };
+export { unwrapResult, parseSseResponse, DEFAULT_HANDSHAKE_TIMEOUT_MS, DEFAULT_CALL_TIMEOUT_MS };
 
 // ---------------------------------------------------------------------------
 // CLI entry (for testing)
