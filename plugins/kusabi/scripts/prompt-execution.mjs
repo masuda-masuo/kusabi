@@ -44,7 +44,13 @@ import { startKaibaProgressWatch } from "./kaiba-progress-watch.mjs";
 // future members are added in exactly one place.  `deriveStopReason` does NOT
 // know this list: the caller passes `capacityReason` non-null iff the reason
 // is a member here.
-export const capacityReasons = ["free_tier_limit"];
+//
+// `account_rate_limit` is opencode-go's subscription cap ("Go limit
+// reached": 5-hour / weekly / monthly windows).  Its reset is hours to weeks
+// away, so opencode schedules the next retry after the task timeout: only
+// attempt 1 is ever seen, the generic attempt-3 threshold never trips, and
+// the job sat silent until timeout instead of walking to the next rung.
+export const capacityReasons = ["free_tier_limit", "account_rate_limit"];
 
 /**
  * Decide whether a provider-retry loop should be stopped immediately.

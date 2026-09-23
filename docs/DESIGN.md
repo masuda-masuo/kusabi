@@ -71,7 +71,7 @@ Every route string follows the format `provider/model` with an optional `:varian
 
 The SSE watcher inside `runPrompt` detects `session.status` events with `type: "retry"`. The decision to stop is made by the pure function `shouldFailFast({ reason, attempt, steps })`:
 
-- **Capacity/quota reasons** (`free_tier_limit` today): dispatch ends on the **first** occurrence. The provider has stated retrying cannot succeed, so no threshold is applied.
+- **Capacity/quota reasons** (`free_tier_limit`, and `account_rate_limit` — opencode-go's 5-hour/weekly/monthly subscription cap, whose next retry lands after any task timeout): dispatch ends on the **first** occurrence. The provider has stated retrying cannot succeed, so no threshold is applied.
 - **Other retry reasons**: dispatch ends when `attempt >= 3` **while** `steps === 0` (no work completed). If at least one step was recorded, retries do NOT end the dispatch — real work is in progress, and the existing watchdog/timeout keep their current role.
 
 When fail-fast triggers, the session is aborted immediately and the job's status is set to `provider-error` — a new status distinct from `completed`, `stalled`, `timeout`, and `error`. The job record carries structured retry information (`job.retry`) so callers never need to parse prose or open `events.ndjson` for triage. `stalled` keeps its meaning ("silence watchdog fired") unchanged.
