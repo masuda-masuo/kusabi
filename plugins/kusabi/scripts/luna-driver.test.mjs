@@ -447,16 +447,34 @@ describe("luna mission driver (kusabi #530 criteria 4-8)", () => {
     assert.equal(chain.calls.length, 0, "a probe-only iteration must not start a chain");
   });
 
-  it("read_probe is bounded: a request beyond maxProbes terminates budget-exhausted with zero further probes", async () => {
+  it("read_probe is bounded ATOMICALLY: a batch beyond maxProbes terminates budget-exhausted with ZERO tool calls and a precise reason", async () => {
+    // Supersedes the original #530 expectation (2 of 3 probes executed before
+    // the 3rd breached): the atomic-preflight contract refuses the WHOLE
+    // oversized batch before any action executes.  The full contract lives in
+    // luna-budget-preflight.test.mjs.
+    //
+    // The fixture delivers all three over-budget probes in ONE coordinator
+    // dispatch (a single JSONL stream): whole-batch atomicity applies to the
+    // oversized batch itself, so zero tool calls execute.  (Per-dispatch
+    // atomicity for separate affordable dispatches is pinned separately by
+    // luna-budget-preflight.test.mjs.)
     const { tools, chain } = await runMission(
-      [readProbeStream("read_file_range", "p1"), readProbeStream("read_file_range", "p2"), readProbeStream("read_file_range", "p3")],
+      [(input) => stream(
+        line("read_probe", input.envelope.envelope_sha256, { tool: "read_file_range", path: "p1" }),
+        line("read_probe", input.envelope.envelope_sha256, { tool: "read_file_range", path: "p2" }),
+        line("read_probe", input.envelope.envelope_sha256, { tool: "read_file_range", path: "p3" }),
+      )],
       { budget: { ...DEFAULT_BUDGET, maxProbes: 2 } },
     );
     const probeCalls = tools.calls.filter((c) => c.name === "read_file_range");
-    assert.equal(probeCalls.length, 2, "no more than maxProbes probes may execute");
+    assert.equal(probeCalls.length, 0, "an oversized probe batch must execute zero tool calls");
     assert.equal(chain.calls.length, 0);
     const { record } = readMission();
     assert.equal(record.disposition, "budget-exhausted");
+    assert.ok(
+      typeof record.terminationReason === "string" && /probe/i.test(record.terminationReason) && /remain|exceed|requested|refused|over budget/i.test(record.terminationReason),
+      `a precise atomic-refusal reason naming the probe bound must be recorded, got ${JSON.stringify(record.terminationReason)}`,
+    );
   });
 
   it("requests execute sequentially, in stream order", async () => {
@@ -491,20 +509,32 @@ describe("luna mission driver (kusabi #530 criteria 4-8)", () => {
     assert.ok(probeIdx < chainIdx, `probe must run before the chain (order: ${sharedOrder.join(" -> ")})`);
   });
 
-  it("chain creation is capped by the explicit mission budget — exhaustion terminates budget-exhausted", async () => {
+  it("chain creation is capped ATOMICALLY by the explicit mission budget — an oversized batch executes zero chains and terminates budget-exhausted", async () => {
+    // Supersedes the original #530 expectation (2 of 4 chains executed before
+    // the 3rd breached): the atomic-preflight contract refuses the WHOLE
+    // oversized batch before any action executes.  The full contract lives in
+    // luna-budget-preflight.test.mjs.
+    //
+    // The fixture delivers all four over-budget chain actions in ONE
+    // coordinator dispatch (a single JSONL stream): whole-batch atomicity
+    // applies to the oversized batch itself, so zero chains are created.
     const { chain } = await runMission(
-      [
-        runChainStream(VALID_RUN_CHAIN_BRIEF),
-        runChainStream(VALID_RUN_CHAIN_BRIEF),
-        runChainStream(VALID_RUN_CHAIN_BRIEF),
-        runChainStream(VALID_RUN_CHAIN_BRIEF),
-      ],
+      [(input) => stream(
+        line("run_chain", input.envelope.envelope_sha256, { brief: VALID_RUN_CHAIN_BRIEF }),
+        line("run_chain", input.envelope.envelope_sha256, { brief: VALID_RUN_CHAIN_BRIEF }),
+        line("run_chain", input.envelope.envelope_sha256, { brief: VALID_RUN_CHAIN_BRIEF }),
+        line("run_chain", input.envelope.envelope_sha256, { brief: VALID_RUN_CHAIN_BRIEF }),
+      )],
       { budget: { ...DEFAULT_BUDGET, maxChains: 2 } },
     );
-    assert.equal(chain.calls.length, 2, "no more than maxChains chains may be created");
+    assert.equal(chain.calls.length, 0, "an oversized chain batch must not create any chain");
     const { record } = readMission();
     assert.equal(record.disposition, "budget-exhausted");
-    assert.equal(record.chains.length, 2, "exactly the two created chains are referenced");
+    assert.equal(record.chains.length, 0, "no chain may be referenced for a refused batch");
+    assert.ok(
+      typeof record.terminationReason === "string" && /chain/i.test(record.terminationReason) && /remain|exceed|requested|refused|over budget/i.test(record.terminationReason),
+      `a precise atomic-refusal reason naming the chain bound must be recorded, got ${JSON.stringify(record.terminationReason)}`,
+    );
   });
 
   it("rework_chain is another bounded mission attempt carrying prior evidence — both chains referenced", async () => {

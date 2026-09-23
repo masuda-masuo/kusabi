@@ -80,7 +80,12 @@ import { parseCoordinatorOutput } from "./coordinator-parse.mjs";
 import { buildAuditEnvelope, truncateEvidenceText } from "./audit-envelope.mjs";
 import { hasSectionHeading, parseDeliverables } from "./brief-parsing.mjs";
 import { mintChainId } from "./chain-phases.mjs";
-import { loadCoordinatorSchema, renderCoordinatorContract } from "./luna-prompt.mjs";
+import {
+  loadCoordinatorSchema,
+  renderCoordinatorContract,
+  remainingMissionBudget,
+  renderRemainingBudget,
+} from "./luna-prompt.mjs";
 import {
   mintMissionId,
   assertMissionIdShape,
@@ -242,6 +247,10 @@ function missionLedgerText(record) {
     probes: Array.isArray(record.probes) ? record.probes.length : 0,
     consults: Array.isArray(record.consults) ? record.consults.length : 0,
     coordinatorErrors: record.coordinatorErrors ?? 0,
+    // The current REMAINING deterministic budget (decision 6): the persisted
+    // record + its canonical budget is the single source of budget truth, so
+    // the ledger exposes max − persisted usage on every dispatch/resume.
+    remaining: remainingMissionBudget(record),
   });
 }
 
@@ -359,7 +368,7 @@ export function capProbeOutput(output) {
  * kusabi-coordinate agent grants zero tools; the envelope is the only
  * evidence path.
  */
-async function realCoordinatorDispatch({ cwd, missionId, brief, envelope, coordinator }) {
+async function realCoordinatorDispatch({ cwd, missionId, brief, envelope, coordinator, record }) {
   const { codexDispatch, assertCodexDispatchSucceeded } = await import("./codex-dispatch.mjs");
   const prompt = [
     `You are the Luna coordinator seat for kusabi mission ${missionId}.`,
@@ -370,6 +379,14 @@ async function realCoordinatorDispatch({ cwd, missionId, brief, envelope, coordi
     ``,
     `Current evidence envelope:`,
     JSON.stringify(envelope, null, 2),
+    ``,
+    // The current REMAINING deterministic budget (decision 6): computed from
+    // the persisted mission record plus its canonical effective budget on
+    // every dispatch/resume — the seat can see exactly how many probes /
+    // attempts / chains / consults its next batch may still consume, so it
+    // can produce an affordable batch (an oversized batch is refused
+    // atomically by the driver preflight).
+    renderRemainingBudget(record ?? {}),
     ``,
     // The runtime-rendered request contract (derived from
     // schemas/coordinator-output.schema.json): the exact per-action body
@@ -461,6 +478,114 @@ async function defaultMissionNotify({ missionId, disposition, container, cwdLabe
     container,
     cwdLabel,
   });
+}
+
+/**
+ * Preflight a whole valid parsed action batch against ALL remaining
+ * deterministic budgets BEFORE any action executes (the atomic batch
+ * contract, decision 1-5).  `read_probe` demands probe budget;
+ * `run_chain` / `rework_chain` jointly demand both attempt and chain
+ * budgets; `consult_sol` demands consult budget; `finish` /
+ * `escalate_to_host` demand none; `maxRework` stays Sol-gate-owned.
+ *
+ * The check is against the REMAINING budget (persisted usage included), not
+ * the caps, and the dimension evaluation order is FIXED (probes, chains,
+ * attempts, consults) so an identical input always reports the same single
+ * breached dimension.  The function is pure and deterministic: the caller
+ * refuses the batch atomically (zero side effects, terminal
+ * `budget-exhausted`, precise reason, no retry, no coordinator-error
+ * increment) when it returns `ok: false`.
+ *
+ * @param {object[]} requests — the valid parsed action batch.
+ * @param {object} record — the persisted mission record (usage counts).
+ * @param {object} budget — the merged effective budget (maxProbes, maxChains,
+ *        maxAttempts, maxConsults).
+ * @returns {{ok: true} | {ok: false, dimension: string, reason: string}}
+ */
+export function preflightBatchBudget(requests, record, budget) {
+  const used = {
+    probes: Array.isArray(record?.probes) ? record.probes.length : 0,
+    attempts: Array.isArray(record?.attempts) ? record.attempts.length : 0,
+    chains: Array.isArray(record?.chains) ? record.chains.length : 0,
+    consults: Array.isArray(record?.consults) ? record.consults.length : 0,
+  };
+  const demand = { probes: 0, attempts: 0, chains: 0, consults: 0 };
+  for (const req of requests ?? []) {
+    if (req?.action === "read_probe") {
+      demand.probes += 1;
+    } else if (req?.action === "run_chain" || req?.action === "rework_chain") {
+      // run_chain / rework_chain jointly consume the attempt AND chain
+      // budgets (decision 4): one action, two bounded dimensions.
+      demand.attempts += 1;
+      demand.chains += 1;
+    } else if (req?.action === "consult_sol") {
+      demand.consults += 1;
+    }
+    // finish / escalate_to_host consume none; maxRework stays Sol-gate-owned.
+  }
+  // FIXED evaluation order (probes, chains, attempts, consults): an input
+  // breaching several dimensions always reports the same one.  Chains are
+  // judged before attempts so a run_chain batch that breaches both bounds
+  // names the chain dimension (the frozen driver contract).
+  const checks = [
+    {
+      dimension: "probe",
+      label: "maxProbes",
+      max: budget?.maxProbes ?? DEFAULT_BUDGET.maxProbes,
+      used: used.probes,
+      demand: demand.probes,
+      noun: "read_probe",
+      unit: "probe",
+      reasonPrefix: "budget preflight refused:",
+    },
+    {
+      dimension: "chain",
+      label: "maxChains",
+      max: budget?.maxChains ?? DEFAULT_BUDGET.maxChains,
+      used: used.chains,
+      demand: demand.chains,
+      noun: "run_chain/rework_chain",
+      unit: "chain",
+      reasonPrefix: "budget preflight refused:",
+    },
+    {
+      dimension: "attempt",
+      label: "maxAttempts",
+      max: budget?.maxAttempts ?? DEFAULT_BUDGET.maxAttempts,
+      used: used.attempts,
+      demand: demand.attempts,
+      noun: "run_chain/rework_chain",
+      unit: "attempt",
+      reasonPrefix: "budget preflight refused:",
+    },
+    {
+      dimension: "consult",
+      label: "maxConsults",
+      max: budget?.maxConsults ?? DEFAULT_BUDGET.maxConsults,
+      used: used.consults,
+      demand: demand.consults,
+      noun: "consult_sol",
+      unit: "consultation",
+      // The frozen consult contract pins this exact leading phrase (the
+      // legacy per-request reason was "consult_sol budget exhausted: ..."),
+      // so the atomic preflight keeps it and appends the remaining-budget
+      // detail the atomic contract demands.
+      reasonPrefix: "consult_sol budget exhausted:",
+    },
+  ];
+  for (const check of checks) {
+    const remaining = Math.max(0, check.max - check.used);
+    if (check.demand > remaining) {
+      return {
+        ok: false,
+        dimension: check.dimension,
+        reason:
+          `${check.reasonPrefix} the batch requests ${check.demand} ${check.noun} action(s), ` +
+          `only ${remaining} ${check.unit}(s) remain (${check.label} ${check.max}, ${check.used} recorded)`,
+      };
+    }
+  }
+  return { ok: true };
 }
 
 /**
@@ -830,6 +955,30 @@ export async function runLunaMission(input) {
         `${parsed.rejectedCount} rejected, ${parsed.malformedCount} malformed record(s)`,
       );
       continue;
+    }
+
+    // Whole-batch budget preflight (atomic batch semantics, decision 1-5):
+    // the ENTIRE valid parsed action batch is checked against ALL remaining
+    // deterministic budgets BEFORE any action executes.  An oversized batch
+    // is refused atomically — zero tool / chain / Sol / host side effects,
+    // terminal `budget-exhausted`, a precise persisted reason, no retry and
+    // no coordinator-error increment.  Whole-batch atomicity wins even when a
+    // terminal action (finish / escalate_to_host) leads or trails the
+    // over-budget actions.  The per-request budget checks below remain as
+    // defense-in-depth.
+    if (stopRequested()) {
+      outcome = { disposition: "cancelled", recommendation: null, handoffReason: null, reason: "stop requested" };
+      break mainLoop;
+    }
+    const preflight = preflightBatchBudget(parsed.requests, record, budget);
+    if (!preflight.ok) {
+      outcome = {
+        disposition: "budget-exhausted",
+        recommendation: null,
+        handoffReason: null,
+        reason: preflight.reason,
+      };
+      break mainLoop;
     }
 
     for (const req of parsed.requests) {

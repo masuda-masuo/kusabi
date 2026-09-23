@@ -194,3 +194,53 @@ export function renderSolContract(schema = loadSolSchema()) {
   lines.push("missing any of them stays malformed and the gate fails closed.");
   return lines.join("\n");
 }
+/**
+ * The remaining deterministic budget for a mission, derived from the
+ * PERSISTED mission record and its canonical effective budget (record.budget
+ * — the single source of budget truth).  `read_probe` consumes probe budget;
+ * `run_chain` / `rework_chain` jointly consume both attempt and chain
+ * budgets; `consult_sol` consumes consult budget; `finish` /
+ * `escalate_to_host` consume none; `maxRework` stays Sol-gate-owned and is
+ * not exposed here.
+ *
+ * There is deliberately NO second hand-maintained source of budget truth: the
+ * same derivation feeds the coordinator prompt and the evidence ledger on
+ * every dispatch/resume, so the values always read max − persisted usage.
+ *
+ * @param {object} [record] — the persisted mission record (must carry its
+ *        effective `budget`; the driver persists it before any dispatch).
+ * @returns {{probes: number, attempts: number, chains: number, consults: number}}
+ */
+export function remainingMissionBudget(record = {}) {
+  const budget = record?.budget ?? {};
+  const count = (arr) => (Array.isArray(arr) ? arr.length : 0);
+  const remaining = (max, used) => Math.max(0, (max ?? 0) - used);
+  return {
+    probes: remaining(budget.maxProbes, count(record?.probes)),
+    attempts: remaining(budget.maxAttempts, count(record?.attempts)),
+    chains: remaining(budget.maxChains, count(record?.chains)),
+    consults: remaining(budget.maxConsults, count(record?.consults)),
+  };
+}
+
+/**
+ * Render the remaining deterministic budget as the single prompt/evidence
+ * text (decision 6: the real coordinator dispatch prompt and the evidence
+ * envelope ledger expose the CURRENT remaining probes / attempts / chains /
+ * consults on every dispatch/resume, computed from the persisted mission
+ * record plus its canonical budget — never the bare caps and never just the
+ * consumed counts).
+ *
+ * @param {object} [record] — the persisted mission record.
+ * @returns {string}
+ */
+export function renderRemainingBudget(record = {}) {
+  const r = remainingMissionBudget(record);
+  return [
+    "Remaining deterministic budget (derived from the persisted mission record and its effective budget):",
+    `- remaining probes: ${r.probes}`,
+    `- remaining attempts: ${r.attempts}`,
+    `- remaining chains: ${r.chains}`,
+    `- remaining consults: ${r.consults}`,
+  ].join("\n");
+}
