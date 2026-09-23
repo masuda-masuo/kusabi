@@ -96,16 +96,20 @@ export function checkAgentPermissions(permission, roleName) {
     violations.push(`"sunaba_sandbox_issue_write" granted to "${roleName}", but only draft/investigate may have it`);
   }
 
-  // 8. kaiba permissions (kusabi #279, #391): `kaiba_recall` and
-  //    `kaiba_progress` are the only grants that may appear under the
-  //    kaiba prefix.  Write permission for conclusions (`remember`) follows
+  // 8. kaiba permissions (kusabi #279, #391): `kaiba_recall`,
+  //    `kaiba_agenda` and `kaiba_progress` are the only grants that may
+  //    appear under the kaiba prefix.  `kaiba_agenda` only LISTS the shared
+  //    queue; editing it (`kaiba_agenda_edit`) is the inspecting side's, like
+  //    `remember`.  A denied agenda read is not harmless on every backend:
+  //    headless agy ends the whole run with no output on one denial
+  //    (chain-k536, 2026-09-23).  Write permission for conclusions (`remember`) follows
   //    the inspection hierarchy — an agent whose output is inspected reads
   //    the shared conclusion store and records in-flight progress notes,
   //    and the inspecting side (the orchestrator) is the only writer of
   //    durable conclusions; a worker that discovers a durable fact reports
   //    it instead of filing it.  A `kaiba*` glob would re-allow
   //    `kaiba_remember` under findLast, so the wildcard is a violation too.
-  const allowedKaibaTools = new Set(["kaiba_recall", "kaiba_progress"]);
+  const allowedKaibaTools = new Set(["kaiba_recall", "kaiba_agenda", "kaiba_progress"]);
   for (const [tool, value] of entries) {
     if (value === "allow" && tool.startsWith("kaiba") && !allowedKaibaTools.has(tool)) {
       violations.push(`Forbidden kaiba grant "${tool}" is allowed (role: ${roleName})`);
@@ -257,12 +261,17 @@ describe("agent permission allowlists", () => {
       );
 
       // Read and progress access: rule 8 rejects any kaiba grant beyond
-      // recall and progress, but only these assertions notice them going
-      // missing entirely.
+      // recall, agenda and progress, but only these assertions notice them
+      // going missing entirely.
       assert.equal(
         permission["kaiba_recall"],
         "allow",
         `${roleName}: kaiba_recall must be granted — every worker phase reads the shared conclusion store`,
+      );
+      assert.equal(
+        permission["kaiba_agenda"],
+        "allow",
+        `${roleName}: kaiba_agenda must be granted — every worker phase may read the shared queue`,
       );
       assert.equal(
         permission["kaiba_progress"],
@@ -444,6 +453,22 @@ describe("agent permission allowlists", () => {
     it('"kaiba_recall" and "kaiba_progress" pass', () => {
       const violations = checkAgentPermissions(
         { ...READ_CORE, "kaiba_recall": "allow", "kaiba_progress": "allow" },
+        "review",
+      );
+      assert.deepEqual(violations, []);
+    });
+
+    it('"kaiba_agenda_edit" granted to any role is a violation — the queue is edited by the inspecting side', () => {
+      const violations = checkAgentPermissions(
+        { ...READ_CORE, "kaiba_recall": "allow", "kaiba_agenda": "allow", "kaiba_agenda_edit": "allow" },
+        "review",
+      );
+      assert.ok(violations.some(v => v.includes("kaiba_agenda_edit")));
+    });
+
+    it('"kaiba_recall", "kaiba_agenda" and "kaiba_progress" pass', () => {
+      const violations = checkAgentPermissions(
+        { ...READ_CORE, "kaiba_recall": "allow", "kaiba_agenda": "allow", "kaiba_progress": "allow" },
         "review",
       );
       assert.deepEqual(violations, []);

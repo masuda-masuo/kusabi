@@ -698,7 +698,7 @@ describe("allowedToolsForAgent", () => {
     assert.throws(() => allowedToolsForAgent("custom-agent"), /no permission allowlist/);
   });
 
-  it("grants kaiba recall and progress to all three supported agents — never remember (kusabi #279, #391)", () => {
+  it("grants kaiba recall, agenda and progress to all three supported agents — never remember or agenda_edit (kusabi #279, #391)", () => {
     // Write permission follows the inspection hierarchy: every agent
     // dispatched here has its output inspected, so it reads the store,
     // records in-flight progress notes, and reports durable facts for the
@@ -708,8 +708,10 @@ describe("allowedToolsForAgent", () => {
     for (const agent of ["kusabi-implement", "kusabi-review", "kusabi-investigate"]) {
       const csv = allowedToolsForAgent(agent);
       assert.ok(csv.includes("mcp__kaiba__recall"), `${agent} must allow mcp__kaiba__recall`);
+      assert.ok(csv.includes("mcp__kaiba__agenda"), `${agent} must allow mcp__kaiba__agenda`);
       assert.ok(csv.includes("mcp__kaiba__progress"), `${agent} must allow mcp__kaiba__progress`);
       assert.ok(!csv.includes("mcp__kaiba__remember"), `${agent} must NOT allow mcp__kaiba__remember`);
+      assert.ok(!csv.includes("mcp__kaiba__agenda_edit"), `${agent} must NOT allow mcp__kaiba__agenda_edit`);
     }
   });
 
@@ -720,7 +722,7 @@ describe("allowedToolsForAgent", () => {
     // only acceptable kaiba entry is the exact recall tool.
     for (const [phase, csv] of Object.entries(ALLOWED_TOOLS)) {
       const kaibaTools = csv.split(",").filter(t => t.startsWith("mcp__kaiba__"));
-      assert.deepEqual(kaibaTools, ["mcp__kaiba__recall", "mcp__kaiba__progress"], `${phase}: kaiba must be recall and progress only`);
+      assert.deepEqual(kaibaTools, ["mcp__kaiba__recall", "mcp__kaiba__agenda", "mcp__kaiba__progress"], `${phase}: kaiba must be recall, agenda and progress only`);
     }
   });
 
