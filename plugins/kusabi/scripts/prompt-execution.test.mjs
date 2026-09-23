@@ -272,6 +272,21 @@ describe("shouldFailFast", () => {
     assert.equal(result.terminal, true);
   });
 
+  it("capacity reason account_rate_limit (opencode-go cap) at attempt 1 → stop + terminal", () => {
+    // Measured 2026-09-23: the only retry event a capped opencode-go job ever
+    // emits is attempt 1 with a reset days away; without this the job idles
+    // until timeout and the tier walk never happens.
+    const result = shouldFailFast({ reason: "account_rate_limit", attempt: 1, steps: 0, retryCount: 1 });
+    assert.equal(result.stop, true);
+    assert.equal(result.terminal, true);
+  });
+
+  it("capacity reason account_rate_limit mid-run (steps>0) → stop + terminal", () => {
+    const result = shouldFailFast({ reason: "account_rate_limit", attempt: 1, steps: 7 });
+    assert.equal(result.stop, true);
+    assert.equal(result.terminal, true);
+  });
+
   it("non-capacity reason at attempt 3 with steps=0 → stop", () => {
     const result = shouldFailFast({ reason: "rate_limit", attempt: 3, steps: 0 });
     assert.equal(result.stop, true);

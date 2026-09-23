@@ -106,7 +106,7 @@ Backward compatibility: ordinary chain invocations (no `--strategy` flag) are un
 Each round r (1..maxRounds, default 4) flows as follows:
 
 1. **implement**: implement with the `kusabi-implement` agent. r=1 gets the full brief; r≥2 gets only the previous round's findings + the brief's acceptance criteria. The previous session's trial-and-error log is not carried over. The companion injects the `--container` ID into every implement prompt (mirroring the review-side injection), so briefs no longer need to carry it.
-   - Every dispatch in the chain (implement, review, strategist) goes through `dispatchWithFallback`. When a dispatch ends as `provider-error`, the companion re-dispatches on the next unused route of the same tier — same round, same container, same brief. Routes that fail with a capacity reason (`free_tier_limit`) or a catalog miss (`UnknownError` whose `data.message` contains `Model not found`, kusabi #431) are remembered for the rest of the process (`terminal: true`). HTTP 401/403/429/5xx stay non-terminal (#233) and still climb within the dispatch. Fallbacks do not consume rounds. `--model` remains a pin (#361): a pinned identifier is the only candidate.
+   - Every dispatch in the chain (implement, review, strategist) goes through `dispatchWithFallback`. When a dispatch ends as `provider-error`, the companion re-dispatches on the next unused route of the same tier — same round, same container, same brief. Routes that fail with a capacity reason (`free_tier_limit`, `account_rate_limit`) or a catalog miss (`UnknownError` whose `data.message` contains `Model not found`, kusabi #431) are remembered for the rest of the process (`terminal: true`). HTTP 401/403/429/5xx stay non-terminal (#233) and still climb within the dispatch. Fallbacks do not consume rounds. `--model` remains a pin (#361): a pinned identifier is the only candidate.
 2. **Deterministic probes** (§3.5.2): non-LLM checks inside the container via sunaba-rpc.
 3. **review**: adversarial review with the `kusabi-review` agent. Carries over previous round findings via `--prior`. The reviewer does not climb the round ladder: it stays on `--model` when given, otherwise on tier 0, for every round — the same route the pre-fallback implementation used. When those routes are dead it falls through to later tiers via the same `dispatchWithFallback` mechanism. Note that tier 0 is the *cheapest* tier, not the strongest; raising the reviewer's model is done with `--model`.
 4. **Derive disposition** (§3.5.4): mechanically determine the disposition.
@@ -1159,7 +1159,7 @@ A dispatched worker job (or a chain round's implement job) ends in exactly one o
 - `completed`: Normal completion with changes made (`worktreeChanged: true`) or unmeasured substance (`worktreeChanged: null`).
 - `empty-completion`: Completed session that executed steps (`stats.steps > 0`) but produced no worktree changes (`worktreeChanged: false`).
 - `infra-death`: Completed session that executed 0 steps (`stats.steps === 0`) and produced no worktree changes (`worktreeChanged: false`).
-- `quota-exhausted`: Dispatch failed with a non-null `capacityReason` (e.g. `free_tier_limit`).
+- `quota-exhausted`: Dispatch failed with a non-null `capacityReason` (e.g. `free_tier_limit`, `account_rate_limit`).
 - `provider-error`: Terminal provider error (`providerError.terminal === true` or status `provider-error`).
 - `cancelled`: Explicitly cancelled session or status `cancelled`.
 
