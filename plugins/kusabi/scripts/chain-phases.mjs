@@ -138,6 +138,28 @@ export function assertChainIdAvailable(stateDir, chainId) {
 }
 
 /**
+ * The refusal for a detached child that lost the claim on a caller-supplied chain id.
+ *
+ * Used when a detached child process finds its directory already exists
+ * (kusabi #522) — because the parent launcher already checked availability,
+ * an existing directory at child creation time indicates a concurrent dispatch
+ * won the claim with the same id.
+ *
+ * @param {string} chainId
+ * @returns {string}
+ */
+export function chainIdClaimLostMessage(chainId) {
+  return (
+    `chain id already exists: ${chainId} — this detached dispatch passed its ` +
+    `launcher's availability check but lost the claim to a concurrent dispatch ` +
+    `using the same id. The chain-wait ${chainId} line this dispatch's launcher ` +
+    `printed therefore follows the other dispatch's chain, not this one — its ` +
+    `result is not this dispatch's work. --chain-id is caller-owned and must ` +
+    `be unique per concurrent dispatch; omit it to have one minted.`
+  );
+}
+
+/**
  * Create a chain directory and return its identity.
  *
  * A supplied chainId (kusabi #514) is validated against the minted shape and
@@ -151,6 +173,10 @@ export function assertChainIdAvailable(stateDir, chainId) {
  * existing directory — so two dispatches that pass the existsSync fast path
  * in the same window cannot both "create" it and interleave round records.
  *
+ * When KUSABI_CHAIN_DETACHED_CHILD=1 and a chainId was supplied by the caller,
+ * createChainDir throws chainIdClaimLostMessage on collision instead of
+ * chainIdExistsMessage (kusabi #522).
+ *
  * @param {string} stateDir
  * @param {string|null} [chainId] — externally supplied id; minted when null.
  * @returns {{ chainId: string, chainDir: string }}
@@ -159,15 +185,23 @@ export function createChainDir(stateDir, chainId = null) {
   const id = chainId ?? mintChainId();
   assertChainIdShape(id);
   const chainDir = path.join(stateDir, "chains", id);
+  const claimLost = process.env.KUSABI_CHAIN_DETACHED_CHILD === "1" && chainId !== null;
   // Fast path for the friendlier error before any write; the EEXIST catch
   // below is what must make the guarantee.
-  assertChainIdAvailable(stateDir, id);
+  try {
+    assertChainIdAvailable(stateDir, id);
+  } catch (err) {
+    if (claimLost) {
+      throw new Error(chainIdClaimLostMessage(id));
+    }
+    throw err;
+  }
   fs.mkdirSync(path.join(stateDir, "chains"), { recursive: true });
   try {
     fs.mkdirSync(chainDir);
   } catch (err) {
     if (err?.code === "EEXIST") {
-      throw new Error(chainIdExistsMessage(id));
+      throw new Error(claimLost ? chainIdClaimLostMessage(id) : chainIdExistsMessage(id));
     }
     throw err;
   }

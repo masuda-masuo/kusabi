@@ -593,7 +593,7 @@ export async function cmdChainDetach(cwd, { flags, text }, opts = {}) {
     cwd,
     detached: true,
     stdio: ["ignore", logFd, logFd],
-    env: { ...process.env },
+    env: { ...process.env, KUSABI_CHAIN_DETACHED_CHILD: "1" },
   });
 
   if (child.unref) child.unref();
@@ -621,6 +621,11 @@ export async function cmdChainDetach(cwd, { flags, text }, opts = {}) {
     "To wait for completion, run:",
     `  ${waitCmd}`,
   ];
+  if (flags["chain-id"] !== undefined) {
+    lines.push(
+      `Note: --chain-id was caller-supplied. It must be unique per concurrent dispatch — if another dispatch used the same id at the same time, the wait line above may follow that dispatch; a refusal from this one would be in ${logFile}.`,
+    );
+  }
 
   return lines.join("\n");
 }

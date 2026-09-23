@@ -10,6 +10,7 @@ import {
   resolveRoundResume,
   captureVerifyBaseline,
   createChainDir,
+  chainIdClaimLostMessage,
 } from "./chain-phases.mjs";
 import { renderPriorFindings } from "./render.mjs";
 
@@ -575,5 +576,130 @@ describe("createChainDir (kusabi #514 finding 2)", () => {
     } finally {
       fs.rmSync(tmp, { recursive: true, force: true });
     }
+  });
+
+  describe("createChainDir concurrent claim loss in detached child (kusabi #522)", () => {
+    it("chainIdClaimLostMessage formats the expected loser message", () => {
+      const msg = chainIdClaimLostMessage("chain-foo");
+      assert.match(msg, /^chain id already exists: chain-foo/);
+      assert.match(msg, /concurrent/);
+      assert.match(msg, /caller-owned/);
+    });
+
+    it("with KUSABI_CHAIN_DETACHED_CHILD=1 and a supplied id whose dir exists, error matches prefix, /concurrent/, and /caller-owned/", () => {
+      const prevEnv = process.env.KUSABI_CHAIN_DETACHED_CHILD;
+      process.env.KUSABI_CHAIN_DETACHED_CHILD = "1";
+      const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-test-createchaindir-lost-"));
+      try {
+        const stateDir = path.join(tmp, "state");
+        fs.mkdirSync(path.join(stateDir, "chains", "chain-x"), { recursive: true });
+        assert.throws(
+          () => createChainDir(stateDir, "chain-x"),
+          (err) => {
+            assert.match(err.message, /chain id already exists: chain-x/);
+            assert.match(err.message, /concurrent/);
+            assert.match(err.message, /caller-owned/);
+            return true;
+          },
+        );
+      } finally {
+        if (prevEnv === undefined) delete process.env.KUSABI_CHAIN_DETACHED_CHILD;
+        else process.env.KUSABI_CHAIN_DETACHED_CHILD = prevEnv;
+        fs.rmSync(tmp, { recursive: true, force: true });
+      }
+    });
+
+    it("with KUSABI_CHAIN_DETACHED_CHILD=1 and EEXIST race path, error matches prefix, /concurrent/, and /caller-owned/", () => {
+      const prevEnv = process.env.KUSABI_CHAIN_DETACHED_CHILD;
+      process.env.KUSABI_CHAIN_DETACHED_CHILD = "1";
+      const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-test-createchaindir-lost-race-"));
+      try {
+        const stateDir = path.join(tmp, "state");
+        const chainDir = path.join(stateDir, "chains", "chain-x");
+        fs.mkdirSync(chainDir, { recursive: true });
+
+        const realExistsSync = fs.existsSync;
+        const realMkdirSync = fs.mkdirSync;
+        fs.existsSync = (p) => (p === chainDir ? false : realExistsSync(p));
+        fs.mkdirSync = (dir, opts) => {
+          if (dir === chainDir && opts === undefined) {
+            throw Object.assign(new Error(`EEXIST: file already exists, mkdir '${dir}'`), { code: "EEXIST" });
+          }
+          return realMkdirSync(dir, opts);
+        };
+        try {
+          assert.throws(
+            () => createChainDir(stateDir, "chain-x"),
+            (err) => {
+              assert.match(err.message, /chain id already exists: chain-x/);
+              assert.match(err.message, /concurrent/);
+              assert.match(err.message, /caller-owned/);
+              return true;
+            },
+          );
+        } finally {
+          fs.existsSync = realExistsSync;
+          fs.mkdirSync = realMkdirSync;
+        }
+      } finally {
+        if (prevEnv === undefined) delete process.env.KUSABI_CHAIN_DETACHED_CHILD;
+        else process.env.KUSABI_CHAIN_DETACHED_CHILD = prevEnv;
+        fs.rmSync(tmp, { recursive: true, force: true });
+      }
+    });
+
+    it("without KUSABI_CHAIN_DETACHED_CHILD, the refusal message does NOT match /caller-owned/", () => {
+      const prevEnv = process.env.KUSABI_CHAIN_DETACHED_CHILD;
+      delete process.env.KUSABI_CHAIN_DETACHED_CHILD;
+      const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-test-createchaindir-noenv-"));
+      try {
+        const stateDir = path.join(tmp, "state");
+        fs.mkdirSync(path.join(stateDir, "chains", "chain-x"), { recursive: true });
+        assert.throws(
+          () => createChainDir(stateDir, "chain-x"),
+          (err) => {
+            assert.match(err.message, /chain id already exists: chain-x/);
+            assert.doesNotMatch(err.message, /caller-owned/);
+            return true;
+          },
+        );
+      } finally {
+        if (prevEnv !== undefined) process.env.KUSABI_CHAIN_DETACHED_CHILD = prevEnv;
+        fs.rmSync(tmp, { recursive: true, force: true });
+      }
+    });
+
+    it("with KUSABI_CHAIN_DETACHED_CHILD=1 but no supplied id (minted), the message is the old one", () => {
+      const prevEnv = process.env.KUSABI_CHAIN_DETACHED_CHILD;
+      process.env.KUSABI_CHAIN_DETACHED_CHILD = "1";
+      const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-test-createchaindir-minted-"));
+      try {
+        const stateDir = path.join(tmp, "state");
+        const realExistsSync = fs.existsSync;
+        // Fast path triggers when chainDir exists
+        fs.existsSync = (p) => {
+          if (typeof p === "string" && p.includes(path.join("chains", "chain-"))) {
+            return true;
+          }
+          return realExistsSync(p);
+        };
+        try {
+          assert.throws(
+            () => createChainDir(stateDir),
+            (err) => {
+              assert.match(err.message, /chain id already exists: chain-/);
+              assert.doesNotMatch(err.message, /caller-owned/);
+              return true;
+            },
+          );
+        } finally {
+          fs.existsSync = realExistsSync;
+        }
+      } finally {
+        if (prevEnv === undefined) delete process.env.KUSABI_CHAIN_DETACHED_CHILD;
+        else process.env.KUSABI_CHAIN_DETACHED_CHILD = prevEnv;
+        fs.rmSync(tmp, { recursive: true, force: true });
+      }
+    });
   });
 });

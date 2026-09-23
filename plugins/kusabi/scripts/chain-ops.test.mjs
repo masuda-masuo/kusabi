@@ -402,4 +402,55 @@ describe("cmdChainDetach smoke baseline refusal (kusabi #513)", () => {
       fx.cleanup();
     }
   });
+
+  it("passes KUSABI_CHAIN_DETACHED_CHILD=1 in the spawned env (kusabi #522)", async () => {
+    const fx = detachFixture();
+    try {
+      const callTool = createFakeCallTool({ exitCode: 0 });
+      await cmdChainDetach(
+        fx.cwd,
+        { flags: { container: "cid-1" }, text: DETACH_BRIEF },
+        fx.opts(callTool),
+      );
+      assert.equal(fx.spawnCalls.length, 1, "the child was spawned");
+      assert.equal(
+        fx.spawnCalls[0].options.env.KUSABI_CHAIN_DETACHED_CHILD,
+        "1",
+        "spawned env carries KUSABI_CHAIN_DETACHED_CHILD=1",
+      );
+    } finally {
+      fx.cleanup();
+    }
+  });
+
+  it("adds caller-supplied note with log path when --chain-id is supplied, but omits it for minted ids (kusabi #522)", async () => {
+    const fx = detachFixture();
+    try {
+      const callTool = createFakeCallTool({ exitCode: 0 });
+      const bannerSupplied = await cmdChainDetach(
+        fx.cwd,
+        { flags: { container: "cid-1", "chain-id": "chain-user" }, text: DETACH_BRIEF },
+        fx.opts(callTool),
+      );
+      assert.match(bannerSupplied, /caller-supplied/);
+      const logs = detachLogs(fx.stateDir);
+      assert.equal(logs.length, 1, "one detach log file created");
+      const logPath = path.join(fx.stateDir, logs[0]);
+      assert.ok(bannerSupplied.includes(logPath), "banner contains the log file path");
+
+      const fx2 = detachFixture();
+      try {
+        const bannerMinted = await cmdChainDetach(
+          fx2.cwd,
+          { flags: { container: "cid-1" }, text: DETACH_BRIEF },
+          fx2.opts(callTool),
+        );
+        assert.doesNotMatch(bannerMinted, /caller-supplied/);
+      } finally {
+        fx2.cleanup();
+      }
+    } finally {
+      fx.cleanup();
+    }
+  });
 });
