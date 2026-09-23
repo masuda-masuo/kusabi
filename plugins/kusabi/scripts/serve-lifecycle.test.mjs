@@ -63,6 +63,54 @@ describe("buildServeEnv", () => {
     const env = buildServeEnv({}, "pw");
     assert.equal(env.KUSABI_SERVE_STATE_DIR, undefined);
   });
+
+  it("sets XDG_CONFIG_HOME from the state root", () => {
+    const origStateDir = process.env.KUSABI_STATE_DIR;
+    const origConfigHome = process.env.KUSABI_OPENCODE_CONFIG_HOME;
+    delete process.env.KUSABI_OPENCODE_CONFIG_HOME;
+    process.env.KUSABI_STATE_DIR = "/tmp/test-ks-state";
+    try {
+      const env = buildServeEnv({}, "pw");
+      assert.equal(env.XDG_CONFIG_HOME, "/tmp/test-ks-state/opencode-config");
+    } finally {
+      if (origStateDir !== undefined) process.env.KUSABI_STATE_DIR = origStateDir;
+      else delete process.env.KUSABI_STATE_DIR;
+      if (origConfigHome !== undefined) process.env.KUSABI_OPENCODE_CONFIG_HOME = origConfigHome;
+      else delete process.env.KUSABI_OPENCODE_CONFIG_HOME;
+    }
+  });
+
+  it("allows KUSABI_OPENCODE_CONFIG_HOME to override XDG_CONFIG_HOME", () => {
+    const origStateDir = process.env.KUSABI_STATE_DIR;
+    const origConfigHome = process.env.KUSABI_OPENCODE_CONFIG_HOME;
+    process.env.KUSABI_STATE_DIR = "/tmp/test-ks-state";
+    process.env.KUSABI_OPENCODE_CONFIG_HOME = "/tmp/custom-config-home";
+    try {
+      const env = buildServeEnv({}, "pw");
+      assert.equal(env.XDG_CONFIG_HOME, "/tmp/custom-config-home");
+    } finally {
+      if (origStateDir !== undefined) process.env.KUSABI_STATE_DIR = origStateDir;
+      else delete process.env.KUSABI_STATE_DIR;
+      if (origConfigHome !== undefined) process.env.KUSABI_OPENCODE_CONFIG_HOME = origConfigHome;
+      else delete process.env.KUSABI_OPENCODE_CONFIG_HOME;
+    }
+  });
+
+  it("overrides an inherited XDG_CONFIG_HOME in baseEnv", () => {
+    const origStateDir = process.env.KUSABI_STATE_DIR;
+    const origConfigHome = process.env.KUSABI_OPENCODE_CONFIG_HOME;
+    delete process.env.KUSABI_OPENCODE_CONFIG_HOME;
+    process.env.KUSABI_STATE_DIR = "/tmp/test-ks-state";
+    try {
+      const env = buildServeEnv({ XDG_CONFIG_HOME: "/inherited/operator/xdg" }, "pw");
+      assert.equal(env.XDG_CONFIG_HOME, "/tmp/test-ks-state/opencode-config");
+    } finally {
+      if (origStateDir !== undefined) process.env.KUSABI_STATE_DIR = origStateDir;
+      else delete process.env.KUSABI_STATE_DIR;
+      if (origConfigHome !== undefined) process.env.KUSABI_OPENCODE_CONFIG_HOME = origConfigHome;
+      else delete process.env.KUSABI_OPENCODE_CONFIG_HOME;
+    }
+  });
 });
 
 // runningRecordIsStale — fossil judgement for `running` job records

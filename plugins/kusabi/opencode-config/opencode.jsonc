@@ -1,0 +1,26 @@
+// This file is kusabi's worker config, seeded once by install-agents and then
+// owned by the operator; edit machine-specific values (e.g. the absolute kaiba
+// binary path) here; nothing personal belongs in it.
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "sunaba": {
+      "type": "remote",
+      "url": "http://127.0.0.1:8750/mcp"
+    },
+    "shiori": {
+      "type": "remote",
+      "url": "http://127.0.0.1:8765/mcp"
+    },
+    "kaiba": {
+      "type": "local",
+      "command": [
+        "kaiba"
+      ],
+      "environment": {
+        "KAIBA_AGENT": "worker"
+      },
+      "enabled": true
+    }
+  }
+}

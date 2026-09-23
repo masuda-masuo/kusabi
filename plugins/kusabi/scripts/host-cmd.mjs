@@ -20,7 +20,7 @@ import { fileURLToPath } from "node:url";
 
 import { parseModel } from "./cli.mjs";
 import { renderHeader } from "./render.mjs";
-import { stateDirFor } from "./state-paths.mjs";
+import { stateDirFor, kusabiOpencodeConfigHome } from "./state-paths.mjs";
 import { jobDir, saveJob, loadJob } from "./job-store.mjs";
 import { runPrompt } from "./prompt-execution.mjs";
 
@@ -73,8 +73,9 @@ function destDirState(p) {
 }
 
 export function cmdInstallAgents() {
+  const kusabiConfigDir = path.join(kusabiOpencodeConfigHome(), "opencode");
   const src = path.join(PLUGIN_ROOT, "opencode-agents");
-  const dest = process.env.OPENCODE_AGENT_DIR || path.join(opencodeConfigDir(), "agent");
+  const dest = process.env.OPENCODE_AGENT_DIR || path.join(kusabiConfigDir, "agent");
 
   // Skills destination preflight — runs BEFORE any mutation, so a broken
   // skills destination fails the whole command cleanly instead of leaving
@@ -82,7 +83,7 @@ export function cmdInstallAgents() {
   // (OPENCODE_SKILL_DIR / OPENCODE_AGENT_DIR are placement overrides that
   // opencode 1.18.15 does not read; see the skills comment below.)
   const skillSrc = path.join(PLUGIN_ROOT, "opencode-skills");
-  const skillDest = process.env.OPENCODE_SKILL_DIR || path.join(opencodeConfigDir(), "skills");
+  const skillDest = process.env.OPENCODE_SKILL_DIR || path.join(kusabiConfigDir, "skills");
   const skillDestState = destDirState(skillDest);
   if (skillDestState !== "absent" && skillDestState !== "directory") {
     throw new Error(
@@ -107,7 +108,7 @@ export function cmdInstallAgents() {
 
   // Skills distribution: copy-and-overwrite ONLY — never delete anything at
   // the destination. The skills dir (OPENCODE_SKILL_DIR, default
-  // ~/.config/opencode/skills) is shared with skills the user installed
+  // <kusabi config home>/opencode/skills) is shared with skills the user installed
   // themselves, and there is no kusabi-owned name registry that would make
   // deletion safe. (Contrast the agent path above, which deletes a fixed,
   // explicit list of legacy oc-* names — no such list exists for skills.)
@@ -117,9 +118,9 @@ export function cmdInstallAgents() {
   // are PLACEMENT overrides honoured by install-agents; opencode 1.18.15 does
   // not read either env var — it discovers skills/agents under its own config
   // dir. The default destination therefore has to be that dir, which is why it
-  // is derived from opencodeConfigDir() (XDG_CONFIG_HOME aware) rather than
-  // hardcoding ~/.config. Setting OPENCODE_SKILL_DIR to anything else lands
-  // outside opencode's scan and must not be reported as discovered.
+  // is derived from kusabiOpencodeConfigHome() rather than hardcoding ~/.config.
+  // Setting OPENCODE_SKILL_DIR to anything else lands outside opencode's scan
+  // and must not be reported as discovered.
   fs.mkdirSync(skillDest, { recursive: true });
 
   const skillDirs = fs.existsSync(skillSrc)
@@ -140,12 +141,44 @@ export function cmdInstallAgents() {
     }
     copyDirTree(path.join(skillSrc, dir), destDir);
   }
+
+  // Seed opencode.jsonc from repo template into kusabi config dir only if absent
+  fs.mkdirSync(kusabiConfigDir, { recursive: true });
+  const targetConfigFile = path.join(kusabiConfigDir, "opencode.jsonc");
+  const templateConfigFile = path.join(PLUGIN_ROOT, "opencode-config", "opencode.jsonc");
+  let seedMessage = "";
+  if (!fs.existsSync(targetConfigFile)) {
+    fs.copyFileSync(templateConfigFile, targetConfigFile);
+    seedMessage = `seeded ${targetConfigFile} from template`;
+  } else {
+    seedMessage = `kept existing ${targetConfigFile}`;
+  }
+
   let message = `installed ${files.length} phase agents to ${dest} (removed ${removed} stale legacy names); ` +
     `installed ${skillDirs.length - skipped.length} skills to ${skillDest}`;
   if (skipped.length > 0) {
     message += `; skipped ${skipped.length} skill(s): ${skipped.join(", ")} (destination exists and is not a directory — left untouched)`;
   }
-  return message;
+
+  const lines = [message];
+  if (seedMessage) {
+    lines.push(seedMessage);
+  }
+
+  // Leftovers report: check personal agent dir
+  const personalAgentDir = path.join(opencodeConfigDir(), "agent");
+  if (path.resolve(personalAgentDir) !== path.resolve(dest) && fs.existsSync(personalAgentDir)) {
+    try {
+      const leftovers = fs.readdirSync(personalAgentDir).filter((f) => f.startsWith("kusabi-") && f.endsWith(".md"));
+      if (leftovers.length > 0) {
+        lines.push(
+          `found ${leftovers.length} leftover kusabi agent definition(s) in ${personalAgentDir}; they are no longer read by kusabi's serve and may be removed by hand`,
+        );
+      }
+    } catch { /* best-effort */ }
+  }
+
+  return lines.join("\n");
 }
 
 export async function cmdSalvage(cwd, { flags, text }) {

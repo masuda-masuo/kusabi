@@ -2970,29 +2970,36 @@ describe("install-agents skills distribution", () => {
     }
   });
 
-  // The defaults must land inside opencode's own config dir, which is
-  // relocatable via XDG_CONFIG_HOME. Hardcoding ~/.config would put the files
-  // outside opencode's scan on a relocated host -- installed but never found.
-  it("defaults to opencode's config dir and follows XDG_CONFIG_HOME", () => {
+  // The defaults must land inside kusabi's own opencode config dir (<state root>/opencode-config),
+  // not the personal dir (kusabi #561).
+  it("defaults to kusabi's opencode config dir under the state root", () => {
+    const tmpState = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-install-state-"));
     const xdgDir = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-install-xdg-"));
     try {
       const result = runInstallAgents({
+        KUSABI_STATE_DIR: tmpState,
         XDG_CONFIG_HOME: xdgDir,
         OPENCODE_AGENT_DIR: "",
         OPENCODE_SKILL_DIR: "",
       });
       assert.equal(result.status, 0, result.stderr);
+      const kusabiOpencodeDir = path.join(tmpState, "opencode-config", "opencode");
       assert.ok(
-        fs.existsSync(path.join(xdgDir, "opencode", "agent", "kusabi-implement.md")),
-        "agents land under $XDG_CONFIG_HOME/opencode/agent",
+        fs.existsSync(path.join(kusabiOpencodeDir, "agent", "kusabi-implement.md")),
+        "agents land under <state root>/opencode-config/opencode/agent",
       );
       for (const d of fs.readdirSync(SKILLS_SRC, { withFileTypes: true }).filter((e) => e.isDirectory())) {
         assert.ok(
-          fs.existsSync(path.join(xdgDir, "opencode", "skills", d.name, "SKILL.md")),
-          `skill ${d.name} lands under $XDG_CONFIG_HOME/opencode/skills`,
+          fs.existsSync(path.join(kusabiOpencodeDir, "skills", d.name, "SKILL.md")),
+          `skill ${d.name} lands under <state root>/opencode-config/opencode/skills`,
         );
       }
+      assert.ok(
+        !fs.existsSync(path.join(xdgDir, "opencode", "agent", "kusabi-implement.md")),
+        "personal dir ($XDG_CONFIG_HOME) is untouched",
+      );
     } finally {
+      fs.rmSync(tmpState, { recursive: true, force: true });
       fs.rmSync(xdgDir, { recursive: true, force: true });
     }
   });

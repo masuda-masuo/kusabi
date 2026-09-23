@@ -618,7 +618,7 @@ The sweep is idempotent (kaiba's retire is idempotent, and duplicate terminal sa
 **Backend identity coverage and its limitation.** A row can only be retired by job id if the worker was able to stamp `KAIBA_JOB` at all. Coverage today:
 
 - **Claude** — covered. `claude-mcp.mjs`'s `applyWorkerKaibaIdentity` writes a per-job generated MCP config carrying `KAIBA_AGENT=worker` and the exact `KAIBA_JOB`; the operator's global MCP config is never mutated.
-- **OpenCode, agy, Cursor** — NOT covered. Their kaiba MCP registration is shared/global (OpenCode's global config, agy/Cursor's shared or per-run configuration) and none of them supports a safe per-job MCP env injection, so kusabi cannot stamp `KAIBA_JOB` for them without writing shared/global config per job — which the #497 constraints forbid. Their `progress` rows keep `job=NULL` and are never retirement targets (a job-scoped retire must not clear another job's rows, and a `NULL` row is not job-scoped).
+- **OpenCode, agy, Cursor** — NOT covered. OpenCode's kaiba MCP registration is now kusabi-owned (`<state root>/opencode-config`) but still per-serve, not per-job, so `KAIBA_JOB` still cannot be stamped — the NOT-covered conclusion stands for a different reason (kusabi cannot stamp `KAIBA_JOB` without writing config per job, which the #497 constraints forbid). agy and Cursor use shared or per-run configuration and neither supports a safe per-job MCP env injection, so kusabi cannot stamp `KAIBA_JOB` for them without writing shared/global config per job. Their `progress` rows keep `job=NULL` and are never retirement targets (a job-scoped retire must not clear another job's rows, and a `NULL` row is not job-scoped).
 
 This limitation is deliberate and documented rather than silently claimed as coverage: the NULL rows are left to kaiba's TTL.
 
@@ -1293,10 +1293,17 @@ context for it in the common case. kusabi ships them under
 **Distribution path.** `install-agents` copies agents and skills in one pass:
 agents to `OPENCODE_AGENT_DIR` and every directory under `opencode-skills/` —
 whole directory, keeping its own name — to `OPENCODE_SKILL_DIR`, creating the
-destination when missing. Both defaults are derived from opencode's own config
-dir (`$XDG_CONFIG_HOME/opencode`, else `~/.config/opencode`) rather than a
-hardcoded `~/.config`, so the default destination stays a discovery path on
-hosts that relocated their config. Known gap: if opencode also honours
+destination when missing. The default destination is derived from kusabi's own
+opencode config home (`<state root>/opencode-config`, overridable via
+`KUSABI_OPENCODE_CONFIG_HOME`, default `~/.kusabi/opencode-config`), which is used
+as `XDG_CONFIG_HOME` for spawned `opencode serve` processes. OpenCode's config
+directory therefore lives at `<kusabi config home>/opencode/`. `install-agents`
+seeds `opencode.jsonc` from `plugins/kusabi/opencode-config/opencode.jsonc` once,
+only if absent (seed-once semantics; it never overwrites an operator-edited file).
+The operator's personal configuration (`~/.config/opencode`) is not read by
+kusabi's serve; leftover `kusabi-*.md` agent definitions found in the personal
+agent dir are reported by `install-agents` for optional manual cleanup and never
+deleted (kusabi #561). Known gap: if opencode also honours
 `OPENCODE_CONFIG_DIR` for relocation, `install-agents` does not follow that
 one — set `OPENCODE_SKILL_DIR` explicitly on such a host. A skill is only *reachable*, never implicitly
 loaded; discovery is opencode's job. Whether a phase can actually pull it is
