@@ -54,12 +54,14 @@ Model resolves from config or built-in chain; explicit `--model` = exception. Es
 Detailed reference, probe mechanics, and incident background: see [references/briefing.md](references/briefing.md).
 
 - **Sign it**: First 5 lines must include `Orchestrator: <model-id> | session <id> | <date>` for attribution (companion parses; discard/rework rates unattributable without it).
-- **Skeleton**: `Deliverables / Smoke / Purpose / Workplace / Read first / Spec / Acceptance criteria / Frozen Tests / Non-goals / Constraints` (machine-read first).
+- **Skeleton**: `Deliverables / Smoke / Premises / Purpose / Workplace / Read first / Spec / Acceptance criteria / Frozen Tests / Non-goals / Constraints` (machine-read first).
 - **`## Deliverables` is machine-read**: Empty change set = discard. List files that must change; notes/summaries are NOT deliverables. Accepted: bullets, numbered, indented, code block (first token = path).
 - **`## Smoke` declares runtime behaviour**: Cheap, deterministic, 1 command/line (`exit 0`). Bullets with backtick command + optional `exit <N>`, or code block. Every Smoke line states the criterion or boundary it proves; reason and pristine-baseline mechanics live in [references/briefing.md](references/briefing.md).
 - **`baseline-red`**: Annotate a line expected to be red on the checkout as handed to the worker — a deliverable file that does not exist yet, or a test that does not exist yet inside a file that does. The probe verifies the claim: measured red at base dispatches, already green refuses. It licenses only a red the round removes; a line red because the container lacks a package is red afterwards too and is refused, so **every Smoke line must be self-contained**.
 - **Never bare `lint`/`type` in `## Smoke` without measuring pristine baseline first**: Measure first: `git show HEAD:<f> | ruff check --stdin-filename <f> -`. If unmeasured, omit — tests/imports usually suffice.
 - **Failing smoke line must be reproduced manually before blaming worker**: Probe shell has no `\xNN` escape (bash extension); POSIX shell `printf` does not support `\xNN` and uses octal (`printf '\xef\xbb\xbf' > f` writes literal chars and fails correct impl).
+- **`## Premises`**: (shape: claim — measured: source, scope, number — guard: <heading/criterion>; lint refuses missing number or guard; heading optional, omit when none).
+- **Evidence under `/tmp` must prove itself in `## Smoke`**: When `## Workplace` names a path under `/tmp` as evidence, include at least one `## Smoke` line reading it (e.g. non-empty check); dispatch lint refuses unread `/tmp` evidence.
 - **`## Frozen Tests`**: Omit heading if empty (never write `(none)`). Dispatch `test-author` first if criteria state new concrete I/O.
 - **Contract discipline**: Inline whole spec; freeze outcomes, not architecture. Non-goals require escape hatch ("do not X; if truly needed, say so explicitly").
 - **Wiring into existing code**: Add `## Suggested design` block (starting point). Dispatch `plan` pre-phase if unfamiliar.
