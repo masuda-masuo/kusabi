@@ -279,6 +279,43 @@ describe("smokeBaselineReport (kusabi #292)", () => {
     assert.match(report, /could not be verified/);
   });
 
+  it("verifies the unverifiable refusal uses the new wording when smoke succeeds but git status cannot run", async () => {
+    const report = await smokeBaselineReport({
+      brief: SMOKE_BRIEF,
+      callTool: async (toolName, params) => {
+        if (params?.commands?.[0] === "git status --porcelain") {
+          throw new Error("git status rpc exploded");
+        }
+        return createFakeCallTool({ exitCode: 0 })(toolName, params);
+      },
+      container: "cid",
+    });
+    assert.ok(report);
+    assert.match(
+      report,
+      /dispatch refused: whether the declared ## Smoke left the worktree and HEAD unchanged could not be verified \(kusabi #292\)\./,
+    );
+    assert.doesNotMatch(report, /Smoke passed/);
+    assert.match(report, /Nothing was dispatched: no job and no round state exist\./);
+    assert.match(
+      report,
+      /The worktree and HEAD must be proven unchanged before the worker is handed the container; check the container by hand and re-run\./,
+    );
+  });
+
+  it("verifies joined report contains 'could not be measured' and does not contain 'Smoke passed' when every callTool call throws", async () => {
+    const report = await smokeBaselineReport({
+      brief: SMOKE_BRIEF,
+      callTool: async () => {
+        throw new Error("rpc exploded");
+      },
+      container: "cid",
+    });
+    assert.ok(report);
+    assert.match(report, /could not be measured/);
+    assert.doesNotMatch(report, /Smoke passed/);
+  });
+
   it("ignores pre-existing dirt the smoke did not add", async () => {
     // The comparison is the delta: whatever the prepared container already
     // carried is not this smoke's doing, and not this refusal's business.
@@ -568,6 +605,24 @@ describe("renderSmokeDirtReport (kusabi #292)", () => {
     assert.ok(report);
     assert.match(report, /could not be verified/);
     assert.match(report, /boom/);
+  });
+
+  it("uses the new wording and does not assert Smoke passed when capture fails", () => {
+    const report = renderSmokeDirtReport({
+      before: { ok: false, reason: "git status could not be run: boom" },
+      after: ok([]),
+    });
+    assert.ok(report);
+    assert.match(
+      report,
+      /dispatch refused: whether the declared ## Smoke left the worktree and HEAD unchanged could not be verified \(kusabi #292\)/,
+    );
+    assert.doesNotMatch(report, /Smoke passed/);
+    assert.match(report, /Nothing was dispatched: no job and no round state exist/);
+    assert.match(
+      report,
+      /The worktree and HEAD must be proven unchanged before the worker is handed the container; check the container by hand and re-run/,
+    );
   });
 
   it("treats missing captures defensively as failures", () => {
