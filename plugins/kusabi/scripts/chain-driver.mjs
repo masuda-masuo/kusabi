@@ -1080,8 +1080,8 @@ export async function runChainDriver({
         roundRecord.resumed = true;
       }
 
-      // ---- stop on implement provider exhaustion ----
-      if (implementJobStatus === "provider-error") {
+      // ---- stop on implement provider exhaustion (kusabi #453) ----
+      if (implementJobStatus === "provider-error" || implementJobFailure?.kind === "quota-exhaustion") {
         const { chainState, outcome } = handleProviderExhaustion({
           records, roundRecord,
           currentTierIndex: ctx.currentTierIndex, phase: "implement", jobError: implementJobError,
