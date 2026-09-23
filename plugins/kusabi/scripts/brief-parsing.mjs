@@ -566,6 +566,60 @@ export function parseOrchestratorSignature(briefText) {
 }
 
 // ---------------------------------------------------------------------------
+// stampInnerBriefSignature — deterministic inner-brief metadata enrichment
+// (the canonical orchestrator line the deterministic driver owns)
+// ---------------------------------------------------------------------------
+
+/**
+ * The canonical inner-brief signature line for a stamped brief.
+ *
+ * The deterministic driver, never Luna, owns the inner-brief signature
+ * (decision 1): before every run_chain / rework_chain the driver calls
+ * `stampInnerBriefSignature` with the canonical values it resolved — model =
+ * coordinator.actual, session = missionId, date = the dispatch's UTC
+ * YYYY-MM-DD — and the stamper computes NOTHING itself.  The rendered line
+ * round-trips through parseOrchestratorSignature (the same `|`-separated,
+ * `session `-prefixed grammar), so the strip rule and the parse rule cannot
+ * drift apart.
+ *
+ * @param {{ model: string, session: string, date: string }} canonical
+ * @returns {string}
+ */
+export function canonicalInnerBriefSignatureLine({ model, session, date }) {
+  return `Orchestrator: ${model} | session ${session} | ${date}`;
+}
+
+/**
+ * Stamp the deterministic canonical inner-brief signature onto a brief text.
+ *
+ * Strips EVERY `Orchestrator:` line found among the ORIGINAL first five lines
+ * (the same recognition parseOrchestratorSignature uses — a line whose trim
+ * starts with "Orchestrator:") and prepends exactly ONE canonical line as
+ * line 1.  Everything from the original line 6 onward is preserved
+ * byte-for-byte as content, and the original line 6 is untouched even when a
+ * signature sat at line 5.
+ *
+ * This is deterministic metadata enrichment ONLY: it never repairs missing
+ * Deliverables, invalid Smoke, invalid Frozen Tests, or any other semantic
+ * defect — those stay the business of the downstream lint/smoke validators
+ * the driver reuses before the seam (decision 6).
+ *
+ * @param {string|null|undefined} briefText  The full brief text.
+ * @param {{ model: string, session: string, date: string }} canonical
+ * @returns {string}  The stamped brief: canonical line 1 + all original lines
+ *                    except the stripped first-five signature line(s).
+ */
+export function stampInnerBriefSignature(briefText, canonical) {
+  const text = typeof briefText === "string" ? briefText : "";
+  const lines = text.split("\n");
+  const kept = lines.filter((line, i) => {
+    if (i >= 5) return true; // line 6+ is content, never stripped
+    return !(typeof line === "string" && line.trim().startsWith("Orchestrator:"));
+  });
+  return [canonicalInnerBriefSignatureLine(canonical), ...kept].join("\n");
+}
+
+// ---------------------------------------------------------------------------
 // zero-entry sections — the brief-syntax defect no worker can fix
 // (kusabi #302 / #303)
 // ---------------------------------------------------------------------------

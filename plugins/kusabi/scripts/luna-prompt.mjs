@@ -138,6 +138,20 @@ export function renderCoordinatorContract(schema = loadCoordinatorSchema()) {
   lines.push("A stream containing any rejected or malformed record is never partially executable:");
   lines.push("the whole parse fails closed. Keep the stream clean — one record per line, no prose");
   lines.push("between records, every record bound to the current envelope hash.");
+  lines.push("");
+  lines.push("## Inner-chain brief contract (run_chain / rework_chain `brief`)");
+  lines.push("");
+  lines.push("The inner-chain brief is authored by Luna, but the deterministic driver owns its");
+  lines.push("signature and validates its semantic sections before any chain work starts:");
+  if (schema.inner_brief && typeof schema.inner_brief === "object") {
+    const rules = schema.inner_brief.properties ?? {};
+    for (const key of Object.keys(rules)) {
+      const rule = rules[key];
+      if (rule && typeof rule.description === "string" && rule.description !== "") {
+        lines.push(`- ${rule.description}`);
+      }
+    }
+  }
   return lines.join("\n");
 }
 
