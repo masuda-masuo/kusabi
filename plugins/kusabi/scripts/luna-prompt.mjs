@@ -31,6 +31,7 @@
 // optional argument (defaulting to the canonical file) so tests can pin the
 // rendering against a fixed input.
 
+import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -348,4 +349,66 @@ export function renderBriefCorrections(record = {}) {
   // last <=3 unique details, rendered in record order.
   const window = unique.slice(-BRIEF_CORRECTION_MAX_ITEMS);
   return window.map(sanitizeBriefCorrectionDetail).join("\n\n");
+}
+
+// ---------------------------------------------------------------------------
+// bounded evidence content rendering
+// ---------------------------------------------------------------------------
+
+/**
+ * Compute backtick fence of length max(3, longest_backtick_run + 1)
+ * so content can never prematurely close the block.
+ */
+function safeBacktickFence(text) {
+  const matches = text.match(/`+/g);
+  const maxRun = matches ? Math.max(...matches.map((m) => m.length)) : 0;
+  return "`".repeat(Math.max(3, maxRun + 1));
+}
+
+/**
+ * Render the evidence contents bound by the evidence envelope.
+ * For each item in envelope.items:
+ * - reads path.join(missionDir, item.path) as UTF-8
+ * - recomputes its sha256 and compares with item.sha256
+ * - throws if file is missing or sha256 mismatches, naming item.path in the error
+ * - formats a header with role, source, path, bytes (and truncation info if truncated)
+ * - encloses content in an unclosable fence
+ *
+ * @param {object} envelope - the evidence envelope
+ * @param {string} missionDir - the root directory holding the materialized evidence tree
+ * @returns {string}
+ */
+export function renderEvidenceContents(envelope, missionDir) {
+  const items = Array.isArray(envelope?.items) ? envelope.items : [];
+  if (items.length === 0) {
+    return "";
+  }
+  const blocks = [];
+  for (const item of items) {
+    if (!missionDir) {
+      throw new Error(`missionDir not provided to render evidence for ${item.path}`);
+    }
+    const fullPath = path.join(missionDir, item.path);
+    let content;
+    try {
+      content = fs.readFileSync(fullPath, "utf8");
+    } catch (err) {
+      throw new Error(`evidence file missing or unreadable: ${item.path} (${err.message})`);
+    }
+    const hash = crypto.createHash("sha256").update(content, "utf8").digest("hex");
+    if (hash !== item.sha256) {
+      throw new Error(`evidence sha256 mismatch for ${item.path}: expected ${item.sha256}, got ${hash}`);
+    }
+    const truncInfo = item.truncated
+      ? `, truncated, ${item.omitted_bytes ?? 0} bytes omitted`
+      : "";
+    const header = `### ${item.path} (role: ${item.role}, source: ${item.source}, ${item.bytes} bytes${truncInfo})`;
+    const fence = safeBacktickFence(content);
+    const body = content.endsWith("\n") ? content : content + "\n";
+    const block = content === ""
+      ? `${header}\n${fence}\n${fence}`
+      : `${header}\n${fence}\n${body}${fence}`;
+    blocks.push(block);
+  }
+  return blocks.join("\n\n");
 }
