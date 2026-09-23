@@ -1052,9 +1052,15 @@ export async function runLunaMission(input) {
       // record executes NOTHING.  The counts are recorded as coordinator
       // errors (the rejected action NAMES are deliberately not persisted —
       // an unknown verb like "publish" must never appear in mission state).
+      // The first error's reason code and line are named (never its detail:
+      // an unknown-action detail is the rejected verb itself).  Without them
+      // "incomplete 0 rejected, 0 malformed" hid a truncated-record at the
+      // `}{` join of concatenated codex messages (mission-mudmmnaub60f0b20).
+      const first = parsed.errors[0];
       recordError(
         `coordinator stream invalid: ${parsed.incomplete ? "incomplete" : ""} ` +
-        `${parsed.rejectedCount} rejected, ${parsed.malformedCount} malformed record(s)`,
+        `${parsed.rejectedCount} rejected, ${parsed.malformedCount} malformed record(s)` +
+        (first ? `; first: ${first.reason} at line ${first.line}` : "; no records"),
       );
       continue;
     }

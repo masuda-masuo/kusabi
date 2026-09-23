@@ -1268,6 +1268,9 @@ describe("coordinator dispatch failure propagation through the real codex seam (
     const details = (record.coordinatorErrorsDetails ?? []).map((d) => d.detail).join("\n");
     assert.doesNotMatch(details, /coordinator dispatch failed/, "a completed job must never be labeled a dispatch failure");
     assert.match(details, /coordinator stream invalid/, "syntactically invalid coordinator content is a stream-parse failure, not a dispatch failure");
+    // Prose only: no record at all, so the tail says so instead of naming a
+    // first error (the parser ignores prose lines rather than erroring).
+    assert.match(details, /; no records/, "an invalid stream names why it is invalid");
   });
 });
 // ---------------------------------------------------------------------------
