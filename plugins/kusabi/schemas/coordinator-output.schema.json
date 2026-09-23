@@ -174,7 +174,7 @@
       },
       "frozen_tests": {
         "type": "string",
-        "description": "Frozen Tests: each `## Frozen Tests` entry is the path alone (a path-only entry) \u2014 leftover prose outside the path token is invisible to the P5 frozen oracle and is refused."
+        "description": "Frozen Tests: each `## Frozen Tests` entry is the path alone (a path-only entry) \u2014 leftover prose outside the path token is invisible to the P5 frozen oracle and is refused. Frozen Tests lists existing test files the worker must not modify (not \"tests that must pass\"); a test the worker should write or edit belongs in Deliverables and must never also appear in Frozen Tests (such a brief is refused)."
       },
       "empty_headings": {
         "type": "string",
