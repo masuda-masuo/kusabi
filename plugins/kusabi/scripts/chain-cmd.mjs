@@ -621,8 +621,12 @@ export async function cmdChainResume(cwd, { flags, text }) {
   const lastResumeRecord = chainJson.records?.[chainJson.records.length - 1] ?? null;
   const quota = recordQuotaExhaustion(lastResumeRecord);
   if (routeFlag && !quota) {
+    const routeFlags = [flags.model ? "--model" : null, flags.backend ? "--backend" : null].filter(Boolean);
+    const flagLabel = routeFlags.length > 1
+      ? `${routeFlags.join(" and ")} are`
+      : `${routeFlags[0]} is`;
     throw new Error(
-      `chain-resume does not support --${routeFlag}: resumption context comes from the saved chain state (chain.json / control.json)`
+      `cannot resume chain ${chainId}: ${flagLabel} accepted only when the chain's last round ended with a quota-exhausted review seat`
     );
   }
   if (flags.backend && !BACKENDS.includes(flags.backend)) {
