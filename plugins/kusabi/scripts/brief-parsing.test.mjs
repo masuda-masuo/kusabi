@@ -867,14 +867,22 @@ describe("zeroEntrySections", () => {
 
   it("reports a heading whose body is prose, per section", () => {
     const frozen = `# T\n\n${SIG}\n## Frozen Tests\n\n(none frozen by name — use judgement.)\n`;
-    assert.deepEqual(zeroEntrySections(frozen), [
-      { heading: "Frozen Tests", label: "## Frozen Tests", probe: "P5: frozen" },
+    // syntax/firstLine (kusabi #575) are asserted separately: the syntax text
+    // is the table's, and pinning it here would duplicate that table.
+    const withoutSyntax = (sections) => sections.map(({ syntax, ...rest }) => {
+      assert.equal(typeof syntax, "string");
+      assert.ok(syntax.length > 0);
+      return rest;
+    });
+    assert.deepEqual(withoutSyntax(zeroEntrySections(frozen)), [
+      { heading: "Frozen Tests", label: "## Frozen Tests", probe: "P5: frozen", firstLine: "(none frozen by name — use judgement.)" },
     ]);
 
     const smoke = `# T\n\n${SIG}\n## Smoke\n\nRun whatever seems sensible.\n`;
-    assert.deepEqual(zeroEntrySections(smoke), [
-      { heading: "Smoke", label: "## Smoke", probe: "P4: smoke" },
+    assert.deepEqual(withoutSyntax(zeroEntrySections(smoke)), [
+      { heading: "Smoke", label: "## Smoke", probe: "P4: smoke", firstLine: "Run whatever seems sensible." },
     ]);
+    assert.notEqual(zeroEntrySections(smoke)[0].syntax, zeroEntrySections(frozen)[0].syntax);
   });
 
   it("reports nothing for an ABSENT heading — absence is not emptiness", () => {
