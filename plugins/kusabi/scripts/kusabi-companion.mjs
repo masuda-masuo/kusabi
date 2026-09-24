@@ -540,8 +540,8 @@ export function briefLintReport({ brief, phase = null, container = null, chain =
 
   if (problems.length === 0) return null;
   return [
-    `brief rejected before dispatch: ${problems.length} required brief item` +
-    `${problems.length === 1 ? " is" : "s are"} missing (kusabi #289). ` +
+    `brief rejected before dispatch: ${problems.length} problem` +
+    `${problems.length === 1 ? "" : "s"} found (kusabi #289). ` +
     "Nothing was started; fix the brief and re-run.",
     ...problems,
   ].join("\n");
