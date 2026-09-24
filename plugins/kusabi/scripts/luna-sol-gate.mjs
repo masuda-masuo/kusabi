@@ -42,7 +42,7 @@ import {
   bindAuditVerdict,
   AUDIT_VERDICTS,
 } from "./audit-verdict.mjs";
-import { renderSolContract, renderBriefCorrections, renderEvidenceContents } from "./luna-prompt.mjs";
+import { renderSolContract, renderBriefCorrections, renderEvidenceContents, remainingMissionBudget } from "./luna-prompt.mjs";
 
 /** The gate phases the frozen #531 vocabulary names. */
 export const GATE_PHASES = ["pre-dispatch", "post-chain", "pre-accept", "consult"];
@@ -83,7 +83,12 @@ export function evidenceFingerprint({ brief, record }) {
   });
   const parts = [String(brief ?? ""), ledger];
   const attempts = Array.isArray(record.attempts) ? record.attempts : [];
-  attempts.forEach((attempt) => parts.push(String(attempt.output ?? attempt.brief ?? "")));
+  attempts.forEach((attempt) => {
+    parts.push(String(attempt.output ?? attempt.brief ?? ""));
+    if (attempt && attempt.postChain) {
+      parts.push(JSON.stringify(attempt.postChain));
+    }
+  });
   const probes = Array.isArray(record.probes) ? record.probes : [];
   probes.forEach((probe) => parts.push(String(probe.output ?? "")));
   return createHash("sha256").update(parts.join("\u0000")).digest("hex");
@@ -139,13 +144,32 @@ export function activePriorVerdicts(gates, fingerprint) {
  * renderBriefCorrections), so the two seats see identical correction
  * feedback.
  */
-function missionLedgerText(record) {
+export function missionLedgerText(record) {
   const ledger = {
     attempts: Array.isArray(record.attempts) ? record.attempts.length : 0,
     chains: Array.isArray(record.chains) ? record.chains : [],
     probes: Array.isArray(record.probes) ? record.probes.length : 0,
     consults: Array.isArray(record.consults) ? record.consults.length : 0,
     coordinatorErrors: record.coordinatorErrors ?? 0,
+  };
+  const corrections = renderBriefCorrections(record ?? {});
+  if (corrections !== "") ledger.briefCorrections = corrections;
+  return JSON.stringify(ledger);
+}
+
+/**
+ * The coordinator's ledger: missionLedgerText plus the current REMAINING
+ * deterministic budget (decision 6), which only the coordinator envelope
+ * carries.
+ */
+export function driverLedgerText(record) {
+  const ledger = {
+    attempts: Array.isArray(record.attempts) ? record.attempts.length : 0,
+    chains: Array.isArray(record.chains) ? record.chains : [],
+    probes: Array.isArray(record.probes) ? record.probes.length : 0,
+    consults: Array.isArray(record.consults) ? record.consults.length : 0,
+    coordinatorErrors: record.coordinatorErrors ?? 0,
+    remaining: remainingMissionBudget(record),
   };
   const corrections = renderBriefCorrections(record ?? {});
   if (corrections !== "") ledger.briefCorrections = corrections;
@@ -170,7 +194,7 @@ export function probeEvidenceText(output) {
  * coordinator envelope binds (brief + worker reports + probe raws + ledger),
  * so the gate and the coordinator are bound to the same current evidence.
  */
-export function missionEvidenceItems({ brief, record }) {
+export function missionEvidenceItems({ brief, record, includeRemaining = false }) {
   const items = [
     { role: "luna_brief", source: "mission-file", content: brief ?? "", path: "evidence/mission-brief.txt" },
   ];
@@ -182,6 +206,41 @@ export function missionEvidenceItems({ brief, record }) {
       content: String(attempt.output ?? attempt.brief ?? ""),
       path: `evidence/worker-report-${i}.txt`,
     });
+    if (attempt && attempt.postChain) {
+      const pc = attempt.postChain;
+      const chainId = pc.chainId ?? attempt.chainId ?? "unknown";
+      // A capped diff is a head+tail splice with no seam in the text, so the
+      // omission is stated up front rather than left for Sol to miss.
+      const diffContent =
+        typeof pc.diff === "string"
+          ? (pc.diffTruncated
+              ? `[post-chain diff truncated: ${pc.diffOmittedBytes} bytes omitted from the middle]\n`
+              : "") + pc.diff
+          : `post-chain diff unavailable: ${pc.diffUnavailable ?? pc.unavailable ?? "unknown"}\n`;
+      items.push({
+        role: "diff",
+        source: `chain-${chainId}-diff`,
+        content: diffContent,
+        path: `evidence/chain-diff-${i}.txt`,
+      });
+      const probeContent = pc.unavailable
+        ? `post-chain probes unavailable: ${pc.unavailable}\n`
+        : JSON.stringify(
+            {
+              baseSha: pc.baseSha ?? null,
+              probeResults: pc.probeResults ?? [],
+              changeScope: pc.changeScope ?? {},
+            },
+            null,
+            2,
+          );
+      items.push({
+        role: "probe_raw",
+        source: `chain-${chainId}-probes`,
+        content: probeContent,
+        path: `evidence/chain-probes-${i}.txt`,
+      });
+    }
   });
   const probes = Array.isArray(record?.probes) ? record.probes : [];
   probes.forEach((probe, i) => {
@@ -195,10 +254,28 @@ export function missionEvidenceItems({ brief, record }) {
   items.push({
     role: "worker_report",
     source: "mission-ledger",
-    content: missionLedgerText(record ?? {}),
+    content: includeRemaining ? driverLedgerText(record ?? {}) : missionLedgerText(record ?? {}),
     path: "evidence/mission-ledger.txt",
   });
   return items;
+}
+
+/**
+ * Resolve the last usable postChain from the mission record's attempts.
+ * Returns null if no attempts have a usable postChain (e.g. absent or unavailable).
+ *
+ * @param {object} record
+ * @returns {object|null}
+ */
+export function resolveLastPostChain(record) {
+  const attempts = Array.isArray(record?.attempts) ? record.attempts : [];
+  for (let i = attempts.length - 1; i >= 0; i--) {
+    const pc = attempts[i]?.postChain;
+    if (pc && !pc.unavailable && pc.baseSha) {
+      return pc;
+    }
+  }
+  return null;
 }
 
 /**
@@ -221,6 +298,7 @@ export function buildGateEnvelope({
   triggers,
   priorVerdicts,
 }) {
+  const lastPostChain = resolveLastPostChain(record);
   return buildAuditEnvelope({
     gateId,
     missionId,
@@ -229,8 +307,8 @@ export function buildGateEnvelope({
     seat,
     triggers,
     container,
-    baseSha: null,
-    changeScope: {},
+    baseSha: lastPostChain?.baseSha ?? null,
+    changeScope: lastPostChain?.changeScope ?? {},
     items: missionEvidenceItems({ brief, record }),
     priorVerdicts,
     allowSubstitute: allowSubstitute === true,

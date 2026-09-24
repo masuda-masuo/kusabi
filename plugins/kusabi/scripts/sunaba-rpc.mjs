@@ -36,6 +36,9 @@ const ALLOWED_TOOLS = new Set([
   "read_file_range",
   "search_in_container",
   "list_files",
+  // The driver's own post-chain diff read (kusabi #568): read-only, called
+  // by the driver after each inner chain, never on the coordinator's behalf.
+  "diff_in_container",
 ]);
 
 // 127.0.0.1 (not "localhost"): node fetch may resolve localhost to ::1 while
