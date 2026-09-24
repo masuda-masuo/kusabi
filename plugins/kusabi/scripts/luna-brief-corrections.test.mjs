@@ -93,7 +93,7 @@ describe("renderBriefCorrections(record) — the pure bounded brief-correction r
     assertRendererExists(render, "single multiline correction");
     const detail = [
       "run_chain refused: the inner chain brief fails deterministic validation",
-      "brief rejected before dispatch: 1 required brief item is missing (kusabi #289). Nothing was started; fix the brief and re-run.",
+      "brief rejected before dispatch: 1 problem found (kusabi #289). Nothing was started; fix the brief and re-run.",
       "  - `## Deliverables` is absent or parses to zero entries: the deliverables probe reads that section, and a round that changes none of the files it names is discarded. Add the section and list the files that must change, one per bullet, each path backtick-quoted.",
     ].join("\n");
     const out = render({ briefCorrectionsDetails: [entry(detail)] });

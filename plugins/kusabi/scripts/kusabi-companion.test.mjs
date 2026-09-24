@@ -4167,7 +4167,7 @@ describe("brief lint and container delivery (kusabi #289)", () => {
     it("requires deliverables and a signature when a chain starts, listing every miss at once", () => {
       const report = briefLintReport({ brief: "# Task\n\nImplement it.\n", container: "cid-1", chain: true });
       assert.ok(report);
-      assert.match(report, /2 required brief items are missing/);
+      assert.match(report, /2 problems found/);
       assert.match(report, /## Deliverables/);
       assert.ok(report.includes("Orchestrator: <model-id>"));
       // `chain` refuses a missing --container on its own, before this call:
@@ -4255,7 +4255,7 @@ describe("brief lint and container delivery (kusabi #289)", () => {
         phase: "implement",
         container: "cid-1",
       });
-      assert.match(report, /1 required brief item is missing/);
+      assert.match(report, /1 problem found/);
       assert.equal(report.match(/## Deliverables/g).length, 1);
       assert.doesNotMatch(report, /P3: deliverables/);
     });
@@ -4275,7 +4275,7 @@ describe("brief lint and container delivery (kusabi #289)", () => {
         phase: "implement",
         container: "cid-1",
       });
-      assert.match(report, /1 required brief item is missing/);
+      assert.match(report, /1 problem found/);
     });
 
     // ---- Frozen Tests qualifier: leftover prose outside the path token (kusabi #386) ----
@@ -4466,7 +4466,7 @@ describe("brief lint and container delivery (kusabi #289)", () => {
       ].join("\n");
       const report = briefLintReport({ brief, phase: "implement", container: "cid-1" });
       assert.ok(report);
-      assert.match(report, /brief rejected before dispatch: 2 required brief items are missing/);
+      assert.match(report, /brief rejected before dispatch: 2 problems found/);
       assert.ok(report.includes("`test/a.test.mjs` is listed under both `## Deliverables` and `## Frozen Tests`"));
       assert.ok(report.includes("`test/b.test.mjs` is listed under both `## Deliverables` and `## Frozen Tests`"));
     });
@@ -4546,6 +4546,22 @@ describe("brief lint and container delivery (kusabi #289)", () => {
       assert.ok(report, "the chain path runs the same overlap check");
       assert.ok(report.includes("test/a.test.mjs"));
       assert.ok(report.includes("Deliverables"));
+    });
+
+    it("refuses a brief whose sole problem is Deliverables/Frozen Tests overlap without claiming items are missing", () => {
+      const brief = [
+        "# Task", "", SIGNATURE, "",
+        "## Deliverables", "",
+        "- src/a.mjs",
+        "- test/a.test.mjs", "",
+        "## Frozen Tests", "",
+        "- test/a.test.mjs", "",
+      ].join("\n");
+      const report = briefLintReport({ brief, phase: "implement", container: "cid-1" });
+      assert.ok(report, "overlap must be refused");
+      const header = report.split("\n")[0];
+      assert.match(header, /brief rejected before dispatch: 1 problem found \(kusabi #289\)\./);
+      assert.doesNotMatch(header, /missing/);
     });
 
     // ---- Premises shape and guard & /tmp evidence (kusabi #536) ----
