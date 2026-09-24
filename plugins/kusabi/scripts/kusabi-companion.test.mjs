@@ -4235,7 +4235,7 @@ describe("brief lint and container delivery (kusabi #289)", () => {
       // The remedy, verbatim: a denial without it just pushes the author onto
       // a worse path (writing `- (none)` as an entry).
       assert.ok(
-        report.includes("Add entries, or delete the heading entirely — an empty section must omit its heading."),
+        report.includes("Write entries as one path per `- ` bullet (`*`, `+` and numbered items also count), or one path per line inside a fenced code block; or delete the heading entirely — an empty section must omit its heading."),
         `the refusal must state the remedy, got: ${report}`,
       );
     });
@@ -4260,6 +4260,58 @@ describe("brief lint and container delivery (kusabi #289)", () => {
       });
       assert.ok(report, "the chain path runs the same lint");
       assert.match(report, /## Frozen Tests/);
+    });
+
+    it("refuses bare-path Frozen Tests quoting the first line and giving the path syntax hint (kusabi #575)", () => {
+      const report = briefLintReport({
+        brief: `# Task\n\n${SIGNATURE}\n\n${DELIVERABLES}\n## Frozen Tests\nplugins/x.test.mjs\nplugins/y.test.mjs\n`,
+        phase: "implement",
+        container: "cid-1",
+      });
+      assert.ok(report);
+      assert.match(report, /## Frozen Tests/);
+      assert.match(report, /parses to zero entries/);
+      assert.ok(report.includes('Its lines were not recognised as entries (first line: "plugins/x.test.mjs").'));
+      assert.ok(report.includes("Write entries as one path per `- ` bullet (`*`, `+` and numbered items also count), or one path per line inside a fenced code block; or delete the heading entirely — an empty section must omit its heading."));
+    });
+
+    it("refuses truly empty Frozen Tests giving the syntax hint with no quote (kusabi #575)", () => {
+      const report = briefLintReport({
+        brief: `# Task\n\n${SIGNATURE}\n\n${DELIVERABLES}\n## Frozen Tests\n\n`,
+        phase: "implement",
+        container: "cid-1",
+      });
+      assert.ok(report);
+      assert.match(report, /## Frozen Tests/);
+      assert.match(report, /parses to zero entries/);
+      assert.ok(!report.includes("Its lines were not recognised as entries"));
+      assert.ok(!report.includes("first line:"));
+      assert.ok(report.includes("Write entries as one path per `- ` bullet (`*`, `+` and numbered items also count), or one path per line inside a fenced code block; or delete the heading entirely — an empty section must omit its heading."));
+    });
+
+    it("refuses prose-only Smoke quoting the first line and giving the smoke syntax hint (kusabi #575)", () => {
+      const report = briefLintReport({
+        brief: `# Task\n\n${SIGNATURE}\n\n${DELIVERABLES}\n## Smoke\n\nRun whatever seems sensible.\n`,
+        phase: "implement",
+        container: "cid-1",
+      });
+      assert.ok(report);
+      assert.match(report, /## Smoke/);
+      assert.match(report, /parses to zero entries/);
+      assert.ok(report.includes('Its lines were not recognised as entries (first line: "Run whatever seems sensible.").'));
+      assert.ok(report.includes("Write entries as one `- ` bullet per command with the command backtick-quoted, or one command per line inside a fenced code block; or delete the heading entirely — an empty section must omit its heading."));
+    });
+
+    it("caps a long first line at 120 characters with ellipsis (kusabi #575)", () => {
+      const longLine = "a".repeat(150);
+      const report = briefLintReport({
+        brief: `# Task\n\n${SIGNATURE}\n\n${DELIVERABLES}\n## Frozen Tests\n${longLine}\n`,
+        phase: "implement",
+        container: "cid-1",
+      });
+      assert.ok(report);
+      const expectedQuoted = "a".repeat(120) + "…";
+      assert.ok(report.includes(`Its lines were not recognised as entries (first line: "${expectedQuoted}").`));
     });
 
     it("does NOT refuse a brief whose Smoke / Frozen Tests headings are ABSENT", () => {

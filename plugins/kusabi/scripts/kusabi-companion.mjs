@@ -401,10 +401,19 @@ export function briefLintReport({ brief, phase = null, container = null, chain =
   if (chain || phase) {
     for (const section of zeroEntrySections(brief)) {
       if (section.heading === "Deliverables") continue;
+      const firstLine = section.firstLine ? section.firstLine.trim() : null;
+      const formattedLine = firstLine
+        ? (firstLine.length > 120 ? `${firstLine.slice(0, 120)}…` : firstLine)
+        : null;
+      const quotePart = formattedLine
+        ? `Its lines were not recognised as entries (first line: "${formattedLine}"). `
+        : "";
       problems.push(
         "  - `" + section.label + "` is present but parses to zero entries: the " + section.probe +
         " probe reads that section from the BRIEF, so it would fail on syntax every round and no " +
-        "worker edit could turn it green (kusabi #302). Add entries, or delete the heading entirely " +
+        "worker edit could turn it green (kusabi #302). " +
+        quotePart +
+        "Write entries as " + section.syntax + "; or delete the heading entirely " +
         "— an empty section must omit its heading."
       );
     }

@@ -763,6 +763,11 @@ export function stampInnerBriefSignature(briefText, canonical) {
 // (kusabi #302 / #303)
 // ---------------------------------------------------------------------------
 
+// The item forms parseSectionItems accepts (kusabi #575): a bare line is none
+// of them, which is exactly the mistake the zero-entry refusal must name.
+const PATH_SECTION_SYNTAX =
+  "one path per `- ` bullet (`*`, `+` and numbered items also count), or one path per line inside a fenced code block";
+
 /**
  * The `## ` sections a probe MACHINE-READS, each paired with the parser that
  * reads it and the probe that fails when the reading comes back empty.
@@ -775,13 +780,31 @@ export function stampInnerBriefSignature(briefText, canonical) {
  * read it" are the same statement rather than two implementations that agree
  * until one is edited.
  *
- * @type {Array<{heading: string, label: string, probe: string,
+ * @type {Array<{heading: string, label: string, probe: string, syntax: string,
  *               parse: function(string|null|undefined): Array<any>}>}
  */
 export const PARSED_BRIEF_SECTIONS = [
-  { heading: "Deliverables", label: "## Deliverables", probe: "P3: deliverables", parse: parseDeliverables },
-  { heading: "Smoke", label: "## Smoke", probe: "P4: smoke", parse: parseSmoke },
-  { heading: "Frozen Tests", label: "## Frozen Tests", probe: "P5: frozen", parse: parseFrozenTests },
+  {
+    heading: "Deliverables",
+    label: "## Deliverables",
+    probe: "P3: deliverables",
+    parse: parseDeliverables,
+    syntax: PATH_SECTION_SYNTAX,
+  },
+  {
+    heading: "Smoke",
+    label: "## Smoke",
+    probe: "P4: smoke",
+    parse: parseSmoke,
+    syntax: "one `- ` bullet per command with the command backtick-quoted, or one command per line inside a fenced code block",
+  },
+  {
+    heading: "Frozen Tests",
+    label: "## Frozen Tests",
+    probe: "P5: frozen",
+    parse: parseFrozenTests,
+    syntax: PATH_SECTION_SYNTAX,
+  },
 ];
 
 /**
@@ -794,17 +817,33 @@ export const PARSED_BRIEF_SECTIONS = [
  * Only the second is reported here, which is exactly the population both
  * consumers act on.
  *
+ * Also returns, per section, the first non-blank line under the heading (before
+ * the next `## `), or null when the section is empty (kusabi #575).
+ *
  * @param {string|null|undefined} briefText
- * @returns {Array<{heading: string, label: string, probe: string}>}
+ * @returns {Array<{heading: string, label: string, probe: string,
+ *                  syntax: string, firstLine: string|null}>}
  *   In table order; `[]` when every present section parses.  Never throws.
  */
 export function zeroEntrySections(briefText) {
+  if (!briefText || typeof briefText !== "string") return [];
   return PARSED_BRIEF_SECTIONS
     .filter(function (s) {
       return hasSectionHeading(briefText, s.heading) && s.parse(briefText).length === 0;
     })
     .map(function (s) {
-      return { heading: s.heading, label: s.label, probe: s.probe };
+      const text = sectionText(briefText, s.heading);
+      let firstLine = null;
+      if (text !== null) {
+        for (const line of text.split("\n")) {
+          const trimmed = line.trim();
+          if (trimmed !== "") {
+            firstLine = trimmed;
+            break;
+          }
+        }
+      }
+      return { heading: s.heading, label: s.label, probe: s.probe, syntax: s.syntax, firstLine };
     });
 }
 
