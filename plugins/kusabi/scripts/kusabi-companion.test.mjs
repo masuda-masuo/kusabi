@@ -2289,6 +2289,46 @@ describe("chain-resume CLI", () => {
       fs.rmSync(tmp, { recursive: true, force: true });
     }
   });
+
+  it("refuses --model and --backend when an existing chain's last round was not quota-exhausted", () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-resume-non-quota-"));
+    try {
+      const stateDir = hashedWorkspaceDir(path.join(tmp, "state"), tmp);
+      const chainDir = makeChain(stateDir, "chain-non-quota", {
+        control: {
+          chainId: "chain-non-quota", container: "cid-1", pid: 0,
+          status: "completed", round: 1, finishedAt: new Date().toISOString(),
+        },
+        chainJson: { ...validChainJson(), chainId: "chain-non-quota" },
+      });
+      const chainJsonBefore = fs.readFileSync(path.join(chainDir, "chain.json"));
+      const controlBefore = fs.readFileSync(path.join(chainDir, "control.json"));
+
+      const modelResult = runResume(["--model", "claude-sonnet-4-6", "chain-non-quota"], {
+        stateDir: path.join(tmp, "state"), cwd: tmp,
+      });
+      assert.notEqual(modelResult.status, 0);
+      assert.match(modelResult.stdout, /chain-non-quota/);
+      assert.match(modelResult.stdout, /--model/);
+      assert.match(modelResult.stdout, /quota-exhausted/);
+      assert.doesNotMatch(modelResult.stdout, /does not support/);
+      assert.ok(fs.readFileSync(path.join(chainDir, "chain.json")).equals(chainJsonBefore));
+      assert.ok(fs.readFileSync(path.join(chainDir, "control.json")).equals(controlBefore));
+
+      const backendResult = runResume(["--backend", "cursor", "chain-non-quota"], {
+        stateDir: path.join(tmp, "state"), cwd: tmp,
+      });
+      assert.notEqual(backendResult.status, 0);
+      assert.match(backendResult.stdout, /chain-non-quota/);
+      assert.match(backendResult.stdout, /--backend/);
+      assert.match(backendResult.stdout, /quota-exhausted/);
+      assert.doesNotMatch(backendResult.stdout, /does not support/);
+      assert.ok(fs.readFileSync(path.join(chainDir, "chain.json")).equals(chainJsonBefore));
+      assert.ok(fs.readFileSync(path.join(chainDir, "control.json")).equals(controlBefore));
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
 });
 
 // Spawn a fake long-lived serve: the marker env buildServeEnv() stamps into
