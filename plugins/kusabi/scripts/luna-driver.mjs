@@ -83,7 +83,6 @@ import { mintChainId } from "./chain-phases.mjs";
 import {
   loadCoordinatorSchema,
   renderCoordinatorContract,
-  remainingMissionBudget,
   renderRemainingBudget,
   renderBriefCorrections,
   sanitizeBriefCorrectionDetail,
@@ -100,7 +99,13 @@ import {
   rearmMissionControl,
   TERMINAL_MISSION_DISPOSITIONS,
 } from "./mission-store.mjs";
-import { evaluateMissionGate, realSolDispatch, probeEvidenceText } from "./luna-sol-gate.mjs";
+import {
+  evaluateMissionGate,
+  realSolDispatch,
+  probeEvidenceText,
+  missionEvidenceItems,
+  resolveLastPostChain,
+} from "./luna-sol-gate.mjs";
 
 /** The exact default seats of #530: coordinator codex/gpt-5.6-luna, auditor codex/gpt-5.6-sol. */
 export const DEFAULT_COORDINATOR_SEAT = { provider: "codex", model: "gpt-5.6-luna" };
@@ -122,6 +127,12 @@ export const DEFAULT_BUDGET = { maxChains: 3, maxAttempts: 2, maxProbes: 5, maxC
  * mission persistence must be bounded on its own (capProbeOutput).
  */
 export const PROBE_OUTPUT_MAX_BYTES = 8192;
+/**
+ * The post-chain diff cap (kusabi #568).  Larger than the probe cap: the diff
+ * is the one item Sol audits the change from, and at most maxAttempts diffs
+ * share the DEFAULT_ENVELOPE_MAX_BYTES envelope budget.
+ */
+export const DIFF_OUTPUT_MAX_BYTES = 65536;
 
 /**
  * The small closed vocabulary a `finish` recommendation is validated against.
@@ -294,66 +305,13 @@ async function innerBriefValidationReport(brief, container) {
 }
 
 /**
- * The mission ledger, persisted as evidence so the next envelope hash changes
- * after any observable action (attempts, probes, consults, errors).
- *
- * The bounded brief-correction feedback (kusabi #553 follow-up) rides on the
- * ledger CONDITIONALLY: `briefCorrections` appears only when the record has
- * at least one rendered correction, so a clean mission's ledger stays
- * byte-identical to the pre-change canonical ledger (no extra field, no
- * extra text).
- */
-function missionLedgerText(record) {
-  const ledger = {
-    attempts: Array.isArray(record.attempts) ? record.attempts.length : 0,
-    chains: Array.isArray(record.chains) ? record.chains : [],
-    probes: Array.isArray(record.probes) ? record.probes.length : 0,
-    consults: Array.isArray(record.consults) ? record.consults.length : 0,
-    coordinatorErrors: record.coordinatorErrors ?? 0,
-    // The current REMAINING deterministic budget (decision 6): the persisted
-    // record + its canonical budget is the single source of budget truth, so
-    // the ledger exposes max − persisted usage on every dispatch/resume.
-    remaining: remainingMissionBudget(record),
-  };
-  const corrections = renderBriefCorrections(record ?? {});
-  if (corrections !== "") ledger.briefCorrections = corrections;
-  return JSON.stringify(ledger);
-}
-
-/**
  * Build the immutable evidence envelope the NEXT coordinator dispatch is
  * bound to.  The envelope binds the mission brief, every worker report
  * (chain attempt output), every probe raw, and the mission ledger — so any
  * observable action changes the envelope hash.
  */
 function buildEvidenceEnvelope({ missionId, missionDir, brief, container, coordinator, allowSubstitute, record, dispatchIndex }) {
-  const items = [
-    { role: "luna_brief", source: "mission-file", content: brief ?? "", path: "evidence/mission-brief.txt" },
-  ];
-  const attempts = Array.isArray(record?.attempts) ? record.attempts : [];
-  attempts.forEach((attempt, i) => {
-    items.push({
-      role: "worker_report",
-      source: `attempt-${attempt.index}`,
-      content: String(attempt.output ?? attempt.brief ?? ""),
-      path: `evidence/worker-report-${i}.txt`,
-    });
-  });
-  const probes = Array.isArray(record?.probes) ? record.probes : [];
-  probes.forEach((probe, i) => {
-    items.push({
-      role: "probe_raw",
-      source: `probe-${i}`,
-      content: probeEvidenceText(probe.output),
-      path: `evidence/probe-${i}.txt`,
-    });
-  });
-  items.push({
-    role: "worker_report",
-    source: "mission-ledger",
-    content: missionLedgerText(record ?? {}),
-    path: "evidence/mission-ledger.txt",
-  });
+  const lastPostChain = resolveLastPostChain(record);
   return buildAuditEnvelope({
     gateId: `mission-${missionId}-dispatch-${dispatchIndex}`,
     missionId,
@@ -362,9 +320,9 @@ function buildEvidenceEnvelope({ missionId, missionDir, brief, container, coordi
     seat: coordinator,
     triggers: [],
     container,
-    baseSha: null,
-    changeScope: {},
-    items,
+    baseSha: lastPostChain?.baseSha ?? null,
+    changeScope: lastPostChain?.changeScope ?? {},
+    items: missionEvidenceItems({ brief, record, includeRemaining: true }),
     priorVerdicts: [],
     allowSubstitute: allowSubstitute === true || coordinator?.substituted !== true,
     writeFile: (p, content) => {
@@ -425,6 +383,109 @@ export function capProbeOutput(output) {
     omittedBytes: truncated.omitted_bytes,
     truncation: truncated.truncation,
   };
+}
+
+/**
+ * Collect post-chain evidence (baseSha, probeResults, changeScope, and raw diff)
+ * for a completed inner chain (kusabi #568).
+ *
+ * @param {object} opts
+ * @param {string} opts.stateDir
+ * @param {string} opts.chainId
+ * @param {string} opts.container
+ * @param {Function} opts.callTool
+ * @param {number} [opts.maxBytes]
+ * @returns {Promise<object>} the postChain object.
+ */
+export async function collectPostChainEvidence({
+  stateDir,
+  chainId,
+  container,
+  callTool,
+  maxBytes = DIFF_OUTPUT_MAX_BYTES,
+}) {
+  try {
+    const chainDir = path.join(stateDir, "chains", chainId);
+    let chainJson;
+    try {
+      chainJson = readJson(path.join(chainDir, "chain.json"));
+    } catch (err) {
+      return { chainId, unavailable: `chain.json unreadable: ${err.message}` };
+    }
+    if (!chainJson || typeof chainJson !== "object") {
+      return { chainId, unavailable: "chain.json missing or invalid" };
+    }
+    const baseSha = chainJson.baseSha;
+    if (typeof baseSha !== "string" || !baseSha) {
+      return { chainId, unavailable: "chain.json has no baseSha" };
+    }
+    const records = Array.isArray(chainJson.records) ? chainJson.records : [];
+    const terminal = records[records.length - 1];
+    if (!terminal || typeof terminal !== "object" || typeof terminal.round !== "number") {
+      return { chainId, unavailable: "chain records empty or missing round" };
+    }
+    let roundRecord;
+    try {
+      roundRecord = readJson(path.join(chainDir, `round-${terminal.round}.json`));
+    } catch (err) {
+      return { chainId, unavailable: `round-${terminal.round}.json unreadable: ${err.message}` };
+    }
+    if (!roundRecord || typeof roundRecord !== "object") {
+      return { chainId, unavailable: `round-${terminal.round}.json missing or invalid` };
+    }
+
+    const probeResults = Array.isArray(roundRecord.probeResults)
+      ? roundRecord.probeResults
+      : (roundRecord.probeResults ?? []);
+    const changeScope =
+      roundRecord.changeScope && typeof roundRecord.changeScope === "object"
+        ? roundRecord.changeScope
+        : {};
+
+    const postChain = {
+      chainId,
+      baseSha,
+      probeResults,
+      changeScope,
+    };
+
+    if (typeof callTool !== "function") {
+      postChain.diffUnavailable = "callTool seam is not available";
+      return postChain;
+    }
+
+    let diffResult;
+    try {
+      diffResult = await callTool("diff_in_container", {
+        container_id: container,
+        base: baseSha,
+        raw: true,
+      });
+    } catch (err) {
+      postChain.diffUnavailable = err?.message ? `diff_in_container call threw: ${err.message}` : String(err);
+      return postChain;
+    }
+
+    if (!diffResult || diffResult.status === "error" || diffResult.error) {
+      const reason = diffResult?.error || diffResult?.message || "diff_in_container returned error status";
+      postChain.diffUnavailable = String(reason);
+      return postChain;
+    }
+
+    const rawDiffText =
+      typeof diffResult.raw_diff === "string"
+        ? diffResult.raw_diff
+        : probeEvidenceText(diffResult);
+
+    const truncated = truncateEvidenceText(rawDiffText, { maxBytes });
+    postChain.diff = truncated.text;
+    postChain.diffTruncated = truncated.truncated;
+    postChain.diffOmittedBytes = truncated.omitted_bytes;
+
+    return postChain;
+  } catch (err) {
+    return { chainId, unavailable: `unexpected error collecting post-chain evidence: ${err.message}` };
+  }
 }
 
 /**
@@ -883,12 +944,22 @@ export async function runLunaMission(input) {
     };
     saveMissionRecord(missionDir, record);
   };
-  const recordAttempt = ({ index, kind, chainId, brief: attemptBrief, output }) => {
+  const recordAttempt = ({ index, kind, chainId, brief: attemptBrief, output, postChain }) => {
+    const attemptRecord = {
+      index,
+      kind,
+      chainId,
+      brief: attemptBrief,
+      status: "completed",
+      output,
+      ...(postChain ? { postChain } : {}),
+      at: new Date().toISOString(),
+    };
     record = {
       ...record,
       attempts: [
         ...(Array.isArray(record.attempts) ? record.attempts : []),
-        { index, kind, chainId, brief: attemptBrief, status: "completed", output, at: new Date().toISOString() },
+        attemptRecord,
       ],
       chains: [...(Array.isArray(record.chains) ? record.chains : []), chainId],
     };
@@ -1227,12 +1298,19 @@ export async function runLunaMission(input) {
             recordError(`${req.action} execution failed for chain ${chainId}: ${err.message}`);
             continue;
           }
+          const postChain = await collectPostChainEvidence({
+            stateDir,
+            chainId,
+            container,
+            callTool,
+          });
           recordAttempt({
             index: (Array.isArray(record.attempts) ? record.attempts.length : 0) + 1,
             kind: req.action,
             chainId,
             brief: req.brief,
             output: String(chainOutput ?? ""),
+            postChain,
           });
           // Stop check again AFTER the inner chain returns: cancellation
           // during an inner chain must stop before any post-chain seat.
@@ -1333,7 +1411,7 @@ export async function runLunaMission(input) {
               // the finish is refused and the coordinator gets another chance
               // to propose a bounded rework_chain (or the rework bound fails
               // the mission closed).
-              recordError(`finish recommend-accept refused: pre-accept Sol gate ${acceptGate.gateId} returned rework`);
+              recordError(`finish recommend-accept refused: pre-accept Sol gate ${acceptGate.gate?.gateId} returned rework`);
               continue;
             }
           }

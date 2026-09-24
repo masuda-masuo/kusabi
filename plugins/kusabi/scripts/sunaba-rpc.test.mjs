@@ -87,6 +87,18 @@ describe("sunaba-rpc allowlist", () => {
     }
   });
 
+  it("allows diff_in_container for the driver's post-chain diff read (kusabi #568)", async () => {
+    const { callTool } = await import("./sunaba-rpc.mjs");
+    // luna-driver collectPostChainEvidence calls this through the default
+    // seam; the allow-list refusal would silently turn every production diff
+    // into "unavailable".
+    try {
+      await callTool("diff_in_container", { container_id: "cid", base: "abc", raw: true });
+    } catch (err) {
+      assert.ok(!err.message.includes("not in the allowed list"), "diff_in_container must be allowed");
+    }
+  });
+
   it("exports verifyInContainer and sandboxExec convenience wrappers", async () => {
     const mod = await import("./sunaba-rpc.mjs");
     assert.ok(typeof mod.verifyInContainer === "function");
