@@ -388,6 +388,40 @@ export function capProbeOutput(output) {
 }
 
 /**
+ * Format an untracked file's contents as a git new-file diff block (kusabi #572).
+ *
+ * @param {string} filePath - Repo-relative file path.
+ * @param {string} [fileContent] - Full file content string (if read succeeded).
+ * @param {object} [opts]
+ * @param {string|null} [opts.readError] - Error description if read failed.
+ * @param {boolean} [opts.hasMore] - Whether read_file_range reported has_more.
+ * @returns {string} The formatted diff block with trailing newline.
+ */
+export function formatUntrackedFileDiff(filePath, fileContent = "", { readError = null, hasMore = false } = {}) {
+  let block =
+    `diff --git a/${filePath} b/${filePath}\n` +
+    `new file (untracked; content read with read_file_range)\n` +
+    `--- /dev/null\n` +
+    `+++ b/${filePath}\n`;
+
+  if (readError != null) {
+    block += `[content unavailable: ${readError}]\n`;
+  } else {
+    if (fileContent !== "") {
+      const stripped = fileContent.endsWith("\n") ? fileContent.slice(0, -1) : fileContent;
+      const lines = stripped.split("\n");
+      for (const line of lines) {
+        block += `+${line}\n`;
+      }
+    }
+    if (hasMore) {
+      block += `[content incomplete: read_file_range reported has_more]\n`;
+    }
+  }
+  return block;
+}
+
+/**
  * Collect post-chain evidence (baseSha, probeResults, changeScope, and raw diff)
  * for a completed inner chain (kusabi #568).
  *
@@ -479,7 +513,47 @@ export async function collectPostChainEvidence({
         ? diffResult.raw_diff
         : probeEvidenceText(diffResult);
 
-    const truncated = truncateEvidenceText(rawDiffText, { maxBytes });
+    let untrackedText = "";
+    if (Array.isArray(diffResult.untracked) && diffResult.untracked.length > 0) {
+      postChain.untrackedIncluded = [...diffResult.untracked];
+      for (const filePath of diffResult.untracked) {
+        let fileContent = "";
+        let readError = null;
+        let hasMore = false;
+        try {
+          const readResult = await callTool("read_file_range", {
+            container_id: container,
+            file_path: filePath,
+            limit: -1,
+          });
+          if (!readResult || readResult.status === "error" || readResult.error != null) {
+            const rawErr = readResult?.error ?? readResult?.message ?? "read_file_range returned error status";
+            readError = typeof rawErr === "object" && rawErr?.message ? rawErr.message : String(rawErr);
+          } else if (typeof readResult.content !== "string") {
+            readError = "read_file_range returned no content";
+          } else {
+            fileContent = readResult.content;
+            hasMore = Boolean(readResult.has_more);
+          }
+        } catch (err) {
+          readError = err?.message ? err.message : String(err);
+        }
+        untrackedText += formatUntrackedFileDiff(filePath, fileContent, {
+          readError,
+          hasMore,
+        });
+      }
+    }
+
+    let combinedDiffText = rawDiffText;
+    if (untrackedText) {
+      if (combinedDiffText && !combinedDiffText.endsWith("\n")) {
+        combinedDiffText += "\n";
+      }
+      combinedDiffText += untrackedText;
+    }
+
+    const truncated = truncateEvidenceText(combinedDiffText, { maxBytes });
     postChain.diff = truncated.text;
     postChain.diffTruncated = truncated.truncated;
     postChain.diffOmittedBytes = truncated.omitted_bytes;
