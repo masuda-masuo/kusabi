@@ -119,7 +119,7 @@ export const DEFAULT_AUDITOR_SEAT = { provider: "codex", model: "gpt-5.6-sol" };
  * verdicts (a rework demand beyond it fails closed sol-blocked) — both
  * conservative defaults, overridable per mission like every other bound.
  */
-export const DEFAULT_BUDGET = { maxChains: 3, maxAttempts: 2, maxProbes: 5, maxConsults: 3, maxRework: 1 };
+export const DEFAULT_BUDGET = { maxChains: 3, maxAttempts: 2, maxProbes: 5, maxConsults: 3, maxRework: 1, maxBriefCorrections: 3 };
 
 /**
  * Documented byte limit for a probe result's serialized payload persisted to
@@ -602,6 +602,11 @@ async function defaultGuardedServeStop(cwd, stateDir) {
   }
 }
 
+function collapseSingleLine(str) {
+  if (typeof str !== "string") return "";
+  return str.replace(/\r?\n|\r/g, " ").replace(/\s+/g, " ").trim();
+}
+
 /**
  * Write the host-facing recommendation artifact for a terminal mission.
  * `finish` writes the recommendation; `escalate_to_host` writes the handoff
@@ -609,15 +614,49 @@ async function defaultGuardedServeStop(cwd, stateDir) {
  * a reason (e.g. the budget bound that was exhausted, or the fail-closed
  * cause of a sol-blocked gate).
  */
-function writeRecommendationFile(missionDir, { missionId, disposition, recommendation, reason }) {
+function writeRecommendationFile(missionDir, { missionId, disposition, recommendation, reason, gate, lastCorrectionDetail }) {
   const lines = [
     "# Mission recommendation",
     "",
     `mission: ${missionId}`,
     `disposition: ${disposition}`,
     recommendation ? `recommendation: ${recommendation}` : null,
-    reason ? `reason: ${reason}` : null,
+    reason ? `reason: ${collapseSingleLine(reason)}` : null,
   ].filter((line) => line !== null);
+
+  if (disposition === "sol-blocked") {
+    if (gate && typeof gate === "object") {
+      const phase = typeof gate.phase === "string" ? gate.phase : "?";
+      const verdict = typeof gate.verdict === "string" ? gate.verdict : "none";
+      lines.push(`gate: ${gate.gateId} (phase: ${phase}, verdict: ${verdict})`);
+      if (gate.verdictRecord && typeof gate.verdictRecord === "object") {
+        if (typeof gate.verdictRecord.summary === "string" && gate.verdictRecord.summary.trim() !== "") {
+          lines.push(`summary: ${collapseSingleLine(gate.verdictRecord.summary)}`);
+        }
+        if (typeof gate.verdictRecord.block_reason === "string" && gate.verdictRecord.block_reason.trim() !== "") {
+          lines.push(`block_reason: ${collapseSingleLine(gate.verdictRecord.block_reason)}`);
+        }
+      }
+      lines.push("");
+      lines.push("## Next actions");
+      lines.push("");
+      lines.push("1. amend the mission brief (resolve what `block_reason`/`summary` names) and start a new mission");
+      lines.push(`2. kusabi-companion luna-resume ${missionId} --audit-override ${gate.gateId} --audit-override-reason <reason> --audit-override-by <actor>`);
+    } else {
+      lines.push("");
+      lines.push("## Next actions");
+      lines.push("");
+      lines.push("1. amend the mission brief (resolve what `block_reason`/`summary` names) and start a new mission");
+    }
+  } else if (disposition === "brief-correction-exhausted") {
+    if (lastCorrectionDetail) {
+      lines.push("");
+      lines.push("## Last brief correction");
+      lines.push("");
+      lines.push(String(lastCorrectionDetail).trimEnd());
+    }
+  }
+
   fs.writeFileSync(path.join(missionDir, "recommendation.md"), lines.join("\n") + "\n", "utf8");
 }
 
@@ -625,7 +664,7 @@ function writeRecommendationFile(missionDir, { missionId, disposition, recommend
  * The default terminal mission notification (kusabi #531): one inbox record,
  * one deduplicated kaiba agenda row.  See chain-notify.notifyMissionTerminal.
  */
-async function defaultMissionNotify({ missionId, disposition, container, cwdLabel, stateDir }) {
+async function defaultMissionNotify({ missionId, disposition, container, cwdLabel, stateDir, reason }) {
   const { notifyMissionTerminal } = await import("./chain-notify.mjs");
   return notifyMissionTerminal({
     stateDir,
@@ -633,6 +672,7 @@ async function defaultMissionNotify({ missionId, disposition, container, cwdLabe
     disposition,
     container,
     cwdLabel,
+    reason,
   });
 }
 
@@ -896,12 +936,7 @@ export async function runLunaMission(input) {
     const at = new Date().toISOString();
     record = {
       ...record,
-      coordinatorErrors: (record.coordinatorErrors ?? 0) + 1,
       briefCorrections: (record.briefCorrections ?? 0) + 1,
-      coordinatorErrorsDetails: [
-        ...(Array.isArray(record.coordinatorErrorsDetails) ? record.coordinatorErrorsDetails : []),
-        { at, detail: sanitized },
-      ],
       briefCorrectionsDetails: [
         ...(Array.isArray(record.briefCorrectionsDetails) ? record.briefCorrectionsDetails : []),
         { at, action, detail: sanitized },
@@ -1247,6 +1282,36 @@ export async function runLunaMission(input) {
                 ? `${req.action} refused: the inner chain brief fails deterministic validation`
                 : `${req.action} refused: the inner chain brief fails deterministic validation\n${report}`;
             recordBriefCorrection(req.action, detail);
+
+            const details = record.briefCorrectionsDetails ?? [];
+            const lastCorrection = details[details.length - 1];
+            const prevCorrection = details.length >= 2 ? details[details.length - 2] : null;
+
+            if (prevCorrection && lastCorrection && prevCorrection.detail === lastCorrection.detail) {
+              const reason = "no progress: the same brief correction was repeated";
+              outcome = {
+                disposition: "brief-correction-exhausted",
+                recommendation: null,
+                handoffReason: null,
+                reason,
+                lastCorrectionDetail: lastCorrection.detail,
+              };
+              break mainLoop;
+            }
+
+            const maxCorrections = budget.maxBriefCorrections ?? DEFAULT_BUDGET.maxBriefCorrections;
+            if ((record.briefCorrections ?? 0) >= maxCorrections) {
+              const reason = `brief correction budget exhausted (${record.briefCorrections}/${maxCorrections})`;
+              outcome = {
+                disposition: "brief-correction-exhausted",
+                recommendation: null,
+                handoffReason: null,
+                reason,
+                lastCorrectionDetail: lastCorrection?.detail ?? detail,
+              };
+              break mainLoop;
+            }
+
             continue;
           }
           // PRE-DISPATCH GATE: the deterministic driver, never Luna, decides
@@ -1257,7 +1322,13 @@ export async function runLunaMission(input) {
             break mainLoop;
           }
           if (pre.outcome === "sol-blocked" || pre.outcome === "block") {
-            outcome = { disposition: "sol-blocked", recommendation: null, handoffReason: null, reason: "Sol audit gate blocked this dispatch" };
+            outcome = {
+              disposition: "sol-blocked",
+              recommendation: null,
+              handoffReason: null,
+              reason: "Sol audit gate blocked this dispatch",
+              gate: pre.gate ?? null,
+            };
             break mainLoop;
           }
           if (pre.outcome === "rework") {
@@ -1331,7 +1402,13 @@ export async function runLunaMission(input) {
             break mainLoop;
           }
           if (post.outcome === "sol-blocked" || post.outcome === "block") {
-            outcome = { disposition: "sol-blocked", recommendation: null, handoffReason: null, reason: "Sol audit gate blocked the chain outcome" };
+            outcome = {
+              disposition: "sol-blocked",
+              recommendation: null,
+              handoffReason: null,
+              reason: "Sol audit gate blocked the chain outcome",
+              gate: post.gate ?? null,
+            };
             break mainLoop;
           }
           // A post-chain `rework` (within the bound) is recorded and the loop
@@ -1363,7 +1440,13 @@ export async function runLunaMission(input) {
             break mainLoop;
           }
           if (consult.outcome === "sol-blocked" || consult.outcome === "block") {
-            outcome = { disposition: "sol-blocked", recommendation: null, handoffReason: null, reason: "Sol audit gate blocked the requested consultation" };
+            outcome = {
+              disposition: "sol-blocked",
+              recommendation: null,
+              handoffReason: null,
+              reason: "Sol audit gate blocked the requested consultation",
+              gate: consult.gate ?? null,
+            };
             break mainLoop;
           }
           recordConsult(req);
@@ -1403,6 +1486,7 @@ export async function runLunaMission(input) {
                 recommendation: null,
                 handoffReason: null,
                 reason: "Sol audit gate blocked the accept recommendation",
+                gate: acceptGate.gate ?? null,
               };
               break mainLoop;
             }
@@ -1462,9 +1546,26 @@ export async function runLunaMission(input) {
     disposition: outcome.disposition,
     recommendation: outcome.recommendation,
     reason: terminationReason,
+    gate: outcome.gate,
+    lastCorrectionDetail: outcome.lastCorrectionDetail,
   });
 
   // ---- exactly one terminal notification per terminal mission ----
+  const notifyReason =
+    outcome.disposition === "sol-blocked" && outcome.gate
+      ? (() => {
+          const g = outcome.gate;
+          const vr = g?.verdictRecord;
+          const text =
+            (typeof vr?.block_reason === "string" && vr.block_reason.trim()) ||
+            (typeof vr?.summary === "string" && vr.summary.trim()) ||
+            terminationReason ||
+            "";
+          const verdict = typeof g?.verdict === "string" ? g.verdict : "none";
+          return g?.gateId ? `${g.gateId} ${verdict}: ${text}`.trim() : terminationReason;
+        })()
+      : terminationReason;
+
   try {
     await notifyMissionTerminal({
       missionId,
@@ -1474,6 +1575,7 @@ export async function runLunaMission(input) {
       container,
       cwdLabel: path.basename(cwd),
       stateDir,
+      reason: notifyReason ?? undefined,
     });
   } catch { /* best-effort — the terminal record is already durable */ }
 

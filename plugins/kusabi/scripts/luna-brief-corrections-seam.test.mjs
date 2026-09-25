@@ -377,11 +377,10 @@ describe("the driver records and surfaces bounded brief corrections (criteria 1,
       detail.includes("is absent or parses to zero entries"),
       "the persisted detail must be the driver-generated validator output, not a generic message",
     );
-    // counters/caps unchanged: a correction is still counted as both a brief
-    // correction and a coordinator error (one refusal, one of each).
+    // brief corrections have their own budget (#577): a correction does not
+    // increment the coordinator error counter.
     assert.equal(record.briefCorrections, 1, "the briefCorrections counter must still count the refusal");
-    assert.equal(record.coordinatorErrors, 1, "the coordinatorErrors counter must still count the refusal");
-    assert.equal(record.briefCorrections, record.coordinatorErrors, "one refusal, one of each — unchanged");
+    assert.equal(record.coordinatorErrors, 0, "the coordinatorErrors counter is unchanged by a brief correction");
     assert.equal(record.disposition, "recommend-escalate", "the mission may still end via a later valid request");
   });
 
@@ -495,7 +494,7 @@ describe("the driver records and surfaces bounded brief corrections (criteria 1,
     const chainId = chain.calls[0].input.flags["chain-id"];
     assert.ok(Array.isArray(record.chains) && record.chains.length === 1 && record.chains[0] === chainId);
     assert.ok(Array.isArray(record.attempts) && record.attempts.length === 1, "one attempt, the valid one");
-    assert.equal(record.coordinatorErrors, 1, "the correction counts as the single coordinator error");
+    assert.equal(record.coordinatorErrors, 0, "the correction does not increment coordinatorErrors");
     assert.equal(record.briefCorrections, 1, "the correction counts as the single brief correction");
     assert.ok(
       Array.isArray(record.briefCorrectionsDetails) && record.briefCorrectionsDetails.length === 1,
@@ -504,7 +503,7 @@ describe("the driver records and surfaces bounded brief corrections (criteria 1,
     assert.equal(record.disposition, "recommend-accept", "a subsequent valid request proceeds normally");
   });
 
-  it("criterion 6: the coordinator error cap is unchanged — a coordinator that keeps proposing invalid briefs fails closed", async () => {
+  it("criterion 6: a coordinator that keeps proposing the same invalid brief terminates via no-progress (#577)", async () => {
     const { coord, chain, mission } = await runMission([
       runChainStream(MISSING_DELIVERABLES_BRIEF),
       runChainStream(MISSING_DELIVERABLES_BRIEF),
@@ -512,9 +511,9 @@ describe("the driver records and surfaces bounded brief corrections (criteria 1,
     const { record } = mission;
     assert.equal(coord.calls.length, 2, "two refused dispatches");
     assert.equal(chain.calls.length, 0, "no seam call for a pure-correction mission");
-    assert.equal(record.coordinatorErrors, 2, "each correction still counts against the cap");
+    assert.equal(record.coordinatorErrors, 0, "corrections do not count as coordinator errors");
     assert.equal(record.briefCorrections, 2);
-    assert.equal(record.disposition, "coordinator-failed", "maxAttempts=2 corrections exhaust the cap exactly as before");
+    assert.equal(record.disposition, "brief-correction-exhausted", "two consecutive identical brief corrections trigger no-progress");
   });
 
   it("empty Frozen Tests, missing Deliverables, and invalid Smoke briefs are actionable and sanitized", async () => {
@@ -866,7 +865,7 @@ describe("the REAL coordinator prompt/evidence seam carries the persisted correc
     );
     assert.ok(detail, "the persisted entry must carry the deterministic validator detail");
     assert.ok(detail.includes("is absent or parses to zero entries"), "the detail must be the actionable validator output");
-    assert.equal(mission.record.coordinatorErrors, 1, "the correction still counts as one coordinator error");
+    assert.equal(mission.record.coordinatorErrors, 0, "the correction does not increment coordinatorErrors");
     assert.equal(mission.record.briefCorrections, 1);
 
     // Two real dispatches: the refusal, then the terminal handoff.

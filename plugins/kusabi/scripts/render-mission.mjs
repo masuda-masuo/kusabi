@@ -59,7 +59,7 @@ export function renderMissionProvenanceBanner(record) {
  * @param {object} record — the mission record.
  * @returns {string[]}
  */
-function renderGateOrigins(record) {
+export function renderGateOrigins(record) {
   const gates = Array.isArray(record?.auditGates) ? record.auditGates : [];
   if (gates.length === 0) return [];
   const lines = ["audit gates:"];
@@ -75,6 +75,16 @@ function renderGateOrigins(record) {
     lines.push(
       `  ${gate.gateId} (${phase}, origin: ${origin}, verdict: ${verdict}, shadow disposition: ${shadow})`,
     );
+    if ((verdict === "block" || verdict === "rework") && gate.verdictRecord && typeof gate.verdictRecord === "object") {
+      if (typeof gate.verdictRecord.summary === "string") {
+        const summary = gate.verdictRecord.summary.replace(/\r?\n|\r/g, " ").replace(/\s+/g, " ").trim();
+        lines.push(`    summary: ${summary}`);
+      }
+      if (typeof gate.verdictRecord.block_reason === "string" && gate.verdictRecord.block_reason.trim() !== "") {
+        const blockReason = gate.verdictRecord.block_reason.replace(/\r?\n|\r/g, " ").replace(/\s+/g, " ").trim();
+        lines.push(`    block_reason: ${blockReason}`);
+      }
+    }
   }
   return lines;
 }

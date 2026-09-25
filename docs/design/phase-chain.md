@@ -668,8 +668,12 @@ partially executable. The closed action enum is the frozen six-verb
 
 **Budgets.** An explicit mission budget caps chains (`maxChains`, default 3),
 attempts (`maxAttempts`, default 2), probes (`maxProbes`, default 5),
-consult/coordination requests (`maxConsults`, default 3) and consecutive Sol
-rework verdicts (`maxRework`, default 1, #531). A request that
+consult/coordination requests (`maxConsults`, default 3), consecutive Sol
+rework verdicts (`maxRework`, default 1, #531) and brief corrections
+(`maxBriefCorrections`, default 3, #577). Brief corrections do not consume
+the coordinator error budget. A mission stops immediately (`brief-correction-exhausted`)
+when the coordinator resends the same defect (the no-progress stop) or exhausts
+`maxBriefCorrections`. A request that
 would exceed a budget terminates the mission `budget-exhausted` and never
 creates another chain or performs another coordinator dispatch. A coordinator
 that cannot produce an executable stream within the bounded attempts budget
@@ -749,8 +753,10 @@ with a different disposition.
 **Terminal dispositions.** `recommend-accept`, `recommend-escalate`,
 `coordinator-failed`, `budget-exhausted` and `host-handoff` (all #530) plus
 `sol-blocked` (an uncleared mandatory Sol gate — only a recorded human
-override can reopen it) and `cancelled` (a stop request was honored — no
-seat is dispatched after `stopRequestedAt`). All are terminal for wait/show
+override can reopen it), `cancelled` (a stop request was honored — no
+seat is dispatched after `stopRequestedAt`) and `brief-correction-exhausted`
+(#577). A `sol-blocked` `recommendation.md` carries the blocking gate, Sol's
+summary/block_reason and the two next actions (#574). All are terminal for wait/show
 surfaces through `TERMINAL_MISSION_DISPOSITIONS`.
 
 **CLI surfaces.** `luna --container <cid> --mission-file <path>` (foreground)
