@@ -671,13 +671,16 @@ attempts (`maxAttempts`, default 2), probes (`maxProbes`, default 5),
 consult/coordination requests (`maxConsults`, default 3), consecutive Sol
 rework verdicts (`maxRework`, default 1, #531) and brief corrections
 (`maxBriefCorrections`, default 3, #577). Brief corrections do not consume
-the coordinator error budget. A mission stops immediately (`brief-correction-exhausted`)
+the coordinator error budget: brief corrections include the chain seam's dispatch-time
+brief refusals (lossy smoke, smoke baseline) except an unmeasured baseline.
+A mission stops immediately (`brief-correction-exhausted`)
 when the coordinator resends the same defect (the no-progress stop) or exhausts
 `maxBriefCorrections`. A request that
 would exceed a budget terminates the mission `budget-exhausted` and never
 creates another chain or performs another coordinator dispatch. A coordinator
 that cannot produce an executable stream within the bounded attempts budget
-terminates `coordinator-failed`. `maxConsults` is the coordination bound that
+terminates `coordinator-failed` (`recommendation.md` carries the reason and the
+last coordinator error). `maxConsults` is the coordination bound that
 stops a consult-only coordinator: each accepted `consult_sol` consumes one
 slot (and opens its additive gate), and the
 request that would exceed the bound terminates `budget-exhausted` with the

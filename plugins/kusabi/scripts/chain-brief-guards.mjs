@@ -19,6 +19,22 @@ import { runSmokeEntries, captureGitStatusPorcelain } from "./chain-probes.mjs";
 // brief guards — evaluated before any chain state or job exists
 // ---------------------------------------------------------------------------
 
+export const BRIEF_REFUSED_CODE = "KUSABI_BRIEF_REFUSED";
+
+/**
+ * Construct an Error for a brief refusal at dispatch time, stamped with
+ * BRIEF_REFUSED_CODE so callers (e.g. Luna mission driver) can distinguish a
+ * deterministic brief refusal from an unexpected infrastructure or runtime error.
+ *
+ * @param {string} message
+ * @returns {Error}
+ */
+export function briefRefusalError(message) {
+  const err = new Error(message);
+  err.code = BRIEF_REFUSED_CODE;
+  return err;
+}
+
 // The one-line orchestrator warning emitted at chain start when the brief
 // appears to demand publish (kusabi #153).  Exported so the exact chain
 // output text is fixed by tests; cmdChain prints it verbatim (plus a
@@ -349,6 +365,47 @@ export function renderSmokeDirtReport({ before, after }) {
   }
   if (reports.length === 0) return null;
   return reports.join("\n\n");
+}
+
+/**
+ * Decide whether a smoke-baseline refusal report is the fault of the brief
+ * (kusabi #579).
+ *
+ * The smoke-baseline report is a brief fault iff it contains at least one
+ * brief-caused section: SMOKE_BASELINE_HEADER (a command ran and missed),
+ * SMOKE_BASELINE_GREEN_ANNOTATION_HEADER, SMOKE_DIRT_HEADER, or
+ * SMOKE_HEAD_MOVE_HEADER.
+ *
+ * A report made only of infrastructure sections —
+ * SMOKE_BASELINE_UNMEASURED_HEADER and/or SMOKE_DIRT_UNVERIFIABLE_HEADER —
+ * is not a brief fault.
+ *
+ * @param {string|null|undefined} report
+ * @returns {boolean}
+ */
+export function isSmokeBaselineBriefFault(report) {
+  if (!report || typeof report !== "string") return false;
+  return (
+    report.includes(SMOKE_BASELINE_HEADER) ||
+    report.includes(SMOKE_BASELINE_GREEN_ANNOTATION_HEADER) ||
+    report.includes(SMOKE_DIRT_HEADER) ||
+    report.includes(SMOKE_HEAD_MOVE_HEADER)
+  );
+}
+
+/**
+ * Helper to wrap a smokeBaselineReport result in an appropriate Error:
+ * a briefRefusalError if the brief is at fault, or a plain Error if the failure
+ * was infrastructure / unmeasured only.
+ *
+ * @param {string} report
+ * @returns {Error}
+ */
+export function baselineRefusalError(report) {
+  if (isSmokeBaselineBriefFault(report)) {
+    return briefRefusalError(report);
+  }
+  return new Error(report);
 }
 
 /**

@@ -267,6 +267,7 @@ async function briefValidators() {
     _briefValidators = {
       briefLintReport: companion.briefLintReport,
       smokeViolationReport: guards.smokeViolationReport,
+      BRIEF_REFUSED_CODE: guards.BRIEF_REFUSED_CODE,
     };
   }
   return _briefValidators;
@@ -608,13 +609,64 @@ function collapseSingleLine(str) {
 }
 
 /**
+ * Evaluate the deterministic brief correction outcome against the no-progress
+ * rule (two consecutive identical correction details) and the maxBriefCorrections
+ * budget (kusabi #578, #579).
+ *
+ * Shared by both the pre-seam brief validation and the post-seam chain brief
+ * refusal so their budget and no-progress semantics cannot drift.
+ *
+ * @param {object} record Current mission record (with briefCorrectionsDetails).
+ * @param {object} budget Current mission budget (with maxBriefCorrections).
+ * @returns {object|null} Terminal outcome object if exhausted, or null to proceed.
+ */
+function evaluateBriefCorrectionOutcome(record, budget) {
+  const details = record.briefCorrectionsDetails ?? [];
+  const lastCorrection = details[details.length - 1];
+  const prevCorrection = details.length >= 2 ? details[details.length - 2] : null;
+
+  if (prevCorrection && lastCorrection && prevCorrection.detail === lastCorrection.detail) {
+    const reason = "no progress: the same brief correction was repeated";
+    return {
+      disposition: "brief-correction-exhausted",
+      recommendation: null,
+      handoffReason: null,
+      reason,
+      lastCorrectionDetail: lastCorrection.detail,
+    };
+  }
+
+  const maxCorrections = budget.maxBriefCorrections ?? DEFAULT_BUDGET.maxBriefCorrections;
+  if ((record.briefCorrections ?? 0) >= maxCorrections) {
+    const reason = `brief correction budget exhausted (${record.briefCorrections}/${maxCorrections})`;
+    return {
+      disposition: "brief-correction-exhausted",
+      recommendation: null,
+      handoffReason: null,
+      reason,
+      lastCorrectionDetail: lastCorrection?.detail ?? null,
+    };
+  }
+
+  return null;
+}
+
+/**
  * Write the host-facing recommendation artifact for a terminal mission.
  * `finish` writes the recommendation; `escalate_to_host` writes the handoff
  * reason; the failure dispositions write their disposition and, when present,
  * a reason (e.g. the budget bound that was exhausted, or the fail-closed
  * cause of a sol-blocked gate).
  */
-function writeRecommendationFile(missionDir, { missionId, disposition, recommendation, reason, gate, lastCorrectionDetail }) {
+function writeRecommendationFile(missionDir, {
+  missionId,
+  disposition,
+  recommendation,
+  reason,
+  gate,
+  lastCorrectionDetail,
+  lastCoordinatorErrorDetail,
+}) {
   const lines = [
     "# Mission recommendation",
     "",
@@ -654,6 +706,13 @@ function writeRecommendationFile(missionDir, { missionId, disposition, recommend
       lines.push("## Last brief correction");
       lines.push("");
       lines.push(String(lastCorrectionDetail).trimEnd());
+    }
+  } else if (disposition === "coordinator-failed") {
+    if (lastCoordinatorErrorDetail) {
+      lines.push("");
+      lines.push("## Last coordinator error");
+      lines.push("");
+      lines.push(String(lastCoordinatorErrorDetail).trimEnd());
     }
   }
 
@@ -1103,7 +1162,12 @@ export async function runLunaMission(input) {
 
     // A coordinator that burns the bounded error budget fails closed.
     if ((record.coordinatorErrors ?? 0) >= coordinatorErrorCap) {
-      outcome = { disposition: "coordinator-failed", recommendation: null, handoffReason: null };
+      outcome = {
+        disposition: "coordinator-failed",
+        recommendation: null,
+        handoffReason: null,
+        reason: `coordinator error budget exhausted (${record.coordinatorErrors ?? 0}/${coordinatorErrorCap})`,
+      };
       break;
     }
 
@@ -1125,8 +1189,16 @@ export async function runLunaMission(input) {
         dispatchIndex,
       });
     } catch (err) {
-      recordError(`evidence envelope build failed: ${err.message}`);
-      outcome = { disposition: "coordinator-failed", recommendation: null, handoffReason: null };
+      const detail = `evidence envelope build failed: ${err.message}`;
+      recordError(detail);
+      const firstLine = detail.split(/\r?\n/)[0];
+      outcome = {
+        disposition: "coordinator-failed",
+        recommendation: null,
+        handoffReason: null,
+        reason: `coordinator error: ${firstLine}`,
+        lastCoordinatorErrorDetail: detail,
+      };
       break;
     }
     writeJson(path.join(missionDir, "evidence", `envelope-${dispatchIndex}.json`), envelope);
@@ -1150,8 +1222,16 @@ export async function runLunaMission(input) {
         auditor,
       });
     } catch (err) {
-      recordError(`coordinator dispatch failed: ${err.message}`);
-      outcome = { disposition: "coordinator-failed", recommendation: null, handoffReason: null };
+      const detail = `coordinator dispatch failed: ${err.message}`;
+      recordError(detail);
+      const firstLine = detail.split(/\r?\n/)[0];
+      outcome = {
+        disposition: "coordinator-failed",
+        recommendation: null,
+        handoffReason: null,
+        reason: `coordinator error: ${firstLine}`,
+        lastCoordinatorErrorDetail: detail,
+      };
       break;
     }
     fs.mkdirSync(path.join(missionDir, "evidence"), { recursive: true });
@@ -1282,33 +1362,9 @@ export async function runLunaMission(input) {
                 ? `${req.action} refused: the inner chain brief fails deterministic validation`
                 : `${req.action} refused: the inner chain brief fails deterministic validation\n${report}`;
             recordBriefCorrection(req.action, detail);
-
-            const details = record.briefCorrectionsDetails ?? [];
-            const lastCorrection = details[details.length - 1];
-            const prevCorrection = details.length >= 2 ? details[details.length - 2] : null;
-
-            if (prevCorrection && lastCorrection && prevCorrection.detail === lastCorrection.detail) {
-              const reason = "no progress: the same brief correction was repeated";
-              outcome = {
-                disposition: "brief-correction-exhausted",
-                recommendation: null,
-                handoffReason: null,
-                reason,
-                lastCorrectionDetail: lastCorrection.detail,
-              };
-              break mainLoop;
-            }
-
-            const maxCorrections = budget.maxBriefCorrections ?? DEFAULT_BUDGET.maxBriefCorrections;
-            if ((record.briefCorrections ?? 0) >= maxCorrections) {
-              const reason = `brief correction budget exhausted (${record.briefCorrections}/${maxCorrections})`;
-              outcome = {
-                disposition: "brief-correction-exhausted",
-                recommendation: null,
-                handoffReason: null,
-                reason,
-                lastCorrectionDetail: lastCorrection?.detail ?? detail,
-              };
+            const correctionOutcome = evaluateBriefCorrectionOutcome(record, budget);
+            if (correctionOutcome) {
+              outcome = correctionOutcome;
               break mainLoop;
             }
 
@@ -1366,6 +1422,17 @@ export async function runLunaMission(input) {
               {},
             );
           } catch (err) {
+            const { BRIEF_REFUSED_CODE } = await briefValidators();
+            if (err?.code === BRIEF_REFUSED_CODE) {
+              const detail = `${req.action} refused by the chain seam: ${err.message}`;
+              recordBriefCorrection(req.action, detail);
+              const correctionOutcome = evaluateBriefCorrectionOutcome(record, budget);
+              if (correctionOutcome) {
+                outcome = correctionOutcome;
+                break mainLoop;
+              }
+              continue;
+            }
             recordError(`${req.action} execution failed for chain ${chainId}: ${err.message}`);
             continue;
           }
@@ -1541,6 +1608,11 @@ export async function runLunaMission(input) {
   };
   saveMissionRecord(missionDir, record);
   finalizeMissionControl(missionDir, outcome.disposition === "cancelled" ? "cancelled" : "completed");
+  const lastCoordinatorErrorDetail =
+    outcome.lastCoordinatorErrorDetail ??
+    (Array.isArray(record.coordinatorErrorsDetails) && record.coordinatorErrorsDetails.length > 0
+      ? record.coordinatorErrorsDetails[record.coordinatorErrorsDetails.length - 1]?.detail
+      : null);
   writeRecommendationFile(missionDir, {
     missionId,
     disposition: outcome.disposition,
@@ -1548,6 +1620,7 @@ export async function runLunaMission(input) {
     reason: terminationReason,
     gate: outcome.gate,
     lastCorrectionDetail: outcome.lastCorrectionDetail,
+    lastCoordinatorErrorDetail,
   });
 
   // ---- exactly one terminal notification per terminal mission ----
