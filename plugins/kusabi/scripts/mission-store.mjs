@@ -51,6 +51,7 @@ export const TERMINAL_MISSION_DISPOSITIONS = new Set([
   "host-handoff",
   "sol-blocked",
   "cancelled",
+  "brief-correction-exhausted",
 ]);
 
 /**

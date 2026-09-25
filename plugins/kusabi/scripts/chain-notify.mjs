@@ -208,6 +208,23 @@ export function notifyChainTerminal(opts) {
 }
 
 /**
+ * Format an optional notification reason: collapse whitespace to a single line,
+ * and truncate to 300 characters with a trailing ellipsis if longer.
+ *
+ * @param {string|null|undefined} reason
+ * @returns {string|null}
+ */
+export function formatNotificationReason(reason) {
+  if (typeof reason !== "string") return null;
+  const collapsed = reason.replace(/\r?\n|\r/g, " ").replace(/\s+/g, " ").trim();
+  if (!collapsed) return null;
+  if (collapsed.length > 300) {
+    return collapsed.slice(0, 300) + "…";
+  }
+  return collapsed;
+}
+
+/**
  * Mission variant of the kaiba agenda insert (kusabi #531): one deduplicated
  * row per terminal MISSION, keyed on the mission id.  Fail-soft like the
  * chain variant - a missing/unreadable DB or a missing actions table is a
@@ -254,8 +271,9 @@ function insertMissionKaibaAgenda(dbPath, info, now) {
     const disposition = info.disposition ?? "none";
     const container = info.container ?? "none";
     const cwdLabel = info.cwdLabel || "unknown";
+    const reasonPart = info.reason ? ` reason=${info.reason}` : "";
     const content =
-      `Inspect ${cwdLabel} ${info.missionId} (status=${info.status}, disposition=${disposition}) ` +
+      `Inspect ${cwdLabel} ${info.missionId} (status=${info.status}, disposition=${disposition})${reasonPart} ` +
       `container=${container} - luna-show then adjudicate. inbox=${info.inboxPath}`;
 
     const insert = db.prepare(
@@ -289,9 +307,11 @@ function writeMissionInboxFile(inboxDir, missionId, info) {
   const inboxPath = path.join(inboxDir, `${missionId}.md`);
   const disposition = info.disposition ?? "none";
   const container = info.container ?? "none";
+  const reasonLine = info.reason ? `- **reason**: ${info.reason}\n` : "";
   const body = `# Mission ${missionId} - terminal\n\n` +
     `- **status**: ${info.status}\n` +
     `- **disposition**: ${disposition}\n` +
+    reasonLine +
     `- **container**: ${container}\n` +
     `- **inbox**: ${info.inboxPath}\n\n` +
     `## Next steps\n\n` +
@@ -329,12 +349,15 @@ export function notifyMissionTerminal(opts) {
     cwdLabel = "",
     env = process.env,
     now = new Date().toISOString(),
+    reason = null,
   } = opts;
 
   // Opt-out (same surface as chain notification)
   if (env.KUSABI_CHAIN_NOTIFY === "0") {
     return { skipped: true };
   }
+
+  const formattedReason = formatNotificationReason(reason);
 
   const inboxDir = path.join(stateDir, "inbox");
   const inboxPath = path.join(inboxDir, `${missionId}.md`);
@@ -345,6 +368,7 @@ export function notifyMissionTerminal(opts) {
       disposition,
       container,
       inboxPath,
+      reason: formattedReason,
     });
   } catch (err) {
     const msg = err && typeof err === "object" && "message" in err ? err.message : String(err);
@@ -361,6 +385,7 @@ export function notifyMissionTerminal(opts) {
     cwdLabel,
     inboxPath,
     author,
+    reason: formattedReason,
   }, now) === true;
 
   return { inboxPath, agendaInserted };

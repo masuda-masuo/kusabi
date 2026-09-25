@@ -586,14 +586,15 @@ describe("luna mission driver (kusabi #530 criteria 4-8)", () => {
     assert.equal(record.disposition, "recommend-accept");
   });
 
-  it("a brief draft that fails deterministic validation executes nothing and is counted as a coordinator error", async () => {
+  it("a brief draft that fails deterministic validation executes nothing and is counted as a brief correction (#577)", async () => {
     const { chain } = await runMission([
       runChainStream(INVALID_RUN_CHAIN_BRIEF),
       finishStream("recommend-accept"),
     ]);
     assert.equal(chain.calls.length, 0, "an invalid brief must never reach the seam");
     const { record } = readMission();
-    assert.ok(record.coordinatorErrors >= 1, "the refused brief must be counted");
+    assert.equal(record.coordinatorErrors, 0, "the refused brief does not increment coordinator errors");
+    assert.equal(record.briefCorrections, 1, "the refused brief is counted as a brief correction");
     assert.equal(record.disposition, "recommend-accept", "the mission may still end via a later valid finish");
   });
 
@@ -804,14 +805,12 @@ describe("mission record observability fields (kusabi #532 criterion 2)", () => 
     assert.equal(record.auditor.reasoningEffort, "high", "the auditor seat must record its reasoning effort");
   });
 
-  it("counts a deterministic brief correction alongside the coordinator error (a rejected brief is both)", async () => {
+  it("counts a deterministic brief correction on its own budget without incrementing coordinator errors (#577)", async () => {
     const badBrief = "no deliverables section at all";
     await runMission([runChainStream(badBrief), finishStream("recommend-escalate")]);
     const { record } = readMission();
-    assert.ok(record.coordinatorErrors >= 1, "the rejected brief is a coordinator error");
-    assert.ok(record.briefCorrections >= 1, "the deterministic pre-flight refusal must be counted as a brief correction");
-    assert.equal(record.briefCorrections, record.coordinatorErrors,
-      "for a pure brief-correction mission the counters agree — nothing is double-counted elsewhere");
+    assert.equal(record.coordinatorErrors, 0, "the rejected brief does not increment coordinator errors");
+    assert.equal(record.briefCorrections, 1, "the deterministic pre-flight refusal must be counted as a brief correction");
   });
 
   it("records host interventions for escalate_to_host (explicit, never inferred)", async () => {

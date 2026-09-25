@@ -540,11 +540,11 @@ describe("luna driver deterministic inner-brief signature (decisions 1-3, 5-6)",
         "no chain state may exist: the refusal happens before any chain state or seam call",
       );
       assert.equal(record.briefCorrections, 1, `exactly one brief correction must be recorded: ${name}`);
-      assert.equal(record.coordinatorErrors, 1, "a brief correction is counted alongside the coordinator error");
+      assert.equal(record.coordinatorErrors, 0, "a brief correction does not increment coordinatorErrors");
 
       // The recorded detail must name the precise defect (never a generic
       // "fails deterministic validation").
-      const details = Array.isArray(record.coordinatorErrorsDetails) ? record.coordinatorErrorsDetails : [];
+      const details = Array.isArray(record.briefCorrectionsDetails) ? record.briefCorrectionsDetails : [];
       const last = details[details.length - 1];
       assert.ok(
         last && detail.test(last.detail),
