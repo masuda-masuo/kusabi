@@ -79,6 +79,8 @@ import {
   publishWarningForBrief,
   smokeViolationReport,
   smokeBaselineReport,
+  briefRefusalError,
+  baselineRefusalError,
 } from "./chain-brief-guards.mjs";
 
 // From chain-driver.mjs (one-directional: cmd -> driver).
@@ -252,7 +254,7 @@ export async function runChainLifecycle(cwd, { flags, text, orchestrator }, opts
   // and no job exist when this fires.  A brief problem is reported whatever
   // the model config says, hence the check sits ahead of backend resolution.
   const smokeRejection = smokeViolationReport(text);
-  if (smokeRejection) throw new Error(smokeRejection);
+  if (smokeRejection) throw briefRefusalError(smokeRejection);
 
   // ---- chain-id validation (kusabi #514) ----
   // The chain id becomes a path segment under chains/, so a value containing
@@ -394,7 +396,7 @@ export async function runChainLifecycle(cwd, { flags, text, orchestrator }, opts
     callTool,
     container,
   });
-  if (baselineRejection) throw new Error(baselineRejection);
+  if (baselineRejection) throw baselineRefusalError(baselineRejection);
 
   const { chainId, chainDir } = createChainDir(stateDir, chainIdFlag ?? null);
   const maxRounds = Number(flags["max-rounds"] ?? 4); // B6: default maxRounds is 4

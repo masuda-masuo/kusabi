@@ -170,7 +170,7 @@
       },
       "smoke": {
         "type": "string",
-        "description": "Smoke: the `## Smoke` commands must be backtick-quoted bullets or fenced code-block lines, and an empty `## Smoke` heading is refused. A `baseline-red` annotation declares an entry expected to fail on the unmodified checkout \u2014 a measured mismatch there is the annotation doing its job."
+        "description": "Smoke: the `## Smoke` commands must be backtick-quoted bullets or fenced code-block lines, and an empty `## Smoke` heading is refused. Every `## Smoke` line is run on the unmodified checkout before the chain starts and must meet its expected exit there unless annotated `baseline-red`; a line that runs a file the chain will create, or checks for something the chain adds, needs `baseline-red`. An absence check with `grep`/`rg` exits 1 when nothing matches, so declare `exit 1` for it."
       },
       "frozen_tests": {
         "type": "string",
