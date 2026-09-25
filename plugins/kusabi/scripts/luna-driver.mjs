@@ -106,6 +106,7 @@ import {
   missionEvidenceItems,
   resolveLastPostChain,
 } from "./luna-sol-gate.mjs";
+import { oneLine } from "./one-line.mjs";
 
 /** The exact default seats of #530: coordinator codex/gpt-5.6-luna, auditor codex/gpt-5.6-sol. */
 export const DEFAULT_COORDINATOR_SEAT = { provider: "codex", model: "gpt-5.6-luna" };
@@ -603,11 +604,6 @@ async function defaultGuardedServeStop(cwd, stateDir) {
   }
 }
 
-function collapseSingleLine(str) {
-  if (typeof str !== "string") return "";
-  return str.replace(/\r?\n|\r/g, " ").replace(/\s+/g, " ").trim();
-}
-
 /**
  * Evaluate the deterministic brief correction outcome against the no-progress
  * rule (two consecutive identical correction details) and the maxBriefCorrections
@@ -673,7 +669,7 @@ function writeRecommendationFile(missionDir, {
     `mission: ${missionId}`,
     `disposition: ${disposition}`,
     recommendation ? `recommendation: ${recommendation}` : null,
-    reason ? `reason: ${collapseSingleLine(reason)}` : null,
+    reason ? `reason: ${oneLine(reason)}` : null,
   ].filter((line) => line !== null);
 
   if (disposition === "sol-blocked") {
@@ -683,10 +679,10 @@ function writeRecommendationFile(missionDir, {
       lines.push(`gate: ${gate.gateId} (phase: ${phase}, verdict: ${verdict})`);
       if (gate.verdictRecord && typeof gate.verdictRecord === "object") {
         if (typeof gate.verdictRecord.summary === "string" && gate.verdictRecord.summary.trim() !== "") {
-          lines.push(`summary: ${collapseSingleLine(gate.verdictRecord.summary)}`);
+          lines.push(`summary: ${oneLine(gate.verdictRecord.summary)}`);
         }
         if (typeof gate.verdictRecord.block_reason === "string" && gate.verdictRecord.block_reason.trim() !== "") {
-          lines.push(`block_reason: ${collapseSingleLine(gate.verdictRecord.block_reason)}`);
+          lines.push(`block_reason: ${oneLine(gate.verdictRecord.block_reason)}`);
         }
       }
       lines.push("");

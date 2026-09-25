@@ -10,6 +10,7 @@ import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import { DatabaseSync } from "node:sqlite";
+import { oneLine } from "./one-line.mjs";
 
 /**
  * Resolve the kaiba database path.
@@ -216,7 +217,7 @@ export function notifyChainTerminal(opts) {
  */
 export function formatNotificationReason(reason) {
   if (typeof reason !== "string") return null;
-  const collapsed = reason.replace(/\r?\n|\r/g, " ").replace(/\s+/g, " ").trim();
+  const collapsed = oneLine(reason);
   if (!collapsed) return null;
   if (collapsed.length > 300) {
     return collapsed.slice(0, 300) + "…";

@@ -19,6 +19,7 @@
 
 import { renderChainShow } from "./render-chain.mjs";
 import { renderMissionShow } from "./luna-cmd.mjs";
+import { oneLine } from "./one-line.mjs";
 
 /**
  * The stable provenance banner: one line per seat with provider/model,
@@ -77,11 +78,11 @@ export function renderGateOrigins(record) {
     );
     if ((verdict === "block" || verdict === "rework") && gate.verdictRecord && typeof gate.verdictRecord === "object") {
       if (typeof gate.verdictRecord.summary === "string") {
-        const summary = gate.verdictRecord.summary.replace(/\r?\n|\r/g, " ").replace(/\s+/g, " ").trim();
+        const summary = oneLine(gate.verdictRecord.summary);
         lines.push(`    summary: ${summary}`);
       }
       if (typeof gate.verdictRecord.block_reason === "string" && gate.verdictRecord.block_reason.trim() !== "") {
-        const blockReason = gate.verdictRecord.block_reason.replace(/\r?\n|\r/g, " ").replace(/\s+/g, " ").trim();
+        const blockReason = oneLine(gate.verdictRecord.block_reason);
         lines.push(`    block_reason: ${blockReason}`);
       }
     }
