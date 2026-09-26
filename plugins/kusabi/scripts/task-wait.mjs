@@ -27,6 +27,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { loadJob, jobDir } from "./job-store.mjs";
+import { mtimeOf, defaultSleep } from "./wait-common.mjs";
 
 /**
  * Job statuses that mean the task process is done with this job.  Written by
@@ -65,14 +66,6 @@ export class TaskWaitError extends Error {
 // ---------------------------------------------------------------------------
 // state reading
 // ---------------------------------------------------------------------------
-
-function mtimeOf(file) {
-  try {
-    return fs.statSync(file).mtimeMs;
-  } catch {
-    return 0;
-  }
-}
 
 /**
  * A read-only snapshot of one job's terminal-ness and its observable movement.
@@ -182,10 +175,6 @@ export function formatTaskDigest(snapshot, { waitedMs = 0 } = {}) {
     parts.push(`error=${err}`);
   }
   return `task ${snapshot.jobId}: ${parts.join(" ")} waited=${Math.round(waitedMs / 1000)}s`;
-}
-
-function defaultSleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 // ---------------------------------------------------------------------------

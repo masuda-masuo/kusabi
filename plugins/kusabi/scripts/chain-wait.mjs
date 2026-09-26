@@ -30,6 +30,7 @@ import path from "node:path";
 import { execFileSync } from "node:child_process";
 import { readJson } from "./state-paths.mjs";
 import { readChainControl } from "./chain-control.mjs";
+import { mtimeOf, defaultSleep } from "./wait-common.mjs";
 
 /**
  * Control-record statuses that mean the chain process is done with this chain.
@@ -84,14 +85,6 @@ export class ChainWaitError extends Error {
 // ---------------------------------------------------------------------------
 // state reading
 // ---------------------------------------------------------------------------
-
-function mtimeOf(file) {
-  try {
-    return fs.statSync(file).mtimeMs;
-  } catch {
-    return 0;
-  }
-}
 
 /** The round's disposition, which is `{disposition, reason}` on live records
  * and a bare string on some older ones. */
@@ -332,10 +325,6 @@ export function formatWaitDigest(snapshot, { waitedMs = 0 } = {}) {
  * spelling as the digest, so the two read alike in a log. */
 export function describeSnapshot(snapshot) {
   return `status=${snapshot.status} disposition=${snapshot.disposition ?? "none"} rounds=${snapshot.rounds}`;
-}
-
-function defaultSleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 // ---------------------------------------------------------------------------
