@@ -25,6 +25,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { readJson } from "./state-paths.mjs";
 import { TERMINAL_MISSION_DISPOSITIONS } from "./mission-store.mjs";
+import { mtimeOf, defaultSleep } from "./wait-common.mjs";
 
 export { TERMINAL_MISSION_DISPOSITIONS } from "./mission-store.mjs";
 
@@ -49,14 +50,6 @@ export class MissionWaitError extends Error {
     super(message);
     this.name = "MissionWaitError";
     this.code = code;
-  }
-}
-
-function mtimeOf(file) {
-  try {
-    return fs.statSync(file).mtimeMs;
-  } catch {
-    return 0;
   }
 }
 
@@ -125,10 +118,6 @@ export function formatMissionDigest(snapshot, { waitedMs = 0 } = {}) {
     `attempts=${Array.isArray(snapshot.record?.attempts) ? snapshot.record.attempts.length : 0} ` +
     `chains=${Array.isArray(snapshot.record?.chains) ? snapshot.record.chains.length : 0}` +
     `${substitution} waited=${Math.round(waitedMs / 1000)}s`;
-}
-
-function defaultSleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 /**
