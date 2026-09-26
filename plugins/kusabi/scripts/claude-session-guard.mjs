@@ -5,6 +5,7 @@ import process from "node:process";
 import { spawn } from "node:child_process";
 
 import { readJson, stateRoot } from "./state-paths.mjs";
+import { killProcessGroup } from "./backend-process-runner.mjs";
 
 // The refusal threshold used when the config names none.
 export const CLAUDE_SESSION_GUARD_DEFAULT_PERCENT = 90;
@@ -153,15 +154,6 @@ function sessionResetFrom(prose, matchIndex) {
   const line = prose.slice(lineStart, lineEnd === -1 ? undefined : lineEnd);
   const m = line.match(/resets?\s+(?:at\s+)?(.+?)\s*$/i);
   return m ? m[1].trim() : null;
-}
-
-function killProcessGroup(child) {
-  if (!child.pid) return;
-  try {
-    process.kill(-child.pid, "SIGKILL");
-  } catch {
-    try { child.kill("SIGKILL"); } catch { /* already gone */ }
-  }
 }
 
 /**
