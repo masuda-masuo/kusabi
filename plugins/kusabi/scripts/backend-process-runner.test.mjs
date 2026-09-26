@@ -325,8 +325,86 @@ describe("runBackendProcess", () => {
 // =========================================================================
 
 describe("killProcessGroup", () => {
+  const originalKill = process.kill;
+
+  afterEach(() => {
+    process.kill = originalKill;
+  });
+
   it("does not throw when child has no pid", () => {
     killProcessGroup({ pid: null });
     killProcessGroup({ pid: undefined });
+  });
+
+  it("kills process group via process.kill(-pid, \"SIGKILL\") without calling child.kill", () => {
+    let killedPid = null;
+    let killedSignal = null;
+    let childKillCalled = false;
+
+    process.kill = (pid, signal) => {
+      killedPid = pid;
+      killedSignal = signal;
+    };
+
+    try {
+      const child = {
+        pid: 12345,
+        kill: () => {
+          childKillCalled = true;
+        },
+      };
+
+      killProcessGroup(child);
+
+      assert.equal(killedPid, -12345);
+      assert.equal(killedSignal, "SIGKILL");
+      assert.equal(childKillCalled, false);
+    } finally {
+      process.kill = originalKill;
+    }
+  });
+
+  it("falls back to child.kill(\"SIGKILL\") when process.kill throws", () => {
+    const childKillSignals = [];
+
+    process.kill = () => {
+      throw new Error("process group already gone");
+    };
+
+    try {
+      const child = {
+        pid: 12345,
+        kill: (signal) => {
+          childKillSignals.push(signal);
+        },
+      };
+
+      killProcessGroup(child);
+
+      assert.deepEqual(childKillSignals, ["SIGKILL"]);
+    } finally {
+      process.kill = originalKill;
+    }
+  });
+
+  it("does not throw when both process.kill and child.kill throw", () => {
+    process.kill = () => {
+      throw new Error("process group already gone");
+    };
+
+    try {
+      const child = {
+        pid: 12345,
+        kill: () => {
+          throw new Error("child process already gone");
+        },
+      };
+
+      assert.doesNotThrow(() => {
+        killProcessGroup(child);
+      });
+    } finally {
+      process.kill = originalKill;
+    }
   });
 });

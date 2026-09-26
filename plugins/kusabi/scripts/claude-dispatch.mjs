@@ -118,6 +118,7 @@ import { durationS } from "./render.mjs";
 import { resolveCompletedResult } from "./result-recovery.mjs";
 import { deriveStopReason } from "./stop-reason.mjs";
 import { startKaibaProgressWatch } from "./kaiba-progress-watch.mjs";
+import { killProcessGroup } from "./backend-process-runner.mjs";
 import {
   claudeMcpSourcePath,
   extractSunabaMcp,
@@ -1480,28 +1481,6 @@ function describeConfigValue(raw) {
  */
 export function renderClaudeRepeatWatchdogError(tool, count) {
   return `repeat-watchdog: ${tool} called ${count} consecutive times with identical arguments on an implement phase (process killed)`;
-}
-
-// =========================================================================
-// spawn — one child per dispatch, bounded by timeoutS
-// =========================================================================
-
-/**
- * SIGKILL the whole process group of a detached child (claude AND everything
- * it spawned — its sunaba MCP server, running tool commands).  Killing only
- * the direct child would orphan the grandchildren in the shared container,
- * where their work (e.g. a long verify) keeps mutating the tree the next
- * dispatch/round is probing (kusabi #184 finding 4).
- *
- * @param {import("node:child_process").ChildProcess} child
- */
-function killProcessGroup(child) {
-  if (!child.pid) return;
-  try {
-    process.kill(-child.pid, "SIGKILL");
-  } catch {
-    try { child.kill("SIGKILL"); } catch { /* already gone */ }
-  }
 }
 
 // =========================================================================
