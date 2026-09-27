@@ -473,18 +473,112 @@ export function buildCodexPrompt({ systemPrompt, promptText }) {
 }
 
 /**
- * The `--output-schema` argument for a dispatch, or null when the phase's
- * output contract is free text.  Same contract as agy's `--json-schema`:
- * the schema is `schemas/review-output.schema.json`, the EXISTING review
- * verdict contract, re-serialised compactly so argv is stable.
+ * Project the canonical review schema into the strict subset accepted by
+ * Codex's `--output-schema` response format.
+ *
+ * This is deliberately pure: callers own the canonical input and receive a
+ * recursively cloned projection.  Codex requires every declared property to
+ * be required, so properties that are optional in the canonical schema are
+ * made nullable to preserve their original optionality.
+ *
+ * @param {unknown} schema
+ * @returns {unknown}
+ */
+export function toCodexStrictSchema(schema) {
+  if (Array.isArray(schema)) return schema.map((value) => toCodexStrictSchema(value));
+  if (schema === null || typeof schema !== "object") return schema;
+
+  const projected = {};
+  for (const [key, value] of Object.entries(schema)) {
+    if (key === "$schema" || key === "if" || key === "then" || key === "else") continue;
+    projected[key] = toCodexStrictSchema(value);
+  }
+
+  if (schema.properties && typeof schema.properties === "object" && !Array.isArray(schema.properties)) {
+    const originalRequired = new Set(Array.isArray(schema.required) ? schema.required : []);
+    projected.required = Object.keys(schema.properties);
+    projected.properties = {};
+    for (const [key, value] of Object.entries(schema.properties)) {
+      const property = toCodexStrictSchema(value);
+      if (!originalRequired.has(key) && property && typeof property === "object" && !Array.isArray(property)) {
+        if (property.type !== undefined) {
+          const types = Array.isArray(property.type) ? [...property.type] : [property.type];
+          if (!types.includes("null")) types.push("null");
+          property.type = types;
+        }
+        if (Array.isArray(property.enum) && !property.enum.includes(null)) {
+          property.enum = [...property.enum, null];
+        }
+      }
+      projected.properties[key] = property;
+    }
+  }
+
+  return projected;
+}
+
+/**
+ * Load and project the one canonical review schema.  The returned text is
+ * used only as the contents of the per-job schema file.
  *
  * @param {string|null|undefined} agent
- * @returns {string|null} Compact JSON schema text, or null.
+ * @returns {string|null}
  */
 export function codexJsonSchemaFor(agent) {
   if (agent !== REVIEW_AGENT) return null;
   const raw = fs.readFileSync(path.join(PLUGIN_ROOT, "schemas", "review-output.schema.json"), "utf8");
-  return JSON.stringify(JSON.parse(raw));
+  return JSON.stringify(toCodexStrictSchema(JSON.parse(raw)));
+}
+
+/**
+ * Remove nulls that Codex emits for properties made nullable by the strict
+ * projection.  Required canonical properties intentionally remain untouched.
+ *
+ * @param {unknown} value
+ * @param {object} schema
+ * @returns {unknown}
+ */
+export function stripCodexOptionalNulls(value, schema) {
+  if (Array.isArray(value)) {
+    return value.map((item) => stripCodexOptionalNulls(item, schema?.items));
+  }
+  if (value === null || typeof value !== "object" || !schema || typeof schema !== "object") {
+    return value;
+  }
+
+  const required = new Set(Array.isArray(schema.required) ? schema.required : []);
+  const properties = schema.properties && typeof schema.properties === "object" && !Array.isArray(schema.properties)
+    ? schema.properties
+    : {};
+  const clean = {};
+  for (const [key, child] of Object.entries(value)) {
+    if (child === null && Object.hasOwn(properties, key) && !required.has(key)) continue;
+    clean[key] = stripCodexOptionalNulls(child, properties[key]);
+  }
+  return clean;
+}
+
+/**
+ * Parse and clean a Codex review JSON result.  Malformed/non-JSON text is
+ * returned unchanged for the existing downstream parser to report.
+ *
+ * @param {string} text
+ * @returns {string}
+ */
+export function stripCodexOptionalNullsFromText(text) {
+  if (typeof text !== "string") return text;
+  let value;
+  try {
+    value = JSON.parse(text);
+  } catch {
+    return text;
+  }
+  return JSON.stringify(stripCodexOptionalNulls(value, loadCanonicalReviewSchema()));
+}
+
+function loadCanonicalReviewSchema() {
+  const raw = fs.readFileSync(path.join(PLUGIN_ROOT, "schemas", "review-output.schema.json"), "utf8");
+  return JSON.parse(raw);
 }
 
 /**
@@ -522,7 +616,7 @@ export function codexJsonSchemaFor(agent) {
  * @param {string} opts.cwd — the working directory (`-C`).
  * @param {string|null|undefined} [opts.sessionId] — the recorded thread id;
  *        present => the resume subcommand shape.
- * @param {string|null} [opts.jsonSchema] — compact schema text, or null.
+ * @param {string|null} [opts.jsonSchema] — schema file path, or null.
  * @param {Record<string, object>|null} [opts.mcpServers] — concrete worker
  *        MCP definitions; each server becomes explicit -c overrides.
  * @param {boolean} [opts.mcpEnabled] — compatibility shorthand for callers
@@ -1254,13 +1348,6 @@ export async function codexDispatch(opts) {
     ? {}
     : codexMcpServerDefinitions(codexMcpTools);
   const codexMcpEnabled = Object.keys(codexMcpDefinitions).length > 0;
-  const args = buildCodexArgs({
-    model: modelEntry,
-    cwd: opts.cwd,
-    sessionId: opts.session,
-    jsonSchema,
-    mcpServers: codexMcpDefinitions,
-  });
 
   // Deny maps arrive from the chain phases unconditionally (implementDenyTools
   // / reviewDenyTools) and from the operator's --read-only.  The canonical
@@ -1392,6 +1479,22 @@ export async function codexDispatch(opts) {
   // The dedicated home always exists (it is the child's state dir), even
   // when there is no operator auth file to bridge.
   fs.mkdirSync(codexHome, { recursive: true });
+  // The CLI consumes a path here, not schema text.  Keep the projected
+  // schema beside this job's codex-home so it cannot be confused with a
+  // shared or checked-in generated schema.
+  const codexSchemaPath = jsonSchema === null
+    ? null
+    : path.join(jobDir(stateDir, job.id), "codex-output-schema.json");
+  if (codexSchemaPath !== null) {
+    fs.writeFileSync(codexSchemaPath, jsonSchema, "utf8");
+  }
+  const args = buildCodexArgs({
+    model: modelEntry,
+    cwd: opts.cwd,
+    sessionId: opts.session,
+    jsonSchema: codexSchemaPath,
+    mcpServers: codexMcpDefinitions,
+  });
   // config.toml is intentionally not written: --ignore-user-config ignores
   // the job-owned file, so every grant is already present in argv above.
   saveJob(stateDir, job);
@@ -1544,6 +1647,9 @@ export async function codexDispatch(opts) {
       coords: { sessionId: job.sessionID },
     });
     resultText = resolved.text ?? streamAcc.assistantText;
+    if (opts.agent === REVIEW_AGENT) {
+      resultText = stripCodexOptionalNullsFromText(resultText);
+    }
     job.result = resolved.record;
     fs.writeFileSync(path.join(jobDir(stateDir, job.id), "result.md"), resultText, "utf8");
   }

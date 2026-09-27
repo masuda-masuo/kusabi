@@ -197,7 +197,7 @@ if (mode === "exit") {
 } else if (mode === "schema") {
   writeRollout(model, "high");
   emit({ type: "thread.started", thread_id: thread });
-  emit({ type: "item.completed", item: { agent_message: { text: "{\\"verdict\\":\\"approve\\"}" } } });
+  emit({ type: "item.completed", item: { agent_message: { text: "{\\"schema_version\\":1,\\"verdict\\":\\"approve\\",\\"summary\\":\\"nothing to review\\",\\"findings\\":[],\\"next_steps\\":[],\\"unverified\\":null,\\"discard_reason\\":null}" } } });
   emit({ type: "turn.completed", usage: { input_tokens: 1, output_tokens: 1 } });
   process.exit(0);
 } else if (mode === "flat") {
@@ -444,11 +444,11 @@ describe("buildCodexArgs — the measured fresh/resume contract", () => {
   });
 
   it("--output-schema rides argv only when a schema is supplied, before the stdin marker", () => {
-    const schema = '{"type":"object"}';
-    const withSchema = buildCodexArgs({ model: "gpt-5.6-sol", cwd: "/repo", sessionId: null, jsonSchema: schema });
+    const schemaPath = "/repo/codex-output-schema.json";
+    const withSchema = buildCodexArgs({ model: "gpt-5.6-sol", cwd: "/repo", sessionId: null, jsonSchema: schemaPath });
     const idx = withSchema.indexOf("--output-schema");
     assert.ok(idx >= 0);
-    assert.equal(withSchema[idx + 1], schema);
+    assert.equal(withSchema[idx + 1], schemaPath);
     assert.equal(withSchema[withSchema.length - 1], "-");
     const without = buildCodexArgs({ model: "gpt-5.6-sol", cwd: "/repo", sessionId: null, jsonSchema: null });
     assert.equal(without.includes("--output-schema"), false);
@@ -1173,13 +1173,16 @@ describe("codexDispatch (fake codex)", () => {
 
   it("--output-schema framing: argv carries the schema and the terminal JSON text is the result", async () => {
     ctx.setMode("schema");
-    const { job, resultText } = await codexDispatch(ctx.dispatchOptions({ agent: "kusabi-review" }));
+    const { job, resultText, stateDir } = await codexDispatch(ctx.dispatchOptions({ agent: "kusabi-review" }));
     assert.equal(job.status, "completed");
-    assert.equal(resultText, '{"verdict":"approve"}');
+    assert.equal(resultText, '{"schema_version":1,"verdict":"approve","summary":"nothing to review","findings":[],"next_steps":[]}');
     const argv = loggedArgs(ctx.argsLog)[0];
     const idx = argv.indexOf("--output-schema");
     assert.ok(idx >= 0, "review dispatch carries --output-schema");
-    assert.equal(argv[idx + 1], JSON.stringify(JSON.parse(codexJsonSchemaFor("kusabi-review"))));
+    const schemaPath = argv[idx + 1];
+    assert.equal(schemaPath, path.join(jobDir(stateDir, job.id), "codex-output-schema.json"));
+    assert.equal(fs.existsSync(schemaPath), true, "schema path exists at dispatch time");
+    assert.deepEqual(JSON.parse(fs.readFileSync(schemaPath, "utf8")), JSON.parse(codexJsonSchemaFor("kusabi-review")));
     assert.equal(job.jsonSchemaEnforced, true);
   });
 
