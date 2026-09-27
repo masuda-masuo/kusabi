@@ -41,6 +41,7 @@ async function translateDenyToolsForFallback(tools) {
 import { resolveCompletedResult } from "./result-recovery.mjs";
 import { deriveStopReason } from "./stop-reason.mjs";
 import { startKaibaProgressWatch } from "./kaiba-progress-watch.mjs";
+import { classifyDispatchQuotaExhaustion } from "./chain-quota.mjs";
 
 // =========================================================================
 // fail-fast retry decision — pure, exported, unit-testable
@@ -1324,14 +1325,33 @@ export async function dispatchWithFallback(opts) {
     lastJob.modelVariant = candidateBackend === "opencode" ? (model?.variant || null) : null;
     lastJob.backend = lastJob.backend || candidateBackend;
 
-    if (lastJob.status === "provider-error") {
-      const nextCandidate = i + 1 < candidates.length ? candidates[i + 1] : null;
+    // A backend-blocked quota exhaustion can arrive as an ordinary error
+    // job (notably from agy), with classification deferred until chain-run.
+    // Treat it like a provider failure only while another seat is available;
+    // the last seat must retain today's structured failure and stop behavior.
+    const quotaFailure = lastJob.failure || classifyDispatchQuotaExhaustion(lastJob.error);
+    const quotaCanAdvance = lastJob.status !== "completed"
+      && quotaFailure?.kind === "quota-exhaustion"
+      && quotaFailure.backendBlocked === true;
+    const nextCandidate = i + 1 < candidates.length ? candidates[i + 1] : null;
+    const canAdvance = lastJob.status === "provider-error"
+      || (quotaCanAdvance && nextCandidate !== null);
+
+    if (canAdvance) {
+      const fallbackMessage = quotaCanAdvance
+        ? (lastJob.error || lastJob.retry?.message || null)
+        : (lastJob.retry?.message || null);
+      const message = quotaCanAdvance
+        && typeof fallbackMessage === "string"
+        && fallbackMessage.length > 500
+        ? fallbackMessage.slice(0, 500) + "…"
+        : fallbackMessage;
       const fb = {
         from: candidate,
         to: nextCandidate,
-        reason: lastJob.retry?.reason || null,
+        reason: quotaCanAdvance ? "quota-exhaustion" : (lastJob.retry?.reason || null),
         attempt: lastJob.retry?.attempt || 0,
-        message: lastJob.retry?.message || null,
+        message,
       };
       fallbacks.push(fb);
       attempts.push({ job: lastJob, resultText: lastResultText, stateDir: lastStateDir });
@@ -1341,7 +1361,7 @@ export async function dispatchWithFallback(opts) {
       // remembered across dispatches.  A transient blip (HTTP 500, non-terminal)
       // still falls back within the current dispatch but is not poisoned for
       // later rounds.
-      if (lastJob.retry?.terminal) {
+      if (lastJob.retry?.terminal || quotaCanAdvance) {
         failedRoutes.add(candidate);
       }
 
@@ -1351,6 +1371,13 @@ export async function dispatchWithFallback(opts) {
           type: "companion.fallback",
           ...fb,
         });
+      }
+
+      // Quota exhaustion invalidates the exhausted seat conversation even
+      // when the next candidate uses the same backend.
+      if (quotaCanAdvance) {
+        currentSession = undefined;
+        currentSessionProvenance = undefined;
       }
 
       continue;
