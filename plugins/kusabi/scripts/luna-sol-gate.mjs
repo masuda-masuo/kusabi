@@ -718,6 +718,7 @@ export async function evaluateMissionGate(input) {
   }
 
   // ---- a verdict was received AND bound to the exact current gate ----
+  const findings = parsed.findings;
   if (bound.verdict === "rework") {
     const reworkCount = gatesAfterArchive.filter((g) => g && g.verdict === "rework").length;
     const nextReworkCount = reworkCount + 1;
@@ -728,6 +729,7 @@ export async function evaluateMissionGate(input) {
         disposition: "sol-blocked",
         reason: "rework-bound",
         verdictRecord: bound,
+        findings,
       };
       return {
         fired: true,
@@ -738,7 +740,7 @@ export async function evaluateMissionGate(input) {
         decision,
       };
     }
-    const gate = { ...baseGate, verdict: "rework", disposition: "verdict-recorded", verdictRecord: bound };
+    const gate = { ...baseGate, verdict: "rework", disposition: "verdict-recorded", verdictRecord: bound, findings };
     return {
       fired: true,
       outcome: "rework",
@@ -750,7 +752,7 @@ export async function evaluateMissionGate(input) {
   }
 
   if (bound.verdict === "block") {
-    const gate = { ...baseGate, verdict: "block", disposition: "verdict-recorded", verdictRecord: bound };
+    const gate = { ...baseGate, verdict: "block", disposition: "verdict-recorded", verdictRecord: bound, findings };
     return {
       fired: true,
       outcome: "block",
@@ -762,7 +764,7 @@ export async function evaluateMissionGate(input) {
   }
 
   // clear
-  const gate = { ...baseGate, verdict: "clear", disposition: "verdict-recorded", verdictRecord: bound };
+  const gate = { ...baseGate, verdict: "clear", disposition: "verdict-recorded", verdictRecord: bound, findings };
   return {
     fired: true,
     outcome: "clear",
