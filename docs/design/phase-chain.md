@@ -1017,6 +1017,36 @@ The bare form is load-bearing: it names no backend, so it moves nothing — `--m
 
 **Review dispatch never crosses backends.** `runChainDriver`'s review-dispatch fallback is backend-aware (`resolveReviewDispatch`): an explicit review seam wins; otherwise the implement dispatch is reused ONLY for a same-backend review (the pre-#192 single-dispatch contract), and a differing review backend gets the canonical dispatch of ITS backend — never the other backend's dispatch. `chain-resume` additionally passes an ALWAYS-explicit review seam (`resolveResumeDispatches`): an opencode review resumes on the plain opencode dispatch, a claude review on the clamped claude dispatch pinned to the recorded `reviewModel`. (Bug fixed: chain-resume of a mixed chain used to pass an undefined review seam, the driver fell back to the claude implement dispatch, and the review job silently ran on the claude CLI with the implement's model while the record claimed `reviewBackend=opencode`.)
 
+#### 3.5.11a Codex worker seats — implemented (kusabi #597)
+
+The Codex backend has two distinct surfaces. The `codex/gpt-5.6-luna`
+coordinator and `codex/gpt-5.6-sol` auditor remain MCP-less: their argv keeps
+`-c 'mcp_servers={}'`, and their job-owned `CODEX_HOME` receives no MCP
+configuration. This preserves the coordinator's mediated evidence boundary
+and the auditor's deterministic gate boundary.
+
+A Codex dispatch for a worker agent (`kusabi-implement`, `kusabi-review`,
+`kusabi-plan`, `kusabi-test-author`, or the existing Claude allowlist for
+`kusabi-investigate`) reads the operator-owned JSONC worker config seeded by
+`install-agents` at `<state root>/opencode-config/opencode/opencode.jsonc`.
+Remote servers become `url` overrides, local command arrays become
+`command` plus `args`, and configured environments become `env` overrides;
+disabled servers are skipped. Each granted server is delivered directly in
+argv as `-c mcp_servers.<name>.<key>=...`, including
+`default_tools_approval_mode = "approve"` and `enabled_tools`. The Codex
+lists are computed from the Claude backend's exported
+`allowedToolsForAgent` table, mapping `mcp__sunaba__<tool>` (and the
+equivalent shiori/kaiba names) to Codex's bare tool names. Hardcoded
+disallowed tools are filtered before argv is built.
+
+Phase and operator deny maps are applied to that same derived list. With MCP
+enabled, a denied server tool is enforced by leaving it out of
+`enabled_tools`; the job record's `codexMcpServers` and
+`codexMcpEnforcedDenies` state the exact grant and applied omissions. A deny
+that does not correspond to a granted, enforceable MCP entry remains recorded
+as unenforced. The host sandbox remains `read-only`, and all writes still go
+through sunaba in the container.
+
 #### 3.5.13 per-round rework tiering — implemented (kusabi #192 axis 2)
 
 Measured motivation (2026-08-09): a strong model's round-1 skeleton was one-shot green where a cheap model took three rounds, while cheap rework on a good skeleton was small. Axis 2 of kusabi #192 therefore tiers the implement phase **per round**: one strong round-1 model, cheap rework rounds after it. One new config key, no new CLI flags.

@@ -320,29 +320,33 @@ split (or without the field) are treated as `opencode` by readers.
 - **codex** — dispatch through the Codex CLI in headless mode
   (`codex exec --ignore-user-config --ignore-rules --skip-git-repo-check
   -C <cwd> -s read-only --json -m <model> -c 'model_reasoning_effort="high"'
-  -c 'mcp_servers={}' -`; the prompt is supplied on stdin, never argv).
+  [`-c 'mcp_servers={}'`] -`; the prompt is supplied on stdin, never argv).
   Config entries and `--model` use `codex/<model>` to select this backend,
   and v1 accepts exactly the seat ids `gpt-5.6-luna` and `gpt-5.6-sol` — a
-  `:variant` suffix or any other id is rejected. The backend is an **opt-in
-  trusted-seat evaluation**: every invocation runs in a dedicated job-owned
-  HOME/CODEX_HOME (no inherited config/rules/sessions/MCP files; the minimum
-  auth symlink to the operator's own cache is the only bridge), in the fixed
-  read-only sandbox, with reasoning effort fixed to `high` and no MCP
-  servers configured. `--read-only` is accepted (it states what the
-  invocation already enforces); `--deny` is rejected because the CLI has no
-  per-job tool-deny flags. Session resume IS supported through
-  `--session <id>` / `--resume-last` (provenance-gated like agy: only a
-  thread id a codex job recorded may be resumed), via
+  `:variant` suffix or any other id is rejected. Every invocation runs in a
+  dedicated job-owned HOME/CODEX_HOME (no inherited config/rules/sessions or
+  MCP files; the minimum auth symlink to the operator's own cache is the only
+  bridge) and the fixed read-only sandbox. Luna and Sol stay MCP-less and keep
+  the empty `mcp_servers={}` override. Worker agents
+  (`kusabi-implement`, `kusabi-review`, `kusabi-plan`,
+  `kusabi-test-author`, and the existing investigate allowlist) instead get a
+  explicit `-c mcp_servers.<name>.<key>=...` argv overrides whose MCP
+  `enabled_tools` are derived from the Claude backend's exported allowlist,
+  with hardcoded disallowed tools removed. Endpoint and command values come
+  from the operator-owned JSONC worker config seeded by `install-agents`;
+  denies are enforced by omitting the denied MCP tool from that list and are
+  recorded in `codexMcpServers` / `codexMcpEnforcedDenies`; the host boundary
+  remains read-only and writes still go through sunaba. Session resume IS
+  supported through `--session <id>` / `--resume-last` (provenance-gated
+  like agy: only a thread id a codex job recorded may be resumed), via
   `codex exec resume <thread_id>` with the sandbox and approval policy
   carried as config. After the process closes the job-owned rollout is
   cross-checked: a recorded model (or reasoning effort) different from the
   request fails the job closed with no result and no substitute model; a
   missing rollout is recorded explicitly as `unverifiable`. The built-in
-  Codex command tool remains inside the sandbox, and credential
-  non-readability is NOT claimed — the codex seat shares the operator's
-  OS-user trust boundary (documented, never described as tool-free or
-  credential-isolated). The binary is resolved through `CODEX_BIN` (default
-  `codex`).
+  Codex command tool remains inside the sandbox, and credential non-readability
+  is NOT claimed — the codex seat shares the operator's OS-user trust boundary.
+  The binary is resolved through `CODEX_BIN` (default `codex`).
 
 The claude backend mirrors the opencode agents' permission tables with two
 hardcoded `--allowedTools` allowlists (implement, review; see

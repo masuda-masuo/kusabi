@@ -70,13 +70,16 @@
 //   - `--read-only` is the FIXED invocation boundary (`-s read-only`); the
 //     sandbox is always read-only, and `--read-only` on the command line is
 //     accepted because it states what the invocation already enforces.
-//   - User-supplied `--deny` claims are rejected at the command layer
-//     (task-cmd.mjs) — the Codex CLI has no per-job tool-deny flags, so a
-//     claim kusabi cannot enforce must never be recorded as enforced.
-//   - No MCP servers are configured (`mcp_servers={}`), but Codex retains its
-//     BUILT-IN COMMAND TOOL inside the sandbox.  The backend is NEVER
-//     described as tool-free or credential-isolated; the job record carries
-//     `codexCommandTool: true` and the read-only sandbox boundary.
+//   - For Luna/Sol coordinator and auditor seats, no MCP servers are
+//     configured (`mcp_servers={}`), but Codex retains its BUILT-IN COMMAND
+//     TOOL inside the sandbox.
+//   - Worker seats get only the job-owned MCP tables derived from Claude's
+//     allowlist; a denied MCP tool is enforced by omission from
+//     `enabled_tools`.  Denies for tools outside that grant remain recorded
+//     as unenforced, never presented as applied.
+//   - The backend is NEVER described as tool-free or credential-isolated; the
+//     job record carries `codexCommandTool: true` and the fixed read-only
+//     sandbox boundary.
 
 import fs from "node:fs";
 import os from "node:os";
@@ -85,9 +88,16 @@ import process from "node:process";
 import { fileURLToPath } from "node:url";
 
 import { firstRoute, WRITE_TOOL_NAMES } from "./cli.mjs";
-import { readAgentSystemPrompt, processStartToken } from "./claude-dispatch.mjs";
+import {
+  readAgentSystemPrompt,
+  processStartToken,
+  allowedToolsForAgent,
+  applyToolDenies,
+  translateDenyTools,
+  DISALLOWED_TOOLS,
+} from "./claude-dispatch.mjs";
 import { newJobId, saveJob, jobDir, appendEvent } from "./job-store.mjs";
-import { stateDirFor, writeJson } from "./state-paths.mjs";
+import { stateDirFor, writeJson, kusabiOpencodeConfigHome } from "./state-paths.mjs";
 import { durationS } from "./render.mjs";
 import { resolveCompletedResult } from "./result-recovery.mjs";
 import { deriveStopReason } from "./stop-reason.mjs";
@@ -231,8 +241,221 @@ export function resolveCodexModel({ flag, phase, config }) {
 }
 
 // =========================================================================
-// argv + prompt construction — pure
+// MCP allowlists + worker configuration
 // =========================================================================
+//
+// The Claude backend owns the permission tables. Codex consumes the same
+// exported accessor and translates Claude's mcp__<server>__<tool> spelling to
+// the bare tool names Codex expects in each server's enabled_tools list.
+//
+// Worker endpoints and commands are operator-owned in the JSONC file seeded by
+// install-agents. The operator's ~/.codex/config.toml is never read: Codex is
+// invoked with explicit -c overrides because --ignore-user-config ignores it.
+export const CODEX_MCP_AGENTS = new Set([
+  "kusabi-implement",
+  "kusabi-review",
+  "kusabi-plan",
+  "kusabi-test-author",
+  "kusabi-investigate",
+]);
+
+function bareMcpToolName(name) {
+  const match = /^mcp__([^_]+)__([\s\S]+)$/.exec(name);
+  return match ? { server: match[1], tool: match[2] } : null;
+}
+
+/**
+ * Compute the Codex MCP grants from the Claude backend's canonical allowlist.
+ *
+ * @param {string|null|undefined} agent
+ * @param {object|null|undefined} tools - the phase/user deny map
+ * @returns {Record<string, string[]>|null} server -> enabled tool names
+ */
+export function codexMcpToolsForAgent(agent, tools = null) {
+  if (!CODEX_MCP_AGENTS.has(agent)) return null;
+
+  const deniedAllowlist = applyToolDenies(
+    allowedToolsForAgent(agent),
+    translateDenyTools(tools),
+  );
+  const disallowed = new Set(DISALLOWED_TOOLS);
+  const servers = {};
+
+  for (const name of deniedAllowlist.split(",").filter(Boolean)) {
+    const parsed = bareMcpToolName(name);
+    if (!parsed) continue;
+    const tool = `mcp__${parsed.server}__${parsed.tool}`;
+    // Codex must never receive a hardcoded disallowed tool, including the
+    // investigate-only Claude exception for issue writes.
+    if (disallowed.has(tool)) continue;
+    const list = servers[parsed.server] ?? (servers[parsed.server] = []);
+    const bare = parsed.tool === "*" ? "*" : parsed.tool;
+    if (!list.includes(bare)) list.push(bare);
+  }
+
+  return servers;
+}
+
+function stripJsoncComments(source) {
+  let out = "";
+  let quote = false;
+  let escaped = false;
+  let lineComment = false;
+  let blockComment = false;
+
+  for (let i = 0; i < source.length; i += 1) {
+    const ch = source[i];
+    const next = source[i + 1];
+    if (lineComment) {
+      if (ch === "\n") {
+        lineComment = false;
+        out += ch;
+      }
+      continue;
+    }
+    if (blockComment) {
+      if (ch === "*" && next === "/") {
+        blockComment = false;
+        i += 1;
+      } else if (ch === "\n") {
+        out += ch;
+      }
+      continue;
+    }
+    if (quote) {
+      out += ch;
+      if (escaped) escaped = false;
+      else if (ch === "\\") escaped = true;
+      else if (ch === '"') quote = false;
+      continue;
+    }
+    if (ch === '"') {
+      quote = true;
+      out += ch;
+    } else if (ch === "/" && next === "/") {
+      lineComment = true;
+      i += 1;
+    } else if (ch === "/" && next === "*") {
+      blockComment = true;
+      i += 1;
+    } else {
+      out += ch;
+    }
+  }
+  return out.replace(/,\s*([}\]])/g, "$1");
+}
+
+/**
+ * Read kusabi's operator-owned worker MCP config.
+ *
+ * @param {string} [configFile] absolute JSONC config path
+ * @returns {object}
+ */
+export function readCodexWorkerMcpConfig(
+  configFile = path.join(kusabiOpencodeConfigHome(), "opencode", "opencode.jsonc"),
+) {
+  if (!fs.existsSync(configFile)) {
+    throw new Error(`Codex worker MCP config is missing: ${configFile}`);
+  }
+  let config;
+  try {
+    config = JSON.parse(stripJsoncComments(fs.readFileSync(configFile, "utf8")));
+  } catch (err) {
+    throw new Error(`Codex worker MCP config is not valid JSONC: ${configFile}: ${err.message}`);
+  }
+  if (!config || typeof config !== "object" || Array.isArray(config)) {
+    throw new Error(`Codex worker MCP config must be an object: ${configFile}`);
+  }
+  if (!config.mcp || typeof config.mcp !== "object" || Array.isArray(config.mcp)) {
+    throw new Error(`Codex worker MCP config has no mcp object: ${configFile}`);
+  }
+  return config;
+}
+
+/**
+ * Resolve granted servers from the seeded worker config.
+ *
+ * @param {Record<string, string[]>} toolsByServer
+ * @param {string} [configFile]
+ * @returns {Record<string, object>}
+ */
+export function codexMcpServerDefinitions(
+  toolsByServer,
+  configFile = path.join(kusabiOpencodeConfigHome(), "opencode", "opencode.jsonc"),
+) {
+  const configured = readCodexWorkerMcpConfig(configFile).mcp;
+  const out = {};
+
+  for (const [server, enabledTools] of Object.entries(toolsByServer ?? {})) {
+    const entry = configured[server];
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+      throw new Error(`Codex worker MCP server "${server}" is missing from ${configFile}`);
+    }
+    if (entry.enabled === false) continue;
+
+    if (entry.type === "remote") {
+      if (typeof entry.url !== "string" || entry.url.length === 0) {
+        throw new Error(`Codex worker MCP server "${server}" has no remote url in ${configFile}`);
+      }
+      out[server] = {
+        url: server === "sunaba" && process.env.KUSABI_SUNABA_URL
+          ? process.env.KUSABI_SUNABA_URL
+          : entry.url,
+        ...(entry.environment === undefined ? {} : { env: entry.environment }),
+        enabledTools,
+      };
+      continue;
+    }
+
+    if (entry.type === "local") {
+      if (!Array.isArray(entry.command) || entry.command.length === 0 ||
+          entry.command.some((part) => typeof part !== "string" || part.length === 0)) {
+        throw new Error(`Codex worker MCP server "${server}" has no valid local command in ${configFile}`);
+      }
+      out[server] = {
+        command: entry.command[0],
+        args: entry.command.slice(1),
+        env: entry.environment ?? {},
+        enabledTools,
+      };
+      continue;
+    }
+
+    throw new Error(`Codex worker MCP server "${server}" has unsupported type in ${configFile}`);
+  }
+
+  return out;
+}
+
+function tomlLiteral(value) {
+  return JSON.stringify(value);
+}
+
+/**
+ * Add explicit Codex config overrides for the granted worker servers.
+ *
+ * @param {Record<string, object>} definitions
+ * @returns {string[]}
+ */
+export function codexMcpArgv(definitions) {
+  const args = [];
+  for (const [server, definition] of Object.entries(definitions ?? {})) {
+    const prefix = `mcp_servers.${server}`;
+    if (definition.url) args.push("-c", `${prefix}.url=${tomlLiteral(definition.url)}`);
+    if (definition.command) args.push("-c", `${prefix}.command=${tomlLiteral(definition.command)}`);
+    if (definition.args?.length) args.push("-c", `${prefix}.args=${tomlLiteral(definition.args)}`);
+    // One `-c` per env key: a JSON object is not a TOML inline table, and
+    // Codex rejects `env="{...}"` as a string where a map is expected
+    // (measured 2026-09-27, codex-cli 0.155.1).
+    for (const [key, value] of Object.entries(definition.env ?? {})) {
+      args.push("-c", `${prefix}.env.${key}=${tomlLiteral(value)}`);
+    }
+    args.push("-c", `${prefix}.enabled_tools=${tomlLiteral(definition.enabledTools)}`);
+    args.push("-c", `${prefix}.default_tools_approval_mode=${tomlLiteral("approve")}`);
+  }
+  return args;
+}
+
 
 /**
  * Compose the prompt text handed to `codex exec` on stdin.
@@ -301,9 +524,15 @@ export function codexJsonSchemaFor(agent) {
  * @param {string|null|undefined} [opts.sessionId] — the recorded thread id;
  *        present => the resume subcommand shape.
  * @param {string|null} [opts.jsonSchema] — compact schema text, or null.
+ * @param {Record<string, object>|null} [opts.mcpServers] — concrete worker
+ *        MCP definitions; each server becomes explicit -c overrides.
+ * @param {boolean} [opts.mcpEnabled] — compatibility shorthand for callers
+ *        that only need to select the MCP argv shape.
  * @returns {string[]}
  */
-export function buildCodexArgs({ model, cwd, sessionId, jsonSchema }) {
+export function buildCodexArgs({ model, cwd, sessionId, jsonSchema, mcpServers = null, mcpEnabled = false }) {
+  const mcpGranted = mcpEnabled || (mcpServers && Object.keys(mcpServers).length > 0);
+  const mcpOverrides = mcpGranted ? codexMcpArgv(mcpServers) : [];
   const common = [
     "--ignore-user-config",
     "--ignore-rules",
@@ -313,7 +542,8 @@ export function buildCodexArgs({ model, cwd, sessionId, jsonSchema }) {
   const modelAndEffort = [
     "-m", model,
     "-c", `model_reasoning_effort="${CODEX_REASONING_EFFORT}"`,
-    "-c", "mcp_servers={}",
+    ...mcpOverrides,
+    ...(mcpGranted ? [] : ["-c", "mcp_servers={}"]),
   ];
   const jsonOut = ["--json"];
   const schemaArgs = jsonSchema ? ["--output-schema", jsonSchema] : [];
@@ -979,9 +1209,9 @@ export function runCodexProcess({ bin, args, cwd, promptText, timeoutS, watchdog
  *        `codex exec resume <thread_id>` ONLY when `sessionProvenance`
  *        proves it a codex thread id; see assertNoCodexSession.
  * @param {string|null|undefined} [opts.sessionProvenance]
- * @param {object|null|undefined} [opts.tools] — deny map.  Codex takes no
- *        per-job tool-deny flags; the map is RECORDED as unenforced (the
- *        fixed read-only sandbox is the enforced write boundary).
+ * @param {object|null|undefined} [opts.tools] — deny map.  For worker
+ *        agents this is applied to the MCP enabled_tools list; for MCP-less
+ *        seats only the fixed read-only sandbox can enforce write denies.
  * @param {unknown} [opts.timeoutS] — positive finite seconds arms the outer
  *        timer; anything else arms nothing (kusabi #328).
  * @param {unknown} [opts.watchdogS] — positive finite seconds arms the
@@ -1020,11 +1250,17 @@ export async function codexDispatch(opts) {
   const timeoutS = isUsableTimeoutS(opts.timeoutS) ? opts.timeoutS : null;
   const watchdogS = isUsableTimeoutS(opts.watchdogS) ? opts.watchdogS : null;
   const jsonSchema = codexJsonSchemaFor(opts.agent);
+  const codexMcpTools = codexMcpToolsForAgent(opts.agent, opts.tools);
+  const codexMcpDefinitions = codexMcpTools === null
+    ? {}
+    : codexMcpServerDefinitions(codexMcpTools);
+  const codexMcpEnabled = Object.keys(codexMcpDefinitions).length > 0;
   const args = buildCodexArgs({
     model: modelEntry,
     cwd: opts.cwd,
     sessionId: opts.session,
     jsonSchema,
+    mcpServers: codexMcpDefinitions,
   });
 
   // Deny maps arrive from the chain phases unconditionally (implementDenyTools
@@ -1038,22 +1274,40 @@ export async function codexDispatch(opts) {
   const deniedToolNames = Object.entries(opts.tools ?? {})
     .filter(([, allowed]) => allowed === false)
     .map(([name]) => name);
-  const codexSandboxEnforcedDenies = deniedToolNames.filter((name) => WRITE_TOOL_NAMES.includes(name));
-  const unenforcedDenies = deniedToolNames.filter((name) => !WRITE_TOOL_NAMES.includes(name));
+  const codexSandboxEnforcedDenies = codexMcpEnabled
+    ? []
+    : deniedToolNames.filter((name) => WRITE_TOOL_NAMES.includes(name));
+  const translatedDeniedToolNames = Object.entries(translateDenyTools(opts.tools) ?? {})
+    .filter(([, allowed]) => allowed === false)
+    .map(([name]) => name.startsWith("sunaba_") ? `mcp__sunaba__${name.slice("sunaba_".length)}` : name);
+  const grantedMcpToolNames = new Set(
+    Object.entries(codexMcpToolsForAgent(opts.agent) ?? {}).flatMap(([server, names]) =>
+      names.includes("*") ? [] : names.map((name) => `mcp__${server}__${name}`)),
+  );
+  const codexMcpEnforcedDenies = codexMcpEnabled
+    ? translatedDeniedToolNames.filter((name) => grantedMcpToolNames.has(name))
+    : [];
+  const enforcedMcpDenies = new Set(codexMcpEnforcedDenies);
+  const unenforcedDenies = codexMcpEnabled
+    ? deniedToolNames.filter((name) => {
+      const translated = translateDenyTools({ [name]: false });
+      const normalized = Object.keys(translated ?? {}).map((key) => key.startsWith("sunaba_") ? `mcp__sunaba__${key.slice("sunaba_".length)}` : key);
+      return !normalized.some((key) => enforcedMcpDenies.has(key));
+    })
+    : deniedToolNames.filter((name) => !WRITE_TOOL_NAMES.includes(name));
 
   // The deny map as supplied (null when no tools map was passed at all) and
   // the truthful tool profile derived from it (kusabi #529 spec 8).  A
-  // no-tools dispatch records `toolDenies: null` and `toolProfile: "no-mcp"`
-  // — the only honest proof that no tools were granted.  When a deny map IS
-  // supplied the profile is "deny-map": the record carries the map and its
-  // unenforced entries and must never be mistaken for proof of no tools (the
-  // codex CLI has no per-job tool-deny flags; the fixed read-only sandbox is
-  // the enforced write boundary).
+  // no-tools dispatch records `toolDenies: null` and `toolProfile: "no-mcp"`.
+  // Worker dispatches instead record their derived MCP profile and applied
+  // omissions; a deny outside that grant remains genuinely unenforced.
   const toolDenies =
     opts.tools && typeof opts.tools === "object" && Object.keys(opts.tools).length > 0
       ? opts.tools
       : null;
-  const toolProfile = toolDenies === null ? "no-mcp" : "deny-map";
+  const toolProfile = codexMcpEnabled
+    ? (toolDenies === null ? "mcp-allowlist" : "mcp-allowlist-deny-map")
+    : (toolDenies === null ? "no-mcp" : "deny-map");
 
   // ---- job record (opencode-path shape + backend) ----
   const job = {
@@ -1083,11 +1337,13 @@ export async function codexDispatch(opts) {
     },
     // Fixed v1 invocation boundaries, recorded truthfully (capability
     // honesty): reasoning effort is always "high", the sandbox is always
-    // "read-only", no MCP servers are configured, and the built-in command
-    // tool remains inside the sandbox.  Credential isolation is NOT claimed.
+    // "read-only", and the built-in command tool remains inside the
+    // sandbox.  Worker MCP grants are job-owned and listed exactly below;
+    // credential isolation is NOT claimed.
     reasoningEffort: CODEX_REASONING_EFFORT,
     sandboxPolicy: CODEX_SANDBOX_POLICY,
-    mcpServersConfigured: false,
+    mcpServersConfigured: codexMcpEnabled,
+    codexMcpServers: codexMcpTools ?? {},
     codexCommandTool: true,
     // kusabi #529 spec 8: the truthful no-tool record.  `toolProfile:
     // "no-mcp"` and `toolDenies: null` describe a dispatch with no MCP
@@ -1108,10 +1364,11 @@ export async function codexDispatch(opts) {
     // Filled after the process closes: { state: "verified"|"unverifiable"|
     // "mismatch", ... } — see readRolloutProvenance.
     codexProvenance: null,
-    // The write-tool names denied by the tools map that the fixed read-only
-    // sandbox ENFORCES (the canonical read-only boundary) — the truthful
-    // counterpart of toolDeniesUnenforced (kusabi #527 finding 2).
+    // Without MCP, the fixed read-only sandbox is the only enforceable
+    // write boundary.  With MCP, denied tools are enforced by omission from
+    // codexMcpServers, and are recorded separately.
     codexSandboxEnforcedDenies,
+    codexMcpEnforcedDenies,
     toolDeniesUnenforced: unenforcedDenies,
     jsonSchemaEnforced: jsonSchema !== null,
     error: null,
@@ -1136,6 +1393,9 @@ export async function codexDispatch(opts) {
   // The dedicated home always exists (it is the child's state dir), even
   // when there is no operator auth file to bridge.
   fs.mkdirSync(codexHome, { recursive: true });
+  // config.toml is intentionally not written: --ignore-user-config ignores
+  // the job-owned file, so every grant is already present in argv above.
+  saveJob(stateDir, job);
   const authBridge = linkOperatorAuth(codexHome);
   const childEnv = { HOME: codexHome, CODEX_HOME: codexHome };
 
@@ -1154,7 +1414,9 @@ export async function codexDispatch(opts) {
     // The bridge KIND only — auth contents are never written to events.
     authBridge: authBridge.bridge,
     jsonSchemaEnforced: job.jsonSchemaEnforced,
+    codexMcpServers: codexMcpTools ?? {},
     codexSandboxEnforcedDenies,
+    codexMcpEnforcedDenies,
     toolDeniesUnenforced: unenforcedDenies,
   });
 
