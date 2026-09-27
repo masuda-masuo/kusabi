@@ -698,6 +698,31 @@ can explain the termination. The mission never accepts, publishes, merges,
 creates issues or creates containers; its terminal result is a host-facing
 recommendation, a host handoff, a Sol block, or a cancellation.
 
+**Standing Sol invariants and per-item verdicts.** Every Sol gate reads
+`plugins/kusabi/prompts/sol-invariants.md` at runtime. The file is the single
+standing list of invariants (`INV1` through `INV5`); its item text is rendered
+verbatim in the Sol prompt and its ids are derived from the file, so changing
+the file changes both the prompt and the required verdict entries. The mission
+brief's top-level numbered or bulleted items under `## Acceptance criteria` or
+`## Acceptance` are extracted as `AC1`, `AC2`, and so on for the current gate.
+
+New Sol verdicts use schema version 2 and retain the full validated record in
+the gate record. They include one { id, held, finding? } entry for every
+invariant and one { id, status, evidence?, note? } entry for every extracted
+criterion. A false invariant requires a finding; a `met` or `not_met` criterion
+requires evidence naming an item path in the current envelope. Finding and note
+text is bounded to 300 characters. Sol checks every invariant and every
+criterion at every gate.
+
+Validation is fail-closed: missing, duplicated, or unknown invariant/criterion
+ids; missing conditional finding/evidence; evidence not naming an envelope
+item; or `clear` with a false invariant or `not_met` criterion makes the
+verdict invalid. Such a result follows the existing malformed/rework/block
+gate handling, and a violated invariant or unmet criterion can only be
+accepted with `rework` or `block`. Historical schema-version 1 verdicts remain
+readable by replay, evaluation, show, and override paths; only newly produced
+gate verdicts require version 2.
+
 **Probe persistence bound.** Before a probe result is written to
 mission.json, its serialized payload is deterministically capped at
 `PROBE_OUTPUT_MAX_BYTES` (8192 bytes, `luna-driver.mjs`). A payload that fits

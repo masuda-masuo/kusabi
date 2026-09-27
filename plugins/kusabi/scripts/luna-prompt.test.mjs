@@ -41,6 +41,7 @@ import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import { stateDirFor, readJson, writeJson } from "./state-paths.mjs";
+import { AUDIT_VERDICT_ITEM_TEXT_MAX_LENGTH } from "./audit-verdict.mjs";
 
 // ---------------------------------------------------------------------------
 // briefs
@@ -244,7 +245,7 @@ function makeSolFake() {
       calls.push(input);
       return JSON.stringify({
         type: "verdict",
-        schema_version: 1,
+        schema_version: 2, invariants: [{ id: "INV1", held: true }, { id: "INV2", held: true }, { id: "INV3", held: true }, { id: "INV4", held: true }, { id: "INV5", held: true }], criteria: [],
         gate_id: input.envelope.gate_id,
         envelope_sha256: input.envelope.envelope_sha256,
         verdict: "clear",
@@ -384,6 +385,35 @@ describe("the real dispatch prompts carry the rendered contract (prompt-contract
     assert.ok(
       prompt.includes("e".repeat(64)),
       "the Sol prompt must bind verdicts to the current envelope hash",
+    );
+  });
+
+
+  it("criterion 2: the rendered Sol item contract follows schema fields, statuses, and bounds", async () => {
+    const { loadSolSchema, renderSolContract } = await import("./luna-prompt.mjs");
+    const schema = loadSolSchema();
+    const prompt = renderSolContract(schema);
+    const invariantItem = schema.properties.invariants.items;
+    const criterionItem = schema.properties.criteria.items;
+    for (const field of Object.keys(invariantItem.properties)) {
+      assert.ok(prompt.includes(field), `the Sol contract must mention invariant field ${field}`);
+    }
+    for (const field of Object.keys(criterionItem.properties)) {
+      assert.ok(prompt.includes(field), `the Sol contract must mention criterion field ${field}`);
+    }
+    for (const field of [...invariantItem.required, ...criterionItem.required]) {
+      assert.match(prompt, new RegExp(`required fields:.*${field}`), `required field ${field} must be stated`);
+    }
+    for (const status of criterionItem.properties.status.enum) {
+      assert.ok(prompt.includes(status), `the Sol contract must mention criterion status ${status}`);
+    }
+    assert.ok(prompt.includes(String(AUDIT_VERDICT_ITEM_TEXT_MAX_LENGTH)), "the Sol contract must state the item text bound");
+
+    const changedSchema = structuredClone(schema);
+    changedSchema.properties.criteria.items.properties.status.enum.push("deferred");
+    assert.ok(
+      renderSolContract(changedSchema).includes("deferred"),
+      "a changed schema status enum must flow into the rendered contract",
     );
   });
 

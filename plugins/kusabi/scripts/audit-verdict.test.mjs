@@ -86,7 +86,7 @@ describe("validateAuditVerdict — rejections", () => {
   });
 
   it("rejects an invalid schema_version", () => {
-    for (const version of [2, 0, -1, "1", 1.5, null, true]) {
+    for (const version of [3, 0, -1, "1", 1.5, null, true]) {
       const result = validateAuditVerdict({ ...VALID_CLEAR, schema_version: version });
       assert.equal(result.valid, false, JSON.stringify(version));
       assert.ok(result.errors.some((e) => e.path === "/schema_version"));
@@ -176,7 +176,7 @@ describe("validateAuditVerdict — rejections", () => {
   });
 
   it("exposes the versioned constants", () => {
-    assert.equal(AUDIT_VERDICT_SCHEMA_VERSION, 1);
+    assert.equal(AUDIT_VERDICT_SCHEMA_VERSION, 2);
     assert.deepEqual(AUDIT_VERDICTS, ["clear", "rework", "block"]);
   });
 });

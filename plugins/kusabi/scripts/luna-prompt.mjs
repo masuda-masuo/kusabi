@@ -35,6 +35,7 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { AUDIT_VERDICT_ITEM_TEXT_MAX_LENGTH } from "./audit-verdict.mjs";
 
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
 const COORDINATOR_SCHEMA_FILE = path.resolve(SCRIPT_DIR, "../schemas/coordinator-output.schema.json");
@@ -163,10 +164,9 @@ export function renderCoordinatorContract(schema = loadCoordinatorSchema()) {
  * Render the Sol verdict contract as deterministic guidance text, derived
  * from `schemas/audit-verdict.schema.json`.
  *
- * The rendered text states the required common fields (including `summary`)
- * and the verdict-specific fields for `block` (`block_reason` +
- * `acknowledgement_required`), matching exactly what the post-hoc validator
- * and the fail-closed gate enforce.
+ * The rendered per-item contract is derived from the schema fields, required
+ * entries, and criterion status enum. Length bounds come from the validator
+ * constant exported by `audit-verdict.mjs`.
  *
  * @param {object} [schema] — the parsed audit-verdict schema (default: the
  *        canonical file, loaded once).
@@ -178,37 +178,53 @@ export function renderSolContract(schema = loadSolSchema()) {
   const blockOnly = [...schema.then.required];
   const typeConst = schema.properties.type.const;
   const schemaVersion = schema.properties.schema_version.const;
+  const invariantItem = schema.properties.invariants.items;
+  const criterionItem = schema.properties.criteria.items;
+  const invariantFields = Object.keys(invariantItem.properties ?? {});
+  const criterionFields = Object.keys(criterionItem.properties ?? {});
+  const invariantRequired = [...(invariantItem.required ?? [])];
+  const criterionRequired = [...(criterionItem.required ?? [])];
+  const statuses = [...(criterionItem.properties?.status?.enum ?? [])];
+  const mark = String.fromCharCode(96);
+  const fields = (names) => names.map((field) => mark + field + mark).join(", ");
 
   const lines = [];
   lines.push("## Sol verdict contract (rendered from schemas/audit-verdict.schema.json)");
   lines.push("");
   lines.push("Answer with line-oriented JSON records: any finding records, then exactly one verdict");
   lines.push("record. The verdict record MUST carry every common field, and the block-only fields");
-  lines.push("when the verdict is `block`:");
+  lines.push("when the verdict is " + mark + "block" + mark + ":");
   lines.push("");
   lines.push("Common fields (every verdict):");
-  // Derive the common-field statements from the schema's `required` array so
-  // the rendered contract and the validator can never drift: a field added
-  // to the schema appears here automatically.
   const fieldNote = {
-    type: `"${typeConst}"`,
+    type: mark + typeConst + mark,
     schema_version: String(schemaVersion),
     gate_id: "the gate named in the envelope above — a verdict naming a different gate is rejected",
     envelope_sha256:
       "the current envelope hash (the 64-char lowercase hex value shown above) — a verdict bound to any other envelope is rejected as evidence-mismatch",
-    verdict: `one of ${verdicts.join(" | ")}`,
+    verdict: "one of " + verdicts.join(" | "),
     summary: "a non-empty string summarising the judgement (bounded to 500 characters)",
   };
   for (const field of commonRequired) {
-    lines.push(`- \`${field}\`: ${fieldNote[field] ?? "required"}`);
+    lines.push("- " + mark + field + mark + ": " + (fieldNote[field] ?? "required"));
   }
   lines.push("");
-  lines.push(`Block-only fields (required when \`verdict\` is "block"):`);
+  lines.push("Block-only fields (required when " + mark + "verdict" + mark + " is \"block\"):");
   for (const field of blockOnly) {
-    lines.push(`- \`${field}\`${field === "acknowledgement_required" ? ": true — the veto is not self-overrulable" : ": a non-empty reason for the block (bounded to 200 characters)"}.`);
+    const description = field === "acknowledgement_required"
+      ? "true — the veto is not self-overrulable"
+      : "a non-empty reason for the block (bounded to 200 characters)";
+    lines.push("- " + mark + field + mark + ": " + description + ".");
   }
   lines.push("");
-  lines.push(`A \`clear\` or \`rework\` verdict never carries the block-only fields; a \`block\` verdict`);
+  lines.push("Invariant entries use fields " + fields(invariantFields) + "; required fields: " + fields(invariantRequired) + ".");
+  lines.push("If " + mark + "held" + mark + " is false, " + mark + "finding" + mark + " is required and non-empty; " + mark + "finding" + mark + " is bounded to " + AUDIT_VERDICT_ITEM_TEXT_MAX_LENGTH + " characters.");
+  lines.push("");
+  lines.push("Criterion entries use fields " + fields(criterionFields) + "; required fields: " + fields(criterionRequired) + ".");
+  lines.push(mark + "status" + mark + " must be one of " + statuses.join(" | ") + ".");
+  lines.push("For " + mark + "status" + mark + " " + mark + "met" + mark + " or " + mark + "not_met" + mark + ", " + mark + "evidence" + mark + " is required and must equal an item path in the current evidence envelope; " + mark + "note" + mark + " is optional and bounded to " + AUDIT_VERDICT_ITEM_TEXT_MAX_LENGTH + " characters.");
+  lines.push("");
+  lines.push("A " + mark + "clear" + mark + " or " + mark + "rework" + mark + " verdict never carries the block-only fields; a " + mark + "block" + mark + " verdict");
   lines.push("missing any of them stays malformed and the gate fails closed.");
   return lines.join("\n");
 }

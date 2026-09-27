@@ -21,9 +21,10 @@ import { validateSchema } from "./review-validate.mjs";
 
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
 const SCHEMA_FILE = path.resolve(SCRIPT_DIR, "../schemas/audit-verdict.schema.json");
+const LEGACY_SCHEMA_FILE = path.resolve(SCRIPT_DIR, "../schemas/audit-verdict.v1.schema.json");
 
 /** Verdict schema version (mirrors `schema_version` const in the schema file). */
-export const AUDIT_VERDICT_SCHEMA_VERSION = 1;
+export const AUDIT_VERDICT_SCHEMA_VERSION = 2;
 
 /** The verdict enum — `clear` is the only clearing verdict. */
 export const AUDIT_VERDICTS = ["clear", "rework", "block"];
@@ -52,6 +53,9 @@ export const SUMMARY_MAX_LENGTH = 500;
 /** Bounded block-reason length. */
 export const BLOCK_REASON_MAX_LENGTH = 200;
 
+/** Bounded per-invariant finding and per-criterion note length. */
+export const AUDIT_VERDICT_ITEM_TEXT_MAX_LENGTH = 300;
+
 /** Every way a verdict is rejected.  `code` is the machine-readable half. */
 export class AuditVerdictError extends Error {
   constructor(message, code, details = null) {
@@ -60,6 +64,15 @@ export class AuditVerdictError extends Error {
     this.code = code;
     if (details !== null) this.details = details;
   }
+}
+
+let cachedLegacySchema = null;
+
+function loadLegacyAuditVerdictSchema() {
+  if (!cachedLegacySchema) {
+    cachedLegacySchema = JSON.parse(fs.readFileSync(LEGACY_SCHEMA_FILE, "utf8"));
+  }
+  return cachedLegacySchema;
 }
 
 let cachedSchema = null;
@@ -96,35 +109,118 @@ export function validateAuditVerdict(record, options = {}) {
     };
   }
 
-  const schema = options.schema || loadAuditVerdictSchema();
+  const schema = options.schema ||
+    (record.schema_version === 1 && options.requireV2 !== true
+      ? loadLegacyAuditVerdictSchema()
+      : loadAuditVerdictSchema());
   const errors = [];
   validateSchema(schema, record, "", options, errors);
+  if (record.schema_version !== 1 && record.schema_version !== AUDIT_VERDICT_SCHEMA_VERSION) {
+    errors.push({ path: "/schema_version", expected: "1 or " + AUDIT_VERDICT_SCHEMA_VERSION, actual: record.schema_version });
+  }
 
-  // Code-level bounds (keywords the generic validator does not implement).
-  if (typeof record.envelope_sha256 === "string" && !ENVELOPE_SHA256_RE.test(record.envelope_sha256)) {
+  if (options.requireV2 === true && record.schema_version !== AUDIT_VERDICT_SCHEMA_VERSION) {
     errors.push({
-      path: "/envelope_sha256",
-      expected: "string matching ^[0-9a-f]{64}$",
-      actual: record.envelope_sha256,
+      path: "/schema_version",
+      expected: "const " + AUDIT_VERDICT_SCHEMA_VERSION,
+      actual: record.schema_version,
     });
+  }
+
+  if (typeof record.envelope_sha256 === "string" && !ENVELOPE_SHA256_RE.test(record.envelope_sha256)) {
+    errors.push({ path: "/envelope_sha256", expected: "string matching ^[0-9a-f]{64}$", actual: record.envelope_sha256 });
   }
   if (typeof record.summary === "string" && record.summary.length > SUMMARY_MAX_LENGTH) {
-    errors.push({
-      path: "/summary",
-      expected: `string with length <= ${SUMMARY_MAX_LENGTH}`,
-      actual: record.summary.length,
-    });
+    errors.push({ path: "/summary", expected: "string with length <= " + SUMMARY_MAX_LENGTH, actual: record.summary.length });
   }
   if (typeof record.block_reason === "string" && record.block_reason.length > BLOCK_REASON_MAX_LENGTH) {
-    errors.push({
-      path: "/block_reason",
-      expected: `string with length <= ${BLOCK_REASON_MAX_LENGTH}`,
-      actual: record.block_reason.length,
+    errors.push({ path: "/block_reason", expected: "string with length <= " + BLOCK_REASON_MAX_LENGTH, actual: record.block_reason.length });
+  }
+
+  if (record.schema_version === AUDIT_VERDICT_SCHEMA_VERSION) {
+    const invariantEntries = Array.isArray(record.invariants) ? record.invariants : [];
+    const criterionEntries = Array.isArray(record.criteria) ? record.criteria : [];
+    const expectedInvariantIds = expectedIds(options.invariantIds ?? options.invariants);
+    const expectedCriterionIds = expectedIds(options.criteria ?? options.acceptanceCriteria);
+    validatePerItemIds(invariantEntries, expectedInvariantIds, "/invariants", errors);
+    validatePerItemIds(criterionEntries, expectedCriterionIds, "/criteria", errors);
+
+    invariantEntries.forEach((entry, index) => {
+      if (entry && entry.held === false) {
+        if (typeof entry.finding !== "string" || entry.finding.trim() === "") {
+          errors.push({ path: "/invariants/" + index + "/finding", expected: "required non-empty string when held is false", actual: entry.finding });
+        }
+      }
+      if (entry && typeof entry.finding === "string" && entry.finding.length > AUDIT_VERDICT_ITEM_TEXT_MAX_LENGTH) {
+        errors.push({ path: "/invariants/" + index + "/finding", expected: "string with length <= " + AUDIT_VERDICT_ITEM_TEXT_MAX_LENGTH, actual: entry.finding.length });
+      }
     });
+
+    const rawEnvelopePaths = options.envelopeItemPaths ?? options.envelopePaths;
+    const envelopePaths = new Set(
+      (Array.isArray(rawEnvelopePaths) ? rawEnvelopePaths : [])
+        .filter((value) => typeof value === "string"),
+    );
+    criterionEntries.forEach((entry, index) => {
+      if (!entry || typeof entry !== "object") return;
+      if (entry.status === "met" || entry.status === "not_met") {
+        if (typeof entry.evidence !== "string" || entry.evidence.trim() === "") {
+          errors.push({ path: "/criteria/" + index + "/evidence", expected: "required envelope item path when status is met or not_met", actual: entry.evidence });
+        } else if (!envelopePaths.has(entry.evidence)) {
+          errors.push({ path: "/criteria/" + index + "/evidence", expected: "path of an item in the current envelope", actual: entry.evidence });
+        }
+      } else if (typeof entry.evidence === "string" && !envelopePaths.has(entry.evidence)) {
+        errors.push({ path: "/criteria/" + index + "/evidence", expected: "path of an item in the current envelope", actual: entry.evidence });
+      }
+      if (typeof entry.note === "string" && entry.note.length > AUDIT_VERDICT_ITEM_TEXT_MAX_LENGTH) {
+        errors.push({ path: "/criteria/" + index + "/note", expected: "string with length <= " + AUDIT_VERDICT_ITEM_TEXT_MAX_LENGTH, actual: entry.note.length });
+      }
+    });
+
+    if (record.verdict === "clear") {
+      if (invariantEntries.some((entry) => entry && entry.held === false)) {
+        errors.push({ path: "/verdict", expected: "rework or block when an invariant is not held", actual: record.verdict });
+      }
+      if (criterionEntries.some((entry) => entry && entry.status === "not_met")) {
+        errors.push({ path: "/verdict", expected: "rework or block when a criterion is not_met", actual: record.verdict });
+      }
+    }
   }
 
   return { valid: errors.length === 0, errors };
 }
+
+function expectedIds(value) {
+  if (!Array.isArray(value)) return null;
+  return value.map((item) => typeof item === "string" ? item : item?.id).filter((id) => typeof id === "string");
+}
+
+function validatePerItemIds(entries, expected, prefix, errors) {
+  const seen = new Map();
+  entries.forEach((entry, index) => {
+    const id = entry?.id;
+    if (typeof id !== "string" || id.trim() === "") return;
+    if (seen.has(id)) {
+      errors.push({ path: prefix + "/" + index + "/id", expected: "unique id", actual: id });
+    } else {
+      seen.set(id, index);
+    }
+    if (expected && !expected.includes(id)) {
+      errors.push({ path: prefix + "/" + index + "/id", expected: "known id", actual: id });
+    }
+  });
+  if (expected) {
+    for (const id of expected) {
+      if (!seen.has(id)) errors.push({ path: prefix, expected: "entry with id " + id, actual: "missing" });
+    }
+    for (const id of new Set(expected)) {
+      if (expected.filter((candidate) => candidate === id).length > 1) {
+        errors.push({ path: prefix, expected: "unique expected ids", actual: id });
+      }
+    }
+  }
+}
+
 
 /**
  * Bind a verdict record to the gate and evidence envelope it is being judged
@@ -139,8 +235,8 @@ export function validateAuditVerdict(record, options = {}) {
  * @returns {object} the same record, unmodified, when binding holds.
  * @throws {AuditVerdictError}
  */
-export function bindAuditVerdict(record, { gateId, envelopeSha256 }) {
-  const { valid, errors } = validateAuditVerdict(record);
+export function bindAuditVerdict(record, { gateId, envelopeSha256, ...validationOptions }) {
+  const { valid, errors } = validateAuditVerdict(record, validationOptions);
   if (!valid) {
     throw new AuditVerdictError(
       `invalid audit verdict record: ${errors.map((e) => `${e.path} ${e.expected}`).join("; ")}`,
@@ -183,8 +279,8 @@ export function bindAuditVerdict(record, { gateId, envelopeSha256 }) {
  * @returns {Promise<object>} the validated, bound record.
  * @throws {AuditVerdictError}
  */
-export async function recordAuditVerdict(record, { gateId, envelopeSha256, persist } = {}) {
-  const bound = bindAuditVerdict(record, { gateId, envelopeSha256 });
+export async function recordAuditVerdict(record, { gateId, envelopeSha256, persist, ...validationOptions } = {}) {
+  const bound = bindAuditVerdict(record, { gateId, envelopeSha256, ...validationOptions });
   if (typeof persist === "function") {
     await persist(bound);
   }
