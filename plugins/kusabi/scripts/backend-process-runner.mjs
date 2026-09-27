@@ -10,6 +10,7 @@
 
 import process from "node:process";
 import { spawn } from "node:child_process";
+import { processStartToken } from "./claude-dispatch.mjs";
 
 // =========================================================================
 // shared predicates
@@ -87,8 +88,8 @@ export function killProcessGroup(child) {
  * @param {number|null} [opts.watchdogS] — the silence watchdog bound, already
  *        resolved (and floored, for agy) by the caller.  A positive finite
  *        number arms the watchdog at that interval; anything else arms none.
- * @param {(info: {pid: number}) => void} [opts.onStart] — called with the
- *        child's pid the instant it exists, so `cancel` has a lever.
+ * @param {(info: {pid: number, startTime: string|null}) => void} [opts.onStart] — called with the
+ *        child's pid and identity token the instant it exists, so `cancel` has a lever.
  * @param {(line: string) => void} [opts.onLine] — called with each complete
  *        stdout line, parsed or not; the caller folds parsed lines into its
  *        accumulator.  Wrapped: a stats-fold bug must never take down the
@@ -122,7 +123,8 @@ export function runBackendProcess({
       detached: true,
     });
     if (typeof onStart === "function" && child.pid) {
-      try { onStart({ pid: child.pid }); } catch { /* best-effort */ }
+      const startTime = processStartToken(child.pid);
+      try { onStart({ pid: child.pid, startTime }); } catch { /* best-effort */ }
     }
 
     let stdout = "";
