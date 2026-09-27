@@ -112,6 +112,36 @@ export function computeDiffStat(diffText = "", untrackedIncluded = []) {
 }
 
 /**
+ * Render bounded terminal job failure context from a chain's final round.
+ *
+ * @param {object|null|undefined} terminal
+ * @returns {string}
+ */
+function formatFailureClauses(terminal) {
+  const clauses = [];
+  for (const [phase, failureKey, errorKey] of [
+    ["implement", "implementJobFailure", "implementJobError"],
+    ["review", "reviewJobFailure", "reviewJobError"],
+  ]) {
+    const failure = terminal?.[failureKey];
+    if (failure && typeof failure === "object") {
+      const kind = typeof failure.kind === "string" && failure.kind
+        ? failure.kind
+        : "unknown";
+      const details = [];
+      if (typeof failure.backend === "string" && failure.backend) details.push(failure.backend);
+      if (typeof failure.quota === "string" && failure.quota) details.push(failure.quota);
+      if (typeof failure.reset === "string" && failure.reset) details.push(`reset ${failure.reset}`);
+      const detailText = details.length > 0 ? ` (${details.join(", ")})` : "";
+      clauses.push(`${phase} failed: ${truncateText(`${kind}${detailText}`, 120)}`);
+    } else if (typeof terminal?.[errorKey] === "string" && terminal[errorKey].trim() !== "") {
+      clauses.push(`${phase} failed: ${truncateText(terminal[errorKey], 120)}`);
+    }
+  }
+  return clauses;
+}
+
+/**
  * Pure renderer for recommendation.md (the single host-facing mission summary).
  *
  * @param {object} input
@@ -125,6 +155,7 @@ export function computeDiffStat(diffText = "", untrackedIncluded = []) {
  * @param {object} [input.record]
  * @param {string} [input.briefText]
  * @param {Object.<string, object|null>} [input.chains]
+ * @param {Object.<string, object|null>} [input.chainControls]
  * @param {Object.<string, object|null>} [input.gateEnvelopes]
  * @returns {string} the full file content
  */
@@ -140,6 +171,7 @@ export function renderRecommendation(input = {}) {
     record,
     briefText,
     chains,
+    chainControls,
     gateEnvelopes,
   } = input;
 
@@ -416,8 +448,15 @@ export function renderRecommendation(input = {}) {
         if (tokens.length > 0) probesCompact = tokens.join(" ");
       }
 
+      const chainControl = chainControls?.[cid];
+      const chainStatus = typeof chainControl?.status === "string" && chainControl.status
+        ? chainControl.status
+        : "unknown";
+      const failureClauses = formatFailureClauses(terminal);
+      const failureSuffix = failureClauses.length > 0 ? `, ${failureClauses.join(", ")}` : "";
+
       newSectionLines.push(
-        `- ${cid}: implement: ${implSeats}, review: ${revSeats}, fallbacks: ${fallbackCount}, rounds: ${rounds}, disposition: ${finalDisp}, probes: ${probesCompact}`
+        `- ${cid}: implement: ${implSeats}, review: ${revSeats}, fallbacks: ${fallbackCount}, rounds: ${rounds}, disposition: ${finalDisp}, probes: ${probesCompact}, status: ${chainStatus}${failureSuffix}`
       );
     }
   }
@@ -452,6 +491,37 @@ export function renderRecommendation(input = {}) {
         continue;
       }
 
+      const currentDiff = typeof postChain.diff === "string" ? postChain.diff : null;
+      const previousAttempt = attempts[i - 1];
+      const previousPostChain = previousAttempt?.postChain;
+      const previousDiff = previousPostChain && typeof previousPostChain.diff === "string"
+        ? previousPostChain.diff
+        : null;
+      const sameAsPrevious = currentDiff !== null &&
+        previousDiff !== null &&
+        !previousPostChain.unavailable &&
+        !previousPostChain.diffUnavailable &&
+        currentDiff === previousDiff;
+
+      const chainJson = chains?.[cid];
+      const chainControl = chainControls?.[cid];
+      const terminal = chainJson && typeof chainJson === "object" && Array.isArray(chainJson.records)
+        ? chainJson.records[chainJson.records.length - 1]
+        : null;
+      const failedBeforeProbes = chainControl?.status === "failed" &&
+        (!Array.isArray(terminal?.probeResults) || terminal.probeResults.length === 0);
+      const failedBeforeProbesNote = failedBeforeProbes
+        ? " (chain failed before probes; stat is the worktree at failure)"
+        : "";
+
+      if (sameAsPrevious) {
+        const previousAttemptIdx = previousAttempt?.index ?? i;
+        newSectionLines.push(
+          `- attempt ${attemptIdx} (${cid}): no change since attempt ${previousAttemptIdx}${failedBeforeProbesNote}`
+        );
+        continue;
+      }
+
       const stat = computeDiffStat(postChain.diff || "", postChain.untrackedIncluded);
       let newFilesPart = "";
       if (stat.newFilesCount > 0) {
@@ -463,7 +533,7 @@ export function renderRecommendation(input = {}) {
       }
 
       newSectionLines.push(
-        `- attempt ${attemptIdx} (${cid}): ${stat.filesCount} file${stat.filesCount === 1 ? "" : "s"} changed, +${stat.additions}/-${stat.deletions} lines${newFilesPart}${truncPart}`
+        `- attempt ${attemptIdx} (${cid}): ${stat.filesCount} file${stat.filesCount === 1 ? "" : "s"} changed, +${stat.additions}/-${stat.deletions} lines${newFilesPart}${truncPart}${failedBeforeProbesNote}`
       );
     }
   }
@@ -545,8 +615,21 @@ export function renderRecommendation(input = {}) {
     }
   }
 
-  // 6. Chains unreadable
+  // 6. Failed chains and unreadable chains
   for (const cid of chainIdList) {
+    const chainControl = chainControls?.[cid];
+    if (chainControl?.status === "failed") {
+      const chainJson = chains?.[cid];
+      const records = chainJson && typeof chainJson === "object" && Array.isArray(chainJson.records)
+        ? chainJson.records
+        : [];
+      const terminal = records[records.length - 1];
+      const failureClauses = formatFailureClauses(terminal);
+      const failureDetail = failureClauses.length > 0
+        ? failureClauses.join(", ")
+        : "no failure detail recorded";
+      risks.push(`- chain ${cid}: failed (${failureDetail})`);
+    }
     if (!chains || !chains[cid] || typeof chains[cid] !== "object") {
       risks.push(`- chain ${cid}: chain.json unreadable`);
     }
