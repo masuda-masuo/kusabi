@@ -719,6 +719,9 @@ export async function dispatchTaskJob(cwd, { flags, text, _dispatch = null }, op
     tiers: modelChain,
     round: 1,
     explicitModel,
+    excludedBackends: opts.excludedBackends,
+    exclusionErrorPrefix: opts.exclusionErrorPrefix,
+    excludedRouteReason: opts.excludedRouteReason,
     // Only CLI-specified --read-only/--deny restrictions are hard constraints
     // across fallback backends. Phase-default deny maps are intentionally
     // backend-specific and retain their existing fallback behavior.

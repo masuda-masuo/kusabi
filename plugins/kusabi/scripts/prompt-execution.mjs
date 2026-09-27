@@ -1174,6 +1174,9 @@ export async function dispatchWithFallback(opts) {
     tierIndex,
     explicitModel,
     explicitRestrictions = false,
+    excludedBackends = [],
+    exclusionErrorPrefix = null,
+    excludedRouteReason = "excluded by caller",
     _runPrompt,
     _agyDispatch,
     _claudeDispatch,
@@ -1183,9 +1186,27 @@ export async function dispatchWithFallback(opts) {
     ...runPromptOpts
   } = opts;
   const routeCandidates = selectRoutes({ tiers, round, tierIndex, explicitModel, failedRoutes });
+  const excludedBackendSet = new Set(excludedBackends);
+  const diagnosticRoutes = excludedBackends.length > 0
+    ? selectRoutes({ tiers, round, tierIndex, explicitModel, failedRoutes: new Set() })
+    : routeCandidates;
+  const skippedExcludedRoutes = excludedBackends.length > 0
+    ? diagnosticRoutes
+      .filter((candidate) => {
+        const { backend } = splitRouteBackend(candidate);
+        return excludedBackendSet.has(backend) || failedRoutes.has(candidate);
+      })
+      .map((route) => ({
+        route,
+        reason: excludedBackendSet.has(splitRouteBackend(route).backend)
+          ? excludedRouteReason
+          : "already failed terminally in this process",
+      }))
+    : [];
   const skippedRestrictedRoutes = [];
   const candidates = routeCandidates.filter((candidate) => {
     const { backend: candidateBackend } = splitRouteBackend(candidate);
+    if (excludedBackendSet.has(candidateBackend)) return false;
     if (explicitRestrictions && (candidateBackend === "agy" || candidateBackend === "cursor")) {
       skippedRestrictedRoutes.push({
         route: candidate,
@@ -1197,7 +1218,9 @@ export async function dispatchWithFallback(opts) {
   });
 
   if (candidates.length === 0) {
-    const errorMsg = skippedRestrictedRoutes.length > 0
+    const errorMsg = exclusionErrorPrefix && skippedExcludedRoutes.length > 0
+      ? `${exclusionErrorPrefix}: ${skippedExcludedRoutes.map((entry) => `${entry.route} — ${entry.reason}`).join("; ")}`
+      : skippedRestrictedRoutes.length > 0
       ? `No compatible routes: ${skippedRestrictedRoutes.map((entry) => `${entry.route} — ${entry.reason}`).join("; ")}`
       : explicitModel && failedRoutes.has(explicitModel)
         ? `Pinned model "${explicitModel}" has already failed terminally in this process.`
@@ -1335,7 +1358,7 @@ export async function dispatchWithFallback(opts) {
       && quotaFailure.backendBlocked === true;
     const nextCandidate = i + 1 < candidates.length ? candidates[i + 1] : null;
     const canAdvance = lastJob.status === "provider-error"
-      || (quotaCanAdvance && nextCandidate !== null);
+      || (quotaCanAdvance && (nextCandidate !== null || skippedExcludedRoutes.length > 0));
 
     if (canAdvance) {
       const fallbackMessage = quotaCanAdvance
@@ -1428,6 +1451,8 @@ export async function dispatchWithFallback(opts) {
     candidates: routeCandidates,
     fallbacks: exhaustedFallbacks,
     skippedRestrictedRoutes,
+    skippedExcludedRoutes,
+    prefix: exclusionErrorPrefix,
   });
   // Closed terminal reason (kusabi #380): every route dead is a provider-side
   // failure regardless of how the last route happened to die.
@@ -1465,13 +1490,16 @@ function attemptSteps(job) {
  * @param {string[]} opts.candidates
  * @param {{ from: string, reason: string|null, attempt: number, message: string|null }[]} opts.fallbacks
  * @param {{ route: string, reason: string }[]} [opts.skippedRestrictedRoutes]
+ * @param {{ route: string, reason: string }[]} [opts.skippedExcludedRoutes]
+ * @param {string|null} [opts.prefix]
  * @returns {string}
  */
-function renderAllExhaustedError({ candidates, fallbacks, skippedRestrictedRoutes = [] }) {
-  const parts = ["All routes exhausted:"];
+function renderAllExhaustedError({ candidates, fallbacks, skippedRestrictedRoutes = [], skippedExcludedRoutes = [], prefix = null }) {
+  const parts = [prefix ? `${prefix}:` : "All routes exhausted:"];
   for (const c of candidates) {
     const fb = fallbacks.find(function (f) { return f.from === c; });
-    const skipped = skippedRestrictedRoutes.find(function (entry) { return entry.route === c; });
+    const skipped = skippedRestrictedRoutes.find(function (entry) { return entry.route === c; })
+      || skippedExcludedRoutes.find(function (entry) { return entry.route === c; });
     if (fb) {
       parts.push(`  ${c} — ${fb.reason || "retry"} at attempt ${fb.attempt}${fb.message ? ": " + fb.message : ""}`);
     } else if (skipped) {
