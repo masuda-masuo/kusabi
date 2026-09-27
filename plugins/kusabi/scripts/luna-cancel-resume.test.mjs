@@ -55,6 +55,7 @@ import path from "node:path";
 import os from "node:os";
 import { DatabaseSync } from "node:sqlite";
 import { stateDirFor, readJson, writeJson } from "./state-paths.mjs";
+import { stubInvestigationSeams } from "./fixtures.mjs";
 import { TERMINAL_MISSION_DISPOSITIONS } from "./mission-store.mjs";
 import { readMissionSnapshot } from "./luna-wait.mjs";
 
@@ -321,6 +322,7 @@ describe("luna-cancel / luna-resume (kusabi #531 criteria 3, 4, 5, 8)", () => {
     const sol = makeSol();
     const notify = makeNotify();
     const realDriverInput = {
+      ...stubInvestigationSeams(),
       coordinatorDispatch: coord.dispatch,
       runChainLifecycle: chain.run,
       callTool: tools.callTool,
@@ -442,6 +444,7 @@ describe("luna-cancel / luna-resume (kusabi #531 criteria 3, 4, 5, 8)", () => {
       allowSubstitute: false,
       budget: DEFAULT_BUDGET,
       inject: {
+        ...stubInvestigationSeams(),
         coordinatorDispatch: coord.dispatch,
         runChainLifecycle: chain.run,
         callTool: tools.callTool,
@@ -493,6 +496,7 @@ describe("luna-cancel / luna-resume (kusabi #531 criteria 3, 4, 5, 8)", () => {
       budget: DEFAULT_BUDGET,
       sampling: { rate: 1, salt: "v1" },
       inject: {
+        ...stubInvestigationSeams(),
         coordinatorDispatch: coord.dispatch,
         runChainLifecycle: chain.run,
         callTool: tools.callTool,
@@ -929,6 +933,7 @@ describe("luna-cancel / luna-resume (kusabi #531 criteria 3, 4, 5, 8)", () => {
         allowSubstitute: false,
         budget: DEFAULT_BUDGET,
         inject: {
+          ...stubInvestigationSeams(),
           coordinatorDispatch: coord.dispatch,
           runChainLifecycle: chain.run,
           callTool: tools.callTool,

@@ -34,6 +34,7 @@ import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import { stateDirFor, readJson, writeJson } from "./state-paths.mjs";
+import { stubInvestigationSeams } from "./fixtures.mjs";
 
 let driverModule = null;
 async function lunaDriver() {
@@ -211,6 +212,7 @@ describe("atomic batch budget preflight (frozen decisions 1-5)", () => {
       budget: DEFAULT_BUDGET,
       ...overrides,
       inject: {
+        ...stubInvestigationSeams(),
         coordinatorDispatch: coord.dispatch,
         runChainLifecycle: chain.run,
         callTool: tools.callTool,

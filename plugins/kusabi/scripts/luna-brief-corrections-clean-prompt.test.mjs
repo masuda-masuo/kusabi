@@ -160,6 +160,7 @@ describe("the real coordinator prompt keeps the clean-mission byte structure (re
 
   async function runRealCoordinatorMission() {
     const { runLunaMission } = await import("./luna-driver.mjs");
+    const { stubInvestigationSeams } = await import("./fixtures.mjs");
     const chain = { calls: [], run: async (cw, input) => { chain.calls.push({ cw, input }); return "chain"; } };
     const notifications = [];
     const result = await runLunaMission({
@@ -171,6 +172,7 @@ describe("the real coordinator prompt keeps the clean-mission byte structure (re
       allowSubstitute: false,
       budget: DEFAULT_BUDGET,
       inject: {
+        ...stubInvestigationSeams(),
         runChainLifecycle: chain.run,
         callTool: async () => ({ status: "ok", output: "canned\n" }),
         solDispatch: async (input) =>

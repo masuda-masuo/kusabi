@@ -24,6 +24,7 @@ import {
   collectPostChainEvidence,
   DEFAULT_BUDGET,
 } from "./luna-driver.mjs";
+import { stubInvestigationSeams } from "./fixtures.mjs";
 
 const DEFAULT_SEATS = {
   coordinator: { provider: "codex", model: "gpt-5.6-luna" },
@@ -611,6 +612,7 @@ describe("luna post-chain evidence (kusabi #568)", () => {
         ...DEFAULT_SEATS,
         budget: DEFAULT_BUDGET,
         inject: {
+          ...stubInvestigationSeams(),
           coordinatorDispatch: coord.dispatch,
           runChainLifecycle: fakeRunChain,
           callTool: fakeCallTool,
@@ -706,6 +708,7 @@ describe("luna post-chain evidence (kusabi #568)", () => {
         ...DEFAULT_SEATS,
         budget: DEFAULT_BUDGET,
         inject: {
+          ...stubInvestigationSeams(),
           coordinatorDispatch: coord.dispatch,
           runChainLifecycle: fakeRunChain,
           callTool: fakeCallTool,
@@ -777,6 +780,7 @@ describe("luna post-chain evidence (kusabi #568)", () => {
         ...DEFAULT_SEATS,
         budget: DEFAULT_BUDGET,
         inject: {
+          ...stubInvestigationSeams(),
           coordinatorDispatch: coord.dispatch,
           runChainLifecycle: fakeRunChain,
           callTool: fakeCallTool,
@@ -834,6 +838,7 @@ describe("luna post-chain evidence (kusabi #568)", () => {
         ...DEFAULT_SEATS,
         budget: DEFAULT_BUDGET,
         inject: {
+          ...stubInvestigationSeams(),
           coordinatorDispatch: coord.dispatch,
           runChainLifecycle: fakeRunChain,
           callTool: async () => ({ status: "ok" }),

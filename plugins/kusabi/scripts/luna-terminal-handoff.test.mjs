@@ -11,6 +11,7 @@ import {
   DEFAULT_AUDITOR_SEAT,
   runLunaMission,
 } from "./luna-driver.mjs";
+import { stubInvestigationSeams } from "./fixtures.mjs";
 import { notifyMissionTerminal, formatNotificationReason } from "./chain-notify.mjs";
 import { renderGateOrigins } from "./render-mission.mjs";
 import { TERMINAL_MISSION_DISPOSITIONS } from "./mission-store.mjs";
@@ -182,6 +183,7 @@ describe("luna terminal handoff: sol-blocked handoff and brief correction budget
       allowSubstitute: false,
       budget: DEFAULT_BUDGET,
       inject: {
+        ...stubInvestigationSeams(),
         coordinatorDispatch: coord.dispatch,
         runChainLifecycle: async () => {},
         callTool: async () => ({ status: "ok", output: "" }),
@@ -360,6 +362,7 @@ describe("luna terminal handoff: sol-blocked handoff and brief correction budget
       allowSubstitute: false,
       budget: DEFAULT_BUDGET,
       inject: {
+        ...stubInvestigationSeams(),
         coordinatorDispatch: coord.dispatch,
         runChainLifecycle: async () => {},
         callTool: async () => ({ status: "ok", output: "" }),
@@ -393,6 +396,7 @@ describe("luna terminal handoff: sol-blocked handoff and brief correction budget
       allowSubstitute: false,
       budget: DEFAULT_BUDGET,
       inject: {
+        ...stubInvestigationSeams(),
         coordinatorDispatch: coord.dispatch,
         runChainLifecycle: async () => {},
         callTool: async () => ({ status: "ok", output: "" }),
@@ -441,6 +445,7 @@ describe("luna terminal handoff: sol-blocked handoff and brief correction budget
       allowSubstitute: false,
       budget: DEFAULT_BUDGET, // maxBriefCorrections: 3
       inject: {
+        ...stubInvestigationSeams(),
         coordinatorDispatch: coord.dispatch,
         runChainLifecycle: async () => {},
         callTool: async () => ({ status: "ok", output: "" }),

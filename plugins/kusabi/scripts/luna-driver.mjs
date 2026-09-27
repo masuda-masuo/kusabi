@@ -122,7 +122,7 @@ export const DEFAULT_AUDITOR_SEAT = { provider: "codex", model: "gpt-5.6-sol" };
  * verdicts (a rework demand beyond it fails closed sol-blocked) — both
  * conservative defaults, overridable per mission like every other bound.
  */
-export const DEFAULT_BUDGET = { maxChains: 3, maxAttempts: 2, maxProbes: 5, maxConsults: 3, maxRework: 1, maxBriefCorrections: 3 };
+export const DEFAULT_BUDGET = { maxChains: 3, maxAttempts: 2, maxProbes: 5, maxConsults: 3, maxRework: 1, maxBriefCorrections: 3, maxInvestigations: 1 };
 
 /**
  * Documented byte limit for a probe result's serialized payload persisted to
@@ -326,7 +326,7 @@ function buildEvidenceEnvelope({ missionId, missionDir, brief, container, coordi
     container,
     baseSha: lastPostChain?.baseSha ?? null,
     changeScope: lastPostChain?.changeScope ?? {},
-    items: missionEvidenceItems({ brief, record, includeRemaining: true }),
+    items: missionEvidenceItems({ brief, record, includeRemaining: true, missionDir }),
     priorVerdicts: [],
     allowSubstitute: allowSubstitute === true || coordinator?.substituted !== true,
     writeFile: (p, content) => {
@@ -922,6 +922,121 @@ export function preflightBatchBudget(requests, record, budget) {
 }
 
 /**
+ * Render the investigation fact sheet artifact (kusabi #591).
+ *
+ * @param {object} input
+ * @param {string|null} input.jobId
+ * @param {string|null} input.actualModel
+ * @param {object|string|null} input.baseline
+ * @param {string} input.body
+ * @returns {string}
+ */
+export function renderFactSheet({ jobId, actualModel, baseline, body }) {
+  let baselineText = "";
+  if (typeof baseline === "string") {
+    baselineText = baseline;
+  } else if (baseline && typeof baseline === "object") {
+    const lines = [];
+    if (baseline.collected !== undefined) {
+      lines.push(`Collected tests: ${baseline.collected ?? "unavailable"}`);
+    }
+    if (baseline.gates && typeof baseline.gates === "object") {
+      if (baseline.gates.gate_passed !== undefined) {
+        lines.push(`Verify gate: ${baseline.gates.gate_passed ? "passed" : "failed"}`);
+      }
+      if (baseline.gates.lint !== undefined) {
+        lines.push(`Lint violations: ${baseline.gates.lint ?? "unavailable"}`);
+      }
+      if (baseline.gates.types !== undefined) {
+        lines.push(`Type violations: ${baseline.gates.types ?? "unavailable"}`);
+      }
+    } else if (baseline.gates !== undefined) {
+      lines.push(`Gates: ${typeof baseline.gates === "string" ? baseline.gates : JSON.stringify(baseline.gates)}`);
+    }
+    baselineText = lines.join("\n");
+  }
+
+  return [
+    `# Investigation fact sheet`,
+    ``,
+    `job: ${jobId ?? "unknown"}`,
+    `seat: ${actualModel ?? "unknown"}`,
+    ``,
+    `## Baseline`,
+    baselineText,
+    ``,
+    `## Report`,
+    body ?? "",
+  ].join("\n");
+}
+
+/**
+ * Default investigation dispatch: routes through the plan phase's configured
+ * model chain against the mission container, using agent kusabi-plan (kusabi #591).
+ * Never defaults to a codex seat (gpt-5.6-luna / gpt-5.6-sol).
+ *
+ * @param {object} input
+ * @param {string} input.cwd
+ * @param {string} input.missionId
+ * @param {string} input.missionDir
+ * @param {string} input.brief
+ * @param {string} input.container
+ * @param {Function} [input._dispatch]
+ * @returns {Promise<{ jobId: string, requestedModel: string, actualModel: string, body: string }>}
+ */
+export async function defaultInvestigationDispatch({
+  cwd,
+  brief,
+  container,
+  _dispatch = null,
+}) {
+  const instruction =
+    "Produce a fact sheet for this task: relevant code locations as file:line, risks, and candidate deliverables (paths).";
+  const prompt = `${(brief ?? "").trim()}\n\n${instruction}`;
+  const flags = { phase: "plan", container };
+
+  const { dispatchTaskJob } = await import("./task-cmd.mjs");
+  const { job, resultText } = await dispatchTaskJob(
+    cwd,
+    { flags, text: prompt, _dispatch },
+    {},
+  );
+
+  if (job.status !== "completed") {
+    throw new Error(job.error || `investigation job ${job.id} failed with status ${job.status}`);
+  }
+
+  const body = (resultText ?? "").trim();
+  if (!body) {
+    throw new Error(`investigation job ${job.id} returned empty report body`);
+  }
+
+  const firstTier = Array.isArray(job.modelChain?.[0]) ? job.modelChain[0][0] : job.modelChain?.[0];
+  const requestedModel = firstTier ?? job.modelEntry ?? "unknown";
+  const actualModel = job.modelEntry ?? requestedModel;
+
+  if (
+    actualModel.includes("gpt-5.6-luna") ||
+    actualModel.includes("gpt-5.6-sol") ||
+    job.backend === "codex"
+  ) {
+    throw new Error(`investigation cannot route to a codex seat (${actualModel})`);
+  }
+
+  return {
+    jobId: job.id,
+    requestedModel,
+    actualModel,
+    body: resultText,
+  };
+}
+
+async function defaultBaseline({ container, callTool }) {
+  const { measureBaseline } = await import("./chain-ops.mjs");
+  return measureBaseline({ callTool, container });
+}
+
+/**
  * Run a luna mission to a terminal host-facing outcome.
  *
  * The driver is re-entrant: with `input.missionId` naming an EXISTING mission
@@ -952,6 +1067,11 @@ export function preflightBatchBudget(requests, record, budget) {
  * @param {Function} [input.inject.solDispatch] — async
  *        ({ cwd, missionId, missionDir, envelope, gate, record, auditor }) =>
  *        string; default: the real gpt-5.6-sol codex dispatch.
+ * @param {Function} [input.inject.investigationDispatch] — async
+ *        ({ cwd, missionId, missionDir, brief, container }) => { jobId, requestedModel, actualModel, body };
+ *        throwing on failure.
+ * @param {Function} [input.inject.baseline] — async
+ *        ({ cwd, container }) => { collected, gates };
  * @param {Function} [input.inject.notifyMissionTerminal] — called exactly once
  *        per terminal mission with { missionId, disposition, ... }; default:
  *        one inbox record + one deduplicated kaiba agenda row.
@@ -970,6 +1090,10 @@ export async function runLunaMission(input) {
   const guardedServeStop = inject.guardedServeStop ?? defaultGuardedServeStop;
   const solDispatch = inject.solDispatch ?? realSolDispatch;
   const notifyMissionTerminal = inject.notifyMissionTerminal ?? defaultMissionNotify;
+  const baselineSeam = inject.baseline ?? ((args) => defaultBaseline({ ...args, callTool }));
+  const investigationDispatchSeam =
+    inject.investigationDispatch ??
+    ((args) => defaultInvestigationDispatch(args));
 
   // ---- exact seat resolution (refused BEFORE mission creation) ----
   const coordinator = resolveMissionSeat(input.coordinator, DEFAULT_COORDINATOR_SEAT, "coordinator", input.allowSubstitute);
@@ -1020,7 +1144,7 @@ export async function runLunaMission(input) {
 
   // Persist the effective budget on the record so show/wait can explain a
   // budget-exhausted termination (the bound and the counts that hit it).
-  record = { ...record, budget: { ...budget } };
+  record = { ...record, budget: { ...budget }, missionDir };
   saveMissionRecord(missionDir, record);
   // The coordinator error cap reuses the attempts budget: a coordinator that
   // cannot produce an executable stream within the mission's bounded attempts
@@ -1041,6 +1165,7 @@ export async function runLunaMission(input) {
   // once.  A chain that failed inside the seam still touched the serve, so it
   // still counts; a mission that never invoked a chain has nothing to clean.
   let invokedInnerChain = false;
+  let invokedInvestigation = false;
 
   // The stop predicate keys off the recorded stop request (control.json
   // stopRequestedAt).  It is checked immediately before every coordinator,
@@ -1227,6 +1352,112 @@ export async function runLunaMission(input) {
     if (result.fired) recordGates(result.gates);
     return result;
   };
+
+  const alreadyCompleted = record.investigation?.status === "completed";
+
+  if (!alreadyCompleted && outcome === null) {
+    if (stopRequested()) {
+      outcome = { disposition: "cancelled", recommendation: null, handoffReason: null, reason: "stop requested" };
+    } else {
+      const startedAt = new Date().toISOString();
+      const failInvestigation = (cause, partial = {}) => {
+        const finishedAt = new Date().toISOString();
+        record = {
+          ...record,
+          investigation: {
+            status: "failed",
+            jobId: partial.jobId ?? null,
+            phase: "plan",
+            requestedModel: partial.requestedModel ?? null,
+            actualModel: partial.actualModel ?? null,
+            startedAt,
+            finishedAt,
+            factSheetPath: null,
+            baseline: partial.baseline ?? null,
+            error: cause,
+          },
+        };
+        saveMissionRecord(missionDir, record);
+        recordHostIntervention(`investigation failed: ${cause}`);
+        outcome = {
+          disposition: "host-handoff",
+          recommendation: null,
+          handoffReason: `investigation failed: ${cause}`,
+        };
+      };
+
+      let baselineRes = null;
+      try {
+        baselineRes = await baselineSeam({ cwd, container });
+        if (!baselineRes || typeof baselineRes !== "object") {
+          throw new Error("baseline measurement returned empty or invalid result");
+        }
+      } catch (err) {
+        const cause = err?.message ?? String(err);
+        failInvestigation(cause);
+      }
+
+      if (outcome === null) {
+        let dispatchRes = null;
+        if (!investigationDispatchSeam?._isStub) {
+          invokedInvestigation = true;
+        }
+        try {
+          dispatchRes = await investigationDispatchSeam({
+            cwd,
+            missionId,
+            missionDir,
+            brief,
+            container,
+          });
+          if (!dispatchRes || typeof dispatchRes !== "object") {
+            throw new Error("investigation dispatch returned invalid or empty result");
+          }
+          if (typeof dispatchRes.body !== "string" || dispatchRes.body.trim() === "") {
+            throw new Error("investigation returned empty report body");
+          }
+        } catch (err) {
+          const cause = err?.message ?? String(err);
+          failInvestigation(cause, {
+            jobId: dispatchRes?.jobId,
+            requestedModel: dispatchRes?.requestedModel,
+            actualModel: dispatchRes?.actualModel,
+            baseline: baselineRes,
+          });
+        }
+
+        if (outcome === null) {
+          const finishedAt = new Date().toISOString();
+          const factSheetRelative = "evidence/fact-sheet.md";
+          const factSheetFull = path.join(missionDir, factSheetRelative);
+          const factSheetContent = renderFactSheet({
+            jobId: dispatchRes.jobId,
+            actualModel: dispatchRes.actualModel,
+            baseline: baselineRes,
+            body: dispatchRes.body,
+          });
+          fs.mkdirSync(path.dirname(factSheetFull), { recursive: true });
+          fs.writeFileSync(factSheetFull, factSheetContent, "utf8");
+
+          record = {
+            ...record,
+            investigation: {
+              status: "completed",
+              jobId: dispatchRes.jobId,
+              phase: "plan",
+              requestedModel: dispatchRes.requestedModel,
+              actualModel: dispatchRes.actualModel,
+              startedAt,
+              finishedAt,
+              factSheetPath: factSheetRelative,
+              baseline: baselineRes,
+            },
+          };
+          saveMissionRecord(missionDir, record);
+        }
+      }
+    }
+  }
 
   mainLoop: for (;;) {
     if (outcome !== null) break;
@@ -1736,7 +1967,7 @@ export async function runLunaMission(input) {
   // failures — but only when inner chain work was actually invoked: a mission
   // with no inner chain never invents cleanup work.  Best-effort: a cleanup
   // failure must never mask the primary terminal result.
-  if (invokedInnerChain) {
+  if (invokedInnerChain || invokedInvestigation) {
     try {
       await guardedServeStop(cwd, stateDir);
     } catch { /* best-effort — never mask the terminal result */ }

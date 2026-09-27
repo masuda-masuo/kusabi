@@ -23,7 +23,7 @@ import {
   DEFAULT_AUDITOR_SEAT,
   runLunaMission,
 } from "./luna-driver.mjs";
-import { createFakeCallTool } from "./fixtures.mjs";
+import { createFakeCallTool, stubInvestigationSeams } from "./fixtures.mjs";
 import { resolveOrchestratorRecord } from "./kusabi-companion.mjs";
 
 const j = (obj) => JSON.stringify(obj);
@@ -310,6 +310,7 @@ describe("A3 & B1: Luna driver handles seam brief refusals and coordinator failu
       allowSubstitute: false,
       budget: DEFAULT_BUDGET,
       inject: {
+        ...stubInvestigationSeams(),
         coordinatorDispatch: coord.dispatch,
         runChainLifecycle: async () => {
           seamCalls++;
@@ -357,6 +358,7 @@ describe("A3 & B1: Luna driver handles seam brief refusals and coordinator failu
       allowSubstitute: false,
       budget: DEFAULT_BUDGET,
       inject: {
+        ...stubInvestigationSeams(),
         coordinatorDispatch: coord.dispatch,
         runChainLifecycle: async () => {
           throw briefRefusalError("identical seam smoke refusal");
@@ -405,6 +407,7 @@ describe("A3 & B1: Luna driver handles seam brief refusals and coordinator failu
       allowSubstitute: false,
       budget: DEFAULT_BUDGET,
       inject: {
+        ...stubInvestigationSeams(),
         coordinatorDispatch: coord.dispatch,
         runChainLifecycle: async () => {
           seamCalls++;
@@ -448,6 +451,7 @@ describe("A3 & B1: Luna driver handles seam brief refusals and coordinator failu
       allowSubstitute: false,
       budget: DEFAULT_BUDGET,
       inject: {
+        ...stubInvestigationSeams(),
         coordinatorDispatch: async () => {
           throw new Error("subprocess exit status 137\nOOM killed by host");
         },
@@ -501,6 +505,7 @@ describe("A3 & B1: Luna driver handles seam brief refusals and coordinator failu
       allowSubstitute: false,
       budget: DEFAULT_BUDGET,
       inject: {
+        ...stubInvestigationSeams(),
         coordinatorDispatch: coord.dispatch,
         runChainLifecycle: async () => {
           seamCalls++;

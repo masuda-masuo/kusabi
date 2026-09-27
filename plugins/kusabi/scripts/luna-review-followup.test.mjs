@@ -33,6 +33,7 @@ import path from "node:path";
 import os from "node:os";
 import { spawnSync } from "node:child_process";
 import { stateDirFor, readJson, writeJson } from "./state-paths.mjs";
+import { stubInvestigationSeams } from "./fixtures.mjs";
 
 const COMPANION_SCRIPT = path.join(import.meta.dirname, "kusabi-companion.mjs");
 
@@ -222,6 +223,7 @@ describe("luna review followups (chain-mub3b6fxc819)", () => {
       budget: DEFAULT_BUDGET,
       ...(overrides.input ?? {}),
       inject: {
+        ...stubInvestigationSeams(),
         coordinatorDispatch: coord.dispatch,
         runChainLifecycle: chain.run,
         callTool: tools.callTool,
@@ -312,6 +314,7 @@ describe("luna review followups (chain-mub3b6fxc819)", () => {
       allowSubstitute: false,
       budget: DEFAULT_BUDGET,
       inject: {
+        ...stubInvestigationSeams(),
         coordinatorDispatch: coord.dispatch,
         runChainLifecycle: chain.run,
         callTool: makeToolFake().callTool,
