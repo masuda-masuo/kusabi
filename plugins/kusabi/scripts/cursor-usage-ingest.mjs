@@ -82,6 +82,7 @@ import {
   upsertCursorSessionCounter,
   deleteCursorTurnsForSession,
 } from "./metrics-db.mjs";
+import { minOrNull, maxOrNull } from "./min-max-or-null.mjs";
 
 /**
  * Parser-version suffix on the `source_file` skip-cache key.  Bump this
@@ -112,18 +113,6 @@ function sourceFileKey(filePath) {
 export function projectSlugFromCwd(cwd) {
   if (typeof cwd !== "string" || !cwd) return null;
   return cwd.replace(/[/\\]/g, "-");
-}
-
-function minOrNull(a, b) {
-  if (a === null || a === undefined) return b ?? null;
-  if (b === null || b === undefined) return a;
-  return Math.min(a, b);
-}
-
-function maxOrNull(a, b) {
-  if (a === null || a === undefined) return b ?? null;
-  if (b === null || b === undefined) return a;
-  return Math.max(a, b);
 }
 
 /**

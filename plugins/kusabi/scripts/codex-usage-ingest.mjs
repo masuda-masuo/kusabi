@@ -28,6 +28,7 @@ import {
   upsertSourceFile,
   isSourceFileUnchanged,
 } from "./metrics-db.mjs";
+import { minOrNull, maxOrNull } from "./min-max-or-null.mjs";
 
 /**
  * Parser-version suffix on the `source_file` skip-cache key.  Bump this
@@ -41,18 +42,6 @@ const SOURCE_FILE_KEY_SUFFIX = "#codex-usage:v1";
 /** Skip-cache key for one codex usage file: the path plus the parser version. */
 function sourceFileKey(filePath) {
   return `${filePath}${SOURCE_FILE_KEY_SUFFIX}`;
-}
-
-function minOrNull(a, b) {
-  if (a === null || a === undefined) return b ?? null;
-  if (b === null || b === undefined) return a;
-  return Math.min(a, b);
-}
-
-function maxOrNull(a, b) {
-  if (a === null || a === undefined) return b ?? null;
-  if (b === null || b === undefined) return a;
-  return Math.max(a, b);
 }
 
 /**

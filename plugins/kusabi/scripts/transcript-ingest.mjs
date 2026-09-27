@@ -64,6 +64,7 @@ import {
   upsertSourceFile,
   isSourceFileUnchanged,
 } from "./metrics-db.mjs";
+import { minOrNull, maxOrNull } from "./min-max-or-null.mjs";
 
 function byteLen(str) {
   return typeof str === "string" ? Buffer.byteLength(str, "utf8") : 0;
@@ -272,18 +273,6 @@ function walkJsonlFiles(dir) {
     }
   }
   return results;
-}
-
-function minOrNull(a, b) {
-  if (a === null || a === undefined) return b ?? null;
-  if (b === null || b === undefined) return a;
-  return Math.min(a, b);
-}
-
-function maxOrNull(a, b) {
-  if (a === null || a === undefined) return b ?? null;
-  if (b === null || b === undefined) return a;
-  return Math.max(a, b);
 }
 
 /**
