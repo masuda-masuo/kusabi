@@ -15,7 +15,7 @@ import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import { createHash } from "node:crypto";
-import { stateDirFor, readJson } from "./state-paths.mjs";
+import { stateDirFor, readJson, writeJson } from "./state-paths.mjs";
 import { renderEvidenceContents } from "./luna-prompt.mjs";
 import { probeEvidenceText, missionEvidenceItems, realSolDispatch } from "./luna-sol-gate.mjs";
 import { runLunaMission } from "./luna-driver.mjs";
@@ -324,15 +324,54 @@ describe("criterion 3: end-to-end runLunaMission with inlined evidence content a
     return fs.readFileSync(path.join(ctx.stateDir, "jobs", jobId, "prompt.md"), "utf8");
   }
 
+  function seedFinishedMission(missionId = "mission-finishedseed") {
+    const missionsDir = path.join(ctx.stateDir, "missions");
+    fs.mkdirSync(missionsDir, { recursive: true });
+    const missionDir = path.join(missionsDir, missionId);
+    fs.mkdirSync(missionDir, { recursive: true });
+    const missionFile = path.join(ctx.cwd, "MISSION.md");
+    writeJson(path.join(missionDir, "control.json"), {
+      missionId,
+      container: "test-cid",
+      pid: process.pid,
+      status: "running",
+    });
+    writeJson(path.join(missionDir, "mission.json"), {
+      missionId,
+      container: "test-cid",
+      missionFile,
+      pid: process.pid,
+      status: "running",
+      coordinator: DEFAULT_SEATS.coordinator,
+      auditor: DEFAULT_SEATS.auditor,
+      startedAt: new Date().toISOString(),
+      attempts: [
+        {
+          index: 1,
+          kind: "run_chain",
+          chainId: "chain-seed",
+          brief: "## Deliverables\n- test",
+          status: "completed",
+          output: "seed output",
+          at: new Date().toISOString(),
+        },
+      ],
+      chains: ["chain-seed"],
+    });
+    return missionId;
+  }
+
   it("coordinator sees probe object as inlined JSON (contains PROBE-MARKER, no [object Object]) and Sol sees inlined evidence", async () => {
     const missionFile = path.join(ctx.cwd, "MISSION.md");
     fs.writeFileSync(missionFile, MISSION_BRIEF, "utf8");
+    const missionId = seedFinishedMission();
 
     const chain = { calls: [], run: async (cw, input) => { chain.calls.push({ cw, input }); return "chain"; } };
     const notifications = [];
 
     const result = await runLunaMission({
       cwd: ctx.cwd,
+      missionId,
       missionFile,
       brief: MISSION_BRIEF,
       container: "test-cid",

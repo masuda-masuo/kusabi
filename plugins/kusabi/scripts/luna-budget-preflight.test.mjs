@@ -80,7 +80,10 @@ function makeCoordinator(streams) {
 }
 
 const probeStream = (n, pathPrefix = "p") => (input) =>
-  stream(...Array.from({ length: n }, (_, i) => line("read_probe", input.envelope.envelope_sha256, { tool: "read_file_range", path: `${pathPrefix}${i}` })));
+  stream(
+    line("run_chain", input.envelope.envelope_sha256, { brief: VALID_RUN_CHAIN_BRIEF }),
+    ...Array.from({ length: n }, (_, i) => line("read_probe", input.envelope.envelope_sha256, { tool: "read_file_range", path: `${pathPrefix}${i}` })),
+  );
 
 const chainStream = (n, action = "run_chain") => (input) =>
   stream(...Array.from({ length: n }, () => line(action, input.envelope.envelope_sha256, { brief: VALID_RUN_CHAIN_BRIEF })));
@@ -369,8 +372,8 @@ describe("atomic batch budget preflight (frozen decisions 1-5)", () => {
   it("a mixed batch over budget on probes executes zero tool AND zero chain calls", async () => {
     const { tools, chain, sol } = await runMission(
       [(input) => stream(
-        ...Array.from({ length: 4 }, (_, i) => line("read_probe", input.envelope.envelope_sha256, { tool: "read_file_range", path: `mix${i}` })),
         line("run_chain", input.envelope.envelope_sha256, { brief: VALID_RUN_CHAIN_BRIEF }),
+        ...Array.from({ length: 4 }, (_, i) => line("read_probe", input.envelope.envelope_sha256, { tool: "read_file_range", path: `mix${i}` })),
       )],
       { budget: { ...DEFAULT_BUDGET, maxProbes: 3, maxAttempts: 5, maxChains: 5 } },
     );
@@ -470,12 +473,13 @@ describe("atomic batch budget preflight (frozen decisions 1-5)", () => {
   // -------------------------------------------------------------------------
 
   it("an over-budget batch with the terminal action FIRST executes nothing (escalate_to_host does not fire)", async () => {
+    const missionId = seedMission({ chains: 1, attempts: 1, budget: { ...DEFAULT_BUDGET, maxProbes: 5 } });
     const { tools, chain, sol, coord } = await runMission(
       [(input) => stream(
         line("escalate_to_host", input.envelope.envelope_sha256, { reason: "handoff before the oversized probes" }),
         ...Array.from({ length: 6 }, (_, i) => line("read_probe", input.envelope.envelope_sha256, { tool: "read_file_range", path: `t${i}` })),
       )],
-      { budget: { ...DEFAULT_BUDGET, maxProbes: 5 } },
+      { missionId, budget: { ...DEFAULT_BUDGET, maxProbes: 5 } },
     );
     const { record } = readMission();
     assert.equal(record.disposition, "budget-exhausted", "whole-batch atomicity beats the leading terminal action");
@@ -488,12 +492,13 @@ describe("atomic batch budget preflight (frozen decisions 1-5)", () => {
   });
 
   it("an over-budget batch with the terminal action LAST executes nothing (finish does not fire)", async () => {
+    const missionId = seedMission({ chains: 1, attempts: 1, budget: { ...DEFAULT_BUDGET, maxProbes: 5 } });
     const { tools, sol, chain } = await runMission(
       [(input) => stream(
         ...Array.from({ length: 6 }, (_, i) => line("read_probe", input.envelope.envelope_sha256, { tool: "read_file_range", path: `t${i}` })),
         line("finish", input.envelope.envelope_sha256, { recommendation: "recommend-accept" }),
       )],
-      { budget: { ...DEFAULT_BUDGET, maxProbes: 5 } },
+      { missionId, budget: { ...DEFAULT_BUDGET, maxProbes: 5 } },
     );
     const { record } = readMission();
     assert.equal(record.disposition, "budget-exhausted", "whole-batch atomicity beats the trailing terminal action");
@@ -506,12 +511,13 @@ describe("atomic batch budget preflight (frozen decisions 1-5)", () => {
   });
 
   it("an over-budget batch with finish FIRST executes nothing (finish does not fire)", async () => {
+    const missionId = seedMission({ chains: 1, attempts: 1, budget: { ...DEFAULT_BUDGET, maxProbes: 5 } });
     const { sol, tools } = await runMission(
       [(input) => stream(
         line("finish", input.envelope.envelope_sha256, { recommendation: "recommend-accept" }),
         ...Array.from({ length: 6 }, (_, i) => line("read_probe", input.envelope.envelope_sha256, { tool: "read_file_range", path: `t${i}` })),
       )],
-      { budget: { ...DEFAULT_BUDGET, maxProbes: 5 } },
+      { missionId, budget: { ...DEFAULT_BUDGET, maxProbes: 5 } },
     );
     const { record } = readMission();
     assert.equal(record.disposition, "budget-exhausted", "whole-batch atomicity beats the leading finish");
@@ -528,9 +534,9 @@ describe("atomic batch budget preflight (frozen decisions 1-5)", () => {
   it("an exact-fit mixed batch executes fully and a valid terminal action completes", async () => {
     const { tools, chain, sol } = await runMission(
       [(input) => stream(
+        line("run_chain", input.envelope.envelope_sha256, { brief: VALID_RUN_CHAIN_BRIEF }),
         line("read_probe", input.envelope.envelope_sha256, { tool: "read_file_range", path: "a" }),
         line("read_probe", input.envelope.envelope_sha256, { tool: "read_file_range", path: "b" }),
-        line("run_chain", input.envelope.envelope_sha256, { brief: VALID_RUN_CHAIN_BRIEF }),
         line("consult_sol", input.envelope.envelope_sha256, { reason: "checkpoint" }),
         line("finish", input.envelope.envelope_sha256, { recommendation: "recommend-accept" }),
       )],
@@ -550,7 +556,7 @@ describe("atomic batch budget preflight (frozen decisions 1-5)", () => {
   it("a batch that fits the REMAINING probes (not just the defaults) executes normally", async () => {
     // 4 probes already persisted; maxProbes=5 leaves exactly 1 remaining — a
     // 1-probe batch must fit and run, proving the preflight counts remaining.
-    const missionId = seedMission({ probes: 4, budget: { ...DEFAULT_BUDGET, maxProbes: 5 } });
+    const missionId = seedMission({ chains: 1, attempts: 1, probes: 4, budget: { ...DEFAULT_BUDGET, maxProbes: 5 } });
     const { tools } = await runMission(
       [(input) => stream(
         line("read_probe", input.envelope.envelope_sha256, { tool: "read_file_range", path: "a" }),
@@ -569,7 +575,7 @@ describe("atomic batch budget preflight (frozen decisions 1-5)", () => {
   // -------------------------------------------------------------------------
 
   it("a batch that exceeds the REMAINING probes after persisted usage is refused with zero execution", async () => {
-    const missionId = seedMission({ probes: 5, budget: { ...DEFAULT_BUDGET, maxProbes: 5 } });
+    const missionId = seedMission({ chains: 1, attempts: 1, probes: 5, budget: { ...DEFAULT_BUDGET, maxProbes: 5 } });
     const { tools, chain, sol } = await runMission(
       [(input) => stream(
         line("read_probe", input.envelope.envelope_sha256, { tool: "read_file_range", path: "a" }),

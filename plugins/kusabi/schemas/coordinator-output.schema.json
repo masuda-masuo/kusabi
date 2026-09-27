@@ -72,7 +72,7 @@
     "properties": {
       "read_probe": {
         "type": "object",
-        "description": "tool (required, closed enum) + path (required); pattern is required when tool is search_in_container.",
+        "description": "Verify a specific claim from a finished chain against the container; not allowed before any inner chain has finished; before that, use the fact sheet or run_chain.",
         "required": [
           "tool",
           "path"

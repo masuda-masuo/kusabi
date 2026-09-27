@@ -650,7 +650,14 @@ partially executable. The closed action enum is the frozen six-verb
 - `read_probe` — mediated by the driver through an allow-listed read-only tool
   set (`read_file_range`, `search_in_container`, `list_files`); results are
   recorded and folded back into the next envelope. Luna has no tool or
-  job-spawn authority.
+  job-spawn authority. Probes are permitted ONLY after at least one inner
+  chain has finished in the mission (kusabi #593): if no inner chain has
+  finished, the probe is refused deterministically, recorded via `recordError`
+  (counting against coordinator errors, without consuming `maxProbes` or recording
+  into `record.probes`), and the rest of the batch continues. In `preflightBatchBudget`,
+  read_probes appearing before the first `run_chain`/`rework_chain` when the record
+  has no finished chain are excluded from probe demand, ensuring pre-chain probes
+  are refused by the gate instead of ending the mission `budget-exhausted`.
 - `run_chain` / `rework_chain` — bounded attempts through `runChainLifecycle`
   with a driver-minted `chain-[a-z0-9]+` id and `keepServe: true`. The brief
   is validated deterministically (a non-empty `## Deliverables` section)

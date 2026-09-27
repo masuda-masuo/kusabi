@@ -555,7 +555,7 @@ describe("luna review followups (chain-mub3b6fxc819)", () => {
     const { PROBE_OUTPUT_MAX_BYTES } = driver;
     const big = "x".repeat(20_000);
     await runMission(
-      [readProbeStream("read_file_range", "big"), finishStream("recommend-accept")],
+      [runChainStream(VALID_RUN_CHAIN_BRIEF), readProbeStream("read_file_range", "big"), finishStream("recommend-accept")],
       { inject: { callTool: makeToolFake(() => ({ status: "ok", output: big })).callTool } },
     );
     const { record } = readMission();
@@ -574,7 +574,7 @@ describe("luna review followups (chain-mub3b6fxc819)", () => {
   it("a small probe output is persisted unchanged with zero omission", async () => {
     const small = { status: "ok", output: "canned\n" };
     await runMission(
-      [readProbeStream("read_file_range", "small"), finishStream("recommend-accept")],
+      [runChainStream(VALID_RUN_CHAIN_BRIEF), readProbeStream("read_file_range", "small"), finishStream("recommend-accept")],
       { inject: { callTool: makeToolFake(() => small).callTool } },
     );
     const { record } = readMission();
