@@ -1,0 +1,20 @@
+// Fixture proves JSONC comments are accepted and values come from the worker config.
+{
+  "mcp": {
+    "sunaba": {
+      "type": "remote",
+      "url": "http://fixture-sunaba/mcp"
+    },
+    "shiori": {
+      "type": "remote",
+      "url": "http://fixture-shiori/mcp",
+      "enabled": false
+    },
+    "kaiba": {
+      "type": "local",
+      "command": ["/workspace/.venv/bin/kaiba", "--worker"],
+      "environment": {"KAIBA_AGENT": "worker"},
+      "enabled": true
+    }
+  },
+}

@@ -625,7 +625,7 @@ export function readAgentSystemPrompt(agent) {
 // dispatches with the investigate agent, but its review-shaped deny map
 // still strips issue write from the allowlist — the exception cannot grant
 // it there.
-const DISALLOWED_TOOLS = [
+export const DISALLOWED_TOOLS = [
   "mcp__sunaba__publish",
   "mcp__sunaba__sandbox_issue_write",
   "mcp__sunaba__sandbox_pr_review_write",

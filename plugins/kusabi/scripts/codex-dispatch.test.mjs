@@ -238,6 +238,16 @@ function fakeCodexContext({ model = MODEL, thread = THREAD_ID, mismatchModel = O
   fs.writeFileSync(envLog, "", "utf8");
 
   const stateRoot = path.join(tmp, "state");
+  const workerConfigDir = path.join(stateRoot, "opencode-config", "opencode");
+  fs.mkdirSync(workerConfigDir, { recursive: true });
+  fs.writeFileSync(path.join(workerConfigDir, "opencode.jsonc"), `{
+    // Test-owned worker endpoints; production reads the seeded operator file.
+    "mcp": {
+      "sunaba": { "type": "remote", "url": "http://127.0.0.1:8750/mcp" },
+      "shiori": { "type": "remote", "url": "http://127.0.0.1:8765/mcp" },
+      "kaiba": { "type": "local", "command": ["/usr/bin/kaiba"], "environment": { "KAIBA_AGENT": "worker" } }
+    }
+  }`, "utf8");
   const cwd = path.join(tmp, "cwd");
   const fakeHome = path.join(tmp, "home");
   const operatorCodexHome = path.join(tmp, "operator-codex-home");
