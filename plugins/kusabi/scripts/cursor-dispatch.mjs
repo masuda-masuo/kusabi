@@ -656,8 +656,8 @@ export async function cursorDispatch(opts) {
     promptText,
     timeoutS,
     watchdogS,
-    onStart: ({ pid }) => {
-      job.process = { pid, recordedAt: new Date().toISOString() };
+    onStart: ({ pid, startTime }) => {
+      job.process = { pid, startTime, recordedAt: new Date().toISOString() };
       saveJob(stateDir, job);
     },
     onLine,

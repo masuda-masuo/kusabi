@@ -90,7 +90,6 @@ import { fileURLToPath } from "node:url";
 import { firstRoute, WRITE_TOOL_NAMES } from "./cli.mjs";
 import {
   readAgentSystemPrompt,
-  processStartToken,
   allowedToolsForAgent,
   applyToolDenies,
   translateDenyTools,
@@ -1458,11 +1457,11 @@ export async function codexDispatch(opts) {
     timeoutS,
     watchdogS,
     env: childEnv,
-    onStart: ({ pid }) => {
-      // The identity token (claude's /proc start time) lets `cancel` verify
+    onStart: ({ pid, startTime }) => {
+      // The identity token (runner's /proc start time) lets `cancel` verify
       // the recorded pid before signalling the group (kusabi #209): a
       // recycled pid must never be killed on a stale record's say-so.
-      job.process = { pid, startTime: processStartToken(pid), recordedAt: new Date().toISOString() };
+      job.process = { pid, startTime, recordedAt: new Date().toISOString() };
       saveJob(stateDir, job);
     },
     onLine,

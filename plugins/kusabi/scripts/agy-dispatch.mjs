@@ -1391,7 +1391,7 @@ export function agyDeniedToolFromConversation({ dbPath }) {
  *        runner already merges onto `process.env`.
  * @param {number|null} [opts.timeoutS]
  * @param {number|null} [opts.watchdogS]
- * @param {(info: {pid: number}) => void} [opts.onStart]
+ * @param {(info: {pid: number, startTime: string|null}) => void} [opts.onStart]
  * @param {(line: string) => void} [opts.onLine]
  * @param {(event: {kind: "fired", silenceS: number}|{kind: "kill"}) => void}
  *        [opts.onWatchdog]
@@ -1735,8 +1735,8 @@ export async function agyDispatch(opts) {
     // decided together.
     timeoutS,
     watchdogS,
-    onStart: ({ pid }) => {
-      job.process = { pid, startTime: null, recordedAt: new Date().toISOString() };
+    onStart: ({ pid, startTime }) => {
+      job.process = { pid, startTime, recordedAt: new Date().toISOString() };
       saveJob(stateDir, job);
     },
     onLine,
