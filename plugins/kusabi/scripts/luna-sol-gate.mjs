@@ -42,7 +42,61 @@ import {
   bindAuditVerdict,
   AUDIT_VERDICTS,
 } from "./audit-verdict.mjs";
-import { renderSolContract, renderBriefCorrections, renderEvidenceContents, remainingMissionBudget } from "./luna-prompt.mjs";
+import {
+  renderSolContract,
+  renderBriefCorrections,
+  sanitizeBriefCorrectionDetail,
+  renderEvidenceContents,
+  remainingMissionBudget,
+} from "./luna-prompt.mjs";
+
+/** Bounded pending rework count rendered to coordinator. */
+export const SOL_REWORK_MAX_GATES = 3;
+
+/** The explicit instruction the coordinator sees when Sol demands rework. */
+export const SOL_REWORK_INSTRUCTION =
+  "The rework must be addressed with a rework_chain, and a finish recommend-accept without one will be re-gated.";
+
+/**
+ * Render the pending Sol rework feedback text from a mission record, or the
+ * empty string when there is no pending rework.
+ *
+ * A rework gate is pending while no subsequent attempt (run_chain or
+ * rework_chain) has executed after that gate (record.attempts.length ===
+ * gate.attemptsAtGate).  Legacy gates missing attemptsAtGate are treated as
+ * pending.  At most the 3 most recent pending rework gates are rendered, each
+ * with C0-sanitised and bounded summary text.
+ *
+ * @param {object} [record] — the persisted mission record.
+ * @returns {string}
+ */
+export function renderPendingSolRework(record = {}) {
+  const gates = Array.isArray(record?.auditGates) ? record.auditGates : [];
+  const currentAttempts = Array.isArray(record?.attempts) ? record.attempts.length : 0;
+  const pending = gates
+    .filter((g) => {
+      if (!g || typeof g !== "object") return false;
+      if (g.verdict !== "rework") return false;
+      return g.attemptsAtGate === undefined || g.attemptsAtGate === currentAttempts;
+    })
+    .slice(-SOL_REWORK_MAX_GATES);
+
+  if (pending.length === 0) return "";
+
+  const lines = [
+    SOL_REWORK_INSTRUCTION,
+    "",
+    ...pending.map((g) => {
+      const gateId = g.gateId ?? "unknown";
+      const phase = g.phase ?? "unknown";
+      const rawSummary = g.verdictRecord?.summary ?? g.summary ?? "";
+      const summary = sanitizeBriefCorrectionDetail(rawSummary);
+      const summarySuffix = summary !== "" ? `: ${summary}` : "";
+      return `- [${gateId}] (${phase})${summarySuffix}`;
+    }),
+  ];
+  return lines.join("\n");
+}
 
 /** The gate phases the frozen #531 vocabulary names. */
 export const GATE_PHASES = ["pre-dispatch", "post-chain", "pre-accept", "consult"];
@@ -173,6 +227,8 @@ export function driverLedgerText(record) {
   };
   const corrections = renderBriefCorrections(record ?? {});
   if (corrections !== "") ledger.briefCorrections = corrections;
+  const rework = renderPendingSolRework(record ?? {});
+  if (rework !== "") ledger.solRework = rework;
   return JSON.stringify(ledger);
 }
 
@@ -536,6 +592,7 @@ export async function evaluateMissionGate(input) {
     origin,
     shadowDisposition,
     evidenceFingerprint: fingerprint,
+    attemptsAtGate: Array.isArray(record?.attempts) ? record.attempts.length : 0,
   };
 
   // Stop check immediately BEFORE the Sol dispatch (criterion 4): a stop
