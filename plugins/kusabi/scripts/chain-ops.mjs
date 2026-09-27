@@ -134,6 +134,32 @@ export async function cmdChainCancel(cwd, { text }) {
 }
 
 /**
+ * Run a deterministic baseline measurement for a container.
+ * Factored out from cmdBaseline (kusabi #591).
+ *
+ * @param {object} opts
+ * @param {Function} [opts.callTool]
+ * @param {string} opts.container
+ * @returns {Promise<{ collected: number|null, gates: { gate_passed: boolean, lint: number|null, types: number|null }, raw: object|null }>}
+ */
+export async function measureBaseline({ callTool, container }) {
+  const rpc = callTool ?? (await import("./sunaba-rpc.mjs")).callTool;
+  const verifyRes = await captureVerifyBaseline(rpc, container);
+  if (!verifyRes || verifyRes.captured !== true) {
+    throw new Error(`baseline error: ${verifyRes?.error ?? "unknown error"}`);
+  }
+  return {
+    collected: verifyRes.collected ?? null,
+    gates: {
+      gate_passed: verifyRes.gate_passed === true,
+      lint: verifyRes.lint ?? null,
+      types: verifyRes.types ?? null,
+    },
+    raw: verifyRes.raw ?? null,
+  };
+}
+
+/**
  * Read-only baseline subcommand.
  * Reports collected test count, gate pass status, lint/type violation counts,
  * and optionally runs declared ## Smoke entries against pristine checkout.
@@ -182,10 +208,12 @@ export async function cmdBaseline(cwd, { flags, text }) {
 
   const { callTool } = await import("./sunaba-rpc.mjs");
 
-  const verifyRes = await captureVerifyBaseline(callTool, container);
-  if (!verifyRes || verifyRes.captured !== true) {
+  let verifyRes;
+  try {
+    verifyRes = await measureBaseline({ callTool, container });
+  } catch (err) {
     return {
-      text: `baseline error: ${verifyRes?.error ?? "unknown error"}`,
+      text: err.message,
       exitCode: 1,
     };
   }
@@ -193,9 +221,9 @@ export async function cmdBaseline(cwd, { flags, text }) {
   const lines = [
     `Baseline for container ${container}:`,
     `  Collected tests: ${verifyRes.collected ?? "unavailable"}`,
-    `  Verify gate: ${verifyRes.gate_passed ? "passed" : "failed"}`,
-    `  Lint violations: ${verifyRes.lint ?? "unavailable"}`,
-    `  Type violations: ${verifyRes.types ?? "unavailable"}`,
+    `  Verify gate: ${verifyRes.gates.gate_passed ? "passed" : "failed"}`,
+    `  Lint violations: ${verifyRes.gates.lint ?? "unavailable"}`,
+    `  Type violations: ${verifyRes.gates.types ?? "unavailable"}`,
   ];
 
   if (briefText) {

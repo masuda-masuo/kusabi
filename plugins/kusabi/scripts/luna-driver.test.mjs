@@ -39,6 +39,7 @@ import path from "node:path";
 import os from "node:os";
 import { stateDirFor, readJson, writeJson } from "./state-paths.mjs";
 import { parseCoordinatorOutput } from "./coordinator-parse.mjs";
+import { stubInvestigationSeams } from "./fixtures.mjs";
 
 let driverModule = null;
 async function lunaDriver() {
@@ -291,6 +292,7 @@ describe("luna mission driver (kusabi #530 criteria 4-8)", () => {
       budget: DEFAULT_BUDGET,
       ...overrides,
       inject: {
+        ...stubInvestigationSeams(),
         coordinatorDispatch: coord.dispatch,
         runChainLifecycle: chain.run,
         callTool: tools.callTool,
@@ -529,7 +531,12 @@ describe("luna mission driver (kusabi #530 criteria 4-8)", () => {
       ...DEFAULT_SEATS,
       allowSubstitute: false,
       budget: DEFAULT_BUDGET,
-      inject: { coordinatorDispatch: coord.dispatch, runChainLifecycle: chain.run, callTool: tools.callTool },
+      inject: {
+        ...stubInvestigationSeams(),
+        coordinatorDispatch: coord.dispatch,
+        runChainLifecycle: chain.run,
+        callTool: tools.callTool,
+      },
     });
     assert.equal(chain.calls.length, 1, "the run_chain after the probe must have executed");
     // The probe side effect precedes the chain call in the shared execution
@@ -770,6 +777,7 @@ describe("mission record observability fields (kusabi #532 criterion 2)", () => 
       budget: DEFAULT_BUDGET,
       ...overrides,
       inject: {
+        ...stubInvestigationSeams(),
         coordinatorDispatch: coord.dispatch,
         runChainLifecycle: chain.run,
         callTool: tools.callTool,
@@ -953,6 +961,7 @@ describe("post-chain audit columns persist onto the durable inner chain round (k
       sampling: { rate: 1, salt: "v1" },
       ...overrides.input,
       inject: {
+        ...stubInvestigationSeams(),
         coordinatorDispatch: coord.dispatch,
         runChainLifecycle: chain.run,
         callTool: makeToolFake().callTool,
@@ -1200,6 +1209,7 @@ describe("coordinator dispatch failure propagation through the real codex seam (
       allowSubstitute: false,
       budget: DEFAULT_BUDGET,
       inject: {
+        ...stubInvestigationSeams(),
         runChainLifecycle: chain.run,
         callTool: tools.callTool,
         solDispatch: sol.dispatch,
@@ -1334,6 +1344,7 @@ async function runWithFakes(env, streams, toolsOverride = null) {
     allowSubstitute: false,
     budget: DEFAULT_BUDGET,
     inject: {
+      ...stubInvestigationSeams(),
       coordinatorDispatch: coord.dispatch,
       runChainLifecycle: chain.run,
       callTool: tools.callTool,
@@ -1749,6 +1760,7 @@ describe("production seam: the real sunaba-rpc bridge dispatches read_probe (rev
       allowSubstitute: false,
       budget: DEFAULT_BUDGET,
       inject: {
+        ...stubInvestigationSeams(),
         coordinatorDispatch: coord.dispatch,
         runChainLifecycle: chain.run,
         solDispatch: sol.dispatch,

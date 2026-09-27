@@ -19,6 +19,7 @@ import { stateDirFor, readJson } from "./state-paths.mjs";
 import { renderEvidenceContents } from "./luna-prompt.mjs";
 import { probeEvidenceText, missionEvidenceItems, realSolDispatch } from "./luna-sol-gate.mjs";
 import { runLunaMission } from "./luna-driver.mjs";
+import { stubInvestigationSeams } from "./fixtures.mjs";
 
 const MISSION_BRIEF = [
   "Orchestrator: gpt-5.6-sol | session luna-evidence-test | 2026-09-23",
@@ -339,6 +340,7 @@ describe("criterion 3: end-to-end runLunaMission with inlined evidence content a
       allowSubstitute: false,
       budget: DEFAULT_BUDGET,
       inject: {
+        ...stubInvestigationSeams(),
         runChainLifecycle: chain.run,
         callTool: async () => ({ content: "PROBE-MARKER", total_lines: 1 }),
         notifyMissionTerminal: async (info) => { notifications.push(info); },

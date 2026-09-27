@@ -313,6 +313,7 @@ describe("the real dispatch prompts carry the rendered contract (prompt-contract
    */
   async function runRealCoordinatorMission({ missionId } = {}) {
     const { runLunaMission } = await import("./luna-driver.mjs");
+    const { stubInvestigationSeams } = await import("./fixtures.mjs");
     const chain = makeChainFake();
     const tools = makeToolFake();
     const sol = makeSolFake();
@@ -327,6 +328,7 @@ describe("the real dispatch prompts carry the rendered contract (prompt-contract
       budget: DEFAULT_BUDGET,
       ...(missionId ? { missionId } : {}),
       inject: {
+        ...stubInvestigationSeams(),
         runChainLifecycle: chain.run,
         callTool: tools.callTool,
         solDispatch: sol.dispatch,

@@ -250,10 +250,37 @@ export function probeEvidenceText(output) {
  * coordinator envelope binds (brief + worker reports + probe raws + ledger),
  * so the gate and the coordinator are bound to the same current evidence.
  */
-export function missionEvidenceItems({ brief, record, includeRemaining = false }) {
+export function missionEvidenceItems({ brief, record, includeRemaining = false, missionDir = null }) {
   const items = [
     { role: "luna_brief", source: "mission-file", content: brief ?? "", path: "evidence/mission-brief.txt" },
   ];
+  if (record?.investigation?.status === "completed") {
+    const factSheetPath =
+      typeof record.investigation.factSheetPath === "string" && record.investigation.factSheetPath
+        ? record.investigation.factSheetPath
+        : "evidence/fact-sheet.md";
+    const dir = missionDir ?? record?.missionDir;
+    if (!dir) {
+      throw new Error(`cannot read fact sheet: missing missionDir for ${factSheetPath}`);
+    }
+    const fullPath = path.join(dir, factSheetPath);
+    let factSheetContent;
+    try {
+      factSheetContent = fs.readFileSync(fullPath, "utf8");
+    } catch (err) {
+      throw new Error(`cannot read fact sheet at ${fullPath}: ${err?.message ?? err}`);
+    }
+    const itemPath =
+      factSheetPath.startsWith("evidence/")
+        ? factSheetPath
+        : "evidence/fact-sheet.md";
+    items.push({
+      role: "worker_report",
+      source: "fact-sheet",
+      content: factSheetContent,
+      path: itemPath,
+    });
+  }
   const attempts = Array.isArray(record?.attempts) ? record.attempts : [];
   attempts.forEach((attempt, i) => {
     items.push({
@@ -365,7 +392,7 @@ export function buildGateEnvelope({
     container,
     baseSha: lastPostChain?.baseSha ?? null,
     changeScope: lastPostChain?.changeScope ?? {},
-    items: missionEvidenceItems({ brief, record }),
+    items: missionEvidenceItems({ brief, record, missionDir }),
     priorVerdicts,
     allowSubstitute: allowSubstitute === true,
     writeFile: (p, content) => {

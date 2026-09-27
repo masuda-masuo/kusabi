@@ -8,6 +8,7 @@ import path from "node:path";
 import os from "node:os";
 import { stateDirFor, readJson, writeJson } from "./state-paths.mjs";
 import { runLunaMission } from "./luna-driver.mjs";
+import { stubInvestigationSeams } from "./fixtures.mjs";
 import {
   renderPendingSolRework,
   driverLedgerText,
@@ -188,6 +189,7 @@ describe("luna driver Sol rework verdict feedback (kusabi #586 criteria 1-6)", (
       budget: DEFAULT_BUDGET,
       sampling: { rate: 1, salt: "v1" },
       inject: {
+        ...stubInvestigationSeams(),
         coordinatorDispatch: coord.dispatch,
         runChainLifecycle: chain.run,
         callTool: async () => ({ status: "ok", output: "test-probe" }),
@@ -280,6 +282,7 @@ describe("luna driver Sol rework verdict feedback (kusabi #586 criteria 1-6)", (
       budget: DEFAULT_BUDGET,
       sampling: { rate: 1, salt: "v1" },
       inject: {
+        ...stubInvestigationSeams(),
         coordinatorDispatch: coord.dispatch,
         runChainLifecycle: chain.run,
         callTool: async () => ({ status: "ok", output: "files-list" }),

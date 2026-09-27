@@ -91,21 +91,47 @@ export function renderGateOrigins(record) {
 }
 
 /**
- * Whether the record carries any #532 observability field worth appending:
- * a reasoning effort on either seat, or recorded audit gates.  A pure legacy
- * record gets the legacy digest byte-for-byte.
+ * Render the single-line investigation digest for luna-show (kusabi #591).
+ * Prints status, seat, job id, collected count, and failure reason when failed.
+ *
+ * @param {object} record
+ * @returns {string|null}
+ */
+export function renderInvestigationLine(record) {
+  const inv = record?.investigation;
+  if (!inv || typeof inv !== "object") return null;
+  const status = inv.status ?? "unknown";
+  const seat = inv.actualModel || inv.requestedModel || "unknown";
+  const jobId = inv.jobId ?? "none";
+  const collected =
+    inv.baseline?.collected !== undefined && inv.baseline?.collected !== null
+      ? inv.baseline.collected
+      : "unavailable";
+  if (status === "failed") {
+    const error = inv.error ? oneLine(inv.error) : "unknown error";
+    return `investigation: status: ${status}, seat: ${seat}, job id: ${jobId}, collected count: ${collected}, failure reason: ${error}`;
+  }
+  return `investigation: status: ${status}, seat: ${seat}, job id: ${jobId}, collected count: ${collected}`;
+}
+
+/**
+ * Whether the record carries any #532/#591 observability field worth appending:
+ * a reasoning effort on either seat, recorded audit gates, or an investigation.
+ * A pure legacy record gets the legacy digest byte-for-byte.
  */
 function has532Observability(record) {
   if (typeof record?.coordinator?.reasoningEffort === "string") return true;
   if (typeof record?.auditor?.reasoningEffort === "string") return true;
   if (Array.isArray(record?.auditGates) && record.auditGates.length > 0) return true;
+  if (record?.investigation && typeof record.investigation === "object") return true;
   return false;
 }
 
 /**
  * Render the read-only mission digest: the legacy mission-show lines
- * (byte-identical, contiguous prefix) followed by the #532 provenance banner
- * and the recorded gate consultation origins when the record carries them.
+ * (byte-identical, contiguous prefix) followed by the #532 provenance banner,
+ * the #591 investigation line, and the recorded gate consultation origins
+ * when the record carries them.
  *
  * @param {object} snapshot — the readMissionSnapshot shape.
  * @returns {string}
@@ -114,7 +140,10 @@ export function renderMissionDigest(snapshot) {
   const legacy = renderMissionShow(snapshot);
   const record = snapshot?.record ?? {};
   if (!has532Observability(record)) return legacy;
-  const lines = [legacy, renderMissionProvenanceBanner(record), ...renderGateOrigins(record)];
+  const lines = [legacy, renderMissionProvenanceBanner(record)];
+  const invLine = renderInvestigationLine(record);
+  if (invLine) lines.push(invLine);
+  lines.push(...renderGateOrigins(record));
   return lines.join("\n");
 }
 

@@ -254,3 +254,36 @@ export function buildCaptureOutput(manifest) {
   lines.push("COUNT=" + entries.length);
   return lines.join("\n");
 }
+
+/**
+ * Stub seams for the pre-mission investigation step (kusabi #591).
+ * Supplies deterministic completed investigationDispatch and baseline seams
+ * for testing without hitting sunaba-rpc or external model dispatches.
+ *
+ * @param {object} [overrides]
+ * @returns {{ investigationDispatch: Function, baseline: Function }}
+ */
+export function stubInvestigationSeams(overrides = {}) {
+  const jobId = overrides.jobId ?? "job-investigation-stub";
+  const requestedModel = overrides.requestedModel ?? "opencode/deepseek-v4-flash-free";
+  const actualModel = overrides.actualModel ?? "opencode/deepseek-v4-flash-free";
+  const body = overrides.body ?? "## Fact sheet\n- Candidate deliverables: `plugins/kusabi/scripts/luna-driver.mjs`";
+  const collected = overrides.collected !== undefined ? overrides.collected : 4342;
+  const gates = overrides.gates !== undefined ? overrides.gates : { gate_passed: true, lint: 0, types: 0 };
+
+  const investigationDispatch = overrides.investigationDispatch ?? (async () => ({
+    jobId,
+    requestedModel,
+    actualModel,
+    body,
+  }));
+  investigationDispatch._isStub = true;
+
+  return {
+    investigationDispatch,
+    baseline: overrides.baseline ?? (async () => ({
+      collected,
+      gates,
+    })),
+  };
+}

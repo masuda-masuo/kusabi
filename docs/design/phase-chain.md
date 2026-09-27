@@ -669,8 +669,9 @@ partially executable. The closed action enum is the frozen six-verb
 **Budgets.** An explicit mission budget caps chains (`maxChains`, default 3),
 attempts (`maxAttempts`, default 2), probes (`maxProbes`, default 5),
 consult/coordination requests (`maxConsults`, default 3), consecutive Sol
-rework verdicts (`maxRework`, default 1, #531) and brief corrections
-(`maxBriefCorrections`, default 3, #577). Brief corrections do not consume
+rework verdicts (`maxRework`, default 1, #531), brief corrections
+(`maxBriefCorrections`, default 3, #577), and pre-mission investigations
+(`maxInvestigations`, default 1, #591). Brief corrections do not consume
 the coordinator error budget: brief corrections include the chain seam's dispatch-time
 brief refusals (lossy smoke, smoke baseline) except an unmeasured baseline.
 A mission stops immediately (`brief-correction-exhausted`)
@@ -699,6 +700,26 @@ explicit `truncated`, exact `omittedBytes`, and `truncation` metadata recorded
 on the persisted probe record — truncation is never silent. This raw-persistence
 bound is independent of the evidence envelope's own payload cap: it is a
 deterministic persistence bound only.
+
+**Pre-mission investigation (kusabi #591).** At mission start, after the
+mission record exists and before the first coordinator dispatch, the driver
+runs one investigation step on a cheap independent seat. On resume, a mission
+whose record already carries a completed investigation does not repeat it.
+The step performs:
+1. A deterministic baseline of the mission container: collected test count
+   and gate states, reusing the logic behind `kusabi-companion baseline`.
+2. One read-only investigation job on the `plan` phase (`kusabi-plan`) against
+   the mission container, routed through the plan phase's configured model chain
+   (never a codex frontier seat by default). Its prompt includes the host brief
+   and an instruction requesting candidate deliverables, test commands, and
+   file:line references.
+The step renders a fact sheet artifact saved to `evidence/fact-sheet.md` and
+injected into every evidence envelope as `role: "worker_report"`, `source: "fact-sheet"`.
+The outcome is persisted in `mission.json` under `record.investigation` and
+displayed by `luna-show`. If baseline measurement or investigation dispatch throws,
+or if the seat returns an empty/whitespace report, the mission ends fail-closed
+with disposition `host-handoff` (`investigation failed: <cause>`), emits a single
+terminal notification, writes `recommendation.md`, and never dispatches the coordinator.
 
 **Seats.** Defaults are exact: coordinator `codex/gpt-5.6-luna`, auditor
 `codex/gpt-5.6-sol`. Any substitution is refused before mission creation

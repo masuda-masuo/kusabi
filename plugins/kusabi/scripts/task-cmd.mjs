@@ -521,111 +521,54 @@ export async function cmdTaskDetach(cwd, { flags, text }, opts = {}) {
 }
 
 export async function cmdTask(cwd, { flags, text, _dispatch = null }, opts = {}) {
-  // Shared synchronous pre-flight with task-detach (brief, phase/agent, backend,
-  // session, tools, dispatch-time brief lint).  Foreground task does NOT refuse
-  // on lossy ## Smoke — base cmdTask never called smokeViolationReport.
-  // Container-dependent work (baseSha, smoke baseline, review input) stays below.
   const pre = resolveTaskPreflight(cwd, { flags, text }, { ...opts, refuseOnLossySmoke: false });
   text = pre.text;
-  let phase = pre.phase;
-  let agent = pre.agent;
-  const stateDir = pre.stateDir;
-  const backend = pre.backend;
-  const modelChain = pre.modelChain;
-  const explicitModel = pre.explicitModel;
-  const session = pre.session;
-  const sessionProvenance = pre.sessionProvenance;
-  const tools = pre.tools;
-  // Idempotent reaffirmation at the dispatch site — pinned by the #237 source
-  // guard in kusabi-companion.test.mjs.  resolveTaskPreflight already resolved
-  // this; same brief yields the same record.
-  const orchestrator = resolveOrchestratorRecord(text);
-  // Internal test seam: command-boundary tests inject a deterministic fallback
-  // dispatcher without starting a real backend process.
-  const dispatch = _dispatch ?? pre.resolvedDispatch;
+  const phase = pre.phase;
 
-  // Idempotent reaffirmation — pinned by the #289 wiring source guard (lint
-  // before container read / dispatch).  resolveTaskPreflight already refused.
   const lintRejection = briefLintReport({ brief: text, phase, container: flags.container ?? null });
   if (lintRejection) throw new Error(lintRejection);
 
-  // ---- record baseSha before dispatching the job if --container (for probe comparison) ----
   let taskBaseSha = null;
-  if (flags.container) {
-    try {
-      const { callTool } = await import("./sunaba-rpc.mjs");
-      const gitRev = await callTool("sandbox_exec", {
-        container_id: flags.container,
-        commands: ["git rev-parse HEAD"],
-      });
-      taskBaseSha = (gitRev?.output ?? "").trim() || null;
-    } catch { /* probe will handle missing baseSha */ }
-  }
-
-  // ---- smoke baseline refusal (kusabi #292) ----
-  // Same guard as the chain's first round, for the single-shot dispatch: the
-  // P4 below runs AFTER the worker has changed things, so a `## Smoke` line
-  // that could not pass on the checkout as handed over would be reported as
-  // the worker's failure.  Measured here with the probe's own executor, and
-  // refused before any job record exists.  A task with no declared smoke (or
-  // no --container to run it in) executes nothing extra and dispatches
-  // exactly as before.
-  if (flags.container) {
-    const { callTool } = await import("./sunaba-rpc.mjs");
-    const baselineRejection = await smokeBaselineReport({
-      brief: text,
-      callTool,
-      container: flags.container,
-    });
-    if (baselineRejection) throw new Error(baselineRejection);
-  }
-
-  // ---- review input (container review only) ----
-  // Runs before dispatch: a container review must carry the diff into the
-  // prompt, and a --base that cannot be honoured must abort before a job is
-  // created rather than after (kusabi #204).
-  const taskReviewInput = await buildTaskReviewInput({ phase, flags });
-
-  const guardrails = fs.readFileSync(path.join(PLUGIN_ROOT, "prompts", "task-guardrails.md"), "utf8").trim();
-  let taskPromptText = taskReviewInput
-    ? `${guardrails}\n\n<task>\n${text}\n</task>\n\n${taskReviewInput}`
-    : `${guardrails}\n\n<task>\n${text}\n</task>`;
-  // kusabi #289: `--container` was recorded on the job and used for the
-  // probes, but never DELIVERED to the worker — the chain injects it into the
-  // implement prompt, the task path did not.  Same helper, so the wording
-  // cannot drift and a brief that also names its workplace is a harmless
-  // duplicate; a no-op when `--container` was not given.
-  taskPromptText = withContainerWorkspace(taskPromptText, flags.container);
-  const { job, resultText } = await dispatch({
+  const { job, resultText, stateDir } = await dispatchTaskJob(
     cwd,
-    kind: "task",
-    title: text.slice(0, 80),
-    promptText: taskPromptText,
-    agent,
-    phase,
-    session,
-    sessionProvenance,
-    tools,
-    timeoutS: Number(flags.timeout ?? DEFAULT_TASK_TIMEOUT_S),
-    watchdogS: Number(flags.watchdog ?? DEFAULT_WATCHDOG_S),
-    tiers: modelChain,
-    round: 1,
-    explicitModel,
-    // Only CLI-specified --read-only/--deny restrictions are hard constraints
-    // across fallback backends. Phase-default deny maps are intentionally
-    // backend-specific and retain their existing fallback behavior.
-    explicitRestrictions: Boolean(flags.readOnly || flags.deny),
-  });
+    { flags, text, _dispatch },
+    {
+      ...opts,
+      preflight: pre,
+      beforeDispatch: async ({ text: briefText }) => {
+        // ---- record baseSha before dispatching the job if --container (for probe comparison) ----
+        if (flags.container) {
+          try {
+            const { callTool } = await import("./sunaba-rpc.mjs");
+            const gitRev = await callTool("sandbox_exec", {
+              container_id: flags.container,
+              commands: ["git rev-parse HEAD"],
+            });
+            taskBaseSha = (gitRev?.output ?? "").trim() || null;
+          } catch { /* probe will handle missing baseSha */ }
+        }
 
-  // Store the resolved model chain, orchestrator, and backend on the job
-  // record (claudeDispatch already stamps backend:"claude"; this makes the
-  // opencode path record it too).
-  job.modelChain = modelChain;
-  job.orchestrator = orchestrator;
-  // dispatchWithFallback records the backend of the attempt that returned.
-  // Preserve it across mixed-backend fallback; only legacy/injected results
-  // without provenance need the command-start default.
-  job.backend = job.backend ?? backend;
+        // ---- smoke baseline refusal (kusabi #292) ----
+        // Same guard as the chain's first round, for the single-shot dispatch: the
+        // P4 below runs AFTER the worker has changed things, so a `## Smoke` line
+        // that could not pass on the checkout as handed over would be reported as
+        // the worker's failure.  Measured here with the probe's own executor, and
+        // refused before any job record exists.  A task with no declared smoke (or
+        // no --container to run it in) executes nothing extra and dispatches
+        // exactly as before.
+        if (flags.container) {
+          const { callTool } = await import("./sunaba-rpc.mjs");
+          const baselineRejection = await smokeBaselineReport({
+            brief: briefText,
+            callTool,
+            container: flags.container,
+          });
+          if (baselineRejection) throw new Error(baselineRejection);
+        }
+      },
+    },
+  );
+  text = pre.text;
 
   // ---- deterministic probes (when --container given) ----
   if (flags.container) {
@@ -719,6 +662,81 @@ export async function cmdTask(cwd, { flags, text, _dispatch = null }, opts = {})
 
   const exitCode = job.status !== "completed" || job.probesGreen === false ? 1 : 0;
   return { text: taskOutput, exitCode };
+}
+
+/**
+ * Dispatch a task job through the resolved backend/phase without running probes.
+ * Factored out from cmdTask (kusabi #591) for reuse by investigationDispatch.
+ *
+ * @param {string} cwd
+ * @param {object} input
+ * @param {object} input.flags
+ * @param {string} input.text
+ * @param {Function} [input._dispatch]
+ * @param {object} [opts]
+ * @returns {Promise<{ job: object, resultText: string, pre: object, stateDir: string }>}
+ */
+export async function dispatchTaskJob(cwd, { flags, text, _dispatch = null }, opts = {}) {
+  const pre = opts.preflight ?? resolveTaskPreflight(cwd, { flags, text }, { ...opts, refuseOnLossySmoke: opts.refuseOnLossySmoke ?? false });
+  text = pre.text;
+  const phase = pre.phase;
+  const agent = pre.agent;
+  const stateDir = pre.stateDir;
+  const backend = pre.backend;
+  const modelChain = pre.modelChain;
+  const explicitModel = pre.explicitModel;
+  const session = pre.session;
+  const sessionProvenance = pre.sessionProvenance;
+  const tools = pre.tools;
+  const orchestrator = resolveOrchestratorRecord(text);
+  const dispatch = _dispatch ?? pre.resolvedDispatch;
+
+  const lintRejection = briefLintReport({ brief: text, phase, container: flags.container ?? null });
+  if (lintRejection) throw new Error(lintRejection);
+
+  if (typeof opts.beforeDispatch === "function") {
+    await opts.beforeDispatch({ pre, text, phase, flags });
+  }
+
+  const taskReviewInput = await buildTaskReviewInput({ phase, flags });
+  const guardrails = fs.readFileSync(path.join(PLUGIN_ROOT, "prompts", "task-guardrails.md"), "utf8").trim();
+  let taskPromptText = taskReviewInput
+    ? `${guardrails}\n\n<task>\n${text}\n</task>\n\n${taskReviewInput}`
+    : `${guardrails}\n\n<task>\n${text}\n</task>`;
+  taskPromptText = withContainerWorkspace(taskPromptText, flags.container);
+  const { job, resultText } = await dispatch({
+    cwd,
+    kind: "task",
+    title: text.slice(0, 80),
+    promptText: taskPromptText,
+    agent,
+    phase,
+    session,
+    sessionProvenance,
+    tools,
+    timeoutS: Number(flags.timeout ?? DEFAULT_TASK_TIMEOUT_S),
+    watchdogS: Number(flags.watchdog ?? DEFAULT_WATCHDOG_S),
+    tiers: modelChain,
+    round: 1,
+    explicitModel,
+    // Only CLI-specified --read-only/--deny restrictions are hard constraints
+    // across fallback backends. Phase-default deny maps are intentionally
+    // backend-specific and retain their existing fallback behavior.
+    explicitRestrictions: Boolean(flags.readOnly || flags.deny),
+  });
+
+  // Store the resolved model chain, orchestrator, and backend on the job
+  // record (claudeDispatch already stamps backend:"claude"; this makes the
+  // opencode path record it too).
+  job.modelChain = modelChain;
+  job.orchestrator = orchestrator;
+  // dispatchWithFallback records the backend of the attempt that returned.
+  // Preserve it across mixed-backend fallback; only legacy/injected results
+  // without provenance need the command-start default.
+  job.backend = job.backend ?? backend;
+  saveJob(stateDir, job);
+
+  return { job, resultText, pre, stateDir };
 }
 
 export async function cmdReview(cwd, { flags, text, _runPrompt = runPrompt } = {}) {

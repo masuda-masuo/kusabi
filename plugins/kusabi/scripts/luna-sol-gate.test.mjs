@@ -65,6 +65,7 @@ import path from "node:path";
 import os from "node:os";
 import { stateDirFor, readJson } from "./state-paths.mjs";
 import { TERMINAL_MISSION_DISPOSITIONS } from "./mission-store.mjs";
+import { stubInvestigationSeams } from "./fixtures.mjs";
 
 let driverModule = null;
 async function lunaDriver() {
@@ -301,6 +302,7 @@ describe("luna Sol gates (kusabi #531 criteria 1, 2, 3, 7, 8, 9, 10)", () => {
       ...(sampling ? { sampling } : {}),
       ...rest,
       inject: {
+        ...stubInvestigationSeams(),
         coordinatorDispatch: coord.dispatch,
         runChainLifecycle: chain.run,
         callTool: tools.callTool,
@@ -705,6 +707,7 @@ describe("live gate durability (kusabi #532 criterion 4)", () => {
       budget: { ...DEFAULT_BUDGET },
       ...(sampling ? { sampling } : {}),
       inject: {
+        ...stubInvestigationSeams(),
         coordinatorDispatch: coord.dispatch,
         runChainLifecycle: chain.run,
         callTool: tools.callTool,
@@ -1089,6 +1092,7 @@ describe("Sol verdict record contract (prompt-contract criterion 7)", () => {
       allowSubstitute: false,
       budget: { ...DEFAULT_BUDGET },
       inject: {
+        ...stubInvestigationSeams(),
         coordinatorDispatch: coord.dispatch,
         runChainLifecycle: chain.run,
         callTool: tools.callTool,

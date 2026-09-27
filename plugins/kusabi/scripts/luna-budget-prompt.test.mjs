@@ -308,6 +308,7 @@ describe("the real coordinator prompt/evidence exposes the remaining budget valu
    */
   async function runRealCoordinatorMission({ missionId, budget = DEFAULT_BUDGET } = {}) {
     const { runLunaMission } = await import("./luna-driver.mjs");
+    const { stubInvestigationSeams } = await import("./fixtures.mjs");
     const chain = makeChainFake();
     const tools = makeToolFake();
     const sol = makeSolFake();
@@ -322,6 +323,7 @@ describe("the real coordinator prompt/evidence exposes the remaining budget valu
       budget,
       ...(missionId ? { missionId } : {}),
       inject: {
+        ...stubInvestigationSeams(),
         runChainLifecycle: chain.run,
         callTool: tools.callTool,
         solDispatch: sol.dispatch,

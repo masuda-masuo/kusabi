@@ -37,6 +37,7 @@ import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import { stateDirFor, readJson, writeJson } from "./state-paths.mjs";
+import { stubInvestigationSeams } from "./fixtures.mjs";
 
 let driverModule = null;
 async function lunaDriver() {
@@ -270,6 +271,7 @@ describe("luna driver deterministic inner-brief signature (decisions 1-3, 5-6)",
       budget: DEFAULT_BUDGET,
       ...overrides,
       inject: {
+        ...stubInvestigationSeams(),
         coordinatorDispatch: coord.dispatch,
         runChainLifecycle: chain.run,
         callTool: tools.callTool,
@@ -469,6 +471,7 @@ describe("luna driver deterministic inner-brief signature (decisions 1-3, 5-6)",
       allowSubstitute: false,
       budget: DEFAULT_BUDGET,
       inject: {
+        ...stubInvestigationSeams(),
         coordinatorDispatch: coord.dispatch,
         runChainLifecycle: chain.run,
         callTool: tools.callTool,

@@ -51,6 +51,7 @@ import path from "node:path";
 import os from "node:os";
 import { createHash } from "node:crypto";
 import { stateDirFor, readJson, writeJson } from "./state-paths.mjs";
+import { stubInvestigationSeams } from "./fixtures.mjs";
 
 const sha256 = (text) => createHash("sha256").update(text, "utf8").digest("hex");
 
@@ -286,6 +287,7 @@ describe("the driver records and surfaces bounded brief corrections (criteria 1,
       budget: DEFAULT_BUDGET,
       ...overrides,
       inject: {
+        ...stubInvestigationSeams(),
         coordinatorDispatch: coord.dispatch,
         runChainLifecycle: chain.run,
         callTool: tools.callTool,
@@ -831,6 +833,7 @@ describe("the REAL coordinator prompt/evidence seam carries the persisted correc
       budget: DEFAULT_BUDGET,
       ...(missionId ? { missionId } : {}),
       inject: {
+        ...stubInvestigationSeams(),
         runChainLifecycle: chain.run,
         callTool: async () => ({ status: "ok", output: "canned\n" }),
         solDispatch: async (input) =>
