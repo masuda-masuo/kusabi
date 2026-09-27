@@ -843,10 +843,15 @@ export function preflightBatchBudget(requests, record, budget) {
     consults: Array.isArray(record?.consults) ? record.consults.length : 0,
   };
   const demand = { probes: 0, attempts: 0, chains: 0, consults: 0 };
+  const hasFinishedChain = Array.isArray(record?.chains) && record.chains.length > 0;
+  let seenChainInBatch = false;
   for (const req of requests ?? []) {
     if (req?.action === "read_probe") {
-      demand.probes += 1;
+      if (hasFinishedChain || seenChainInBatch) {
+        demand.probes += 1;
+      }
     } else if (req?.action === "run_chain" || req?.action === "rework_chain") {
+      seenChainInBatch = true;
       // run_chain / rework_chain jointly consume the attempt AND chain
       // budgets (decision 4): one action, two bounded dimensions.
       demand.attempts += 1;
@@ -1599,6 +1604,13 @@ export async function runLunaMission(input) {
       }
       switch (req.action) {
         case "read_probe": {
+          const finishedChains = Array.isArray(record.chains) ? record.chains.length : 0;
+          if (finishedChains === 0) {
+            recordError(
+              "read_probe refused: no inner chain has finished in this mission (use the fact sheet in the evidence envelope, or run_chain)",
+            );
+            continue;
+          }
           const probeCount = Array.isArray(record.probes) ? record.probes.length : 0;
           if (probeCount >= budget.maxProbes) {
             outcome = { disposition: "budget-exhausted", recommendation: null, handoffReason: null };

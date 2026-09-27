@@ -269,6 +269,42 @@ describe("the driver records and surfaces bounded brief corrections (criteria 1,
     };
   }
 
+  function seedFinishedMission(missionId = "mission-finishedseed") {
+    const missionsDir = path.join(stateDir, "missions");
+    fs.mkdirSync(missionsDir, { recursive: true });
+    const missionDir = path.join(missionsDir, missionId);
+    fs.mkdirSync(missionDir, { recursive: true });
+    writeJson(path.join(missionDir, "control.json"), {
+      missionId,
+      container: "test-cid",
+      pid: process.pid,
+      status: "running",
+    });
+    writeJson(path.join(missionDir, "mission.json"), {
+      missionId,
+      container: "test-cid",
+      missionFile,
+      pid: process.pid,
+      status: "running",
+      coordinator: DEFAULT_SEATS.coordinator,
+      auditor: DEFAULT_SEATS.auditor,
+      startedAt: new Date().toISOString(),
+      attempts: [
+        {
+          index: 1,
+          kind: "run_chain",
+          chainId: "chain-seed",
+          brief: VALID_RUN_CHAIN_BRIEF,
+          status: "completed",
+          output: "seed output",
+          at: new Date().toISOString(),
+        },
+      ],
+      chains: ["chain-seed"],
+    });
+    return missionId;
+  }
+
   /** Run the driver with the given canned coordinator streams. */
   async function runMission(streams, overrides = {}) {
     const driver = await import("./luna-driver.mjs");
@@ -440,6 +476,7 @@ describe("the driver records and surfaces bounded brief corrections (criteria 1,
     // ends normally after the fourth dispatch.
     const budget = { ...DEFAULT_BUDGET, maxAttempts: 3 };
     const toolSecret = "TOOL-OUTPUT-SECRET";
+    const missionId = seedFinishedMission();
     const { mission } = await runMission(
       [
         runChainStream(MISSING_DELIVERABLES_BRIEF),
@@ -447,7 +484,7 @@ describe("the driver records and surfaces bounded brief corrections (criteria 1,
         malformedJsonStream,
         finishStream("recommend-escalate"),
       ],
-      { budget, inject: { callTool: makeToolFake(toolSecret + "\n").callTool } },
+      { missionId, budget, inject: { callTool: makeToolFake(toolSecret + "\n").callTool } },
     );
     const { missionDir, record } = mission;
 

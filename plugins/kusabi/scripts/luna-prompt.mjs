@@ -109,6 +109,9 @@ export function renderCoordinatorContract(schema = loadCoordinatorSchema()) {
     const requirement = parts.length > 0 ? ` — ${parts.join("; ")}` : " — no body fields";
     lines.push(`- \`${action}\`${requirement}.`);
     if (action === "read_probe") {
+      if (body && typeof body.description === "string" && body.description !== "") {
+        lines.push(`  - ${body.description}`);
+      }
       const toolNames = tools.map((t) => `\`${t}\``).join(", ");
       lines.push(`  - \`tool\` must be one of ${toolNames} (the probe tool allow-list).`);
       lines.push("  - Per-tool required fields and call arguments the driver passes to the tool seam");

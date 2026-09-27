@@ -319,6 +319,42 @@ describe("luna mission driver (kusabi #530 criteria 4-8)", () => {
     };
   }
 
+  function seedFinishedMission(missionId = "mission-finishedseed") {
+    const missionsDir = path.join(stateDir, "missions");
+    fs.mkdirSync(missionsDir, { recursive: true });
+    const missionDir = path.join(missionsDir, missionId);
+    fs.mkdirSync(missionDir, { recursive: true });
+    writeJson(path.join(missionDir, "control.json"), {
+      missionId,
+      container: "test-cid",
+      pid: process.pid,
+      status: "running",
+    });
+    writeJson(path.join(missionDir, "mission.json"), {
+      missionId,
+      container: "test-cid",
+      missionFile,
+      pid: process.pid,
+      status: "running",
+      coordinator: DEFAULT_SEATS.coordinator,
+      auditor: DEFAULT_SEATS.auditor,
+      startedAt: new Date().toISOString(),
+      attempts: [
+        {
+          index: 1,
+          kind: "run_chain",
+          chainId: "chain-seed",
+          brief: VALID_RUN_CHAIN_BRIEF,
+          status: "completed",
+          output: "seed output",
+          at: new Date().toISOString(),
+        },
+      ],
+      chains: ["chain-seed"],
+    });
+    return missionId;
+  }
+
   it("surface: exports runLunaMission (baseline-red on pristine main)", async () => {
     const driver = await lunaDriver();
     assert.equal(typeof driver.runLunaMission, "function");
@@ -472,10 +508,11 @@ describe("luna mission driver (kusabi #530 criteria 4-8)", () => {
   });
 
   it("read_probe is driver-mediated: executed through the callTool seam", async () => {
+    const missionId = seedFinishedMission();
     const { chain, tools } = await runMission([
       readProbeStream("read_file_range", "evidence/probes.json"),
       finishStream("recommend-accept"),
-    ]);
+    ], { missionId });
     const probeCalls = tools.calls.filter((c) => c.name === "read_file_range");
     assert.equal(probeCalls.length, 1, "the requested probe must run exactly once");
     assert.equal(chain.calls.length, 0, "a probe-only iteration must not start a chain");
@@ -492,13 +529,14 @@ describe("luna mission driver (kusabi #530 criteria 4-8)", () => {
     // oversized batch itself, so zero tool calls execute.  (Per-dispatch
     // atomicity for separate affordable dispatches is pinned separately by
     // luna-budget-preflight.test.mjs.)
+    const missionId = seedFinishedMission();
     const { tools, chain } = await runMission(
       [(input) => stream(
         line("read_probe", input.envelope.envelope_sha256, { tool: "read_file_range", path: "p1" }),
         line("read_probe", input.envelope.envelope_sha256, { tool: "read_file_range", path: "p2" }),
         line("read_probe", input.envelope.envelope_sha256, { tool: "read_file_range", path: "p3" }),
       )],
-      { budget: { ...DEFAULT_BUDGET, maxProbes: 2 } },
+      { missionId, budget: { ...DEFAULT_BUDGET, maxProbes: 2 } },
     );
     const probeCalls = tools.calls.filter((c) => c.name === "read_file_range");
     assert.equal(probeCalls.length, 0, "an oversized probe batch must execute zero tool calls");
@@ -512,6 +550,7 @@ describe("luna mission driver (kusabi #530 criteria 4-8)", () => {
   });
 
   it("requests execute sequentially, in stream order", async () => {
+    const missionId = seedFinishedMission();
     const driver = await lunaDriver();
     const sharedOrder = [];
     const coord = makeCoordinator([
@@ -526,6 +565,7 @@ describe("luna mission driver (kusabi #530 criteria 4-8)", () => {
     await driver.runLunaMission({
       cwd,
       missionFile,
+      missionId,
       brief: MISSION_BRIEF,
       container: "test-cid",
       ...DEFAULT_SEATS,
@@ -1410,6 +1450,7 @@ describe("one valid request per coordinator action (prompt-contract criterion 4)
   const ACTION_CASES = {
     read_probe: {
       stream: (input) => stream(
+        line("run_chain", input.envelope.envelope_sha256, { brief: VALID_RUN_CHAIN_BRIEF }),
         line("read_probe", input.envelope.envelope_sha256, { tool: "read_file_range", path: "plugins/kusabi/scripts/luna-driver.mjs" }),
         line("finish", input.envelope.envelope_sha256, { recommendation: "recommend-escalate" }),
       ),
@@ -1503,6 +1544,9 @@ describe("the observed malformed read_probe records stay refused (prompt-contrac
       j({ action: "read_probe", envelope_sha256: hash, probe: { paths: ["plugins/kusabi/scripts/luna-driver.mjs"] } });
     const { driver, tools, record, result } = await runWithFakes(env, [
       (input) => stream(
+        line("run_chain", input.envelope.envelope_sha256, { brief: VALID_RUN_CHAIN_BRIEF }),
+      ),
+      (input) => stream(
         observedRecord(input.envelope.envelope_sha256),
         observedRecord(input.envelope.envelope_sha256),
       ),
@@ -1539,6 +1583,7 @@ describe("read_probe argument surface (prompt-contract criterion 6)", () => {
   it("valid probes for read_file_range, search_in_container, list_files pass the existing argument surface to the seam", async () => {
     const { tools, record, result } = await runWithFakes(env, [
       (input) => stream(
+        line("run_chain", input.envelope.envelope_sha256, { brief: VALID_RUN_CHAIN_BRIEF }),
         line("read_probe", input.envelope.envelope_sha256, { tool: "read_file_range", path: "plugins/kusabi/scripts/luna-driver.mjs" }),
         line("read_probe", input.envelope.envelope_sha256, { tool: "search_in_container", pattern: "runLunaMission", path: "plugins/kusabi" }),
         line("read_probe", input.envelope.envelope_sha256, { tool: "list_files", path: "plugins/kusabi/scripts" }),
@@ -1567,6 +1612,9 @@ describe("read_probe argument surface (prompt-contract criterion 6)", () => {
       return { status: "ok", output: "canned\n" };
     };
     const { record, result } = await runWithFakes(env, [
+      (input) => stream(
+        line("run_chain", input.envelope.envelope_sha256, { brief: VALID_RUN_CHAIN_BRIEF }),
+      ),
       (input) => stream(
         line("read_probe", input.envelope.envelope_sha256, { tool: "search_in_container", path: "plugins/kusabi" }),
       ),
@@ -1604,6 +1652,9 @@ describe("search pattern enforcement at the driver boundary (review finding 2)",
   it("missing, empty, and whitespace-only search patterns are refused before any tool call", async () => {
     const tools = makeToolFake();
     const { record, result } = await runWithFakes(env, [
+      (input) => stream(
+        line("run_chain", input.envelope.envelope_sha256, { brief: VALID_RUN_CHAIN_BRIEF }),
+      ),
       (input) => stream(
         line("read_probe", input.envelope.envelope_sha256, { tool: "search_in_container", path: "plugins/kusabi" }),
         line("read_probe", input.envelope.envelope_sha256, { tool: "search_in_container", pattern: "", path: "plugins/kusabi" }),
@@ -1779,6 +1830,7 @@ describe("production seam: the real sunaba-rpc bridge dispatches read_probe (rev
   it("a valid read_probe stream reaches the real bridge, which dispatches exactly the requested read-only tools", async () => {
     const { dispatched, record, result } = await runThroughRealBridge([
       (input) => stream(
+        line("run_chain", input.envelope.envelope_sha256, { brief: VALID_RUN_CHAIN_BRIEF }),
         line("read_probe", input.envelope.envelope_sha256, { tool: "read_file_range", path: "plugins/kusabi/scripts/luna-driver.mjs" }),
         line("read_probe", input.envelope.envelope_sha256, { tool: "search_in_container", pattern: "runLunaMission", path: "plugins/kusabi" }),
         line("read_probe", input.envelope.envelope_sha256, { tool: "list_files", path: "plugins/kusabi/scripts" }),
