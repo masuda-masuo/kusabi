@@ -582,12 +582,13 @@ The one place the disposition set lies is **after a `chain-resume`**: `rearmChai
 ```
 Inspect {cwdLabel} {chainId} (status={status}, disposition={disposition}) container={container} — chain-show then adjudicate/publish/record. inbox={inboxPath}
 ```
+Here, `{cwdLabel}` is the brief title: consider only lines before the first level-two-or-deeper markdown heading (`##` through `######`); the first level-one heading (`#` followed by whitespace) wins, otherwise use the first non-empty line that does not start with `Orchestrator:` or `Container:`; if neither exists, it is empty. The label is kept to one line and at most 120 characters, truncated with `…`.
 
 **Fail-soft.** The kaiba write is wrapped in try/catch. Missing DB, missing `actions` table, SQL errors — all log-and-continue. The inbox file is always written; the agenda row is best-effort. Chain finalisation is never prevented by notify errors.
 
 **Opt-out.** Set `KUSABI_CHAIN_NOTIFY=0` to skip both inbox and agenda writes entirely (returns `{ skipped: true }`).
 
-**Wiring.** `finalizeChainControl()` calls `notifyChainTerminal` after a successful control write when the status is terminal. It reads `chain.json` for disposition and container, and derives the brief filename for `cwdLabel`. The stale-chain cancellation path in `requestChainStop()` also notifies. No second detach waiter is required for correctness — `chain-wait` remains for same-session blocking only.
+**Wiring.** `finalizeChainControl()` calls `notifyChainTerminal` after a successful control write when the status is terminal. It reads `chain.json` for disposition and container, and derives the brief title for `cwdLabel`. The stale-chain cancellation path in `requestChainStop()` also notifies. No second detach waiter is required for correctness — `chain-wait` remains for same-session blocking only.
 
 #### 3.5.7d `task-detach` and `task-wait` — standalone background tasks and external notifier boundary (kusabi #491)
 
