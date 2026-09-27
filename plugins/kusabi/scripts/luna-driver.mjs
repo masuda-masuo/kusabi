@@ -762,6 +762,7 @@ export function writeRecommendationFile(missionDir, {
     }
   }
   const effectiveStateDir = stateDir ?? (missionDir ? path.dirname(path.dirname(missionDir)) : null);
+  const chainControls = {};
   for (const cid of chainIds) {
     let chainJson = null;
     try {
@@ -772,6 +773,16 @@ export function writeRecommendationFile(missionDir, {
       chainJson = null;
     }
     chains[cid] = (chainJson && typeof chainJson === "object") ? chainJson : null;
+
+    let controlJson = null;
+    try {
+      if (effectiveStateDir) {
+        controlJson = readJson(path.join(effectiveStateDir, "chains", cid, "control.json"));
+      }
+    } catch {
+      controlJson = null;
+    }
+    chainControls[cid] = (controlJson && typeof controlJson === "object") ? controlJson : null;
   }
 
   const gateEnvelopes = {};
@@ -805,6 +816,7 @@ export function writeRecommendationFile(missionDir, {
     record,
     briefText,
     chains,
+    chainControls,
     gateEnvelopes,
   });
 

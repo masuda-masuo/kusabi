@@ -738,3 +738,117 @@ describe("render-recommendation (kusabi #592)", () => {
     assert.match(out, /- chain chain-beta: \.\.\/\.\.\/chains\/chain-beta\//);
   });
 });
+
+
+describe("render-recommendation (kusabi #605)", () => {
+  it("renders failed chain status, structured implement failure, failed-before-probes note, and residual risk", () => {
+    const diff = [
+      "diff --git a/file.txt b/file.txt",
+      "--- a/file.txt",
+      "+++ b/file.txt",
+      "@@ -1 +1 @@",
+      "-old",
+      "+new",
+    ].join("\n");
+    const out = renderRecommendation({
+      missionId: "m-605-failed",
+      disposition: "recommend-escalate",
+      record: {
+        chains: ["chain-failed"],
+        attempts: [{
+          index: 1,
+          chainId: "chain-failed",
+          postChain: { chainId: "chain-failed", diff },
+        }],
+      },
+      chains: {
+        "chain-failed": {
+          records: [{
+            modelEntry: "agy/gemini-3.8-flash-high",
+            implementJobFailure: {
+              kind: "quota-exhaustion",
+              backend: "agy",
+              quota: "individual",
+              backendBlocked: true,
+              reset: "17h34m29s",
+            },
+          }],
+        },
+      },
+      chainControls: { "chain-failed": { status: "failed" } },
+    });
+
+    assert.match(out, /- chain-failed: implement: agy\/gemini-3\.8-flash-high[\s\S]*status: failed, implement failed: quota-exhaustion \(agy, individual, reset 17h34m29s\)/);
+    assert.match(out, /- attempt 1 \(chain-failed\): 1 file changed, \+1\/-1 lines \(chain failed before probes; stat is the worktree at failure\)/);
+    assert.match(out, /- chain chain-failed: failed \(implement failed: quota-exhaustion \(agy, individual, reset 17h34m29s\)\)/);
+    for (const line of out.split("\n")) assert.ok(line.length <= 300);
+  });
+
+  it("renders bounded error fallback, completed status, and unknown status when control is absent", () => {
+    const longError = "backend returned an unusably long error ".repeat(8);
+    const out = renderRecommendation({
+      missionId: "m-605-statuses",
+      disposition: "recommend-accept",
+      record: { chains: ["chain-error", "chain-complete", "chain-unknown"] },
+      chains: {
+        "chain-error": { records: [{ implementJobError: longError }] },
+        "chain-complete": { records: [{ disposition: "accepted", probeResults: [] }] },
+        "chain-unknown": { records: [{}] },
+      },
+      chainControls: {
+        "chain-error": { status: "failed" },
+        "chain-complete": { status: "completed" },
+        "chain-unknown": null,
+      },
+    });
+
+    assert.match(out, /chain-error:[\s\S]*status: failed, implement failed: backend returned an unusably long error/);
+    assert.match(out, /chain-complete:[\s\S]*status: completed(?!, implement failed)/);
+    assert.match(out, /chain-unknown:[\s\S]*status: unknown/);
+    const errorLine = out.split("\n").find((line) => line.includes("chain-error: implement:"));
+    assert.ok(errorLine);
+    assert.ok(errorLine.length <= 300);
+    assert.ok(errorLine.includes("…"));
+  });
+
+  it("collapses identical consecutive diffs and keeps different diff stats", () => {
+    const diffA = "diff --git a/a.txt b/a.txt\n+same";
+    const diffB = "diff --git a/b.txt b/b.txt\n+different";
+    const out = renderRecommendation({
+      missionId: "m-605-diffs",
+      disposition: "recommend-accept",
+      record: {
+        chains: ["c1", "c2", "c3"],
+        attempts: [
+          { index: 1, chainId: "c1", postChain: { diff: diffA } },
+          { index: 2, chainId: "c2", postChain: { diff: diffA } },
+          { index: 3, chainId: "c3", postChain: { diff: diffB } },
+        ],
+      },
+      chains: {
+        c1: { records: [{}] },
+        c2: { records: [{}] },
+        c3: { records: [{}] },
+      },
+    });
+
+    assert.match(out, /- attempt 1 \(c1\): 1 file changed, \+1\/-0 lines/);
+    assert.match(out, /- attempt 2 \(c2\): no change since attempt 1/);
+    assert.match(out, /- attempt 3 \(c3\): 1 file changed, \+1\/-0 lines/);
+  });
+
+  it("caps failed-chain residual risks with the existing section cap", () => {
+    const ids = Array.from({ length: 20 }, (_, i) => `failed-${i + 1}`);
+    const out = renderRecommendation({
+      missionId: "m-605-cap",
+      disposition: "recommend-escalate",
+      record: { chains: ids },
+      chains: Object.fromEntries(ids.map((id) => [id, { records: [{ implementJobFailure: { kind: "quota-exhaustion" } }] }])),
+      chainControls: Object.fromEntries(ids.map((id) => [id, { status: "failed" }])),
+    });
+    const section = out.split("## Residual risks / not verified")[1].split("## Evidence")[0];
+    const failedRiskLines = section.split("\n").filter((line) => line.startsWith("- chain ") && line.includes(": failed ("));
+    assert.equal(failedRiskLines.length, 12);
+    assert.match(section, /\(\+8 more …\)/);
+  });
+});
