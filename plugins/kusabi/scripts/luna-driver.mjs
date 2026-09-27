@@ -1018,7 +1018,11 @@ export async function defaultInvestigationDispatch({
   const { job, resultText } = await dispatchTaskJob(
     cwd,
     { flags, text: prompt, _dispatch },
-    {},
+    {
+      excludedBackends: ["codex"],
+      exclusionErrorPrefix: "investigation has no non-codex seat available",
+      excludedRouteReason: "codex backend excluded before investigation dispatch",
+    },
   );
 
   if (job.status !== "completed") {
