@@ -590,7 +590,7 @@ describe("luna post-chain evidence (kusabi #568)", () => {
         });
         return JSON.stringify({
           type: "verdict",
-          schema_version: 1,
+          schema_version: 2, invariants: [{ id: "INV1", held: true }, { id: "INV2", held: true }, { id: "INV3", held: true }, { id: "INV4", held: true }, { id: "INV5", held: true }], criteria: [],
           gate_id: input.envelope.gate_id,
           envelope_sha256: input.envelope.envelope_sha256,
           verdict: "clear",
@@ -686,7 +686,7 @@ describe("luna post-chain evidence (kusabi #568)", () => {
         solEnvelopes.push(input);
         return JSON.stringify({
           type: "verdict",
-          schema_version: 1,
+          schema_version: 2, invariants: [{ id: "INV1", held: true }, { id: "INV2", held: true }, { id: "INV3", held: true }, { id: "INV4", held: true }, { id: "INV5", held: true }], criteria: [],
           gate_id: input.envelope.gate_id,
           envelope_sha256: input.envelope.envelope_sha256,
           verdict: "clear",
@@ -758,7 +758,7 @@ describe("luna post-chain evidence (kusabi #568)", () => {
         solEnvelopes.push(input);
         return JSON.stringify({
           type: "verdict",
-          schema_version: 1,
+          schema_version: 2, invariants: [{ id: "INV1", held: true }, { id: "INV2", held: true }, { id: "INV3", held: true }, { id: "INV4", held: true }, { id: "INV5", held: true }], criteria: [],
           gate_id: input.envelope.gate_id,
           envelope_sha256: input.envelope.envelope_sha256,
           verdict: "clear",
@@ -812,7 +812,7 @@ describe("luna post-chain evidence (kusabi #568)", () => {
         const isPreAccept = input.gate.phase === "pre-accept";
         return JSON.stringify({
           type: "verdict",
-          schema_version: 1,
+          schema_version: 2, invariants: [{ id: "INV1", held: true }, { id: "INV2", held: true }, { id: "INV3", held: true }, { id: "INV4", held: true }, { id: "INV5", held: true }], criteria: [],
           gate_id: input.envelope.gate_id,
           envelope_sha256: input.envelope.envelope_sha256,
           verdict: isPreAccept ? "rework" : "clear",

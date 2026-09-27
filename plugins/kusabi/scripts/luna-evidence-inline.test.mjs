@@ -51,7 +51,7 @@ if (stdinText.includes("Sol auditor seat")) {
   const gateId = gateMatch ? gateMatch[1] : "gate-1";
   const verdictText = JSON.stringify({
     type: "verdict",
-    schema_version: 1,
+    schema_version: 2, invariants: [{ id: "INV1", held: true }, { id: "INV2", held: true }, { id: "INV3", held: true }, { id: "INV4", held: true }, { id: "INV5", held: true }], criteria: [],
     gate_id: gateId,
     envelope_sha256: firstHash,
     verdict: "clear",

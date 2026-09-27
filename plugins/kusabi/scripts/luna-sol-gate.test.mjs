@@ -159,7 +159,7 @@ function makeToolFake(sharedOrder = null) {
 const verdictLine = (input, verdict, extra = {}) =>
   j({
     type: "verdict",
-    schema_version: 1,
+    schema_version: 2, invariants: [{ id: "INV1", held: true }, { id: "INV2", held: true }, { id: "INV3", held: true }, { id: "INV4", held: true }, { id: "INV5", held: true }], criteria: [],
     gate_id: input.envelope.gate_id,
     envelope_sha256: input.envelope.envelope_sha256,
     verdict,
@@ -1109,7 +1109,7 @@ describe("Sol verdict record contract (prompt-contract criterion 7)", () => {
 
   const verdictBase = (overrides = {}) => ({
     type: "verdict",
-    schema_version: 1,
+    schema_version: 2, invariants: [{ id: "INV1", held: true }, { id: "INV2", held: true }, { id: "INV3", held: true }, { id: "INV4", held: true }, { id: "INV5", held: true }], criteria: [],
     gate_id: "gate-1",
     envelope_sha256: "b".repeat(64),
     verdict: "clear",
@@ -1136,19 +1136,19 @@ describe("Sol verdict record contract (prompt-contract criterion 7)", () => {
   const MISSING_FIELD_CASES = [
     {
       name: "a clear verdict without summary",
-      record: { type: "verdict", schema_version: 1, gate_id: "gate-1", envelope_sha256: "b".repeat(64), verdict: "clear" },
+      record: { type: "verdict", schema_version: 2, invariants: [{ id: "INV1", held: true }, { id: "INV2", held: true }, { id: "INV3", held: true }, { id: "INV4", held: true }, { id: "INV5", held: true }], criteria: [], gate_id: "gate-1", envelope_sha256: "b".repeat(64), verdict: "clear" },
     },
     {
       name: "a clear verdict with an empty summary",
-      record: { type: "verdict", schema_version: 1, gate_id: "gate-1", envelope_sha256: "b".repeat(64), verdict: "clear", summary: "" },
+      record: { type: "verdict", schema_version: 2, invariants: [{ id: "INV1", held: true }, { id: "INV2", held: true }, { id: "INV3", held: true }, { id: "INV4", held: true }, { id: "INV5", held: true }], criteria: [], gate_id: "gate-1", envelope_sha256: "b".repeat(64), verdict: "clear", summary: "" },
     },
     {
       name: "a block verdict without block_reason",
-      record: { type: "verdict", schema_version: 1, gate_id: "gate-1", envelope_sha256: "b".repeat(64), verdict: "block", acknowledgement_required: true, summary: "x" },
+      record: { type: "verdict", schema_version: 2, invariants: [{ id: "INV1", held: true }, { id: "INV2", held: true }, { id: "INV3", held: true }, { id: "INV4", held: true }, { id: "INV5", held: true }], criteria: [], gate_id: "gate-1", envelope_sha256: "b".repeat(64), verdict: "block", acknowledgement_required: true, summary: "x" },
     },
     {
       name: "a block verdict without acknowledgement_required",
-      record: { type: "verdict", schema_version: 1, gate_id: "gate-1", envelope_sha256: "b".repeat(64), verdict: "block", block_reason: "x", summary: "x" },
+      record: { type: "verdict", schema_version: 2, invariants: [{ id: "INV1", held: true }, { id: "INV2", held: true }, { id: "INV3", held: true }, { id: "INV4", held: true }, { id: "INV5", held: true }], criteria: [], gate_id: "gate-1", envelope_sha256: "b".repeat(64), verdict: "block", block_reason: "x", summary: "x" },
     },
   ];
   for (const c of MISSING_FIELD_CASES) {

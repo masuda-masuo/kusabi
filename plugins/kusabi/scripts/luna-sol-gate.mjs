@@ -33,6 +33,9 @@
 import fs from "node:fs";
 import path from "node:path";
 import { createHash } from "node:crypto";
+import { fileURLToPath } from "node:url";
+
+const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
 
 import { evaluateAuditGate, AUDIT_POLICY_VERSION } from "./audit-policy.mjs";
 import { buildAuditEnvelope, resolveSolGateSeatFailure } from "./audit-envelope.mjs";
@@ -42,6 +45,7 @@ import {
   bindAuditVerdict,
   AUDIT_VERDICTS,
 } from "./audit-verdict.mjs";
+import { parseAcceptanceCriteria } from "./brief-parsing.mjs";
 import {
   renderSolContract,
   renderBriefCorrections,
@@ -49,6 +53,22 @@ import {
   renderEvidenceContents,
   remainingMissionBudget,
 } from "./luna-prompt.mjs";
+
+const SOL_INVARIANTS_FILE = path.resolve(SCRIPT_DIR, "../prompts/sol-invariants.md");
+
+/**
+ * Read the standing invariant file at runtime.  The prompt receives the exact
+ * file text, while validation derives its expected ids from the same bytes.
+ */
+export function loadSolInvariants() {
+  const text = fs.readFileSync(SOL_INVARIANTS_FILE, "utf8");
+  const ids = [];
+  for (const line of text.split("\n")) {
+    const match = line.match(/^\s*\d+[.)]\s+(INV[A-Za-z0-9_-]+)\b/);
+    if (match) ids.push(match[1]);
+  }
+  return { text, ids };
+}
 
 /** Bounded pending rework count rendered to coordinator. */
 export const SOL_REWORK_MAX_GATES = 3;
@@ -410,9 +430,11 @@ export function buildGateEnvelope({
  * job-identification pattern `luna mission <mission-id>: ...` so
  * reconciliation can attribute seat jobs to the mission.
  */
-export async function realSolDispatch({ cwd, missionId, missionDir, envelope, gate, auditor }) {
+export async function realSolDispatch({ cwd, missionId, missionDir, brief, envelope, gate, auditor }) {
   const { codexDispatch, assertCodexDispatchSucceeded } = await import("./codex-dispatch.mjs");
   const evidenceContents = renderEvidenceContents(envelope, missionDir);
+  const { text: invariantText, ids: invariantIds } = loadSolInvariants();
+  const criteria = parseAcceptanceCriteria(brief);
   const prompt = [
     `You are the Sol auditor seat for kusabi mission ${missionId}, audit gate ${gate.gateId} (phase: ${gate.phase}).`,
     `The current immutable evidence envelope hash is ${envelope.envelope_sha256}.`,
@@ -431,9 +453,13 @@ export async function realSolDispatch({ cwd, missionId, missionDir, envelope, ga
     // see the contract, never a hand-written copy.
     renderSolContract(),
     ``,
-    `Answer with line-oriented JSON records: any finding records, then exactly one ` +
-      `verdict record with type "verdict", schema_version 1, gate_id "${gate.gateId}", ` +
-      `envelope_sha256 "${envelope.envelope_sha256}", and verdict one of clear | rework | block.`,
+    `## Standing Sol invariants (rendered verbatim from plugins/kusabi/prompts/sol-invariants.md)`,
+    invariantText,
+    ``,
+    `## Mission acceptance criteria (extracted from the brief)`,
+    criteria.length === 0 ? "(none)" : criteria.map((criterion) => `- ${criterion.id}: ${criterion.text}`).join("\n"),
+    ``,
+    `Answer with line-oriented JSON records: any finding records, then exactly one verdict record with type "verdict", schema_version 2, gate_id "${gate.gateId}", envelope_sha256 "${envelope.envelope_sha256}", invariants for exactly ${invariantIds.join(", ")}, and criteria for exactly ${criteria.map((criterion) => criterion.id).join(", ") || "none"}.`,
   ].join("\n");
   const result = await codexDispatch({
     cwd,
@@ -555,6 +581,8 @@ export async function evaluateMissionGate(input) {
   const priorVerdicts = activePriorVerdicts(gatesAfterArchive, fingerprint);
 
   // ---- the gate envelope the seat judges ----
+  const { ids: invariantIds } = loadSolInvariants();
+  const acceptanceCriteria = parseAcceptanceCriteria(brief);
   const envelope = buildGateEnvelope({
     missionId,
     missionDir,
@@ -639,6 +667,7 @@ export async function evaluateMissionGate(input) {
       envelope,
       gate: { gateId, phase },
       record: { ...record },
+      brief,
       auditor,
     });
   } catch {
@@ -664,7 +693,12 @@ export async function evaluateMissionGate(input) {
     return seatFailure({ baseGate, gatesAfterArchive, envelope, decision, reason: "missing" });
   }
 
-  const validation = validateAuditVerdict(parsed.verdict);
+  const validation = validateAuditVerdict(parsed.verdict, {
+    requireV2: true,
+    invariantIds,
+    criteria: acceptanceCriteria,
+    envelopeItemPaths: envelope.items.map((item) => item.path),
+  });
   if (!validation.valid) {
     return seatFailure({ baseGate, gatesAfterArchive, envelope, decision, reason: "malformed" });
   }
@@ -674,6 +708,10 @@ export async function evaluateMissionGate(input) {
     bound = bindAuditVerdict(parsed.verdict, {
       gateId,
       envelopeSha256: envelope.envelope_sha256,
+      requireV2: true,
+      invariantIds,
+      criteria: acceptanceCriteria,
+      envelopeItemPaths: envelope.items.map((item) => item.path),
     });
   } catch {
     return seatFailure({ baseGate, gatesAfterArchive, envelope, decision, reason: "evidence-mismatch" });

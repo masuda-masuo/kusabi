@@ -253,6 +253,58 @@ function parsePathSection(briefText, headingName) {
 }
 
 // ---------------------------------------------------------------------------
+// parseAcceptanceCriteria — pure extraction of top-level items from the
+// case-insensitive ## Acceptance criteria / ## Acceptance section.
+// ---------------------------------------------------------------------------
+
+/**
+ * Return the mission's top-level acceptance criteria in source order.
+ *
+ * @param {string|null|undefined} briefText
+ * @returns {Array<{id: string, text: string}>}
+ */
+export function parseAcceptanceCriteria(briefText) {
+  if (typeof briefText !== "string" || briefText === "") return [];
+  const lines = briefText.split("\n");
+  let inSection = false;
+  let inCodeBlock = false;
+  let found = false;
+  const criteria = [];
+  const fence = String.fromCharCode(96).repeat(3);
+
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (trimmed.startsWith(fence)) {
+      inCodeBlock = !inCodeBlock;
+      continue;
+    }
+    if (!inCodeBlock && trimmed.startsWith("## ")) {
+      const heading = trimmed.slice(3).trim().toLowerCase();
+      const isAcceptanceHeading = ["acceptance criteria", "acceptance"].some(
+        (name) =>
+          heading === name ||
+          (heading.startsWith(name) && !/[A-Za-z0-9_]/.test(heading[name.length])),
+      );
+      if (isAcceptanceHeading) {
+        inSection = true;
+        found = true;
+        continue;
+      }
+      if (inSection) break;
+      continue;
+    }
+    if (!inSection || inCodeBlock) continue;
+    if (/^\s/.test(line)) continue;
+    const match = line.match(/^(?:[-*+]|\d+[.)])\s+(.*)$/);
+    if (!match) continue;
+    const text = match[1].trim();
+    if (text) criteria.push({ id: "AC" + (criteria.length + 1), text });
+  }
+
+  return found ? criteria : [];
+}
+
+// ---------------------------------------------------------------------------
 // parseDeliverables — pure function parsing ## Deliverables section from a
 // brief text.
 // ---------------------------------------------------------------------------
