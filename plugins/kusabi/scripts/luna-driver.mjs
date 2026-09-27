@@ -108,7 +108,7 @@ import {
   renderPendingSolRework,
 } from "./luna-sol-gate.mjs";
 export { renderPendingSolRework } from "./luna-sol-gate.mjs";
-import { oneLine } from "./one-line.mjs";
+import { renderRecommendation } from "./render-recommendation.mjs";
 
 /** The exact default seats of #530: coordinator codex/gpt-5.6-luna, auditor codex/gpt-5.6-sol. */
 export const DEFAULT_COORDINATOR_SEAT = { provider: "codex", model: "gpt-5.6-luna" };
@@ -736,7 +736,7 @@ function evaluateBriefCorrectionOutcome(record, budget) {
  * a reason (e.g. the budget bound that was exhausted, or the fail-closed
  * cause of a sol-blocked gate).
  */
-function writeRecommendationFile(missionDir, {
+export function writeRecommendationFile(missionDir, {
   missionId,
   disposition,
   recommendation,
@@ -744,57 +744,71 @@ function writeRecommendationFile(missionDir, {
   gate,
   lastCorrectionDetail,
   lastCoordinatorErrorDetail,
+  record,
+  briefText,
+  stateDir,
 }) {
-  const lines = [
-    "# Mission recommendation",
-    "",
-    `mission: ${missionId}`,
-    `disposition: ${disposition}`,
-    recommendation ? `recommendation: ${recommendation}` : null,
-    reason ? `reason: ${oneLine(reason)}` : null,
-  ].filter((line) => line !== null);
-
-  if (disposition === "sol-blocked") {
-    if (gate && typeof gate === "object") {
-      const phase = typeof gate.phase === "string" ? gate.phase : "?";
-      const verdict = typeof gate.verdict === "string" ? gate.verdict : "none";
-      lines.push(`gate: ${gate.gateId} (phase: ${phase}, verdict: ${verdict})`);
-      if (gate.verdictRecord && typeof gate.verdictRecord === "object") {
-        if (typeof gate.verdictRecord.summary === "string" && gate.verdictRecord.summary.trim() !== "") {
-          lines.push(`summary: ${oneLine(gate.verdictRecord.summary)}`);
-        }
-        if (typeof gate.verdictRecord.block_reason === "string" && gate.verdictRecord.block_reason.trim() !== "") {
-          lines.push(`block_reason: ${oneLine(gate.verdictRecord.block_reason)}`);
-        }
-      }
-      lines.push("");
-      lines.push("## Next actions");
-      lines.push("");
-      lines.push("1. amend the mission brief (resolve what `block_reason`/`summary` names) and start a new mission");
-      lines.push(`2. kusabi-companion luna-resume ${missionId} --audit-override ${gate.gateId} --audit-override-reason <reason> --audit-override-by <actor>`);
-    } else {
-      lines.push("");
-      lines.push("## Next actions");
-      lines.push("");
-      lines.push("1. amend the mission brief (resolve what `block_reason`/`summary` names) and start a new mission");
-    }
-  } else if (disposition === "brief-correction-exhausted") {
-    if (lastCorrectionDetail) {
-      lines.push("");
-      lines.push("## Last brief correction");
-      lines.push("");
-      lines.push(String(lastCorrectionDetail).trimEnd());
-    }
-  } else if (disposition === "coordinator-failed") {
-    if (lastCoordinatorErrorDetail) {
-      lines.push("");
-      lines.push("## Last coordinator error");
-      lines.push("");
-      lines.push(String(lastCoordinatorErrorDetail).trimEnd());
+  const chains = {};
+  const chainIds = new Set();
+  if (Array.isArray(record?.chains)) {
+    for (const cid of record.chains) {
+      if (typeof cid === "string" && cid) chainIds.add(cid);
     }
   }
+  if (Array.isArray(record?.attempts)) {
+    for (const att of record.attempts) {
+      const cid = att?.chainId ?? att?.postChain?.chainId;
+      if (typeof cid === "string" && cid) chainIds.add(cid);
+    }
+  }
+  const effectiveStateDir = stateDir ?? (missionDir ? path.dirname(path.dirname(missionDir)) : null);
+  for (const cid of chainIds) {
+    let chainJson = null;
+    try {
+      if (effectiveStateDir) {
+        chainJson = readJson(path.join(effectiveStateDir, "chains", cid, "chain.json"));
+      }
+    } catch {
+      chainJson = null;
+    }
+    chains[cid] = (chainJson && typeof chainJson === "object") ? chainJson : null;
+  }
 
-  fs.writeFileSync(path.join(missionDir, "recommendation.md"), lines.join("\n") + "\n", "utf8");
+  const gateEnvelopes = {};
+  const gateIds = new Set();
+  if (gate?.gateId) gateIds.add(gate.gateId);
+  if (Array.isArray(record?.auditGates)) {
+    for (const g of record.auditGates) {
+      if (g?.gateId) gateIds.add(g.gateId);
+    }
+  }
+  for (const gid of gateIds) {
+    let envJson = null;
+    try {
+      if (missionDir) {
+        envJson = readJson(path.join(missionDir, "evidence", `gate-envelope-${gid}.json`));
+      }
+    } catch {
+      envJson = null;
+    }
+    gateEnvelopes[gid] = (envJson && typeof envJson === "object") ? envJson : null;
+  }
+
+  const content = renderRecommendation({
+    missionId,
+    disposition,
+    recommendation,
+    reason,
+    gate,
+    lastCorrectionDetail,
+    lastCoordinatorErrorDetail,
+    record,
+    briefText,
+    chains,
+    gateEnvelopes,
+  });
+
+  fs.writeFileSync(path.join(missionDir, "recommendation.md"), content, "utf8");
 }
 
 /**
@@ -1942,6 +1956,9 @@ export async function runLunaMission(input) {
     gate: outcome.gate,
     lastCorrectionDetail: outcome.lastCorrectionDetail,
     lastCoordinatorErrorDetail,
+    record,
+    briefText: brief,
+    stateDir,
   });
 
   // ---- exactly one terminal notification per terminal mission ----

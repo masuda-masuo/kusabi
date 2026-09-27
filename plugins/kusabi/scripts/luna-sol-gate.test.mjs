@@ -1183,4 +1183,17 @@ describe("Sol verdict record contract (prompt-contract criterion 7)", () => {
     const gates = record.auditGates ?? [];
     assert.equal(gates[0].reason, "malformed");
   });
+
+  it("a valid verdict with finding records persists them on gate.findings (kusabi #592)", async () => {
+    const solWithFindings = (input) => [
+      JSON.stringify({ type: "finding", severity: "medium", title: "Residual risk", body: "Check manual steps" }),
+      verdictLine(input, "clear"),
+    ].join("\n");
+    const { record } = await runMission([finishStream("recommend-accept")], solWithFindings);
+    const gates = record.auditGates ?? [];
+    assert.equal(gates.length, 1);
+    assert.ok(Array.isArray(gates[0].findings));
+    assert.equal(gates[0].findings.length, 1);
+    assert.equal(gates[0].findings[0].title, "Residual risk");
+  });
 });
