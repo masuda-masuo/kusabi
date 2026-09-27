@@ -19,6 +19,52 @@ import { notifyChainTerminal, stateDirForChain } from "./chain-notify.mjs";
 import { retireJobProgress } from "./kaiba-progress-retire.mjs";
 
 /**
+ * Extract the human-readable title from a chain brief.
+ *
+ * @param {unknown} text
+ * @returns {string}
+ */
+export function briefTitle(text) {
+  if (typeof text !== "string" || text.length === 0) return "";
+
+  const lines = text.split(/\r?\n/);
+  const titleRegion = [];
+
+  for (const line of lines) {
+    if (/^\s*#{2,6}(?:\s+|$)/.test(line)) break;
+    titleRegion.push(line);
+  }
+
+  let title = "";
+  for (const line of titleRegion) {
+    const heading = line.match(/^\s*#\s+(.*?)\s*$/);
+    if (heading && heading[1].trim()) {
+      title = heading[1].trim();
+      break;
+    }
+  }
+
+  if (!title) {
+    for (const line of titleRegion) {
+      const candidate = line.trim();
+      if (
+        candidate &&
+        !candidate.startsWith("Orchestrator:") &&
+        !candidate.startsWith("Container:")
+      ) {
+        title = candidate;
+        break;
+      }
+    }
+  }
+
+  if (Array.from(title).length > 120) {
+    title = Array.from(title).slice(0, 119).join("") + "…";
+  }
+  return title;
+}
+
+/**
  * Build args for notifyChainTerminal from a chain directory + control record.
  * Shared by finalizeChainControl and the stale-pid path in requestChainStop.
  *
@@ -32,10 +78,7 @@ export function buildNotifyArgs(chainDir, existing, status) {
   const chainId = existing.chainId || (chainJson && chainJson.chainId) || path.basename(chainDir);
   const disposition = chainJson?.disposition?.disposition ?? null;
   const container = existing.container || chainJson?.container || null;
-  let cwdLabel = "";
-  if (chainJson?.brief) {
-    cwdLabel = path.basename(chainJson.brief, path.extname(chainJson.brief));
-  }
+  const cwdLabel = briefTitle(chainJson?.brief);
   return {
     stateDir: stateDirForChain(chainDir),
     chainId,

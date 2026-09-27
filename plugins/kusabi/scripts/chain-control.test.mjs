@@ -345,7 +345,8 @@ describe("finalizeChainControl", () => {
         chainId: "chain-notify-wire",
         container: "cid-wire",
         disposition: { disposition: "accept", round: 1 },
-        brief: "/tmp/briefs/demo.md",
+        // chain.json's `brief` is the brief TEXT, never a path (kusabi #612).
+        brief: "# Demo chain\n\nOrchestrator: m | session s | 2026-09-28\n\n- To see an original use `git show HEAD:<path>`.\n",
       }),
       "utf8",
     );
@@ -376,7 +377,7 @@ describe("finalizeChainControl", () => {
     assert.equal(args.chainId, "chain-notify-wire");
     assert.equal(args.disposition, "accept");
     assert.equal(args.container, "cid-wire");
-    assert.equal(args.cwdLabel, "demo");
+    assert.equal(args.cwdLabel, "Demo chain");
   });
 });
 
