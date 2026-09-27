@@ -105,7 +105,9 @@ import {
   probeEvidenceText,
   missionEvidenceItems,
   resolveLastPostChain,
+  renderPendingSolRework,
 } from "./luna-sol-gate.mjs";
+export { renderPendingSolRework } from "./luna-sol-gate.mjs";
 import { oneLine } from "./one-line.mjs";
 
 /** The exact default seats of #530: coordinator codex/gpt-5.6-luna, auditor codex/gpt-5.6-sol. */
@@ -590,6 +592,11 @@ async function realCoordinatorDispatch({ cwd, missionId, missionDir, brief, enve
     correctionsText !== ""
       ? [`Brief corrections from the previous dispatch:`, ``, correctionsText, ``]
       : [];
+  const solReworkText = renderPendingSolRework(record ?? {});
+  const solReworkSection =
+    solReworkText !== ""
+      ? [`Sol audit rework demanded:`, ``, solReworkText, ``]
+      : [];
   const prompt = [
     `You are the Luna coordinator seat for kusabi mission ${missionId}.`,
     `The current immutable evidence envelope hash is ${envelope.envelope_sha256}.`,
@@ -620,6 +627,7 @@ async function realCoordinatorDispatch({ cwd, missionId, missionDir, brief, enve
     // text, probe output, tool output and exception messages never reach the
     // seat.
     ...correctionsSection,
+    ...solReworkSection,
     // The runtime-rendered request contract (derived from
     // schemas/coordinator-output.schema.json): the exact per-action body
     // fields, the probe tool enum and per-tool arguments, the inner-chain
