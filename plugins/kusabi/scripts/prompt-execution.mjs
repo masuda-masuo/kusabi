@@ -21,6 +21,15 @@ async function getClaudeDispatch() {
   return _cachedClaudeDispatch;
 }
 
+let _cachedCodexDispatch = null;
+async function getCodexDispatch() {
+  if (!_cachedCodexDispatch) {
+    const mod = await import("./codex-dispatch.mjs");
+    _cachedCodexDispatch = mod.codexDispatch;
+  }
+  return _cachedCodexDispatch;
+}
+
 let _cachedTranslateDenyTools = null;
 async function translateDenyToolsForFallback(tools) {
   if (!_cachedTranslateDenyTools) {
@@ -1168,6 +1177,7 @@ export async function dispatchWithFallback(opts) {
     _agyDispatch,
     _claudeDispatch,
     _cursorDispatch,
+    _codexDispatch,
     _backendDispatch,
     ...runPromptOpts
   } = opts;
@@ -1257,6 +1267,16 @@ export async function dispatchWithFallback(opts) {
     } else if (candidateBackend === "agy") {
       const doAgy = _backendDispatch ? _backendDispatch("agy") : (_agyDispatch || agyDispatch);
       result = await doAgy({
+        ...runPromptOpts,
+        session: currentSession,
+        sessionProvenance: currentSessionProvenance,
+        explicitModel: modelStr,
+        model: modelStr,
+        tiers: [[modelStr]],
+      });
+    } else if (candidateBackend === "codex") {
+      const doCodex = _backendDispatch ? _backendDispatch("codex") : (_codexDispatch || (await getCodexDispatch()));
+      result = await doCodex({
         ...runPromptOpts,
         session: currentSession,
         sessionProvenance: currentSessionProvenance,
