@@ -36,6 +36,10 @@ import {
   AGY_MAX_ARG_STRLEN,
   AGY_MAX_ARG_BYTES,
   checkAgyArgvSize,
+  assertNoAgySession,
+  agyDispatch,
+} from "./agy-dispatch.mjs";
+import {
   parseAgyResult,
   parseAgyStreamLine,
   initAgyStreamAccumulator,
@@ -45,13 +49,13 @@ import {
   agyPayload,
   describeAgyResult,
   mapAgyUsage,
-  assertNoAgySession,
-  agyDispatch,
+} from "./agy-stream.mjs";
+import {
   resolveAgyHome,
   agyDeniedActionNames,
   agyDeniedToolFromConversation,
   agyHomeSettingsPath,
-} from "./agy-dispatch.mjs";
+} from "./agy-home.mjs";
 import {
   BACKENDS,
   resolveBackend,
