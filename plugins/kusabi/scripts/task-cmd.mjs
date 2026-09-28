@@ -36,7 +36,7 @@ import {
 import { stateRoot, stateDirFor } from "./state-paths.mjs";
 import { jobDir, saveJob, latestJob, appendEvent } from "./job-store.mjs";
 import { runPrompt, finalizeIncompleteCompletedRun } from "./prompt-execution.mjs";
-import { translateDenyTools } from "./claude-dispatch.mjs";
+import { translateDenyTools } from "./tool-permissions.mjs";
 import { AGY_BACKEND } from "./agy-dispatch.mjs";
 import { CURSOR_BACKEND } from "./cursor-dispatch.mjs";
 import { CODEX_BACKEND } from "./codex-dispatch.mjs";

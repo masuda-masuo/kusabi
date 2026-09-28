@@ -33,7 +33,7 @@ async function getCodexDispatch() {
 let _cachedTranslateDenyTools = null;
 async function translateDenyToolsForFallback(tools) {
   if (!_cachedTranslateDenyTools) {
-    const mod = await import("./claude" + "-dispatch.mjs");
+    const mod = await import("./tool-permissions.mjs");
     _cachedTranslateDenyTools = mod.translateDenyTools;
   }
   return _cachedTranslateDenyTools(tools);

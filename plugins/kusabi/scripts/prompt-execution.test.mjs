@@ -25,7 +25,7 @@ import { cmdTask } from "./task-cmd.mjs";
 import { commandOutcome } from "./kusabi-companion.mjs";
 import { resolveResumeLastSession } from "./kusabi-companion.mjs";
 import { WRITE_TOOL_NAMES, implementDenyTools, reviewDenyTools } from "./cli.mjs";
-import { translateDenyTools } from "./claude-dispatch.mjs";
+import { translateDenyTools } from "./tool-permissions.mjs";
 
 // decidePermission — always returns "once"
 // ---------------------------------------------------------------------------

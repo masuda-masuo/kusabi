@@ -67,7 +67,8 @@ import {
   resolveResumeDispatches,
   effectiveTierCount,
 } from "./chain-driver.mjs";
-import { claudeDispatch, readAgentSystemPrompt } from "./claude-dispatch.mjs";
+import { claudeDispatch } from "./claude-dispatch.mjs";
+import { readAgentSystemPrompt } from "./agent-system-prompt.mjs";
 import { dispatchWithFallback } from "./prompt-execution.mjs";
 import { runImplementPhase } from "./chain-run.mjs";
 import { backendSupportsResume, splitRouteBackend, stripBackendPrefixChain } from "./cli.mjs";

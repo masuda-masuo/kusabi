@@ -88,13 +88,13 @@ import process from "node:process";
 import { fileURLToPath } from "node:url";
 
 import { firstRoute, WRITE_TOOL_NAMES } from "./cli.mjs";
+import { readAgentSystemPrompt } from "./agent-system-prompt.mjs";
 import {
-  readAgentSystemPrompt,
   allowedToolsForAgent,
   applyToolDenies,
   translateDenyTools,
   DISALLOWED_TOOLS,
-} from "./claude-dispatch.mjs";
+} from "./tool-permissions.mjs";
 import { newJobId, saveJob, jobDir, appendEvent } from "./job-store.mjs";
 import { stateDirFor, writeJson, kusabiOpencodeConfigHome } from "./state-paths.mjs";
 import { durationS } from "./render.mjs";
