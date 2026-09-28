@@ -265,6 +265,38 @@ describe("runBackendProcess", () => {
     assert.equal(result.timedOut, false);
   });
 
+  it("a stalled parent does not defer the silence watchdog clock (kusabi #619)", async () => {
+    // Deterministic bounds rationale:
+    // 1. Clock starts before spawn (t = 0).
+    // 2. onStart stalls the parent thread synchronously for 800ms (t = 0..800ms).
+    // 3. The silence watchdog polls every 250ms starting when setup returns at t = 800ms.
+    // 4. At the first poll tick (t ~= 800 + 250 = 1050ms), elapsed silence from spawn
+    //    is 1050ms > watchdogS (1000ms). The watchdog fires and kills the child group.
+    //    If tick 1 is slightly delayed, tick 2 fires at 1300ms.
+    // 5. The child lives 1700ms without emitting anything. This provides a 650ms safety
+    //    margin after the first poll (1050ms) and 400ms after the second poll (1300ms)
+    //    to ensure the child cannot exit naturally before the watchdog fires.
+    // 6. Before fix #619, the clock was initialized after onStart (t = 800ms). The 250ms
+    //    polls observed silence of 250ms (at 1050ms), 500ms (at 1300ms), and 750ms (at
+    //    1550ms). The child exited naturally at 1700ms before the 4th poll at 1800ms
+    //    could observe >= 1000ms, deterministically causing stalled === false (exit 0).
+    // 7. Therefore, with the fix stalled is deterministically true; without it, false.
+    const result = await runBackendProcess({
+      bin: process.execPath,
+      args: ["-e", "setTimeout(() => {}, 1700)"],
+      cwd: ctx.tmp,
+      watchdogS: 1,
+      parseLine: parseLineNothing,
+      onStart: () => {
+        const end = Date.now() + 800;
+        while (Date.now() < end) { /* busy wait */ }
+      },
+    });
+    assert.equal(result.stalled, true);
+    assert.equal(result.timedOut, false);
+    assert.equal(result.spawnError, null);
+  });
+
   it("onLine errors do not crash the process runner (stats-fold safety)", async () => {
     const result = await runBackendProcess({
       bin: ctx.binPath,

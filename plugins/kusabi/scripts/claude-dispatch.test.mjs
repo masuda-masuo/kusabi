@@ -3814,6 +3814,25 @@ describe("runClaudeProcess — write watchdog", () => {
     assert.deepEqual(seen, []);
     assert.equal(result.writeStalled, false);
   });
+
+  it("stalled parent during setup still gets write-watchdog warning for short-lived child (kusabi #619)", async () => {
+    const seen = [];
+    const result = await runClaudeProcess({
+      bin: process.execPath,
+      args: ["-e", "setTimeout(() => {}, 120)"],
+      timeoutS: 20,
+      watchdogS: 0,
+      writeWatchdog: { warnS: 0.01, killS: null },
+      onStart: () => {
+        const end = Date.now() + 400;
+        while (Date.now() < end) { /* busy wait */ }
+      },
+      onWriteWatchdog: (e) => seen.push(e),
+    });
+    assert.equal(result.spawnError, null);
+    assert.equal(result.writeStalled, false);
+    assert.deepEqual(seen.map((e) => e.kind), ["warned"]);
+  });
 });
 
 describe("claudeDispatch — write-tool watchdog (kusabi #215 item 3)", () => {
