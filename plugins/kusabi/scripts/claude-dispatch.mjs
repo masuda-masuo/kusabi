@@ -679,6 +679,7 @@ export function renderClaudeQuotaError(failure, detail, { resetFromRateFeed = fa
  */
 export function runClaudeProcess({ bin, args, cwd, timeoutS, watchdogS, promptText, onStart, onLine, onWatchdog, writeWatchdog = null, onWriteWatchdog, repeatWatchdog = null, onRepeatWatchdog }) {
   return new Promise((resolve) => {
+    const spawnedAt = Date.now();
     const child = spawn(bin, args, {
       cwd,
       env: { ...process.env, KUSABI_WORKER_CONTEXT: "1" },
@@ -710,11 +711,16 @@ export function runClaudeProcess({ bin, args, cwd, timeoutS, watchdogS, promptTe
     let writeStalled = false;
     let spawnError = null;
     let lineBuffer = "";
-    let lastEventAt = Date.now();
-    // The write-tool clock (kusabi #215 item 3).  Starts at spawn, like the
-    // silence clock: a worker that never writes anything at all must trip
-    // this, not be held off by the absence of a first write to measure from.
-    let lastWriteAt = Date.now();
+    // The silence clock starts at spawn (kusabi #215 Job B item 3, #619),
+    // captured before spawn() so a parent stalled during setup cannot
+    // shorten the measured idle.
+    let lastEventAt = spawnedAt;
+    // The write-tool clock (kusabi #215 item 3, #619).  Starts at spawn, like the
+    // silence clock: captured before spawn() so a parent stalled during setup
+    // cannot shorten the measured idle.  A worker that never writes anything
+    // at all must trip this, not be held off by the absence of a first write to
+    // measure from.
+    let lastWriteAt = spawnedAt;
     let writeWarned = false;
     // The repeat-tool chain (kusabi #234).  Count-based, so there is no
     // clock and no timer: the chain folds synchronously at line delivery

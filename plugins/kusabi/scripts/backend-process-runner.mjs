@@ -112,6 +112,7 @@ export function runBackendProcess({
 }) {
   return new Promise((resolve) => {
     const hasStdin = typeof promptText === "string";
+    const spawnedAt = Date.now();
     const child = spawn(bin, args, {
       cwd,
       // `env` overrides ride on top of the parent env (additive); the only
@@ -133,10 +134,11 @@ export function runBackendProcess({
     let stalled = false;
     let spawnError = null;
     let lineBuffer = "";
-    // The silence clock starts at spawn, not at the first event: a child
-    // that never prints anything at all still trips the watchdog (the same
-    // rule as the claude backend, kusabi #215 Job B item 3).
-    let lastEventAt = Date.now();
+    // The silence clock starts at spawn, not at the first event: captured
+    // before spawn() so a parent stalled during setup cannot shorten the
+    // measured idle (kusabi #215 Job B item 3, #619).  A child that never
+    // prints anything at all still trips the watchdog.
+    let lastEventAt = spawnedAt;
 
     // Delivers one complete NDJSON line to the caller and resets the
     // silence clock the watchdog measures against.  Only a PARSED event
