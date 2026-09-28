@@ -24,11 +24,13 @@ import {
 import {
   parseTimeBound,
   computeReport,
+  missingStoreReport,
+} from "./metrics-report.mjs";
+import {
   renderReportText,
   renderReportJson,
-  missingStoreReport,
   renderMissingText,
-} from "./metrics-report.mjs";
+} from "./metrics-render.mjs";
 
 describe("parseTimeBound", () => {
   it("returns undefined for an absent bound", () => {

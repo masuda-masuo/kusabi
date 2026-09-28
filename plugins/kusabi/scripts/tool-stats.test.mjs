@@ -13,7 +13,8 @@ import {
   getSourceFile,
 } from "./metrics-db.mjs";
 import { ingestJobDirectory } from "./chain-ingest.mjs";
-import { computeReport, renderReportText, renderReportJson } from "./metrics-report.mjs";
+import { computeReport } from "./metrics-report.mjs";
+import { renderReportText, renderReportJson } from "./metrics-render.mjs";
 
 function toolPart(id, tool, status) {
   return {

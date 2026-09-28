@@ -31,13 +31,12 @@ import { ingestCursorUsageDirectory } from "./cursor-usage-ingest.mjs";
 import { ingestCodexUsageDirectory } from "./codex-usage-ingest.mjs";
 import { ingestChainDirectory, ingestJobDirectory } from "./chain-ingest.mjs";
 import { ingestMissionDirectory } from "./mission-ingest.mjs";
+import { computeReport, missingStoreReport } from "./metrics-report.mjs";
 import {
-  computeReport,
   renderReportText,
   renderReportJson,
-  missingStoreReport,
   renderMissingText,
-} from "./metrics-report.mjs";
+} from "./metrics-render.mjs";
 import { startDashboard } from "./dashboard.mjs";
 import { cursorUsageDir } from "./cursor-statusline-sink.mjs";
 
