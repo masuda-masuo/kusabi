@@ -59,7 +59,7 @@ import {
   backendDispatch,
   backendPinsModel,
   assertSessionBackendCompatible,
-} from "./kusabi-companion.mjs";
+} from "./dispatch-backend.mjs";
 // The chain-side seams moved out of the companion with the driver
 // (kusabi #264 PR 2/2); no compatibility re-export was left behind.
 import {

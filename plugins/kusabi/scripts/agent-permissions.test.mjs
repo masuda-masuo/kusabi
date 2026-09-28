@@ -7,7 +7,7 @@ import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import os from "node:os";
 
-import { PHASE_AGENTS } from "./kusabi-companion.mjs";
+import { PHASE_AGENTS } from "./companion-config.mjs";
 import { codexDispatch } from "./codex-dispatch.mjs";
 import { stateDirFor } from "./state-paths.mjs";
 import { loadJob } from "./job-store.mjs";

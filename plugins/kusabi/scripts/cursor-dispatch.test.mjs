@@ -36,7 +36,7 @@ import {
   backendDispatch,
   backendPinsModel,
   resolveDispatchBackend,
-} from "./kusabi-companion.mjs";
+} from "./dispatch-backend.mjs";
 import { splitRouteBackend, resolveModelBackend, backendSupportsResume } from "./cli.mjs";
 import { stateDirFor } from "./state-paths.mjs";
 import { loadJob, jobDir } from "./job-store.mjs";

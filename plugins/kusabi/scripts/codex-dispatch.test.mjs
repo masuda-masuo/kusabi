@@ -50,7 +50,7 @@ import {
   backendPinsModel,
   resolveDispatchBackend,
   resolveResumeLastSession,
-} from "./kusabi-companion.mjs";
+} from "./dispatch-backend.mjs";
 import { splitRouteBackend, resolveModelBackend, backendSupportsResume, WRITE_TOOL_NAMES, implementDenyTools, reviewDenyTools } from "./cli.mjs";
 import { renderHeader } from "./render.mjs";
 import { stateDirFor } from "./state-paths.mjs";

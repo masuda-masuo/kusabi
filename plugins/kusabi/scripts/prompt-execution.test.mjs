@@ -23,7 +23,7 @@ import { stateDirFor } from "./state-paths.mjs";
 import { loadJob, saveJob } from "./job-store.mjs";
 import { cmdTask } from "./task-cmd.mjs";
 import { commandOutcome } from "./kusabi-companion.mjs";
-import { resolveResumeLastSession } from "./kusabi-companion.mjs";
+import { resolveResumeLastSession } from "./dispatch-backend.mjs";
 import { WRITE_TOOL_NAMES, implementDenyTools, reviewDenyTools } from "./cli.mjs";
 import { translateDenyTools } from "./tool-permissions.mjs";
 

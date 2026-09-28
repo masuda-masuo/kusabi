@@ -5,7 +5,7 @@ import path from "node:path";
 import os from "node:os";
 import crypto from "node:crypto";
 import { sessionProvenanceRefusal, renderChainBanner, cmdChain, runChainLifecycle } from "./chain-cmd.mjs";
-import { resolveOrchestratorRecord } from "./kusabi-companion.mjs";
+import { resolveOrchestratorRecord } from "./companion-config.mjs";
 import { createChainDir } from "./chain-phases.mjs";
 import { effectiveTierCount } from "./chain-driver.mjs";
 

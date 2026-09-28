@@ -57,7 +57,7 @@ import {
   renderClaudeRepeatWatchdogError,
 } from "./claude-watchdogs.mjs";
 import { agyDispatch } from "./agy-dispatch.mjs";
-import { resolveBackend, resolveDispatchBackend } from "./kusabi-companion.mjs";
+import { resolveBackend, resolveDispatchBackend } from "./dispatch-backend.mjs";
 import { dispatchWithFallback } from "./prompt-execution.mjs";
 import { runImplementPhase } from "./chain-run.mjs";
 import { WRITE_TOOL_NAMES, implementDenyTools, firstRoute } from "./cli.mjs";

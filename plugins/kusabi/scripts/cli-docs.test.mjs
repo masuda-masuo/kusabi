@@ -8,7 +8,7 @@ import {
   BUILTIN_DEFAULT_CHAIN,
   resolveModelBackend,
 } from "./cli.mjs";
-import { BACKENDS, resolveDispatchBackend } from "./kusabi-companion.mjs";
+import { BACKENDS, resolveDispatchBackend } from "./dispatch-backend.mjs";
 
 const readme = fs.readFileSync(new URL("../../../README.md", import.meta.url), "utf8");
 const help = execFileSync(process.execPath, [

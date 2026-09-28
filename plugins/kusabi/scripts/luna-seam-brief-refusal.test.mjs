@@ -24,7 +24,7 @@ import {
   runLunaMission,
 } from "./luna-driver.mjs";
 import { createFakeCallTool, stubInvestigationSeams } from "./fixtures.mjs";
-import { resolveOrchestratorRecord } from "./kusabi-companion.mjs";
+import { resolveOrchestratorRecord } from "./companion-config.mjs";
 
 const j = (obj) => JSON.stringify(obj);
 const line = (action, hash, body = {}) => j({ action, envelope_sha256: hash, ...body });
