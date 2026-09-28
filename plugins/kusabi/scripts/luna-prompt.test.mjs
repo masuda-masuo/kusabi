@@ -442,7 +442,8 @@ describe("the real dispatch prompts carry the rendered contract (prompt-contract
     }
     // Adapter surface: the schema bridge only exists for the review agent and
     // a null schema never produces the --output-schema argv flag.
-    const { codexJsonSchemaFor, buildCodexArgs } = await import("./codex-dispatch.mjs");
+    const { buildCodexArgs } = await import("./codex-dispatch.mjs");
+    const { codexJsonSchemaFor } = await import("./codex-schema.mjs");
     assert.equal(codexJsonSchemaFor("kusabi-coordinate"), null);
     assert.equal(codexJsonSchemaFor(null), null);
     for (const args of [

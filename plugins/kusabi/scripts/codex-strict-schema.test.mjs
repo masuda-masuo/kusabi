@@ -4,13 +4,13 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { buildCodexArgs } from "./codex-dispatch.mjs";
 import {
-  buildCodexArgs,
   codexJsonSchemaFor,
   stripCodexOptionalNulls,
   stripCodexOptionalNullsFromText,
   toCodexStrictSchema,
-} from "./codex-dispatch.mjs";
+} from "./codex-schema.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const SCHEMA_PATH = path.join(HERE, "../schemas/review-output.schema.json");

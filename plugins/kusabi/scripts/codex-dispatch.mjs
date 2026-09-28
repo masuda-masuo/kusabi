@@ -80,31 +80,49 @@
 //   - The backend is NEVER described as tool-free or credential-isolated; the
 //     job record carries `codexCommandTool: true` and the fixed read-only
 //     sandbox boundary.
+//
+// Split into focused modules by role: MCP allowlists and worker configuration
+// live in codex-mcp.mjs, strict output schema projection lives in
+// codex-schema.mjs, NDJSON stream parsing lives in codex-stream.mjs, and
+// rollout provenance verification lives in codex-rollout.mjs.
 
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import process from "node:process";
-import { fileURLToPath } from "node:url";
 
 import { firstRoute, WRITE_TOOL_NAMES } from "./cli.mjs";
 import { readAgentSystemPrompt } from "./agent-system-prompt.mjs";
-import {
-  allowedToolsForAgent,
-  applyToolDenies,
-  translateDenyTools,
-  DISALLOWED_TOOLS,
-} from "./tool-permissions.mjs";
+import { translateDenyTools } from "./tool-permissions.mjs";
 import { newJobId, saveJob, jobDir, appendEvent } from "./job-store.mjs";
-import { stateDirFor, writeJson, kusabiOpencodeConfigHome } from "./state-paths.mjs";
+import { stateDirFor, writeJson } from "./state-paths.mjs";
 import { durationS } from "./render.mjs";
 import { resolveCompletedResult } from "./result-recovery.mjs";
 import { deriveStopReason } from "./stop-reason.mjs";
 import { startKaibaProgressWatch } from "./kaiba-progress-watch.mjs";
 import { isUsableTimeoutS, runBackendProcess } from "./backend-process-runner.mjs";
+import {
+  codexMcpArgv,
+  codexMcpServerDefinitions,
+  codexMcpToolsForAgent,
+} from "./codex-mcp.mjs";
+import {
+  REVIEW_AGENT,
+  codexJsonSchemaFor,
+  stripCodexOptionalNullsFromText,
+} from "./codex-schema.mjs";
+import {
+  applyCodexStreamEvent,
+  describeCodexResult,
+  initCodexStreamAccumulator,
+  mapCodexUsage,
+  parseCodexStreamLine,
+} from "./codex-stream.mjs";
+import {
+  CODEX_REASONING_EFFORT,
+  readRolloutProvenance,
+} from "./codex-rollout.mjs";
 
-const HERE = path.dirname(fileURLToPath(import.meta.url));
-const PLUGIN_ROOT = path.resolve(HERE, "..");
 
 export const CODEX_BACKEND = "codex";
 
@@ -120,18 +138,10 @@ export const CODEX_SUPPORTED_MODELS = ["gpt-5.6-luna", "gpt-5.6-sol"];
 // interchangeable routes exactly like the other pinning backends' defaults.
 export const CODEX_DEFAULT_CHAIN = [["gpt-5.6-luna", "gpt-5.6-sol"]];
 
-// Reasoning effort is FIXED to high in v1 (measured fresh invocation).  It is
-// not configurable and never translated from a :variant suffix.
-export const CODEX_REASONING_EFFORT = "high";
 
 // The sandbox every invocation runs in (measured `-s read-only`).
 export const CODEX_SANDBOX_POLICY = "read-only";
 
-// The agent whose output contract IS the review verdict.  When a dispatch
-// carries it, `--output-schema` enforces the shape at the CLI (the measured
-// `--output-schema` framing returns the terminal JSON text in the
-// agent-message item, which the same extraction path reads).
-export const REVIEW_AGENT = "kusabi-review";
 
 // Tests point CODEX_BIN at a fake script.  The real binary is a host install
 // (`codex` from codex-cli) that exists in neither CI nor the sunaba
@@ -239,221 +249,6 @@ export function resolveCodexModel({ flag, phase, config }) {
   return { model: undefined, chain };
 }
 
-// =========================================================================
-// MCP allowlists + worker configuration
-// =========================================================================
-//
-// The Claude backend owns the permission tables. Codex consumes the same
-// exported accessor and translates Claude's mcp__<server>__<tool> spelling to
-// the bare tool names Codex expects in each server's enabled_tools list.
-//
-// Worker endpoints and commands are operator-owned in the JSONC file seeded by
-// install-agents. The operator's ~/.codex/config.toml is never read: Codex is
-// invoked with explicit -c overrides because --ignore-user-config ignores it.
-export const CODEX_MCP_AGENTS = new Set([
-  "kusabi-implement",
-  "kusabi-review",
-  "kusabi-plan",
-  "kusabi-test-author",
-  "kusabi-investigate",
-]);
-
-function bareMcpToolName(name) {
-  const match = /^mcp__([^_]+)__([\s\S]+)$/.exec(name);
-  return match ? { server: match[1], tool: match[2] } : null;
-}
-
-/**
- * Compute the Codex MCP grants from the Claude backend's canonical allowlist.
- *
- * @param {string|null|undefined} agent
- * @param {object|null|undefined} tools - the phase/user deny map
- * @returns {Record<string, string[]>|null} server -> enabled tool names
- */
-export function codexMcpToolsForAgent(agent, tools = null) {
-  if (!CODEX_MCP_AGENTS.has(agent)) return null;
-
-  const deniedAllowlist = applyToolDenies(
-    allowedToolsForAgent(agent),
-    translateDenyTools(tools),
-  );
-  const disallowed = new Set(DISALLOWED_TOOLS);
-  const servers = {};
-
-  for (const name of deniedAllowlist.split(",").filter(Boolean)) {
-    const parsed = bareMcpToolName(name);
-    if (!parsed) continue;
-    const tool = `mcp__${parsed.server}__${parsed.tool}`;
-    // Codex must never receive a hardcoded disallowed tool, including the
-    // investigate-only Claude exception for issue writes.
-    if (disallowed.has(tool)) continue;
-    const list = servers[parsed.server] ?? (servers[parsed.server] = []);
-    const bare = parsed.tool === "*" ? "*" : parsed.tool;
-    if (!list.includes(bare)) list.push(bare);
-  }
-
-  return servers;
-}
-
-function stripJsoncComments(source) {
-  let out = "";
-  let quote = false;
-  let escaped = false;
-  let lineComment = false;
-  let blockComment = false;
-
-  for (let i = 0; i < source.length; i += 1) {
-    const ch = source[i];
-    const next = source[i + 1];
-    if (lineComment) {
-      if (ch === "\n") {
-        lineComment = false;
-        out += ch;
-      }
-      continue;
-    }
-    if (blockComment) {
-      if (ch === "*" && next === "/") {
-        blockComment = false;
-        i += 1;
-      } else if (ch === "\n") {
-        out += ch;
-      }
-      continue;
-    }
-    if (quote) {
-      out += ch;
-      if (escaped) escaped = false;
-      else if (ch === "\\") escaped = true;
-      else if (ch === '"') quote = false;
-      continue;
-    }
-    if (ch === '"') {
-      quote = true;
-      out += ch;
-    } else if (ch === "/" && next === "/") {
-      lineComment = true;
-      i += 1;
-    } else if (ch === "/" && next === "*") {
-      blockComment = true;
-      i += 1;
-    } else {
-      out += ch;
-    }
-  }
-  return out.replace(/,\s*([}\]])/g, "$1");
-}
-
-/**
- * Read kusabi's operator-owned worker MCP config.
- *
- * @param {string} [configFile] absolute JSONC config path
- * @returns {object}
- */
-export function readCodexWorkerMcpConfig(
-  configFile = path.join(kusabiOpencodeConfigHome(), "opencode", "opencode.jsonc"),
-) {
-  if (!fs.existsSync(configFile)) {
-    throw new Error(`Codex worker MCP config is missing: ${configFile}`);
-  }
-  let config;
-  try {
-    config = JSON.parse(stripJsoncComments(fs.readFileSync(configFile, "utf8")));
-  } catch (err) {
-    throw new Error(`Codex worker MCP config is not valid JSONC: ${configFile}: ${err.message}`);
-  }
-  if (!config || typeof config !== "object" || Array.isArray(config)) {
-    throw new Error(`Codex worker MCP config must be an object: ${configFile}`);
-  }
-  if (!config.mcp || typeof config.mcp !== "object" || Array.isArray(config.mcp)) {
-    throw new Error(`Codex worker MCP config has no mcp object: ${configFile}`);
-  }
-  return config;
-}
-
-/**
- * Resolve granted servers from the seeded worker config.
- *
- * @param {Record<string, string[]>} toolsByServer
- * @param {string} [configFile]
- * @returns {Record<string, object>}
- */
-export function codexMcpServerDefinitions(
-  toolsByServer,
-  configFile = path.join(kusabiOpencodeConfigHome(), "opencode", "opencode.jsonc"),
-) {
-  const configured = readCodexWorkerMcpConfig(configFile).mcp;
-  const out = {};
-
-  for (const [server, enabledTools] of Object.entries(toolsByServer ?? {})) {
-    const entry = configured[server];
-    if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
-      throw new Error(`Codex worker MCP server "${server}" is missing from ${configFile}`);
-    }
-    if (entry.enabled === false) continue;
-
-    if (entry.type === "remote") {
-      if (typeof entry.url !== "string" || entry.url.length === 0) {
-        throw new Error(`Codex worker MCP server "${server}" has no remote url in ${configFile}`);
-      }
-      out[server] = {
-        url: server === "sunaba" && process.env.KUSABI_SUNABA_URL
-          ? process.env.KUSABI_SUNABA_URL
-          : entry.url,
-        ...(entry.environment === undefined ? {} : { env: entry.environment }),
-        enabledTools,
-      };
-      continue;
-    }
-
-    if (entry.type === "local") {
-      if (!Array.isArray(entry.command) || entry.command.length === 0 ||
-          entry.command.some((part) => typeof part !== "string" || part.length === 0)) {
-        throw new Error(`Codex worker MCP server "${server}" has no valid local command in ${configFile}`);
-      }
-      out[server] = {
-        command: entry.command[0],
-        args: entry.command.slice(1),
-        env: entry.environment ?? {},
-        enabledTools,
-      };
-      continue;
-    }
-
-    throw new Error(`Codex worker MCP server "${server}" has unsupported type in ${configFile}`);
-  }
-
-  return out;
-}
-
-function tomlLiteral(value) {
-  return JSON.stringify(value);
-}
-
-/**
- * Add explicit Codex config overrides for the granted worker servers.
- *
- * @param {Record<string, object>} definitions
- * @returns {string[]}
- */
-export function codexMcpArgv(definitions) {
-  const args = [];
-  for (const [server, definition] of Object.entries(definitions ?? {})) {
-    const prefix = `mcp_servers.${server}`;
-    if (definition.url) args.push("-c", `${prefix}.url=${tomlLiteral(definition.url)}`);
-    if (definition.command) args.push("-c", `${prefix}.command=${tomlLiteral(definition.command)}`);
-    if (definition.args?.length) args.push("-c", `${prefix}.args=${tomlLiteral(definition.args)}`);
-    // One `-c` per env key: a JSON object is not a TOML inline table, and
-    // Codex rejects `env="{...}"` as a string where a map is expected
-    // (measured 2026-09-27, codex-cli 0.155.1).
-    for (const [key, value] of Object.entries(definition.env ?? {})) {
-      args.push("-c", `${prefix}.env.${key}=${tomlLiteral(value)}`);
-    }
-    args.push("-c", `${prefix}.enabled_tools=${tomlLiteral(definition.enabledTools)}`);
-    args.push("-c", `${prefix}.default_tools_approval_mode=${tomlLiteral("approve")}`);
-  }
-  return args;
-}
 
 
 /**
@@ -472,114 +267,6 @@ export function buildCodexPrompt({ systemPrompt, promptText }) {
   return `<role>\n${systemPrompt}\n</role>\n\n${body}`;
 }
 
-/**
- * Project the canonical review schema into the strict subset accepted by
- * Codex's `--output-schema` response format.
- *
- * This is deliberately pure: callers own the canonical input and receive a
- * recursively cloned projection.  Codex requires every declared property to
- * be required, so properties that are optional in the canonical schema are
- * made nullable to preserve their original optionality.
- *
- * @param {unknown} schema
- * @returns {unknown}
- */
-export function toCodexStrictSchema(schema) {
-  if (Array.isArray(schema)) return schema.map((value) => toCodexStrictSchema(value));
-  if (schema === null || typeof schema !== "object") return schema;
-
-  const projected = {};
-  for (const [key, value] of Object.entries(schema)) {
-    if (key === "$schema" || key === "if" || key === "then" || key === "else") continue;
-    projected[key] = toCodexStrictSchema(value);
-  }
-
-  if (schema.properties && typeof schema.properties === "object" && !Array.isArray(schema.properties)) {
-    const originalRequired = new Set(Array.isArray(schema.required) ? schema.required : []);
-    projected.required = Object.keys(schema.properties);
-    projected.properties = {};
-    for (const [key, value] of Object.entries(schema.properties)) {
-      const property = toCodexStrictSchema(value);
-      if (!originalRequired.has(key) && property && typeof property === "object" && !Array.isArray(property)) {
-        if (property.type !== undefined) {
-          const types = Array.isArray(property.type) ? [...property.type] : [property.type];
-          if (!types.includes("null")) types.push("null");
-          property.type = types;
-        }
-        if (Array.isArray(property.enum) && !property.enum.includes(null)) {
-          property.enum = [...property.enum, null];
-        }
-      }
-      projected.properties[key] = property;
-    }
-  }
-
-  return projected;
-}
-
-/**
- * Load and project the one canonical review schema.  The returned text is
- * used only as the contents of the per-job schema file.
- *
- * @param {string|null|undefined} agent
- * @returns {string|null}
- */
-export function codexJsonSchemaFor(agent) {
-  if (agent !== REVIEW_AGENT) return null;
-  const raw = fs.readFileSync(path.join(PLUGIN_ROOT, "schemas", "review-output.schema.json"), "utf8");
-  return JSON.stringify(toCodexStrictSchema(JSON.parse(raw)));
-}
-
-/**
- * Remove nulls that Codex emits for properties made nullable by the strict
- * projection.  Required canonical properties intentionally remain untouched.
- *
- * @param {unknown} value
- * @param {object} schema
- * @returns {unknown}
- */
-export function stripCodexOptionalNulls(value, schema) {
-  if (Array.isArray(value)) {
-    return value.map((item) => stripCodexOptionalNulls(item, schema?.items));
-  }
-  if (value === null || typeof value !== "object" || !schema || typeof schema !== "object") {
-    return value;
-  }
-
-  const required = new Set(Array.isArray(schema.required) ? schema.required : []);
-  const properties = schema.properties && typeof schema.properties === "object" && !Array.isArray(schema.properties)
-    ? schema.properties
-    : {};
-  const clean = {};
-  for (const [key, child] of Object.entries(value)) {
-    if (child === null && Object.hasOwn(properties, key) && !required.has(key)) continue;
-    clean[key] = stripCodexOptionalNulls(child, properties[key]);
-  }
-  return clean;
-}
-
-/**
- * Parse and clean a Codex review JSON result.  Malformed/non-JSON text is
- * returned unchanged for the existing downstream parser to report.
- *
- * @param {string} text
- * @returns {string}
- */
-export function stripCodexOptionalNullsFromText(text) {
-  if (typeof text !== "string") return text;
-  let value;
-  try {
-    value = JSON.parse(text);
-  } catch {
-    return text;
-  }
-  return JSON.stringify(stripCodexOptionalNulls(value, loadCanonicalReviewSchema()));
-}
-
-function loadCanonicalReviewSchema() {
-  const raw = fs.readFileSync(path.join(PLUGIN_ROOT, "schemas", "review-output.schema.json"), "utf8");
-  return JSON.parse(raw);
-}
 
 /**
  * Build the argv for a `codex exec` dispatch.
@@ -667,184 +354,6 @@ export function buildCodexArgs({ model, cwd, sessionId, jsonSchema, mcpServers =
   ];
 }
 
-// =========================================================================
-// stream parsing — pure
-// =========================================================================
-
-/**
- * Parse one line of the codex NDJSON stream.  Returns null for blank lines
- * and non-JSON prose (the same tolerance every backend applies).
- *
- * @param {string} line
- * @returns {object|null}
- */
-export function parseCodexStreamLine(line) {
-  const trimmed = typeof line === "string" ? line.trim() : "";
-  if (!trimmed) return null;
-  let obj;
-  try {
-    obj = JSON.parse(trimmed);
-  } catch {
-    return null;
-  }
-  if (obj === null || typeof obj !== "object" || Array.isArray(obj)) return null;
-  return obj;
-}
-
-/**
- * Pull the thread id off a `thread.started` event (measured: top-level
- * `thread_id`).  This is the thread/session id the job records as sessionID
- * and the resume invocation passes back.
- *
- * @param {object} evt
- * @returns {string|null}
- */
-export function codexThreadIdFromEvent(evt) {
-  return typeof evt?.thread_id === "string" && evt.thread_id ? evt.thread_id : null;
-}
-
-/**
- * Extract assistant text from an `item.completed` event.
- *
- * Two measured shapes:
- *   - CURRENT flat shape (live codex-cli 0.154.0, incident
- *     mission-mucn5qb2a76e2095): `item.type === "agent_message"` with the
- *     terminal text on `item.text`.
- *   - LEGACY nested shape (the previously measured contract):
- *     `item.agent_message.text`.
- *
- * Non-agent items (tool_call, custom_tool_call, ...) and malformed shapes
- * contribute no text and never throw.
- *
- * @param {object} evt
- * @returns {string}
- */
-export function codexAssistantTextFromEvent(evt) {
-  const item = evt?.item;
-  if (!item || typeof item !== "object") return "";
-  if (item.type === "agent_message" && typeof item.text === "string") {
-    return item.text;
-  }
-  const legacy = item.agent_message?.text;
-  return typeof legacy === "string" ? legacy : "";
-}
-
-/**
- * A fresh accumulator for folding a codex NDJSON stream into job stats.
- *
- * @returns {{ events: number, steps: number, lastTool: string|null,
- *             lastActivity: string|null, models: string[],
- *             threadId: string|null, assistantText: string,
- *             usageEvent: object|null }}
- */
-export function initCodexStreamAccumulator() {
-  return {
-    events: 0,
-    steps: 0,
-    lastTool: null,
-    lastActivity: null,
-    models: [],
-    threadId: null,
-    assistantText: "",
-    usageEvent: null,
-  };
-}
-
-/**
- * Fold one parsed stream event into the accumulator (mutates and returns
- * it).  Every parsed object bumps `events` and `lastActivity`; the measured
- * kinds contribute:
- *
- *   - `thread.started` — the thread id (top-level `thread_id`).
- *   - `item.completed` — assistant text from `item.agent_message.text`
- *     (terminal text for both the text and `--output-schema` framings);
- *     each completed item also counts one step (a message or a tool item).
- *   - `turn.completed` — the `usage` event kept as `usageEvent`; a later one
- *     replaces an earlier one.
- *
- * Unknown kinds and malformed shapes must not throw.
- *
- * @param {object} acc
- * @param {object} evt
- * @param {string} [now]
- * @returns {object}
- */
-export function applyCodexStreamEvent(acc, evt, now = new Date().toISOString()) {
-  if (!acc || typeof acc !== "object") return acc;
-  if (!evt || typeof evt !== "object") return acc;
-  acc.events += 1;
-  acc.lastActivity = now;
-  try {
-    const type = evt.type;
-    if (type === "thread.started") {
-      const id = codexThreadIdFromEvent(evt);
-      if (id) acc.threadId = id;
-    } else if (type === "item.completed") {
-      acc.steps += 1;
-      // The LAST agent message is the answer; earlier ones are commentary.
-      // A turn can complete several agent_message items (phase commentary
-      // before tool calls, then final_answer); concatenating them glued
-      // three JSONL batches together with no separator and the coordinator
-      // parser refused the whole stream as truncated (mission-mudmmnaub60f0b20,
-      // job-mudmn0ba8267: 481 + 555 + 555 = the 1591 assistantChars recorded).
-      const text = codexAssistantTextFromEvent(evt);
-      if (text) acc.assistantText = text;
-    } else if (type === "turn.completed") {
-      acc.usageEvent = evt;
-    }
-  } catch {
-    // A malformed event must never take down the dispatch.
-  }
-  return acc;
-}
-
-/**
- * Map the terminal `turn.completed.usage` object onto the job-record usage
- * shape the other backends already store.  MEASURED snake-case token fields
- * (codex-cli 0.154.0, same vocabulary codex-usage-ingest.mjs reads):
- * input_tokens, cached_input_tokens, cache_write_input_tokens, output_tokens.
- * `total_tokens` / `reasoning_tokens` / `cost_usd` are mapped when present;
- * total defaults to the sum of the four measured counters.
- *
- * @param {object|null} result
- * @returns {object}
- */
-export function mapCodexUsage(result) {
-  const u = result?.usage ?? {};
-  const input = u.input_tokens ?? 0;
-  const output = u.output_tokens ?? 0;
-  const cacheRead = u.cached_input_tokens ?? 0;
-  const cacheWrite = u.cache_write_input_tokens ?? 0;
-  return {
-    available: true,
-    input,
-    output,
-    reasoning: u.reasoning_tokens ?? 0,
-    cacheRead,
-    cacheWrite,
-    total: u.total_tokens ?? (input + output + cacheRead + cacheWrite),
-    cost: u.cost_usd ?? 0,
-    model: result?.model ?? null,
-  };
-}
-
-/**
- * A short, faithful description of what arrived — quoted into failure
- * messages so the error names the received payload.
- *
- * @param {unknown} value
- * @returns {string}
- */
-export function describeCodexResult(value) {
-  if (value === null || value === undefined) return "(nothing)";
-  let text;
-  try {
-    text = typeof value === "string" ? value : JSON.stringify(value);
-  } catch {
-    text = String(value);
-  }
-  return text.length > 500 ? `${text.slice(0, 500)}…` : text;
-}
 
 /**
  * Fail-closed check on a RESOLVED codexDispatch result: a job that did not
@@ -869,6 +378,7 @@ export function assertCodexDispatchSucceeded({ job, resultText, stateDir }, labe
   const error = job?.error ?? "no error recorded";
   throw new Error(`codex dispatch failed (${label}): job ${id} resolved ${status}: ${error}`);
 }
+
 
 // =========================================================================
 // dedicated state + auth bridge
@@ -937,261 +447,6 @@ export function linkOperatorAuth(jobCodexHome) {
   }
 }
 
-// =========================================================================
-// rollout provenance verification — pure over JSONL text
-// =========================================================================
-
-/**
- * Parse Codex rollout JSONL text into the provenance fields the adapter can
- * verify.  Tolerant: non-JSON lines are skipped, and a missing field stays
- * null (absent, not asserted).  The rollout vocabulary (codex-usage-ingest
- * reads the same records) is:
- *
- *   {"type":"session_meta","payload":{"id","cwd", model, model_reasoning_effort,
- *      approval_policy, sandbox_policy, network_policy, ...}}
- *   {"type":"turn_context","payload":{"turn_id","model", model_reasoning_effort, ...}}
- *
- * The actual model may live on session_meta or turn_context payloads; effort
- * and the policies are read from either record type when present.
- *
- * The per-record arrays (`sessionMetas`, `turns`) preserve FILE ORDER so a
- * RESUMED dispatch can bind to the evidence the resumed invocation itself
- * produced (its turn_context is the LAST one in the thread's rollout) instead
- * of a stale matching turn from the original session.  The flat aggregate
- * fields keep the fresh-dispatch semantics exactly as they have always been
- * (last session_meta wins, first named turn as the model fallback).
- *
- * @param {string} content — the full text of one or more rollout files.
- * @returns {{ found: boolean, model: string|null, reasoningEffort: string|null,
- *             approvalPolicy: string|null, sandboxPolicy: string|null,
- *             networkPolicy: string|null,
- *             sessionMetas: object[], turns: Array<{model: string|null,
- *               reasoningEffort: string|null}> }}
- */
-export function parseRolloutProvenance(content) {
-  const sessionMetas = [];
-  const turns = [];
-  const turnModels = [];
-  let found = false;
-  const lines = typeof content === "string" ? content.split("\n") : [];
-  for (const raw of lines) {
-    const line = raw.trim();
-    if (!line) continue;
-    let rec;
-    try {
-      rec = JSON.parse(line);
-    } catch {
-      continue;
-    }
-    if (!rec || typeof rec !== "object" || Array.isArray(rec)) continue;
-    const payload = rec.payload;
-    if (!payload || typeof payload !== "object" || Array.isArray(payload)) continue;
-    if (rec.type === "session_meta") {
-      found = true;
-      const meta = {
-        model: typeof payload.model === "string" && payload.model ? payload.model : null,
-        reasoningEffort: typeof payload.model_reasoning_effort === "string" && payload.model_reasoning_effort
-          ? payload.model_reasoning_effort
-          : null,
-        approvalPolicy: typeof payload.approval_policy === "string" && payload.approval_policy
-          ? payload.approval_policy
-          : null,
-        sandboxPolicy: (typeof payload.sandbox_policy === "string" && payload.sandbox_policy)
-          ? payload.sandbox_policy
-          : (typeof payload.sandbox_mode === "string" && payload.sandbox_mode ? payload.sandbox_mode : null),
-        networkPolicy: typeof payload.network_policy === "string" && payload.network_policy
-          ? payload.network_policy
-          : null,
-      };
-      sessionMetas.push(meta);
-    } else if (rec.type === "turn_context") {
-      found = true;
-      const model = typeof payload.model === "string" && payload.model ? payload.model : null;
-      const reasoningEffort = typeof payload.model_reasoning_effort === "string" && payload.model_reasoning_effort
-        ? payload.model_reasoning_effort
-        : null;
-      if (model) turnModels.push(model);
-      turns.push({ model, reasoningEffort });
-    }
-  }
-  const lastMeta = sessionMetas[sessionMetas.length - 1] ?? null;
-  return {
-    found,
-    model: lastMeta?.model || turnModels[0] || null,
-    reasoningEffort: lastMeta?.reasoningEffort ?? null,
-    approvalPolicy: lastMeta?.approvalPolicy ?? null,
-    sandboxPolicy: lastMeta?.sandboxPolicy ?? null,
-    networkPolicy: lastMeta?.networkPolicy ?? null,
-    sessionMetas,
-    turns,
-  };
-}
-
-/**
- * Verify a parsed rollout against the requested model and the fixed
- * reasoning effort.
- *
- *   state: "verified"      — the bound evidence's model matches the requested
- *                            one (and its effort, when present, matches the
- *                            fixed "high").
- *   state: "unverifiable"  — no rollout, or the bound evidence carries no
- *                            model field to check: represented EXPLICITLY as
- *                            unverifiable, never silently treated as verified.
- *   state: "mismatch"      — a present field contradicts the request.  The
- *                            caller fails the job closed on this: no
- *                            successful result, no fallback/substitution.
- *
- * `resumed: true` changes WHICH evidence is bound (kusabi #527 review
- * follow-up): the rollout of a resumed thread holds the ORIGINAL session's
- * records first and the resumed invocation's records last, and only the
- * resumed invocation's own evidence may verify the run.  The resumed turn is
- * the LAST turn_context in the rollout; a matching turn_context from the
- * original session is never accepted in its place, so a model or effort
- * mismatch on the resumed turn fails closed.  A resumed dispatch whose
- * rollout carries no turn_context at all is unverifiable (the resumed
- * invocation produced no turn evidence to bind to).
- *
- * @param {object} opts
- * @param {object} opts.rollout — output of `parseRolloutProvenance`.
- * @param {string} opts.requestedModel — the exact model the invocation asked for.
- * @param {string} [opts.requestedEffort] — defaults to CODEX_REASONING_EFFORT.
- * @param {boolean} [opts.resumed] — bind to the resumed invocation's own
- *        (last) turn_context evidence instead of the fresh-path aggregate.
- * @returns {object}
- */
-export function verifyRolloutProvenance({ rollout, requestedModel, requestedEffort = CODEX_REASONING_EFFORT, resumed = false }) {
-  if (!rollout?.found) {
-    return { state: "unverifiable", reason: "no-rollout-record" };
-  }
-  if (resumed) {
-    // Bind to the evidence the RESUMED invocation itself produced.  The
-    // thread's rollout holds the original session's records first and the
-    // resumed run's records last, so the resumed turn is the LAST
-    // turn_context.  A stale matching turn_context from the original session
-    // must never verify a resumed run whose own turn mismatches.
-    const turns = Array.isArray(rollout.turns) ? rollout.turns : [];
-    const turn = turns[turns.length - 1] ?? null;
-    if (!turn) {
-      return { state: "unverifiable", reason: "no-resumed-turn-evidence" };
-    }
-    if (!turn.model) {
-      return { state: "unverifiable", reason: "rollout-model-field-absent" };
-    }
-    if (turn.model !== requestedModel) {
-      return {
-        state: "mismatch",
-        kind: "model",
-        requested: requestedModel,
-        actual: turn.model,
-      };
-    }
-    if (turn.reasoningEffort && turn.reasoningEffort !== requestedEffort) {
-      return {
-        state: "mismatch",
-        kind: "reasoning-effort",
-        requested: requestedEffort,
-        actual: turn.reasoningEffort,
-      };
-    }
-    return {
-      state: "verified",
-      model: turn.model,
-      reasoningEffort: turn.reasoningEffort ?? null,
-      approvalPolicy: rollout.approvalPolicy ?? null,
-      sandboxPolicy: rollout.sandboxPolicy ?? null,
-      networkPolicy: rollout.networkPolicy ?? null,
-    };
-  }
-  if (rollout.model && rollout.model !== requestedModel) {
-    return {
-      state: "mismatch",
-      kind: "model",
-      requested: requestedModel,
-      actual: rollout.model,
-    };
-  }
-  if (!rollout.model) {
-    return { state: "unverifiable", reason: "rollout-model-field-absent" };
-  }
-  if (rollout.reasoningEffort && rollout.reasoningEffort !== requestedEffort) {
-    return {
-      state: "mismatch",
-      kind: "reasoning-effort",
-      requested: requestedEffort,
-      actual: rollout.reasoningEffort,
-    };
-  }
-  return {
-    state: "verified",
-    model: rollout.model,
-    reasoningEffort: rollout.reasoningEffort ?? null,
-    approvalPolicy: rollout.approvalPolicy ?? null,
-    sandboxPolicy: rollout.sandboxPolicy ?? null,
-    networkPolicy: rollout.networkPolicy ?? null,
-  };
-}
-
-/**
- * Locate the rollout files under a job-owned Codex home.  The CLI persists
- * `$CODEX_HOME/sessions/<thread-id>/rollout-<timestamp>.jsonl`; a recursive
- * scan tolerates layout drift (the exact nesting is the CLI's, not ours).
- *
- * @param {string} codexHome
- * @returns {string[]} sorted absolute rollout file paths (possibly empty).
- */
-export function findRolloutFiles(codexHome) {
-  const root = path.join(codexHome, "sessions");
-  const results = [];
-  try {
-    fs.readdirSync(root);
-  } catch {
-    return results;
-  }
-  const stack = [root];
-  while (stack.length > 0) {
-    const dir = stack.pop();
-    let children;
-    try {
-      children = fs.readdirSync(dir, { withFileTypes: true });
-    } catch {
-      continue;
-    }
-    for (const child of children) {
-      const full = path.join(dir, child.name);
-      if (child.isDirectory()) {
-        stack.push(full);
-      } else if (child.isFile() && child.name.startsWith("rollout-") && child.name.endsWith(".jsonl")) {
-        results.push(full);
-      }
-    }
-  }
-  return results.sort();
-}
-
-/**
- * Read the rollout provenance for a finished run: parse every rollout file
- * under the job-owned home and verify it.  Never throws — a read failure is
- * represented as `unverifiable` with the reason named.
- *
- * @param {object} opts
- * @param {string} opts.codexHome — the job-owned home.
- * @param {string} opts.requestedModel — the exact model that was requested.
- * @param {boolean} [opts.resumed] — true for a resumed dispatch: bind to
- *        the resumed invocation's own (last) turn_context evidence.
- * @returns {object} the `verifyRolloutProvenance` result.
- */
-export function readRolloutProvenance({ codexHome, requestedModel, resumed = false }) {
-  try {
-    const files = findRolloutFiles(codexHome);
-    if (files.length === 0) {
-      return verifyRolloutProvenance({ rollout: { found: false }, requestedModel, resumed });
-    }
-    const content = files.map((file) => fs.readFileSync(file, "utf8")).join("\n");
-    return verifyRolloutProvenance({ rollout: parseRolloutProvenance(content), requestedModel, resumed });
-  } catch (err) {
-    return { state: "unverifiable", reason: `rollout-read-failed: ${err?.message ?? err}` };
-  }
-}
 
 // =========================================================================
 // cross-backend session guard — pure

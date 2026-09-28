@@ -5,12 +5,12 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
+import { buildCodexArgs } from "./codex-dispatch.mjs";
 import {
-  buildCodexArgs,
   codexMcpArgv,
   codexMcpServerDefinitions,
   codexMcpToolsForAgent,
-} from "./codex-dispatch.mjs";
+} from "./codex-mcp.mjs";
 
 const fixture = path.join(import.meta.dirname, "test-fixtures", "codex-worker-opencode.jsonc");
 
