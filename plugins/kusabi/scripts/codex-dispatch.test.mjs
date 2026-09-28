@@ -55,7 +55,7 @@ import { splitRouteBackend, resolveModelBackend, backendSupportsResume, WRITE_TO
 import { renderHeader } from "./render.mjs";
 import { stateDirFor } from "./state-paths.mjs";
 import { loadJob, jobDir, listJobs } from "./job-store.mjs";
-import { stopRecordedProcess } from "./claude-dispatch.mjs";
+import { stopRecordedProcess } from "./process-identity.mjs";
 
 const THREAD_ID = "thread-527-9f3c2a1b";
 const MODEL = "gpt-5.6-sol";

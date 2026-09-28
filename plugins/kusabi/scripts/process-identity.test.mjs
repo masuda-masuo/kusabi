@@ -20,7 +20,7 @@ import { runBackendProcess } from "./backend-process-runner.mjs";
 import { agyDispatch } from "./agy-dispatch.mjs";
 import { cursorDispatch } from "./cursor-dispatch.mjs";
 import { codexDispatch } from "./codex-dispatch.mjs";
-import { processStartToken, stopRecordedProcess, readProcessStat } from "./claude-dispatch.mjs";
+import { processStartToken, stopRecordedProcess, readProcessStat } from "./process-identity.mjs";
 import { listJobs } from "./job-store.mjs";
 import { stateDirFor } from "./state-paths.mjs";
 

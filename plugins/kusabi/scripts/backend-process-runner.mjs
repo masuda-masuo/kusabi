@@ -10,7 +10,7 @@
 
 import process from "node:process";
 import { spawn } from "node:child_process";
-import { processStartToken } from "./claude-dispatch.mjs";
+import { processStartToken } from "./process-identity.mjs";
 
 // =========================================================================
 // shared predicates

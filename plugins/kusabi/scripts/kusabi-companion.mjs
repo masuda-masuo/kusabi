@@ -70,7 +70,8 @@ import {
 import { jobDir, saveJob, loadJob, listJobs, latestJob } from "./job-store.mjs";
 import { opencodeBin, serverHealthy, ensureServer, reapIdleServes, reapOrphanedServes, runningRecordIsStale, isOurServe, api } from "./serve-lifecycle.mjs";
 import { dispatchWithFallback } from "./prompt-execution.mjs";
-import { claudeDispatch, resolveClaudeModel, validateClaudeModel, validateClaudeChain, clampModelDispatch, stopRecordedProcess, CLAUDE_BACKEND } from "./claude-dispatch.mjs";
+import { claudeDispatch, resolveClaudeModel, validateClaudeModel, validateClaudeChain, clampModelDispatch, CLAUDE_BACKEND } from "./claude-dispatch.mjs";
+import { stopRecordedProcess } from "./process-identity.mjs";
 import { agyDispatch, resolveAgyModel, validateAgyModel, validateAgyChain, AGY_BACKEND } from "./agy-dispatch.mjs";
 import { cursorDispatch, resolveCursorModel, validateCursorModel, validateCursorChain, CURSOR_BACKEND } from "./cursor-dispatch.mjs";
 import { codexDispatch, resolveCodexModel, validateCodexModel, validateCodexChain, CODEX_BACKEND } from "./codex-dispatch.mjs";

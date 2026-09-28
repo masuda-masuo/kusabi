@@ -26,7 +26,8 @@ import { spawn } from "node:child_process";
 import { once } from "node:events";
 
 import { cmdCancel, commandOutcome } from "./kusabi-companion.mjs";
-import { claudeDispatch, processStartToken, readProcessStat } from "./claude-dispatch.mjs";
+import { claudeDispatch } from "./claude-dispatch.mjs";
+import { processStartToken, readProcessStat } from "./process-identity.mjs";
 import { saveJob, loadJob, latestJob, jobDir } from "./job-store.mjs";
 import { stateDirFor, writeJson } from "./state-paths.mjs";
 

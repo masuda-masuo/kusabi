@@ -161,7 +161,7 @@ import { DatabaseSync } from "node:sqlite";
 import { fileURLToPath } from "node:url";
 
 import { firstRoute } from "./cli.mjs";
-import { readAgentSystemPrompt } from "./claude-dispatch.mjs";
+import { readAgentSystemPrompt } from "./agent-system-prompt.mjs";
 import { newJobId, saveJob, jobDir, appendEvent } from "./job-store.mjs";
 import { stateDirFor, writeJson, readJson, stateRoot } from "./state-paths.mjs";
 import { durationS } from "./render.mjs";

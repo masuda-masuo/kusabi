@@ -16,25 +16,30 @@ import crypto from "node:crypto";
 import { spawnSync } from "node:child_process";
 
 import {
-  ALLOWED_TOOLS,
   CLAUDE_DEFAULT_CHAIN,
   claudeBin,
   validateClaudeModel,
   validateClaudeChain,
   resolveClaudeModel,
-  stripFrontmatter,
   buildClaudeArgs,
   parseClaudeResult,
   mapClaudeUsage,
   classifyClaudeTerminalFailure,
   renderClaudeQuotaError,
+  clampModelDispatch,
+  claudeDispatch,
+  runClaudeProcess,
+} from "./claude-dispatch.mjs";
+import {
+  ALLOWED_TOOLS,
   allowedToolsForAgent,
   disallowedToolsForAgent,
   applyToolDenies,
   translateDenyTools,
-  clampModelDispatch,
   sunabaProfileForAgent,
-  claudeDispatch,
+} from "./tool-permissions.mjs";
+import { stripFrontmatter } from "./agent-system-prompt.mjs";
+import {
   CLAUDE_WRITE_WATCHDOG_DEFAULT_WARN_S,
   resolveClaudeWriteWatchdog,
   writeWatchdogAppliesToPhase,
@@ -50,8 +55,7 @@ import {
   claudeRepeatChainAdvance,
   foldClaudeRepeatCalls,
   renderClaudeRepeatWatchdogError,
-  runClaudeProcess,
-} from "./claude-dispatch.mjs";
+} from "./claude-watchdogs.mjs";
 import { agyDispatch } from "./agy-dispatch.mjs";
 import { resolveBackend, resolveDispatchBackend } from "./kusabi-companion.mjs";
 import { dispatchWithFallback } from "./prompt-execution.mjs";
