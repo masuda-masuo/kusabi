@@ -12,15 +12,15 @@
 // That module imports from both kusabi-companion.mjs and this module; this
 // module does NOT import from chain-cmd.mjs.
 //
-// IMPORT DIRECTION.  This module imports from kusabi-companion.mjs for
-// backendDispatch / backendPinsModel / phaseDispatchFor / liveRunningJobs /
-// cmdServeStop -- helpers used by the round loop and the driver section.
-// The companion cycle (companion <-> chain-cmd) is documented in chain-cmd.mjs.
+// IMPORT DIRECTION.  This module imports backendDispatch / backendPinsModel /
+// phaseDispatchFor from dispatch-backend.mjs and liveRunningJobs / cmdServeStop
+// from job-control-cmd.mjs — the helpers the round loop needs, split out of
+// kusabi-companion.mjs (pure move refactor).
 //
 // The backend table (backendDispatch / backendPinsModel / phaseDispatchFor) is
-// imported from the companion rather than moved, even though only this module
-// calls it today.  It is one cohesive row-per-backend table together with
-// resolveBackend / resolveDispatchBackend / assertSessionBackendCompatible,
+// imported from dispatch-backend.mjs rather than moved here, even though only
+// this module calls it today.  It is one cohesive row-per-backend table together
+// with resolveBackend / resolveDispatchBackend / assertSessionBackendCompatible,
 // which must stay behind for `task` and `review`; splitting three rows out of
 // it would leave the table describing backends in two files.
 
@@ -82,14 +82,13 @@ import {
   renderCoverageReport,
 } from "./tdd-chain.mjs";
 
-// The companion side of the round loop's import needs.
-import {
-  backendDispatch,
-  backendPinsModel,
-  phaseDispatchFor,
-  liveRunningJobs,
-  cmdServeStop,
-} from "./kusabi-companion.mjs";
+// The companion side of the round loop's import needs — the helpers this
+// module used to import from kusabi-companion.mjs now live in the split
+// library modules (pure move refactor): the backend table in
+// dispatch-backend.mjs, the serve-stop / live-job surfaces in
+// job-control-cmd.mjs.
+import { backendDispatch, backendPinsModel, phaseDispatchFor } from "./dispatch-backend.mjs";
+import { liveRunningJobs, cmdServeStop } from "./job-control-cmd.mjs";
 
 // Round-finalisation functions lifted to module scope (kusabi #422 Job 3).
 import {

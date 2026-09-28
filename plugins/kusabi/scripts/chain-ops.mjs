@@ -2,14 +2,12 @@
 //
 // Extracted from kusabi-companion.mjs (kusabi #427): the CLI subcommands that
 // observe or steer an already-dispatched chain, plus baseline measurement.
-// This module is NOT a leaf: it imports helpers from kusabi-companion.mjs,
-// forming a companion cycle.
 //
-// IMPORT DIRECTION. This module imports from kusabi-companion.mjs (readBriefFile,
-// loadConfig, resolveDispatchBackend, briefLintReport), and companion imports
-// the moved subcommand functions back. The cycle is safe because every name
-// crossing it is a hoisted function declaration and nothing here runs at
-// module-evaluation time: companion is evaluated after this module's definitions exist.
+// IMPORT DIRECTION. This module imports library helpers (readBriefFile,
+// loadConfig, resolveDispatchBackend, briefLintReport) from the modules they
+// were split into (brief-lint.mjs, companion-config.mjs, dispatch-backend.mjs);
+// the entry point kusabi-companion.mjs imports the moved subcommand functions
+// back from here.
 //
 // This module also imports sessionProvenanceRefusal from chain-cmd.mjs.
 // This module does NOT import chain-driver.mjs.
@@ -53,12 +51,12 @@ import {
 } from "./chain-brief-guards.mjs";
 import { loadTddState } from "./tdd-chain.mjs";
 
-import {
-  readBriefFile,
-  loadConfig,
-  resolveDispatchBackend,
-  briefLintReport,
-} from "./kusabi-companion.mjs";
+// The helpers this module used to import from kusabi-companion.mjs now live in
+// the split library modules (pure move refactor): config in companion-config.mjs,
+// brief checks in brief-lint.mjs, backend selection in dispatch-backend.mjs.
+import { readBriefFile, briefLintReport } from "./brief-lint.mjs";
+import { loadConfig } from "./companion-config.mjs";
+import { resolveDispatchBackend } from "./dispatch-backend.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const COMPANION_SCRIPT = path.join(HERE, "kusabi-companion.mjs");

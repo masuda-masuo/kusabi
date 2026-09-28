@@ -22,7 +22,7 @@ import { readJson, stateDirFor } from "./state-paths.mjs";
 // reapIdleServes.  (kusabi-companion.mjs and prompt-execution.mjs guard
 // their CLI/interval entry points behind argv checks, so importing them is
 // side-effect free.)
-import { cmdServeStop } from "./kusabi-companion.mjs";
+import { cmdServeStop } from "./job-control-cmd.mjs";
 import { watchdogKillOrDecline } from "./prompt-execution.mjs";
 
 // buildServeEnv — env-building seam for ensureServer's spawn (kusabi #136 fix 3)

@@ -263,12 +263,12 @@ export function validChainBrief(brief) {
 let _briefValidators = null;
 async function briefValidators() {
   if (_briefValidators === null) {
-    const [companion, guards] = await Promise.all([
-      import("./kusabi-companion.mjs"),
+    const [briefLint, guards] = await Promise.all([
+      import("./brief-lint.mjs"),
       import("./chain-brief-guards.mjs"),
     ]);
     _briefValidators = {
-      briefLintReport: companion.briefLintReport,
+      briefLintReport: briefLint.briefLintReport,
       smokeViolationReport: guards.smokeViolationReport,
       BRIEF_REFUSED_CODE: guards.BRIEF_REFUSED_CODE,
     };
@@ -679,7 +679,7 @@ async function realCoordinatorDispatch({ cwd, missionId, missionDir, brief, enve
  * @param {string} stateDir
  */
 async function defaultGuardedServeStop(cwd, stateDir) {
-  const { liveRunningJobs, cmdServeStop } = await import("./kusabi-companion.mjs");
+  const { liveRunningJobs, cmdServeStop } = await import("./job-control-cmd.mjs");
   const hasRunning = liveRunningJobs(stateDir).length > 0;
   if (!hasRunning) {
     cmdServeStop(cwd);

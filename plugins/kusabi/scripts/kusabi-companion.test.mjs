@@ -9,12 +9,11 @@ import { spawn, spawnSync } from "node:child_process";
 import {
   PHASE_AGENTS,
   loadConfig,
-  readBriefFile,
-  resolveResumeLastSession,
   resolveOrchestratorRecord,
   ORCH_SESSION_ENV,
-  briefLintReport,
-} from "./kusabi-companion.mjs";
+} from "./companion-config.mjs";
+import { readBriefFile, briefLintReport } from "./brief-lint.mjs";
+import { resolveResumeLastSession } from "./dispatch-backend.mjs";
 import {
   cmdChainDetach,
   extractChainAndWaitArgs,

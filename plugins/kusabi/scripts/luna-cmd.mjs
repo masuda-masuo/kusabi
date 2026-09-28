@@ -73,7 +73,7 @@ export const DEFAULT_AUDITOR_SEAT = { provider: "codex", model: "gpt-5.6-sol" };
  * @param {string} stateDir
  */
 async function resumeSettleGuardedServeStop(cwd, stateDir) {
-  const { liveRunningJobs, cmdServeStop } = await import("./kusabi-companion.mjs");
+  const { liveRunningJobs, cmdServeStop } = await import("./job-control-cmd.mjs");
   if (liveRunningJobs(stateDir).length === 0) {
     cmdServeStop(cwd);
   }

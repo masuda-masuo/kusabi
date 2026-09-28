@@ -4,14 +4,12 @@
 // commands (cmdTask, cmdReview) and their review input builders (buildReviewInput,
 // buildTaskReviewInput).
 //
-// IMPORT DIRECTION. This module imports from kusabi-companion.mjs (readBriefFile,
-// resolveOrchestratorRecord, loadConfig, resolveDispatchBackend,
-// assertSessionBackendCompatible, resolveResumeLastSession, briefLintReport,
-// PHASE_AGENTS), and companion imports cmdTask / cmdReview back -- a deliberate
-// cycle, same as chain-cmd.mjs and chain-ops.mjs. The cycle is safe because every
-// name crossing it is a hoisted function declaration (or constant) and nothing
-// here runs at module-evaluation time: companion is evaluated after this module's
-// definitions exist.
+// IMPORT DIRECTION. This module imports library helpers from the modules they
+// were split into (readBriefFile / briefLintReport from brief-lint.mjs,
+// resolveOrchestratorRecord / loadConfig / PHASE_AGENTS from companion-config.mjs,
+// resolveDispatchBackend / assertSessionBackendCompatible / resolveResumeLastSession
+// from dispatch-backend.mjs), and the entry point kusabi-companion.mjs imports
+// cmdTask / cmdReview back from here.
 //
 // This module does NOT import chain-driver.mjs or chain-cmd.mjs.
 
@@ -59,16 +57,17 @@ import {
   runCollectedProbe,
 } from "./chain-probes.mjs";
 import { smokeBaselineReport, smokeViolationReport } from "./chain-brief-guards.mjs";
+import { readBriefFile, briefLintReport } from "./brief-lint.mjs";
 import {
-  readBriefFile,
   resolveOrchestratorRecord,
   loadConfig,
+  PHASE_AGENTS,
+} from "./companion-config.mjs";
+import {
   resolveDispatchBackend,
   assertSessionBackendCompatible,
   resolveResumeLastSession,
-  briefLintReport,
-  PHASE_AGENTS,
-} from "./kusabi-companion.mjs";
+} from "./dispatch-backend.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const PLUGIN_ROOT = path.resolve(HERE, "..");

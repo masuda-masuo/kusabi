@@ -25,7 +25,8 @@ import http from "node:http";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
 
-import { cmdCancel, commandOutcome } from "./kusabi-companion.mjs";
+import { cmdCancel } from "./job-control-cmd.mjs";
+import { commandOutcome } from "./kusabi-companion.mjs";
 import { claudeDispatch } from "./claude-dispatch.mjs";
 import { processStartToken, readProcessStat } from "./process-identity.mjs";
 import { saveJob, loadJob, latestJob, jobDir } from "./job-store.mjs";

@@ -2,21 +2,16 @@
 //
 // Extracted from chain-driver.mjs (Job 2): the two CLI entry points and
 // their banner / session-provenance / quota-reroute helpers that exist only
-// to serve them.  This module is NOT a leaf: it imports from both
-// kusabi-companion.mjs and chain-driver.mjs, forming the companion cycle
-// that the driver header used to document.
+// to serve them.  This module is NOT a leaf: it imports from chain-driver.mjs
+// and from the split library modules (brief-lint.mjs, companion-config.mjs,
+// dispatch-backend.mjs) that used to live in kusabi-companion.mjs.
 //
-// IMPORT DIRECTION.  This module imports from kusabi-companion.mjs, and the
-// companion imports cmdChain / cmdChainResume / sessionProvenanceRefusal
-// back -- a deliberate cycle, not an oversight.  The helpers crossing it
-// (readBriefFile, resolveOrchestratorRecord, loadConfig, resolveDispatchBackend,
-// liveRunningJobs, cmdServeStop) are used by the companion's own non-chain
-// commands as well, and the two alternatives -- duplicating them, or leaving
-// a compatibility re-export behind -- are both forbidden by kusabi #264.
-// The cycle is safe because every name crossing it is a hoisted function
-// declaration and nothing here runs at module-evaluation time: the companion
-// is the process entry point, so it is evaluated last, after this module's
-// definitions exist.
+// IMPORT DIRECTION.  This module imports library helpers (readBriefFile,
+// resolveOrchestratorRecord, loadConfig, resolveDispatchBackend,
+// backendDispatch, phaseDispatchFor, BACKENDS, briefLintReport) from the
+// modules they were split into; kusabi-companion.mjs imports cmdChain /
+// cmdChainResume back from here.  No name crosses the old companion entry
+// point any more — the entry point only dispatches.
 //
 // This module also imports from chain-driver.mjs (effectiveTierCount,
 // runChainDriver, resolveResumeReviewContext, resolveResumeReworkContext,
@@ -63,17 +58,17 @@ import { AGY_DEFAULT_CHAIN } from "./agy-dispatch.mjs";
 import { CURSOR_DEFAULT_CHAIN, DEFAULT_CURSOR_MODEL } from "./cursor-dispatch.mjs";
 import { CODEX_DEFAULT_CHAIN } from "./codex-dispatch.mjs";
 
-// The companion side of the cycle documented above.
+// The helpers this module used to import from kusabi-companion.mjs now live in
+// the split library modules (pure move refactor): config in companion-config.mjs,
+// brief checks in brief-lint.mjs, backend selection in dispatch-backend.mjs.
+import { readBriefFile, briefLintReport } from "./brief-lint.mjs";
+import { resolveOrchestratorRecord, loadConfig } from "./companion-config.mjs";
 import {
-  readBriefFile,
-  briefLintReport,
-  resolveOrchestratorRecord,
-  loadConfig,
   resolveDispatchBackend,
   backendDispatch,
   phaseDispatchFor,
   BACKENDS,
-} from "./kusabi-companion.mjs";
+} from "./dispatch-backend.mjs";
 
 import {
   publishWarningForBrief,
