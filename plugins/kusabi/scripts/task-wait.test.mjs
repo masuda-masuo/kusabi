@@ -222,6 +222,18 @@ describe("task-wait --next appearance and selection", () => {
     fs.rmSync(tmpDir, { recursive: true, force: true });
   });
 
+  const waitForChildRead = async (jobFile, isClosed, timeoutMs = 4000) => {
+    const initialAtime = fs.statSync(jobFile).atimeMs;
+    const start = Date.now();
+    while (Date.now() - start < timeoutMs && !isClosed()) {
+      if (fs.statSync(jobFile).atimeMs > initialAtime) {
+        return true;
+      }
+      await new Promise((r) => setTimeout(r, 20));
+    }
+    return false;
+  };
+
   it("waits for delayed job-id appearance without guessing an ID", async () => {
     const env = { ...process.env };
     delete env.KUSABI_WORKER_CONTEXT;
@@ -245,8 +257,6 @@ describe("task-wait --next appearance and selection", () => {
       });
     });
 
-    // Job appears after wait starts (without wait caller knowing or passing the ID up front)
-    await new Promise((resolve) => setTimeout(resolve, 200));
     const delayedJobId = "job-delayed-appearance-42";
     if (!closed) {
       writeJob(workspaceStateDir, {
@@ -258,7 +268,9 @@ describe("task-wait --next appearance and selection", () => {
       });
     }
 
-    await new Promise((resolve) => setTimeout(resolve, 200));
+    const delayedJobFile = path.join(workspaceStateDir, "jobs", delayedJobId, "job.json");
+    await waitForChildRead(delayedJobFile, () => closed);
+    await new Promise((resolve) => setTimeout(resolve, 50));
     if (!closed) {
       writeJob(workspaceStateDir, {
         id: delayedJobId,
@@ -321,8 +333,19 @@ describe("task-wait --next appearance and selection", () => {
       });
     });
 
-    await new Promise((resolve) => setTimeout(resolve, 200));
     const newerJobId = "job-newer-after-terminals-009";
+    if (!closed) {
+      writeJob(workspaceStateDir, {
+        id: newerJobId,
+        kind: "task",
+        status: "running",
+        startedAt: new Date().toISOString(),
+      });
+    }
+
+    const newerJobFile = path.join(workspaceStateDir, "jobs", newerJobId, "job.json");
+    await waitForChildRead(newerJobFile, () => closed);
+    await new Promise((resolve) => setTimeout(resolve, 50));
     if (!closed) {
       writeJob(workspaceStateDir, {
         id: newerJobId,
@@ -397,6 +420,49 @@ describe("task-wait --next appearance and selection", () => {
     assert.equal(code, 0, `expected exit code 0, got: ${code}; stdout: ${stdout}; stderr: ${stderr}`);
     assert.match(stdout, new RegExp(newerJobId));
     assert.doesNotMatch(stdout, new RegExp(olderJobId));
+  });
+
+  it("--next without --since accepts a job that appears already terminal after the wait started", async () => {
+    const preJobId = "job-preexisting-terminal-001";
+    writeJob(workspaceStateDir, {
+      id: preJobId,
+      kind: "task",
+      status: "completed",
+      startedAt: "2026-09-01T00:00:00.000Z",
+      finishedAt: "2026-09-01T00:05:00.000Z",
+    });
+
+    const newJobId = "job-new-terminal-002";
+    let t = 0;
+    let sleepCount = 0;
+    const flush = () => new Promise((resolve) => setTimeout(resolve, 0));
+    const sleep = async (ms) => {
+      sleepCount += 1;
+      t += ms;
+      if (sleepCount === 1) {
+        writeJob(workspaceStateDir, {
+          id: newJobId,
+          kind: "task",
+          status: "completed",
+          startedAt: "2026-09-01T00:06:00.000Z",
+          finishedAt: "2026-09-01T00:07:00.000Z",
+        });
+      }
+      await flush();
+    };
+
+    const result = await waitForTask({
+      stateDir: workspaceStateDir,
+      next: true,
+      pollIntervalMs: 1_000,
+      appearTimeoutMs: 5_000,
+      sleep,
+      now: () => t,
+    });
+
+    assert.equal(result.jobId, newJobId);
+    assert.equal(result.status, "completed");
+    assert.notEqual(result.jobId, preJobId);
   });
 });
 
