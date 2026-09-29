@@ -72,19 +72,14 @@
 //   - `ses_*` ids are refused on shape (opencode).  A bare UUID is passed
 //     through as `--resume`; companion-level provenance is the caller's job.
 
-import fs from "node:fs";
-import path from "node:path";
 import process from "node:process";
 
 import { firstRoute } from "./cli.mjs";
 import { readAgentSystemPrompt } from "./agent-system-prompt.mjs";
-import { newJobId, saveJob, jobDir, appendEvent } from "./job-store.mjs";
-import { stateDirFor, writeJson } from "./state-paths.mjs";
-import { durationS } from "./render.mjs";
-import { resolveCompletedResult } from "./result-recovery.mjs";
-import { deriveStopReason } from "./stop-reason.mjs";
-import { startKaibaProgressWatch } from "./kaiba-progress-watch.mjs";
+import { newJobId } from "./job-store.mjs";
+import { stateDirFor } from "./state-paths.mjs";
 import { isUsableTimeoutS, runBackendProcess } from "./backend-process-runner.mjs";
+import { runBackendDispatch } from "./backend-dispatch-core.mjs";
 
 export const CURSOR_BACKEND = "cursor";
 
@@ -599,13 +594,7 @@ export async function cursorDispatch(opts) {
     retry: null,
     fallbacks: null,
   };
-  saveJob(stateDir, job);
-  fs.writeFileSync(path.join(jobDir(stateDir, job.id), "prompt.md"), promptText, "utf8");
-
-  const progressWatch = startKaibaProgressWatch({ stateDir, jobId: job.id });
-
-  try {
-    appendEvent(stateDir, job.id, {
+  const dispatchEvent = {
     type: "companion.cursor.dispatch",
     backend: CURSOR_BACKEND,
     model: modelEntry,
@@ -613,135 +602,106 @@ export async function cursorDispatch(opts) {
     bin,
     toolDeniesUnenforced: unenforcedDenies,
     modelResidueHazard: job.modelResidueHazard,
-  });
-
-  let assistantText = "";
-  let lastResult = null;
-  const streamAcc = initCursorStreamAccumulator();
-  let lastStatsSaveAt = 0;
-  const STATS_SAVE_INTERVAL_MS = 1000;
-  const onLine = (rawLine) => {
-    const evt = parseCursorStreamLine(rawLine);
-    if (evt === null) return;
-    applyCursorStreamEvent(streamAcc, evt);
-    if (evt.type === "assistant") {
-      assistantText += assistantTextFromEvent(evt);
-    } else if (evt.type === "result") {
-      lastResult = evt;
-    }
-    if (typeof evt.session_id === "string" && evt.session_id) {
-      job.sessionID = evt.session_id;
-    }
-    job.stats = {
-      instrumented: true,
-      events: streamAcc.events,
-      steps: streamAcc.steps,
-      lastTool: streamAcc.lastTool,
-      permissionsAllowed: job.stats.permissionsAllowed,
-      permissionsRejected: job.stats.permissionsRejected,
-      lastActivity: streamAcc.lastActivity,
-      models: streamAcc.models,
-    };
-    const now = Date.now();
-    if (now - lastStatsSaveAt >= STATS_SAVE_INTERVAL_MS) {
-      lastStatsSaveAt = now;
-      saveJob(stateDir, job);
-    }
   };
 
-  const { code, stdout, stderr, timedOut, stalled, spawnError } = await runCursorProcess({
-    bin,
-    args,
-    cwd: opts.cwd,
+  const stream = {
+    init: () => ({
+      ...initCursorStreamAccumulator(),
+      assistantText: "",
+      lastResult: null,
+    }),
+    onLine: (streamAcc, rawLine, j) => {
+      const evt = parseCursorStreamLine(rawLine);
+      if (evt === null) return false;
+      applyCursorStreamEvent(streamAcc, evt);
+      if (evt.type === "assistant") {
+        streamAcc.assistantText += assistantTextFromEvent(evt);
+      } else if (evt.type === "result") {
+        streamAcc.lastResult = evt;
+      }
+      if (typeof evt.session_id === "string" && evt.session_id) {
+        j.sessionID = evt.session_id;
+      }
+      j.stats = {
+        instrumented: true,
+        events: streamAcc.events,
+        steps: streamAcc.steps,
+        lastTool: streamAcc.lastTool,
+        permissionsAllowed: j.stats?.permissionsAllowed ?? 0,
+        permissionsRejected: j.stats?.permissionsRejected ?? 0,
+        lastActivity: streamAcc.lastActivity,
+        models: streamAcc.models,
+      };
+    },
+  };
+
+  return runBackendDispatch({
+    stateDir,
+    job,
     promptText,
+    dispatchEvent,
+    bin,
+    labels: { spawnErrorPrefix: "cursor dispatch failed" },
     timeoutS,
     watchdogS,
-    onStart: ({ pid, startTime }) => {
-      job.process = { pid, startTime, recordedAt: new Date().toISOString() };
-      saveJob(stateDir, job);
-    },
-    onLine,
-    onWatchdog: ({ kind, silenceS }) => {
-      if (kind === "fired") {
-        appendEvent(stateDir, job.id, { type: "companion.watchdog.fired", silenceS });
-      } else {
-        appendEvent(stateDir, job.id, { type: "companion.watchdog.kill" });
+    runProcess: (hooks) =>
+      runCursorProcess({
+        bin,
+        args,
+        cwd: opts.cwd,
+        promptText,
+        timeoutS,
+        watchdogS,
+        ...hooks,
+      }),
+    stream,
+    classifyExit: ({ code, stdout, stderr, state }) => {
+      const lastResult = state.lastResult;
+      if (code !== 0 && code !== null) {
+        const detail = (stderr || stdout || "(no output)").trim();
+        const error =
+          `cursor exited with code ${code}: ${describeCursorResult(detail)}` +
+          (lastResult ? `; terminal line: ${describeCursorResult(lastResult)}` : "");
+        const extra = {};
+        if (lastResult) {
+          extra.cursorIsError = lastResult.is_error === true;
+          if (typeof lastResult.session_id === "string") extra.sessionID = lastResult.session_id;
+        }
+        return { status: "error", error, ...extra };
       }
-    },
-  });
-
-  job.finishedAt = new Date().toISOString();
-
-  let resultText = "";
-  if (spawnError) {
-    job.status = "error";
-    job.error = `cursor dispatch failed: could not start ${bin}: ${spawnError.message}`;
-  } else if (stalled) {
-    job.status = "stalled";
-    job.error = `watchdog: no events for ${watchdogS}s (process killed)`;
-  } else if (timedOut) {
-    job.status = "timeout";
-    job.error = `timed out after ${timeoutS}s`;
-  } else if (code !== 0 && code !== null) {
-    job.status = "error";
-    const detail = (stderr || stdout || "(no output)").trim();
-    job.error =
-      `cursor exited with code ${code}: ${describeCursorResult(detail)}` +
-      (lastResult ? `; terminal line: ${describeCursorResult(lastResult)}` : "");
-    if (lastResult) {
-      job.cursorIsError = lastResult.is_error === true;
-      if (typeof lastResult.session_id === "string") job.sessionID = lastResult.session_id;
-    }
-  } else if (!lastResult) {
-    job.status = "error";
-    job.error =
-      "cursor produced no terminal result line. " +
-      `Received: ${describeCursorResult((stdout || "").trim() || "(empty stdout)")}`;
-  } else {
-    const outcome = cursorPayload(lastResult);
-    job.cursorIsError = outcome.isError;
-    if (outcome.sessionId) job.sessionID = outcome.sessionId;
-    if (outcome.ok) {
-      job.status = "completed";
-      job.usage = {
-        ...mapCursorUsage(lastResult),
-        phase: job.phase,
-        durationSeconds: durationS(job),
+      if (!lastResult) {
+        return {
+          status: "error",
+          error:
+            "cursor produced no terminal result line. " +
+            `Received: ${describeCursorResult((stdout || "").trim() || "(empty stdout)")}`,
+        };
+      }
+      const outcome = cursorPayload(lastResult);
+      if (outcome.ok) {
+        return {
+          status: "completed",
+          cursorIsError: outcome.isError,
+          sessionID: outcome.sessionId,
+          usage: mapCursorUsage(lastResult),
+          text: outcome.text,
+        };
+      }
+      return {
+        status: "error",
+        error: outcome.error,
+        cursorIsError: outcome.isError,
+        sessionID: outcome.sessionId,
       };
-      writeJson(path.join(jobDir(stateDir, job.id), "usage.json"), job.usage);
-      const resolved = resolveCompletedResult({
-        backend: CURSOR_BACKEND,
-        fetched: { ok: true, text: outcome.text },
-        coords: { sessionId: job.sessionID },
-      });
-      resultText = resolved.text ?? outcome.text;
-      job.result = resolved.record;
-      fs.writeFileSync(path.join(jobDir(stateDir, job.id), "result.md"), resultText, "utf8");
-    } else {
-      job.status = "error";
-      job.error = outcome.error;
-    }
-  }
-
-  appendEvent(stateDir, job.id, {
-    type: "companion.cursor.finished",
-    status: job.status,
-    cursorIsError: job.cursorIsError,
-    sessionId: job.sessionID,
-    exitCode: code,
-    assistantChars: assistantText.length,
+    },
+    finishedEvent: ({ state, job: j, code }) => ({
+      type: "companion.cursor.finished",
+      status: j.status,
+      cursorIsError: j.cursorIsError,
+      sessionId: j.sessionID,
+      exitCode: code,
+      assistantChars: state.assistantText.length,
+    }),
+    resultBackend: CURSOR_BACKEND,
   });
-
-  // Record the closed terminal reason (kusabi #388).  Cursor finalizes its
-  // job.json on this path and never calls deriveStopReason via the opencode
-  // SSE fold, so stamp here at the terminal write.  worktreeChanged is left
-  // unmeasured at job level, matching the opencode path: a completed wrapper
-  // records "completed"; error/timeout/stalled fall through to "unknown".
-  job.stopReason = deriveStopReason({ status: job.status, stats: job.stats });
-  saveJob(stateDir, job);
-
-  return { job, resultText, stateDir };
-  } finally {
-    progressWatch.stop();
-  }
 }
