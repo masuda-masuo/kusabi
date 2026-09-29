@@ -5591,6 +5591,20 @@ fs.writeFileSync(path.join(jobDir, "job.json"), JSON.stringify({
       assert.match(res.stdout, /Detached task launched \(pid \d+\)/i);
       assert.match(res.stdout, /Log: .*task-detach-\d+\.log/i);
       assert.match(res.stdout, /kusabi-companion task-wait/);
+
+      // task-detach returns right after spawn(), without waiting for the job to
+      // appear, so the stand-in can still be writing its job.json under tmp.
+      // Removing tmp under it raced (ENOTEMPTY, or tmp recreated after the
+      // test, kusabi #620): wait for its last write before cleaning up.
+      const jobsDir = path.join(workspaceStateDir, "jobs");
+      const deadline = Date.now() + 10_000;
+      const standinDone = () =>
+        fs.existsSync(jobsDir) &&
+        fs.readdirSync(jobsDir).some((id) => fs.existsSync(path.join(jobsDir, id, "job.json")));
+      while (!standinDone() && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+      assert.ok(standinDone(), "the detached stand-in never wrote its job.json");
     } finally {
       server?.close();
       fs.rmSync(tmp, { recursive: true, force: true });
