@@ -26,6 +26,7 @@ import { commandOutcome } from "./kusabi-companion.mjs";
 import { resolveResumeLastSession } from "./dispatch-backend.mjs";
 import { WRITE_TOOL_NAMES, implementDenyTools, reviewDenyTools } from "./cli.mjs";
 import { translateDenyTools } from "./tool-permissions.mjs";
+import { patchEnv } from "./fixtures.mjs";
 
 // decidePermission — always returns "once"
 // ---------------------------------------------------------------------------
@@ -1595,18 +1596,14 @@ function incidentServeContext({ firstError }) {
   fs.mkdirSync(cwd, { recursive: true });
   const testLog = path.join(tmp, "requests.log");
   fs.writeFileSync(testLog, "", "utf8");
-  const saved = {
-    OPENCODE_BIN: process.env.OPENCODE_BIN,
-    KUSABI_STATE_DIR: process.env.KUSABI_STATE_DIR,
-    KUSABI_SERVE_READY_TIMEOUT_MS: process.env.KUSABI_SERVE_READY_TIMEOUT_MS,
-    KUSABI_TEST_LOG: process.env.KUSABI_TEST_LOG,
-  };
   // Set env first: stateDirFor hashes cwd under KUSABI_STATE_DIR, so it
   // must see the temp root or the returned paths point at the real root.
-  process.env.OPENCODE_BIN = binPath;
-  process.env.KUSABI_STATE_DIR = stateRoot;
-  process.env.KUSABI_SERVE_READY_TIMEOUT_MS = "8000";
-  process.env.KUSABI_TEST_LOG = testLog;
+  const restoreEnv = patchEnv({
+    OPENCODE_BIN: binPath,
+    KUSABI_STATE_DIR: stateRoot,
+    KUSABI_SERVE_READY_TIMEOUT_MS: "8000",
+    KUSABI_TEST_LOG: testLog,
+  });
   const stateDir = stateDirFor(cwd);
   return {
     tmp,
@@ -1614,10 +1611,7 @@ function incidentServeContext({ firstError }) {
     stateDir,
     testLog,
     restore() {
-      for (const [key, value] of Object.entries(saved)) {
-        if (value === undefined) delete process.env[key];
-        else process.env[key] = value;
-      }
+      restoreEnv();
     },
     killAll() {
       try {
@@ -2637,24 +2631,18 @@ function incompleteServeContext({ finalMessage, finishShape = "flat" }) {
   const stateRoot = path.join(tmp, "state");
   const cwd = path.join(tmp, "cwd");
   fs.mkdirSync(cwd, { recursive: true });
-  const saved = {
-    OPENCODE_BIN: process.env.OPENCODE_BIN,
-    KUSABI_STATE_DIR: process.env.KUSABI_STATE_DIR,
-    KUSABI_SERVE_READY_TIMEOUT_MS: process.env.KUSABI_SERVE_READY_TIMEOUT_MS,
-  };
-  process.env.OPENCODE_BIN = binPath;
-  process.env.KUSABI_STATE_DIR = stateRoot;
-  process.env.KUSABI_SERVE_READY_TIMEOUT_MS = "8000";
+  const restoreEnv = patchEnv({
+    OPENCODE_BIN: binPath,
+    KUSABI_STATE_DIR: stateRoot,
+    KUSABI_SERVE_READY_TIMEOUT_MS: "8000",
+  });
   const stateDir = stateDirFor(cwd);
   return {
     tmp,
     cwd,
     stateDir,
     restore() {
-      for (const [key, value] of Object.entries(saved)) {
-        if (value === undefined) delete process.env[key];
-        else process.env[key] = value;
-      }
+      restoreEnv();
     },
     killAll() {
       try {

@@ -28,6 +28,7 @@ import { once } from "node:events";
 import { cmdCancel } from "./job-control-cmd.mjs";
 import { commandOutcome } from "./kusabi-companion.mjs";
 import { claudeDispatch } from "./claude-dispatch.mjs";
+import { patchEnv } from "./fixtures.mjs";
 import { processStartToken, readProcessStat } from "./process-identity.mjs";
 import { saveJob, loadJob, latestJob, jobDir } from "./job-store.mjs";
 import { stateDirFor, writeJson } from "./state-paths.mjs";
@@ -62,14 +63,13 @@ async function waitFor(predicate, { timeoutMs = 5000, stepMs = 20, what = "condi
 
 function sandbox() {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-cancel-"));
-  const saved = {
-    KUSABI_STATE_DIR: process.env.KUSABI_STATE_DIR,
+  const restoreEnv = patchEnv({
+    KUSABI_STATE_DIR: path.join(tmp, "state"),
     KUSABI_CANCEL_KILL_WAIT_MS: process.env.KUSABI_CANCEL_KILL_WAIT_MS,
     CLAUDE_BIN: process.env.CLAUDE_BIN,
     KUSABI_CLAUDE_MCP_SOURCE: process.env.KUSABI_CLAUDE_MCP_SOURCE,
     FAKE_CLAUDE_CHILD_PID: process.env.FAKE_CLAUDE_CHILD_PID,
-  };
-  process.env.KUSABI_STATE_DIR = path.join(tmp, "state");
+  });
   const cwd = path.join(tmp, "cwd");
   fs.mkdirSync(cwd, { recursive: true });
   const stateDir = stateDirFor(cwd);
@@ -78,10 +78,7 @@ function sandbox() {
     cwd,
     stateDir,
     restore() {
-      for (const [key, value] of Object.entries(saved)) {
-        if (value === undefined) delete process.env[key];
-        else process.env[key] = value;
-      }
+      restoreEnv();
       fs.rmSync(tmp, { recursive: true, force: true });
     },
   };

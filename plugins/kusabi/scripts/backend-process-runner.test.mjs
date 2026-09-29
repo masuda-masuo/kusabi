@@ -11,6 +11,7 @@ import assert from "node:assert/strict";
 import os from "node:os";
 import path from "node:path";
 import fs from "node:fs";
+import { patchEnv } from "./fixtures.mjs";
 
 import {
   isUsableTimeoutS,
@@ -102,11 +103,10 @@ function fakeContext() {
   fs.chmodSync(binPath, 0o755);
   fs.writeFileSync(stdinLog, "", "utf8");
 
-  const saved = {
+  const restoreEnv = patchEnv({
     FAKE_MODE: process.env.FAKE_MODE,
-    FAKE_STDIN_LOG: process.env.FAKE_STDIN_LOG,
-  };
-  process.env.FAKE_STDIN_LOG = stdinLog;
+    FAKE_STDIN_LOG: stdinLog,
+  });
 
   return {
     tmp,
@@ -114,10 +114,7 @@ function fakeContext() {
     stdinLog,
     setMode(mode) { process.env.FAKE_MODE = mode; },
     restore() {
-      for (const [key, value] of Object.entries(saved)) {
-        if (value === undefined) delete process.env[key];
-        else process.env[key] = value;
-      }
+      restoreEnv();
       fs.rmSync(tmp, { recursive: true, force: true });
     },
   };

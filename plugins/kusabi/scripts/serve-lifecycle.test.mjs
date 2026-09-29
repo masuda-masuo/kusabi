@@ -24,6 +24,7 @@ import { readJson, stateDirFor } from "./state-paths.mjs";
 // side-effect free.)
 import { cmdServeStop } from "./job-control-cmd.mjs";
 import { watchdogKillOrDecline } from "./prompt-execution.mjs";
+import { patchEnv } from "./fixtures.mjs";
 
 // buildServeEnv — env-building seam for ensureServer's spawn (kusabi #136 fix 3)
 // ---------------------------------------------------------------------------
@@ -546,19 +547,15 @@ function fakeServeContext(mode) {
   const stateRoot = path.join(tmp, "state");
   const cwd = path.join(tmp, "cwd");
   fs.mkdirSync(cwd, { recursive: true });
-  const saved = {
-    OPENCODE_BIN: process.env.OPENCODE_BIN,
-    KUSABI_STATE_DIR: process.env.KUSABI_STATE_DIR,
-    KUSABI_SERVE_READY_TIMEOUT_MS: process.env.KUSABI_SERVE_READY_TIMEOUT_MS,
-    FAKE_MODE: process.env.FAKE_MODE,
-    FAKE_SPAWN_PIDS: process.env.FAKE_SPAWN_PIDS,
-  };
   // Set the env first: stateDirFor hashes cwd under KUSABI_STATE_DIR, so it
   // must see the temp root or the returned paths point at the real state dir.
-  process.env.OPENCODE_BIN = binPath;
-  process.env.KUSABI_STATE_DIR = stateRoot;
-  process.env.FAKE_MODE = mode;
-  process.env.FAKE_SPAWN_PIDS = spawnLog;
+  const restoreEnv = patchEnv({
+    OPENCODE_BIN: binPath,
+    KUSABI_STATE_DIR: stateRoot,
+    KUSABI_SERVE_READY_TIMEOUT_MS: process.env.KUSABI_SERVE_READY_TIMEOUT_MS,
+    FAKE_MODE: mode,
+    FAKE_SPAWN_PIDS: spawnLog,
+  });
   const stateDir = stateDirFor(cwd); // hashes cwd under KUSABI_STATE_DIR
   return {
     tmp,
@@ -568,10 +565,7 @@ function fakeServeContext(mode) {
     lockFile: path.join(stateDir, "serve.lock"),
     spawnLog,
     restore() {
-      for (const [key, value] of Object.entries(saved)) {
-        if (value === undefined) delete process.env[key];
-        else process.env[key] = value;
-      }
+      restoreEnv();
     },
     killAll() {
       for (const pid of spawnedPids(spawnLog)) {

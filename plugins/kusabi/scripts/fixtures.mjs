@@ -410,6 +410,48 @@ export function runNodeAsync(script, args = [], { cwd, env, killAfterMs = 15_000
 }
 
 /**
+ * Write a file with utf8 encoding and chmod 0o755.
+ *
+ * @param {string} file
+ * @param {string} source
+ */
+export function writeExecutable(file, source) {
+  fs.writeFileSync(file, source, "utf8");
+  fs.chmodSync(file, 0o755);
+}
+
+/**
+ * Snapshot environment variables, apply the provided patches (deleting undefined values),
+ * and return a restore function. Calling restore() twice is harmless.
+ *
+ * @param {Record<string, string | undefined>} vars
+ * @returns {() => void}
+ */
+export function patchEnv(vars) {
+  const saved = {};
+  for (const [key, val] of Object.entries(vars)) {
+    saved[key] = process.env[key];
+    if (val === undefined) {
+      delete process.env[key];
+    } else {
+      process.env[key] = String(val);
+    }
+  }
+  let restored = false;
+  return function restore() {
+    if (restored) return;
+    restored = true;
+    for (const [key, val] of Object.entries(saved)) {
+      if (val === undefined) {
+        delete process.env[key];
+      } else {
+        process.env[key] = val;
+      }
+    }
+  };
+}
+
+/**
  * Install a fake claude CLI binary and MCP configuration in a directory, setting
  * the CLAUDE_BIN, FAKE_CLAUDE_ARGS_LOG, and KUSABI_CLAUDE_MCP_SOURCE environment variables.
  *
@@ -420,34 +462,22 @@ export function installFakeClaude(dir) {
   const claudeArgsLog = path.join(dir, "claude-args.ndjson");
   fs.writeFileSync(claudeArgsLog, "", "utf8");
   const claudeBinPath = path.join(dir, "fake-claude.mjs");
-  fs.writeFileSync(
+  writeExecutable(
     claudeBinPath,
     "#!/usr/bin/env node\n" +
     "import fs from \"node:fs\";\n" +
     "fs.appendFileSync(process.env.FAKE_CLAUDE_ARGS_LOG, JSON.stringify(process.argv.slice(2)) + \"\\n\");\n" +
     "process.stdout.write(JSON.stringify({ type: \"result\", is_error: false, result: \"ok\", session_id: \"claude-uuid-resume\" }));\n",
-    "utf8",
   );
-  fs.chmodSync(claudeBinPath, 0o755);
 
-  const savedClaudeBin = process.env.CLAUDE_BIN;
-  const savedArgsLog = process.env.FAKE_CLAUDE_ARGS_LOG;
-  const savedMcpSource = process.env.KUSABI_CLAUDE_MCP_SOURCE;
-
-  process.env.CLAUDE_BIN = claudeBinPath;
-  process.env.FAKE_CLAUDE_ARGS_LOG = claudeArgsLog;
   const mcpSource = path.join(dir, "claude.json");
   fs.writeFileSync(mcpSource, JSON.stringify({ mcpServers: { sunaba: { command: "npx" } } }), "utf8");
-  process.env.KUSABI_CLAUDE_MCP_SOURCE = mcpSource;
 
-  const restore = () => {
-    if (savedClaudeBin === undefined) delete process.env.CLAUDE_BIN;
-    else process.env.CLAUDE_BIN = savedClaudeBin;
-    if (savedArgsLog === undefined) delete process.env.FAKE_CLAUDE_ARGS_LOG;
-    else process.env.FAKE_CLAUDE_ARGS_LOG = savedArgsLog;
-    if (savedMcpSource === undefined) delete process.env.KUSABI_CLAUDE_MCP_SOURCE;
-    else process.env.KUSABI_CLAUDE_MCP_SOURCE = savedMcpSource;
-  };
+  const restore = patchEnv({
+    CLAUDE_BIN: claudeBinPath,
+    FAKE_CLAUDE_ARGS_LOG: claudeArgsLog,
+    KUSABI_CLAUDE_MCP_SOURCE: mcpSource,
+  });
 
   return { claudeArgsLog, restore };
 }

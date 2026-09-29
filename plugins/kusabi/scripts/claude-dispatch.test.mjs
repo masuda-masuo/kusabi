@@ -14,6 +14,7 @@ import path from "node:path";
 import fs from "node:fs";
 import crypto from "node:crypto";
 import { spawnSync } from "node:child_process";
+import { patchEnv } from "./fixtures.mjs";
 
 import {
   CLAUDE_DEFAULT_CHAIN,
@@ -1301,22 +1302,15 @@ function fakeClaudeContext(mode = "ok", { config = null } = {}) {
   const mcpSource = path.join(tmp, "claude.json");
   fs.writeFileSync(mcpSource, JSON.stringify({ mcpServers: { sunaba: SUNABA_MCP, other: { command: "echo" } } }), "utf8");
 
-  const saved = {
-    CLAUDE_BIN: process.env.CLAUDE_BIN,
-    KUSABI_STATE_DIR: process.env.KUSABI_STATE_DIR,
-    KUSABI_CLAUDE_MCP_SOURCE: process.env.KUSABI_CLAUDE_MCP_SOURCE,
-    FAKE_CLAUDE_MODE: process.env.FAKE_CLAUDE_MODE,
-    FAKE_CLAUDE_ARGS_LOG: process.env.FAKE_CLAUDE_ARGS_LOG,
-    FAKE_CLAUDE_PIDS: process.env.FAKE_CLAUDE_PIDS,
-    FAKE_CLAUDE_STDIN_LOG: process.env.FAKE_CLAUDE_STDIN_LOG,
-  };
-  process.env.CLAUDE_BIN = binPath;
-  process.env.KUSABI_STATE_DIR = stateRoot;
-  process.env.KUSABI_CLAUDE_MCP_SOURCE = mcpSource;
-  process.env.FAKE_CLAUDE_MODE = mode;
-  process.env.FAKE_CLAUDE_ARGS_LOG = argsLog;
-  process.env.FAKE_CLAUDE_PIDS = pidsLog;
-  process.env.FAKE_CLAUDE_STDIN_LOG = stdinLog;
+  const restoreEnv = patchEnv({
+    CLAUDE_BIN: binPath,
+    KUSABI_STATE_DIR: stateRoot,
+    KUSABI_CLAUDE_MCP_SOURCE: mcpSource,
+    FAKE_CLAUDE_MODE: mode,
+    FAKE_CLAUDE_ARGS_LOG: argsLog,
+    FAKE_CLAUDE_PIDS: pidsLog,
+    FAKE_CLAUDE_STDIN_LOG: stdinLog,
+  });
 
   const stateDir = stateDirFor(cwd);
   return {
@@ -1345,10 +1339,7 @@ function fakeClaudeContext(mode = "ok", { config = null } = {}) {
       };
     },
     restore() {
-      for (const [key, value] of Object.entries(saved)) {
-        if (value === undefined) delete process.env[key];
-        else process.env[key] = value;
-      }
+      restoreEnv();
     },
   };
 }
@@ -3219,29 +3210,19 @@ function guardContext({ config = {}, usageMode = "at-41" } = {}) {
   const mcpSource = path.join(tmp, "claude.json");
   fs.writeFileSync(mcpSource, JSON.stringify({ mcpServers: { sunaba: SUNABA_MCP } }), "utf8");
 
-  const saved = {
-    CLAUDE_BIN: process.env.CLAUDE_BIN,
-    AGY_BIN: process.env.AGY_BIN,
-    KUSABI_STATE_DIR: process.env.KUSABI_STATE_DIR,
-    KUSABI_CLAUDE_MCP_SOURCE: process.env.KUSABI_CLAUDE_MCP_SOURCE,
-    KUSABI_CLAUDE_USAGE_PROBE_TIMEOUT_MS: process.env.KUSABI_CLAUDE_USAGE_PROBE_TIMEOUT_MS,
-    FAKE_CLAUDE_USAGE_MODE: process.env.FAKE_CLAUDE_USAGE_MODE,
-    FAKE_CLAUDE_USAGE_LOG: process.env.FAKE_CLAUDE_USAGE_LOG,
-    FAKE_CLAUDE_USAGE_PIDS: process.env.FAKE_CLAUDE_USAGE_PIDS,
-    FAKE_CLAUDE_WORKER_LOG: process.env.FAKE_CLAUDE_WORKER_LOG,
-    FAKE_AGY_ARGS_LOG: process.env.FAKE_AGY_ARGS_LOG,
-  };
-  process.env.CLAUDE_BIN = binPath;
-  process.env.AGY_BIN = agyBinPath;
-  process.env.KUSABI_STATE_DIR = stateRootDir;
-  process.env.KUSABI_CLAUDE_MCP_SOURCE = mcpSource;
-  // The hang test must not sit out the real 5s bound.
-  process.env.KUSABI_CLAUDE_USAGE_PROBE_TIMEOUT_MS = "400";
-  process.env.FAKE_CLAUDE_USAGE_MODE = usageMode;
-  process.env.FAKE_CLAUDE_USAGE_LOG = usageLog;
-  process.env.FAKE_CLAUDE_USAGE_PIDS = usagePids;
-  process.env.FAKE_CLAUDE_WORKER_LOG = workerLog;
-  process.env.FAKE_AGY_ARGS_LOG = agyArgsLog;
+  const restoreEnv = patchEnv({
+    CLAUDE_BIN: binPath,
+    AGY_BIN: agyBinPath,
+    KUSABI_STATE_DIR: stateRootDir,
+    KUSABI_CLAUDE_MCP_SOURCE: mcpSource,
+    // The hang test must not sit out the real 5s bound.
+    KUSABI_CLAUDE_USAGE_PROBE_TIMEOUT_MS: "400",
+    FAKE_CLAUDE_USAGE_MODE: usageMode,
+    FAKE_CLAUDE_USAGE_LOG: usageLog,
+    FAKE_CLAUDE_USAGE_PIDS: usagePids,
+    FAKE_CLAUDE_WORKER_LOG: workerLog,
+    FAKE_AGY_ARGS_LOG: agyArgsLog,
+  });
 
   const lines = (file) => {
     const text = fs.readFileSync(file, "utf8").trim();
@@ -3275,10 +3256,7 @@ function guardContext({ config = {}, usageMode = "at-41" } = {}) {
       };
     },
     restore() {
-      for (const [key, value] of Object.entries(saved)) {
-        if (value === undefined) delete process.env[key];
-        else process.env[key] = value;
-      }
+      restoreEnv();
       fs.rmSync(tmp, { recursive: true, force: true });
     },
   };
