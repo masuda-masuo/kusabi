@@ -94,13 +94,10 @@ import process from "node:process";
 import { firstRoute, WRITE_TOOL_NAMES } from "./cli.mjs";
 import { readAgentSystemPrompt } from "./agent-system-prompt.mjs";
 import { translateDenyTools } from "./tool-permissions.mjs";
-import { newJobId, saveJob, jobDir, appendEvent } from "./job-store.mjs";
-import { stateDirFor, writeJson } from "./state-paths.mjs";
-import { durationS } from "./render.mjs";
-import { resolveCompletedResult } from "./result-recovery.mjs";
-import { deriveStopReason } from "./stop-reason.mjs";
-import { startKaibaProgressWatch } from "./kaiba-progress-watch.mjs";
+import { newJobId, jobDir } from "./job-store.mjs";
+import { stateDirFor } from "./state-paths.mjs";
 import { isUsableTimeoutS, runBackendProcess } from "./backend-process-runner.mjs";
+import { runBackendDispatch } from "./backend-dispatch-core.mjs";
 import {
   codexMcpArgv,
   codexMcpServerDefinitions,
@@ -724,9 +721,6 @@ export async function codexDispatch(opts) {
   // of the operator's cache).
   const codexHome = codexHomeForJob(stateDir, job.id);
   job.codexHome = codexHome;
-  saveJob(stateDir, job);
-  fs.writeFileSync(path.join(jobDir(stateDir, job.id), "prompt.md"), promptText, "utf8");
-
   // ---- dedicated state ----
   // HOME and CODEX_HOME both point at the job-owned directory.  The child
   // never inherits the orchestrator's config/rules/sessions/MCP files; the
@@ -752,15 +746,10 @@ export async function codexDispatch(opts) {
   });
   // config.toml is intentionally not written: --ignore-user-config ignores
   // the job-owned file, so every grant is already present in argv above.
-  saveJob(stateDir, job);
   const authBridge = linkOperatorAuth(codexHome);
   const childEnv = { HOME: codexHome, CODEX_HOME: codexHome };
 
-  const progressWatch = startKaibaProgressWatch({ stateDir, jobId: job.id });
-
-  try {
-
-  appendEvent(stateDir, job.id, {
+  const dispatchEvent = {
     type: "companion.codex.dispatch",
     backend: CODEX_BACKEND,
     model: modelEntry,
@@ -775,156 +764,137 @@ export async function codexDispatch(opts) {
     codexSandboxEnforcedDenies,
     codexMcpEnforcedDenies,
     toolDeniesUnenforced: unenforcedDenies,
-  });
-
-  // ---- run: fold the NDJSON stream as it arrives ----
-  const streamAcc = initCodexStreamAccumulator();
-  let lastStatsSaveAt = 0;
-  const STATS_SAVE_INTERVAL_MS = 1000;
-  const onLine = (rawLine) => {
-    const evt = parseCodexStreamLine(rawLine);
-    if (evt === null) {
-      // Not fatal (the real CLI may print non-JSON warning lines) — just not
-      // countable as a parsed event.
-      return;
-    }
-    applyCodexStreamEvent(streamAcc, evt);
-    if (streamAcc.threadId) job.sessionID = streamAcc.threadId;
-    job.stats = {
-      instrumented: true,
-      events: streamAcc.events,
-      steps: streamAcc.steps,
-      lastTool: streamAcc.lastTool,
-      permissionsAllowed: 0,
-      permissionsRejected: 0,
-      lastActivity: streamAcc.lastActivity,
-      models: streamAcc.models,
-    };
-    const now = Date.now();
-    if (now - lastStatsSaveAt >= STATS_SAVE_INTERVAL_MS) {
-      lastStatsSaveAt = now;
-      saveJob(stateDir, job);
-    }
   };
 
-  const { code, stdout, stderr, timedOut, stalled, spawnError } = await runCodexProcess({
-    bin,
-    args,
-    cwd: opts.cwd,
+  // ---- run: fold the NDJSON stream as it arrives ----
+  const stream = {
+    init: () => initCodexStreamAccumulator(),
+    onLine: (streamAcc, rawLine, j) => {
+      const evt = parseCodexStreamLine(rawLine);
+      if (evt === null) {
+        // Not fatal (the real CLI may print non-JSON warning lines) — just not
+        // countable as a parsed event.
+        return false;
+      }
+      if (typeof rawLine === "string") {
+        streamAcc.stdoutBytes += Buffer.byteLength(rawLine, "utf8");
+      }
+      applyCodexStreamEvent(streamAcc, evt);
+      if (streamAcc.threadId) j.sessionID = streamAcc.threadId;
+      j.stats = {
+        instrumented: true,
+        events: streamAcc.events,
+        steps: streamAcc.steps,
+        lastTool: streamAcc.lastTool,
+        permissionsAllowed: 0,
+        permissionsRejected: 0,
+        lastActivity: streamAcc.lastActivity,
+        models: streamAcc.models,
+      };
+    },
+  };
+
+  return runBackendDispatch({
+    stateDir,
+    job,
     promptText,
+    dispatchEvent,
+    bin,
+    labels: { spawnErrorPrefix: "codex dispatch failed" },
     timeoutS,
     watchdogS,
-    env: childEnv,
-    onStart: ({ pid, startTime }) => {
-      // The identity token (runner's /proc start time) lets `cancel` verify
-      // the recorded pid before signalling the group (kusabi #209): a
-      // recycled pid must never be killed on a stale record's say-so.
-      job.process = { pid, startTime, recordedAt: new Date().toISOString() };
-      saveJob(stateDir, job);
+    runProcess: (hooks) =>
+      runCodexProcess({
+        bin,
+        args,
+        cwd: opts.cwd,
+        promptText,
+        timeoutS,
+        watchdogS,
+        env: childEnv,
+        ...hooks,
+      }),
+    stream,
+    afterProcess: ({ state }) => {
+      // The thread/session id of THIS run, decided ONCE for every terminal path:
+      // the thread id the stream reported when it reported one (a fresh job, and
+      // a resume whose CLI re-emits thread.started), else the known thread id a
+      // resumed dispatch was asked to continue, else null.  Recording the known
+      // resumed id even when the resume stream omits thread.started keeps the
+      // session chain intact — later --resume-last selection and rendering both
+      // read this field (kusabi #527 review follow-up).
+      job.sessionID = state.threadId ?? resumedSessionId ?? null;
+
+      // ---- provenance cross-check after close ----
+      // The rollout lives under the job-owned CODEX_HOME.  A different actual
+      // model or reasoning effort is an integrity failure: the job errors, names
+      // requested vs actual, writes no successful result, and never retries
+      // another model.  A missing rollout is UNVERIFIABLE, never silently
+      // verified.  For a resumed dispatch the verification binds to the resumed
+      // invocation's OWN turn_context evidence, never a stale matching turn from
+      // the original session.
+      const provenance = readRolloutProvenance({
+        codexHome,
+        requestedModel: modelEntry,
+        resumed: resumedSessionId !== null,
+      });
+      job.codexProvenance = provenance;
+      // `substituted` is set from post-run provenance (kusabi #529 finding 4):
+      // `false` only when the actual model is verified equal to the requested
+      // one, `true` for an observed mismatch, and `null` when provenance is
+      // unverifiable (no rollout / no model field in the rollout) — never a
+      // claimed value.  The fail-closed mismatch handling below is unchanged: a
+      // mismatch is a hard error, no result and no substitute model.
+      job.substituted =
+        provenance.state === "verified"
+          ? false
+          : provenance.state === "mismatch"
+          ? true
+          : null;
     },
-    onLine,
-    onWatchdog: ({ kind, silenceS }) => {
-      if (kind === "fired") {
-        appendEvent(stateDir, job.id, { type: "companion.watchdog.fired", silenceS });
-      } else {
-        appendEvent(stateDir, job.id, { type: "companion.watchdog.kill" });
+    classifyExit: ({ code, stdout, stderr, state }) => {
+      const provenance = job.codexProvenance;
+      if (provenance?.state === "mismatch") {
+        // Fail closed: no successful result, no fallback/substitution.
+        return {
+          status: "error",
+          error:
+            `codex provenance mismatch: requested ${provenance.kind} ${provenance.requested} ` +
+            `but the recorded rollout shows ${provenance.actual} — integrity failure; ` +
+            "no result was written and no substitute model was attempted",
+        };
       }
+      if (code !== 0 && code !== null) {
+        const detail = (stderr || stdout || "(no output)").trim();
+        return {
+          status: "error",
+          error: `codex exited with code ${code}: ${describeCodexResult(detail)}`,
+        };
+      }
+      if (!state.assistantText) {
+        return {
+          status: "error",
+          error:
+            "codex produced no terminal assistant message. " +
+            `Received: ${describeCodexResult((stdout || "").trim() || "(empty stdout)")}`,
+        };
+      }
+      return {
+        status: "completed",
+        usage: mapCodexUsage(state.usageEvent),
+        text: state.assistantText,
+      };
     },
+    transformResultText: (text) =>
+      opts.agent === REVIEW_AGENT ? stripCodexOptionalNullsFromText(text) : text,
+    finishedEvent: ({ state, job: j, code }) => ({
+      type: "companion.codex.finished",
+      status: j.status,
+      sessionId: j.sessionID,
+      exitCode: code,
+      provenanceState: j.codexProvenance?.state,
+      assistantChars: state.assistantText.length,
+    }),
+    resultBackend: CODEX_BACKEND,
   });
-
-  job.finishedAt = new Date().toISOString();
-
-  // The thread/session id of THIS run, decided ONCE for every terminal path:
-  // the thread id the stream reported when it reported one (a fresh job, and
-  // a resume whose CLI re-emits thread.started), else the known thread id a
-  // resumed dispatch was asked to continue, else null.  Recording the known
-  // resumed id even when the resume stream omits thread.started keeps the
-  // session chain intact \u2014 later --resume-last selection and rendering both
-  // read this field (kusabi #527 review follow-up).
-  job.sessionID = streamAcc.threadId ?? resumedSessionId ?? null;
-
-  // ---- provenance cross-check after close ----
-  // The rollout lives under the job-owned CODEX_HOME.  A different actual
-  // model or reasoning effort is an integrity failure: the job errors, names
-  // requested vs actual, writes no successful result, and never retries
-  // another model.  A missing rollout is UNVERIFIABLE, never silently
-  // verified.  For a resumed dispatch the verification binds to the resumed
-  // invocation's OWN turn_context evidence, never a stale matching turn from
-  // the original session.
-  const provenance = readRolloutProvenance({ codexHome, requestedModel: modelEntry, resumed: resumedSessionId !== null });
-  job.codexProvenance = provenance;
-  // `substituted` is set from post-run provenance (kusabi #529 finding 4):
-  // `false` only when the actual model is verified equal to the requested
-  // one, `true` for an observed mismatch, and `null` when provenance is
-  // unverifiable (no rollout / no model field in the rollout) — never a
-  // claimed value.  The fail-closed mismatch handling below is unchanged: a
-  // mismatch is a hard error, no result and no substitute model.
-  job.substituted = provenance.state === "verified" ? false : provenance.state === "mismatch" ? true : null;
-
-  // ---- classification (all failure text preserved on the record) ----
-  let resultText = "";
-  if (spawnError) {
-    job.status = "error";
-    job.error = `codex dispatch failed: could not start ${bin}: ${spawnError.message}`;
-  } else if (stalled) {
-    job.status = "stalled";
-    job.error = `watchdog: no events for ${watchdogS}s (process killed)`;
-  } else if (timedOut) {
-    job.status = "timeout";
-    job.error = `timed out after ${timeoutS}s`;
-  } else if (provenance.state === "mismatch") {
-    // Fail closed: no successful result, no fallback/substitution.
-    job.status = "error";
-    job.error =
-      `codex provenance mismatch: requested ${provenance.kind} ${provenance.requested} ` +
-      `but the recorded rollout shows ${provenance.actual} — integrity failure; ` +
-      "no result was written and no substitute model was attempted";
-  } else if (code !== 0 && code !== null) {
-    job.status = "error";
-    const detail = (stderr || stdout || "(no output)").trim();
-    job.error = `codex exited with code ${code}: ${describeCodexResult(detail)}`;
-  } else if (!streamAcc.assistantText) {
-    job.status = "error";
-    job.error =
-      "codex produced no terminal assistant message. " +
-      `Received: ${describeCodexResult((stdout || "").trim() || "(empty stdout)")}`;
-  } else {
-    job.status = "completed";
-    job.usage = {
-      ...mapCodexUsage(streamAcc.usageEvent),
-      phase: job.phase,
-      durationSeconds: durationS(job),
-    };
-    writeJson(path.join(jobDir(stateDir, job.id), "usage.json"), job.usage);
-    const resolved = resolveCompletedResult({
-      backend: CODEX_BACKEND,
-      fetched: { ok: true, text: streamAcc.assistantText },
-      coords: { sessionId: job.sessionID },
-    });
-    resultText = resolved.text ?? streamAcc.assistantText;
-    if (opts.agent === REVIEW_AGENT) {
-      resultText = stripCodexOptionalNullsFromText(resultText);
-    }
-    job.result = resolved.record;
-    fs.writeFileSync(path.join(jobDir(stateDir, job.id), "result.md"), resultText, "utf8");
-  }
-
-  appendEvent(stateDir, job.id, {
-    type: "companion.codex.finished",
-    status: job.status,
-    sessionId: job.sessionID,
-    exitCode: code,
-    provenanceState: provenance.state,
-    assistantChars: streamAcc.assistantText.length,
-  });
-
-  // Record the closed terminal reason (kusabi #388).  codex finalizes its
-  // job.json on this path, so stamp here at the terminal write.
-  job.stopReason = deriveStopReason({ status: job.status, stats: job.stats });
-  saveJob(stateDir, job);
-
-  return { job, resultText, stateDir };
-  } finally {
-    progressWatch.stop();
-  }
 }
