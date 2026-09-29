@@ -4,7 +4,6 @@ import os from "node:os";
 import path from "node:path";
 import fs from "node:fs";
 import crypto from "node:crypto";
-import http from "node:http";
 import { spawn, spawnSync } from "node:child_process";
 import {
   PHASE_AGENTS,
@@ -40,6 +39,12 @@ import {
   writeChainControl,
 } from "./chain-control.mjs";
 import { writeJson, stateDirFor } from "./state-paths.mjs";
+import {
+  startSunabaStub,
+  startDetachStub,
+  runNodeAsync,
+  installFakeClaude,
+} from "./fixtures.mjs";
 
 
 /**
@@ -1621,71 +1626,9 @@ describe("chain-resume CLI", () => {
   // Async variant for tests that serve a stub endpoint: spawnSync would block
   // this process's event loop, so the stub could never answer the child.
   function runResumeAsync(args, { stateDir, cwd, env: extraEnv } = {}) {
-    return new Promise((resolve) => {
-      const child = spawn(process.execPath, [COMPANION_SCRIPT, "chain-resume", ...args], {
-        cwd,
-        env: resumeEnv(stateDir, extraEnv),
-      });
-      let stdout = "";
-      let stderr = "";
-      child.stdout.on("data", (chunk) => { stdout += chunk; });
-      child.stderr.on("data", (chunk) => { stderr += chunk; });
-      const timer = setTimeout(() => child.kill("SIGTERM"), 15_000);
-      child.on("close", (code) => {
-        clearTimeout(timer);
-        resolve({ status: code, stdout, stderr });
-      });
-    });
-  }
-
-  // A minimal sunaba MCP endpoint for the reachability tests. callTool does
-  // three POSTs to the same URL: initialize (must answer with the
-  // mcp-session-id response header), notifications/initialized, then
-  // tools/call (parsed as SSE, unwrapped from result.content[0].text as JSON).
-  // We answer every request with the session-id header, a 200, and one SSE
-  // data: line; tools/call carries the given tool result. Bound to port 0 so
-  // parallel runs do not collide.
-  function startSunabaStub({ toolResultText }) {
-    const server = http.createServer((req, res) => {
-      res.on("error", () => {});
-      let body = "";
-      req.on("data", (chunk) => { body += chunk; });
-      req.on("end", () => {
-        let payload = null;
-        try {
-          payload = JSON.parse(body);
-        } catch {
-          // not JSON — still answer the handshake
-        }
-        res.setHeader("mcp-session-id", "stub-session");
-        res.writeHead(200, { "content-type": "text/event-stream" });
-        let envelope;
-        if (payload?.method === "tools/call") {
-          envelope = {
-            jsonrpc: "2.0",
-            id: payload.id ?? 1,
-            result: { content: [{ type: "text", text: JSON.stringify(toolResultText) }] },
-          };
-        } else {
-          envelope = {
-            jsonrpc: "2.0",
-            id: payload?.id ?? 1,
-            result: {
-              protocolVersion: "2024-11-05",
-              capabilities: {},
-              serverInfo: { name: "kusabi-stub", version: "0.0.0" },
-            },
-          };
-        }
-        res.end(`data: ${JSON.stringify(envelope)}\n\n`);
-      });
-    });
-    return new Promise((resolve, reject) => {
-      server.once("error", reject);
-      server.listen(0, "127.0.0.1", () => {
-        const { port } = server.address();
-        resolve({ server, url: `http://127.0.0.1:${port}/mcp` });
-      });
+    return runNodeAsync(COMPANION_SCRIPT, ["chain-resume", ...args], {
+      cwd,
+      env: resumeEnv(stateDir, extraEnv),
     });
   }
 
@@ -1948,26 +1891,7 @@ describe("chain-resume CLI", () => {
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-resume-cli-"));
     // A fake claude that would record an invocation — its log must stay
     // empty, proving the guard fires before any dispatch.
-    const claudeArgsLog = path.join(tmp, "claude-args.ndjson");
-    fs.writeFileSync(claudeArgsLog, "", "utf8");
-    const claudeBinPath = path.join(tmp, "fake-claude.mjs");
-    fs.writeFileSync(
-      claudeBinPath,
-      "#!/usr/bin/env node\n" +
-      "import fs from \"node:fs\";\n" +
-      "fs.appendFileSync(process.env.FAKE_CLAUDE_ARGS_LOG, JSON.stringify(process.argv.slice(2)) + \"\\n\");\n" +
-      "process.stdout.write(JSON.stringify({ type: \"result\", is_error: false, result: \"ok\", session_id: \"claude-uuid-resume\" }));\n",
-      "utf8",
-    );
-    fs.chmodSync(claudeBinPath, 0o755);
-    const savedClaudeBin = process.env.CLAUDE_BIN;
-    const savedArgsLog = process.env.FAKE_CLAUDE_ARGS_LOG;
-    const savedMcpSource = process.env.KUSABI_CLAUDE_MCP_SOURCE;
-    process.env.CLAUDE_BIN = claudeBinPath;
-    process.env.FAKE_CLAUDE_ARGS_LOG = claudeArgsLog;
-    const mcpSource = path.join(tmp, "claude.json");
-    fs.writeFileSync(mcpSource, JSON.stringify({ mcpServers: { sunaba: { command: "npx" } } }), "utf8");
-    process.env.KUSABI_CLAUDE_MCP_SOURCE = mcpSource;
+    const { claudeArgsLog, restore } = installFakeClaude(tmp);
     try {
       const stateDir = hashedWorkspaceDir(path.join(tmp, "state"), tmp);
       const chainJson = validChainJson();
@@ -1998,12 +1922,7 @@ describe("chain-resume CLI", () => {
       assert.equal(control.status, "running");
       assert.equal(control.resumedAt, undefined);
     } finally {
-      if (savedClaudeBin === undefined) delete process.env.CLAUDE_BIN;
-      else process.env.CLAUDE_BIN = savedClaudeBin;
-      if (savedArgsLog === undefined) delete process.env.FAKE_CLAUDE_ARGS_LOG;
-      else process.env.FAKE_CLAUDE_ARGS_LOG = savedArgsLog;
-      if (savedMcpSource === undefined) delete process.env.KUSABI_CLAUDE_MCP_SOURCE;
-      else process.env.KUSABI_CLAUDE_MCP_SOURCE = savedMcpSource;
+      restore();
       server.close();
       server.closeAllConnections?.();
       fs.rmSync(tmp, { recursive: true, force: true });
@@ -2021,26 +1940,7 @@ describe("chain-resume CLI", () => {
       toolResultText: { output: " M src/foo.js\n" },
     });
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-resume-legacy-claude-"));
-    const claudeArgsLog = path.join(tmp, "claude-args.ndjson");
-    fs.writeFileSync(claudeArgsLog, "", "utf8");
-    const claudeBinPath = path.join(tmp, "fake-claude.mjs");
-    fs.writeFileSync(
-      claudeBinPath,
-      "#!/usr/bin/env node\n" +
-      "import fs from \"node:fs\";\n" +
-      "fs.appendFileSync(process.env.FAKE_CLAUDE_ARGS_LOG, JSON.stringify(process.argv.slice(2)) + \"\\n\");\n" +
-      "process.stdout.write(JSON.stringify({ type: \"result\", is_error: false, result: \"ok\", session_id: \"claude-uuid-resume\" }));\n",
-      "utf8",
-    );
-    fs.chmodSync(claudeBinPath, 0o755);
-    const savedClaudeBin = process.env.CLAUDE_BIN;
-    const savedArgsLog = process.env.FAKE_CLAUDE_ARGS_LOG;
-    const savedMcpSource = process.env.KUSABI_CLAUDE_MCP_SOURCE;
-    process.env.CLAUDE_BIN = claudeBinPath;
-    process.env.FAKE_CLAUDE_ARGS_LOG = claudeArgsLog;
-    const mcpSource = path.join(tmp, "claude.json");
-    fs.writeFileSync(mcpSource, JSON.stringify({ mcpServers: { sunaba: { command: "npx" } } }), "utf8");
-    process.env.KUSABI_CLAUDE_MCP_SOURCE = mcpSource;
+    const { claudeArgsLog, restore } = installFakeClaude(tmp);
     try {
       const stateDir = hashedWorkspaceDir(path.join(tmp, "state"), tmp);
       const chainJson = validChainJson();
@@ -2077,12 +1977,7 @@ describe("chain-resume CLI", () => {
           "resumed review must not re-derive from the chain's first route");
       }
     } finally {
-      if (savedClaudeBin === undefined) delete process.env.CLAUDE_BIN;
-      else process.env.CLAUDE_BIN = savedClaudeBin;
-      if (savedArgsLog === undefined) delete process.env.FAKE_CLAUDE_ARGS_LOG;
-      else process.env.FAKE_CLAUDE_ARGS_LOG = savedArgsLog;
-      if (savedMcpSource === undefined) delete process.env.KUSABI_CLAUDE_MCP_SOURCE;
-      else process.env.KUSABI_CLAUDE_MCP_SOURCE = savedMcpSource;
+      restore();
       server.close();
       server.closeAllConnections?.();
       fs.rmSync(tmp, { recursive: true, force: true });
@@ -2101,26 +1996,7 @@ describe("chain-resume CLI", () => {
       toolResultText: { output: " M src/foo.js\n" },
     });
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-resume-rework-cli-"));
-    const claudeArgsLog = path.join(tmp, "claude-args.ndjson");
-    fs.writeFileSync(claudeArgsLog, "", "utf8");
-    const claudeBinPath = path.join(tmp, "fake-claude.mjs");
-    fs.writeFileSync(
-      claudeBinPath,
-      "#!/usr/bin/env node\n" +
-      "import fs from \"node:fs\";\n" +
-      "fs.appendFileSync(process.env.FAKE_CLAUDE_ARGS_LOG, JSON.stringify(process.argv.slice(2)) + \"\\n\");\n" +
-      "process.stdout.write(JSON.stringify({ type: \"result\", is_error: false, result: \"ok\", session_id: \"claude-uuid-resume\" }));\n",
-      "utf8",
-    );
-    fs.chmodSync(claudeBinPath, 0o755);
-    const savedClaudeBin = process.env.CLAUDE_BIN;
-    const savedArgsLog = process.env.FAKE_CLAUDE_ARGS_LOG;
-    const savedMcpSource = process.env.KUSABI_CLAUDE_MCP_SOURCE;
-    process.env.CLAUDE_BIN = claudeBinPath;
-    process.env.FAKE_CLAUDE_ARGS_LOG = claudeArgsLog;
-    const mcpSource = path.join(tmp, "claude.json");
-    fs.writeFileSync(mcpSource, JSON.stringify({ mcpServers: { sunaba: { command: "npx" } } }), "utf8");
-    process.env.KUSABI_CLAUDE_MCP_SOURCE = mcpSource;
+    const { claudeArgsLog, restore } = installFakeClaude(tmp);
     try {
       const stateDir = hashedWorkspaceDir(path.join(tmp, "state"), tmp);
       const chainJson = {
@@ -2193,12 +2069,7 @@ describe("chain-resume CLI", () => {
       }
       assert.equal(result.status, 0, `resumed chain should complete: ${result.stdout} ${result.stderr}`);
     } finally {
-      if (savedClaudeBin === undefined) delete process.env.CLAUDE_BIN;
-      else process.env.CLAUDE_BIN = savedClaudeBin;
-      if (savedArgsLog === undefined) delete process.env.FAKE_CLAUDE_ARGS_LOG;
-      else process.env.FAKE_CLAUDE_ARGS_LOG = savedArgsLog;
-      if (savedMcpSource === undefined) delete process.env.KUSABI_CLAUDE_MCP_SOURCE;
-      else process.env.KUSABI_CLAUDE_MCP_SOURCE = savedMcpSource;
+      restore();
       server.close();
       server.closeAllConnections?.();
       fs.rmSync(tmp, { recursive: true, force: true });
@@ -4997,49 +4868,6 @@ describe("brief lint and container delivery (kusabi #289)", () => {
   });
 
   describe("cmdBaseline subcommand", () => {
-    function startSunabaStub({ toolResultText }) {
-      const server = http.createServer((req, res) => {
-        res.on("error", () => {});
-        let body = "";
-        req.on("data", (chunk) => { body += chunk; });
-        req.on("end", () => {
-          let payload = null;
-          try {
-            payload = JSON.parse(body);
-          } catch {
-            // not JSON — still answer the handshake
-          }
-          res.setHeader("mcp-session-id", "stub-session");
-          res.writeHead(200, { "content-type": "text/event-stream" });
-          let envelope;
-          if (payload?.method === "tools/call") {
-            envelope = {
-              jsonrpc: "2.0",
-              id: payload.id ?? 1,
-              result: { content: [{ type: "text", text: JSON.stringify(toolResultText) }] },
-            };
-          } else {
-            envelope = {
-              jsonrpc: "2.0",
-              id: payload?.id ?? 1,
-              result: {
-                protocolVersion: "2024-11-05",
-                capabilities: {},
-                serverInfo: { name: "kusabi-stub", version: "0.0.0" },
-              },
-            };
-          }
-          res.end(`data: ${JSON.stringify(envelope)}\n\n`);
-        });
-      });
-      return new Promise((resolve) => {
-        server.listen(0, "127.0.0.1", () => {
-          const addr = server.address();
-          resolve({ server, url: `http://127.0.0.1:${addr.port}/mcp` });
-        });
-      });
-    }
-
     function run(args, tmp) {
       const env = { ...process.env };
       delete env.KUSABI_WORKER_CONTEXT;
@@ -5392,72 +5220,6 @@ describe("help flags validation (kusabi #360)", () => {
 // (git status --porcelain), an unmoved HEAD (git rev-parse HEAD) and a smoke
 // command that exits 0 (SMOKE_EXIT=0).  Diagnostic tail reads fall through to
 // an empty output.
-function startDetachStub() {
-  const server = http.createServer((req, res) => {
-    res.on("error", () => {});
-    let body = "";
-    req.on("data", (chunk) => { body += chunk; });
-    req.on("end", () => {
-      let payload = null;
-      try {
-        payload = JSON.parse(body);
-      } catch {
-        // not JSON — still answer the handshake
-      }
-      res.setHeader("mcp-session-id", "stub-session");
-      res.writeHead(200, { "content-type": "text/event-stream" });
-      let resultText = { output: "" };
-      if (payload?.method === "tools/call") {
-        const args = payload.params?.arguments ?? {};
-        const cmd = (args.commands ?? [])[0] ?? "";
-        if (cmd === "git rev-parse HEAD") resultText = { output: "deadbeefcafe\n" };
-        else if (cmd.includes("SMOKE_EXIT=")) resultText = { output: "SMOKE_EXIT=0\n" };
-        else resultText = { output: "" };
-      }
-      const envelope =
-        payload?.method === "tools/call"
-          ? {
-              jsonrpc: "2.0",
-              id: payload.id ?? 1,
-              result: { content: [{ type: "text", text: JSON.stringify(resultText) }] },
-            }
-          : {
-              jsonrpc: "2.0",
-              id: payload?.id ?? 1,
-              result: {
-                protocolVersion: "2024-11-05",
-                capabilities: {},
-                serverInfo: { name: "kusabi-stub", version: "0.0.0" },
-              },
-            };
-      res.end(`data: ${JSON.stringify(envelope)}\n\n`);
-    });
-  });
-  return new Promise((resolve, reject) => {
-    server.once("error", reject);
-    server.listen(0, "127.0.0.1", () => {
-      const { port } = server.address();
-      resolve({ server, url: `http://127.0.0.1:${port}/mcp` });
-    });
-  });
-}
-
-// spawnSync would block the event loop, so the stub could never answer the
-// child: detach launches that need a live baseline answer run async.
-function runDetachAsync(script, args, { cwd, env } = {}) {
-  return new Promise((resolve) => {
-    const child = spawn(process.execPath, [script, ...args], { cwd, env });
-    let stdout = "";
-    let stderr = "";
-    child.stdout.on("data", (chunk) => { stdout += chunk; });
-    child.stderr.on("data", (chunk) => { stderr += chunk; });
-    const timer = setTimeout(() => child.kill("SIGTERM"), 15_000);
-    child.on("close", (code) => {
-      clearTimeout(timer);
-      resolve({ status: code, stdout, stderr });
-    });
-  });
-}
 
 describe("chain-detach CLI", () => {
   const COMPANION_SCRIPT = path.join(import.meta.dirname, "kusabi-companion.mjs");
@@ -5598,7 +5360,7 @@ setTimeout(() => {
       server = stub.server;
       env.KUSABI_SUNABA_URL = stub.url;
 
-      const res = await runDetachAsync(
+      const res = await runNodeAsync(
         COMPANION_SCRIPT,
         ["chain-detach", "--container", "cid-1", "--brief-file", briefPath, "--appear-timeout", "10"],
         { cwd: tmp, env },
@@ -5690,7 +5452,7 @@ setTimeout(() => {
       server = stub.server;
       env.KUSABI_SUNABA_URL = stub.url;
 
-      const res = await runDetachAsync(
+      const res = await runNodeAsync(
         COMPANION_SCRIPT,
         ["chain-detach", "--container", "cid-1", "--brief-file", briefPath, "--appear-timeout", "10"],
         { cwd: tmp, env },
@@ -5819,7 +5581,7 @@ fs.writeFileSync(path.join(jobDir, "job.json"), JSON.stringify({
       server = stub.server;
       env.KUSABI_SUNABA_URL = stub.url;
 
-      const res = await runDetachAsync(
+      const res = await runNodeAsync(
         COMPANION_SCRIPT,
         ["task-detach", "--phase", "review", "--container", "cid-1", "--brief-file", briefPath, "--appear-timeout", "10"],
         { cwd: tmp, env },

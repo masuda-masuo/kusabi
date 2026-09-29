@@ -1,3 +1,8 @@
+import http from "node:http";
+import { spawn } from "node:child_process";
+import fs from "node:fs";
+import path from "node:path";
+
 // Shared test fixtures for kusabi-companion modules.
 // NOT a test file - imported by *.test.mjs files.
 // This file is not discovered by node --test.
@@ -286,4 +291,163 @@ export function stubInvestigationSeams(overrides = {}) {
       gates,
     })),
   };
+}
+
+/**
+ * Start a lightweight MCP HTTP+SSE stub server for testing.
+ *
+ * Implements the minimal handshake and SSE response expected by MCP clients:
+ * - Emits mcp-session-id: stub-session header
+ * - Answers non-tools/call with protocolVersion: "2024-11-05" and kusabi-stub serverInfo
+ * - Answers tools/call by invoking onToolCall(params) and returning result.content[0].text
+ * - Listens on 127.0.0.1 port 0
+ *
+ * @param {object} [opts]
+ * @param {(params: any) => any} [opts.onToolCall]
+ * @returns {Promise<{ server: import("node:http").Server, url: string }>}
+ */
+export function startMcpStub({ onToolCall } = {}) {
+  const server = http.createServer((req, res) => {
+    res.on("error", () => {});
+    let body = "";
+    req.on("data", (chunk) => { body += chunk; });
+    req.on("end", () => {
+      let payload = null;
+      try {
+        payload = JSON.parse(body);
+      } catch {
+        // not JSON — still answer the handshake
+      }
+      res.setHeader("mcp-session-id", "stub-session");
+      res.writeHead(200, { "content-type": "text/event-stream" });
+      let envelope;
+      if (payload?.method === "tools/call") {
+        const toolResult = onToolCall ? onToolCall(payload.params) : { output: "" };
+        envelope = {
+          jsonrpc: "2.0",
+          id: payload.id ?? 1,
+          result: { content: [{ type: "text", text: JSON.stringify(toolResult) }] },
+        };
+      } else {
+        envelope = {
+          jsonrpc: "2.0",
+          id: payload?.id ?? 1,
+          result: {
+            protocolVersion: "2024-11-05",
+            capabilities: {},
+            serverInfo: { name: "kusabi-stub", version: "0.0.0" },
+          },
+        };
+      }
+      res.end(`data: ${JSON.stringify(envelope)}\n\n`);
+    });
+  });
+  return new Promise((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", () => {
+      const { port } = server.address();
+      resolve({ server, url: `http://127.0.0.1:${port}/mcp` });
+    });
+  });
+}
+
+/**
+ * Start a sunaba MCP stub server that answers tools/call with the given toolResultText.
+ *
+ * @param {object} [opts]
+ * @param {any} [opts.toolResultText]
+ * @returns {Promise<{ server: import("node:http").Server, url: string }>}
+ */
+export function startSunabaStub({ toolResultText } = {}) {
+  return startMcpStub({
+    onToolCall: () => toolResultText,
+  });
+}
+
+/**
+ * Start a detach smoke-baseline stub server (kusabi #513).
+ * Answers git rev-parse HEAD with deadbeefcafe, commands containing SMOKE_EXIT= with SMOKE_EXIT=0,
+ * and anything else with empty output.
+ *
+ * @returns {Promise<{ server: import("node:http").Server, url: string }>}
+ */
+export function startDetachStub() {
+  return startMcpStub({
+    onToolCall: (params) => {
+      const args = params?.arguments ?? {};
+      const cmd = (args.commands ?? [])[0] ?? "";
+      if (cmd === "git rev-parse HEAD") return { output: "deadbeefcafe\n" };
+      if (cmd.includes("SMOKE_EXIT=")) return { output: "SMOKE_EXIT=0\n" };
+      return { output: "" };
+    },
+  });
+}
+
+/**
+ * Run a Node script asynchronously with a kill timer, returning exit code, stdout, and stderr.
+ *
+ * @param {string} script
+ * @param {string[]} [args]
+ * @param {object} [opts]
+ * @param {string} [opts.cwd]
+ * @param {NodeJS.ProcessEnv} [opts.env]
+ * @param {number} [opts.killAfterMs=15000]
+ * @returns {Promise<{ status: number | null, stdout: string, stderr: string }>}
+ */
+export function runNodeAsync(script, args = [], { cwd, env, killAfterMs = 15_000 } = {}) {
+  return new Promise((resolve) => {
+    const child = spawn(process.execPath, [script, ...args], { cwd, env });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (chunk) => { stdout += chunk; });
+    child.stderr.on("data", (chunk) => { stderr += chunk; });
+    const timer = setTimeout(() => child.kill("SIGTERM"), killAfterMs);
+    child.on("close", (code) => {
+      clearTimeout(timer);
+      resolve({ status: code, stdout, stderr });
+    });
+  });
+}
+
+/**
+ * Install a fake claude CLI binary and MCP configuration in a directory, setting
+ * the CLAUDE_BIN, FAKE_CLAUDE_ARGS_LOG, and KUSABI_CLAUDE_MCP_SOURCE environment variables.
+ *
+ * @param {string} dir
+ * @returns {{ claudeArgsLog: string, restore: () => void }}
+ */
+export function installFakeClaude(dir) {
+  const claudeArgsLog = path.join(dir, "claude-args.ndjson");
+  fs.writeFileSync(claudeArgsLog, "", "utf8");
+  const claudeBinPath = path.join(dir, "fake-claude.mjs");
+  fs.writeFileSync(
+    claudeBinPath,
+    "#!/usr/bin/env node\n" +
+    "import fs from \"node:fs\";\n" +
+    "fs.appendFileSync(process.env.FAKE_CLAUDE_ARGS_LOG, JSON.stringify(process.argv.slice(2)) + \"\\n\");\n" +
+    "process.stdout.write(JSON.stringify({ type: \"result\", is_error: false, result: \"ok\", session_id: \"claude-uuid-resume\" }));\n",
+    "utf8",
+  );
+  fs.chmodSync(claudeBinPath, 0o755);
+
+  const savedClaudeBin = process.env.CLAUDE_BIN;
+  const savedArgsLog = process.env.FAKE_CLAUDE_ARGS_LOG;
+  const savedMcpSource = process.env.KUSABI_CLAUDE_MCP_SOURCE;
+
+  process.env.CLAUDE_BIN = claudeBinPath;
+  process.env.FAKE_CLAUDE_ARGS_LOG = claudeArgsLog;
+  const mcpSource = path.join(dir, "claude.json");
+  fs.writeFileSync(mcpSource, JSON.stringify({ mcpServers: { sunaba: { command: "npx" } } }), "utf8");
+  process.env.KUSABI_CLAUDE_MCP_SOURCE = mcpSource;
+
+  const restore = () => {
+    if (savedClaudeBin === undefined) delete process.env.CLAUDE_BIN;
+    else process.env.CLAUDE_BIN = savedClaudeBin;
+    if (savedArgsLog === undefined) delete process.env.FAKE_CLAUDE_ARGS_LOG;
+    else process.env.FAKE_CLAUDE_ARGS_LOG = savedArgsLog;
+    if (savedMcpSource === undefined) delete process.env.KUSABI_CLAUDE_MCP_SOURCE;
+    else process.env.KUSABI_CLAUDE_MCP_SOURCE = savedMcpSource;
+  };
+
+  return { claudeArgsLog, restore };
 }
