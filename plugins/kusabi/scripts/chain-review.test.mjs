@@ -27,6 +27,67 @@ import {
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const PLUGIN_ROOT = path.resolve(HERE, "..");
 
+// Hoisted shared test scaffolding (kusabi step 3 slice g)
+
+function makeReviewJob({
+  id = "review-job-1",
+  status = "completed",
+  modelEntry = "test-org/test-review-model",
+  modelVariant = null,
+  fallbacks = null,
+  usage = null,
+  error = null,
+  resultText = JSON.stringify({ verdict: "approve", findings: [] }),
+  ...jobOverrides
+} = {}) {
+  return {
+    job: {
+      id,
+      status,
+      modelEntry,
+      modelVariant,
+      fallbacks,
+      usage,
+      error,
+      ...jobOverrides,
+    },
+    resultText,
+  };
+}
+
+function fakeJob(id, resultText, extra = {}) {
+  return makeReviewJob({ id, resultText, ...extra });
+}
+
+function makeDispatch(results) {
+  const calls = [];
+  function stubbedDispatch(options) {
+    calls.push(options);
+    return results.shift();
+  }
+  return { stubbedDispatch, calls };
+}
+
+function runReview(opts = {}) {
+  return runReviewPhase({
+    container: "test",
+    brief: "test brief",
+    modelChain: ["test-org/test-flash", "test-org/test-pro"],
+    chainId: "test-chain",
+    cwd: process.cwd(),
+    previousRecord: null,
+    baseSha: "abc123",
+    chainStatusOutput: "",
+    chainBaseLog: "",
+    chainUntracked: "",
+    chainChangedPaths: [],
+    chainStatusObserved: false,
+    chainDeliverables: [],
+    flagsModel: null,
+    ...opts,
+  });
+}
+
 // =========================================================================
 // shouldSkipReview  —  pure, extracted from cmdChain (chain-phases.mjs -> chain-review.mjs)
 // =========================================================================
@@ -688,38 +749,16 @@ describe("parseReviewResult — JSONL review stream (kusabi #202)", () => {
 describe("runReviewPhase — stubbed dispatch route recording", () => {
   it("records reviewModelEntry and reviewModelVariant on the roundRecord", async () => {
     function stubbedDispatch() {
-      return {
-        job: {
-          id: "review-job-1",
-          status: "completed",
-          modelEntry: "test-org/test-review-model:variant",
-          modelVariant: "variant",
-          fallbacks: null,
-          usage: null,
-          error: null,
-        },
-        resultText: JSON.stringify({ verdict: "approve", findings: [] }),
-      };
+      return makeReviewJob({
+        modelEntry: "test-org/test-review-model:variant",
+        modelVariant: "variant",
+      });
     }
 
     const roundRecord = { round: 1 };
 
-    const result = await runReviewPhase({
-      container: "test",
-      brief: "test brief",
-      modelChain: ["test-org/test-flash", "test-org/test-pro"],
-      chainId: "test-chain",
-      cwd: process.cwd(),
-      previousRecord: null,
-      baseSha: "abc123",
-      chainStatusOutput: "",
-      chainBaseLog: "",
-      chainUntracked: "",
+    const result = await runReview({
       roundRecord,
-      chainChangedPaths: [],
-      chainStatusObserved: false,
-      chainDeliverables: [],
-      flagsModel: null,
       _dispatchWithFallback: stubbedDispatch,
     });
 
@@ -731,40 +770,21 @@ describe("runReviewPhase — stubbed dispatch route recording", () => {
 
   it("records reviewFallbacks when dispatch had fallbacks", async () => {
     function stubbedDispatch() {
-      return {
-        job: {
-          id: "review-job-2",
-          status: "completed",
-          modelEntry: "test-org/test-review-model",
-          modelVariant: null,
-          fallbacks: [
-            { from: "test-org/old-route", to: "test-org/test-review-model", reason: "capacity", attempt: 1, message: "busy" },
-          ],
-          usage: null,
-          error: null,
-        },
-        resultText: JSON.stringify({ verdict: "approve", findings: [] }),
-      };
+      return makeReviewJob({
+        id: "review-job-2",
+        fallbacks: [
+          { from: "test-org/old-route", to: "test-org/test-review-model", reason: "capacity", attempt: 1, message: "busy" },
+        ],
+      });
     }
 
     const roundRecord = { round: 1 };
 
-    await runReviewPhase({
-      container: "test",
-      brief: "test brief",
-      modelChain: ["test-org/test-flash", "test-org/test-pro"],
-      chainId: "test-chain",
-      cwd: process.cwd(),
-      previousRecord: null,
-      baseSha: "abc123",
-      chainStatusOutput: "",
-      chainBaseLog: "",
-      chainUntracked: "",
+    await runReview({
       roundRecord,
       chainChangedPaths: ["some/file"],
       chainStatusObserved: true,
       chainDeliverables: ["test/file"],
-      flagsModel: null,
       _dispatchWithFallback: stubbedDispatch,
     });
 
@@ -782,38 +802,13 @@ describe("runReviewPhase — stubbed dispatch route recording", () => {
     let seen = null;
     const stubbedDispatch = (opts) => {
       seen = opts;
-      return {
-        job: {
-          id: "review-job-3",
-          status: "completed",
-          modelEntry: "test-org/test-review-model",
-          modelVariant: null,
-          fallbacks: null,
-          usage: null,
-          error: null,
-        },
-        resultText: JSON.stringify({ verdict: "approve", findings: [] }),
-      };
+      return makeReviewJob({ id: "review-job-3" });
     };
 
     const roundRecord = { round: 1 };
 
-    await runReviewPhase({
-      container: "test",
-      brief: "test brief",
-      modelChain: ["test-org/test-flash", "test-org/test-pro"],
-      chainId: "test-chain",
-      cwd: process.cwd(),
-      previousRecord: null,
-      baseSha: "abc123",
-      chainStatusOutput: "",
-      chainBaseLog: "",
-      chainUntracked: "",
+    await runReview({
       roundRecord,
-      chainChangedPaths: [],
-      chainStatusObserved: false,
-      chainDeliverables: [],
-      flagsModel: null,
       _dispatchWithFallback: stubbedDispatch,
     });
 
@@ -827,40 +822,13 @@ describe("runReviewPhase — stubbed dispatch route recording", () => {
 
 describe("runReviewPhase fallback trail fidelity", () => {
   function dispatchReturning(fallbacks) {
-    return function stubbedDispatch() {
-      return {
-        job: {
-          id: "job-1",
-          status: "completed",
-          modelEntry: "test-org/test-review-model",
-          modelVariant: null,
-          fallbacks,
-          usage: null,
-          error: null,
-        },
-        resultText: JSON.stringify({ verdict: "approve", findings: [] }),
-      };
-    };
+    return () => makeReviewJob({ id: "job-1", fallbacks });
   }
 
   async function runWith(fallbacks) {
     const roundRecord = { round: 1 };
-    await runReviewPhase({
-      container: "test",
-      brief: "test brief",
-      modelChain: ["test-org/test-flash", "test-org/test-pro"],
-      chainId: "test-chain",
-      cwd: process.cwd(),
-      previousRecord: null,
-      baseSha: "abc123",
-      chainStatusOutput: "",
-      chainBaseLog: "",
-      chainUntracked: "",
+    await runReview({
       roundRecord,
-      chainChangedPaths: [],
-      chainStatusObserved: false,
-      chainDeliverables: [],
-      flagsModel: null,
       _dispatchWithFallback: dispatchReturning(fallbacks),
     });
     return roundRecord;
@@ -887,16 +855,11 @@ describe("runReviewPhase fallback trail fidelity", () => {
 
 describe("runReviewPhase — single result conduit (kusabi #100)", () => {
   function stubbedDispatch() {
-    return {
-      job: {
-        id: "job-1",
-        status: "completed",
-        modelEntry: "test-org/test-review-model:variant",
-        modelVariant: "variant",
-        fallbacks: null,
-        usage: { available: true, input: 3, output: 2, reasoning: 0, cacheRead: 0, cacheWrite: 0, cost: 0.001 },
-        error: null,
-      },
+    return makeReviewJob({
+      id: "job-1",
+      modelEntry: "test-org/test-review-model:variant",
+      modelVariant: "variant",
+      usage: { available: true, input: 3, output: 2, reasoning: 0, cacheRead: 0, cacheWrite: 0, cost: 0.001 },
       resultText: JSON.stringify({
         schema_version: 1,
         verdict: "needs-attention",
@@ -907,26 +870,12 @@ describe("runReviewPhase — single result conduit (kusabi #100)", () => {
         ],
         next_steps: [],
       }),
-    };
+    });
   }
 
   async function runPhase(roundRecord, extra = {}) {
-    return runReviewPhase({
-      container: "test",
-      brief: "test brief",
-      modelChain: ["test-org/test-flash", "test-org/test-pro"],
-      chainId: "test-chain",
-      cwd: process.cwd(),
-      previousRecord: null,
-      baseSha: "abc123",
-      chainStatusOutput: "",
-      chainBaseLog: "",
-      chainUntracked: "",
+    return runReview({
       roundRecord,
-      chainChangedPaths: [],
-      chainStatusObserved: false,
-      chainDeliverables: [],
-      flagsModel: null,
       _dispatchWithFallback: stubbedDispatch,
       ...extra,
     });
@@ -986,31 +935,6 @@ describe("runReviewPhase — single result conduit (kusabi #100)", () => {
 // ---------------------------------------------------------------------------
 
 describe("runReviewPhase — unparseable-output retry (issue #145)", () => {
-  function makeDispatch(results) {
-    const calls = [];
-    function stubbedDispatch(options) {
-      calls.push(options);
-      return results.shift();
-    }
-    return { stubbedDispatch, calls };
-  }
-
-  function fakeJob(id, resultText, extra = {}) {
-    return {
-      job: {
-        id,
-        status: "completed",
-        modelEntry: "test-org/test-review-model",
-        modelVariant: null,
-        fallbacks: null,
-        usage: null,
-        error: null,
-        ...extra,
-      },
-      resultText,
-    };
-  }
-
   const GARBAGE = "definitely not JSON and no VERDICT token here at all";
   const GARBAGE_WITH_TOKEN = "not JSON either\nVERDICT: needs-attention";
   const VALID = JSON.stringify({
@@ -1026,22 +950,8 @@ describe("runReviewPhase — unparseable-output retry (issue #145)", () => {
   async function runWith(results, extra = {}) {
     const { stubbedDispatch, calls } = makeDispatch(results);
     const roundRecord = { round: 1 };
-    const result = await runReviewPhase({
-      container: "test",
-      brief: "test brief",
-      modelChain: ["test-org/test-flash", "test-org/test-pro"],
-      chainId: "test-chain",
-      cwd: process.cwd(),
-      previousRecord: null,
-      baseSha: "abc123",
-      chainStatusOutput: "",
-      chainBaseLog: "",
-      chainUntracked: "",
+    const result = await runReview({
       roundRecord,
-      chainChangedPaths: [],
-      chainStatusObserved: false,
-      chainDeliverables: [],
-      flagsModel: null,
       _dispatchWithFallback: stubbedDispatch,
       ...extra,
     });
@@ -1223,25 +1133,6 @@ describe("runReviewPhase — unparseable-output retry (issue #145)", () => {
 // =========================================================================
 
 describe("runReviewPhase — partial JSONL review (kusabi #202)", () => {
-  function makeDispatch(results) {
-    const calls = [];
-    function stubbedDispatch(options) {
-      calls.push(options);
-      return results.shift();
-    }
-    return { stubbedDispatch, calls };
-  }
-
-  function fakeJob(id, resultText, extra = {}) {
-    return {
-      job: {
-        id, status: "completed", modelEntry: "test-org/test-review-model",
-        modelVariant: null, fallbacks: null, usage: null, error: null, ...extra,
-      },
-      resultText,
-    };
-  }
-
   const FINDING_1 = {
     type: "finding", severity: "high", kind: "design", title: "Unbounded retry",
     body: "b", file: "src/a.mjs", line_start: 12, line_end: 18,
@@ -1270,14 +1161,10 @@ describe("runReviewPhase — partial JSONL review (kusabi #202)", () => {
   async function runWith(results, extra = {}) {
     const { stubbedDispatch, calls } = makeDispatch(results);
     const roundRecord = { round: 1 };
-    const result = await runReviewPhase({
-      container: "test", brief: "test brief",
-      modelChain: ["test-org/test-flash", "test-org/test-pro"],
-      chainId: "test-chain", cwd: process.cwd(), previousRecord: null,
-      baseSha: "abc123", chainStatusOutput: "", chainBaseLog: "",
-      chainUntracked: "", roundRecord, chainChangedPaths: [],
-      chainStatusObserved: false, chainDeliverables: [], flagsModel: null,
-      _dispatchWithFallback: stubbedDispatch, ...extra,
+    const result = await runReview({
+      roundRecord,
+      _dispatchWithFallback: stubbedDispatch,
+      ...extra,
     });
     return { result, roundRecord, calls };
   }
@@ -1437,18 +1324,17 @@ describe("chain review prompt byte-identity", () => {
     let captured = null;
     function stubbedDispatch(opts) {
       captured = opts.promptText;
-      return {
-        job: { id: "review-golden", status: "completed", modelEntry: "m", modelVariant: null, fallbacks: null, usage: null, error: null },
+      return makeReviewJob({
+        id: "review-golden",
+        modelEntry: "m",
         resultText: JSON.stringify({ schema_version: 1, verdict: "approve", summary: "ok", findings: [], next_steps: [] }),
-      };
+      });
     }
-    await runReviewPhase({
+    await runReview({
       container: "cafe1234beef",
       brief: "GOLDEN BRIEF TEXT",
       modelChain: ["test-org/test-flash"],
       chainId: "chain-golden",
-      cwd: process.cwd(),
-      previousRecord: null,
       baseSha: "0123456789abcdef",
       chainStatusOutput: " M src/foo.js\n?? src/new.js\n",
       chainBaseLog: "abc1234 first\ndef5678 second\n",
@@ -1457,7 +1343,6 @@ describe("chain review prompt byte-identity", () => {
       chainChangedPaths: ["src/foo.js"],
       chainStatusObserved: true,
       chainDeliverables: ["src/foo.js"],
-      flagsModel: null,
       _dispatchWithFallback: stubbedDispatch,
     });
     return captured;
@@ -1539,27 +1424,24 @@ describe("runReviewPhase — {{PROBE_REPORT}} slot (kusabi #236)", () => {
     let captured = null;
     function stubbedDispatch(opts) {
       captured = opts.promptText;
-      return {
-        job: { id: "job-probes", status: "completed", modelEntry: "m", modelVariant: null, fallbacks: null, usage: null, error: null },
+      return makeReviewJob({
+        id: "job-probes",
+        modelEntry: "m",
         resultText: JSON.stringify({ schema_version: 1, verdict: "approve", summary: "ok", findings: [], next_steps: [] }),
-      };
+      });
     }
-    await runReviewPhase({
+    await runReview({
       container: "cafe1234beef",
       brief: "GOLDEN BRIEF TEXT",
       modelChain: ["test-org/test-flash"],
       chainId: "chain-probes",
-      cwd: process.cwd(),
-      previousRecord: null,
       baseSha: "0123456789abcdef",
       chainStatusOutput: " M src/foo.js\n",
       chainBaseLog: "abc1234 first\n",
-      chainUntracked: "",
       roundRecord,
       chainChangedPaths: ["src/foo.js"],
       chainStatusObserved: true,
       chainDeliverables: ["src/foo.js"],
-      flagsModel: null,
       _dispatchWithFallback: stubbedDispatch,
     });
     return captured;
@@ -1648,30 +1530,28 @@ describe("runReviewPhase — scope-aware prior findings (kusabi #334)", () => {
     }));
     function stubbedDispatch(opts) {
       captured = opts.promptText;
-      return {
-        job: { id: "job-scope", status: "completed", modelEntry: "m", modelVariant: null, fallbacks: null, usage: null, error: null },
+      return makeReviewJob({
+        id: "job-scope",
+        modelEntry: "m",
         resultText: JSON.stringify({ schema_version: 1, verdict: "approve", summary: "ok", findings: fullFindings, next_steps: [] }),
-      };
+      });
     }
     const roundRecord = { round: 2 };
-    const result = await runReviewPhase({
+    const result = await runReview({
       container: "cafe1234beef",
       brief: "BRIEF",
       modelChain: ["test-org/test-flash"],
       chainId: "chain-scope",
-      cwd: process.cwd(),
       previousRecord,
       reworkScope,
       baseSha: "0123456789abcdef",
       chainStatusOutput: " M src/foo.js\n",
       chainBaseLog: "abc1234 first\n",
-      chainUntracked: "",
       roundRecord,
       chainChangedPaths: ["src/foo.js"],
       chainNewlyChanged: ["src/foo.js"],
       chainStatusObserved: true,
       chainDeliverables: ["src/foo.js"],
-      flagsModel: null,
       _dispatchWithFallback: stubbedDispatch,
     });
     return { prompt: captured, result };
@@ -1912,31 +1792,8 @@ describe("buildReviewRepairPrompt (kusabi #395)", () => {
 });
 
 describe("runReviewPhase — schema-invalid repair loop (kusabi #395)", () => {
-  function makeDispatch(results) {
-    const calls = [];
-    function stubbedDispatch(options) {
-      calls.push(options);
-      return results.shift();
-    }
-    return { stubbedDispatch, calls };
-  }
-
-  function fakeJob(id, resultText, extra = {}) {
-    return {
-      job: {
-        id,
-        status: "completed",
-        sessionID: "session-" + id,
-        modelEntry: "test-org/test-review-model",
-        modelVariant: null,
-        fallbacks: null,
-        usage: null,
-        error: null,
-        ...extra,
-      },
-      resultText,
-    };
-  }
+  const fakeJob = (id, resultText, extra = {}) =>
+    makeReviewJob({ id, sessionID: "session-" + id, resultText, ...extra });
 
   const SCHEMA_INVALID_MISSING_VERSION = JSON.stringify({
     verdict: "needs-attention",
@@ -1972,22 +1829,9 @@ describe("runReviewPhase — schema-invalid repair loop (kusabi #395)", () => {
     const { stubbedDispatch, calls } = makeDispatch(results);
     const roundRecord = { round: 1 };
     const tempDir = customStateDir || fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-repair-test-"));
-    const result = await runReviewPhase({
-      container: "test",
-      brief: "test brief",
-      modelChain: ["test-org/test-flash", "test-org/test-pro"],
-      chainId: "test-chain",
+    const result = await runReview({
       cwd: tempDir,
-      previousRecord: null,
-      baseSha: "abc123",
-      chainStatusOutput: "",
-      chainBaseLog: "",
-      chainUntracked: "",
       roundRecord,
-      chainChangedPaths: [],
-      chainStatusObserved: false,
-      chainDeliverables: [],
-      flagsModel: null,
       _dispatchWithFallback: stubbedDispatch,
       ...extra,
     });

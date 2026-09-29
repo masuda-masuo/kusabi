@@ -17,6 +17,27 @@ import { deriveDisposition } from "./disposition.mjs";
 
 const PLUGIN_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
+// Hoisted shared test scaffolding (kusabi step 3 slice g)
+
+function makeStubDispatch({ idPrefix = "claude-uuid-", jobOverrides = {} } = {}) {
+  const calls = [];
+  const dispatch = async (opts) => {
+    calls.push(opts);
+    return {
+      job: {
+        id: "job-imp-" + (opts.round ?? 1), status: "completed", modelEntry: "opus",
+        modelVariant: null, fallbacks: null,
+        sessionID: opts.session ?? (idPrefix + (opts.round ?? 1)),
+        usage: { available: true, input: 1, output: 1, reasoning: 0, cacheRead: 0, cacheWrite: 0, cost: 0.01 },
+        error: null,
+        ...jobOverrides,
+      },
+      resultText: "implemented",
+    };
+  };
+  return { dispatch, calls };
+}
+
 // =========================================================================
 // Source guards (kusabi #447)
 // =========================================================================
@@ -304,6 +325,13 @@ describe("phase functions carry the failure classification — runImplementPhase
     reset: "1:20am (Asia/Tokyo)",
   };
 
+  const base = {
+    cwd: "/tmp", chainId: "chain-test", round: 1, isFirstRound: true,
+    implementText: "brief", modelChain: [["opus"]], tierIndex: 0,
+    useNewSession: false, session: undefined, resumeMethod: { type: "fresh_session" },
+    flagsModel: null, backend: "claude",
+  };
+
   function failingDispatch(status, failure) {
     return async () => ({
       job: {
@@ -318,10 +346,7 @@ describe("phase functions carry the failure classification — runImplementPhase
 
   it("runImplementPhase returns implementJobFailure from the failed job's record", async () => {
     const result = await runImplementPhase({
-      cwd: "/tmp", chainId: "chain-test", round: 1, isFirstRound: true,
-      implementText: "brief", modelChain: [["opus"]], tierIndex: 0,
-      useNewSession: false, session: undefined, resumeMethod: { type: "fresh_session" },
-      flagsModel: null, backend: "claude",
+      ...base,
       _dispatchWithFallback: failingDispatch("provider-error", QUOTA_FAILURE),
     });
     assert.deepEqual(result.implementJobFailure, QUOTA_FAILURE);
@@ -330,10 +355,7 @@ describe("phase functions carry the failure classification — runImplementPhase
 
   it("runImplementPhase returns null implementJobFailure for a generic failure", async () => {
     const result = await runImplementPhase({
-      cwd: "/tmp", chainId: "chain-test", round: 1, isFirstRound: true,
-      implementText: "brief", modelChain: [["opus"]], tierIndex: 0,
-      useNewSession: false, session: undefined, resumeMethod: { type: "fresh_session" },
-      flagsModel: null, backend: "claude",
+      ...base,
       _dispatchWithFallback: failingDispatch("error", null),
     });
     assert.equal(result.implementJobFailure, null);
@@ -343,10 +365,9 @@ describe("phase functions carry the failure classification — runImplementPhase
   it("runImplementPhase classifies an agy quota error as implementJobFailure", async () => {
     const agyError = "agy dispatch failed: Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 1h1m21s.";
     const result = await runImplementPhase({
-      cwd: "/tmp", chainId: "chain-test", round: 1, isFirstRound: true,
-      implementText: "brief", modelChain: [["gemini-3.6-flash-high"]], tierIndex: 0,
-      useNewSession: false, session: undefined, resumeMethod: { type: "fresh_session" },
-      flagsModel: null, backend: "agy",
+      ...base,
+      modelChain: [["gemini-3.6-flash-high"]],
+      backend: "agy",
       _dispatchWithFallback: async () => ({
         job: {
           id: "job-fail", status: "error", modelEntry: "gemini-3.6-flash-high",
@@ -580,23 +601,6 @@ describe("runProbePhase return value", () => {
 // =========================================================================
 
 describe("runImplementPhase session lineage guard (kusabi #192)", () => {
-  function makeStubDispatch() {
-    const calls = [];
-    const dispatch = async (opts) => {
-      calls.push(opts);
-      return {
-        job: {
-          id: "job-imp", status: "completed", modelEntry: "opus",
-          modelVariant: null, fallbacks: null, sessionID: "claude-uuid-new",
-          usage: { available: true, input: 1, output: 1, reasoning: 0, cacheRead: 0, cacheWrite: 0, cost: 0.01 },
-          error: null,
-        },
-        resultText: "implemented",
-      };
-    };
-    return { dispatch, calls };
-  }
-
   const base = {
     cwd: "/tmp", chainId: "chain-test", round: 2, isFirstRound: false,
     implementText: "brief", modelChain: [["opus"]], tierIndex: 0,
@@ -675,29 +679,6 @@ describe("runImplementPhase session lineage guard (kusabi #192)", () => {
 // =========================================================================
 
 describe("runImplementPhase round-to-round session hand-off (kusabi #320/#323)", () => {
-  // A realistic stub: a dispatch that RESUMES echoes the session it was
-  // given (job.sessionID === opts.session), a dispatch that starts fresh
-  // creates a new id (`idPrefix` + round).  Every backend stamps the job
-  // with the session it actually used or created.
-  function makeStubDispatch({ idPrefix = "claude-uuid-", jobOverrides = {} } = {}) {
-    const calls = [];
-    const dispatch = async (opts) => {
-      calls.push(opts);
-      return {
-        job: {
-          id: "job-imp-" + (opts.round ?? 1), status: "completed", modelEntry: "opus",
-          modelVariant: null, fallbacks: null,
-          sessionID: opts.session ?? (idPrefix + (opts.round ?? 1)),
-          usage: { available: true, input: 1, output: 1, reasoning: 0, cacheRead: 0, cacheWrite: 0, cost: 0.01 },
-          error: null,
-          ...jobOverrides,
-        },
-        resultText: "implemented",
-      };
-    };
-    return { dispatch, calls };
-  }
-
   const base = {
     cwd: "/tmp", chainId: "chain-test", round: 2, isFirstRound: false,
     implementText: "brief", modelChain: [["opus"]], tierIndex: 0,
@@ -917,29 +898,6 @@ describe("runImplementPhase round-to-round session hand-off (kusabi #320/#323)",
 // =========================================================================
 
 describe("runImplementPhase carry prefers the observed session id (kusabi #324)", () => {
-  // Same realistic stub as the #320/#323 block: a resuming dispatch echoes
-  // the session it was given (job.sessionID === opts.session) unless a
-  // jobOverrides.sessionID forces the job to record a DIFFERENT id -- the
-  // divergence agy exhibits in the wild.
-  function makeStubDispatch({ idPrefix = "claude-uuid-", jobOverrides = {} } = {}) {
-    const calls = [];
-    const dispatch = async (opts) => {
-      calls.push(opts);
-      return {
-        job: {
-          id: "job-imp-" + (opts.round ?? 1), status: "completed", modelEntry: "opus",
-          modelVariant: null, fallbacks: null,
-          sessionID: opts.session ?? (idPrefix + (opts.round ?? 1)),
-          usage: { available: true, input: 1, output: 1, reasoning: 0, cacheRead: 0, cacheWrite: 0, cost: 0.01 },
-          error: null,
-          ...jobOverrides,
-        },
-        resultText: "implemented",
-      };
-    };
-    return { dispatch, calls };
-  }
-
   const base = {
     cwd: "/tmp", chainId: "chain-test", round: 2, isFirstRound: false,
     implementText: "brief", modelChain: [["opus"]], tierIndex: 0,
