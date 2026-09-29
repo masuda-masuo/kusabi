@@ -23,6 +23,7 @@ import { codexDispatch } from "./codex-dispatch.mjs";
 import { processStartToken, stopRecordedProcess, readProcessStat } from "./process-identity.mjs";
 import { listJobs } from "./job-store.mjs";
 import { stateDirFor } from "./state-paths.mjs";
+import { patchEnv } from "./fixtures.mjs";
 
 async function waitForRunningJob(stateDir, timeoutMs = 5000) {
   const deadline = Date.now() + timeoutMs;
@@ -53,12 +54,10 @@ setTimeout(() => { process.exit(0); }, 30000);
 `;
   fs.writeFileSync(binPath, script, { encoding: "utf8", mode: 0o755 });
 
-  const savedEnv = {
-    AGY_BIN: process.env.AGY_BIN,
-    KUSABI_STATE_DIR: process.env.KUSABI_STATE_DIR,
-  };
-  process.env.AGY_BIN = binPath;
-  process.env.KUSABI_STATE_DIR = stateRoot;
+  const restoreEnv = patchEnv({
+    AGY_BIN: binPath,
+    KUSABI_STATE_DIR: stateRoot,
+  });
 
   const stateDir = stateDirFor(cwd);
 
@@ -81,10 +80,7 @@ setTimeout(() => { process.exit(0); }, 30000);
       explicitModel: null,
     },
     cleanup() {
-      for (const [k, v] of Object.entries(savedEnv)) {
-        if (v === undefined) delete process.env[k];
-        else process.env[k] = v;
-      }
+      restoreEnv();
       fs.rmSync(tmp, { recursive: true, force: true });
     },
   };
@@ -113,14 +109,11 @@ setTimeout(() => { process.exit(0); }, 30000);
 `;
   fs.writeFileSync(binPath, script, { encoding: "utf8", mode: 0o755 });
 
-  const savedEnv = {
-    CURSOR_BIN: process.env.CURSOR_BIN,
-    KUSABI_STATE_DIR: process.env.KUSABI_STATE_DIR,
-    HOME: process.env.HOME,
-  };
-  process.env.CURSOR_BIN = binPath;
-  process.env.KUSABI_STATE_DIR = stateRoot;
-  process.env.HOME = fakeHome;
+  const restoreEnv = patchEnv({
+    CURSOR_BIN: binPath,
+    KUSABI_STATE_DIR: stateRoot,
+    HOME: fakeHome,
+  });
 
   const stateDir = stateDirFor(cwd);
 
@@ -143,10 +136,7 @@ setTimeout(() => { process.exit(0); }, 30000);
       explicitModel: null,
     },
     cleanup() {
-      for (const [k, v] of Object.entries(savedEnv)) {
-        if (v === undefined) delete process.env[k];
-        else process.env[k] = v;
-      }
+      restoreEnv();
       fs.rmSync(tmp, { recursive: true, force: true });
     },
   };
@@ -198,16 +188,12 @@ setTimeout(() => { process.exit(0); }, 30000);
 `;
   fs.writeFileSync(binPath, script, { encoding: "utf8", mode: 0o755 });
 
-  const savedEnv = {
-    CODEX_BIN: process.env.CODEX_BIN,
-    KUSABI_STATE_DIR: process.env.KUSABI_STATE_DIR,
-    HOME: process.env.HOME,
-    CODEX_HOME: process.env.CODEX_HOME,
-  };
-  process.env.CODEX_BIN = binPath;
-  process.env.KUSABI_STATE_DIR = stateRoot;
-  process.env.HOME = fakeHome;
-  process.env.CODEX_HOME = operatorCodexHome;
+  const restoreEnv = patchEnv({
+    CODEX_BIN: binPath,
+    KUSABI_STATE_DIR: stateRoot,
+    HOME: fakeHome,
+    CODEX_HOME: operatorCodexHome,
+  });
 
   const stateDir = stateDirFor(cwd);
 
@@ -230,10 +216,7 @@ setTimeout(() => { process.exit(0); }, 30000);
       explicitModel: model,
     },
     cleanup() {
-      for (const [k, v] of Object.entries(savedEnv)) {
-        if (v === undefined) delete process.env[k];
-        else process.env[k] = v;
-      }
+      restoreEnv();
       fs.rmSync(tmp, { recursive: true, force: true });
     },
   };

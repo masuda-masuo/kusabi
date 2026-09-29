@@ -19,6 +19,7 @@ import path from "node:path";
 import fs from "node:fs";
 import { spawnSync } from "node:child_process";
 import { DatabaseSync } from "node:sqlite";
+import { patchEnv } from "./fixtures.mjs";
 
 import {
   AGY_DEFAULT_CHAIN,
@@ -1845,20 +1846,14 @@ function fakeAgyContext(mode = "ok") {
   const cwd = path.join(tmp, "cwd");
   fs.mkdirSync(cwd, { recursive: true });
 
-  const saved = {
-    AGY_BIN: process.env.AGY_BIN,
-    KUSABI_STATE_DIR: process.env.KUSABI_STATE_DIR,
-    FAKE_AGY_MODE: process.env.FAKE_AGY_MODE,
-    FAKE_AGY_ARGS_LOG: process.env.FAKE_AGY_ARGS_LOG,
-    FAKE_AGY_PIDS: process.env.FAKE_AGY_PIDS,
-    FAKE_AGY_HOME_LOG: process.env.FAKE_AGY_HOME_LOG,
-  };
-  process.env.AGY_BIN = binPath;
-  process.env.KUSABI_STATE_DIR = stateRoot;
-  process.env.FAKE_AGY_MODE = mode;
-  process.env.FAKE_AGY_ARGS_LOG = argsLog;
-  process.env.FAKE_AGY_PIDS = pidsLog;
-  process.env.FAKE_AGY_HOME_LOG = homeLog;
+  const restoreEnv = patchEnv({
+    AGY_BIN: binPath,
+    KUSABI_STATE_DIR: stateRoot,
+    FAKE_AGY_MODE: mode,
+    FAKE_AGY_ARGS_LOG: argsLog,
+    FAKE_AGY_PIDS: pidsLog,
+    FAKE_AGY_HOME_LOG: homeLog,
+  });
 
   const stateDir = stateDirFor(cwd);
   return {
@@ -1890,10 +1885,7 @@ function fakeAgyContext(mode = "ok") {
       };
     },
     restore() {
-      for (const [key, value] of Object.entries(saved)) {
-        if (value === undefined) delete process.env[key];
-        else process.env[key] = value;
-      }
+      restoreEnv();
       fs.rmSync(tmp, { recursive: true, force: true });
     },
   };

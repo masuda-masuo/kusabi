@@ -11,6 +11,7 @@ import assert from "node:assert/strict";
 import os from "node:os";
 import path from "node:path";
 import fs from "node:fs";
+import { patchEnv } from "./fixtures.mjs";
 
 import {
   CURSOR_BACKEND,
@@ -134,20 +135,14 @@ function fakeCursorContext() {
   fs.mkdirSync(cwd, { recursive: true });
   fs.mkdirSync(fakeHome, { recursive: true });
 
-  const saved = {
-    CURSOR_BIN: process.env.CURSOR_BIN,
-    KUSABI_STATE_DIR: process.env.KUSABI_STATE_DIR,
-    FAKE_CURSOR_MODE: process.env.FAKE_CURSOR_MODE,
-    FAKE_CURSOR_ARGS_LOG: process.env.FAKE_CURSOR_ARGS_LOG,
-    FAKE_CURSOR_STDIN_LOG: process.env.FAKE_CURSOR_STDIN_LOG,
-    HOME: process.env.HOME,
-  };
-  process.env.CURSOR_BIN = binPath;
-  process.env.KUSABI_STATE_DIR = stateRoot;
-  process.env.FAKE_CURSOR_MODE = "ok";
-  process.env.FAKE_CURSOR_ARGS_LOG = argsLog;
-  process.env.FAKE_CURSOR_STDIN_LOG = stdinLog;
-  process.env.HOME = fakeHome;
+  const restoreEnv = patchEnv({
+    CURSOR_BIN: binPath,
+    KUSABI_STATE_DIR: stateRoot,
+    FAKE_CURSOR_MODE: "ok",
+    FAKE_CURSOR_ARGS_LOG: argsLog,
+    FAKE_CURSOR_STDIN_LOG: stdinLog,
+    HOME: fakeHome,
+  });
 
   const stateDir = stateDirFor(cwd);
   return {
@@ -176,10 +171,7 @@ function fakeCursorContext() {
       };
     },
     restore() {
-      for (const [key, value] of Object.entries(saved)) {
-        if (value === undefined) delete process.env[key];
-        else process.env[key] = value;
-      }
+      restoreEnv();
       fs.rmSync(tmp, { recursive: true, force: true });
     },
   };

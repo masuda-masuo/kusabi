@@ -16,6 +16,7 @@ import assert from "node:assert/strict";
 import os from "node:os";
 import path from "node:path";
 import fs from "node:fs";
+import { patchEnv } from "./fixtures.mjs";
 
 import {
   CODEX_BACKEND,
@@ -261,24 +262,16 @@ function fakeCodexContext({ model = MODEL, thread = THREAD_ID, mismatchModel = O
   fs.mkdirSync(fakeHome, { recursive: true });
   fs.mkdirSync(operatorCodexHome, { recursive: true });
 
-  const saved = {
-    CODEX_BIN: process.env.CODEX_BIN,
-    KUSABI_STATE_DIR: process.env.KUSABI_STATE_DIR,
-    FAKE_CODEX_MODE: process.env.FAKE_CODEX_MODE,
-    FAKE_CODEX_ARGS_LOG: process.env.FAKE_CODEX_ARGS_LOG,
-    FAKE_CODEX_ENV_LOG: process.env.FAKE_CODEX_ENV_LOG,
-    FAKE_CODEX_STDIN_LOG: process.env.FAKE_CODEX_STDIN_LOG,
-    HOME: process.env.HOME,
-    CODEX_HOME: process.env.CODEX_HOME,
-  };
-  process.env.CODEX_BIN = binPath;
-  process.env.KUSABI_STATE_DIR = stateRoot;
-  process.env.FAKE_CODEX_MODE = "ok";
-  process.env.FAKE_CODEX_ARGS_LOG = argsLog;
-  process.env.FAKE_CODEX_ENV_LOG = envLog;
-  process.env.FAKE_CODEX_STDIN_LOG = stdinLog;
-  process.env.HOME = fakeHome;
-  process.env.CODEX_HOME = operatorCodexHome;
+  const restoreEnv = patchEnv({
+    CODEX_BIN: binPath,
+    KUSABI_STATE_DIR: stateRoot,
+    FAKE_CODEX_MODE: "ok",
+    FAKE_CODEX_ARGS_LOG: argsLog,
+    FAKE_CODEX_ENV_LOG: envLog,
+    FAKE_CODEX_STDIN_LOG: stdinLog,
+    HOME: fakeHome,
+    CODEX_HOME: operatorCodexHome,
+  });
 
   const stateDir = stateDirFor(cwd);
   return {
@@ -309,10 +302,7 @@ function fakeCodexContext({ model = MODEL, thread = THREAD_ID, mismatchModel = O
       };
     },
     restore() {
-      for (const [key, value] of Object.entries(saved)) {
-        if (value === undefined) delete process.env[key];
-        else process.env[key] = value;
-      }
+      restoreEnv();
       fs.rmSync(tmp, { recursive: true, force: true });
     },
   };

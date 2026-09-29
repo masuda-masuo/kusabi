@@ -11,6 +11,7 @@ import { PHASE_AGENTS } from "./companion-config.mjs";
 import { codexDispatch } from "./codex-dispatch.mjs";
 import { stateDirFor } from "./state-paths.mjs";
 import { loadJob } from "./job-store.mjs";
+import { patchEnv } from "./fixtures.mjs";
 
 // ---------------------------------------------------------------------------
 // Pure exported checker
@@ -824,16 +825,12 @@ function seatDispatchContext() {
   const cwd = path.join(tmp, "cwd");
   fs.mkdirSync(cwd, { recursive: true });
 
-  const saved = {
-    CODEX_BIN: process.env.CODEX_BIN,
-    KUSABI_STATE_DIR: process.env.KUSABI_STATE_DIR,
-    HOME: process.env.HOME,
-    CODEX_HOME: process.env.CODEX_HOME,
-  };
-  process.env.CODEX_BIN = binPath;
-  process.env.KUSABI_STATE_DIR = stateRoot;
-  process.env.HOME = path.join(tmp, "home");
-  process.env.CODEX_HOME = path.join(tmp, "operator-codex-home");
+  const restoreEnv = patchEnv({
+    CODEX_BIN: binPath,
+    KUSABI_STATE_DIR: stateRoot,
+    HOME: path.join(tmp, "home"),
+    CODEX_HOME: path.join(tmp, "operator-codex-home"),
+  });
 
   const stateDir = stateDirFor(cwd);
   return {
@@ -858,10 +855,7 @@ function seatDispatchContext() {
       };
     },
     restore() {
-      for (const [key, value] of Object.entries(saved)) {
-        if (value === undefined) delete process.env[key];
-        else process.env[key] = value;
-      }
+      restoreEnv();
       fs.rmSync(tmp, { recursive: true, force: true });
     },
   };

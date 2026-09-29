@@ -27,6 +27,7 @@ import { claudeDispatch, claudeFinalMessage } from "./claude-dispatch.mjs";
 import { extractJson } from "./render.mjs";
 import { loadJob, jobDir } from "./job-store.mjs";
 import { stateDirFor } from "./state-paths.mjs";
+import { patchEnv } from "./fixtures.mjs";
 
 // =========================================================================
 // fixtures — opencode event stream
@@ -659,19 +660,14 @@ function claudeContext() {
   const projects = path.join(tmp, "projects", "-home-masuda-kusabi");
   fs.mkdirSync(projects, { recursive: true });
 
-  const saved = {
-    CLAUDE_BIN: process.env.CLAUDE_BIN,
-    KUSABI_STATE_DIR: process.env.KUSABI_STATE_DIR,
-    KUSABI_CLAUDE_MCP_SOURCE: process.env.KUSABI_CLAUDE_MCP_SOURCE,
-    KUSABI_CLAUDE_PROJECTS_DIR: process.env.KUSABI_CLAUDE_PROJECTS_DIR,
+  const restoreEnv = patchEnv({
+    CLAUDE_BIN: binPath,
+    KUSABI_STATE_DIR: path.join(tmp, "state"),
+    KUSABI_CLAUDE_MCP_SOURCE: mcpSource,
+    KUSABI_CLAUDE_PROJECTS_DIR: path.join(tmp, "projects"),
     FAKE_CLAUDE_RESULT: process.env.FAKE_CLAUDE_RESULT,
-    FAKE_CLAUDE_SESSION: process.env.FAKE_CLAUDE_SESSION,
-  };
-  process.env.CLAUDE_BIN = binPath;
-  process.env.KUSABI_STATE_DIR = path.join(tmp, "state");
-  process.env.KUSABI_CLAUDE_MCP_SOURCE = mcpSource;
-  process.env.KUSABI_CLAUDE_PROJECTS_DIR = path.join(tmp, "projects");
-  process.env.FAKE_CLAUDE_SESSION = "sess-recovered-1";
+    FAKE_CLAUDE_SESSION: "sess-recovered-1",
+  });
 
   return {
     tmp,
@@ -705,10 +701,7 @@ function claudeContext() {
       };
     },
     restore() {
-      for (const [key, value] of Object.entries(saved)) {
-        if (value === undefined) delete process.env[key];
-        else process.env[key] = value;
-      }
+      restoreEnv();
       fs.rmSync(tmp, { recursive: true, force: true });
     },
   };
