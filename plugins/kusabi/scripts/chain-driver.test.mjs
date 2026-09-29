@@ -52,6 +52,192 @@ function fakeChangeScopeResult(params) {
   }
   return null;
 }
+
+
+// Hoisted shared test scaffolding (kusabi step 3 slice b)
+
+function finding({
+  file = "src/foo.js",
+  severity = "medium",
+  title = "t",
+  body = "fix the parser",
+  recommendation = "fix",
+  confidence = 0.8,
+  line_start = 1,
+  line_end = 1,
+  ...rest
+} = {}) {
+  return {
+    severity,
+    title,
+    body,
+    recommendation,
+    confidence,
+    line_start,
+    line_end,
+    file,
+    ...rest,
+  };
+}
+
+const APPROVE = JSON.stringify({
+  schema_version: 1,
+  verdict: "approve",
+  findings: [],
+  summary: "ok",
+  next_steps: [],
+});
+
+function reviewVerdict(verdict, findings = [], { summary = (verdict === "approve" ? "ok" : "s"), next_steps = [] } = {}) {
+  return JSON.stringify({ schema_version: 1, verdict, findings, summary, next_steps });
+}
+
+function needsAttentionReview(findings = [finding()], { summary = "s", next_steps = [] } = {}) {
+  return reviewVerdict("needs-attention", findings, { summary, next_steps });
+}
+
+const REWORK = needsAttentionReview();
+const REWORK_A = needsAttentionReview([finding({ file: "src/a.js", recommendation: "r" })]);
+const REWORK_B = needsAttentionReview([finding({ file: "src/b.js", recommendation: "r" })]);
+
+function makeChainDir({ prefix = "kusabi-chain-", chainId = "chain-test", container = "cid-1" } = {}) {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+  const chainDir = path.join(tmp, "chains", chainId);
+  fs.mkdirSync(chainDir, { recursive: true });
+  writeChainControl(chainDir, {
+    chainId, container, pid: process.pid,
+    status: "running", round: 0, startedAt: new Date().toISOString(),
+  });
+  return { tmp, chainDir };
+}
+
+function fakeCallTool({
+  statusOutput = " M src/foo.js\n",
+  headSha = "abc123",
+  untrackedOutput = "untracked.txt\n",
+  gatePassed = true,
+  gatePassedSequence,
+} = {}) {
+  let verifyCount = 0;
+  return async (toolName, params) => {
+    if (toolName === "verify_in_container") {
+      verifyCount += 1;
+      if (Array.isArray(gatePassedSequence)) {
+        return { gate_passed: gatePassedSequence[verifyCount - 1] ?? true };
+      }
+      return { gate_passed: gatePassed };
+    }
+    if (toolName !== "sandbox_exec") return { output: "" };
+    const scope = fakeChangeScopeResult(params);
+    if (scope) return scope;
+    const cmd = params?.commands?.[0] ?? "";
+    if (cmd.startsWith("cd /workspace &&") && cmd.includes("TMPIDX=")) {
+      return { output: "ERROR_NO_INDEX\n" };
+    }
+    if (cmd === "git rev-parse HEAD") return { output: headSha + "\n" };
+    if (cmd === "git status --porcelain") return { output: statusOutput };
+    if (cmd === "git log --oneline -5") return { output: "abc123 latest change\n" };
+    if (cmd === "git diff") return { output: "diff --git a/src/foo.js b/src/foo.js\n" };
+    if (cmd === "git ls-files --others --exclude-standard") return { output: untrackedOutput };
+    return { output: "" };
+  };
+}
+
+function makePhaseDispatch({
+  kind = "task",
+  modelEntry = "opus",
+  sessionPrefix = "claude-uuid-",
+  resultText = "implemented",
+  jobIdPrefix,
+} = {}) {
+  const calls = [];
+  const dispatch = async (opts) => {
+    calls.push(opts);
+    if (opts.kind === "strategist" && kind === "task") {
+      return {
+        job: {
+          id: "job-strat-1",
+          status: "completed",
+          modelEntry,
+          modelVariant: null,
+          fallbacks: null,
+          sessionID: sessionPrefix.endsWith("-") ? sessionPrefix + "strat" : sessionPrefix + "-strat",
+          usage: { available: true, input: 1, output: 1, reasoning: 0, cacheRead: 0, cacheWrite: 0, cost: 0.01 },
+          error: null,
+        },
+        resultText: "restructure the module",
+      };
+    }
+    if (opts.kind !== kind) {
+      throw new Error("unexpected dispatch kind: " + opts.kind + " on the " + kind + " seam");
+    }
+    const prefix = jobIdPrefix ?? (kind === "task" ? "job-imp-" : `${kind}-job-`);
+    return {
+      job: {
+        id: prefix + (opts.round ?? 1),
+        status: "completed",
+        modelEntry,
+        modelVariant: null,
+        fallbacks: null,
+        sessionID: sessionPrefix + (opts.round ?? 1),
+        usage: { available: true, input: 1, output: 1, reasoning: 0, cacheRead: 0, cacheWrite: 0, cost: 0.01 },
+        error: null,
+      },
+      resultText,
+    };
+  };
+  return { dispatch, calls };
+}
+
+function makeReviewDispatch({
+  reviewResult = APPROVE,
+  reviewResults,
+  modelEntry = "opencode/deepseek-v4-flash-free",
+  modelVariant = "max",
+  sessionPrefix = "ses_review_",
+  jobIdPrefix = "job-rev-",
+} = {}) {
+  const calls = [];
+  let idx = 0;
+  const dispatch = async (opts) => {
+    calls.push(opts);
+    if (opts.kind !== "review") {
+      throw new Error("unexpected review dispatch kind: " + opts.kind);
+    }
+    const resultText = Array.isArray(reviewResults)
+      ? reviewResults[Math.min(idx++, reviewResults.length - 1)]
+      : (typeof reviewResult === "function" ? reviewResult(opts) : reviewResult);
+    return {
+      job: {
+        id: jobIdPrefix + (opts.round ?? 1),
+        status: "completed",
+        modelEntry,
+        modelVariant,
+        fallbacks: null,
+        sessionID: sessionPrefix + (opts.round ?? 1),
+        usage: { available: true, input: 2, output: 2, reasoning: 0, cacheRead: 0, cacheWrite: 0, cost: 0.01 },
+        error: null,
+      },
+      resultText,
+    };
+  };
+  return { dispatch, calls };
+}
+
+function runDriver(opts) {
+  return runChainDriver({
+    chainId: "chain-test",
+    container: "cid-1",
+    orchestrator: null,
+    baseSha: "abc123",
+    worktreeBaseline: null,
+    keepServe: true,
+    signalReceived: () => false,
+    resume: null,
+    ...(opts?.cwd && !opts?.stateDir ? { stateDir: opts.cwd } : {}),
+    ...opts,
+  });
+}
 // sessionProvenanceRefusal — the agy --session chain-start gate (kusabi #321)
 // ---------------------------------------------------------------------------
 // The refusal decision is pure and exported so every case is testable
@@ -71,30 +257,10 @@ function fakeChangeScopeResult(params) {
 describe("runChainDriver resume", () => {
   const BRIEF = "Implement X.\n\n## Deliverables\n- src/foo.js\n";
 
-  function fakeResumeCallTool({ statusOutput = " M src/foo.js\n", headSha = "abc123" } = {}) {
-    return async (toolName, params) => {
-      if (toolName === "verify_in_container") {
-        return { gate_passed: true };
-      }
-      if (toolName !== "sandbox_exec") return { output: "" };
-      const scope = fakeChangeScopeResult(params);
-      if (scope) return scope;
-      const cmd = params.commands[0];
-      // captureWorktreeState: capture failure → baseline null (graceful)
-      if (cmd.startsWith("cd /workspace &&") && cmd.includes("TMPIDX=")) {
-        return { output: "ERROR_NO_INDEX\n" };
-      }
-      if (cmd === "git rev-parse HEAD") return { output: headSha + "\n" };
-      if (cmd === "git status --porcelain") return { output: statusOutput };
-      if (cmd === "git log --oneline -5") return { output: "abc123 latest change\n" };
-      if (cmd === "git diff") return { output: "diff --git a/src/foo.js b/src/foo.js\n" };
-      if (cmd === "git ls-files --others --exclude-standard") return { output: "untracked.txt\n" };
-      return { output: "" };
-    };
-  }
+  const fakeResumeCallTool = fakeCallTool;
 
   function makeFakeDispatch({
-    reviewResult = JSON.stringify({ schema_version: 1, verdict: "approve", findings: [], summary: "ok", next_steps: [] }),
+    reviewResult = APPROVE,
     implementStatus = "completed",
     implementFailure = null,
   } = {}) {
@@ -189,18 +355,15 @@ describe("runChainDriver resume", () => {
     });
     const tmp = path.dirname(path.dirname(chainDir));
     const chainJson = readJson(path.join(chainDir, "chain.json"));
-    return runChainDriver({
-      cwd: tmp, stateDir: path.dirname(path.dirname(chainDir)), chainDir,
-      chainId: "chain-test", container: "cid-1",
+    return runDriver({
+      cwd: tmp, chainDir,
       model: "fake/model", modelChain: [["fake/model"], ["fake/pro"]], maxRounds: 4,
-      brief: BRIEF, orchestrator: null, baseSha: "abc123", worktreeBaseline: null,
+      brief: BRIEF,
       // Mirror cmdChainResume: reuse the verify baseline recorded in
       // chain.json; never re-capture on the modified worktree (kusabi #173).
       verifyBaseline: chainJson.verifyBaseline ?? null,
       callTool: callTool ?? fakeResumeCallTool({ statusOutput }),
       dispatchWithFallback: dispatch,
-      keepServe: true,
-      signalReceived: () => false,
       resume: resolution.position,
     });
   }
@@ -294,13 +457,7 @@ describe("runChainDriver resume", () => {
     // names nothing over green probes escalates instead of reworking, and
     // this test is about the rework ladder, not about that row.
     const dispatch = makeFakeDispatch({
-      reviewResult: JSON.stringify({
-        schema_version: 1,
-        verdict: "needs-attention",
-        summary: "s",
-        findings: [{ severity: "medium", title: "Still broken", body: "b", recommendation: "r", confidence: 0.8, line_start: 1, line_end: 1, file: "src/foo.js" }],
-        next_steps: [],
-      }),
+      reviewResult: needsAttentionReview([finding({ title: "Still broken", body: "b", recommendation: "r" })]),
       implementStatus: "provider-error",
     });
 
@@ -396,15 +553,12 @@ describe("runChainDriver resume", () => {
       },
     });
 
-    const text = await runChainDriver({
-      cwd: tmp, stateDir: tmp, chainDir, chainId: "chain-test", container: "cid-1",
+    const text = await runDriver({
+      cwd: tmp, chainDir,
       model: "fake/model", modelChain: [["fake/model"], ["fake/pro"]], maxRounds: 4,
-      brief: BRIEF, orchestrator: null, baseSha: "abc123", worktreeBaseline: null,
+      brief: BRIEF,
       callTool: fakeResumeCallTool(),
       dispatchWithFallback: dispatch,
-      keepServe: true,
-      signalReceived: () => false,
-      resume: null,
     });
 
     // The chain stops at implement provider exhaustion and the surface
@@ -449,15 +603,12 @@ describe("runChainDriver resume", () => {
       return result;
     };
 
-    const text = await runChainDriver({
-      cwd: tmp, stateDir: tmp, chainDir, chainId: "chain-test", container: "cid-1",
+    const text = await runDriver({
+      cwd: tmp, chainDir,
       model: "fake/model", modelChain: [["fake/model"], ["fake/pro"]], maxRounds: 4,
-      brief: BRIEF, orchestrator: null, baseSha: "abc123", worktreeBaseline: null,
+      brief: BRIEF,
       callTool: fakeResumeCallTool(),
       dispatchWithFallback: dispatchWithStop,
-      keepServe: true,
-      signalReceived: () => false,
-      resume: null,
     });
 
     assert.match(text, /cancelled during round 1/);
@@ -620,16 +771,13 @@ describe("runChainDriver resume", () => {
     });
 
     const dispatch = makeFakeDispatch();
-    const text = await runChainDriver({
-      cwd: tmp, stateDir: tmp, chainDir, chainId: "chain-test", container: "cid-1",
+    const text = await runDriver({
+      cwd: tmp, chainDir,
       model: "fake/model", modelChain: [["fake/model"]], maxRounds: 1,
-      brief: BRIEF, orchestrator: null, baseSha: "abc123", worktreeBaseline: null,
+      brief: BRIEF,
       callTool: fakeResumeCallTool(),
       dispatchWithFallback: dispatch,
       backend: "claude",
-      keepServe: true,
-      signalReceived: () => false,
-      resume: null,
     });
 
     assert.match(text, /accepted at round 1/);
@@ -668,15 +816,12 @@ describe("runChainDriver resume", () => {
         status: "running", round: 0, startedAt: new Date().toISOString(),
       });
       const dispatch = makeFakeDispatch(); // review approves round 1
-      const text = await runChainDriver({
-        cwd: tmp, stateDir: tmp, chainDir, chainId: "chain-mid", container: "cid-1",
+      const text = await runDriver({
+        cwd: tmp, chainDir, chainId: "chain-mid",
         model: "fake/model", modelChain: [["fake/model"]], maxRounds: 1,
-        brief: BRIEF, orchestrator: null, baseSha: "abc123", worktreeBaseline: null,
+        brief: BRIEF,
         callTool: fakeResumeCallTool(),
         dispatchWithFallback: dispatch,
-        keepServe: true,
-        signalReceived: () => false,
-        resume: null,
         // The luna driver threads the owning mission id; a plain chain omits it.
         ...(missionId ? { missionId } : {}),
       });
@@ -1053,13 +1198,7 @@ describe("runChainDriver resume", () => {
     // The resumed review finds a problem => rework; the next
     // round's implement hits provider exhaustion so the chain stops there.
     const dispatch = makeFakeDispatch({
-      reviewResult: JSON.stringify({
-        schema_version: 1,
-        verdict: "needs-attention",
-        summary: "s",
-        findings: [{ severity: "medium", title: "t", body: "fix the parser", recommendation: "r", confidence: 0.8, line_start: 1, line_end: 1, file: "src/foo.js" }],
-        next_steps: [],
-      }),
+      reviewResult: needsAttentionReview([finding({ recommendation: "r" })]),
       implementStatus: "provider-error",
     });
 
@@ -1088,15 +1227,12 @@ describe("runChainDriver resume", () => {
     });
     const callTool = probeCountingCallTool();
 
-    const text = await runChainDriver({
-      cwd: tmp, stateDir: tmp, chainDir, chainId: "chain-test", container: "cid-1",
+    const text = await runDriver({
+      cwd: tmp, chainDir,
       model: "fake/model", modelChain: [["fake/model"]], maxRounds: 1,
-      brief: BRIEF, orchestrator: null, baseSha: "abc123", worktreeBaseline: null,
+      brief: BRIEF,
       callTool,
       dispatchWithFallback: makeFakeDispatch(),
-      keepServe: true,
-      signalReceived: () => false,
-      resume: null,
     });
 
     assert.match(text, /accepted at round 1/);
@@ -1124,131 +1260,23 @@ describe("runChainDriver resume", () => {
 
 describe("runChainDriver per-phase backends (kusabi #192)", () => {
   const BRIEF = "Implement X.\n\n## Deliverables\n- src/foo.js\n";
-  const APPROVE = JSON.stringify({ schema_version: 1, verdict: "approve", findings: [], summary: "ok", next_steps: [] });
-  const REWORK = JSON.stringify({
-    schema_version: 1,
-    verdict: "needs-attention",
-    summary: "s",
-    findings: [{ severity: "medium", title: "t", body: "fix the parser", recommendation: "fix", confidence: 0.8, line_start: 1, line_end: 1, file: "src/foo.js" }],
-    next_steps: [],
-  });
-
-  function fakeCallTool({ statusOutput = " M src/foo.js\n", gatePassedSequence } = {}) {
-    let verifyCount = 0;
-    return async (toolName, params) => {
-      if (toolName === "verify_in_container") {
-        verifyCount += 1;
-        if (Array.isArray(gatePassedSequence)) {
-          return { gate_passed: gatePassedSequence[verifyCount - 1] ?? true };
-        }
-        return { gate_passed: false };
-      }
-      if (toolName !== "sandbox_exec") return { output: "" };
-      const scope = fakeChangeScopeResult(params);
-      if (scope) return scope;
-      const cmd = params.commands[0];
-      if (cmd.startsWith("cd /workspace &&") && cmd.includes("TMPIDX=")) {
-        return { output: "ERROR_NO_INDEX\n" };
-      }
-      if (cmd === "git rev-parse HEAD") return { output: "abc123\n" };
-      if (cmd === "git status --porcelain") return { output: statusOutput };
-      if (cmd === "git log --oneline -5") return { output: "abc123 latest change\n" };
-      if (cmd === "git diff") return { output: "diff --git a/src/foo.js b/src/foo.js\n" };
-      if (cmd === "git ls-files --others --exclude-standard") return { output: "untracked.txt\n" };
-      return { output: "" };
-    };
-  }
-
-  // The implement-side fake: claude-shaped (bare-alias modelEntry, UUID
-  // session ids).  Records every dispatch options object.
-  function makeImplementDispatch() {
-    const calls = [];
-    const dispatch = async (opts) => {
-      calls.push(opts);
-      if (opts.kind === "task") {
-        return {
-          job: {
-            id: "job-imp-" + (opts.round ?? 1), status: "completed",
-            modelEntry: "opus", modelVariant: null, fallbacks: null,
-            sessionID: "claude-uuid-" + (opts.round ?? 1),
-            usage: { available: true, input: 1, output: 1, reasoning: 0, cacheRead: 0, cacheWrite: 0, cost: 0.01 },
-            error: null,
-          },
-          resultText: "implemented",
-        };
-      }
-      if (opts.kind === "strategist") {
-        return {
-          job: {
-            id: "job-strat-1", status: "completed",
-            modelEntry: "opus", modelVariant: null, fallbacks: null,
-            sessionID: "claude-uuid-strat",
-            usage: { available: true, input: 1, output: 1, reasoning: 0, cacheRead: 0, cacheWrite: 0, cost: 0.01 },
-            error: null,
-          },
-          resultText: "restructure the module",
-        };
-      }
-      throw new Error("unexpected implement dispatch kind: " + opts.kind);
-    };
-    return { dispatch, calls };
-  }
-
-  // The review-side fake: opencode-shaped (provider/model modelEntry, ses_*
-  // session ids).  Records every dispatch options object.  `reviewResult`
-  // may be a value or a function (opts) => string, so tests can switch the
-  // verdict between rounds.
-  function makeReviewDispatch({ reviewResult = APPROVE } = {}) {
-    const calls = [];
-    const dispatch = async (opts) => {
-      calls.push(opts);
-      if (opts.kind === "review") {
-        return {
-          job: {
-            id: "job-rev-" + (opts.round ?? 1), status: "completed",
-            modelEntry: "opencode/deepseek-v4-flash-free", modelVariant: "max",
-            fallbacks: null, sessionID: "ses_review_" + (opts.round ?? 1),
-            usage: { available: true, input: 2, output: 2, reasoning: 0, cacheRead: 0, cacheWrite: 0, cost: 0.01 },
-            error: null,
-          },
-          resultText: typeof reviewResult === "function" ? reviewResult(opts) : reviewResult,
-        };
-      }
-      throw new Error("unexpected review dispatch kind: " + opts.kind);
-    };
-    return { dispatch, calls };
-  }
-
-  function makeChainDir() {
-    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-phase-backend-"));
-    const chainDir = path.join(tmp, "chains", "chain-test");
-    fs.mkdirSync(chainDir, { recursive: true });
-    writeChainControl(chainDir, {
-      chainId: "chain-test", container: "cid-1", pid: process.pid,
-      status: "running", round: 0, startedAt: new Date().toISOString(),
-    });
-    return { tmp, chainDir };
-  }
 
   it("dispatches implement on claude and review on opencode, recording both backends and per-phase models/agents", async () => {
     const { tmp, chainDir } = makeChainDir();
-    const implement = makeImplementDispatch();
+    const implement = makePhaseDispatch();
     const review = makeReviewDispatch();
 
-    const text = await runChainDriver({
-      cwd: tmp, stateDir: tmp, chainDir, chainId: "chain-test", container: "cid-1",
+    const text = await runDriver({
+      cwd: tmp, chainDir,
       model: "opus", modelChain: [["opus"]],
       reviewModel: { providerID: "opencode", modelID: "deepseek-v4-flash-free", variant: "max" },
       reviewModelChain: [["opencode/deepseek-v4-flash-free:max"]],
       maxRounds: 1,
-      brief: BRIEF, orchestrator: null, baseSha: "abc123", worktreeBaseline: null,
+      brief: BRIEF,
       callTool: fakeCallTool({ gatePassedSequence: [true] }),
       backend: "claude", reviewBackend: "opencode",
       dispatchWithFallback: implement.dispatch,
       reviewDispatchWithFallback: review.dispatch,
-      keepServe: true,
-      signalReceived: () => false,
-      resume: null,
     });
 
     assert.match(text, /accepted at round 1/);
@@ -1288,7 +1316,7 @@ describe("runChainDriver per-phase backends (kusabi #192)", () => {
 
   it("session lineage stays within the implement backend across rework rounds (never the review backend's session)", async () => {
     const { tmp, chainDir } = makeChainDir();
-    const implement = makeImplementDispatch();
+    const implement = makePhaseDispatch();
     // Review finds problems in round 1 (rework); the review dispatch then
     // switches to approve so round 2 accepts.
     let reviewCount = 0;
@@ -1298,19 +1326,16 @@ describe("runChainDriver per-phase backends (kusabi #192)", () => {
     const review = reviewInner.dispatch;
     review.calls = reviewInner.calls;
 
-    const text = await runChainDriver({
-      cwd: tmp, stateDir: tmp, chainDir, chainId: "chain-test", container: "cid-1",
+    const text = await runDriver({
+      cwd: tmp, chainDir,
       model: "opus", modelChain: [["opus"]],
       reviewModelChain: [["opencode/deepseek-v4-flash-free:max"]],
       maxRounds: 2,
-      brief: BRIEF, orchestrator: null, baseSha: "abc123", worktreeBaseline: null,
+      brief: BRIEF,
       callTool: fakeCallTool({ gatePassedSequence: [false, true] }),
       backend: "claude", reviewBackend: "opencode",
       dispatchWithFallback: implement.dispatch,
       reviewDispatchWithFallback: review,
-      keepServe: true,
-      signalReceived: () => false,
-      resume: null,
     });
 
     assert.match(text, /accepted at round 2/);
@@ -1371,18 +1396,16 @@ describe("runChainDriver per-phase backends (kusabi #192)", () => {
         baseSha: "abc123", chainTotals: computeChainTotals([previous]),
         strategized: false, followupIssueDraft: null,
       });
-      const implement = makeImplementDispatch();
+      const implement = makePhaseDispatch();
       const review = makeReviewDispatch();
-      const text = await runChainDriver({
-        cwd: tmp, stateDir: tmp, chainDir, chainId: "chain-test", container: "cid-1",
+      const text = await runDriver({
+        cwd: tmp, chainDir,
         model: "opus", modelChain: [["opus"]], maxRounds: 4,
-        brief: BRIEF, orchestrator: null, baseSha: "abc123", worktreeBaseline: null,
+        brief: BRIEF,
         callTool: fakeCallTool({ gatePassedSequence: [true] }),
         backend: driverBackend, reviewBackend: "opencode",
         dispatchWithFallback: implement.dispatch,
         reviewDispatchWithFallback: review.dispatch,
-        keepServe: true,
-        signalReceived: () => false,
         resume: {
           phase: "implement", round: 2, roundRecord: null, records: [previous],
           reworkCount: 1, currentTierIndex: 0, strategized: false,
@@ -1421,116 +1444,6 @@ describe("runChainDriver per-phase backends (kusabi #192)", () => {
 
 describe("runChainDriver per-round rework tiering (kusabi #192 axis 2)", () => {
   const BRIEF = "Implement X.\n\n## Deliverables\n- src/foo.js\n";
-  const APPROVE = JSON.stringify({ schema_version: 1, verdict: "approve", findings: [], summary: "ok", next_steps: [] });
-  const REWORK = JSON.stringify({
-    schema_version: 1,
-    verdict: "needs-attention",
-    summary: "s",
-    findings: [{ severity: "medium", title: "t", body: "fix the parser", recommendation: "fix", confidence: 0.8, line_start: 1, line_end: 1, file: "src/foo.js" }],
-    next_steps: [],
-  });
-
-  function fakeCallTool({ statusOutput = " M src/foo.js\n", gatePassedSequence } = {}) {
-    let verifyCount = 0;
-    return async (toolName, params) => {
-      if (toolName === "verify_in_container") {
-        verifyCount += 1;
-        if (Array.isArray(gatePassedSequence)) {
-          return { gate_passed: gatePassedSequence[verifyCount - 1] ?? true };
-        }
-        return { gate_passed: false };
-      }
-      if (toolName !== "sandbox_exec") return { output: "" };
-      const scope = fakeChangeScopeResult(params);
-      if (scope) return scope;
-      const cmd = params.commands[0];
-      if (cmd.startsWith("cd /workspace &&") && cmd.includes("TMPIDX=")) {
-        return { output: "ERROR_NO_INDEX\n" };
-      }
-      if (cmd === "git rev-parse HEAD") return { output: "abc123\n" };
-      if (cmd === "git status --porcelain") return { output: statusOutput };
-      if (cmd === "git log --oneline -5") return { output: "abc123 latest change\n" };
-      if (cmd === "git diff") return { output: "diff --git a/src/foo.js b/src/foo.js\n" };
-      if (cmd === "git ls-files --others --exclude-standard") return { output: "untracked.txt\n" };
-      return { output: "" };
-    };
-  }
-
-  // One dispatch fake per phase seam.  `kind` gates the accepted phase
-  // (task = implement, review = review); `sessionPrefix` gives ids of the
-  // shape that phase's backend would produce (claude-uuid-* for the claude
-  // fake, ses_* for the opencode fakes) so session lineage assertions can
-  // tell the fakes apart.
-  function makePhaseDispatch({ kind, modelEntry, sessionPrefix, resultText }) {
-    const calls = [];
-    const dispatch = async (opts) => {
-      calls.push(opts);
-      // The strategist runs on the IMPLEMENT seam (runStrategizePhase threads
-      // the implement dispatch); a task fake must answer it so a strategize
-      // disposition in a fixture does not crash the chain.
-      if (opts.kind === "strategist" && kind === "task") {
-        return {
-          job: {
-            id: "strategist-job-" + (opts.round ?? 1), status: "completed",
-            modelEntry, modelVariant: null, fallbacks: null,
-            sessionID: sessionPrefix + "-strat",
-            usage: { available: true, input: 1, output: 1, reasoning: 0, cacheRead: 0, cacheWrite: 0, cost: 0.01 },
-            error: null,
-          },
-          resultText: "restructure the module",
-        };
-      }
-      if (opts.kind !== kind) {
-        throw new Error("unexpected dispatch kind: " + opts.kind + " on the " + kind + " seam");
-      }
-      return {
-        job: {
-          id: kind + "-job-" + (opts.round ?? 1), status: "completed",
-          modelEntry, modelVariant: null, fallbacks: null,
-          sessionID: sessionPrefix + (opts.round ?? 1),
-          usage: { available: true, input: 1, output: 1, reasoning: 0, cacheRead: 0, cacheWrite: 0, cost: 0.01 },
-          error: null,
-        },
-        resultText,
-      };
-    };
-    return { dispatch, calls };
-  }
-
-  function makeReviewDispatch({ reviewResults }) {
-    const calls = [];
-    let idx = 0;
-    const dispatch = async (opts) => {
-      calls.push(opts);
-      if (opts.kind !== "review") {
-        throw new Error("unexpected dispatch kind on the review seam: " + opts.kind);
-      }
-      const resultText = reviewResults[Math.min(idx, reviewResults.length - 1)];
-      idx += 1;
-      return {
-        job: {
-          id: "review-job-" + (opts.round ?? 1), status: "completed",
-          modelEntry: "opencode-go/deepseek-v4-flash", modelVariant: null, fallbacks: null,
-          sessionID: "ses_review_" + (opts.round ?? 1),
-          usage: { available: true, input: 2, output: 2, reasoning: 0, cacheRead: 0, cacheWrite: 0, cost: 0.01 },
-          error: null,
-        },
-        resultText,
-      };
-    };
-    return { dispatch, calls };
-  }
-
-  function makeChainDir() {
-    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-rework-tier-"));
-    const chainDir = path.join(tmp, "chains", "chain-test");
-    fs.mkdirSync(chainDir, { recursive: true });
-    writeChainControl(chainDir, {
-      chainId: "chain-test", container: "cid-1", pid: process.pid,
-      status: "running", round: 0, startedAt: new Date().toISOString(),
-    });
-    return { tmp, chainDir };
-  }
 
   it("mixed backends: round 1 dispatches claude/opus, a rework round dispatches the opencode flash route with a FRESH session, and records carry each round's true backend", async () => {
     const { tmp, chainDir } = makeChainDir();
@@ -1538,22 +1451,19 @@ describe("runChainDriver per-round rework tiering (kusabi #192 axis 2)", () => {
     const rework = makePhaseDispatch({ kind: "task", modelEntry: "opencode-go/deepseek-v4-flash", sessionPrefix: "ses_rework_", resultText: "implemented" });
     const review = makeReviewDispatch({ reviewResults: [REWORK, APPROVE] });
 
-    const text = await runChainDriver({
-      cwd: tmp, stateDir: tmp, chainDir, chainId: "chain-test", container: "cid-1",
+    const text = await runDriver({
+      cwd: tmp, chainDir,
       model: "opus", modelChain: [["opus"]],
       reworkModel: "deepseek-v4-flash", reworkModelChain: [["opencode-go/deepseek-v4-flash"]],
       reworkBackend: "opencode",
       reviewModelChain: [["opencode-go/deepseek-v4-flash"]],
       maxRounds: 2,
-      brief: BRIEF, orchestrator: null, baseSha: "abc123", worktreeBaseline: null,
+      brief: BRIEF,
       callTool: fakeCallTool({ gatePassedSequence: [false, true] }),
       backend: "claude", reviewBackend: "opencode",
       dispatchWithFallback: implement.dispatch,
       reworkDispatchWithFallback: rework.dispatch,
       reviewDispatchWithFallback: review.dispatch,
-      keepServe: true,
-      signalReceived: () => false,
-      resume: null,
     });
 
     assert.match(text, /accepted at round 2/);
@@ -1596,23 +1506,20 @@ describe("runChainDriver per-round rework tiering (kusabi #192 axis 2)", () => {
     const rework = makePhaseDispatch({ kind: "task", modelEntry: "opencode-go/deepseek-v4-flash", sessionPrefix: "ses_rework_", resultText: "implemented" });
     const review = makeReviewDispatch({ reviewResults: [REWORK, APPROVE] });
 
-    const text = await runChainDriver({
-      cwd: tmp, stateDir: tmp, chainDir, chainId: "chain-test", container: "cid-1",
+    const text = await runDriver({
+      cwd: tmp, chainDir,
       model: { providerID: "opencode-go", modelID: "deepseek-v4-pro" },
       modelChain: [["opencode-go/deepseek-v4-pro"]],
       reworkModel: "deepseek-v4-flash", reworkModelChain: [["opencode-go/deepseek-v4-flash"]],
       reworkBackend: "opencode",
       reviewModelChain: [["opencode-go/deepseek-v4-flash"]],
       maxRounds: 2,
-      brief: BRIEF, orchestrator: null, baseSha: "abc123", worktreeBaseline: null,
+      brief: BRIEF,
       callTool: fakeCallTool({ gatePassedSequence: [false, true] }),
       backend: "opencode", reviewBackend: "opencode",
       dispatchWithFallback: implement.dispatch,
       reworkDispatchWithFallback: rework.dispatch,
       reviewDispatchWithFallback: review.dispatch,
-      keepServe: true,
-      signalReceived: () => false,
-      resume: null,
     });
 
     assert.match(text, /accepted at round 2/);
@@ -1641,39 +1548,22 @@ describe("runChainDriver per-round rework tiering (kusabi #192 axis 2)", () => {
     const rework = makePhaseDispatch({ kind: "task", modelEntry: "opencode-go/deepseek-v4-flash", sessionPrefix: "ses_rework_", resultText: "implemented" });
     // Distinct finding files per round: same-file repeats would trigger the
     // strategize lever instead of the plain rework this test exercises.
-    const reworkA = JSON.stringify({
-      schema_version: 1,
-      verdict: "needs-attention",
-      summary: "s",
-      findings: [{ severity: "medium", title: "t", body: "fix the parser", recommendation: "r", confidence: 0.8, line_start: 1, line_end: 1, file: "src/a.js" }],
-      next_steps: [],
-    });
-    const reworkB = JSON.stringify({
-      schema_version: 1,
-      verdict: "needs-attention",
-      summary: "s",
-      findings: [{ severity: "medium", title: "t", body: "fix the parser", recommendation: "r", confidence: 0.8, line_start: 1, line_end: 1, file: "src/b.js" }],
-      next_steps: [],
-    });
-    const review = makeReviewDispatch({ reviewResults: [reworkA, reworkB, APPROVE] });
+    const review = makeReviewDispatch({ reviewResults: [REWORK_A, REWORK_B, APPROVE] });
 
-    const text = await runChainDriver({
-      cwd: tmp, stateDir: tmp, chainDir, chainId: "chain-test", container: "cid-1",
+    const text = await runDriver({
+      cwd: tmp, chainDir,
       model: "deepseek-v4-pro", modelChain: [["opencode-go/deepseek-v4-pro"]],
       reworkModel: "deepseek-v4-flash",
       reworkModelChain: [["opencode-go/deepseek-v4-flash"], ["opencode-go/deepseek-v4-pro"]],
       reworkBackend: "opencode",
       reviewModelChain: [["opencode-go/deepseek-v4-flash"]],
       maxRounds: 3,
-      brief: BRIEF, orchestrator: null, baseSha: "abc123", worktreeBaseline: null,
+      brief: BRIEF,
       callTool: fakeCallTool({ gatePassedSequence: [false, false, true] }),
       backend: "opencode", reviewBackend: "opencode",
       dispatchWithFallback: implement.dispatch,
       reworkDispatchWithFallback: rework.dispatch,
       reviewDispatchWithFallback: review.dispatch,
-      keepServe: true,
-      signalReceived: () => false,
-      resume: null,
     });
 
     assert.match(text, /accepted at round 3/);
@@ -1704,38 +1594,21 @@ describe("runChainDriver per-round rework tiering (kusabi #192 axis 2)", () => {
     const { tmp, chainDir } = makeChainDir();
     const implement = makePhaseDispatch({ kind: "task", modelEntry: "opencode-go/deepseek-v4-pro", sessionPrefix: "ses_imp_", resultText: "implemented" });
     const rework = makePhaseDispatch({ kind: "task", modelEntry: "opencode-go/deepseek-v4-flash", sessionPrefix: "ses_rework_", resultText: "implemented" });
-    const reworkA = JSON.stringify({
-      schema_version: 1,
-      verdict: "needs-attention",
-      summary: "s",
-      findings: [{ severity: "medium", title: "t", body: "fix the parser", recommendation: "r", confidence: 0.8, line_start: 1, line_end: 1, file: "src/a.js" }],
-      next_steps: [],
-    });
-    const reworkB = JSON.stringify({
-      schema_version: 1,
-      verdict: "needs-attention",
-      summary: "s",
-      findings: [{ severity: "medium", title: "t", body: "fix the parser", recommendation: "r", confidence: 0.8, line_start: 1, line_end: 1, file: "src/b.js" }],
-      next_steps: [],
-    });
-    const review = makeReviewDispatch({ reviewResults: [reworkA, reworkB, APPROVE] });
+    const review = makeReviewDispatch({ reviewResults: [REWORK_A, REWORK_B, APPROVE] });
 
-    const text = await runChainDriver({
-      cwd: tmp, stateDir: tmp, chainDir, chainId: "chain-test", container: "cid-1",
+    const text = await runDriver({
+      cwd: tmp, chainDir,
       model: "deepseek-v4-pro", modelChain: [["opencode-go/deepseek-v4-pro"]],
       reworkModel: "deepseek-v4-flash", reworkModelChain: [["opencode-go/deepseek-v4-flash"]],
       reworkBackend: "opencode",
       reviewModelChain: [["opencode-go/deepseek-v4-flash"]],
       maxRounds: 3,
-      brief: BRIEF, orchestrator: null, baseSha: "abc123", worktreeBaseline: null,
+      brief: BRIEF,
       callTool: fakeCallTool({ gatePassedSequence: [false, false, true] }),
       backend: "opencode", reviewBackend: "opencode",
       dispatchWithFallback: implement.dispatch,
       reworkDispatchWithFallback: rework.dispatch,
       reviewDispatchWithFallback: review.dispatch,
-      keepServe: true,
-      signalReceived: () => false,
-      resume: null,
     });
 
     assert.match(text, /accepted at round 3/);
@@ -1781,14 +1654,14 @@ describe("runChainDriver per-round rework tiering (kusabi #192 axis 2)", () => {
       const implement = makePhaseDispatch({ kind: "task", modelEntry: "opencode-go/deepseek-v4-pro", sessionPrefix: "ses_imp_", resultText: "implemented" });
       const rework = makePhaseDispatch({ kind: "task", modelEntry: "opencode-go/deepseek-v4-flash", sessionPrefix: "ses_rework_", resultText: "implemented" });
       const review = makeReviewDispatch({ reviewResults: [APPROVE] });
-      const text = await runChainDriver({
-        cwd: tmp, stateDir: tmp, chainDir, chainId: "chain-test", container: "cid-1",
+      const text = await runDriver({
+        cwd: tmp, chainDir,
         model: "opus", modelChain: [["opus"]],
         reworkModel: reworkCtx.reworkModel ?? null,
         reworkModelChain: reworkCtx.reworkModelChain ?? null,
         reworkBackend,
         maxRounds: 2,
-        brief: BRIEF, orchestrator: null, baseSha: "abc123", worktreeBaseline: null,
+        brief: BRIEF,
         callTool: fakeCallTool({ gatePassedSequence: [true] }),
         backend: "opencode", reviewBackend: "opencode",
         dispatchWithFallback: implement.dispatch,
@@ -1796,8 +1669,6 @@ describe("runChainDriver per-round rework tiering (kusabi #192 axis 2)", () => {
         // (legacy: null → the driver falls back to the implement dispatch).
         reworkDispatchWithFallback: reworkCtx.reworkModelChain ? rework.dispatch : null,
         reviewDispatchWithFallback: review.dispatch,
-        keepServe: true,
-        signalReceived: () => false,
         resume: {
           phase: "implement", round: 2, roundRecord: null, records: [previous],
           reworkCount: 1, currentTierIndex: 0, strategized: false,
@@ -1866,24 +1737,10 @@ describe("runChainDriver per-round rework tiering (kusabi #192 axis 2)", () => {
     const { tmp, chainDir } = makeChainDir();
     const implement = makePhaseDispatch({ kind: "task", modelEntry: "opus", sessionPrefix: "claude-uuid-", resultText: "implemented" });
     const rework = makePhaseDispatch({ kind: "task", modelEntry: "sonnet", sessionPrefix: "claude-uuid-rw-", resultText: "implemented" });
-    const reworkA = JSON.stringify({
-      schema_version: 1,
-      verdict: "needs-attention",
-      summary: "s",
-      findings: [{ severity: "medium", title: "t", body: "fix the parser", recommendation: "r", confidence: 0.8, line_start: 1, line_end: 1, file: "src/a.js" }],
-      next_steps: [],
-    });
-    const reworkB = JSON.stringify({
-      schema_version: 1,
-      verdict: "needs-attention",
-      summary: "s",
-      findings: [{ severity: "medium", title: "t", body: "fix the parser", recommendation: "r", confidence: 0.8, line_start: 1, line_end: 1, file: "src/b.js" }],
-      next_steps: [],
-    });
-    const review = makeReviewDispatch({ reviewResults: [reworkA, reworkB, APPROVE] });
+    const review = makeReviewDispatch({ reviewResults: [REWORK_A, REWORK_B, APPROVE] });
 
-    const text = await runChainDriver({
-      cwd: tmp, stateDir: tmp, chainDir, chainId: "chain-test", container: "cid-1",
+    const text = await runDriver({
+      cwd: tmp, chainDir,
       model: "opus", modelChain: [["opus"]],
       reworkModel: "sonnet",
       // Multi-entry claude chain — legal config (kusabi #184), but the
@@ -1893,15 +1750,12 @@ describe("runChainDriver per-round rework tiering (kusabi #192 axis 2)", () => {
       reworkBackend: "claude",
       reviewModelChain: [["opencode-go/deepseek-v4-flash"]],
       maxRounds: 3,
-      brief: BRIEF, orchestrator: null, baseSha: "abc123", worktreeBaseline: null,
+      brief: BRIEF,
       callTool: fakeCallTool({ gatePassedSequence: [false, false, true] }),
       backend: "claude", reviewBackend: "opencode",
       dispatchWithFallback: implement.dispatch,
       reworkDispatchWithFallback: rework.dispatch,
       reviewDispatchWithFallback: review.dispatch,
-      keepServe: true,
-      signalReceived: () => false,
-      resume: null,
     });
 
     assert.match(text, /accepted at round 3/);
@@ -1933,24 +1787,10 @@ describe("runChainDriver per-round rework tiering (kusabi #192 axis 2)", () => {
   it("a multi-entry claude IMPLEMENT ladder (no rework key) also clamps: tierAfter stays 0 (pre-existing base surface, kusabi #192 follow-up)", async () => {
     const { tmp, chainDir } = makeChainDir();
     const implement = makePhaseDispatch({ kind: "task", modelEntry: "opus", sessionPrefix: "claude-uuid-", resultText: "implemented" });
-    const reworkA = JSON.stringify({
-      schema_version: 1,
-      verdict: "needs-attention",
-      summary: "s",
-      findings: [{ severity: "medium", title: "t", body: "fix the parser", recommendation: "r", confidence: 0.8, line_start: 1, line_end: 1, file: "src/a.js" }],
-      next_steps: [],
-    });
-    const reworkB = JSON.stringify({
-      schema_version: 1,
-      verdict: "needs-attention",
-      summary: "s",
-      findings: [{ severity: "medium", title: "t", body: "fix the parser", recommendation: "r", confidence: 0.8, line_start: 1, line_end: 1, file: "src/b.js" }],
-      next_steps: [],
-    });
-    const review = makeReviewDispatch({ reviewResults: [reworkA, reworkB, APPROVE] });
+    const review = makeReviewDispatch({ reviewResults: [REWORK_A, REWORK_B, APPROVE] });
 
-    const text = await runChainDriver({
-      cwd: tmp, stateDir: tmp, chainDir, chainId: "chain-test", container: "cid-1",
+    const text = await runDriver({
+      cwd: tmp, chainDir,
       model: "opus",
       // Multi-entry claude IMPLEMENT chain, no models.phases.rework key:
       // rework rounds keep the implement resolution (effectiveReworkChain is
@@ -1958,15 +1798,12 @@ describe("runChainDriver per-round rework tiering (kusabi #192 axis 2)", () => {
       modelChain: [["opus"], ["sonnet"]],
       reviewModelChain: [["opencode-go/deepseek-v4-flash"]],
       maxRounds: 3,
-      brief: BRIEF, orchestrator: null, baseSha: "abc123", worktreeBaseline: null,
+      brief: BRIEF,
       callTool: fakeCallTool({ gatePassedSequence: [false, false, true] }),
       backend: "claude", reviewBackend: "opencode",
       dispatchWithFallback: implement.dispatch,
       reworkDispatchWithFallback: null,
       reviewDispatchWithFallback: review.dispatch,
-      keepServe: true,
-      signalReceived: () => false,
-      resume: null,
     });
 
     assert.match(text, /accepted at round 3/);
@@ -2010,26 +1847,7 @@ describe("runChainDriver per-round rework tiering (kusabi #192 axis 2)", () => {
 describe("chain-resume review dispatch fallback (kusabi #192 finding)", () => {
   const BRIEF = "Implement X.\n\n## Deliverables\n- src/foo.js\n";
 
-  function fakeCallTool() {
-    return async (toolName, params) => {
-      if (toolName === "verify_in_container") {
-        return { gate_passed: true };
-      }
-      if (toolName !== "sandbox_exec") return { output: "" };
-      const scope = fakeChangeScopeResult(params);
-      if (scope) return scope;
-      const cmd = params.commands[0];
-      if (cmd.startsWith("cd /workspace &&") && cmd.includes("TMPIDX=")) {
-        return { output: "ERROR_NO_INDEX\n" };
-      }
-      if (cmd === "git rev-parse HEAD") return { output: "abc123\n" };
-      if (cmd === "git status --porcelain") return { output: " M src/foo.js\n" };
-      if (cmd === "git log --oneline -5") return { output: "abc123 latest change\n" };
-      if (cmd === "git diff") return { output: "diff --git a/src/foo.js b/src/foo.js\n" };
-      if (cmd === "git ls-files --others --exclude-standard") return { output: "untracked.txt\n" };
-      return { output: "" };
-    };
-  }
+
 
   it("resolveReviewDispatch: an undefined review seam on a mixed chain never yields the claude implement dispatch", () => {
     const claudeFake = async () => { throw new Error("review must not reach the claude dispatch"); };
@@ -2138,8 +1956,8 @@ describe("chain-resume review dispatch fallback (kusabi #192 finding)", () => {
       throw new Error("review must not reach the claude dispatch");
     };
 
-    const text = await runChainDriver({
-      cwd: tmp, stateDir: tmp, chainDir, chainId: "chain-test", container: "cid-1",
+    const text = await runDriver({
+      cwd: tmp, chainDir,
       model: "opus", modelChain: [["opus"]],
       // Empty review chain: the REAL opencode dispatch (dispatchWithFallback)
       // fails fast with a "No available routes" provider-error job — no
@@ -2147,14 +1965,11 @@ describe("chain-resume review dispatch fallback (kusabi #192 finding)", () => {
       // phase used: the opencode one, never the claude fake.
       reviewModelChain: [],
       maxRounds: 1,
-      brief: BRIEF, orchestrator: null, baseSha: "abc123", worktreeBaseline: null,
+      brief: BRIEF,
       callTool: fakeCallTool(),
       backend: "claude", reviewBackend: "opencode",
       dispatchWithFallback: claudeImplement,
       reviewDispatchWithFallback: undefined, // the buggy cmdChainResume seam value
-      keepServe: true,
-      signalReceived: () => false,
-      resume: null,
     });
 
     // The chain stops at review provider exhaustion (the opencode dispatch's
@@ -2321,9 +2136,7 @@ describe("runChainDriver rework scheduling", () => {
   function mechFinding(n, file) {
     return { severity: "medium", title: "Mechanical fix " + n, file, line_start: 10, line_end: 10, confidence: 0.8, kind: "mechanical", body: "b", recommendation: "r" };
   }
-  function reviewResult(verdict, findings) {
-    return JSON.stringify({ schema_version: 1, verdict, findings, summary: "s", next_steps: [] });
-  }
+  const reviewResult = reviewVerdict;
 
   // `gatePassed: false` makes P2 red, which is what a probe-failure rework
   // (the "full" scope, per resolveReworkScope) actually looks like.
@@ -2400,12 +2213,11 @@ describe("runChainDriver rework scheduling", () => {
     return {
       tmp, chainDir, calls,
       run() {
-        return runChainDriver({
-          cwd: tmp, stateDir: tmp, chainDir, chainId: "chain-test", container: "cid-1",
+        return runDriver({
+          cwd: tmp, chainDir,
           model: "fake/model", modelChain: [["fake/model"]], maxRounds,
-          brief: BRIEF, orchestrator: null, baseSha: "abc123", worktreeBaseline: null,
+          brief: BRIEF,
           callTool, dispatchWithFallback: dispatch,
-          keepServe: true, signalReceived: () => false, resume: null,
         });
       },
     };
@@ -2444,13 +2256,11 @@ describe("runChainDriver rework scheduling", () => {
     });
     const { dispatch, calls } = makeQueueDispatch(reviewResults);
     const stateDir = path.dirname(path.dirname(chainDir));
-    const text = await runChainDriver({
-      cwd: stateDir, stateDir, chainDir,
-      chainId: "chain-test", container: "cid-1",
+    const text = await runDriver({
+      cwd: stateDir, chainDir,
       model: "fake/model", modelChain: [["fake/model"]], maxRounds,
-      brief: BRIEF, orchestrator: null, baseSha: "abc123", worktreeBaseline: null,
+      brief: BRIEF,
       callTool, dispatchWithFallback: dispatch,
-      keepServe: true, signalReceived: () => false,
       resume: resolution.position,
     });
     return { text, calls };
@@ -2894,7 +2704,7 @@ describe("runChainDriver oracle routing", () => {
             id: "job-rev-1", status: "completed", modelEntry: "fake/review", modelVariant: null,
             fallbacks: null, sessionID: "sess-rev", usage: null, error: null,
           },
-          resultText: JSON.stringify({ schema_version: 1, verdict: "approve", findings: [], summary: "ok", next_steps: [] }),
+          resultText: APPROVE,
         };
       }
       return {
@@ -2915,16 +2725,13 @@ describe("runChainDriver oracle routing", () => {
       chainId: "chain-oracle", container: "cid-1", pid: process.pid,
       status: "running", round: 0, startedAt: new Date().toISOString(),
     });
-    const text = await runChainDriver({
-      cwd: tmp, stateDir: tmp, chainDir, chainId: "chain-oracle", container: "cid-1",
+    const text = await runDriver({
+      cwd: tmp, chainDir, chainId: "chain-oracle",
       model: "fake/model", modelChain: [["fake/model"]], maxRounds: 4,
-      brief, orchestrator: null, baseSha: "abc123", worktreeBaseline: null,
+      brief,
       verifyBaseline,
       callTool: oracleCallTool({ statusOutput, verifyResult }),
       dispatchWithFallback: approvingDispatch(),
-      keepServe: true,
-      signalReceived: () => false,
-      resume: null,
     });
     return { tmp, chainDir, text };
   }
@@ -3145,7 +2952,7 @@ describe("runChainDriver resumed-accept oracle re-validation (kusabi #197 follow
             id: "job-rev-2", status: "completed", modelEntry: "fake/review", modelVariant: null,
             fallbacks: null, sessionID: "sess-rev-2", usage: null, error: null,
           },
-          resultText: JSON.stringify({ schema_version: 1, verdict: "approve", findings: [], summary: "ok", next_steps: [] }),
+          resultText: APPROVE,
         };
       }
       return {
@@ -3170,16 +2977,14 @@ describe("runChainDriver resumed-accept oracle re-validation (kusabi #197 follow
     rearmChainControl({ chainDir, round: resolution.position.round });
     const tmp = path.dirname(path.dirname(chainDir));
     const chainJson = readJson(path.join(chainDir, "chain.json"));
-    return runChainDriver({
-      cwd: tmp, stateDir: tmp, chainDir, chainId: "chain-test", container: "cid-1",
+    return runDriver({
+      cwd: tmp, chainDir,
       model: "fake/model", modelChain: [["fake/model"]], maxRounds: 4,
-      brief, orchestrator: null, baseSha: "abc123", worktreeBaseline: null,
+      brief,
       // Reuse the recorded baseline; never re-capture (kusabi #173).
       verifyBaseline: chainJson.verifyBaseline ?? null,
       callTool,
       dispatchWithFallback: approvingDispatch(),
-      keepServe: true,
-      signalReceived: () => false,
       resume: resolution.position,
     });
   }
@@ -3913,7 +3718,7 @@ describe("runChainDriver qualifying refusal (kusabi #293)", () => {
             id: "job-rev-1", status: "completed", modelEntry: "fake/review", modelVariant: null,
             fallbacks: null, sessionID: "sess-rev", usage: null, error: null,
           },
-          resultText: JSON.stringify({ schema_version: 1, verdict: "approve", findings: [], summary: "ok", next_steps: [] }),
+          resultText: APPROVE,
         };
       }
       return {
@@ -3946,16 +3751,13 @@ describe("runChainDriver qualifying refusal (kusabi #293)", () => {
       status: "running", round: 0, startedAt: new Date().toISOString(),
     });
     const dispatch = reportingDispatch(implementReport);
-    const text = await runChainDriver({
-      cwd: tmp, stateDir: tmp, chainDir, chainId: "chain-refusal", container: "cid-1",
+    const text = await runDriver({
+      cwd: tmp, chainDir, chainId: "chain-refusal",
       model: "fake/model", modelChain: [["fake/model"], ["fake/pro"]], maxRounds: 4,
-      brief: gate ? GATE_BRIEF : BRIEF, orchestrator: null, baseSha: "abc123", worktreeBaseline: null,
+      brief: gate ? GATE_BRIEF : BRIEF,
       verifyBaseline: { captured: true, gate_passed: true, lint: 0, types: 0, collected: 10, raw: {} },
       callTool: refusalCallTool({ statusOutput, cwd: tmp }),
       dispatchWithFallback: dispatch,
-      keepServe: true,
-      signalReceived: () => false,
-      resume: null,
     });
     return { tmp, chainDir, text, dispatch };
   }
@@ -4058,16 +3860,13 @@ describe("runChainDriver qualifying refusal (kusabi #293)", () => {
       return result;
     };
     try {
-      const cancelled = await runChainDriver({
-        cwd: tmp, stateDir: tmp, chainDir, chainId: "chain-refusal", container: "cid-1",
+      const cancelled = await runDriver({
+        cwd: tmp, chainDir, chainId: "chain-refusal",
         model: "fake/model", modelChain: [["fake/model"], ["fake/pro"]], maxRounds: 4,
-        brief: GATE_BRIEF, orchestrator: null, baseSha: "abc123", worktreeBaseline: null,
+        brief: GATE_BRIEF,
         verifyBaseline: { captured: true, gate_passed: true, lint: 0, types: 0, collected: 10, raw: {} },
         callTool: refusalCallTool({ statusOutput: "", cwd: tmp }),
         dispatchWithFallback: dispatchWithStop,
-        keepServe: true,
-        signalReceived: () => false,
-        resume: null,
       });
       assert.match(cancelled, /cancelled during round 1/);
 
@@ -4094,17 +3893,15 @@ describe("runChainDriver qualifying refusal (kusabi #293)", () => {
         round: resolution.position.phase === "review" ? resolution.position.round : resolution.position.round - 1,
       });
 
-      const text = await runChainDriver({
-        cwd: tmp, stateDir: tmp, chainDir, chainId: "chain-refusal", container: "cid-1",
+      const text = await runDriver({
+        cwd: tmp, chainDir, chainId: "chain-refusal",
         model: "fake/model", modelChain: [["fake/model"], ["fake/pro"]], maxRounds: 4,
-        brief: GATE_BRIEF, orchestrator: null, baseSha: "abc123", worktreeBaseline: null,
+        brief: GATE_BRIEF,
         // Mirror cmdChainResume: reuse the verify baseline recorded in
         // chain.json; never re-capture on the modified worktree (kusabi #173).
         verifyBaseline: readJson(path.join(chainDir, "chain.json")).verifyBaseline ?? null,
         callTool: refusalCallTool({ statusOutput: "", cwd: tmp }),
         dispatchWithFallback: dispatch,
-        keepServe: true,
-        signalReceived: () => false,
         resume: resolution.position,
       });
 
@@ -4229,16 +4026,13 @@ describe("runChainDriver qualifying refusal (kusabi #293)", () => {
     const gateBrief = "Implement X.\n\n## Frozen tests\n\nAll existing tests pass unchanged.\n\n## Deliverables\n- src/foo.js\n";
     const dispatch = reportingDispatch(REFUSAL_REPORT);
     try {
-      const text = await runChainDriver({
-        cwd: tmp, stateDir: tmp, chainDir, chainId: "chain-refusal", container: "cid-1",
+      const text = await runDriver({
+        cwd: tmp, chainDir, chainId: "chain-refusal",
         model: "fake/model", modelChain: [["fake/model"], ["fake/pro"]], maxRounds: 4,
-        brief: gateBrief, orchestrator: null, baseSha: "abc123", worktreeBaseline: null,
+        brief: gateBrief,
         verifyBaseline: { captured: true, gate_passed: true, lint: 0, types: 0, collected: 10, raw: {} },
         callTool: refusalCallTool({ statusOutput: "", cwd: tmp }),
         dispatchWithFallback: dispatch,
-        keepServe: true,
-        signalReceived: () => false,
-        resume: null,
       });
       assert.match(text, /refused at round 1/);
       assert.match(text, /## Frozen tests/);
@@ -4273,17 +4067,13 @@ describe("runChainDriver qualifying refusal (kusabi #293)", () => {
     });
     const dispatch = reportingDispatch(REFUSAL_REPORT);
     try {
-      const text = await runChainDriver({
-        cwd: tmp, stateDir: tmp, chainDir, chainId: "chain-refusal", container: "cid-1",
+      const text = await runDriver({
+        cwd: tmp, chainDir, chainId: "chain-refusal",
         model: "fake/model", modelChain: [["fake/model"], ["fake/pro"]], maxRounds: 4,
-        brief: "Implement X.\n\n## Deliverables\n- src/foo.js\n", orchestrator: null,
-        baseSha: "abc123", worktreeBaseline: null,
+        brief: "Implement X.\n\n## Deliverables\n- src/foo.js\n",
         verifyBaseline: { captured: true, gate_passed: true, lint: 0, types: 0, collected: 10, raw: {} },
         callTool: refusalCallTool({ statusOutput: "", cwd: tmp }),
         dispatchWithFallback: dispatch,
-        keepServe: true,
-        signalReceived: () => false,
-        resume: null,
       });
       // Routing is the pre-existing discard → escalate; the forgery does not ride.
       assert.match(text, /escalated at round 1/);
@@ -4351,16 +4141,13 @@ describe("runChainDriver qualifying refusal (kusabi #293)", () => {
     const dispatch = reportingDispatch(reportText);
 
     // tests/a.py DOES NOT exist in host tmp directory!
-    const text = await runChainDriver({
-      cwd: tmp, stateDir: tmp, chainDir, chainId: "chain-refusal", container: "cid-1",
+    const text = await runDriver({
+      cwd: tmp, chainDir, chainId: "chain-refusal",
       model: "fake/model", modelChain: [["fake/model"]], maxRounds: 4,
-      brief, orchestrator: null, baseSha: "abc123", worktreeBaseline: null,
+      brief,
       verifyBaseline: { captured: true, gate_passed: true, lint: 0, types: 0, collected: 10, raw: {} },
       callTool,
       dispatchWithFallback: dispatch,
-      keepServe: true,
-      signalReceived: () => false,
-      resume: null,
     });
 
     try {
@@ -4434,16 +4221,13 @@ describe("runChainDriver qualifying refusal (kusabi #293)", () => {
 
     const dispatch = reportingDispatch(reportText);
 
-    const text = await runChainDriver({
-      cwd: tmp, stateDir: tmp, chainDir, chainId: "chain-refusal", container: "cid-1",
+    const text = await runDriver({
+      cwd: tmp, chainDir, chainId: "chain-refusal",
       model: "fake/model", modelChain: [["fake/model"]], maxRounds: 4,
-      brief, orchestrator: null, baseSha: "abc123", worktreeBaseline: null,
+      brief,
       verifyBaseline: { captured: true, gate_passed: true, lint: 0, types: 0, collected: 10, raw: {} },
       callTool,
       dispatchWithFallback: dispatch,
-      keepServe: true,
-      signalReceived: () => false,
-      resume: null,
     });
 
     try {
@@ -4492,16 +4276,13 @@ describe("runChainDriver qualifying refusal (kusabi #293)", () => {
 
     const dispatch = reportingDispatch(reportText);
 
-    const text = await runChainDriver({
-      cwd: tmp, stateDir: tmp, chainDir, chainId: "chain-refusal", container: null,
+    const text = await runDriver({
+      cwd: tmp, chainDir, chainId: "chain-refusal", container: null,
       model: "fake/model", modelChain: [["fake/model"]], maxRounds: 4,
-      brief, orchestrator: null, baseSha: "abc123", worktreeBaseline: null,
+      brief,
       verifyBaseline: { captured: true, gate_passed: true, lint: 0, types: 0, collected: 10, raw: {} },
       callTool,
       dispatchWithFallback: dispatch,
-      keepServe: true,
-      signalReceived: () => false,
-      resume: null,
     });
 
     try {
@@ -4599,7 +4380,7 @@ describe("runChainDriver brief-syntax defect (kusabi #303)", () => {
             id: "job-rev-" + calls.length, status: "completed", modelEntry: "fake/review",
             modelVariant: null, fallbacks: null, sessionID: "sess-rev", usage: null, error: null,
           },
-          resultText: JSON.stringify({ schema_version: 1, verdict: "approve", findings: [], summary: "ok", next_steps: [] }),
+          resultText: APPROVE,
         };
       }
       return {
@@ -4628,16 +4409,13 @@ describe("runChainDriver brief-syntax defect (kusabi #303)", () => {
       }
       return { job: { id: "job-1", status: "completed" }, resultText: "verdict: approve" };
     } : approvingDispatch());
-    const text = await runChainDriver({
-      cwd: tmp, stateDir: tmp, chainDir, chainId: "chain-bsd", container: "cid-1",
+    const text = await runDriver({
+      cwd: tmp, chainDir, chainId: "chain-bsd",
       model: "fake/model", modelChain: [["fake/model"], ["fake/pro"]], maxRounds: 4,
-      brief, orchestrator: null, baseSha: "abc123", worktreeBaseline: null,
+      brief,
       verifyBaseline: { captured: true, gate_passed: true, lint: 0, types: 0, collected: 10, raw: {} },
       callTool: chainCallTool({ statusOutput }),
       dispatchWithFallback: dispatch,
-      keepServe: true,
-      signalReceived: () => false,
-      resume: null,
     });
     return { tmp, chainDir, text, dispatch };
   }
@@ -4765,16 +4543,13 @@ describe("runChainDriver brief-syntax defect (kusabi #303)", () => {
           stopRequestedAt: new Date().toISOString(),
         });
 
-        const outcome = await runChainDriver({
-          cwd: tmp, stateDir: tmp, chainDir, chainId: "chain-stop-pre", container: "cid-1",
+        const outcome = await runDriver({
+          cwd: tmp, chainDir, chainId: "chain-stop-pre",
           model: "fake/model", modelChain: [["fake/model"]], maxRounds: 3,
-          brief: "Implement X.\n", orchestrator: null, baseSha: "abc123", worktreeBaseline: null,
+          brief: "Implement X.\n",
           verifyBaseline: null,
           callTool: async (toolName, params) => fakeChangeScopeResult(params) ?? createFakeCallTool()(toolName, params),
           dispatchWithFallback: approvingDispatch(),
-          keepServe: true,
-          signalReceived: () => false,
-          resume: null,
         });
 
         assert.match(outcome, /Chain chain-stop-pre cancelled at round 1 \(stop requested\)\./);
@@ -4801,16 +4576,13 @@ describe("runChainDriver brief-syntax defect (kusabi #303)", () => {
 
         await assert.rejects(
           async () => {
-            await runChainDriver({
-              cwd: tmp, stateDir: tmp, chainDir, chainId: "chain-err", container: "cid-1",
+            await runDriver({
+              cwd: tmp, chainDir, chainId: "chain-err",
               model: "fake/model", modelChain: [["fake/model"]], maxRounds: 3,
-              brief: "Implement X.\n", orchestrator: null, baseSha: "abc123", worktreeBaseline: null,
+              brief: "Implement X.\n",
               verifyBaseline: null,
               callTool: async (toolName, params) => fakeChangeScopeResult(params) ?? createFakeCallTool()(toolName, params),
               dispatchWithFallback: customDispatch,
-              keepServe: true,
-              signalReceived: () => false,
-              resume: null,
             });
           },
           {
@@ -4829,24 +4601,7 @@ describe("runChainDriver quota-exhausted review (kusabi #373)", () => {
   const BRIEF = "Implement X.\n\n## Deliverables\n- src/foo.js\n";
   const AGY_ERR = "agy dispatch failed: agy returned no payload {\"status\":\"ERROR\",\"response\":\"\",\"error\":\"Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 1h1m21s.\"}";
 
-  function fakeCallTool() {
-    return async (toolName, params) => {
-      if (toolName === "verify_in_container") return { gate_passed: true };
-      if (toolName !== "sandbox_exec") return { output: "" };
-      const scope = fakeChangeScopeResult(params);
-      if (scope) return scope;
-      const cmd = params.commands[0];
-      if (cmd.startsWith("cd /workspace &&") && cmd.includes("TMPIDX=")) {
-        return { output: "ERROR_NO_INDEX\n" };
-      }
-      if (cmd === "git rev-parse HEAD") return { output: "abc123\n" };
-      if (cmd === "git status --porcelain") return { output: " M src/foo.js\n" };
-      if (cmd === "git log --oneline -5") return { output: "abc123 latest change\n" };
-      if (cmd === "git diff") return { output: "diff --git a/src/foo.js b/src/foo.js\n" };
-      if (cmd === "git ls-files --others --exclude-standard") return { output: "" };
-      return { output: "" };
-    };
-  }
+
 
   it("escalates naming the exhausted pool instead of unexpected verdict: unparseable", async () => {
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-quota-round-"));
@@ -4878,16 +4633,13 @@ describe("runChainDriver quota-exhausted review (kusabi #373)", () => {
           resultText: "implemented",
         };
       };
-      const text = await runChainDriver({
-        cwd: tmp, stateDir: tmp, chainDir, chainId: "chain-test", container: "cid-1",
+      const text = await runDriver({
+        cwd: tmp, chainDir,
         model: "gemini-3.6-flash-high", modelChain: [["gemini-3.6-flash-high"]], maxRounds: 4,
-        brief: BRIEF, orchestrator: null, baseSha: "abc123", worktreeBaseline: null,
+        brief: BRIEF,
         callTool: fakeCallTool(),
         backend: "agy", reviewBackend: "agy",
         dispatchWithFallback: dispatch,
-        keepServe: true,
-        signalReceived: () => false,
-        resume: null,
       });
       assert.match(text, /quota exhausted \(agy individual pool\)/);
       assert.doesNotMatch(text, /unexpected verdict: unparseable/);
@@ -4953,7 +4705,7 @@ describe("runChainDriver change-scope fail-closed (kusabi #379)", () => {
             modelVariant: null, fallbacks: null, sessionID: "sess-rev",
             usage: null, error: null,
           },
-          resultText: JSON.stringify({ schema_version: 1, verdict: "approve", findings: [], summary: "ok", next_steps: [] }),
+          resultText: APPROVE,
         };
       }
       return {
@@ -4978,16 +4730,13 @@ describe("runChainDriver change-scope fail-closed (kusabi #379)", () => {
       status: "running", round: 0, startedAt: new Date().toISOString(),
     });
     const dispatch = recordingDispatch();
-    const text = await runChainDriver({
-      cwd: tmp, stateDir: tmp, chainDir, chainId: "chain-scope", container: "cid-1",
+    const text = await runDriver({
+      cwd: tmp, chainDir, chainId: "chain-scope",
       model: "fake/model", modelChain: [["fake/model"]], maxRounds: 4,
-      brief: BRIEF, orchestrator: null, baseSha: "abc123", worktreeBaseline: null,
+      brief: BRIEF,
       verifyBaseline: { captured: true, gate_passed: true, lint: 0, types: 0, collected: 10, raw: {} },
       callTool: callToolForDriver(changeScopeResult),
       dispatchWithFallback: dispatch,
-      keepServe: true,
-      signalReceived: () => false,
-      resume: null,
     });
     return { tmp, chainDir, text, dispatch };
   }
@@ -5125,7 +4874,7 @@ describe("runChainDriver probe-gate survival on collectChangeScope failure (kusa
             modelVariant: null, fallbacks: null, sessionID: "sess-rev",
             usage: null, error: null,
           },
-          resultText: JSON.stringify({ schema_version: 1, verdict: "approve", findings: [], summary: "ok", next_steps: [] }),
+          resultText: APPROVE,
         };
       }
       return {
@@ -5152,16 +4901,13 @@ describe("runChainDriver probe-gate survival on collectChangeScope failure (kusa
     });
     const callTool = callToolForDriver({ changeScopeFault, probeFault });
     const dispatch = recordingDispatch();
-    await runChainDriver({
-      cwd: tmp, stateDir: tmp, chainDir, chainId, container: "cid-541",
+    await runDriver({
+      cwd: tmp, chainDir, chainId, container: "cid-541",
       model: "fake/model", modelChain: [["fake/model"]], maxRounds: 4,
-      brief: BRIEF, orchestrator: null, baseSha: "abc123", worktreeBaseline: null,
+      brief: BRIEF,
       verifyBaseline: { captured: true, gate_passed: true, lint: 0, types: 0, collected: 10, raw: {} },
       callTool,
       dispatchWithFallback: dispatch,
-      keepServe: true,
-      signalReceived: () => false,
-      resume: null,
     });
     return { tmp, chainDir, callTool, round1: readJson(path.join(chainDir, "round-1.json")) };
   }
@@ -5366,10 +5112,7 @@ describe("runTddExecutor lifecycle", () => {
             usage: { available: true, input: 1, output: 1, reasoning: 0, cacheRead: 0, cacheWrite: 0, cost: 0.01 },
             error: null,
           },
-          resultText: JSON.stringify({
-            schema_version: 1, verdict: "approve", findings: [],
-            summary: "ok", next_steps: [],
-          }),
+          resultText: APPROVE,
         };
       }
       // Detect test-author vs implement phase from the prompt text.
