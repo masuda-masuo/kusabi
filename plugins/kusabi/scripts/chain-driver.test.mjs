@@ -3,12 +3,11 @@ import assert from "node:assert/strict";
 import os from "node:os";
 import path from "node:path";
 import fs from "node:fs";
-import http from "node:http";
 import { spawn } from "node:child_process";
 import crypto from "node:crypto";
 import { dispatchWithFallback } from "./prompt-execution.mjs";
 import { claudeDispatch } from "./claude-dispatch.mjs";
-import { createFakeCallTool } from "./fixtures.mjs";
+import { createFakeCallTool, startMcpStub, McpRpcError } from "./fixtures.mjs";
 import { saveJob } from "./job-store.mjs";
 import {
   runChainDriver,
@@ -3165,76 +3164,36 @@ describe("CLI smoke baseline (kusabi #292)", () => {
     // Every tools/call the child makes, whatever the tool.  A refusal that
     // must fire BEFORE any container work proves itself by leaving this at
     // zero (kusabi #321).
-    let toolsCall = 0;
-    const server = http.createServer((req, res) => {
-      res.on("error", () => {});
-      let body = "";
-      req.on("data", (chunk) => { body += chunk; });
-      req.on("end", () => {
-        let payload = null;
-        try {
-          payload = JSON.parse(body);
-        } catch {
-          // not JSON \u2014 still answer the handshake
-        }
-        if (payload?.method === "tools/call") toolsCall += 1;
-        res.setHeader("mcp-session-id", "stub-session");
-        res.writeHead(200, { "content-type": "text/event-stream" });
-        let callResult = toolResult;
-        const isGitStatus = payload?.method === "tools/call"
-          && payload.params?.name === "sandbox_exec"
-          && payload.params?.arguments?.commands?.[0] === "git status --porcelain";
+    return startMcpStub({
+      onToolCall: (params) => {
+        const isGitStatus = params?.name === "sandbox_exec"
+          && params?.arguments?.commands?.[0] === "git status --porcelain";
         if (isGitStatus) {
           const statuses = Array.isArray(gitStatus) ? gitStatus : [gitStatus];
           const scripted = statuses[gitStatusCalls] ?? "";
           if (scripted === "!THROW!") {
-            res.end("data: {\"jsonrpc\":\"2.0\",\"error\":{\"code\":-32000,\"message\":\"stub rpc exploded\"}}\n\n");
-            return;
+            throw new McpRpcError("stub rpc exploded");
           }
-          callResult = { output: scripted };
           gitStatusCalls++;
+          return { output: scripted };
         }
         // `git rev-parse HEAD` rides in the same capture as the status
         // listing (kusabi #292 follow-up), so it is routed the same way: a
         // string answers every call identically (HEAD never moved), an array
         // one entry per call, "!THROW!" makes that call fail.
-        const isGitHead = payload?.method === "tools/call"
-          && payload.params?.name === "sandbox_exec"
-          && payload.params?.arguments?.commands?.[0] === "git rev-parse HEAD";
+        const isGitHead = params?.name === "sandbox_exec"
+          && params?.arguments?.commands?.[0] === "git rev-parse HEAD";
         if (isGitHead) {
           const heads = Array.isArray(gitHead) ? gitHead : [gitHead];
           const scripted = heads[gitHeadCalls] ?? heads[heads.length - 1] ?? "";
           if (scripted === "!THROW!") {
-            res.end("data: {\"jsonrpc\":\"2.0\",\"error\":{\"code\":-32000,\"message\":\"stub head read exploded\"}}\n\n");
-            return;
+            throw new McpRpcError("stub head read exploded");
           }
-          callResult = { output: `${scripted}\n` };
           gitHeadCalls++;
+          return { output: `${scripted}\n` };
         }
-        const envelope = payload?.method === "tools/call"
-          ? {
-            jsonrpc: "2.0",
-            id: payload.id ?? 1,
-            result: { content: [{ type: "text", text: JSON.stringify(callResult) }] },
-          }
-          : {
-            jsonrpc: "2.0",
-            id: payload?.id ?? 1,
-            result: {
-              protocolVersion: "2024-11-05",
-              capabilities: {},
-              serverInfo: { name: "kusabi-stub", version: "0.0.0" },
-            },
-          };
-        res.end(`data: ${JSON.stringify(envelope)}\n\n`);
-      });
-    });
-    return new Promise((resolve, reject) => {
-      server.once("error", reject);
-      server.listen(0, "127.0.0.1", () => {
-        const { port } = server.address();
-        resolve({ server, url: `http://127.0.0.1:${port}/mcp`, toolsCallCount: () => toolsCall });
-      });
+        return toolResult;
+      },
     });
   }
 

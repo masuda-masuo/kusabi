@@ -294,19 +294,32 @@ export function stubInvestigationSeams(overrides = {}) {
 }
 
 /**
+ * Error class thrown by onToolCall to emit a JSON-RPC error response from startMcpStub.
+ */
+export class McpRpcError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = "McpRpcError";
+  }
+}
+
+/**
  * Start a lightweight MCP HTTP+SSE stub server for testing.
  *
  * Implements the minimal handshake and SSE response expected by MCP clients:
  * - Emits mcp-session-id: stub-session header
  * - Answers non-tools/call with protocolVersion: "2024-11-05" and kusabi-stub serverInfo
  * - Answers tools/call by invoking onToolCall(params) and returning result.content[0].text
+ * - Resolves with toolsCallCount() reporting the number of tools/call requests
+ * - Emits a JSON-RPC error (no id) when onToolCall throws an McpRpcError
  * - Listens on 127.0.0.1 port 0
  *
  * @param {object} [opts]
  * @param {(params: any) => any} [opts.onToolCall]
- * @returns {Promise<{ server: import("node:http").Server, url: string }>}
+ * @returns {Promise<{ server: import("node:http").Server, url: string, toolsCallCount: () => number }>}
  */
 export function startMcpStub({ onToolCall } = {}) {
+  let toolsCall = 0;
   const server = http.createServer((req, res) => {
     res.on("error", () => {});
     let body = "";
@@ -318,11 +331,21 @@ export function startMcpStub({ onToolCall } = {}) {
       } catch {
         // not JSON — still answer the handshake
       }
+      if (payload?.method === "tools/call") toolsCall += 1;
       res.setHeader("mcp-session-id", "stub-session");
       res.writeHead(200, { "content-type": "text/event-stream" });
       let envelope;
       if (payload?.method === "tools/call") {
-        const toolResult = onToolCall ? onToolCall(payload.params) : { output: "" };
+        let toolResult;
+        try {
+          toolResult = onToolCall ? onToolCall(payload.params) : { output: "" };
+        } catch (err) {
+          // Only a deliberate McpRpcError becomes a JSON-RPC error answer; any
+          // other exception is a bug in the test's onToolCall and stays loud.
+          if (!(err instanceof McpRpcError)) throw err;
+          res.end(`data: ${JSON.stringify({ jsonrpc: "2.0", error: { code: -32000, message: err.message } })}\n\n`);
+          return;
+        }
         envelope = {
           jsonrpc: "2.0",
           id: payload.id ?? 1,
@@ -346,7 +369,11 @@ export function startMcpStub({ onToolCall } = {}) {
     server.once("error", reject);
     server.listen(0, "127.0.0.1", () => {
       const { port } = server.address();
-      resolve({ server, url: `http://127.0.0.1:${port}/mcp` });
+      resolve({
+        server,
+        url: `http://127.0.0.1:${port}/mcp`,
+        toolsCallCount: () => toolsCall,
+      });
     });
   });
 }
