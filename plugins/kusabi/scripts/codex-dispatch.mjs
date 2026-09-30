@@ -852,7 +852,7 @@ export async function codexDispatch(opts) {
           ? true
           : null;
     },
-    classifyExit: ({ code, stdout, stderr, state }) => {
+    classifyExit: ({ code, stdout, stderr, state, streamEvents, malformedLines }) => {
       const provenance = job.codexProvenance;
       if (provenance?.state === "mismatch") {
         // Fail closed: no successful result, no fallback/substitution.
@@ -864,7 +864,7 @@ export async function codexDispatch(opts) {
             "no result was written and no substitute model was attempted",
         };
       }
-      if (code !== 0 && code !== null) {
+      if (code !== 0) {
         const detail = (stderr || stdout || "(no output)").trim();
         return {
           status: "error",
@@ -872,11 +872,12 @@ export async function codexDispatch(opts) {
         };
       }
       if (!state.assistantText) {
+        const snippet = (stdout || "").trim().slice(0, 300);
         return {
           status: "error",
           error:
-            "codex produced no terminal assistant message. " +
-            `Received: ${describeCodexResult((stdout || "").trim() || "(empty stdout)")}`,
+            `codex stream produced no terminal result event ` +
+            `(${streamEvents} parsed, ${malformedLines} unparseable line(s)): ${snippet || "(empty stdout)"}`,
         };
       }
       return {

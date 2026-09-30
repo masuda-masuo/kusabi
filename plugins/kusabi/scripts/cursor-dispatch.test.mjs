@@ -78,6 +78,19 @@ if (mode === "no-result") {
   emit({ type: "assistant", message: { content: [{ type: "text", text: "almost" }] } });
   process.exit(0);
 }
+if (mode === "sigkill-after-result") {
+  emit({ type: "thinking", subtype: "delta" });
+  emit({ type: "thinking", subtype: "completed" });
+  emit({ type: "assistant", message: { content: [{ type: "text", text: "ALPHA-7" }] } });
+  emit({ type: "result", subtype: "success", is_error: false, result: "ALPHA-7", usage });
+  process.kill(process.pid, "SIGKILL");
+}
+if (mode === "non-terminal-with-garbage") {
+  emit({ type: "thinking", subtype: "delta" });
+  emit({ type: "assistant", message: { content: [{ type: "text", text: "almost" }] } });
+  process.stdout.write("this is not json at all" + NL);
+  process.exit(0);
+}
 if (mode === "empty-result") {
   emit({ type: "thinking", subtype: "completed" });
   emit({ type: "assistant", message: { content: [{ type: "text", text: "" }] } });
@@ -553,7 +566,7 @@ describe("cursorDispatch (fake cursor-agent)", () => {
     ctx.setMode("no-result");
     const missing = await cursorDispatch(ctx.dispatchOptions());
     assert.equal(missing.job.status, "error");
-    assert.match(missing.job.error, /no terminal result line/);
+    assert.match(missing.job.error, /stream produced no terminal result event/);
     // (kusabi #388) an unmappable status records the "unknown" sentinel, both
     // on the returned job and the persisted record.
     assert.equal(missing.job.stopReason, "unknown");
@@ -569,6 +582,29 @@ describe("cursorDispatch (fake cursor-agent)", () => {
     const exited = await cursorDispatch(ctx.dispatchOptions());
     assert.equal(exited.job.status, "error");
     assert.match(exited.job.error, /exited with code 3/);
+  });
+
+  it("signal death (exit code null) after complete result fails the job: exited with code null", async () => {
+    ctx.setMode("sigkill-after-result");
+    const { job } = await cursorDispatch(ctx.dispatchOptions());
+    assert.equal(job.status, "error");
+    assert.ok(job.error.startsWith("cursor exited with code null"));
+  });
+
+  it("stream of valid non-terminal event lines plus one garbage line, exit 0, no terminal result", async () => {
+    ctx.setMode("non-terminal-with-garbage");
+    const { job } = await cursorDispatch(ctx.dispatchOptions());
+    assert.equal(job.status, "error");
+    assert.match(
+      job.error,
+      /^cursor stream produced no terminal result event \(2 parsed, 1 unparseable line\(s\)\):/,
+    );
+    const events = fs.readFileSync(path.join(jobDir(ctx.stateDir, job.id), "events.ndjson"), "utf8")
+      .trim().split("\n").map(JSON.parse);
+    const finished = events.at(-1);
+    assert.equal(finished.type, "companion.cursor.finished");
+    assert.equal(finished.streamEvents, 2);
+    assert.equal(finished.malformedLines, 1);
   });
 
   it("is_error true with a non-empty result is NOT discarded; the flag is recorded", async () => {

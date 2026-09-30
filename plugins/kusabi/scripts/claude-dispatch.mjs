@@ -1156,14 +1156,12 @@ export async function claudeDispatch(opts) {
   const stream = {
     init: () => ({
       streamAcc: initClaudeStreamAccumulator(),
-      malformedLines: 0,
     }),
     onLine: (state, rawLine, j) => {
       const evt = parseClaudeStreamLine(rawLine);
       if (evt === null) {
         // Not fatal (a leading non-JSON warning line has been observed on
         // the real CLI) — just not countable as a parsed event.
-        state.malformedLines += 1;
         return false;
       }
       applyClaudeStreamEvent(state.streamAcc, evt);
@@ -1419,7 +1417,7 @@ export async function claudeDispatch(opts) {
           }
         },
       }),
-    classifyExit: ({ code, stdout, stderr, state, job: j, runResult }) => {
+    classifyExit: ({ code, stdout, stderr, state, job: j, runResult, streamEvents, malformedLines }) => {
       const { writeStalled, repeatStalled } = runResult || {};
       if (repeatStalled) {
         // The repeat-tool watchdog killed the group (kusabi #234).  Same
@@ -1471,7 +1469,7 @@ export async function claudeDispatch(opts) {
         return {
           status: "error",
           error: `claude stream produced no terminal result event ` +
-            `(${state.streamAcc.events} parsed, ${state.malformedLines} unparseable line(s)): ${snippet || "(empty stdout)"}`,
+            `(${streamEvents} parsed, ${malformedLines} unparseable line(s)): ${snippet || "(empty stdout)"}`,
         };
       }
 
@@ -1541,13 +1539,11 @@ export async function claudeDispatch(opts) {
     // event still leaves whatever `system`/`init` reported — the only source
     // of a session id when nothing else names one (kusabi #215 Job B item 5).
     fallbackSessionId: ({ state }) => state.streamAcc.sessionIdFromInit ?? null,
-    finishedEvent: ({ state, job: j, code }) => ({
+    finishedEvent: ({ job: j, code }) => ({
       type: "companion.claude.finished",
       status: j.status,
       sessionId: j.sessionID,
       exitCode: code,
-      streamEvents: state.streamAcc.events,
-      malformedLines: state.malformedLines,
     }),
   });
 }

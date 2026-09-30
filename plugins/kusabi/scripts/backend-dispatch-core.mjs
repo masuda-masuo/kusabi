@@ -34,6 +34,31 @@ function capacityReasonOf(job) {
     : null;
 }
 
+// The trail keeps its dispatch/finished bookends so auditing tools see no
+// hole; `spawned` tells a refusal apart from a run, and stream health counts
+// (streamEvents, malformedLines) reflect what arrived before finish.
+function appendFinishedEvent(stateDir, jobId, finishedEvent, {
+  state,
+  job,
+  code,
+  resultText,
+  streamEvents,
+  malformedLines,
+  spawned,
+}) {
+  const finishedPayload = typeof finishedEvent === "function"
+    ? finishedEvent({ state, job, code, resultText, streamEvents, malformedLines })
+    : finishedEvent;
+  if (finishedPayload) {
+    appendEvent(stateDir, jobId, {
+      ...finishedPayload,
+      streamEvents,
+      malformedLines,
+      spawned,
+    });
+  }
+}
+
 /**
  * Run the standard backend dispatch lifecycle.
  *
@@ -50,9 +75,9 @@ function capacityReasonOf(job) {
  * @param {number|null} [opts.timeoutS] - Timeout in seconds.
  * @param {number|null} [opts.watchdogS] - Watchdog silence threshold in seconds.
  * @param {Function} [opts.afterProcess] - Hook run after process exit before classification.
- * @param {Function} [opts.classifyExit] - ({ code, stdout, stderr, state, job, runResult }) => ExitOutcome. A backend opts in to capacity classification by returning failure. Exit-code-versus-payload precedence is the backend's decision, see docs/design/phase-chain.md.
+ * @param {Function} [opts.classifyExit] - ({ code, stdout, stderr, state, job, runResult, streamEvents, malformedLines }) => ExitOutcome. A backend opts in to capacity classification by returning failure. Exit-code-versus-payload precedence is the backend's decision, see docs/design/phase-chain.md.
  * @param {Function} [opts.fallbackSessionId] - Optional ({ state, job }) => string|null for fallback session ID before finished event.
- * @param {Function|object} [opts.finishedEvent] - Finished event payload or builder function.
+ * @param {Function|object} [opts.finishedEvent] - Finished event payload or builder function ({ state, job, code, resultText, streamEvents, malformedLines }) => object.
  * @param {string} [opts.resultBackend] - Backend identifier for result recovery.
  * @param {Function} [opts.transformResultText] - Optional (text, { job, state }) => string.
  * @returns {Promise<{ job: object, resultText: string, stateDir: string }>}
@@ -112,14 +137,15 @@ export async function runBackendDispatch({
         } else if (refusal.event) {
           appendEvent(stateDir, job.id, refusal.event);
         }
-        // The trail keeps its dispatch/finished bookends so auditing tools see
-        // no hole; `spawned: false` is what tells this apart from a run.
-        const finishedPayload = typeof finishedEvent === "function"
-          ? finishedEvent({ state: streamState, job, code: null, resultText: "" })
-          : finishedEvent;
-        if (finishedPayload) {
-          appendEvent(stateDir, job.id, { ...finishedPayload, spawned: false });
-        }
+        appendFinishedEvent(stateDir, job.id, finishedEvent, {
+          state: streamState,
+          job,
+          code: null,
+          resultText: "",
+          streamEvents: 0,
+          malformedLines: 0,
+          spawned: false,
+        });
         job.stopReason = deriveStopReason({
           status: job.status,
           stats: job.stats,
@@ -131,13 +157,24 @@ export async function runBackendDispatch({
     }
 
     let spawned = false;
+    let streamEvents = 0;
+    let malformedLines = 0;
     let lastStatsSaveAt = 0;
 
     const onLine = (rawLine) => {
+      const isBlank = typeof rawLine === "string" ? !rawLine.trim() : !rawLine;
       if (typeof stream?.onLine === "function") {
         const handled = stream.onLine(streamState, rawLine, job);
-        if (handled === false || handled === null) return;
+        if (handled === false || handled === null) {
+          if (!isBlank) {
+            malformedLines += 1;
+          }
+          return;
+        }
+      } else if (isBlank) {
+        return;
       }
+      streamEvents += 1;
       const now = Date.now();
       if (now - lastStatsSaveAt >= STATS_SAVE_INTERVAL_MS) {
         lastStatsSaveAt = now;
@@ -208,6 +245,8 @@ export async function runBackendDispatch({
         state: streamState,
         job,
         runResult: processResult,
+        streamEvents,
+        malformedLines,
       });
 
       if (exitOutcome) {
@@ -264,12 +303,15 @@ export async function runBackendDispatch({
       }
     }
 
-    const finishedPayload = typeof finishedEvent === "function"
-      ? finishedEvent({ state: streamState, job, code, resultText })
-      : finishedEvent;
-    if (finishedPayload) {
-      appendEvent(stateDir, job.id, { ...finishedPayload, spawned });
-    }
+    appendFinishedEvent(stateDir, job.id, finishedEvent, {
+      state: streamState,
+      job,
+      code,
+      resultText,
+      streamEvents,
+      malformedLines,
+      spawned,
+    });
 
     // Record the closed terminal reason (kusabi #388). The dispatch finalizes its
     // job.json on this path and never calls deriveStopReason via an SSE fold,

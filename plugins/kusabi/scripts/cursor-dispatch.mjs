@@ -655,9 +655,9 @@ export async function cursorDispatch(opts) {
         ...hooks,
       }),
     stream,
-    classifyExit: ({ code, stdout, stderr, state }) => {
+    classifyExit: ({ code, stdout, stderr, state, streamEvents, malformedLines }) => {
       const lastResult = state.lastResult;
-      if (code !== 0 && code !== null) {
+      if (code !== 0) {
         const detail = (stderr || stdout || "(no output)").trim();
         const error =
           `cursor exited with code ${code}: ${describeCursorResult(detail)}` +
@@ -670,11 +670,12 @@ export async function cursorDispatch(opts) {
         return { status: "error", error, ...extra };
       }
       if (!lastResult) {
+        const snippet = (stdout || "").trim().slice(0, 300);
         return {
           status: "error",
           error:
-            "cursor produced no terminal result line. " +
-            `Received: ${describeCursorResult((stdout || "").trim() || "(empty stdout)")}`,
+            `cursor stream produced no terminal result event ` +
+            `(${streamEvents} parsed, ${malformedLines} unparseable line(s)): ${snippet || "(empty stdout)"}`,
         };
       }
       const outcome = cursorPayload(lastResult);

@@ -1063,14 +1063,13 @@ export async function agyDispatch(opts) {
         ...hooks,
       }),
     stream,
-    classifyExit: ({ code, stdout, stderr, state }) => {
+    classifyExit: ({ code, stdout, stderr, state, streamEvents, malformedLines }) => {
       // Parse FIRST, exit code second.  The payload rule is about not throwing
       // away completed work on a signal that is not authoritative, and a
       // nonzero exit accompanying a complete payload is the same class of
       // signal as `status: "ERROR"`.  A nonzero exit with NO payload still
       // fails, and its error names the exit code.
       let parsed = null;
-      let parseError = null;
       // The terminal payload is the stream's LAST `result` event's inner
       // object — byte-shape-identical to what `--output-format json` used to
       // print (measured 2026-08-20), so every downstream consumer receives
@@ -1085,8 +1084,8 @@ export async function agyDispatch(opts) {
       } else {
         try {
           parsed = parseAgyResult(stdout);
-        } catch (err) {
-          parseError = err;
+        } catch {
+          // unparseable stdout falls through to exit check or terminal error below
         }
       }
 
@@ -1174,7 +1173,9 @@ export async function agyDispatch(opts) {
       const snippet = (stdout || "").trim().slice(0, 300);
       return {
         status: "error",
-        error: `agy dispatch failed: ${parseError.message}: ${snippet || "(empty stdout)"}`,
+        error:
+          `agy stream produced no terminal result event ` +
+          `(${streamEvents} parsed, ${malformedLines} unparseable line(s)): ${snippet || "(empty stdout)"}`,
         sessionID: state.conversationIdFromInit ?? null,
       };
     },
