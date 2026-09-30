@@ -1847,3 +1847,25 @@ describe("production seam: the real sunaba-rpc bridge dispatches read_probe (rev
     assert.match(result, /disposition=recommend-escalate/);
   });
 });
+describe("investigation guard refuses codex seats", () => {
+  it("refuses a job whose model is codex/gpt-6.1-sol", async () => {
+    const { defaultInvestigationDispatch } = await lunaDriver();
+    await assert.rejects(
+      defaultInvestigationDispatch({
+        cwd: os.tmpdir(),
+        brief: MISSION_BRIEF,
+        container: "test-cid",
+        _dispatch: async () => ({
+          job: {
+            id: "job-inv-guard",
+            status: "completed",
+            modelEntry: "codex/gpt-6.1-sol",
+          },
+          resultText: "## Fact sheet\n- candidate deliverables",
+          stateDir: null,
+        }),
+      }),
+      /investigation cannot route to a codex seat \(codex\/gpt-6\.1-sol\)/,
+    );
+  });
+});

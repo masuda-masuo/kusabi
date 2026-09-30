@@ -80,6 +80,7 @@ import { parseCoordinatorOutput } from "./coordinator-parse.mjs";
 import { buildAuditEnvelope, truncateEvidenceText } from "./audit-envelope.mjs";
 import { hasSectionHeading, parseDeliverables, stampInnerBriefSignature, parseOrchestratorSignature } from "./brief-parsing.mjs";
 import { mintChainId } from "./chain-phases.mjs";
+import { CODEX_SUPPORTED_MODELS } from "./codex-dispatch.mjs";
 import {
   loadCoordinatorSchema,
   renderCoordinatorContract,
@@ -1004,7 +1005,7 @@ export function renderFactSheet({ jobId, actualModel, baseline, body }) {
 /**
  * Default investigation dispatch: routes through the plan phase's configured
  * model chain against the mission container, using agent kusabi-plan (kusabi #591).
- * Never defaults to a codex seat (gpt-5.6-luna / gpt-5.6-sol).
+ * Never defaults to a codex seat (any id in `CODEX_SUPPORTED_MODELS`).
  *
  * @param {object} input
  * @param {string} input.cwd
@@ -1051,8 +1052,7 @@ export async function defaultInvestigationDispatch({
   const actualModel = job.modelEntry ?? requestedModel;
 
   if (
-    actualModel.includes("gpt-5.6-luna") ||
-    actualModel.includes("gpt-5.6-sol") ||
+    CODEX_SUPPORTED_MODELS.some((seat) => actualModel.includes(seat)) ||
     job.backend === "codex"
   ) {
     throw new Error(`investigation cannot route to a codex seat (${actualModel})`);

@@ -22,6 +22,7 @@ import {
   CODEX_BACKEND,
   CODEX_DEFAULT_CHAIN,
   CODEX_SUPPORTED_MODELS,
+  formatCodexSupportedModels,
   CODEX_SANDBOX_POLICY,
   codexBin,
   validateCodexModel,
@@ -354,7 +355,7 @@ describe("codexBin", () => {
 
 describe("validateCodexModel", () => {
   it("accepts exactly the supported seat ids", () => {
-    assert.deepEqual(CODEX_SUPPORTED_MODELS, ["gpt-5.6-luna", "gpt-5.6-sol"]);
+    assert.deepEqual(CODEX_SUPPORTED_MODELS, ["gpt-5.6-luna", "gpt-5.6-sol", "gpt-6-luna", "gpt-6.1-sol"]);
     for (const id of CODEX_SUPPORTED_MODELS) {
       assert.equal(validateCodexModel(id), id);
     }
@@ -378,6 +379,20 @@ describe("validateCodexModel", () => {
       () => validateCodexModel("gpt-5.7-future"),
       /does not support model "gpt-5.7-future"/,
     );
+  });
+
+  it("rejects an unlisted model id such as gpt-6-sol, naming every supported id", () => {
+    assert.throws(
+      () => validateCodexModel("gpt-6-sol"),
+      /codex backend does not support model "gpt-6-sol" — v1 executes the exact seat ids gpt-5.6-luna, gpt-5.6-sol, gpt-6-luna and gpt-6.1-sol/,
+    );
+  });
+});
+
+describe("formatCodexSupportedModels", () => {
+  it("formats the list with conjunction", () => {
+    assert.equal(formatCodexSupportedModels("or"), "gpt-5.6-luna, gpt-5.6-sol, gpt-6-luna or gpt-6.1-sol");
+    assert.equal(formatCodexSupportedModels("and"), "gpt-5.6-luna, gpt-5.6-sol, gpt-6-luna and gpt-6.1-sol");
   });
 });
 
@@ -1345,6 +1360,36 @@ describe("codexDispatch (fake codex)", () => {
     assert.equal(job.status, "error");
     assert.match(job.error, /requested reasoning-effort high but the recorded rollout shows low/);
     assert.equal(fs.existsSync(path.join(jobDir(ctx.stateDir, job.id), "result.md")), false);
+  });
+
+  it("fake-codex dispatch requesting gpt-6.1-sol with a matching rollout completes with verified provenance", async () => {
+    const customCtx = fakeCodexContext({ model: "gpt-6.1-sol" });
+    try {
+      const { job, resultText } = await codexDispatch(customCtx.dispatchOptions({ explicitModel: "gpt-6.1-sol" }));
+      assert.equal(job.status, "completed");
+      assert.equal(job.modelEntry, "gpt-6.1-sol");
+      assert.equal(job.codexProvenance.state, "verified");
+      assert.equal(job.codexProvenance.model, "gpt-6.1-sol");
+      assert.equal(job.substituted, false);
+      assert.equal(resultText, "ALPHA-7");
+    } finally {
+      customCtx.restore();
+    }
+  });
+
+  it("fake-codex dispatch requesting gpt-6.1-sol with a rollout recording gpt-5.6-sol fails closed as a mismatch", async () => {
+    const customCtx = fakeCodexContext({ model: "gpt-6.1-sol", mismatchModel: "gpt-5.6-sol" });
+    try {
+      customCtx.setMode("mismatch-model");
+      const { job, resultText } = await codexDispatch(customCtx.dispatchOptions({ explicitModel: "gpt-6.1-sol" }));
+      assert.equal(job.status, "error");
+      assert.match(job.error, /codex provenance mismatch: requested model gpt-6.1-sol but the recorded rollout shows gpt-5.6-sol/);
+      assert.equal(resultText, "");
+      assert.equal(job.codexProvenance.state, "mismatch");
+      assert.equal(job.substituted, true);
+    } finally {
+      customCtx.restore();
+    }
   });
 
   it("missing rollout is unverifiable but the run still completes (provenance marked, not claimed)", async () => {
