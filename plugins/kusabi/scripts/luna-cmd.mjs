@@ -3,7 +3,7 @@
 // Four adapters on top of the mission machinery:
 //
 //   cmdLuna        — run a luna mission in the foreground (the driver runs
-//                    the gpt-5.6-luna coordinator and executes its bounded
+//                    the gpt-6-luna coordinator and executes its bounded
 //                    requests deterministically).
 //   cmdLunaDetach  — launch a luna mission in a detached background process
 //                    and print the exact `kusabi-companion luna-wait
@@ -17,8 +17,8 @@
 //                    errors/consults, state and recommendation.
 //
 // Both creating commands require `--container <cid>` and
-// `--mission-file <path>`.  The seats default to the exact codex/gpt-5.6-luna
-// coordinator and codex/gpt-5.6-sol auditor; any substitution is refused
+// `--mission-file <path>`.  The seats default to the exact codex/gpt-6-luna
+// coordinator and codex/gpt-6.1-sol auditor; any substitution is refused
 // BEFORE mission creation unless `--allow-substitute` explicitly authorizes
 // it, and authorized substitution is loud in the records and rendered output.
 
@@ -56,9 +56,13 @@ import { reconcileMissionState, missionHasLiveJob } from "./luna-reconcile.mjs";
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const COMPANION_SCRIPT = path.join(HERE, "kusabi-companion.mjs");
 
-/** The exact default seats of #530. */
-export const DEFAULT_COORDINATOR_SEAT = { provider: "codex", model: "gpt-5.6-luna" };
-export const DEFAULT_AUDITOR_SEAT = { provider: "codex", model: "gpt-5.6-sol" };
+import {
+  DEFAULT_COORDINATOR_SEAT,
+  DEFAULT_AUDITOR_SEAT,
+} from "./luna-driver.mjs";
+
+/** The exact default seats of #530 (defined in luna-driver.mjs; re-exported for callers). */
+export { DEFAULT_COORDINATOR_SEAT, DEFAULT_AUDITOR_SEAT };
 
 /**
  * The mission-owned guarded serve cleanup used when cmdLunaResume settles a
@@ -137,7 +141,7 @@ export function readMissionFile(missionFile) {
  * Resolve the coordinator/auditor seats from the mission flags.
  *
  * `--coordinator-model <provider/model>` and `--auditor-model <provider/model>`
- * select the seats (defaults: codex/gpt-5.6-luna and codex/gpt-5.6-sol).  A
+ * select the seats (defaults: codex/gpt-6-luna and codex/gpt-6.1-sol).  A
  * non-codex provider is refused outright; any model substitution is refused
  * unless `--allow-substitute` authorizes it.
  *

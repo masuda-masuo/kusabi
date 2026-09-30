@@ -483,7 +483,7 @@ function resolveCursorPhaseDispatch({ flags, phase, config, modelSpec }) {
  * `codex/` prefix.
  *
  * The branch never invents a model: an explicit `--model` must be one exact
- * seat id (`gpt-5.6-luna` or `gpt-5.6-sol`), and a config chain is validated
+ * seat id (one of `CODEX_SUPPORTED_MODELS` in codex-dispatch.mjs), and a config chain is validated
  * with `validateCodexChain` so a mixed chain that routes through this branch
  * fails loudly at command start (codex does not walk capacity ladders — an
  * explicit pin is never substituted after a terminal failure).

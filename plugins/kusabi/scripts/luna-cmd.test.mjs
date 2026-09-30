@@ -210,9 +210,49 @@ describe("luna CLI surfaces (kusabi #530 criteria 1, 2, 9, 10)", () => {
     assert.equal(out, "mission done: recommend-accept");
     assert.equal(received.container, "test-cid");
     assert.equal(received.brief, MISSION_BRIEF, "cmdLuna resolves the mission file text for the driver");
-    assert.deepEqual(received.coordinator, { provider: "codex", model: "gpt-5.6-luna", substituted: false });
-    assert.deepEqual(received.auditor, { provider: "codex", model: "gpt-5.6-sol", substituted: false });
+    assert.deepEqual(received.coordinator, { provider: "codex", model: "gpt-6-luna", substituted: false });
+    assert.deepEqual(received.auditor, { provider: "codex", model: "gpt-6.1-sol", substituted: false });
     assert.equal(received.allowSubstitute, false);
+  });
+
+  it("a mission started without seat flags resolves coordinator codex/gpt-6-luna and auditor codex/gpt-6.1-sol, both substituted: false, and --coordinator-model codex/gpt-5.6-luna without --allow-substitute is refused", async () => {
+    const mod = await lunaCmd();
+    const seats = mod.resolveMissionSeats({});
+    assert.deepEqual(seats.coordinator, { provider: "codex", model: "gpt-6-luna", substituted: false });
+    assert.deepEqual(seats.auditor, { provider: "codex", model: "gpt-6.1-sol", substituted: false });
+    assert.equal(seats.coordinator.substituted, false);
+    assert.equal(seats.auditor.substituted, false);
+
+    let received = null;
+    const driver = {
+      run: async (input) => {
+        received = input;
+        return "mission done";
+      },
+    };
+    await mod.cmdLuna(
+      cwd,
+      { flags: { container: "test-cid", "mission-file": missionFile }, text: "" },
+      { inject: { runLunaMission: driver.run } },
+    );
+    assert.deepEqual(received.coordinator, { provider: "codex", model: "gpt-6-luna", substituted: false });
+    assert.deepEqual(received.auditor, { provider: "codex", model: "gpt-6.1-sol", substituted: false });
+
+    await assert.rejects(
+      mod.cmdLuna(
+        cwd,
+        {
+          flags: {
+            container: "test-cid",
+            "mission-file": missionFile,
+            "coordinator-model": "codex/gpt-5.6-luna",
+          },
+          text: "",
+        },
+        { inject: { runLunaMission: driver.run } },
+      ),
+      /substitution refused: requested model "gpt-5\.6-luna" is not the exact seat gpt-6-luna/i,
+    );
   });
 
   it("cmdLuna passes an authorized substitution through with the exact model", async () => {

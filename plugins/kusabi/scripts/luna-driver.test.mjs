@@ -241,8 +241,8 @@ const INVALID_RUN_CHAIN_BRIEF = [
 ].join("\n");
 
 const DEFAULT_SEATS = {
-  coordinator: { provider: "codex", model: "gpt-5.6-luna" },
-  auditor: { provider: "codex", model: "gpt-5.6-sol" },
+  coordinator: { provider: "codex", model: "gpt-6-luna" },
+  auditor: { provider: "codex", model: "gpt-6.1-sol" },
 };
 
 const DEFAULT_BUDGET = { maxChains: 3, maxAttempts: 2, maxProbes: 5 };
@@ -390,7 +390,7 @@ describe("luna mission driver (kusabi #530 criteria 4-8)", () => {
     );
     assert.match(
       stampedLines[0],
-      /^Orchestrator: gpt-5.6-luna \| session mission-[a-z0-9]+ \| \d{4}-\d{2}-\d{2}$/,
+      /^Orchestrator: gpt-6-luna \| session mission-[a-z0-9]+ \| \d{4}-\d{2}-\d{2}$/,
       "the seam must receive exactly one canonical signature as line 1",
     );
     assert.equal(
@@ -399,7 +399,7 @@ describe("luna mission driver (kusabi #530 criteria 4-8)", () => {
       "remaining content must be byte-stable apart from the removed first-five signature and the leading insertion",
     );
     assert.ok(chain.calls[0].input.orchestrator, "the seam must receive a non-null parsed orchestrator attribution");
-    assert.equal(chain.calls[0].input.orchestrator.model, "gpt-5.6-luna");
+    assert.equal(chain.calls[0].input.orchestrator.model, "gpt-6-luna");
     assert.equal(chain.calls[0].input.orchestrator.session, record.missionId, "the canonical session must be the mission id");
     assert.match(chain.calls[0].input.orchestrator.date, /^\d{4}-\d{2}-\d{2}$/, "the canonical date must be a UTC YYYY-MM-DD dispatch date");
     assert.equal(chain.calls[0].input.flags.container, "test-cid");
@@ -424,9 +424,9 @@ describe("luna mission driver (kusabi #530 criteria 4-8)", () => {
 
     // Exact default seat provenance.
     assert.equal(record.coordinator.provider, "codex");
-    assert.equal(record.coordinator.model, "gpt-5.6-luna");
+    assert.equal(record.coordinator.model, "gpt-6-luna");
     assert.equal(record.coordinator.substituted, false);
-    assert.equal(record.auditor.model, "gpt-5.6-sol");
+    assert.equal(record.auditor.model, "gpt-6.1-sol");
 
     // The host-facing recommendation artifact names the recommendation.
     const recFile = path.join(missionDir, "recommendation.md");
@@ -692,7 +692,7 @@ describe("luna mission driver (kusabi #530 criteria 4-8)", () => {
         brief: MISSION_BRIEF,
         container: "test-cid",
         coordinator: { provider: "codex", model: "gpt-5.6-luna-mini" },
-        auditor: { provider: "codex", model: "gpt-5.6-sol" },
+        auditor: { provider: "codex", model: "gpt-6.1-sol" },
         allowSubstitute: false,
         budget: DEFAULT_BUDGET,
         inject: { coordinatorDispatch: coord.dispatch, runChainLifecycle: chain.run, callTool: tools.callTool },
@@ -725,7 +725,7 @@ describe("luna mission driver (kusabi #530 criteria 4-8)", () => {
         brief: MISSION_BRIEF,
         container: "test-cid",
         coordinator: { provider: "opencode", model: "deepseek-v4-flash" },
-        auditor: { provider: "codex", model: "gpt-5.6-sol" },
+        auditor: { provider: "codex", model: "gpt-6.1-sol" },
         allowSubstitute: true,
         budget: DEFAULT_BUDGET,
         inject: { coordinatorDispatch: coord.dispatch, runChainLifecycle: makeChainFake().run, callTool: makeToolFake().callTool },
@@ -845,9 +845,9 @@ describe("mission record observability fields (kusabi #532 criterion 2)", () => 
     await runMission([finishStream("recommend-escalate")]);
     const { record } = readMission();
     assert.equal(record.coordinator.provider, "codex");
-    assert.equal(record.coordinator.model, "gpt-5.6-luna");
-    assert.equal(record.coordinator.requested, "gpt-5.6-luna");
-    assert.equal(record.coordinator.actual, "gpt-5.6-luna");
+    assert.equal(record.coordinator.model, "gpt-6-luna");
+    assert.equal(record.coordinator.requested, "gpt-6-luna");
+    assert.equal(record.coordinator.actual, "gpt-6-luna");
     assert.equal(record.coordinator.substituted, false);
     assert.equal(record.coordinator.reasoningEffort, "high", "the coordinator seat must record its reasoning effort");
     assert.equal(record.auditor.reasoningEffort, "high", "the auditor seat must record its reasoning effort");

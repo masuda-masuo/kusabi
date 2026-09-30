@@ -1,6 +1,6 @@
 // mission-store.mjs — kusabi #530: the mission state store.
 //
-// A luna mission is a separate, opt-in dispatch surface: the gpt-5.6-luna
+// A luna mission is a separate, opt-in dispatch surface: the gpt-6-luna
 // coordinator proposes bounded actions, and a deterministic driver validates
 // and executes them (luna-driver.mjs).  This module owns where that mission
 // state lives and how it is written:
