@@ -1937,6 +1937,50 @@ describe("claudeDispatch (fake claude binary)", () => {
     assert.equal(args[args.indexOf("--resume") + 1], "claude-uuid-echo-1");
   });
 
+  it("shows toolDeniesEnforced and toolDeniesUnenforced on job and start event", async () => {
+    const { job } = await claudeDispatch(ctx.dispatchOptions({
+      tools: { bash: false },
+    }));
+    assert.deepEqual(job.toolDeniesEnforced, ["bash"]);
+    assert.deepEqual(job.toolDeniesUnenforced, []);
+    const events = fs.readFileSync(path.join(jobDir(ctx.stateDir, job.id), "events.ndjson"), "utf8")
+      .trim().split("\n").map(JSON.parse);
+    const startEvent = events[0];
+    assert.deepEqual(startEvent.toolDeniesEnforced, ["bash"]);
+    assert.deepEqual(startEvent.toolDeniesUnenforced, []);
+  });
+
+  it("start event records resume: true when matching session provenance is passed and resume: false otherwise", async () => {
+    const resumed = await claudeDispatch(ctx.dispatchOptions({
+      session: "claude-session-123",
+      sessionProvenance: "claude",
+    }));
+    const resumedEvents = fs.readFileSync(path.join(jobDir(ctx.stateDir, resumed.job.id), "events.ndjson"), "utf8")
+      .trim().split("\n").map(JSON.parse);
+    assert.equal(resumedEvents[0].resume, true);
+
+    const fresh = await claudeDispatch(ctx.dispatchOptions());
+    const freshEvents = fs.readFileSync(path.join(jobDir(ctx.stateDir, fresh.job.id), "events.ndjson"), "utf8")
+      .trim().split("\n").map(JSON.parse);
+    assert.equal(freshEvents[0].resume, false);
+  });
+
+  it("finished event records assistantChars equal to answer length on completed run and 0 on run with no terminal result", async () => {
+    const completed = await claudeDispatch(ctx.dispatchOptions());
+    const completedEvents = fs.readFileSync(path.join(jobDir(ctx.stateDir, completed.job.id), "events.ndjson"), "utf8")
+      .trim().split("\n").map(JSON.parse);
+    const completedFinished = completedEvents.find((e) => e.type === "companion.claude.finished");
+    assert.equal(completedFinished.assistantChars, "implemented the thing per the brief".length);
+
+    ctx.restore();
+    ctx = fakeClaudeContext("exit");
+    const noResult = await claudeDispatch(ctx.dispatchOptions());
+    const noResultEvents = fs.readFileSync(path.join(jobDir(ctx.stateDir, noResult.job.id), "events.ndjson"), "utf8")
+      .trim().split("\n").map(JSON.parse);
+    const noResultFinished = noResultEvents.find((e) => e.type === "companion.claude.finished");
+    assert.equal(noResultFinished.assistantChars, 0);
+  });
+
   it("rejects an opencode-shaped session id (ses_*) loudly, before any process or job record", async () => {
     await assert.rejects(
       () => claudeDispatch(ctx.dispatchOptions({ session: "ses_xyz" })),

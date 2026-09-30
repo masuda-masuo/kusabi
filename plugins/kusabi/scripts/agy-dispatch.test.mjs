@@ -2271,6 +2271,49 @@ describe("agyDispatch (fake agy binary)", () => {
       ["--output-format", "--model", "--print-timeout"]);
   });
 
+  it("shows toolDeniesEnforced and toolDeniesUnenforced on job and start event", async () => {
+    const { job } = await agyDispatch(ctx.dispatchOptions({
+      tools: { bash: false },
+    }));
+    assert.deepEqual(job.toolDeniesEnforced, []);
+    assert.deepEqual(job.toolDeniesUnenforced, ["bash"]);
+    const events = fs.readFileSync(path.join(jobDir(ctx.stateDir, job.id), "events.ndjson"), "utf8")
+      .trim().split("\n").map(JSON.parse);
+    const startEvent = events[0];
+    assert.deepEqual(startEvent.toolDeniesEnforced, []);
+    assert.deepEqual(startEvent.toolDeniesUnenforced, ["bash"]);
+  });
+
+  it("start event records resume: true when matching session provenance is passed and resume: false otherwise", async () => {
+    const resumed = await agyDispatch(ctx.dispatchOptions({
+      session: "6f5f0f1e-0000-4a1b-9c2d-1122334455aa",
+      sessionProvenance: "agy",
+    }));
+    const resumedEvents = fs.readFileSync(path.join(jobDir(ctx.stateDir, resumed.job.id), "events.ndjson"), "utf8")
+      .trim().split("\n").map(JSON.parse);
+    assert.equal(resumedEvents[0].resume, true);
+
+    const fresh = await agyDispatch(ctx.dispatchOptions());
+    const freshEvents = fs.readFileSync(path.join(jobDir(ctx.stateDir, fresh.job.id), "events.ndjson"), "utf8")
+      .trim().split("\n").map(JSON.parse);
+    assert.equal(freshEvents[0].resume, false);
+  });
+
+  it("finished event records assistantChars equal to answer length on completed run and 0 on run with no terminal result", async () => {
+    const completed = await agyDispatch(ctx.dispatchOptions());
+    const completedEvents = fs.readFileSync(path.join(jobDir(ctx.stateDir, completed.job.id), "events.ndjson"), "utf8")
+      .trim().split("\n").map(JSON.parse);
+    const completedFinished = completedEvents.find((e) => e.type === "companion.agy.finished");
+    assert.equal(completedFinished.assistantChars, "implemented the thing per the brief".length);
+
+    ctx.setMode("no-result");
+    const noResult = await agyDispatch(ctx.dispatchOptions());
+    const noResultEvents = fs.readFileSync(path.join(jobDir(ctx.stateDir, noResult.job.id), "events.ndjson"), "utf8")
+      .trim().split("\n").map(JSON.parse);
+    const noResultFinished = noResultEvents.find((e) => e.type === "companion.agy.finished");
+    assert.equal(noResultFinished.assistantChars, 0);
+  });
+
   it("rejects a session before spawning anything and before any job record exists", async () => {
     // ses_* is refused on SHAPE alone; a bare UUID is refused when the
     // caller has not established its provenance (the backstop fails closed).
