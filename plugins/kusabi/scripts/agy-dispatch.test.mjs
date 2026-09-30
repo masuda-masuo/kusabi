@@ -1738,6 +1738,10 @@ if (mode === "no-result") {
   emitToolStep(1, "bash", "DONE", { name: "bash", parameters: { command: "ls" } });
   process.exit(0);
 }
+if (mode === "init-then-exit") {
+  emitInit();
+  process.exit(1);
+}
 if (mode === "step-error") {
   // A tool step that ends in ERROR is still ONE step and still refreshes
   // lastTool (the failure line carries tool_name too).
@@ -2053,6 +2057,13 @@ describe("agyDispatch (fake agy binary)", () => {
     assert.equal(job.status, "error");
     assert.match(job.error, /agy exited with code 3/);
     assert.match(job.error, /model not available/);
+  });
+
+  it("an agy job whose stream printed an init line with a conversation id and then exited non-zero with no result payload ends with that id as job.sessionID", async () => {
+    ctx.setMode("init-then-exit");
+    const { job } = await agyDispatch(ctx.dispatchOptions());
+    assert.equal(job.status, "error");
+    assert.equal(job.sessionID, "6f5f0f1e-0000-4a1b-9c2d-1122334455aa");
   });
 
   it("a spawn failure is a failed job, not a throw", async () => {
@@ -3480,18 +3491,37 @@ describe("agyDispatch — an oversized argv is refused before the spawn", () => 
 
     const events = fs.readFileSync(path.join(jdir, "events.ndjson"), "utf8")
       .trim().split("\n").map(JSON.parse);
-    assert.equal(events.length, 1);
-    assert.equal(events[0].type, "companion.agy.argv-too-large");
-    assert.equal(events[0].backend, "agy");
-    assert.equal(events[0].model, "gemini-3.6-flash-high");
-    assert.equal(events[0].limit, AGY_MAX_ARG_BYTES);
+    assert.equal(events.length, 3);
+    assert.equal(events[0].type, "companion.agy.dispatch");
+    assert.equal(events[1].type, "companion.agy.argv-too-large");
+    assert.equal(events[1].backend, "agy");
+    assert.equal(events[1].model, "gemini-3.6-flash-high");
+    assert.equal(events[1].limit, AGY_MAX_ARG_BYTES);
     // The MEASURED sizes, so the refusal can be checked rather than trusted.
-    assert.deepEqual(events[0].oversized, [
+    assert.deepEqual(events[1].oversized, [
       { index: 1, element: "prompt", flag: "-p", bytes: AGY_MAX_ARG_BYTES + 1 },
     ]);
-    // No dispatch event: nothing was dispatched.
-    assert.deepEqual(events.filter((e) => e.type === "companion.agy.dispatch"), []);
-    assert.deepEqual(events.filter((e) => e.type === "companion.agy.finished"), []);
+    assert.equal(events[2].type, "companion.agy.finished");
+    assert.equal(events[2].spawned, false);
+    assert.equal(events[2].exitCode, null);
+  });
+
+  it("a refused (argv too large) dispatch records dispatch, argv-too-large, finished with spawned false, and no process", async () => {
+    const oversized = "x".repeat(AGY_MAX_ARG_BYTES + 1);
+    const { job, stateDir } = await agyDispatch(
+      ctx.dispatchOptions({ promptText: oversized }),
+    );
+    const events = fs.readFileSync(path.join(jobDir(stateDir, job.id), "events.ndjson"), "utf8")
+      .trim().split("\n").map(JSON.parse);
+    assert.deepEqual(events.map((e) => e.type), [
+      "companion.agy.dispatch",
+      "companion.agy.argv-too-large",
+      "companion.agy.finished",
+    ]);
+    assert.equal(events[2].spawned, false);
+    assert.equal(events[2].exitCode, null);
+    assert.equal(job.process, null);
+    assert.equal(fs.readFileSync(ctx.pidsLog, "utf8").trim(), "");
   });
 
   it("a prompt exactly AT the limit dispatches exactly as today (criterion 3)", async () => {

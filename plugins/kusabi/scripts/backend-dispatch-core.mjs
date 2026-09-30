@@ -2,9 +2,10 @@
 //
 // Shared execution lifecycle extracted from dispatch adapters (kusabi step 5).
 // Owns the mechanical job-level lifecycle: initial save, prompt persistence,
-// progress watch, start event, stats saving throttle, process identity & watchdog
-// recording, failure classification dispatch, usage & completed result persistence,
-// finished event, stop reason assignment, and final save.
+// start event, pre-spawn hook, process execution with stats saving throttle,
+// failure classification dispatch, completed result persistence (usage, recovery,
+// result.md), fallback session id, finished event with spawned flag, stop reason
+// assignment, and final save.
 //
 // Backend-specific policy (argument building, stream event parsing, exit
 // classification logic, and event payloads) remains in the caller.
@@ -23,6 +24,16 @@ import { startKaibaProgressWatch } from "./kaiba-progress-watch.mjs";
 // record move while the child is running, not only once it exits.
 const STATS_SAVE_INTERVAL_MS = 1000;
 
+// A terminal failure the backend already named a quota exhaustion becomes
+// "quota-exhausted" (kusabi #388); any other provider-error stays
+// "provider-error".  Used on the refusal path and the normal path alike, so
+// a backend opts in only by putting `failure` on the job.
+function capacityReasonOf(job) {
+  return (job.status === "provider-error" && job.failure?.kind === "quota-exhaustion")
+    ? (job.failure?.quota ?? "quota-exhaustion")
+    : null;
+}
+
 /**
  * Run the standard backend dispatch lifecycle.
  *
@@ -31,8 +42,7 @@ const STATS_SAVE_INTERVAL_MS = 1000;
  * @param {object} opts.job - Initial job record (already populated, status "running").
  * @param {string} opts.promptText - Prompt content to persist in prompt.md.
  * @param {object} [opts.dispatchEvent] - Start event payload appended to events.ndjson.
- * @param {boolean} [opts.dispatchBeforeSpawn] - If true, append dispatchEvent before beforeSpawn runs.
- * @param {Function} [opts.beforeSpawn] - Optional hook () => null | { status, error, event, events, failure, resultText }.
+ * @param {Function} [opts.beforeSpawn] - Optional hook () => null | { status, error, event, events, failure, resultText }. A backend opts in to capacity classification by returning failure.
  * @param {Function} opts.runProcess - (hooks: { onStart, onLine, onWatchdog }) => Promise<{ code, stdout, stderr, timedOut, stalled, spawnError }>.
  * @param {object} [opts.stream] - Stream handling { init, state, onLine: (state, rawLine, job) => void }.
  * @param {object} [opts.labels] - String labels e.g. { spawnErrorPrefix, bin }.
@@ -40,13 +50,11 @@ const STATS_SAVE_INTERVAL_MS = 1000;
  * @param {number|null} [opts.timeoutS] - Timeout in seconds.
  * @param {number|null} [opts.watchdogS] - Watchdog silence threshold in seconds.
  * @param {Function} [opts.afterProcess] - Hook run after process exit before classification.
- * @param {Function} [opts.classifyExit] - ({ code, stdout, stderr, state, job, runResult }) => ExitOutcome.
+ * @param {Function} [opts.classifyExit] - ({ code, stdout, stderr, state, job, runResult }) => ExitOutcome. A backend opts in to capacity classification by returning failure. Exit-code-versus-payload precedence is the backend's decision, see docs/design/phase-chain.md.
  * @param {Function} [opts.fallbackSessionId] - Optional ({ state, job }) => string|null for fallback session ID before finished event.
  * @param {Function|object} [opts.finishedEvent] - Finished event payload or builder function.
- * @param {Function} [opts.stopReasonInput] - Optional (job) => object with extra deriveStopReason parameters.
  * @param {string} [opts.resultBackend] - Backend identifier for result recovery.
  * @param {Function} [opts.transformResultText] - Optional (text, { job, state }) => string.
- * @param {boolean} [opts.deferResultWrite] - If true, write result.md after finished event and final save.
  * @returns {Promise<{ job: object, resultText: string, stateDir: string }>}
  */
 export async function runBackendDispatch({
@@ -54,7 +62,6 @@ export async function runBackendDispatch({
   job,
   promptText,
   dispatchEvent,
-  dispatchBeforeSpawn = false,
   beforeSpawn,
   runProcess,
   stream,
@@ -66,10 +73,8 @@ export async function runBackendDispatch({
   classifyExit,
   fallbackSessionId,
   finishedEvent,
-  stopReasonInput,
   resultBackend,
   transformResultText,
-  deferResultWrite = false,
 }) {
   const bin = binOpt ?? labels?.bin;
   const spawnErrorPrefix = labels?.spawnErrorPrefix ?? "dispatch failed";
@@ -77,13 +82,15 @@ export async function runBackendDispatch({
   saveJob(stateDir, job);
   fs.writeFileSync(path.join(jobDir(stateDir, job.id), "prompt.md"), promptText, "utf8");
 
-  if (dispatchBeforeSpawn && dispatchEvent) {
+  if (dispatchEvent) {
     appendEvent(stateDir, job.id, dispatchEvent);
   }
 
   const progressWatch = startKaibaProgressWatch({ stateDir, jobId: job.id });
 
   try {
+    const streamState = typeof stream?.init === "function" ? stream.init() : (stream?.state ?? {});
+
     if (typeof beforeSpawn === "function") {
       const refusal = await beforeSpawn({ job, stateDir });
       if (refusal) {
@@ -105,18 +112,25 @@ export async function runBackendDispatch({
         } else if (refusal.event) {
           appendEvent(stateDir, job.id, refusal.event);
         }
-        const extraStopReason = typeof stopReasonInput === "function" ? stopReasonInput(job) : null;
-        job.stopReason = deriveStopReason({ status: job.status, stats: job.stats, ...extraStopReason });
+        // The trail keeps its dispatch/finished bookends so auditing tools see
+        // no hole; `spawned: false` is what tells this apart from a run.
+        const finishedPayload = typeof finishedEvent === "function"
+          ? finishedEvent({ state: streamState, job, code: null, resultText: "" })
+          : finishedEvent;
+        if (finishedPayload) {
+          appendEvent(stateDir, job.id, { ...finishedPayload, spawned: false });
+        }
+        job.stopReason = deriveStopReason({
+          status: job.status,
+          stats: job.stats,
+          capacityReason: capacityReasonOf(job),
+        });
         saveJob(stateDir, job);
         return { job, resultText: refusal.resultText ?? "", stateDir };
       }
     }
 
-    if (!dispatchBeforeSpawn && dispatchEvent) {
-      appendEvent(stateDir, job.id, dispatchEvent);
-    }
-
-    const streamState = typeof stream?.init === "function" ? stream.init() : (stream?.state ?? {});
+    let spawned = false;
     let lastStatsSaveAt = 0;
 
     const onLine = (rawLine) => {
@@ -132,6 +146,7 @@ export async function runBackendDispatch({
     };
 
     const onStart = ({ pid, startTime }) => {
+      spawned = true;
       // The identity token (runner's /proc start time) lets `cancel` verify
       // the recorded pid before signalling the group (kusabi #209): a
       // recycled pid must never be killed on a stale record's say-so.
@@ -153,6 +168,9 @@ export async function runBackendDispatch({
       onWatchdog,
     });
     const { code, stdout, stderr, timedOut, stalled, spawnError } = processResult;
+    if (spawnError) {
+      spawned = false;
+    }
 
     job.finishedAt = new Date().toISOString();
 
@@ -215,56 +233,6 @@ export async function runBackendDispatch({
         writeJson(path.join(jobDir(stateDir, job.id), "usage.json"), job.usage);
       }
 
-      if (!deferResultWrite) {
-        const rawText = exitOutcome?.text ?? "";
-        const fetched = exitOutcome?.fetched ?? { ok: true, text: rawText };
-        const resolved = resolveCompletedResult({
-          backend: resultBackend,
-          fetched,
-          coords: { sessionId: job.sessionID },
-        });
-        resultText = resolved.text ?? rawText;
-        if (typeof transformResultText === "function") {
-          resultText = transformResultText(resultText, { job, state: streamState });
-        }
-        job.result = resolved.record;
-        if (resolved.record?.recovered) {
-          appendEvent(stateDir, job.id, {
-            type: "companion.result.recovered",
-            source: resolved.record.recovery.source,
-            chars: resolved.record.recovery.chars,
-            fetchFailed: resolved.record.fetchFailed,
-            fetchError: resolved.record.fetchError,
-          });
-        }
-        fs.writeFileSync(path.join(jobDir(stateDir, job.id), "result.md"), resultText, "utf8");
-      }
-    }
-
-    if (!job.sessionID && typeof fallbackSessionId === "function") {
-      const fallback = fallbackSessionId({ state: streamState, job });
-      if (fallback) {
-        job.sessionID = fallback;
-      }
-    }
-
-    const finishedPayload = typeof finishedEvent === "function"
-      ? finishedEvent({ state: streamState, job, code, resultText })
-      : finishedEvent;
-    if (finishedPayload) {
-      appendEvent(stateDir, job.id, finishedPayload);
-    }
-
-    // Record the closed terminal reason (kusabi #388). The dispatch finalizes its
-    // job.json on this path and never calls deriveStopReason via an SSE fold,
-    // so stamp here at the terminal write. worktreeChanged is left
-    // unmeasured at job level, matching the shared path: a completed wrapper
-    // records "completed"; error/timeout/stalled fall through to "unknown".
-    const extraStopReason = typeof stopReasonInput === "function" ? stopReasonInput(job) : null;
-    job.stopReason = deriveStopReason({ status: job.status, stats: job.stats, ...extraStopReason });
-    saveJob(stateDir, job);
-
-    if (deferResultWrite && job.status === "completed") {
       const rawText = exitOutcome?.text ?? "";
       const fetched = exitOutcome?.fetched ?? { ok: true, text: rawText };
       const resolved = resolveCompletedResult({
@@ -286,9 +254,34 @@ export async function runBackendDispatch({
           fetchError: resolved.record.fetchError,
         });
       }
-      saveJob(stateDir, job);
       fs.writeFileSync(path.join(jobDir(stateDir, job.id), "result.md"), resultText, "utf8");
     }
+
+    if (!job.sessionID && typeof fallbackSessionId === "function") {
+      const fallback = fallbackSessionId({ state: streamState, job });
+      if (fallback) {
+        job.sessionID = fallback;
+      }
+    }
+
+    const finishedPayload = typeof finishedEvent === "function"
+      ? finishedEvent({ state: streamState, job, code, resultText })
+      : finishedEvent;
+    if (finishedPayload) {
+      appendEvent(stateDir, job.id, { ...finishedPayload, spawned });
+    }
+
+    // Record the closed terminal reason (kusabi #388). The dispatch finalizes its
+    // job.json on this path and never calls deriveStopReason via an SSE fold,
+    // so stamp here at the terminal write. worktreeChanged is left
+    // unmeasured at job level, matching the shared path: a completed wrapper
+    // records "completed"; error/timeout/stalled fall through to "unknown".
+    job.stopReason = deriveStopReason({
+      status: job.status,
+      stats: job.stats,
+      capacityReason: capacityReasonOf(job),
+    });
+    saveJob(stateDir, job);
 
     return { job, resultText, stateDir };
   } finally {
