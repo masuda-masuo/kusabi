@@ -155,6 +155,18 @@ if (mode === "exit") {
   emit({ type: "turn.started", turn_id: "turn-1" });
   emit({ type: "turn.completed", usage: {} });
   process.exit(0);
+} else if (mode === "sigkill-after-result") {
+  writeRollout(model, "high");
+  emit({ type: "thread.started", thread_id: thread });
+  emit({ type: "item.completed", item: { agent_message: { text: "ALPHA-7" } } });
+  emit({ type: "turn.completed", usage });
+  process.kill(process.pid, "SIGKILL");
+} else if (mode === "non-terminal-with-garbage") {
+  writeRollout(model, "high");
+  emit({ type: "thread.started", thread_id: thread });
+  emit({ type: "turn.started", turn_id: "turn-1" });
+  fs.writeSync(1, "this is not json at all" + NL);
+  process.exit(0);
 } else if (mode === "empty-result") {
   writeRollout(model, "high");
   emit({ type: "thread.started", thread_id: thread });
@@ -1229,17 +1241,40 @@ describe("codexDispatch (fake codex)", () => {
     ctx.setMode("no-result");
     const missing = await codexDispatch(ctx.dispatchOptions());
     assert.equal(missing.job.status, "error");
-    assert.match(missing.job.error, /produced no terminal assistant message/);
+    assert.match(missing.job.error, /stream produced no terminal result event/);
 
     ctx.setMode("malformed");
     const malformed = await codexDispatch(ctx.dispatchOptions());
     assert.equal(malformed.job.status, "error");
-    assert.match(malformed.job.error, /produced no terminal assistant message/);
+    assert.match(malformed.job.error, /stream produced no terminal result event/);
 
     ctx.setMode("empty-result");
     const empty = await codexDispatch(ctx.dispatchOptions());
     assert.equal(empty.job.status, "error");
-    assert.match(empty.job.error, /produced no terminal assistant message/);
+    assert.match(empty.job.error, /stream produced no terminal result event/);
+  });
+
+  it("signal death (exit code null) after complete result fails the job: exited with code null", async () => {
+    ctx.setMode("sigkill-after-result");
+    const { job } = await codexDispatch(ctx.dispatchOptions());
+    assert.equal(job.status, "error");
+    assert.ok(job.error.startsWith("codex exited with code null"));
+  });
+
+  it("stream of valid non-terminal event lines plus one garbage line, exit 0, no terminal result", async () => {
+    ctx.setMode("non-terminal-with-garbage");
+    const { job } = await codexDispatch(ctx.dispatchOptions());
+    assert.equal(job.status, "error");
+    assert.match(
+      job.error,
+      /^codex stream produced no terminal result event \(2 parsed, 1 unparseable line\(s\)\):/,
+    );
+    const events = fs.readFileSync(path.join(jobDir(ctx.stateDir, job.id), "events.ndjson"), "utf8")
+      .trim().split("\n").map(JSON.parse);
+    const finished = events.at(-1);
+    assert.equal(finished.type, "companion.codex.finished");
+    assert.equal(finished.streamEvents, 2);
+    assert.equal(finished.malformedLines, 1);
   });
 
   it("nonzero exit is a failure naming the exit code", async () => {

@@ -1738,6 +1738,12 @@ if (mode === "no-result") {
   emitToolStep(1, "bash", "DONE", { name: "bash", parameters: { command: "ls" } });
   process.exit(0);
 }
+if (mode === "non-terminal-with-garbage") {
+  emitInit();
+  emitToolStep(1, "bash", "ACTIVE", { name: "bash", parameters: { command: "ls" } });
+  process.stdout.write("warning: something unparseable" + NL);
+  process.exit(0);
+}
 if (mode === "init-then-exit") {
   emitInit();
   process.exit(1);
@@ -2047,8 +2053,24 @@ describe("agyDispatch (fake agy binary)", () => {
     ctx.setMode("garbage");
     const { job } = await agyDispatch(ctx.dispatchOptions());
     assert.equal(job.status, "error");
-    assert.match(job.error, /not JSON/);
+    assert.match(job.error, /stream produced no terminal result event/);
     assert.match(job.error, /this is not json at all/);
+  });
+
+  it("stream of valid non-terminal event lines plus one garbage line, exit 0, no terminal result", async () => {
+    ctx.setMode("non-terminal-with-garbage");
+    const { job } = await agyDispatch(ctx.dispatchOptions());
+    assert.equal(job.status, "error");
+    assert.match(
+      job.error,
+      /^agy stream produced no terminal result event \(2 parsed, 1 unparseable line\(s\)\):/,
+    );
+    const events = fs.readFileSync(path.join(jobDir(ctx.stateDir, job.id), "events.ndjson"), "utf8")
+      .trim().split("\n").map(JSON.parse);
+    const finished = events.at(-1);
+    assert.equal(finished.type, "companion.agy.finished");
+    assert.equal(finished.streamEvents, 2);
+    assert.equal(finished.malformedLines, 1);
   });
 
   it("a nonzero exit with no payload fails, naming the exit code and stderr", async () => {
