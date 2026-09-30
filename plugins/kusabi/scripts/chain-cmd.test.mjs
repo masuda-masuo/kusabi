@@ -23,6 +23,8 @@ describe("sessionProvenanceRefusal (kusabi #321)", () => {
   const AGY = "agy";
   const OPENCODE = "opencode";
   const CLAUDE = "claude";
+  const CURSOR = "cursor";
+  const CODEX = "codex";
   const UUID = "123e4567-e89b-12d3-a456-426614174000";
 
   it("passes a chain with no --session", () => {
@@ -55,12 +57,39 @@ describe("sessionProvenanceRefusal (kusabi #321)", () => {
     }
   });
 
+  for (const b of [CLAUDE, CURSOR, CODEX]) {
+    it(`passes a session the store proves ${b}-owned on a ${b} chain`, () => {
+      assert.equal(sessionProvenanceRefusal({ session: UUID, provenance: b, implementBackend: b }), null);
+    });
+
+    it(`refuses a session with no owner record on a ${b} chain, naming the id`, () => {
+      const refusal = sessionProvenanceRefusal({ session: UUID, provenance: null, implementBackend: b });
+      assert.ok(refusal, `an unprovable id on a ${b} chain must refuse`);
+      assert.match(refusal, new RegExp(UUID));
+      assert.match(refusal, /dispatch refused/);
+      assert.match(refusal, /owner record/);
+      assert.match(refusal, /provenance cannot be established/);
+      assert.match(refusal, new RegExp(`A ${b} chain resumes a session only when a ${b} job recorded it`));
+    });
+
+    it(`refuses a session owned by another backend on a ${b} chain, naming both backends`, () => {
+      for (const owner of [OPENCODE, b === CLAUDE ? AGY : CLAUDE]) {
+        const refusal = sessionProvenanceRefusal({ session: UUID, provenance: owner, implementBackend: b });
+        assert.ok(refusal, `an ${owner}-owned id on a ${b} chain must refuse`);
+        assert.match(refusal, new RegExp(UUID));
+        assert.match(refusal, new RegExp(owner));
+        assert.match(refusal, new RegExp(b));
+        assert.match(refusal, /belongs to the /);
+      }
+    });
+  }
+
   it("passes every session shape when the implement phase does not resolve to agy", () => {
     assert.equal(sessionProvenanceRefusal({ session: UUID, provenance: null, implementBackend: OPENCODE }), null);
     assert.equal(sessionProvenanceRefusal({ session: UUID, provenance: CLAUDE, implementBackend: OPENCODE }), null);
     assert.equal(sessionProvenanceRefusal({ session: UUID, provenance: AGY, implementBackend: OPENCODE }), null);
-    assert.equal(sessionProvenanceRefusal({ session: UUID, provenance: null, implementBackend: CLAUDE }), null);
-    assert.equal(sessionProvenanceRefusal({ session: UUID, provenance: AGY, implementBackend: CLAUDE }), null);
+    assert.notEqual(sessionProvenanceRefusal({ session: UUID, provenance: null, implementBackend: CLAUDE }), null);
+    assert.notEqual(sessionProvenanceRefusal({ session: UUID, provenance: AGY, implementBackend: CLAUDE }), null);
   });
 
   it("never mentions --resume-last: the gate is property-shaped, with no flag-shaped branch", () => {

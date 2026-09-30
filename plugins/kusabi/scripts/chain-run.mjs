@@ -134,15 +134,14 @@ export async function runImplementPhase({
 }) {
   // Session lineage guard (kusabi #199 shape, #316 resume): a session is
   // carried into a backend only when the backend can resume one AND the
-  // session's provenance is established.  For agy both halves matter: the
-  // dispatch itself refuses a bare UUID without the caller's provenance
-  // signal (assertNoAgySession), so a chain that forwarded an unproven
-  // session would throw at dispatch instead of running — this seam must
-  // either prove the session (from the previous round's record, below) or
-  // pass through the caller's proof (chain-resume's initialSession
-  // provenance, established at command start where the job store is in
-  // hand).  claude and opencode ignore the signal; the forwarding is
-  // byte-identical for them.
+  // session's provenance is established. For CLI backends (agy, claude, cursor,
+  // codex) both halves matter: the dispatch itself refuses an unproven session
+  // without the caller's provenance signal (assertSessionResumable), so a chain
+  // that forwarded an unproven session would throw at dispatch instead of running
+  // — this seam must either prove the session (from the previous round's record,
+  // below) or pass through the caller's proof (chain-resume's initialSession
+  // provenance, established at command start where the job store is in hand).
+  // opencode ignores the signal; the forwarding is byte-identical for it.
   let resolvedSession = backendSupportsResume(backend) ? session : undefined;
   let resolvedSessionProvenance = null;
   if (resolvedSession) {

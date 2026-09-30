@@ -299,15 +299,14 @@ export function resolveTaskPreflight(cwd, { flags, text }, opts = {}) {
         : `--resume-last: no previous ${backend} task session found for this directory`);
     }
   }
-  // The dispatch-level agy backstop resumes a session only on POSITIVE
-  // provenance (assertNoAgySession in agy-dispatch.mjs): an agy
-  // conversation_id and a claude session id are both bare UUIDs, so the
-  // distinguishing evidence is the job store, which is in hand HERE, not in
-  // the dispatch.  The owner record of the session names its backend
-  // (records without the backend field predate the split -> opencode); no
-  // owner means the id's provenance is unknown, and the agy dispatch fails
-  // closed rather than passing an unproven id to `--conversation`.  claude
-  // and opencode dispatches ignore the signal.
+  // The dispatch-level session backstop resumes a session only on POSITIVE
+  // provenance (assertSessionResumable in backend-session-guard.mjs): session
+  // ids are backend-specific, so the distinguishing evidence is the job store,
+  // which is in hand HERE, not in the dispatch. The owner record of the session
+  // names its backend (records without the backend field predate the split ->
+  // opencode); no owner means the id's provenance is unknown, and CLI
+  // dispatches (claude, cursor, codex, agy) fail closed rather than passing an
+  // unproven id to resume flags. The opencode dispatch ignores the signal.
   let sessionProvenance = null;
   if (session) {
     const owner = latestJob(stateDir, (j) => j.sessionID === session);
@@ -819,7 +818,11 @@ export async function cmdReview(cwd, { flags, text, _runPrompt = runPrompt } = {
       tools: reviewDenyTools(),
       timeoutS: Number(flags?.timeout ?? DEFAULT_REVIEW_TIMEOUT_S),
       watchdogS: Number(flags?.watchdog ?? DEFAULT_WATCHDOG_S),
-      ...(hasSession ? { session: job.sessionID } : {}),
+      // The repair continues the review job's own session, so that job's
+      // record is the provenance proof the CLI backends require
+      // (assertSessionResumable); without it a repair on a non-opencode
+      // seat is refused instead of run.
+      ...(hasSession ? { session: job.sessionID, sessionProvenance: job.backend ?? "opencode" } : {}),
     });
     job = repairResult.job;
     resultText = repairResult.resultText;

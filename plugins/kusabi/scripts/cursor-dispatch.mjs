@@ -69,11 +69,12 @@
 //     has no `--append-system-prompt` in the measured argv list.
 //   - No `--json-schema` / inner print-timeout flag (not in the measured
 //     invocation).
-//   - `ses_*` ids are refused on shape (opencode).  A bare UUID is passed
-//     through as `--resume`; companion-level provenance is the caller's job.
+//   - `ses_*` ids are refused on shape (opencode). A session is resumed only
+//     on positive provenance (assertSessionResumable from backend-session-guard.mjs).
 
 import process from "node:process";
 
+import { assertSessionResumable } from "./backend-session-guard.mjs";
 import { firstRoute } from "./cli.mjs";
 import { readAgentSystemPrompt } from "./agent-system-prompt.mjs";
 import { newJobId } from "./job-store.mjs";
@@ -487,23 +488,6 @@ export function mapCursorUsage(result) {
 // =========================================================================
 
 /**
- * Refuse an opencode `ses_*` id on shape.  Bare UUIDs pass through.
- *
- * @param {string|null|undefined} session
- * @throws {Error}
- */
-export function assertNoOpencodeSessionOnCursor(session) {
-  if (typeof session !== "string" || session === "") return;
-  if (session.startsWith("ses_")) {
-    throw new Error(
-      `opencode session ${session} cannot be resumed on the cursor backend — ` +
-      "ses_* session ids belong to opencode; run the command without --backend cursor " +
-      "(or drop --session / --resume-last)"
-    );
-  }
-}
-
-/**
  * Spawn cursor-agent, write the prompt on stdin, and fold its NDJSON stream.
  *
  * Delegates the mechanical lifecycle (spawn, line framing, timeout, silence
@@ -538,7 +522,12 @@ export function runCursorProcess({
  * @returns {Promise<{ job: object, resultText: string, stateDir: string }>}
  */
 export async function cursorDispatch(opts) {
-  assertNoOpencodeSessionOnCursor(opts.session);
+  assertSessionResumable(opts.session, {
+    backend: "cursor",
+    provenance: opts.sessionProvenance,
+    detail: "A cursor session id is passed to `cursor-agent --resume` only when a cursor job recorded it; an unproven id would silently start a fresh-looking run instead of continuing one.",
+    tail: "a session id that a cursor job on this directory recorded",
+  });
 
   const modelEntry =
     validateCursorModel(opts.explicitModel || firstRoute(opts.tiers || [])) || DEFAULT_CURSOR_MODEL;
