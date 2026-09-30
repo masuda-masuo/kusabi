@@ -132,35 +132,37 @@ export function renderChainBanner({ chainId, tierCount, reworkTierCount, reworkK
  * backend is the same class of problem as an id with no owner at all: it is
  * the operator's input, it is knowable now, and running the chain cannot
  * make it correct — both refuse here.  The module-level backstop in
- * agy-dispatch.mjs (assertNoAgySession) stays exactly as it is; this is the
- * early, friendly refusal in front of it, not a replacement.
+ * backend-session-guard.mjs (assertSessionResumable) stays exactly as it is;
+ * this is the early, friendly refusal in front of it, not a replacement.
  *
  * @param {object} opts
  * @param {string|null|undefined} [opts.session] — the --session flag value.
- * @param {"opencode"|"claude"|"agy"|null|undefined} [opts.provenance] — the
+ * @param {"opencode"|"claude"|"agy"|"cursor"|"codex"|null|undefined} [opts.provenance] — the
  *        backend the job store established as the session's owner, or null
  *        when no owner record exists.
- * @param {"opencode"|"claude"|"agy"} opts.implementBackend — the resolved
+ * @param {"opencode"|"claude"|"agy"|"cursor"|"codex"} opts.implementBackend — the resolved
  *        implement backend of the chain about to start.
  * @returns {string|null}
  */
 export function sessionProvenanceRefusal({ session, provenance, implementBackend }) {
   if (!session) return null;
-  if (implementBackend !== "agy") return null;
-  if (provenance === "agy") return null;
+  if (implementBackend === "opencode") return null;
+  if (provenance === implementBackend) return null;
   if (!provenance) {
+    const reason = implementBackend === "agy"
+      ? "An agy conversation_id and a claude session id are both bare UUIDs, so an agy chain passes an id to `--conversation` only when an agy job recorded it."
+      : `A ${implementBackend} chain resumes a session only when a ${implementBackend} job recorded it.`;
     return (
       "dispatch refused: --session " + session + " — no owner record for it exists in the job store, so its " +
-      "provenance cannot be established (kusabi #321). An agy conversation_id and a claude session id are " +
-      "both bare UUIDs, so an agy chain passes an id to `--conversation` only when an agy job recorded it. " +
+      "provenance cannot be established (kusabi #321). " + reason + " " +
       "Nothing was started: no chain state, no job and no round state exist. " +
       "Drop --session, or pass an id that a recorded job on this directory used."
     );
   }
   return (
     "dispatch refused: --session " + session + " belongs to the " + provenance + " backend, but this chain's " +
-    "implement phase resolves to the agy backend (kusabi #321). A session id is backend-specific, and the " +
-    "agy dispatch would resume it only on positive provenance. Nothing was started: no chain state, no job " +
+    "implement phase resolves to the " + implementBackend + " backend (kusabi #321). A session id is backend-specific, and the " +
+    implementBackend + " dispatch would resume it only on positive provenance. Nothing was started: no chain state, no job " +
     "and no round state exist. Run the chain on the " + provenance + " backend, or drop --session."
   );
 }
@@ -264,12 +266,12 @@ export async function runChainLifecycle(cwd, { flags, text, orchestrator }, opts
   // ---- setup ----
   const stateDir = stateDirFor(cwd);
   const config = loadConfig(stateRoot());
-  // The agy dispatch resumes a session only on positive provenance
-  // (assertNoAgySession in agy-dispatch.mjs), established where the job
-  // store is in hand — here, exactly as cmdTask does: the owner record of
-  // the session names its backend.  No owner means the id's provenance is
-  // unknown and an agy chain fails closed at dispatch rather than passing
-  // the id to `--conversation`.  sessionProvenanceRefusal below gates it at
+  // CLI dispatches resume a session only on positive provenance
+  // (assertSessionResumable in backend-session-guard.mjs), established where
+  // the job store is in hand — here, exactly as cmdTask does: the owner
+  // record of the session names its backend. No owner means the id's provenance
+  // is unknown and the chain fails closed at dispatch rather than passing
+  // the id to resume flags. sessionProvenanceRefusal below gates it at
   // command start (kusabi #321), before any setup runs.
   const initialSessionOwner = flags.session
     ? latestJob(stateDir, (j) => j.sessionID === flags.session)
@@ -642,12 +644,12 @@ export async function cmdChainResume(cwd, { flags, text }) {
 
   // ---- resumed-session provenance (kusabi #316) ----
   // The resumed run carries `position.session` (the interrupted chain's
-  // implement session) into the next implement round.  The agy dispatch
-  // resumes only on positive provenance, established where the job store is
+  // implement session) into the next implement round. CLI dispatches
+  // resume only on positive provenance, established where the job store is
   // in hand — here: the session was recorded by a kusabi job, so the store
-  // names its backend.  No owner (an unusual state — the session was
-  // persisted from a kusabi job) means unknown provenance and the agy
-  // dispatch fails closed rather than passing the id to `--conversation`.
+  // names its backend. No owner (an unusual state — the session was
+  // persisted from a kusabi job) means unknown provenance and CLI
+  // dispatches fail closed rather than passing the id to resume flags.
   const resumedSessionOwner = position.session
     ? latestJob(stateDir, (j) => j.sessionID === position.session)
     : null;
@@ -806,7 +808,7 @@ export async function cmdChainResume(cwd, { flags, text }) {
         reworkBackendForResume, backendDispatch(reworkBackendForResume), resumeReworkModel),
       initialSession: position.session,
       // The provenance of the resumed session (null when no session or no
-      // owning record) — the agy dispatch's resume gate.
+      // owning record) — the dispatch-level resume gate.
       sessionProvenance,
       flagsModel: null,
       reviewFlagsModel: resumeReviewFlagsModel,

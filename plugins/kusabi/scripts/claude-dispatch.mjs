@@ -120,6 +120,8 @@
 import process from "node:process";
 import { spawn } from "node:child_process";
 
+import { assertSessionResumable } from "./backend-session-guard.mjs";
+
 import { firstRoute } from "./cli.mjs";
 import { newJobId, saveJob, jobDir, appendEvent } from "./job-store.mjs";
 import { stateDirFor } from "./state-paths.mjs";
@@ -979,20 +981,12 @@ export function runClaudeProcess({ bin, args, cwd, timeoutS, watchdogS, promptTe
  * @returns {Promise<{ job: object, resultText: string, stateDir: string }>}
  */
 export async function claudeDispatch(opts) {
-  // ---- cross-backend session guard (the single decision point for "may
-  // this session be resumed here") ----
-  // An opencode session id (`ses_*`) can never be resumed on the claude
-  // backend: transcripts live under different roots and `claude -p --resume`
-  // would silently start a fresh-looking session the user thinks continues
-  // their opencode work.  Fail LOUDLY, before any process is spawned or any
-  // job record exists — this is a config-level error, not a failed job.
-  if (typeof opts.session === "string" && opts.session.startsWith("ses_")) {
-    throw new Error(
-      `opencode session ${opts.session} cannot be resumed on the claude backend \u2014 ` +
-      "ses_* session ids belong to opencode; run the command without --backend claude " +
-      "(or resume the claude session id on this backend)"
-    );
-  }
+  assertSessionResumable(opts.session, {
+    backend: "claude",
+    provenance: opts.sessionProvenance,
+    detail: "A claude session id and an agy conversation_id are both bare UUIDs, so kusabi passes an id to `claude --resume` only when a claude job recorded it.",
+    tail: "a session id that a claude job on this directory recorded",
+  });
 
   // ---- repeat-tool watchdog config (kusabi #234) ----
   // Resolved in PRE-FLIGHT, unlike its two siblings: an invalid

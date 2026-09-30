@@ -30,9 +30,9 @@ import {
   buildCodexArgs,
   codexHomeForJob,
   linkOperatorAuth,
-  assertNoCodexSession,
   codexDispatch,
 } from "./codex-dispatch.mjs";
+import { assertSessionResumable } from "./backend-session-guard.mjs";
 import {
   codexJsonSchemaFor,
 } from "./codex-schema.mjs";
@@ -800,7 +800,15 @@ describe("rollout provenance verification", () => {
   });
 });
 
-describe("assertNoCodexSession", () => {
+describe("assertSessionResumable on codex", () => {
+  const assertNoCodexSession = (session, opts = {}) =>
+    assertSessionResumable(session, {
+      backend: "codex",
+      detail: "A codex thread id is passed to `codex exec resume` only when a codex job recorded it; an unproven id would silently start a fresh-looking run instead of continuing one.",
+      tail: "a thread id that a codex job on this directory recorded",
+      ...opts,
+    });
+
   it("refuses an opencode ses_* id on shape, even with codex provenance", () => {
     assert.throws(
       () => assertNoCodexSession("ses_abc", { provenance: "codex" }),

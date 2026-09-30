@@ -88,6 +88,8 @@
 
 import fs from "node:fs";
 import os from "node:os";
+
+import { assertSessionResumable } from "./backend-session-guard.mjs";
 import path from "node:path";
 import process from "node:process";
 
@@ -446,48 +448,6 @@ export function linkOperatorAuth(jobCodexHome) {
 
 
 // =========================================================================
-// cross-backend session guard — pure
-// =========================================================================
-
-/**
- * Reject a session that must not be resumed on the codex backend, naming the
- * reasons.  Mirrors assertNoAgySession:
- *
- *   - `ses_*` — an opencode session id.  Shape alone decides it.
- *   - anything else — a codex thread id is only resumed on POSITIVE
- *     provenance: the caller must have established from the job store that a
- *     codex job recorded this id (`provenance: "codex"`).  Unknown or
- *     cross-backend ownership fails closed here, so an unproven id can never
- *     silently become a `codex exec resume` argument.
- *
- * @param {string|null|undefined} session
- * @param {object} [opts]
- * @param {string|null|undefined} [opts.provenance] — the backend the caller
- *        PROVED created this session (from the job store), or nothing.
- * @throws {Error} When a session was given without codex provenance.
- */
-export function assertNoCodexSession(session, { provenance } = {}) {
-  if (typeof session !== "string" || session === "") return;
-  if (session.startsWith("ses_")) {
-    throw new Error(
-      `opencode session ${session} cannot be resumed on the codex backend — ` +
-      "ses_* session ids belong to opencode; run the command without --backend codex " +
-      "(or drop --session / --resume-last)"
-    );
-  }
-  if (provenance === "codex") return;
-  const attribution = provenance
-    ? `the job store attributes it to the ${provenance} backend`
-    : "no kusabi job record reports it, so its backend cannot be established";
-  throw new Error(
-    `session ${session} cannot be resumed on the codex backend — ${attribution}. ` +
-    "A codex thread id is passed to `codex exec resume` only when a codex job recorded it; " +
-    "an unproven id would silently start a fresh-looking run instead of continuing one. " +
-    "Drop --session / --resume-last, or pass a thread id that a codex job on this directory recorded"
-  );
-}
-
-// =========================================================================
 // process — spawn/IO
 // =========================================================================
 
@@ -552,7 +512,7 @@ export function runCodexProcess({ bin, args, cwd, promptText, timeoutS, watchdog
  * @param {string|null} [opts.phase]
  * @param {string|null|undefined} [opts.session] — resumed via
  *        `codex exec resume <thread_id>` ONLY when `sessionProvenance`
- *        proves it a codex thread id; see assertNoCodexSession.
+ *        proves it a codex thread id; see assertSessionResumable.
  * @param {string|null|undefined} [opts.sessionProvenance]
  * @param {object|null|undefined} [opts.tools] — deny map.  For worker
  *        agents this is applied to the MCP enabled_tools list; for MCP-less
@@ -570,7 +530,12 @@ export async function codexDispatch(opts) {
   // ---- cross-backend / provenance session guard ----
   // Before anything is spawned and before any job record exists: this is a
   // config-level error, not a failed job.
-  assertNoCodexSession(opts.session, { provenance: opts.sessionProvenance });
+  assertSessionResumable(opts.session, {
+    backend: "codex",
+    provenance: opts.sessionProvenance,
+    detail: "A codex thread id is passed to `codex exec resume` only when a codex job recorded it; an unproven id would silently start a fresh-looking run instead of continuing one.",
+    tail: "a thread id that a codex job on this directory recorded",
+  });
 
   // The thread id of a resumed dispatch, known BEFORE the run: the CLI was
   // asked to continue this exact thread.  A successful resumed job must

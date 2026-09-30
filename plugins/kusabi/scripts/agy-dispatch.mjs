@@ -79,7 +79,7 @@
 //     `conversation_id` and a claude session id are BOTH bare UUIDs, so
 //     shape cannot tell them apart — this module resumes a session only
 //     when the caller states its provenance (an explicit signal, see
-//     `assertNoAgySession`), and fails closed otherwise.  The job store,
+//     `assertSessionResumable`), and fails closed otherwise.  The job store,
 //     where the distinguishing record lives, is consulted by the caller
 //     (kusabi-companion.mjs / the chain seams); this module never touches
 //     the store itself.
@@ -165,6 +165,7 @@ import fs from "node:fs";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
 
+import { assertSessionResumable } from "./backend-session-guard.mjs";
 import { firstRoute } from "./cli.mjs";
 import { readAgentSystemPrompt } from "./agent-system-prompt.mjs";
 import { newJobId } from "./job-store.mjs";
@@ -483,7 +484,7 @@ export function resolveAgyTimeoutS(value) {
  * @param {string} opts.promptText  — already composed (buildAgyPrompt).
  * @param {string|null} [opts.jsonSchema] — compact schema text, or null.
  * @param {string|null|undefined} [opts.conversationId] — an id the CALLER
- *        has proven to be an agy conversation (assertNoAgySession's
+ *        has proven to be an agy conversation (assertSessionResumable's
  *        provenance gate has already run); appends `--conversation <id>`.
  * @param {number|null} [opts.timeoutS] — the value agyDispatch already
  *        resolved (resolveAgyTimeoutS): a positive finite number, or null
@@ -618,62 +619,6 @@ export function checkAgyArgvSize(args, limit = AGY_MAX_ARG_BYTES) {
 }
 
 // =========================================================================
-// cross-backend session guard — pure
-// =========================================================================
-
-/**
- * Reject a session that must not be resumed on the agy backend, naming BOTH
- * backends.
- *
- * Two id shapes, two gates (kusabi #316 replaced the v1 blanket refusal):
- *
- *   - `ses_*` — an opencode session id.  Shape alone decides it, which is
- *     the same guard `claudeDispatch` has had since kusabi #184; kusabi #199
- *     makes it SYMMETRIC so an opencode id cannot reach agy either.  This
- *     check always fires on shape, whatever provenance says.
- *   - anything else — an agy `conversation_id` is a bare UUID, and so is a
- *     claude session id: shape CANNOT tell them apart.  The one thing that
- *     can is the job store, and the store lives in the CALLER's hand
- *     (kusabi-companion.mjs's `assertSessionBackendCompatible` / the chain
- *     seams), not this module's.  So the module requires POSITIVE EVIDENCE
- *     rather than inferring: the caller passes `provenance: "agy"` only
- *     when it has established from the store that an agy job recorded this
- *     id.  Anything else — no signal (a caller that skipped the
- *     companion-level check), or a signal naming another backend — is
- *     refused HERE, so an id whose provenance is unknown to this module can
- *     never silently become a `--conversation` argument.  This is the
- *     backstop: it fails closed on exactly the callers that forgot to
- *     check.
- *
- * @param {string|null|undefined} session
- * @param {object} [opts]
- * @param {string|null|undefined} [opts.provenance] — the backend the caller
- *        PROVED created this session (from the job store), or nothing when
- *        no such proof exists.  Only `"agy"` lets a bare UUID through.
- * @throws {Error} When a session was given without agy provenance.
- */
-export function assertNoAgySession(session, { provenance } = {}) {
-  if (typeof session !== "string" || session === "") return;
-  if (session.startsWith("ses_")) {
-    throw new Error(
-      `opencode session ${session} cannot be resumed on the agy backend — ` +
-      "ses_* session ids belong to opencode; run the command without --backend agy " +
-      "(or drop --session / --resume-last)"
-    );
-  }
-  if (provenance === "agy") return;
-  const attribution = provenance
-    ? `the job store attributes it to the ${provenance} backend`
-    : "no kusabi job record reports it, so its backend cannot be established";
-  throw new Error(
-    `session ${session} cannot be resumed on the agy backend — ${attribution}. ` +
-    "An agy conversation_id and a claude session id are both bare UUIDs, so kusabi passes an id to " +
-    "`agy --conversation` only when an agy job recorded it. " +
-    "Drop --session / --resume-last, or pass a conversation id that an agy job on this directory recorded"
-  );
-}
-
-// =========================================================================
 // process — spawn/IO
 // =========================================================================
 
@@ -745,10 +690,10 @@ export function runAgyProcess({ bin, args, cwd, env, timeoutS, watchdogS, onStar
  * @param {string|null} [opts.phase]
  * @param {string|null|undefined} [opts.session] — resumed via
  *        `--conversation` ONLY when `sessionProvenance` proves it an agy
- *        conversation; see assertNoAgySession.
+ *        conversation; see assertSessionResumable.
  * @param {string|null|undefined} [opts.sessionProvenance] — the backend
  *        the caller established from the job store as the creator of
- *        `session`.  The dispatch-level backstop (assertNoAgySession)
+ *        `session`.  The dispatch-level backstop (assertSessionResumable)
  *        requires `"agy"` for any bare-UUID session; a caller that forgets
  *        to establish provenance fails closed here.
  * @param {object|null|undefined} [opts.tools] — deny map.  agy takes no
@@ -776,8 +721,13 @@ export async function agyDispatch(opts) {
   // config-level error, not a failed job.  `ses_*` ids are refused on shape
   // alone; a bare UUID is resumed only when the caller established (from
   // the job store, which this module never touches) that an agy job
-  // recorded it — assertNoAgySession.
-  assertNoAgySession(opts.session, { provenance: opts.sessionProvenance });
+  // recorded it — assertSessionResumable.
+  assertSessionResumable(opts.session, {
+    backend: "agy",
+    provenance: opts.sessionProvenance,
+    detail: "An agy conversation_id and a claude session id are both bare UUIDs, so kusabi passes an id to `agy --conversation` only when an agy job recorded it.",
+    tail: "a conversation id that an agy job on this directory recorded",
+  });
 
   // v1 model selection: explicit model, else the chain's first route.
   // tiers/round/tierIndex are accepted for contract parity but the tier
@@ -843,7 +793,7 @@ export async function agyDispatch(opts) {
   // kill correct runs.  The floor is enforced in code, never left to
   // callers passing a sane value.
   const watchdogS = agyWatchdogSeconds(opts.watchdogS);
-  // `session` survived assertNoAgySession, so it is either absent or a
+  // `session` survived assertSessionResumable, so it is either absent or a
   // provenance-proven agy conversation id — the only shape that may become
   // a `--conversation` argument.  `timeoutS` becomes agy's INNER bound
   // (`--print-timeout`) sized so this dispatch's OUTER bound (the timer in

@@ -1827,6 +1827,7 @@ describe("claudeDispatch (fake claude binary)", () => {
   it("resumes a session: --resume <id> reaches argv, the job keeps the result's session id", async () => {
     const { job } = await claudeDispatch(ctx.dispatchOptions({
       session: "claude-session-round1",
+      sessionProvenance: "claude",
     }));
 
     // The fake claude observed --resume <session> on its argv.
@@ -1910,6 +1911,7 @@ describe("claudeDispatch (fake claude binary)", () => {
     const { job } = await claudeDispatch(ctx.dispatchOptions({
       round: 2,
       session: calls[1].session,
+      sessionProvenance: "claude",
     }));
     const lines = fs.readFileSync(ctx.argsLog, "utf8").trim().split("\n");
     const round2Args = JSON.parse(lines[lines.length - 1]);
@@ -1924,6 +1926,7 @@ describe("claudeDispatch (fake claude binary)", () => {
     ctx = fakeClaudeContext("resume-echo");
     const { job } = await claudeDispatch(ctx.dispatchOptions({
       session: "claude-uuid-echo-1",
+      sessionProvenance: "claude",
     }));
     assert.equal(job.status, "completed");
     // The fake modeled the real CLI contract: `--resume <id>` in, the SAME
@@ -1949,6 +1952,37 @@ describe("claudeDispatch (fake claude binary)", () => {
     assert.equal(fs.readFileSync(ctx.argsLog, "utf8").trim(), "");
     assert.equal(fs.readFileSync(ctx.pidsLog, "utf8").trim(), "");
     // ...and no job record was left behind (nothing recorded "running").
+    assert.deepEqual(fs.readdirSync(path.join(ctx.stateDir, "jobs")), []);
+  });
+
+  it("a bare UUID with no provenance is refused before any job record is written", async () => {
+    await assert.rejects(
+      () => claudeDispatch(ctx.dispatchOptions({ session: "6f5f0f1e-0000-4a1b-9c2d-1122334455aa" })),
+      (err) => {
+        assert.match(err.message, /cannot be resumed on the claude backend/);
+        assert.match(err.message, /no kusabi job record reports it/);
+        return true;
+      },
+    );
+    assert.equal(fs.readFileSync(ctx.argsLog, "utf8").trim(), "");
+    assert.equal(fs.readFileSync(ctx.pidsLog, "utf8").trim(), "");
+    assert.deepEqual(fs.readdirSync(path.join(ctx.stateDir, "jobs")), []);
+  });
+
+  it("a session attributed to another backend is refused, naming that backend", async () => {
+    await assert.rejects(
+      () => claudeDispatch(ctx.dispatchOptions({
+        session: "6f5f0f1e-0000-4a1b-9c2d-1122334455aa",
+        sessionProvenance: "cursor",
+      })),
+      (err) => {
+        assert.match(err.message, /cannot be resumed on the claude backend/);
+        assert.match(err.message, /the job store attributes it to the cursor backend/);
+        return true;
+      },
+    );
+    assert.equal(fs.readFileSync(ctx.argsLog, "utf8").trim(), "");
+    assert.equal(fs.readFileSync(ctx.pidsLog, "utf8").trim(), "");
     assert.deepEqual(fs.readdirSync(path.join(ctx.stateDir, "jobs")), []);
   });
 
@@ -2542,7 +2576,11 @@ describe("CLI session wiring (subprocess)", () => {
   it("--backend claude --session <id> passes the session through cmdTask as --resume", () => {
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-claude-session-"));
     try {
-      const { env, argsLog } = setup(tmp, { jobs: [] });
+      const { env, argsLog } = setup(tmp, {
+        jobs: [
+          { id: "job-claude", kind: "task", status: "completed", backend: "claude", sessionID: "claude-uuid-cli", startedAt: "2026-08-01T00:00:00.000Z" },
+        ],
+      });
 
       const result = spawnSync(
         process.execPath,

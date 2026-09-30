@@ -37,9 +37,9 @@ import {
   AGY_MAX_ARG_STRLEN,
   AGY_MAX_ARG_BYTES,
   checkAgyArgvSize,
-  assertNoAgySession,
   agyDispatch,
 } from "./agy-dispatch.mjs";
+import { assertSessionResumable } from "./backend-session-guard.mjs";
 import {
   parseAgyResult,
   parseAgyStreamLine,
@@ -818,7 +818,15 @@ describe("mapAgyUsage", () => {
 // cross-backend session guard (criterion 7)
 // =========================================================================
 
-describe("assertNoAgySession", () => {
+describe("assertSessionResumable on agy", () => {
+  const assertNoAgySession = (session, opts = {}) =>
+    assertSessionResumable(session, {
+      backend: "agy",
+      detail: "An agy conversation_id and a claude session id are both bare UUIDs, so kusabi passes an id to `agy --conversation` only when an agy job recorded it.",
+      tail: "a conversation id that an agy job on this directory recorded",
+      ...opts,
+    });
+
   it("accepts no session at all", () => {
     assert.doesNotThrow(() => assertNoAgySession(undefined));
     assert.doesNotThrow(() => assertNoAgySession(null));

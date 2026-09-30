@@ -509,7 +509,7 @@ export async function runReviewPhase({
       const repairDispatchOptions = {
         ...reviewDispatchOptions,
         promptText: repairPromptText,
-        ...(hasSession ? { session: reviewJob.sessionID } : {}),
+        ...(hasSession ? { session: reviewJob.sessionID, sessionProvenance: reviewJob.backend ?? "opencode" } : {}),
       };
 
       ({ job: reviewJob, resultText: reviewResultText } = await _dispatch(repairDispatchOptions));

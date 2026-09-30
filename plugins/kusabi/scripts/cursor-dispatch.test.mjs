@@ -555,11 +555,39 @@ describe("cursorDispatch (fake cursor-agent)", () => {
     assert.equal(loggedArgs(ctx.argsLog)[0].includes("--resume"), false);
 
     fs.writeFileSync(ctx.argsLog, "", "utf8");
-    await cursorDispatch(ctx.dispatchOptions({ session: SESSION_ID }));
+    await cursorDispatch(ctx.dispatchOptions({ session: SESSION_ID, sessionProvenance: "cursor" }));
     const argv = loggedArgs(ctx.argsLog)[0];
     const idx = argv.indexOf("--resume");
     assert.ok(idx >= 0);
     assert.equal(argv[idx + 1], SESSION_ID);
+  });
+
+  it("a bare UUID with no provenance is refused before any job record is written", async () => {
+    fs.writeFileSync(ctx.argsLog, "", "utf8");
+    await assert.rejects(
+      () => cursorDispatch(ctx.dispatchOptions({ session: SESSION_ID })),
+      (err) => {
+        assert.match(err.message, /cannot be resumed on the cursor backend/);
+        assert.match(err.message, /no kusabi job record reports it/);
+        return true;
+      }
+    );
+    assert.equal(fs.readFileSync(ctx.argsLog, "utf8").trim(), "");
+    assert.deepEqual(fs.readdirSync(path.join(ctx.stateDir, "jobs")), []);
+  });
+
+  it("a session attributed to another backend is refused, naming that backend", async () => {
+    fs.writeFileSync(ctx.argsLog, "", "utf8");
+    await assert.rejects(
+      () => cursorDispatch(ctx.dispatchOptions({ session: SESSION_ID, sessionProvenance: "claude" })),
+      (err) => {
+        assert.match(err.message, /cannot be resumed on the cursor backend/);
+        assert.match(err.message, /the job store attributes it to the claude backend/);
+        return true;
+      }
+    );
+    assert.equal(fs.readFileSync(ctx.argsLog, "utf8").trim(), "");
+    assert.deepEqual(fs.readdirSync(path.join(ctx.stateDir, "jobs")), []);
   });
 
   it("missing terminal line / empty result / non-zero exit are distinguishable failures", async () => {
