@@ -2384,6 +2384,23 @@ describe("claudeDispatch (fake claude binary)", () => {
     assert.equal(job.status, "completed");
   });
 
+  it("while the fake is still running (after the init line, before the result), the saved job record already has the init session id", async () => {
+    ctx.restore();
+    ctx = fakeClaudeContext("trickle");
+    const promise = claudeDispatch(ctx.dispatchOptions());
+    let midflight = null;
+    const deadline = Date.now() + 5000;
+    while (Date.now() < deadline) {
+      midflight = listJobs(ctx.stateDir).find((j) => j.status === "running" && j.sessionID);
+      if (midflight) break;
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    assert.ok(midflight, "the running claude job must be recorded with a sessionID");
+    assert.equal(midflight.sessionID, "claude-trickle-1");
+    const { job } = await promise;
+    assert.equal(job.status, "completed");
+  });
+
   it("fails loudly when the MCP source config lacks mcpServers.sunaba", async () => {
     const badSource = path.join(ctx.tmp, "no-sunaba.json");
     fs.writeFileSync(badSource, JSON.stringify({ mcpServers: { other: { command: "echo" } } }), "utf8");

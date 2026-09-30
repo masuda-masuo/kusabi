@@ -381,6 +381,9 @@ export function initCursorStreamAccumulator() {
  *     completed included, so the most recent call wins.  Unrecognisable
  *     names leave `lastTool` unchanged (including null) and still count.
  *
+ * A `type:"result"` line contributes its `model` (when a non-empty string)
+ * to `models` (deduped).
+ *
  * @param {object} acc
  * @param {object} evt
  * @param {string} [now]
@@ -404,6 +407,14 @@ export function applyCursorStreamEvent(acc, evt, now = new Date().toISOString())
         }
       } else if (evt.subtype !== "completed") {
         acc.steps += 1;
+      }
+    } else if (evt.type === "result") {
+      const model = nonEmptyString(evt.model);
+      if (model) {
+        if (!Array.isArray(acc.models)) acc.models = [];
+        if (!acc.models.includes(model)) {
+          acc.models.push(model);
+        }
       }
     }
   } catch {

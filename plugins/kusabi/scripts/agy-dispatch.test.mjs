@@ -2246,6 +2246,21 @@ describe("agyDispatch (fake agy binary)", () => {
     }
   });
 
+  it("while the fake is still running (after the init line, before the result), the saved job record already has the init session id", async () => {
+    ctx.setMode("stall-after-init");
+    const pending = agyDispatch(ctx.dispatchOptions({ timeoutS: 1 }));
+    let running = null;
+    const deadline = Date.now() + 5000;
+    while (Date.now() < deadline) {
+      running = listJobs(ctx.stateDir).find((j) => j.status === "running" && j.sessionID);
+      if (running) break;
+      await new Promise((r) => setTimeout(r, 20));
+    }
+    assert.ok(running, "the running agy job must be recorded with a sessionID");
+    assert.equal(running.sessionID, "6f5f0f1e-0000-4a1b-9c2d-1122334455aa");
+    await pending;
+  });
+
   it("records an unenforceable deny map rather than dropping it", async () => {
     const { job } = await agyDispatch(ctx.dispatchOptions({
       tools: { bash: false, write: false, read: true },

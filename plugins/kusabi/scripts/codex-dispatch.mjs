@@ -819,6 +819,9 @@ export async function codexDispatch(opts) {
         resumed: resumedSessionId !== null,
       });
       job.codexProvenance = provenance;
+      if (job.stats) {
+        job.stats.models = provenance.state === "verified" ? [provenance.model] : [];
+      }
       // `substituted` is set from post-run provenance (kusabi #529 finding 4):
       // `false` only when the actual model is verified equal to the requested
       // one, `true` for an observed mismatch, and `null` when provenance is

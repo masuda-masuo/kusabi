@@ -541,7 +541,7 @@ describe("codex stream parsing", () => {
     applyCodexStreamEvent(acc, { type: "item.completed", item: { type: "tool_call", id: "t1" } });
     applyCodexStreamEvent(acc, { type: "item.completed", item: { type: "agent_message", text: "ALPHA" } });
     applyCodexStreamEvent(acc, { type: "item.completed", item: { type: "custom_tool_call", id: "t2" } });
-    assert.equal(acc.steps, 3, "every completed item still counts as one step");
+    assert.equal(acc.steps, 2, "only the tool items count as steps");
     assert.equal(acc.assistantText, "ALPHA", "only the flat agent_message item contributes text");
     assert.doesNotThrow(() => applyCodexStreamEvent(acc, { type: "item.completed", item: null }));
     assert.doesNotThrow(() => applyCodexStreamEvent(acc, { type: "item.completed", item: { type: "agent_message", text: 42 } }));
@@ -561,7 +561,7 @@ describe("codex stream parsing", () => {
     // The last agent message wins; earlier ones are commentary (see the
     // multi-message regression test below).
     assert.equal(acc.assistantText, "-7");
-    assert.equal(acc.steps, 2);
+    assert.equal(acc.steps, 0);
     assert.equal(acc.events, 5);
     assert.equal(acc.usageEvent.type, "turn.completed");
   });
@@ -595,6 +595,25 @@ describe("codex stream parsing", () => {
     assert.doesNotThrow(() => applyCodexStreamEvent(acc, { type: "item.completed", item: "not-an-object" }));
     assert.doesNotThrow(() => applyCodexStreamEvent(acc, "string"));
     assert.equal(acc.events, 1);
+  });
+
+  it("agent_message and reasoning items do not count as steps", () => {
+    const acc = initCodexStreamAccumulator();
+    applyCodexStreamEvent(acc, { type: "item.completed", item: { type: "agent_message", text: "ALPHA" } });
+    applyCodexStreamEvent(acc, { type: "item.completed", item: { type: "reasoning", text: "thinking..." } });
+    applyCodexStreamEvent(acc, { type: "item.completed", item: { agent_message: { text: "legacy" } } });
+    assert.equal(acc.steps, 0);
+    assert.equal(acc.lastTool, null);
+  });
+
+  it("a command_execution item counts one step and sets lastTool to shell", () => {
+    const acc = initCodexStreamAccumulator();
+    applyCodexStreamEvent(acc, {
+      type: "item.completed",
+      item: { type: "command_execution", command: "git status" },
+    });
+    assert.equal(acc.steps, 1);
+    assert.equal(acc.lastTool, "shell");
   });
 
   it("mapCodexUsage maps ALL measured snake-case token fields", () => {
@@ -1018,7 +1037,7 @@ describe("codexDispatch (fake codex)", () => {
     ctx.setMode("flat");
     const { job, resultText, stateDir } = await codexDispatch(ctx.dispatchOptions());
     assert.equal(job.status, "completed");
-    assert.equal(job.stats.steps, 2, "the flat agent_message item and the tool item each count one step");
+    assert.equal(job.stats.steps, 1, "only the tool item counts as a step");
     const readProbe = { action: "read_probe", envelope_sha256: "deadbeef", tool: "read_file_range", path: "evidence/probes.json" };
     assert.equal(resultText, JSON.stringify(readProbe), "the flat item.text payload is the dispatched result");
     assert.equal(job.sessionID, THREAD_ID);
@@ -1418,6 +1437,32 @@ describe("codexDispatch (fake codex)", () => {
     assert.ok(running.process.startTime, "the recorded process carries the identity token");
     const stop = await stopRecordedProcess(running.process);
     assert.equal(stop.outcome, "stopped");
+    await pending;
+  });
+
+  it("a verified run has stats.models equal to [<requested model>] and an unverifiable one []", async () => {
+    const { job: verifiedJob } = await codexDispatch(ctx.dispatchOptions());
+    assert.equal(verifiedJob.codexProvenance.state, "verified");
+    assert.deepEqual(verifiedJob.stats.models, [MODEL]);
+
+    ctx.setMode("no-rollout");
+    const { job: unverifiableJob } = await codexDispatch(ctx.dispatchOptions());
+    assert.equal(unverifiableJob.codexProvenance.state, "unverifiable");
+    assert.deepEqual(unverifiableJob.stats.models, []);
+  });
+
+  it("the mid-run save has the thread id", async () => {
+    ctx.setMode("sleep");
+    const pending = codexDispatch(ctx.dispatchOptions({ timeoutS: 1, watchdogS: null }));
+    let running = null;
+    const deadline = Date.now() + 5000;
+    while (Date.now() < deadline) {
+      running = listJobs(ctx.stateDir).find((j) => j.status === "running" && j.sessionID);
+      if (running) break;
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    assert.ok(running, "the running codex job must be recorded with a sessionID");
+    assert.equal(running.sessionID, THREAD_ID);
     await pending;
   });
 });

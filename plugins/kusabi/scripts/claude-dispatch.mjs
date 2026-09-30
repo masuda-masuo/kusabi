@@ -1159,6 +1159,9 @@ export async function claudeDispatch(opts) {
         return false;
       }
       applyClaudeStreamEvent(state.streamAcc, evt);
+      if (state.streamAcc.sessionIdFromInit) {
+        j.sessionID = state.streamAcc.sessionIdFromInit;
+      }
       j.stats = {
         instrumented: true,
         events: state.streamAcc.events,
