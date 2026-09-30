@@ -117,19 +117,14 @@
 // `{ job, resultText, stateDir }`, picked by kusabi-companion.mjs for
 // `--backend claude`.  v1 limits unchanged (docs/design/phase-chain.md §3.5.11).
 
-import path from "node:path";
-import fs from "node:fs";
 import process from "node:process";
 import { spawn } from "node:child_process";
 
 import { firstRoute } from "./cli.mjs";
 import { newJobId, saveJob, jobDir, appendEvent } from "./job-store.mjs";
-import { stateDirFor, writeJson } from "./state-paths.mjs";
-import { durationS } from "./render.mjs";
-import { resolveCompletedResult } from "./result-recovery.mjs";
-import { deriveStopReason } from "./stop-reason.mjs";
-import { startKaibaProgressWatch } from "./kaiba-progress-watch.mjs";
+import { stateDirFor } from "./state-paths.mjs";
 import { killProcessGroup } from "./backend-process-runner.mjs";
+import { runBackendDispatch } from "./backend-dispatch-core.mjs";
 import {
   claudeMcpSourcePath,
   extractSunabaMcp,
@@ -1155,202 +1150,52 @@ export async function claudeDispatch(opts) {
     retry: null,
     fallbacks: null,
   };
-  saveJob(stateDir, job);
-  fs.writeFileSync(path.join(jobDir(stateDir, job.id), "prompt.md"), opts.promptText || "", "utf8");
-  appendEvent(stateDir, job.id, {
-    type: "companion.claude.dispatch",
-    backend: CLAUDE_BACKEND,
-    model: modelEntry,
-    bin,
-  });
 
-  const progressWatch = startKaibaProgressWatch({ stateDir, jobId: job.id });
-
-  // ---- pre-dispatch session-quota guard (kusabi #215) ----
-  // Runs AFTER the record exists (so a refusal is a finalised job record with
-  // a prompt and an audit trail, not a silent nothing) and BEFORE any worker
-  // is spawned — which is the whole point: at a spent session window the
-  // spawn is what costs money and takes the operator's own session down with
-  // it.  Wrapped end to end: the guard may cost a dispatch its worker, never
-  // the dispatch itself.
-  let guard;
-  try {
-    guard = resolveClaudeSessionGuard(loadClaudeGuardConfig());
-  } catch (err) {
-    // Reading a settings file must never be the thing that fails a dispatch.
-    guard = { enabled: false, threshold: null, reason: `config-unreadable: ${err.message}` };
-  }
-  if (guard.enabled) {
-    let probe;
-    try {
-      probe = await probeClaudeSessionUsage({ bin, cwd: opts.cwd });
-    } catch (err) {
-      // probeClaudeSessionUsage is written never to reject; if it ever does,
-      // that is still not a reason to fail a dispatch.
-      probe = { readable: false, percent: null, reset: null, reason: "probe-threw", detail: err.message, elapsedMs: null };
-    }
-    const observation = claudeSessionGuardObservation(guard, probe);
-    job.sessionGuard = observation;
-    saveJob(stateDir, job);
-    appendEvent(stateDir, job.id, { type: "companion.claude.session-guard", ...observation });
-
-    if (observation.decision === "refused") {
-      // The SAME structured classification a mid-run session limit produces,
-      // so the chain's provider-exhaustion stop and every reader react
-      // identically — no new chain logic, no second vocabulary for "the
-      // claude backend is blocked".
-      const failure = {
-        kind: "quota-exhaustion",
-        quota: "session",
-        backendBlocked: true,
-        reset: observation.reset ?? null,
-      };
-      job.failure = failure;
-      job.status = "provider-error";
-      job.finishedAt = new Date().toISOString();
-      job.error = renderClaudeQuotaError(failure, renderClaudeSessionGuardRefusal(observation));
-      appendEvent(stateDir, job.id, {
-        type: "companion.claude.dispatch-refused",
-        reason: "session-quota-guard",
-        percent: observation.percent,
-        threshold: observation.threshold,
-        reset: observation.reset ?? null,
-      });
-      // The trail keeps its dispatch/finished bookends so auditing tools see
-      // no hole; `spawned: false` is what tells this apart from a run.
-      appendEvent(stateDir, job.id, {
-        type: "companion.claude.finished",
-        status: job.status,
-        sessionId: null,
-        exitCode: null,
-        streamEvents: 0,
-        malformedLines: 0,
-        spawned: false,
-      });
-      // Record the closed terminal reason (kusabi #388).  Same capacityReason
-      // rule as the main claude finalize: a terminal refusal the classifier
-      // named a quota exhaustion becomes "quota-exhausted".
-      const capacityReason =
-        (job.status === "provider-error" && job.failure?.kind === "quota-exhaustion")
-          ? (job.failure?.quota ?? "quota-exhaustion")
-          : null;
-      job.stopReason = deriveStopReason({
-        status: job.status,
-        stats: job.stats,
-        capacityReason,
-      });
-      saveJob(stateDir, job);
-      progressWatch.stop();
-      return { job, resultText: "", stateDir };
-    }
-  }
-
-  try {
-    // ---- write-tool watchdog (kusabi #215 item 3) ----
-  // Resolved independently of the session guard above (its own config read,
-  // its own try/catch): the two guards must not be able to break each other,
-  // and this one is the destructive one.  Off unless BOTH the config asks
-  // for it and the phase is one whose deliverable is an edit — a review or
-  // investigate job legitimately never writes a file.
   let writeWatchdog;
-  try {
-    writeWatchdog = resolveClaudeWriteWatchdog(loadClaudeGuardConfig());
-  } catch (err) {
-    // Reading a settings file must never be the thing that fails a dispatch.
-    writeWatchdog = { enabled: false, warnS: null, killS: null, reason: `config-unreadable: ${err.message}` };
-  }
-  if (writeWatchdog.enabled && !writeWatchdogAppliesToPhase(opts.phase)) {
-    writeWatchdog = { enabled: false, warnS: null, killS: null, reason: "phase-not-gated" };
-  }
-  if (writeWatchdog.enabled) {
-    // Recorded ONLY when armed: a dispatch with the feature off must leave a
-    // job record byte-identical to the pre-item-3 one (no new key at all).
-    job.writeWatchdog = {
-      warnS: writeWatchdog.warnS,
-      killS: writeWatchdog.killS,
-      reason: writeWatchdog.reason,
-      warned: false,
-      warnedAt: null,
-      idleS: null,
-      killed: false,
-    };
-    saveJob(stateDir, job);
-  }
 
-  // ---- repeat-tool watchdog (kusabi #234) ----
-  // Config was resolved (and validated) in pre-flight, above.  Here the
-  // watchdog is GATED exactly like its siblings: armed only when the config
-  // enabled it AND the phase is one whose deliverable is an edit — the same
-  // implement-only gate the write watchdog uses (every chain rework round
-  // dispatches under "implement").
-  if (repeatWatchdog.enabled && !writeWatchdogAppliesToPhase(opts.phase)) {
-    repeatWatchdog = { enabled: false, threshold: null, killThreshold: null, reason: "phase-not-gated" };
-  }
-  if (repeatWatchdog.enabled) {
-    // Recorded ONLY when armed: an unarmed dispatch must leave a job record
-    // byte-identical to the pre-#234 one (no new key at all).  `count` is
-    // the chain length at the last recorded event (the warn, or the kill).
-    job.repeatWatchdog = {
-      threshold: repeatWatchdog.threshold,
-      killThreshold: repeatWatchdog.killThreshold,
-      reason: repeatWatchdog.reason,
-      warned: false,
-      warnedAt: null,
-      tool: null,
-      count: 0,
-    };
-    saveJob(stateDir, job);
-  }
-
-  // ---- run: parse the NDJSON stream as it arrives (kusabi #215 Job B) ----
-  const streamAcc = initClaudeStreamAccumulator();
-  let malformedLines = 0;
-  let lastStatsSaveAt = 0;
-  const STATS_SAVE_INTERVAL_MS = 1000;
-  const onLine = (rawLine) => {
-    const evt = parseClaudeStreamLine(rawLine);
-    if (evt === null) {
-      // Not fatal (a leading non-JSON warning line has been observed on
-      // the real CLI) — just not countable as a parsed event.
-      malformedLines += 1;
-      return;
-    }
-    applyClaudeStreamEvent(streamAcc, evt);
-    job.stats = {
-      instrumented: true,
-      events: streamAcc.events,
-      steps: streamAcc.steps,
-      lastTool: streamAcc.lastTool,
-      permissionsAllowed: 0,
-      permissionsRejected: 0,
-      lastActivity: streamAcc.lastActivity,
-      models: streamAcc.models,
-    };
-    if (streamAcc.rateLimit) job.rateLimit = streamAcc.rateLimit;
-    // Bounded cadence, not every line: a chatty stream must not turn into a
-    // write per event, but `kusabi status` still needs to see the job
-    // record move while the child is running, not only once it exits.
-    const now = Date.now();
-    if (now - lastStatsSaveAt >= STATS_SAVE_INTERVAL_MS) {
-      lastStatsSaveAt = now;
-      saveJob(stateDir, job);
-    }
+  const stream = {
+    init: () => ({
+      streamAcc: initClaudeStreamAccumulator(),
+      malformedLines: 0,
+    }),
+    onLine: (state, rawLine, j) => {
+      const evt = parseClaudeStreamLine(rawLine);
+      if (evt === null) {
+        // Not fatal (a leading non-JSON warning line has been observed on
+        // the real CLI) — just not countable as a parsed event.
+        state.malformedLines += 1;
+        return false;
+      }
+      applyClaudeStreamEvent(state.streamAcc, evt);
+      j.stats = {
+        instrumented: true,
+        events: state.streamAcc.events,
+        steps: state.streamAcc.steps,
+        lastTool: state.streamAcc.lastTool,
+        permissionsAllowed: 0,
+        permissionsRejected: 0,
+        lastActivity: state.streamAcc.lastActivity,
+        models: state.streamAcc.models,
+      };
+      if (state.streamAcc.rateLimit) j.rateLimit = state.streamAcc.rateLimit;
+    },
   };
 
-  const { code, stdout, stderr, timedOut, stalled, writeStalled, repeatStalled, spawnError } = await runClaudeProcess({
-    bin,
-    args,
-    cwd: opts.cwd,
-    timeoutS: opts.timeoutS,
-    watchdogS: opts.watchdogS,
+  return runBackendDispatch({
+    stateDir,
+    job,
     promptText: opts.promptText || "",
-    // Persist the child's identity on the record while it is still running,
-    // so `cancel` can verify and stop it (kusabi #209).
-    onStart: ({ pid, startTime }) => {
-      job.process = { pid, startTime, recordedAt: new Date().toISOString() };
-      saveJob(stateDir, job);
+    dispatchEvent: {
+      type: "companion.claude.dispatch",
+      backend: CLAUDE_BACKEND,
+      model: modelEntry,
+      bin,
     },
-    onLine,
+    dispatchBeforeSpawn: true,
+    bin,
+    labels: { spawnErrorPrefix: `${CLAUDE_BACKEND} dispatch failed` },
+    // Same failure status/text the opencode path uses for timeouts.
+    timeoutS: opts.timeoutS,
     // The SAME event types the opencode watchdog writes
     // (prompt-execution.mjs), so stall auditing over events.ndjson is
     // backend-agnostic and finally counts claude stalls too — until now the
@@ -1359,274 +1204,374 @@ export async function claudeDispatch(opts) {
     // `companion.watchdog.declined-kill` counterpart: that event exists on
     // opencode because a shared serve's pid may not be ours to signal, while
     // this child is ours alone, so the kill always runs.
-    onWatchdog: ({ kind, silenceS }) => {
-      if (kind === "fired") {
-        appendEvent(stateDir, job.id, { type: "companion.watchdog.fired", silenceS });
-      } else {
-        appendEvent(stateDir, job.id, { type: "companion.watchdog.kill" });
-      }
-    },
-    // Null unless the config armed it AND the phase is one that must edit.
-    writeWatchdog: writeWatchdog.enabled ? { warnS: writeWatchdog.warnS, killS: writeWatchdog.killS } : null,
-    // Naming parity with the silence pair from day one (kusabi #215 finding
-    // 4): `companion.write-watchdog.{warned,fired,kill}`, so stall auditing
-    // over events.ndjson needs no second vocabulary.  The warn is ALSO put
-    // on the job record — a warning nobody can see in `kusabi status` is a
-    // warning that changes nothing.
-    onWriteWatchdog: ({ kind, idleS }) => {
-      if (kind === "warned") {
-        // Trail first, record second: this callback is wrapped end to end,
-        // so a failing record save must not be able to swallow the audit
-        // event that is the warning's whole point.
-        appendEvent(stateDir, job.id, {
-          type: "companion.write-watchdog.warned",
-          idleS,
-          warnS: writeWatchdog.warnS,
-          killS: writeWatchdog.killS,
-          phase: job.phase,
-        });
-        if (job.writeWatchdog) {
-          job.writeWatchdog.warned = true;
-          job.writeWatchdog.warnedAt = new Date().toISOString();
-          job.writeWatchdog.idleS = idleS;
-          saveJob(stateDir, job);
-        }
-      } else if (kind === "fired") {
-        appendEvent(stateDir, job.id, { type: "companion.write-watchdog.fired", idleS, killS: writeWatchdog.killS });
-      } else {
-        if (job.writeWatchdog) job.writeWatchdog.killed = true;
-        appendEvent(stateDir, job.id, { type: "companion.write-watchdog.kill" });
-      }
-    },
-    // Null unless the config armed it AND the phase is one that must edit
-    // (resolved in pre-flight, gated above).
-    repeatWatchdog: repeatWatchdog.enabled ? { threshold: repeatWatchdog.threshold, killThreshold: repeatWatchdog.killThreshold } : null,
-    // Naming parity with the two siblings (kusabi #234):
-    // `companion.repeat-watchdog.{warned,fired,kill}`, so stall auditing
-    // over events.ndjson needs no third vocabulary.  The warn is ALSO put
-    // on the job record — a warning nobody can see in `kusabi status` is a
-    // warning that changes nothing.
-    onRepeatWatchdog: ({ kind, tool, count, argsPreview }) => {
-      if (kind === "warned") {
-        // Trail first, record second (the write watchdog's discipline): a
-        // failing record save must not be able to swallow the audit event
-        // that is the warning's whole point.
-        appendEvent(stateDir, job.id, {
-          type: "companion.repeat-watchdog.warned",
-          tool,
-          count,
-          argsPreview,
-          threshold: repeatWatchdog.threshold,
-          killThreshold: repeatWatchdog.killThreshold,
-          phase: job.phase,
-        });
-        if (job.repeatWatchdog) {
-          job.repeatWatchdog.warned = true;
-          job.repeatWatchdog.warnedAt = new Date().toISOString();
-          job.repeatWatchdog.tool = tool;
-          job.repeatWatchdog.count = count;
-          saveJob(stateDir, job);
-        }
-      } else if (kind === "fired") {
-        appendEvent(stateDir, job.id, {
-          type: "companion.repeat-watchdog.fired",
-          tool,
-          count,
-          killThreshold: repeatWatchdog.killThreshold,
-        });
-        // The record's tool/count follow the chain to the kill, so the
-        // finalised record shows what actually repeated.
-        if (job.repeatWatchdog) {
-          job.repeatWatchdog.tool = tool;
-          job.repeatWatchdog.count = count;
-        }
-      } else {
-        appendEvent(stateDir, job.id, { type: "companion.repeat-watchdog.kill" });
-      }
-    },
-  });
-
-  job.finishedAt = new Date().toISOString();
-
-  // ---- failure classification (all failure text preserved on the record) ----
-  let parsed = null;
-  if (spawnError) {
-    job.status = "error";
-    job.error = `claude dispatch failed: could not start ${bin}: ${spawnError.message}`;
-  } else if (repeatStalled) {
-    // The repeat-tool watchdog killed the group (kusabi #234).  Same
-    // `stalled` STATUS as both siblings — a chain must treat all three the
-    // same way — but a DISTINCT error text, because this failure has its
-    // own cause and fix: the worker called one tool with one argument shape
-    // over and over, satisfying both time-based clocks the whole way.
-    // Checked before the write branch so the kill that actually happened is
-    // the one reported (the flags are mutually exclusive by construction:
-    // each watchdog sets only its own, and once any of them has killed the
-    // group the others' paths go quiet).
-    job.status = "stalled";
-    job.error = renderClaudeRepeatWatchdogError(
-      job.repeatWatchdog?.tool ?? "an unknown tool",
-      job.repeatWatchdog?.count ?? 0,
-    );
-  } else if (writeStalled) {
-    // The write-tool watchdog killed the group (kusabi #215 item 3).  Same
-    // `stalled` STATUS as the silence watchdog — a chain must treat both the
-    // same way — but a DISTINCT error text, because the two failures have
-    // different causes and different fixes: this one says the worker was
-    // busy and producing nothing, not that it went quiet.  Checked BEFORE
-    // the silence branch so the kill that actually happened is the one
-    // reported.
-    job.status = "stalled";
-    job.error = renderClaudeWriteWatchdogError(writeWatchdog.killS);
-  } else if (stalled) {
+    //
     // Mirrors the opencode watchdog's own status and wording exactly (kusabi
     // #215 Job B item 3), so a chain treats a stalled claude worker like a
     // stalled opencode one.  The kill always ran (runClaudeProcess only sets
     // `stalled` after killProcessGroup), so the wording always names it —
     // there is no "declined kill" case here, unlike the opencode serve
     // watchdog: this process is ours alone, nothing to verify ownership of.
-    job.status = "stalled";
-    job.error = `watchdog: no events for ${opts.watchdogS}s (process killed)`;
-  } else if (timedOut) {
-    // Same failure status/text the opencode path uses for timeouts.
-    job.status = "timeout";
-    job.error = `timed out after ${opts.timeoutS}s`;
-  } else if (code !== 0 && streamAcc.resultEvent?.is_error !== true) {
-    // Nonzero exit with nothing to classify: no terminal payload at all, or
-    // one that does not itself claim failure.  Generic error, exactly as
-    // before.  (A terminal payload that DOES claim failure skips this branch
-    // — see the comment on the classification branch below.)
-    job.status = "error";
-    const detail = (stderr || stdout || "(no output)").trim();
-    job.error = `claude exited with code ${code}: ${detail}`;
-  } else if (streamAcc.resultEvent === null) {
-    // The process exited 0 but the stream never carried a terminal `result`
-    // event — garbage output, or a shape this parser does not recognize.
-    // Still a failed job, never a stuck "running" record.
-    job.status = "error";
-    const snippet = stdout.trim().slice(0, 300);
-    job.error = `claude stream produced no terminal result event ` +
-      `(${streamAcc.events} parsed, ${malformedLines} unparseable line(s)): ${snippet || "(empty stdout)"}`;
-  } else {
-    parsed = streamAcc.resultEvent;
-    if (parsed.is_error === true) {
-      // Reached on exit 0 AND on a nonzero exit (cross-review of PR #219).
-      // The exit code decides nothing this payload does not already say: a
-      // terminal event with `is_error: true` names the failure, and whether
-      // it is quota exhaustion. Gating the classification on `code === 0`
-      // made the provider-exhaustion stop and its operator advice hostage to
-      // an exit code the real CLI is not documented to set either way — the
-      // one captured session-limit run exited 0, and a future build exiting 1
-      // on the same payload would have silently downgraded it to a generic
-      // error. The exit code is still recorded (companion.claude.finished).
-      //
-      // `subtype` is NEVER consulted here: a terminal payload can carry
-      // `subtype: "success"` next to `is_error: true` (real 2026-08-11
-      // session-limit payload) — the failure signal is is_error alone.
-      const failure = classifyClaudeTerminalFailure(parsed, { rateLimit: job.rateLimit });
-      const detail = typeof parsed.result === "string" && parsed.result.trim()
-        ? parsed.result.trim()
-        : "claude reported is_error: true";
-      job.failure = failure;
-      if (failure) {
-        // Quota exhaustion gets the provider-error status so the chain's
-        // provider-exhaustion stop renders the classification instead of
-        // the generic error text (kusabi #215); the error text carries
-        // the operator-facing advice (which quota, reset, what to do).
-        job.status = "provider-error";
-        job.error = renderClaudeQuotaError(failure, detail, {
-          // Provenance of the reset the classifier settled on: the payload
-          // names one, or it fell back to the live rate feed. Asked the same
-          // way the classifier asks it, so the two can never disagree.
-          resetFromRateFeed: failure.reset !== null && extractClaudeQuotaReset(parsed) === null,
-        });
-      } else {
-        job.status = "error";
+    watchdogS: opts.watchdogS,
+    stream,
+    deferResultWrite: true,
+    resultBackend: CLAUDE_BACKEND,
+    beforeSpawn: async ({ job: j, stateDir: sd }) => {
+      // ---- pre-dispatch session-quota guard (kusabi #215) ----
+      // Runs AFTER the record exists (so a refusal is a finalised job record with
+      // a prompt and an audit trail, not a silent nothing) and BEFORE any worker
+      // is spawned — which is the whole point: at a spent session window the
+      // spawn is what costs money and takes the operator's own session down with
+      // it.  Wrapped end to end: the guard may cost a dispatch its worker, never
+      // the dispatch itself.
+      let guard;
+      try {
+        guard = resolveClaudeSessionGuard(loadClaudeGuardConfig());
+      } catch (err) {
+        // Reading a settings file must never be the thing that fails a dispatch.
+        guard = { enabled: false, threshold: null, reason: `config-unreadable: ${err.message}` };
+      }
+      if (guard.enabled) {
+        let probe;
+        try {
+          probe = await probeClaudeSessionUsage({ bin, cwd: opts.cwd });
+        } catch (err) {
+          // probeClaudeSessionUsage is written never to reject; if it ever does,
+          // that is still not a reason to fail a dispatch.
+          probe = { readable: false, percent: null, reset: null, reason: "probe-threw", detail: err.message, elapsedMs: null };
+        }
+        const observation = claudeSessionGuardObservation(guard, probe);
+        j.sessionGuard = observation;
+        saveJob(sd, j);
+        appendEvent(sd, j.id, { type: "companion.claude.session-guard", ...observation });
+
+        if (observation.decision === "refused") {
+          // The SAME structured classification a mid-run session limit produces,
+          // so the chain's provider-exhaustion stop and every reader react
+          // identically — no new chain logic, no second vocabulary for "the
+          // claude backend is blocked".
+          const failure = {
+            kind: "quota-exhaustion",
+            quota: "session",
+            backendBlocked: true,
+            reset: observation.reset ?? null,
+          };
+          return {
+            status: "provider-error",
+            failure,
+            error: renderClaudeQuotaError(failure, renderClaudeSessionGuardRefusal(observation)),
+            events: [
+              {
+                type: "companion.claude.dispatch-refused",
+                reason: "session-quota-guard",
+                percent: observation.percent,
+                threshold: observation.threshold,
+                reset: observation.reset ?? null,
+              },
+              // The trail keeps its dispatch/finished bookends so auditing tools see
+              // no hole; `spawned: false` is what tells this apart from a run.
+              {
+                type: "companion.claude.finished",
+                status: "provider-error",
+                sessionId: null,
+                exitCode: null,
+                streamEvents: 0,
+                malformedLines: 0,
+                spawned: false,
+              },
+            ],
+          };
+        }
+      }
+
+      // ---- write-tool watchdog (kusabi #215 item 3) ----
+      // Resolved independently of the session guard above (its own config read,
+      // its own try/catch): the two guards must not be able to break each other,
+      // and this one is the destructive one.  Off unless BOTH the config asks
+      // for it and the phase is one whose deliverable is an edit — a review or
+      // investigate job legitimately never writes a file.
+      try {
+        writeWatchdog = resolveClaudeWriteWatchdog(loadClaudeGuardConfig());
+      } catch (err) {
+        // Reading a settings file must never be the thing that fails a dispatch.
+        writeWatchdog = { enabled: false, warnS: null, killS: null, reason: `config-unreadable: ${err.message}` };
+      }
+      if (writeWatchdog.enabled && !writeWatchdogAppliesToPhase(opts.phase)) {
+        writeWatchdog = { enabled: false, warnS: null, killS: null, reason: "phase-not-gated" };
+      }
+      if (writeWatchdog.enabled) {
+        // Recorded ONLY when armed: a dispatch with the feature off must leave a
+        // job record byte-identical to the pre-item-3 one (no new key at all).
+        j.writeWatchdog = {
+          warnS: writeWatchdog.warnS,
+          killS: writeWatchdog.killS,
+          reason: writeWatchdog.reason,
+          warned: false,
+          warnedAt: null,
+          idleS: null,
+          killed: false,
+        };
+        saveJob(sd, j);
+      }
+
+      // ---- repeat-tool watchdog (kusabi #234) ----
+      // Config was resolved (and validated) in pre-flight, above.  Here the
+      // watchdog is GATED exactly like its siblings: armed only when the config
+      // enabled it AND the phase is one whose deliverable is an edit — the same
+      // implement-only gate the write watchdog uses (every chain rework round
+      // dispatches under "implement").
+      if (repeatWatchdog.enabled && !writeWatchdogAppliesToPhase(opts.phase)) {
+        repeatWatchdog = { enabled: false, threshold: null, killThreshold: null, reason: "phase-not-gated" };
+      }
+      if (repeatWatchdog.enabled) {
+        // Recorded ONLY when armed: an unarmed dispatch must leave a job record
+        // byte-identical to the pre-#234 one (no new key at all).  `count` is
+        // the chain length at the last recorded event (the warn, or the kill).
+        j.repeatWatchdog = {
+          threshold: repeatWatchdog.threshold,
+          killThreshold: repeatWatchdog.killThreshold,
+          reason: repeatWatchdog.reason,
+          warned: false,
+          warnedAt: null,
+          tool: null,
+          count: 0,
+        };
+        saveJob(sd, j);
+      }
+
+      return null;
+    },
+    runProcess: (hooks) =>
+      runClaudeProcess({
+        bin,
+        args,
+        cwd: opts.cwd,
+        timeoutS: opts.timeoutS,
+        watchdogS: opts.watchdogS,
+        promptText: opts.promptText || "",
+        ...hooks,
+        // Null unless the config armed it AND the phase is one that must edit.
+        writeWatchdog: writeWatchdog?.enabled
+          ? { warnS: writeWatchdog.warnS, killS: writeWatchdog.killS }
+          : null,
+        // Naming parity with the silence pair from day one (kusabi #215 finding
+        // 4): `companion.write-watchdog.{warned,fired,kill}`, so stall auditing
+        // over events.ndjson needs no second vocabulary.  The warn is ALSO put
+        // on the job record — a warning nobody can see in `kusabi status` is a
+        // warning that changes nothing.
+        onWriteWatchdog: ({ kind, idleS }) => {
+          if (kind === "warned") {
+            // Trail first, record second: this callback is wrapped end to end,
+            // so a failing record save must not be able to swallow the audit
+            // event that is the warning's whole point.
+            appendEvent(stateDir, job.id, {
+              type: "companion.write-watchdog.warned",
+              idleS,
+              warnS: writeWatchdog.warnS,
+              killS: writeWatchdog.killS,
+              phase: job.phase,
+            });
+            if (job.writeWatchdog) {
+              job.writeWatchdog.warned = true;
+              job.writeWatchdog.warnedAt = new Date().toISOString();
+              job.writeWatchdog.idleS = idleS;
+              saveJob(stateDir, job);
+            }
+          } else if (kind === "fired") {
+            appendEvent(stateDir, job.id, { type: "companion.write-watchdog.fired", idleS, killS: writeWatchdog.killS });
+          } else {
+            if (job.writeWatchdog) job.writeWatchdog.killed = true;
+            appendEvent(stateDir, job.id, { type: "companion.write-watchdog.kill" });
+          }
+        },
+        // Null unless the config armed it AND the phase is one that must edit
+        // (resolved in pre-flight, gated above).
+        repeatWatchdog: repeatWatchdog?.enabled
+          ? { threshold: repeatWatchdog.threshold, killThreshold: repeatWatchdog.killThreshold }
+          : null,
+        // Naming parity with the two siblings (kusabi #234):
+        // `companion.repeat-watchdog.{warned,fired,kill}`, so stall auditing
+        // over events.ndjson needs no third vocabulary.  The warn is ALSO put
+        // on the job record — a warning nobody can see in `kusabi status` is a
+        // warning that changes nothing.
+        onRepeatWatchdog: ({ kind, tool, count, argsPreview }) => {
+          if (kind === "warned") {
+            // Trail first, record second (the write watchdog's discipline): a
+            // failing record save must not be able to swallow the audit event
+            // that is the warning's whole point.
+            appendEvent(stateDir, job.id, {
+              type: "companion.repeat-watchdog.warned",
+              tool,
+              count,
+              argsPreview,
+              threshold: repeatWatchdog.threshold,
+              killThreshold: repeatWatchdog.killThreshold,
+              phase: job.phase,
+            });
+            if (job.repeatWatchdog) {
+              job.repeatWatchdog.warned = true;
+              job.repeatWatchdog.warnedAt = new Date().toISOString();
+              job.repeatWatchdog.tool = tool;
+              job.repeatWatchdog.count = count;
+              saveJob(stateDir, job);
+            }
+          } else if (kind === "fired") {
+            appendEvent(stateDir, job.id, {
+              type: "companion.repeat-watchdog.fired",
+              tool,
+              count,
+              killThreshold: repeatWatchdog.killThreshold,
+            });
+            // The record's tool/count follow the chain to the kill, so the
+            // finalised record shows what actually repeated.
+            if (job.repeatWatchdog) {
+              job.repeatWatchdog.tool = tool;
+              job.repeatWatchdog.count = count;
+            }
+          } else {
+            appendEvent(stateDir, job.id, { type: "companion.repeat-watchdog.kill" });
+          }
+        },
+      }),
+    classifyExit: ({ code, stdout, stderr, state, job: j, runResult }) => {
+      const { writeStalled, repeatStalled } = runResult || {};
+      if (repeatStalled) {
+        // The repeat-tool watchdog killed the group (kusabi #234).  Same
+        // `stalled` STATUS as both siblings — a chain must treat all three the
+        // same way — but a DISTINCT error text, because this failure has its
+        // own cause and fix: the worker called one tool with one argument shape
+        // over and over, satisfying both time-based clocks the whole way.
+        // Checked before the write branch so the kill that actually happened is
+        // the one reported (the flags are mutually exclusive by construction:
+        // each watchdog sets only its own, and once any of them has killed the
+        // group the others' paths go quiet).
+        return {
+          status: "stalled",
+          error: renderClaudeRepeatWatchdogError(
+            j.repeatWatchdog?.tool ?? "an unknown tool",
+            j.repeatWatchdog?.count ?? 0,
+          ),
+        };
+      }
+      if (writeStalled) {
+        // The write-tool watchdog killed the group (kusabi #215 item 3).  Same
+        // `stalled` STATUS as the silence watchdog — a chain must treat both the
+        // same way — but a DISTINCT error text, because the two failures have
+        // different causes and different fixes: this one says the worker was
+        // busy and producing nothing, not that it went quiet.  Checked BEFORE
+        // the silence branch so the kill that actually happened is the one
+        // reported.
+        return {
+          status: "stalled",
+          error: renderClaudeWriteWatchdogError(writeWatchdog.killS),
+        };
+      }
+      if (code !== 0 && state.streamAcc.resultEvent?.is_error !== true) {
+        // Nonzero exit with nothing to classify: no terminal payload at all, or
+        // one that does not itself claim failure.  Generic error, exactly as
+        // before.  (A terminal payload that DOES claim failure skips this branch
+        // — see the comment on the classification branch below.)
+        const detail = (stderr || stdout || "(no output)").trim();
+        return {
+          status: "error",
+          error: `claude exited with code ${code}: ${detail}`,
+        };
+      }
+      if (state.streamAcc.resultEvent === null) {
+        // The process exited 0 but the stream never carried a terminal `result`
+        // event — garbage output, or a shape this parser does not recognize.
+        // Still a failed job, never a stuck "running" record.
+        const snippet = stdout.trim().slice(0, 300);
+        return {
+          status: "error",
+          error: `claude stream produced no terminal result event ` +
+            `(${state.streamAcc.events} parsed, ${state.malformedLines} unparseable line(s)): ${snippet || "(empty stdout)"}`,
+        };
+      }
+
+      const parsed = state.streamAcc.resultEvent;
+      if (parsed.is_error === true) {
+        // Reached on exit 0 AND on a nonzero exit (cross-review of PR #219).
+        // The exit code decides nothing this payload does not already say: a
+        // terminal event with `is_error: true` names the failure, and whether
+        // it is quota exhaustion. Gating the classification on `code === 0`
+        // made the provider-exhaustion stop and its operator advice hostage to
+        // an exit code the real CLI is not documented to set either way — the
+        // one captured session-limit run exited 0, and a future build exiting 1
+        // on the same payload would have silently downgraded it to a generic
+        // error. The exit code is still recorded (companion.claude.finished).
+        //
+        // `subtype` is NEVER consulted here: a terminal payload can carry
+        // `subtype: "success"` next to `is_error: true` (real 2026-08-11
+        // session-limit payload) — the failure signal is is_error alone.
+        const failure = classifyClaudeTerminalFailure(parsed, { rateLimit: j.rateLimit });
+        const detail = typeof parsed.result === "string" && parsed.result.trim()
+          ? parsed.result.trim()
+          : "claude reported is_error: true";
+        if (failure) {
+          // Quota exhaustion gets the provider-error status so the chain's
+          // provider-exhaustion stop renders the classification instead of
+          // the generic error text (kusabi #215); the error text carries
+          // the operator-facing advice (which quota, reset, what to do).
+          return {
+            status: "provider-error",
+            failure,
+            error: renderClaudeQuotaError(failure, detail, {
+              // Provenance of the reset the classifier settled on: the payload
+              // names one, or it fell back to the live rate feed. Asked the same
+              // way the classifier asks it, so the two can never disagree.
+              resetFromRateFeed: failure.reset !== null && extractClaudeQuotaReset(parsed) === null,
+            }),
+          };
+        }
         // Nonzero exit with stderr/stdout text: keep the CLI's own
         // diagnostic on the record — a terse is_error payload says what
         // happened, not why.  The quota arm never appends it: the
         // classification names the failure and stderr would be noise.
         // Exit-0 rendering is unchanged (this suffix is exit-gated).
         const exitDiagnostic = (stderr || stdout || "").trim();
-        job.error = code !== 0 && exitDiagnostic
-          ? `claude dispatch failed: ${detail} (exited with code ${code}: ${exitDiagnostic})`
-          : `claude dispatch failed: ${detail}`;
+        return {
+          status: "error",
+          failure: null,
+          error: code !== 0 && exitDiagnostic
+            ? `claude dispatch failed: ${detail} (exited with code ${code}: ${exitDiagnostic})`
+            : `claude dispatch failed: ${detail}`,
+        };
       }
-    } else {
-      job.status = "completed";
-      job.sessionID = parsed.session_id ?? null;
-      job.usage = {
-        ...mapClaudeUsage(parsed),
-        phase: job.phase,
-        durationSeconds: durationS(job),
+
+      // A run can end with no final message and the whole output still on disk
+      // — for this backend in Claude Code's own transcript, since `claude -p`
+      // is a child process and there is no stream of ours to record.  Recover
+      // from it (deterministically, no LLM, no extra request) rather than write
+      // an empty result.md (result-recovery.mjs).
+      return {
+        status: "completed",
+        sessionID: parsed.session_id ?? null,
+        usage: mapClaudeUsage(parsed),
+        fetched: claudeFinalMessage(parsed),
       };
-      writeJson(path.join(jobDir(stateDir, job.id), "usage.json"), job.usage);
-    }
-  }
-
-  // A stream that never reached (or never carried) a terminal `result`
-  // event still leaves whatever `system`/`init` reported — the only source
-  // of a session id when nothing else names one (kusabi #215 Job B item 5).
-  if (!job.sessionID && streamAcc.sessionIdFromInit) {
-    job.sessionID = streamAcc.sessionIdFromInit;
-  }
-
-  appendEvent(stateDir, job.id, {
-    type: "companion.claude.finished",
-    status: job.status,
-    sessionId: job.sessionID,
-    exitCode: code,
-    streamEvents: streamAcc.events,
-    malformedLines,
+    },
+    // A stream that never reached (or never carried) a terminal `result`
+    // event still leaves whatever `system`/`init` reported — the only source
+    // of a session id when nothing else names one (kusabi #215 Job B item 5).
+    fallbackSessionId: ({ state }) => state.streamAcc.sessionIdFromInit ?? null,
+    finishedEvent: ({ state, job: j, code }) => ({
+      type: "companion.claude.finished",
+      status: j.status,
+      sessionId: j.sessionID,
+      exitCode: code,
+      streamEvents: state.streamAcc.events,
+      malformedLines: state.malformedLines,
+    }),
+    stopReasonInput: (j) => {
+      // Record the closed terminal reason (kusabi #388).  A terminal failure the
+      // classifier already named a quota exhaustion becomes "quota-exhausted";
+      // any other provider-error stays "provider-error"; error/timeout/stalled
+      // fall through to "unknown".
+      const capacityReason =
+        (j.status === "provider-error" && j.failure?.kind === "quota-exhaustion")
+          ? (j.failure?.quota ?? "quota-exhaustion")
+          : null;
+      return { capacityReason };
+    },
   });
-
-  // Record the closed terminal reason (kusabi #388).  Claude finalizes its
-  // job.json on this path and never calls deriveStopReason via the opencode
-  // SSE fold, so stamp here at the terminal write.  A terminal failure the
-  // classifier already named a quota exhaustion becomes "quota-exhausted";
-  // any other provider-error stays "provider-error"; error/timeout/stalled
-  // fall through to "unknown".  worktreeChanged is left unmeasured at job
-  // level, matching the opencode path.
-  const capacityReason =
-    (job.status === "provider-error" && job.failure?.kind === "quota-exhaustion")
-      ? (job.failure?.quota ?? "quota-exhaustion")
-      : null;
-  job.stopReason = deriveStopReason({
-    status: job.status,
-    stats: job.stats,
-    capacityReason,
-  });
-  saveJob(stateDir, job);
-
-  let resultText = "";
-  if (job.status === "completed" && parsed !== null) {
-    // A run can end with no final message and the whole output still on disk
-    // — for this backend in Claude Code's own transcript, since `claude -p`
-    // is a child process and there is no stream of ours to record.  Recover
-    // from it (deterministically, no LLM, no extra request) rather than write
-    // an empty result.md (result-recovery.mjs).
-    const resolved = resolveCompletedResult({
-      backend: CLAUDE_BACKEND,
-      fetched: claudeFinalMessage(parsed),
-      coords: { sessionId: job.sessionID },
-    });
-    resultText = resolved.text;
-    job.result = resolved.record;
-    if (resolved.record.recovered) {
-      appendEvent(stateDir, job.id, {
-        type: "companion.result.recovered",
-        source: resolved.record.recovery.source,
-        chars: resolved.record.recovery.chars,
-        fetchFailed: resolved.record.fetchFailed,
-        fetchError: resolved.record.fetchError,
-      });
-    }
-    saveJob(stateDir, job);
-    fs.writeFileSync(path.join(jobDir(stateDir, job.id), "result.md"), resultText, "utf8");
-  }
-
-  return { job, resultText, stateDir };
-  } finally {
-    progressWatch.stop();
-  }
 }

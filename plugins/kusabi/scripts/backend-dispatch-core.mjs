@@ -18,6 +18,9 @@ import { resolveCompletedResult } from "./result-recovery.mjs";
 import { deriveStopReason } from "./stop-reason.mjs";
 import { startKaibaProgressWatch } from "./kaiba-progress-watch.mjs";
 
+// Bounded cadence, not every line: a chatty stream must not turn into a
+// write per event, but `kusabi status` still needs to see the job
+// record move while the child is running, not only once it exits.
 const STATS_SAVE_INTERVAL_MS = 1000;
 
 /**
@@ -28,7 +31,8 @@ const STATS_SAVE_INTERVAL_MS = 1000;
  * @param {object} opts.job - Initial job record (already populated, status "running").
  * @param {string} opts.promptText - Prompt content to persist in prompt.md.
  * @param {object} [opts.dispatchEvent] - Start event payload appended to events.ndjson.
- * @param {Function} [opts.beforeSpawn] - Optional hook () => null | { status, error, event, resultText }.
+ * @param {boolean} [opts.dispatchBeforeSpawn] - If true, append dispatchEvent before beforeSpawn runs.
+ * @param {Function} [opts.beforeSpawn] - Optional hook () => null | { status, error, event, events, failure, resultText }.
  * @param {Function} opts.runProcess - (hooks: { onStart, onLine, onWatchdog }) => Promise<{ code, stdout, stderr, timedOut, stalled, spawnError }>.
  * @param {object} [opts.stream] - Stream handling { init, state, onLine: (state, rawLine, job) => void }.
  * @param {object} [opts.labels] - String labels e.g. { spawnErrorPrefix, bin }.
@@ -36,8 +40,10 @@ const STATS_SAVE_INTERVAL_MS = 1000;
  * @param {number|null} [opts.timeoutS] - Timeout in seconds.
  * @param {number|null} [opts.watchdogS] - Watchdog silence threshold in seconds.
  * @param {Function} [opts.afterProcess] - Hook run after process exit before classification.
- * @param {Function} [opts.classifyExit] - ({ code, stdout, stderr, state, job }) => ExitOutcome.
+ * @param {Function} [opts.classifyExit] - ({ code, stdout, stderr, state, job, runResult }) => ExitOutcome.
+ * @param {Function} [opts.fallbackSessionId] - Optional ({ state, job }) => string|null for fallback session ID before finished event.
  * @param {Function|object} [opts.finishedEvent] - Finished event payload or builder function.
+ * @param {Function} [opts.stopReasonInput] - Optional (job) => object with extra deriveStopReason parameters.
  * @param {string} [opts.resultBackend] - Backend identifier for result recovery.
  * @param {Function} [opts.transformResultText] - Optional (text, { job, state }) => string.
  * @param {boolean} [opts.deferResultWrite] - If true, write result.md after finished event and final save.
@@ -48,6 +54,7 @@ export async function runBackendDispatch({
   job,
   promptText,
   dispatchEvent,
+  dispatchBeforeSpawn = false,
   beforeSpawn,
   runProcess,
   stream,
@@ -57,7 +64,9 @@ export async function runBackendDispatch({
   watchdogS,
   afterProcess,
   classifyExit,
+  fallbackSessionId,
   finishedEvent,
+  stopReasonInput,
   resultBackend,
   transformResultText,
   deferResultWrite = false,
@@ -68,6 +77,10 @@ export async function runBackendDispatch({
   saveJob(stateDir, job);
   fs.writeFileSync(path.join(jobDir(stateDir, job.id), "prompt.md"), promptText, "utf8");
 
+  if (dispatchBeforeSpawn && dispatchEvent) {
+    appendEvent(stateDir, job.id, dispatchEvent);
+  }
+
   const progressWatch = startKaibaProgressWatch({ stateDir, jobId: job.id });
 
   try {
@@ -77,16 +90,29 @@ export async function runBackendDispatch({
         job.status = refusal.status ?? "error";
         job.error = refusal.error;
         job.finishedAt = new Date().toISOString();
-        if (refusal.event) {
+        if (refusal.failure !== undefined) {
+          job.failure = refusal.failure;
+        }
+        for (const [key, val] of Object.entries(refusal)) {
+          if (!["status", "error", "event", "events", "resultText", "failure"].includes(key) && val !== undefined) {
+            job[key] = val;
+          }
+        }
+        if (Array.isArray(refusal.events)) {
+          for (const evt of refusal.events) {
+            appendEvent(stateDir, job.id, evt);
+          }
+        } else if (refusal.event) {
           appendEvent(stateDir, job.id, refusal.event);
         }
-        job.stopReason = deriveStopReason({ status: job.status, stats: job.stats });
+        const extraStopReason = typeof stopReasonInput === "function" ? stopReasonInput(job) : null;
+        job.stopReason = deriveStopReason({ status: job.status, stats: job.stats, ...extraStopReason });
         saveJob(stateDir, job);
         return { job, resultText: refusal.resultText ?? "", stateDir };
       }
     }
 
-    if (dispatchEvent) {
+    if (!dispatchBeforeSpawn && dispatchEvent) {
       appendEvent(stateDir, job.id, dispatchEvent);
     }
 
@@ -121,11 +147,12 @@ export async function runBackendDispatch({
       }
     };
 
-    const { code, stdout, stderr, timedOut, stalled, spawnError } = await runProcess({
+    const processResult = await runProcess({
       onStart,
       onLine,
       onWatchdog,
     });
+    const { code, stdout, stderr, timedOut, stalled, spawnError } = processResult;
 
     job.finishedAt = new Date().toISOString();
 
@@ -139,6 +166,7 @@ export async function runBackendDispatch({
         spawnError,
         state: streamState,
         job,
+        runResult: processResult,
       });
     }
 
@@ -161,6 +189,7 @@ export async function runBackendDispatch({
         stderr,
         state: streamState,
         job,
+        runResult: processResult,
       });
 
       if (exitOutcome) {
@@ -168,7 +197,7 @@ export async function runBackendDispatch({
         if (exitOutcome.error !== undefined) job.error = exitOutcome.error;
         if (exitOutcome.sessionID) job.sessionID = exitOutcome.sessionID;
         for (const [key, val] of Object.entries(exitOutcome)) {
-          if (!["status", "error", "usage", "text", "sessionID"].includes(key) && val !== undefined) {
+          if (!["status", "error", "usage", "text", "sessionID", "fetched"].includes(key) && val !== undefined) {
             job[key] = val;
           }
         }
@@ -188,9 +217,10 @@ export async function runBackendDispatch({
 
       if (!deferResultWrite) {
         const rawText = exitOutcome?.text ?? "";
+        const fetched = exitOutcome?.fetched ?? { ok: true, text: rawText };
         const resolved = resolveCompletedResult({
           backend: resultBackend,
-          fetched: { ok: true, text: rawText },
+          fetched,
           coords: { sessionId: job.sessionID },
         });
         resultText = resolved.text ?? rawText;
@@ -198,7 +228,23 @@ export async function runBackendDispatch({
           resultText = transformResultText(resultText, { job, state: streamState });
         }
         job.result = resolved.record;
+        if (resolved.record?.recovered) {
+          appendEvent(stateDir, job.id, {
+            type: "companion.result.recovered",
+            source: resolved.record.recovery.source,
+            chars: resolved.record.recovery.chars,
+            fetchFailed: resolved.record.fetchFailed,
+            fetchError: resolved.record.fetchError,
+          });
+        }
         fs.writeFileSync(path.join(jobDir(stateDir, job.id), "result.md"), resultText, "utf8");
+      }
+    }
+
+    if (!job.sessionID && typeof fallbackSessionId === "function") {
+      const fallback = fallbackSessionId({ state: streamState, job });
+      if (fallback) {
+        job.sessionID = fallback;
       }
     }
 
@@ -214,14 +260,16 @@ export async function runBackendDispatch({
     // so stamp here at the terminal write. worktreeChanged is left
     // unmeasured at job level, matching the shared path: a completed wrapper
     // records "completed"; error/timeout/stalled fall through to "unknown".
-    job.stopReason = deriveStopReason({ status: job.status, stats: job.stats });
+    const extraStopReason = typeof stopReasonInput === "function" ? stopReasonInput(job) : null;
+    job.stopReason = deriveStopReason({ status: job.status, stats: job.stats, ...extraStopReason });
     saveJob(stateDir, job);
 
     if (deferResultWrite && job.status === "completed") {
       const rawText = exitOutcome?.text ?? "";
+      const fetched = exitOutcome?.fetched ?? { ok: true, text: rawText };
       const resolved = resolveCompletedResult({
         backend: resultBackend,
-        fetched: { ok: true, text: rawText },
+        fetched,
         coords: { sessionId: job.sessionID },
       });
       resultText = resolved.text ?? rawText;
@@ -229,6 +277,15 @@ export async function runBackendDispatch({
         resultText = transformResultText(resultText, { job, state: streamState });
       }
       job.result = resolved.record;
+      if (resolved.record?.recovered) {
+        appendEvent(stateDir, job.id, {
+          type: "companion.result.recovered",
+          source: resolved.record.recovery.source,
+          chars: resolved.record.recovery.chars,
+          fetchFailed: resolved.record.fetchFailed,
+          fetchError: resolved.record.fetchError,
+        });
+      }
       saveJob(stateDir, job);
       fs.writeFileSync(path.join(jobDir(stateDir, job.id), "result.md"), resultText, "utf8");
     }
