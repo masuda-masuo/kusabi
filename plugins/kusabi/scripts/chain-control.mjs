@@ -65,6 +65,32 @@ export function briefTitle(text) {
 }
 
 /**
+ * The round's disposition, which is `{disposition, reason}` on live records
+ * and a bare string on some older ones.
+ *
+ * Resolves the disposition string of the last record in a chain that has one,
+ * or null.
+ *
+ * @param {object|Array} chainJsonOrRecords — parsed chain.json or its records array
+ * @returns {string|null}
+ */
+export function dispositionOf(chainJsonOrRecords) {
+  const records = Array.isArray(chainJsonOrRecords)
+    ? chainJsonOrRecords
+    : Array.isArray(chainJsonOrRecords?.records)
+      ? chainJsonOrRecords.records
+      : null;
+  if (!records) return null;
+
+  for (let i = records.length - 1; i >= 0; i -= 1) {
+    const value = records[i]?.disposition;
+    if (typeof value === "string") return value;
+    if (value && typeof value.disposition === "string") return value.disposition;
+  }
+  return null;
+}
+
+/**
  * Build args for notifyChainTerminal from a chain directory + control record.
  * Shared by finalizeChainControl and the stale-pid path in requestChainStop.
  *
@@ -76,7 +102,7 @@ export function briefTitle(text) {
 export function buildNotifyArgs(chainDir, existing, status) {
   const chainJson = readJson(path.join(chainDir, "chain.json"));
   const chainId = existing.chainId || (chainJson && chainJson.chainId) || path.basename(chainDir);
-  const disposition = chainJson?.disposition?.disposition ?? null;
+  const disposition = dispositionOf(chainJson);
   const container = existing.container || chainJson?.container || null;
   const cwdLabel = briefTitle(chainJson?.brief);
   return {

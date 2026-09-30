@@ -20,6 +20,7 @@ import {
   listChainDirs,
   collectChainStatuses,
   buildNotifyArgs,
+  dispositionOf,
 } from "./chain-control.mjs";
 
 // ---------------------------------------------------------------------------
@@ -344,7 +345,9 @@ describe("finalizeChainControl", () => {
       JSON.stringify({
         chainId: "chain-notify-wire",
         container: "cid-wire",
-        disposition: { disposition: "accept", round: 1 },
+        records: [
+          { disposition: { disposition: "accept", reason: "done" } },
+        ],
         // chain.json's `brief` is the brief TEXT, never a path (kusabi #612).
         brief: "# Demo chain\n\nOrchestrator: m | session s | 2026-09-28\n\n- To see an original use `git show HEAD:<path>`.\n",
       }),
@@ -372,12 +375,122 @@ describe("finalizeChainControl", () => {
     const body = fs.readFileSync(inboxPath, "utf8");
     assert.ok(body.includes("chain-notify-wire"));
     assert.ok(body.includes("completed"));
+    assert.ok(body.includes("accept"));
 
     const args = buildNotifyArgs(chainDir, readChainControl(chainDir), "completed");
     assert.equal(args.chainId, "chain-notify-wire");
     assert.equal(args.disposition, "accept");
     assert.equal(args.container, "cid-wire");
     assert.equal(args.cwdLabel, "Demo chain");
+  });
+
+  it("resolves disposition from earlier record when last record has no disposition", () => {
+    if (prevNotify === undefined) delete process.env.KUSABI_CHAIN_NOTIFY;
+    else process.env.KUSABI_CHAIN_NOTIFY = prevNotify;
+
+    const stateDir = tmpDir;
+    const chainDir = path.join(stateDir, "chains", "chain-notify-fallback");
+    fs.mkdirSync(chainDir, { recursive: true });
+    writeChainControl(chainDir, {
+      chainId: "chain-notify-fallback",
+      container: "cid-fallback",
+      pid: 124,
+      status: "running",
+      round: 0,
+    });
+    fs.writeFileSync(
+      path.join(chainDir, "chain.json"),
+      JSON.stringify({
+        chainId: "chain-notify-fallback",
+        container: "cid-fallback",
+        records: [
+          { disposition: { disposition: "accept", reason: "earlier round" } },
+          { disposition: null },
+        ],
+        brief: "# Fallback chain\n\nOrchestrator: m | session s | 2026-09-28\n",
+      }),
+      "utf8",
+    );
+
+    const kaibaDb = path.join(stateDir, "kaiba.db");
+    const db = new DatabaseSync(kaibaDb, { open: true, write: true });
+    db.exec(
+      "CREATE TABLE actions (id INTEGER PRIMARY KEY AUTOINCREMENT, content TEXT NOT NULL, position REAL NOT NULL, author TEXT, created_at TEXT NOT NULL, done_at TEXT)"
+    );
+    db.close();
+
+    const prevDb = process.env.KAIBA_DB;
+    process.env.KAIBA_DB = kaibaDb;
+    try {
+      finalizeChainControl({ chainDir, status: "completed", round: 2 });
+    } finally {
+      if (prevDb === undefined) delete process.env.KAIBA_DB;
+      else process.env.KAIBA_DB = prevDb;
+    }
+
+    const inboxPath = path.join(stateDir, "inbox", "chain-notify-fallback.md");
+    assert.ok(fs.existsSync(inboxPath), "inbox file should exist");
+    const body = fs.readFileSync(inboxPath, "utf8");
+    assert.ok(body.includes("chain-notify-fallback"));
+    assert.ok(body.includes("completed"));
+    assert.ok(body.includes("accept"));
+
+    const args = buildNotifyArgs(chainDir, readChainControl(chainDir), "completed");
+    assert.equal(args.chainId, "chain-notify-fallback");
+    assert.equal(args.disposition, "accept");
+  });
+
+  it("reports disposition as none when chain has no records", () => {
+    if (prevNotify === undefined) delete process.env.KUSABI_CHAIN_NOTIFY;
+    else process.env.KUSABI_CHAIN_NOTIFY = prevNotify;
+
+    const stateDir = tmpDir;
+    const chainDir = path.join(stateDir, "chains", "chain-notify-norecords");
+    fs.mkdirSync(chainDir, { recursive: true });
+    writeChainControl(chainDir, {
+      chainId: "chain-notify-norecords",
+      container: "cid-none",
+      pid: 125,
+      status: "running",
+      round: 0,
+    });
+    fs.writeFileSync(
+      path.join(chainDir, "chain.json"),
+      JSON.stringify({
+        chainId: "chain-notify-norecords",
+        container: "cid-none",
+        records: [],
+        brief: "# Empty chain\n\nOrchestrator: m | session s | 2026-09-28\n",
+      }),
+      "utf8",
+    );
+
+    const kaibaDb = path.join(stateDir, "kaiba.db");
+    const db = new DatabaseSync(kaibaDb, { open: true, write: true });
+    db.exec(
+      "CREATE TABLE actions (id INTEGER PRIMARY KEY AUTOINCREMENT, content TEXT NOT NULL, position REAL NOT NULL, author TEXT, created_at TEXT NOT NULL, done_at TEXT)"
+    );
+    db.close();
+
+    const prevDb = process.env.KAIBA_DB;
+    process.env.KAIBA_DB = kaibaDb;
+    try {
+      finalizeChainControl({ chainDir, status: "completed", round: 0 });
+    } finally {
+      if (prevDb === undefined) delete process.env.KAIBA_DB;
+      else process.env.KAIBA_DB = prevDb;
+    }
+
+    const inboxPath = path.join(stateDir, "inbox", "chain-notify-norecords.md");
+    assert.ok(fs.existsSync(inboxPath), "inbox file should exist");
+    const body = fs.readFileSync(inboxPath, "utf8");
+    assert.ok(body.includes("chain-notify-norecords"));
+    assert.ok(body.includes("completed"));
+    assert.ok(body.includes("- **disposition**: none"));
+
+    const args = buildNotifyArgs(chainDir, readChainControl(chainDir), "completed");
+    assert.equal(args.chainId, "chain-notify-norecords");
+    assert.equal(args.disposition, null);
   });
 });
 
@@ -907,3 +1020,60 @@ describe("kaiba job retirement at chain terminal paths", () => {
     assert.equal(loggedJobIds().length, EXPECTED_SWEEP_IDS.size);
   });
 });
+
+// ---------------------------------------------------------------------------
+// dispositionOf
+// ---------------------------------------------------------------------------
+
+describe("dispositionOf", () => {
+  it("returns null for non-objects or empty structures", () => {
+    assert.equal(dispositionOf(null), null);
+    assert.equal(dispositionOf(undefined), null);
+    assert.equal(dispositionOf({}), null);
+    assert.equal(dispositionOf([]), null);
+    assert.equal(dispositionOf({ records: [] }), null);
+  });
+
+  it("extracts disposition from the last record with an object disposition", () => {
+    const chainJson = {
+      records: [
+        { disposition: { disposition: "escalate", reason: "stuck" } },
+        { disposition: { disposition: "accept", reason: "all good" } },
+      ],
+    };
+    assert.equal(dispositionOf(chainJson), "accept");
+    assert.equal(dispositionOf(chainJson.records), "accept");
+  });
+
+  it("extracts bare string disposition from older records", () => {
+    const chainJson = {
+      records: [
+        { disposition: "escalate" },
+      ],
+    };
+    assert.equal(dispositionOf(chainJson), "escalate");
+    assert.equal(dispositionOf(chainJson.records), "escalate");
+  });
+
+  it("walks backwards to find the last record with a valid disposition", () => {
+    const records = [
+      { disposition: { disposition: "discard", reason: "initial" } },
+      { disposition: { disposition: "accept", reason: "revised" } },
+      { disposition: null },
+      {},
+    ];
+    assert.equal(dispositionOf({ records }), "accept");
+    assert.equal(dispositionOf(records), "accept");
+  });
+
+  it("returns null when no record has a disposition", () => {
+    const records = [
+      { disposition: null },
+      {},
+      { disposition: 123 },
+    ];
+    assert.equal(dispositionOf({ records }), null);
+    assert.equal(dispositionOf(records), null);
+  });
+});
+
