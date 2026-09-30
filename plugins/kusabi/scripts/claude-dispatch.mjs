@@ -1191,7 +1191,6 @@ export async function claudeDispatch(opts) {
       model: modelEntry,
       bin,
     },
-    dispatchBeforeSpawn: true,
     bin,
     labels: { spawnErrorPrefix: `${CLAUDE_BACKEND} dispatch failed` },
     // Same failure status/text the opencode path uses for timeouts.
@@ -1213,7 +1212,6 @@ export async function claudeDispatch(opts) {
     // watchdog: this process is ours alone, nothing to verify ownership of.
     watchdogS: opts.watchdogS,
     stream,
-    deferResultWrite: true,
     resultBackend: CLAUDE_BACKEND,
     beforeSpawn: async ({ job: j, stateDir: sd }) => {
       // ---- pre-dispatch session-quota guard (kusabi #215) ----
@@ -1266,17 +1264,6 @@ export async function claudeDispatch(opts) {
                 percent: observation.percent,
                 threshold: observation.threshold,
                 reset: observation.reset ?? null,
-              },
-              // The trail keeps its dispatch/finished bookends so auditing tools see
-              // no hole; `spawned: false` is what tells this apart from a run.
-              {
-                type: "companion.claude.finished",
-                status: "provider-error",
-                sessionId: null,
-                exitCode: null,
-                streamEvents: 0,
-                malformedLines: 0,
-                spawned: false,
               },
             ],
           };
@@ -1562,16 +1549,5 @@ export async function claudeDispatch(opts) {
       streamEvents: state.streamAcc.events,
       malformedLines: state.malformedLines,
     }),
-    stopReasonInput: (j) => {
-      // Record the closed terminal reason (kusabi #388).  A terminal failure the
-      // classifier already named a quota exhaustion becomes "quota-exhausted";
-      // any other provider-error stays "provider-error"; error/timeout/stalled
-      // fall through to "unknown".
-      const capacityReason =
-        (j.status === "provider-error" && j.failure?.kind === "quota-exhaustion")
-          ? (j.failure?.quota ?? "quota-exhaustion")
-          : null;
-      return { capacityReason };
-    },
   });
 }

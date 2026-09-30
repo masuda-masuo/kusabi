@@ -1012,7 +1012,6 @@ export async function agyDispatch(opts) {
     // Unreachable in practice — an empty payload is a FAILED job under the
     // payload rule — but the shared path keeps the record shape identical
     // across backends.
-    deferResultWrite: true,
     resultBackend: AGY_BACKEND,
     beforeSpawn: () => {
       // prompt.md is written BEFORE the size guard runs, on purpose: the operator
@@ -1064,13 +1063,6 @@ export async function agyDispatch(opts) {
         ...hooks,
       }),
     stream,
-    afterProcess: ({ state, job: j }) => {
-      // The run stays resumable even though no terminal `result` arrived:
-      // the conversation id seen on `init` is the session.
-      // Same resumability rule as the stall path: the init id survives a run
-      // the outer bound cut short.
-      j.sessionID = state.conversationIdFromInit ?? null;
-    },
     classifyExit: ({ code, stdout, stderr, state }) => {
       // Parse FIRST, exit code second.  The payload rule is about not throwing
       // away completed work on a signal that is not authoritative, and a
@@ -1186,6 +1178,9 @@ export async function agyDispatch(opts) {
         sessionID: state.conversationIdFromInit ?? null,
       };
     },
+    // The run stays resumable even though no terminal `result` arrived:
+    // the conversation id seen on `init` is the session.
+    fallbackSessionId: ({ state }) => state.conversationIdFromInit ?? null,
     finishedEvent: ({ job: j, code }) => ({
       type: "companion.agy.finished",
       status: j.status,

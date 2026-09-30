@@ -1245,10 +1245,13 @@ if (mode === "stall" || mode === "stall-with-child" || mode === "stall-garbage" 
   const sessionId = mode === "resume-echo" && resumeAt >= 0
     ? argv[resumeAt + 1]
     : "claude-session-abc123";
+  const resultText = process.env.FAKE_CLAUDE_RESULT !== undefined
+    ? process.env.FAKE_CLAUDE_RESULT
+    : "implemented the thing per the brief";
   const result = {
     type: "result",
     is_error: false,
-    result: "implemented the thing per the brief",
+    result: resultText,
     session_id: sessionId,
     usage: {
       input_tokens: 1000,
@@ -1475,6 +1478,40 @@ describe("claudeDispatch (fake claude binary)", () => {
     assert.equal(events[0].type, "companion.claude.dispatch");
     assert.equal(events[1].type, "companion.claude.finished");
     assert.equal(events[1].status, "completed");
+    assert.equal(events[1].spawned, true);
+  });
+
+  it("a recovered result's companion.result.recovered event precedes companion.claude.finished", async () => {
+    const projects = path.join(ctx.tmp, "projects", "-test-project");
+    fs.mkdirSync(projects, { recursive: true });
+    fs.writeFileSync(
+      path.join(projects, "claude-session-abc123.jsonl"),
+      JSON.stringify({
+        type: "assistant",
+        message: { content: [{ type: "text", text: "recovered text from transcript" }] },
+      }) + "\n",
+      "utf8",
+    );
+    const restoreProjects = patchEnv({
+      KUSABI_CLAUDE_PROJECTS_DIR: path.join(ctx.tmp, "projects"),
+      FAKE_CLAUDE_RESULT: "",
+    });
+    try {
+      const { job, resultText, stateDir } = await claudeDispatch(ctx.dispatchOptions());
+      assert.equal(job.status, "completed");
+      assert.equal(job.result?.recovered, true);
+      assert.ok(resultText.includes("recovered text from transcript"));
+
+      const events = readJobEvents(stateDir, job.id);
+      const recoveredIdx = events.findIndex((e) => e.type === "companion.result.recovered");
+      const finishedIdx = events.findIndex((e) => e.type === "companion.claude.finished");
+      assert.ok(recoveredIdx >= 0, "companion.result.recovered must be present");
+      assert.ok(finishedIdx >= 0, "companion.claude.finished must be present");
+      assert.ok(recoveredIdx < finishedIdx, "companion.result.recovered must precede companion.claude.finished");
+      assert.equal(events[finishedIdx].spawned, true);
+    } finally {
+      restoreProjects();
+    }
   });
 
   it("builds the contract invocation shape (implement agent: allowlist + system prompt)", async () => {
