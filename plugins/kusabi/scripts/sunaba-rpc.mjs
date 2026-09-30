@@ -31,7 +31,7 @@ const ALLOWED_TOOLS = new Set([
   "checkpoint_list",
   "copy_file",
   // The exact read-only probe tools the luna mission driver mediates for the
-  // gpt-5.6-luna coordinator seat (kusabi #530).  Nothing else is added: the
+  // gpt-6-luna coordinator seat (kusabi #530).  Nothing else is added: the
   // write/exec authority boundary above is unchanged.
   "read_file_range",
   "search_in_container",

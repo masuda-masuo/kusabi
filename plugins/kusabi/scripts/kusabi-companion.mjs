@@ -34,7 +34,16 @@ import { cmdTask, cmdReview, cmdTaskDetach } from "./task-cmd.mjs";
 // luna-detach, luna-wait, luna-show, luna-cancel, luna-resume).  luna-cmd.mjs
 // is NOT on a cycle with companion: it imports only leaf modules (the mission
 // driver reaches the chain lifecycle seam through a lazy import).
-import { cmdLuna, cmdLunaDetach, cmdLunaWait, cmdLunaShow, cmdLunaCancel, cmdLunaResume } from "./luna-cmd.mjs";
+import {
+  cmdLuna,
+  cmdLunaDetach,
+  cmdLunaWait,
+  cmdLunaShow,
+  cmdLunaCancel,
+  cmdLunaResume,
+  DEFAULT_COORDINATOR_SEAT,
+  DEFAULT_AUDITOR_SEAT,
+} from "./luna-cmd.mjs";
 // metrics-cmd (kusabi #443): the look-at-recorded-work command surfaces
 // (chain-stats, metrics-ingest, metrics-report, dashboard). Unlike chain-cmd,
 // chain-ops, and task-cmd, metrics-cmd.mjs is NOT on a cycle with companion:
@@ -248,7 +257,7 @@ function usage() {
     "  chain-stats Aggregate every chain record and print a summary (read-only, no LLM)",
     "  task-detach Launch a task in a detached background process and print a runnable task-wait command line (no LLM in launcher)",
     "  task-wait  Block until a task reaches a terminal state, print a one-line digest, exit 0 (read-only, no LLM; safe to SIGTERM at any moment). Non-zero means the WAIT itself failed — unknown job id, nothing appeared under --next, or the task stalled",
-    "  luna       Run an opt-in luna mission: the gpt-5.6-luna coordinator proposes bounded actions, and the deterministic driver validates and executes only the frozen enum (read_probe, run_chain, rework_chain, consult_sol, escalate_to_host, finish) against an immutable evidence envelope. The mission never accepts, publishes, merges, creates issues or creates containers — its terminal result is a host-facing recommendation",
+    `  luna       Run an opt-in luna mission: the ${DEFAULT_COORDINATOR_SEAT.model} coordinator proposes bounded actions, and the deterministic driver validates and executes only the frozen enum (read_probe, run_chain, rework_chain, consult_sol, escalate_to_host, finish) against an immutable evidence envelope. The mission never accepts, publishes, merges, creates issues or creates containers — its terminal result is a host-facing recommendation`,
     "  luna-detach Launch a luna mission in a detached background process and print a runnable luna-wait command line (no LLM in launcher)",
     "  luna-wait  Block until a NAMED luna mission reaches a terminal state, print a one-line digest, exit 0 (read-only, no LLM, no serve; safe to SIGTERM at any moment). Non-zero means the WAIT itself failed — a mission that never appeared, a malformed mission id, or a stalled mission — never a disposition you dislike",
     "  luna-show  Print a compact plain-text digest of a luna mission: exact seat provenance/substitution, attempts and inner chain ids, errors/consults, state and recommendation (read-only, no LLM)",
@@ -288,8 +297,8 @@ function usage() {
     "  --requirements-file <path> (chain: path to the requirements file for --strategy incremental-tdd; required when the strategy is incremental-tdd)",
     "  --mission-file <path> (luna / luna-detach: the mission brief file; required. The mission brief is the outer brief — inner chains get their own brief from the coordinator's run_chain request)",
     "  --mission-id <id> (luna / luna-detach: run the mission under this id instead of minting one. The id becomes a path segment under missions/, so it must match mission-[a-z0-9]+. luna-detach hands the SAME id back: the emitted wait line is `luna-wait <id>`, which waits for the mission by name — no recency selection)",
-    "  --coordinator-model <provider/model> (luna / luna-detach: the coordinator seat, default codex/gpt-5.6-luna; the luna mode never leaves the codex seats, and a non-default model is refused unless --allow-substitute authorizes it)",
-    "  --auditor-model <provider/model> (luna / luna-detach: the auditor seat, default codex/gpt-5.6-sol; same substitution rule as --coordinator-model)",
+    `  --coordinator-model <provider/model> (luna / luna-detach: the coordinator seat, default ${DEFAULT_COORDINATOR_SEAT.provider}/${DEFAULT_COORDINATOR_SEAT.model}; the luna mode never leaves the codex seats, and a non-default model is refused unless --allow-substitute authorizes it)`,
+    `  --auditor-model <provider/model> (luna / luna-detach: the auditor seat, default ${DEFAULT_AUDITOR_SEAT.provider}/${DEFAULT_AUDITOR_SEAT.model}; same substitution rule as --coordinator-model)`,
     "  --allow-substitute (luna / luna-detach: explicitly authorize a non-default coordinator/auditor seat. Substitution is loud in mission records and show/wait output — requested and actual models are both recorded)",
     "  --audit-override <gateId> (luna-resume: the blocking gate a human override resolves. Required together with --audit-override-reason and --audit-override-by; the original verdict is embedded byte-for-byte and only a sol-blocked mission can be overridden)",
     "  --audit-override-reason <reason> (luna-resume: the human's reason for the override, persisted verbatim. Required; refused when empty)",

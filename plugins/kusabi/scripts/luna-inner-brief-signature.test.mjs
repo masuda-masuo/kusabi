@@ -213,8 +213,8 @@ const FROZEN_QUALIFIER_BRIEF = [
 ].join("\n");
 
 const DEFAULT_SEATS = {
-  coordinator: { provider: "codex", model: "gpt-5.6-luna" },
-  auditor: { provider: "codex", model: "gpt-5.6-sol" },
+  coordinator: { provider: "codex", model: "gpt-6-luna" },
+  auditor: { provider: "codex", model: "gpt-6.1-sol" },
 };
 
 const DEFAULT_BUDGET = { maxChains: 3, maxAttempts: 2, maxProbes: 5, maxConsults: 3, maxRework: 1 };
@@ -353,7 +353,7 @@ describe("luna driver deterministic inner-brief signature (decisions 1-3, 5-6)",
     );
     assert.equal(
       lines[0],
-      `Orchestrator: gpt-5.6-luna | session ${record.missionId} | ${DISPATCH_UTC}`,
+      `Orchestrator: gpt-6-luna | session ${record.missionId} | ${DISPATCH_UTC}`,
       "the seam must receive the canonical signature as line 1",
     );
     assert.equal(
@@ -366,7 +366,7 @@ describe("luna driver deterministic inner-brief signature (decisions 1-3, 5-6)",
     assert.ok(input.orchestrator, "the seam must receive a non-null parsed orchestrator attribution");
     assert.deepEqual(
       input.orchestrator,
-      { model: "gpt-5.6-luna", session: record.missionId, date: DISPATCH_UTC },
+      { model: "gpt-6-luna", session: record.missionId, date: DISPATCH_UTC },
       "the parsed attribution must match the canonical line 1 exactly",
     );
   });
@@ -384,7 +384,7 @@ describe("luna driver deterministic inner-brief signature (decisions 1-3, 5-6)",
 
     assert.equal(
       lines[0],
-      `Orchestrator: gpt-5.6-luna | session ${record.missionId} | ${DISPATCH_UTC}`,
+      `Orchestrator: gpt-6-luna | session ${record.missionId} | ${DISPATCH_UTC}`,
       "the seam must receive the canonical signature as line 1 for rework_chain",
     );
     assert.equal(
@@ -395,7 +395,7 @@ describe("luna driver deterministic inner-brief signature (decisions 1-3, 5-6)",
     assert.ok(input.orchestrator, "the seam must receive a non-null parsed orchestrator attribution");
     assert.deepEqual(
       input.orchestrator,
-      { model: "gpt-5.6-luna", session: record.missionId, date: DISPATCH_UTC },
+      { model: "gpt-6-luna", session: record.missionId, date: DISPATCH_UTC },
       "the parsed attribution must match the canonical line 1 exactly",
     );
   });

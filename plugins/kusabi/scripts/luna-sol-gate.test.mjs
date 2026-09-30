@@ -239,8 +239,8 @@ const VALID_RUN_CHAIN_BRIEF = [
 ].join("\n");
 
 const DEFAULT_SEATS = {
-  coordinator: { provider: "codex", model: "gpt-5.6-luna" },
-  auditor: { provider: "codex", model: "gpt-5.6-sol" },
+  coordinator: { provider: "codex", model: "gpt-6-luna" },
+  auditor: { provider: "codex", model: "gpt-6.1-sol" },
 };
 
 // #531 adds the rework bound to the #530 budget: consecutive Sol `rework`
@@ -943,7 +943,7 @@ describe("realSolDispatch failure propagation (criterion 5/7)", () => {
       missionId: "mission-aaaaaaaa",
       envelope: { envelope_sha256: "e".repeat(64) },
       gate: { gateId: "gate-1", phase: "pre-dispatch" },
-      auditor: { provider: "codex", model: "gpt-5.6-sol" },
+      auditor: { provider: "codex", model: "gpt-6.1-sol" },
       ...overrides,
     };
   }
@@ -978,7 +978,7 @@ describe("realSolDispatch failure propagation (criterion 5/7)", () => {
       missionDir,
       brief: "Sol dispatch-failure classification",
       container: "test-cid",
-      auditor: { provider: "codex", model: "gpt-5.6-sol" },
+      auditor: { provider: "codex", model: "gpt-6.1-sol" },
       allowSubstitute: false,
       sampling: null,
       phase: "pre-accept",
@@ -1022,7 +1022,7 @@ describe("realSolDispatch failure propagation (criterion 5/7)", () => {
       missionDir,
       brief: "Sol invalid-verdict-content classification",
       container: "test-cid",
-      auditor: { provider: "codex", model: "gpt-5.6-sol" },
+      auditor: { provider: "codex", model: "gpt-6.1-sol" },
       allowSubstitute: false,
       sampling: null,
       phase: "pre-accept",

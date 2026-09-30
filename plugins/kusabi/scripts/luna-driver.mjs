@@ -1,6 +1,6 @@
 // luna-driver.mjs — kusabi #530 + #531: the deterministic luna mission driver.
 //
-// A luna mission is an opt-in dispatch surface: the gpt-5.6-luna coordinator
+// A luna mission is an opt-in dispatch surface: the gpt-6-luna coordinator
 // seat proposes bounded actions as line-oriented JSON records, and THIS
 // driver is the only authority that validates and executes them.  The
 // contract, frozen by luna-driver.test.mjs (+ #531's luna-sol-gate /
@@ -70,8 +70,8 @@
 //
 // The driver receives injected coordinator/chain/tool/Sol/notify seams in
 // tests and real adapters in production (the real coordinator dispatch runs
-// the exact gpt-5.6-luna seat through the codex backend, the real Sol
-// dispatch runs the exact gpt-5.6-sol seat through it).
+// the exact gpt-6-luna seat through the codex backend, the real Sol
+// dispatch runs the exact gpt-6.1-sol seat through it).
 
 import fs from "node:fs";
 import path from "node:path";
@@ -111,9 +111,9 @@ import {
 export { renderPendingSolRework } from "./luna-sol-gate.mjs";
 import { renderRecommendation } from "./render-recommendation.mjs";
 
-/** The exact default seats of #530: coordinator codex/gpt-5.6-luna, auditor codex/gpt-5.6-sol. */
-export const DEFAULT_COORDINATOR_SEAT = { provider: "codex", model: "gpt-5.6-luna" };
-export const DEFAULT_AUDITOR_SEAT = { provider: "codex", model: "gpt-5.6-sol" };
+/** The exact default seats of #530: coordinator codex/gpt-6-luna, auditor codex/gpt-6.1-sol. */
+export const DEFAULT_COORDINATOR_SEAT = { provider: "codex", model: "gpt-6-luna" };
+export const DEFAULT_AUDITOR_SEAT = { provider: "codex", model: "gpt-6.1-sol" };
 
 /**
  * The explicit mission budget: bounded chains, attempts, probes, consults and
@@ -568,7 +568,7 @@ export async function collectPostChainEvidence({
 }
 
 /**
- * The real coordinator dispatch (production): run the exact gpt-5.6-luna seat
+ * The real coordinator dispatch (production): run the exact gpt-6-luna seat
  * through the codex backend with the mission brief and the current envelope
  * as framing, and return its raw output text (the JSONL request stream).  The
  * kusabi-coordinate agent grants zero tools; the envelope is the only
@@ -1085,8 +1085,8 @@ async function defaultBaseline({ container, callTool }) {
  * @param {string} input.brief — the resolved mission brief text.
  * @param {string} input.container
  * @param {string} [input.missionId] — driver-minted when absent.
- * @param {object} [input.coordinator] — {provider, model}; default codex/gpt-5.6-luna.
- * @param {object} [input.auditor] — {provider, model}; default codex/gpt-5.6-sol.
+ * @param {object} [input.coordinator] — {provider, model}; default codex/gpt-6-luna.
+ * @param {object} [input.auditor] — {provider, model}; default codex/gpt-6.1-sol.
  * @param {boolean} [input.allowSubstitute] — authorizes a non-default seat.
  * @param {object} [input.budget] — {maxChains, maxAttempts, maxProbes, maxConsults, maxRework}.
  * @param {object} [input.sampling] — {rate, salt}; folded into every
@@ -1101,7 +1101,7 @@ async function defaultBaseline({ container, callTool }) {
  *        semantics of chain-driver.mjs).
  * @param {Function} [input.inject.solDispatch] — async
  *        ({ cwd, missionId, missionDir, envelope, gate, record, auditor }) =>
- *        string; default: the real gpt-5.6-sol codex dispatch.
+ *        string; default: the real gpt-6.1-sol codex dispatch.
  * @param {Function} [input.inject.investigationDispatch] — async
  *        ({ cwd, missionId, missionDir, brief, container }) => { jobId, requestedModel, actualModel, body };
  *        throwing on failure.

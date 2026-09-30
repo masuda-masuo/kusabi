@@ -424,7 +424,7 @@ export function buildGateEnvelope({
 }
 
 /**
- * The real Sol seat dispatch (production): run the exact gpt-5.6-sol auditor
+ * The real Sol seat dispatch (production): run the exact gpt-6.1-sol auditor
  * seat through the codex backend with the gate envelope as its ONLY evidence
  * path, and return its raw JSONL output.  The job title follows the frozen
  * job-identification pattern `luna mission <mission-id>: ...` so

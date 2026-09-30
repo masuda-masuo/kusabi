@@ -628,7 +628,7 @@ This limitation is deliberate and documented rather than silently claimed as cov
 ### 3.5.7f luna mission driver (kusabi #530/#531) — opt-in separate mission surface
 
 A luna mission is an opt-in dispatch surface layered on top of the chain
-lifecycle: the `gpt-5.6-luna` coordinator seat proposes bounded actions, and a
+lifecycle: the `gpt-6-luna` coordinator seat proposes bounded actions, and a
 **deterministic driver** — never the coordinator — validates and executes them.
 The mission surface is separate from `chain` in both directions: default
 `chain` / `task` behaviour is byte-identical when luna is not invoked, and no
@@ -638,7 +638,7 @@ real chains run through the `runChainLifecycle` seam (`chain-cmd.mjs`, kusabi
 is the single outer serve owner (`keepServe: true`).
 
 **Authority boundary.** The coordinator seat (`kusabi-coordinate`,
-`codex/gpt-5.6-luna`) grants ZERO tools and no MCP servers (`"*": deny`). Its
+`codex/gpt-6-luna`) grants ZERO tools and no MCP servers (`"*": deny`). Its
 only information path is the immutable evidence envelope (kusabi #529) and the
 read-only evidence tree placed by the driver; its only output is a line-oriented
 JSONL request stream, parsed exclusively through `parseCoordinatorOutput`
@@ -754,8 +754,9 @@ or if the seat returns an empty/whitespace report, the mission ends fail-closed
 with disposition `host-handoff` (`investigation failed: <cause>`), emits a single
 terminal notification, writes `recommendation.md`, and never dispatches the coordinator.
 
-**Seats.** Defaults are exact: coordinator `codex/gpt-5.6-luna`, auditor
-`codex/gpt-5.6-sol`. Any substitution is refused before mission creation
+**Seats.** Defaults are exact: coordinator `codex/gpt-6-luna`, auditor
+`codex/gpt-6.1-sol` (the defaults moved from the 5.6 seats on 2026-10-01 (#641);
+5.6 remains available with `--allow-substitute`). Any substitution is refused before mission creation
 unless `--allow-substitute` explicitly authorizes it, and an authorized
 substitution is loud in the records (`requested`/`actual`/`substituted: true`)
 and in show/wait output. A non-codex provider is refused outright — the luna
@@ -1045,8 +1046,8 @@ The bare form is load-bearing: it names no backend, so it moves nothing — `--m
 
 #### 3.5.11a Codex worker seats — implemented (kusabi #597)
 
-The Codex backend has two distinct surfaces. The `codex/gpt-5.6-luna`
-coordinator and `codex/gpt-5.6-sol` auditor remain MCP-less: their argv keeps
+The Codex backend has two distinct surfaces. The `codex/gpt-6-luna`
+coordinator and `codex/gpt-6.1-sol` auditor remain MCP-less: their argv keeps
 `-c 'mcp_servers={}'`, and their job-owned `CODEX_HOME` receives no MCP
 configuration. This preserves the coordinator's mediated evidence boundary
 and the auditor's deterministic gate boundary.

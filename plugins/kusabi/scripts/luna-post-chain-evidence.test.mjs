@@ -27,8 +27,8 @@ import {
 import { stubInvestigationSeams } from "./fixtures.mjs";
 
 const DEFAULT_SEATS = {
-  coordinator: { provider: "codex", model: "gpt-5.6-luna" },
-  auditor: { provider: "codex", model: "gpt-5.6-sol" },
+  coordinator: { provider: "codex", model: "gpt-6-luna" },
+  auditor: { provider: "codex", model: "gpt-6.1-sol" },
 };
 import {
   missionEvidenceItems,
