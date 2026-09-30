@@ -167,12 +167,9 @@ import { fileURLToPath } from "node:url";
 
 import { firstRoute } from "./cli.mjs";
 import { readAgentSystemPrompt } from "./agent-system-prompt.mjs";
-import { newJobId, saveJob, jobDir, appendEvent } from "./job-store.mjs";
-import { stateDirFor, writeJson } from "./state-paths.mjs";
-import { durationS } from "./render.mjs";
-import { resolveCompletedResult } from "./result-recovery.mjs";
-import { deriveStopReason } from "./stop-reason.mjs";
-import { startKaibaProgressWatch } from "./kaiba-progress-watch.mjs";
+import { newJobId } from "./job-store.mjs";
+import { stateDirFor } from "./state-paths.mjs";
+import { runBackendDispatch } from "./backend-dispatch-core.mjs";
 import { isUsableTimeoutS, runBackendProcess } from "./backend-process-runner.mjs";
 import {
   parseAgyResult,
@@ -939,49 +936,7 @@ export async function agyDispatch(opts) {
     retry: null,
     fallbacks: null,
   };
-  saveJob(stateDir, job);
-  // prompt.md is written BEFORE the size guard runs, on purpose: the operator
-  // of a refused dispatch is the one who most needs to see what was too big.
-  fs.writeFileSync(path.join(jobDir(stateDir, job.id), "prompt.md"), promptText, "utf8");
-
-  const progressWatch = startKaibaProgressWatch({ stateDir, jobId: job.id });
-
-  // ---- argv size guard (kusabi #221 residual) ----
-  // The last thing before the spawn.  An oversized argument would fail with a
-  // raw E2BIG that says nothing about which string was too long or what to do
-  // about it; this refuses first and says both.
-  //
-  // `status: "error"`, NOT `provider-error`: nothing upstream is blocked and
-  // no capacity is exhausted.  This is a CALLER error — the same brief would
-  // fail identically on the next agy dispatch, so marking it a provider
-  // outage would send a retry walk at a wall.  The record is finalised here
-  // and NO process is started: `job.process` stays null because there is no
-  // child to point `cancel` at.
-  const argvSize = checkAgyArgvSize(args);
-  if (!argvSize.ok) {
-    job.status = "error";
-    job.error = argvSize.message;
-    job.finishedAt = new Date().toISOString();
-    appendEvent(stateDir, job.id, {
-      type: "companion.agy.argv-too-large",
-      backend: AGY_BACKEND,
-      model: modelEntry,
-      limit: argvSize.limit,
-      // The measured sizes, element by element — what the guard actually saw,
-      // so the refusal can be checked rather than taken on faith.
-      oversized: argvSize.oversized,
-    });
-    // Record the closed terminal reason (kusabi #388): an argv-too-large
-    // refusal finalises the record here, error -> "unknown".
-    job.stopReason = deriveStopReason({ status: job.status, stats: job.stats });
-    saveJob(stateDir, job);
-    progressWatch.stop();
-    return { job, resultText: "", stateDir };
-  }
-
-  try {
-
-  appendEvent(stateDir, job.id, {
+  const dispatchEvent = {
     type: "companion.agy.dispatch",
     backend: AGY_BACKEND,
     model: modelEntry,
@@ -996,7 +951,7 @@ export async function agyDispatch(opts) {
     // Unknown until the terminal result arrives — null here mirrors the
     // record's initial value so the trail and the record never disagree.
     agyDeniedTool: null,
-  });
+  };
 
   // ---- run: fold the NDJSON stream as it arrives (kusabi #332) ----
   // Each complete stdout line is parsed and folded into the accumulator the
@@ -1004,72 +959,44 @@ export async function agyDispatch(opts) {
   // every parsed event.  Bounded cadence for the SAVE, not for the fold: a
   // chatty stream must not turn into a write per event, but `kusabi status`
   // still needs to see the record move while the child is running.
-  const streamAcc = initAgyStreamAccumulator();
-  let lastStatsSaveAt = 0;
-  const STATS_SAVE_INTERVAL_MS = 1000;
-  const onLine = (rawLine) => {
-    const evt = parseAgyStreamLine(rawLine);
-    if (evt === null) {
-      // Not fatal (the real CLI has been observed printing non-JSON
-      // warning lines) — just not countable as a parsed event.
-      return;
-    }
-    applyAgyStreamEvent(streamAcc, evt);
-    job.stats = {
-      instrumented: true,
-      events: streamAcc.events,
-      steps: streamAcc.steps,
-      lastTool: streamAcc.lastTool,
-      permissionsAllowed: 0,
-      permissionsRejected: 0,
-      lastActivity: streamAcc.lastActivity,
-      models: streamAcc.models,
-    };
-    const now = Date.now();
-    if (now - lastStatsSaveAt >= STATS_SAVE_INTERVAL_MS) {
-      lastStatsSaveAt = now;
-      saveJob(stateDir, job);
-    }
+  const stream = {
+    init: () => initAgyStreamAccumulator(),
+    onLine: (streamAcc, rawLine, j) => {
+      const evt = parseAgyStreamLine(rawLine);
+      if (evt === null) {
+        // Not fatal (the real CLI has been observed printing non-JSON
+        // warning lines) — just not countable as a parsed event.
+        return false;
+      }
+      applyAgyStreamEvent(streamAcc, evt);
+      j.stats = {
+        instrumented: true,
+        events: streamAcc.events,
+        steps: streamAcc.steps,
+        lastTool: streamAcc.lastTool,
+        permissionsAllowed: 0,
+        permissionsRejected: 0,
+        lastActivity: streamAcc.lastActivity,
+        models: streamAcc.models,
+      };
+    },
   };
 
-  const { code, stdout, stderr, timedOut, stalled, spawnError } = await runAgyProcess({
+  return runBackendDispatch({
+    stateDir,
+    job,
+    promptText,
+    dispatchEvent,
     bin,
-    args,
-    cwd: opts.cwd,
-    // The resolved role HOME (or nothing when `agy.homes` resolved to null,
-    // so the child inherits the parent env byte-for-byte).  runBackendProcess
-    // merges this on top of `process.env`, so the override is additive.
-    env: agyHome !== null ? { HOME: agyHome } : undefined,
-    // The already-resolved values (the TWO decisions above) — the same
-    // values buildAgyArgs and the stall text consumed, so every bound was
-    // decided together.
+    labels: { spawnErrorPrefix: "agy dispatch failed" },
+    // Same failure status/text the opencode and claude paths use.
+    // The resolved value — the timer only fires when it is a positive
+    // number, so this renders the same number the timer was armed with.
     timeoutS,
-    watchdogS,
-    onStart: ({ pid, startTime }) => {
-      job.process = { pid, startTime, recordedAt: new Date().toISOString() };
-      saveJob(stateDir, job);
-    },
-    onLine,
     // The SAME event types the opencode and claude watchdogs write
     // (prompt-execution.mjs, claude-dispatch.mjs), so stall auditing over
     // events.ndjson is backend-agnostic and finally counts agy stalls too.
-    onWatchdog: ({ kind, silenceS }) => {
-      if (kind === "fired") {
-        appendEvent(stateDir, job.id, { type: "companion.watchdog.fired", silenceS });
-      } else {
-        appendEvent(stateDir, job.id, { type: "companion.watchdog.kill" });
-      }
-    },
-  });
-
-  job.finishedAt = new Date().toISOString();
-
-  // ---- classification (all failure text preserved on the record) ----
-  let payload = null;
-  if (spawnError) {
-    job.status = "error";
-    job.error = `agy dispatch failed: could not start ${bin}: ${spawnError.message}`;
-  } else if (stalled) {
+    //
     // The silence watchdog killed the group (kusabi #332).  Same `stalled`
     // STATUS and the opencode/claude watchdog's own wording, so a chain
     // treats a stalled agy worker exactly like a stalled opencode/claude
@@ -1077,154 +1004,7 @@ export async function agyDispatch(opts) {
     // killProcessGroup), so the wording always names it.  The interval the
     // text names is the ARMED one — the floored value, never what the
     // caller happened to pass.
-    job.status = "stalled";
-    job.error = `watchdog: no events for ${watchdogS}s (process killed)`;
-    // The run stays resumable even though no terminal `result` arrived:
-    // the conversation id seen on `init` is the session.
-    job.sessionID = streamAcc.conversationIdFromInit ?? null;
-  } else if (timedOut) {
-    // Same failure status/text the opencode and claude paths use.
-    job.status = "timeout";
-    // The resolved value — the timer only fires when it is a positive
-    // number, so this renders the same number the timer was armed with.
-    job.error = `timed out after ${timeoutS}s`;
-    // Same resumability rule as the stall path: the init id survives a run
-    // the outer bound cut short.
-    job.sessionID = streamAcc.conversationIdFromInit ?? null;
-  } else {
-    // Parse FIRST, exit code second.  The payload rule is about not throwing
-    // away completed work on a signal that is not authoritative, and a
-    // nonzero exit accompanying a complete payload is the same class of
-    // signal as `status: "ERROR"`.  A nonzero exit with NO payload still
-    // fails, and its error names the exit code.
-    let parsed = null;
-    let parseError = null;
-    // The terminal payload is the stream's LAST `result` event's inner
-    // object — byte-shape-identical to what `--output-format json` used to
-    // print (measured 2026-08-20), so every downstream consumer receives
-    // the exact object it receives today.  When no terminal `result` event
-    // arrived, fall back to the LEGACY single-object reading: a stream that
-    // collapses to the old shape (a CLI build that ignores stream-json)
-    // still delivers its work; anything else is a failed job whose error
-    // names the exit code or the parse failure.
-    const resultObj = streamAcc.resultEvent?.result ?? null;
-    if (resultObj !== null && typeof resultObj === "object" && !Array.isArray(resultObj)) {
-      parsed = resultObj;
-    } else {
-      try {
-        parsed = parseAgyResult(stdout);
-      } catch (err) {
-        parseError = err;
-      }
-    }
-
-    if (parsed !== null) {
-      job.agyStatus = typeof parsed.status === "string" ? parsed.status : null;
-      // The tool calls headless agy auto-denied, taken defensively (entries
-      // may lack display_name; the field may be absent on older CLIs).
-      job.agyDeniedActions = agyDeniedActionNames(parsed);
-      // Denial diagnosis (kusabi #545): an `mcp` class names ONLY the class —
-      // which MCP tool was denied is not in the result, nor in cli.log.  The
-      // name lives as plaintext inside a protobuf BLOB in agy's conversation
-      // database, so when (and ONLY when) `mcp` is among the classes, read
-      // that database and record the tool.  The other classes (read_file,
-      // read_url, command, write_file, browser) are FULLY NAMED by
-      // `display_name`, and the last tool step of such a run belongs to a
-      // successful call — consulting the database for them would misattribute
-      // the denial.  `agyDeniedTool` is the string `<server>/<tool>` when
-      // identified, else null; it is present on every record from the initial
-      // write below, exactly like `agyHome`.  The lookup is defensive: any
-      // database failure yields null and the dispatch proceeds as today — this
-      // is diagnostic enrichment, not a gate, and never changes the terminal
-      // decision.
-      let deniedToolUnresolved = false;
-      if (job.agyDeniedActions.includes("mcp")) {
-        const conversationId = parsed.conversation_id ?? streamAcc.conversationIdFromInit ?? null;
-        const home = agyHome ?? process.env.HOME ?? null;
-        if (conversationId !== null && home !== null) {
-          const dbPath = path.join(
-            home, ".gemini", "antigravity-cli", "conversations", `${conversationId}.db`,
-          );
-          const found = agyDeniedToolFromConversation({ dbPath });
-          if (found !== null) {
-            job.agyDeniedTool = `${found.server}/${found.tool}`;
-          } else {
-            // An mcp class WAS denied but the tool could not be pinned down.
-            // The error must say so rather than let the reader assume the
-            // class was all there was.
-            deniedToolUnresolved = true;
-          }
-        } else {
-          // No conversation id (or no home at all) — nothing to consult.
-          deniedToolUnresolved = true;
-        }
-      }
-      // `settingsPath` is the file this run's HOME would consult — named in a
-      // denied-run error so the operator is pointed at the exact table.
-      const outcome = agyPayload(parsed, {
-        settingsPath: agySettingsPath,
-        deniedTool: job.agyDeniedTool,
-        deniedToolUnresolved,
-      });
-      if (outcome.ok) {
-        job.status = "completed";
-        job.sessionID = parsed.conversation_id ?? streamAcc.conversationIdFromInit ?? null;
-        job.payloadSource = outcome.payloadSource;
-        payload = outcome;
-        job.usage = {
-          ...mapAgyUsage(parsed),
-          phase: job.phase,
-          durationSeconds: durationS(job),
-        };
-        writeJson(path.join(jobDir(stateDir, job.id), "usage.json"), job.usage);
-      } else {
-        job.status = "error";
-        // The session id is still worth recording: a payload-less run is the
-        // one an operator most wants to open in the agy UI.
-        job.sessionID = parsed.conversation_id ?? streamAcc.conversationIdFromInit ?? null;
-        job.error = `agy dispatch failed: ${outcome.error}`;
-      }
-    } else if (code !== 0) {
-      job.status = "error";
-      const detail = (stderr || stdout || "(no output)").trim();
-      job.error = `agy exited with code ${code}: ${detail}`;
-      job.sessionID = streamAcc.conversationIdFromInit ?? null;
-    } else {
-      job.status = "error";
-      const snippet = (stdout || "").trim().slice(0, 300);
-      job.error = `agy dispatch failed: ${parseError.message}: ${snippet || "(empty stdout)"}`;
-      job.sessionID = streamAcc.conversationIdFromInit ?? null;
-    }
-  }
-
-  appendEvent(stateDir, job.id, {
-    type: "companion.agy.finished",
-    status: job.status,
-    // Advisory: what the CLI claimed, next to what kusabi decided from the
-    // payload.  Recorded side by side on purpose — the two disagreeing is
-    // the normal case for a run with one failed tool call.
-    agyStatus: job.agyStatus,
-    sessionId: job.sessionID,
-    exitCode: code,
-    // The tool calls headless agy auto-denied, as measured on this run's
-    // terminal result ([] when none, or when the run never produced one).
-    agyDeniedActions: job.agyDeniedActions,
-    // The MCP tool behind an `mcp` denial, when it could be identified from
-    // the conversation record (null otherwise — non-`mcp` denials are fully
-    // named by `display_name` and never consult the database).
-    agyDeniedTool: job.agyDeniedTool,
-  });
-
-  // Record the closed terminal reason (kusabi #388).  agy finalizes its
-  // job.json on this path and never calls deriveStopReason via the opencode
-  // SSE fold, so stamp here at the terminal write.  worktreeChanged is left
-  // unmeasured at job level, matching the opencode path: a completed wrapper
-  // records "completed"; error/timeout/stalled fall through to "unknown".
-  job.stopReason = deriveStopReason({ status: job.status, stats: job.stats });
-  saveJob(stateDir, job);
-
-  let resultText = "";
-  if (job.status === "completed" && payload !== null) {
+    watchdogS,
     // `resolveCompletedResult` selects a recovery source by backend and has
     // none for agy (its transcripts are the CLI's own, in a location kusabi
     // does not read): an empty payload therefore records
@@ -1232,19 +1012,196 @@ export async function agyDispatch(opts) {
     // Unreachable in practice — an empty payload is a FAILED job under the
     // payload rule — but the shared path keeps the record shape identical
     // across backends.
-    const resolved = resolveCompletedResult({
-      backend: AGY_BACKEND,
-      fetched: { ok: true, text: payload.text },
-      coords: { sessionId: job.sessionID },
-    });
-    resultText = resolved.text;
-    job.result = resolved.record;
-    saveJob(stateDir, job);
-    fs.writeFileSync(path.join(jobDir(stateDir, job.id), "result.md"), resultText, "utf8");
-  }
+    deferResultWrite: true,
+    resultBackend: AGY_BACKEND,
+    beforeSpawn: () => {
+      // prompt.md is written BEFORE the size guard runs, on purpose: the operator
+      // of a refused dispatch is the one who most needs to see what was too big.
+      //
+      // ---- argv size guard (kusabi #221 residual) ----
+      // The last thing before the spawn.  An oversized argument would fail with a
+      // raw E2BIG that says nothing about which string was too long or what to do
+      // about it; this refuses first and says both.
+      //
+      // `status: "error"`, NOT `provider-error`: nothing upstream is blocked and
+      // no capacity is exhausted.  This is a CALLER error — the same brief would
+      // fail identically on the next agy dispatch, so marking it a provider
+      // outage would send a retry walk at a wall.  The record is finalised here
+      // and NO process is started: `job.process` stays null because there is no
+      // child to point `cancel` at.
+      const argvSize = checkAgyArgvSize(args);
+      if (!argvSize.ok) {
+        return {
+          status: "error",
+          error: argvSize.message,
+          event: {
+            type: "companion.agy.argv-too-large",
+            backend: AGY_BACKEND,
+            model: modelEntry,
+            limit: argvSize.limit,
+            // The measured sizes, element by element — what the guard actually saw,
+            // so the refusal can be checked rather than taken on faith.
+            oversized: argvSize.oversized,
+          },
+        };
+      }
+      return null;
+    },
+    runProcess: (hooks) =>
+      runAgyProcess({
+        bin,
+        args,
+        cwd: opts.cwd,
+        // The resolved role HOME (or nothing when `agy.homes` resolved to null,
+        // so the child inherits the parent env byte-for-byte).  runBackendProcess
+        // merges this on top of `process.env`, so the override is additive.
+        env: agyHome !== null ? { HOME: agyHome } : undefined,
+        // The already-resolved values (the TWO decisions above) — the same
+        // values buildAgyArgs and the stall text consumed, so every bound was
+        // decided together.
+        timeoutS,
+        watchdogS,
+        ...hooks,
+      }),
+    stream,
+    afterProcess: ({ state, job: j }) => {
+      // The run stays resumable even though no terminal `result` arrived:
+      // the conversation id seen on `init` is the session.
+      // Same resumability rule as the stall path: the init id survives a run
+      // the outer bound cut short.
+      j.sessionID = state.conversationIdFromInit ?? null;
+    },
+    classifyExit: ({ code, stdout, stderr, state }) => {
+      // Parse FIRST, exit code second.  The payload rule is about not throwing
+      // away completed work on a signal that is not authoritative, and a
+      // nonzero exit accompanying a complete payload is the same class of
+      // signal as `status: "ERROR"`.  A nonzero exit with NO payload still
+      // fails, and its error names the exit code.
+      let parsed = null;
+      let parseError = null;
+      // The terminal payload is the stream's LAST `result` event's inner
+      // object — byte-shape-identical to what `--output-format json` used to
+      // print (measured 2026-08-20), so every downstream consumer receives
+      // the exact object it receives today.  When no terminal `result` event
+      // arrived, fall back to the LEGACY single-object reading: a stream that
+      // collapses to the old shape (a CLI build that ignores stream-json)
+      // still delivers its work; anything else is a failed job whose error
+      // names the exit code or the parse failure.
+      const resultObj = state.resultEvent?.result ?? null;
+      if (resultObj !== null && typeof resultObj === "object" && !Array.isArray(resultObj)) {
+        parsed = resultObj;
+      } else {
+        try {
+          parsed = parseAgyResult(stdout);
+        } catch (err) {
+          parseError = err;
+        }
+      }
 
-  return { job, resultText, stateDir };
-  } finally {
-    progressWatch.stop();
-  }
+      if (parsed !== null) {
+        const agyStatus = typeof parsed.status === "string" ? parsed.status : null;
+        // The tool calls headless agy auto-denied, taken defensively (entries
+        // may lack display_name; the field may be absent on older CLIs).
+        const agyDeniedActions = agyDeniedActionNames(parsed);
+        // Denial diagnosis (kusabi #545): an `mcp` class names ONLY the class —
+        // which MCP tool was denied is not in the result, nor in cli.log.  The
+        // name lives as plaintext inside a protobuf BLOB in agy's conversation
+        // database, so when (and ONLY when) `mcp` is among the classes, read
+        // that database and record the tool.  The other classes (read_file,
+        // read_url, command, write_file, browser) are FULLY NAMED by
+        // `display_name`, and the last tool step of such a run belongs to a
+        // successful call — consulting the database for them would misattribute
+        // the denial.  `agyDeniedTool` is the string `<server>/<tool>` when
+        // identified, else null; it is present on every record from the initial
+        // write below, exactly like `agyHome`.  The lookup is defensive: any
+        // database failure yields null and the dispatch proceeds as today — this
+        // is diagnostic enrichment, not a gate, and never changes the terminal
+        // decision.
+        let agyDeniedTool = null;
+        let deniedToolUnresolved = false;
+        if (agyDeniedActions.includes("mcp")) {
+          const conversationId = parsed.conversation_id ?? state.conversationIdFromInit ?? null;
+          const home = agyHome ?? process.env.HOME ?? null;
+          if (conversationId !== null && home !== null) {
+            const dbPath = path.join(
+              home, ".gemini", "antigravity-cli", "conversations", `${conversationId}.db`,
+            );
+            const found = agyDeniedToolFromConversation({ dbPath });
+            if (found !== null) {
+              agyDeniedTool = `${found.server}/${found.tool}`;
+            } else {
+              // An mcp class WAS denied but the tool could not be pinned down.
+              // The error must say so rather than let the reader assume the
+              // class was all there was.
+              deniedToolUnresolved = true;
+            }
+          } else {
+            // No conversation id (or no home at all) — nothing to consult.
+            deniedToolUnresolved = true;
+          }
+        }
+        // `settingsPath` is the file this run's HOME would consult — named in a
+        // denied-run error so the operator is pointed at the exact table.
+        const outcome = agyPayload(parsed, {
+          settingsPath: agySettingsPath,
+          deniedTool: agyDeniedTool,
+          deniedToolUnresolved,
+        });
+        const sessionID = parsed.conversation_id ?? state.conversationIdFromInit ?? null;
+        if (outcome.ok) {
+          return {
+            status: "completed",
+            sessionID,
+            agyStatus,
+            agyDeniedActions,
+            agyDeniedTool,
+            payloadSource: outcome.payloadSource,
+            usage: mapAgyUsage(parsed),
+            text: outcome.text,
+          };
+        }
+        return {
+          status: "error",
+          // The session id is still worth recording: a payload-less run is the
+          // one an operator most wants to open in the agy UI.
+          sessionID,
+          agyStatus,
+          agyDeniedActions,
+          agyDeniedTool,
+          error: `agy dispatch failed: ${outcome.error}`,
+        };
+      }
+      if (code !== 0) {
+        const detail = (stderr || stdout || "(no output)").trim();
+        return {
+          status: "error",
+          error: `agy exited with code ${code}: ${detail}`,
+          sessionID: state.conversationIdFromInit ?? null,
+        };
+      }
+      const snippet = (stdout || "").trim().slice(0, 300);
+      return {
+        status: "error",
+        error: `agy dispatch failed: ${parseError.message}: ${snippet || "(empty stdout)"}`,
+        sessionID: state.conversationIdFromInit ?? null,
+      };
+    },
+    finishedEvent: ({ job: j, code }) => ({
+      type: "companion.agy.finished",
+      status: j.status,
+      // Advisory: what the CLI claimed, next to what kusabi decided from the
+      // payload.  Recorded side by side on purpose — the two disagreeing is
+      // the normal case for a run with one failed tool call.
+      agyStatus: j.agyStatus,
+      sessionId: j.sessionID,
+      exitCode: code,
+      // The tool calls headless agy auto-denied, as measured on this run's
+      // terminal result ([] when none, or when the run never produced one).
+      agyDeniedActions: j.agyDeniedActions,
+      // The MCP tool behind an `mcp` denial, when it could be identified from
+      // the conversation record (null otherwise — non-`mcp` denials are fully
+      // named by `display_name` and never consult the database).
+      agyDeniedTool: j.agyDeniedTool,
+    }),
+  });
 }
