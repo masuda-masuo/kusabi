@@ -681,4 +681,33 @@ describe("cursorDispatch (fake cursor-agent)", () => {
     assert.equal(job.stats.steps, 1);
     assert.equal(job.stats.lastTool, null);
   });
+
+  it("shows toolDeniesEnforced and toolDeniesUnenforced on job and start event", async () => {
+    const { job } = await cursorDispatch(ctx.dispatchOptions({
+      tools: { bash: false },
+    }));
+    assert.deepEqual(job.toolDeniesEnforced, []);
+    assert.deepEqual(job.toolDeniesUnenforced, ["bash"]);
+    const events = fs.readFileSync(path.join(jobDir(ctx.stateDir, job.id), "events.ndjson"), "utf8")
+      .trim().split("\n").map(JSON.parse);
+    const startEvent = events[0];
+    assert.deepEqual(startEvent.toolDeniesEnforced, []);
+    assert.deepEqual(startEvent.toolDeniesUnenforced, ["bash"]);
+  });
+
+  it("start event records resume: true when matching session provenance is passed and resume: false otherwise", async () => {
+    const resumed = await cursorDispatch(ctx.dispatchOptions({
+      session: SESSION_ID,
+      sessionProvenance: "cursor",
+    }));
+    const resumedEvents = fs.readFileSync(path.join(jobDir(ctx.stateDir, resumed.job.id), "events.ndjson"), "utf8")
+      .trim().split("\n").map(JSON.parse);
+    assert.equal(resumedEvents[0].resume, true);
+
+    const fresh = await cursorDispatch(ctx.dispatchOptions());
+    const freshEvents = fs.readFileSync(path.join(jobDir(ctx.stateDir, fresh.job.id), "events.ndjson"), "utf8")
+      .trim().split("\n").map(JSON.parse);
+    assert.equal(freshEvents[0].resume, false);
+  });
 });
+

@@ -95,7 +95,7 @@ import process from "node:process";
 
 import { firstRoute, WRITE_TOOL_NAMES } from "./cli.mjs";
 import { readAgentSystemPrompt } from "./agent-system-prompt.mjs";
-import { translateDenyTools } from "./tool-permissions.mjs";
+import { toolDeniesEnforced, translateDenyTools } from "./tool-permissions.mjs";
 import { newJobId, jobDir } from "./job-store.mjs";
 import { stateDirFor } from "./state-paths.mjs";
 import { isUsableTimeoutS, runBackendProcess } from "./backend-process-runner.mjs";
@@ -613,6 +613,7 @@ export async function codexDispatch(opts) {
       return !normalized.some((key) => enforcedMcpDenies.has(key));
     })
     : deniedToolNames.filter((name) => !WRITE_TOOL_NAMES.includes(name));
+  const enforcedDenies = toolDeniesEnforced(opts.tools, unenforcedDenies);
 
   // The deny map as supplied (null when no tools map was passed at all) and
   // the truthful tool profile derived from it (kusabi #529 spec 8).  A
@@ -687,6 +688,7 @@ export async function codexDispatch(opts) {
     // codexMcpServers, and are recorded separately.
     codexSandboxEnforcedDenies,
     codexMcpEnforcedDenies,
+    toolDeniesEnforced: enforcedDenies,
     toolDeniesUnenforced: unenforcedDenies,
     jsonSchemaEnforced: jsonSchema !== null,
     error: null,
@@ -743,6 +745,7 @@ export async function codexDispatch(opts) {
     codexMcpServers: codexMcpTools ?? {},
     codexSandboxEnforcedDenies,
     codexMcpEnforcedDenies,
+    toolDeniesEnforced: enforcedDenies,
     toolDeniesUnenforced: unenforcedDenies,
   };
 

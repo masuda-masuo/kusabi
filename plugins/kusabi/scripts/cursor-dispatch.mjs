@@ -81,6 +81,7 @@ import { newJobId } from "./job-store.mjs";
 import { stateDirFor } from "./state-paths.mjs";
 import { isUsableTimeoutS, runBackendProcess } from "./backend-process-runner.mjs";
 import { runBackendDispatch } from "./backend-dispatch-core.mjs";
+import { toolDeniesEnforced } from "./tool-permissions.mjs";
 
 export const CURSOR_BACKEND = "cursor";
 
@@ -559,6 +560,7 @@ export async function cursorDispatch(opts) {
   const unenforcedDenies = Object.entries(opts.tools ?? {})
     .filter(([, allowed]) => allowed === false)
     .map(([name]) => name);
+  const enforcedDenies = toolDeniesEnforced(opts.tools, unenforcedDenies);
 
   const job = {
     id: newJobId(),
@@ -588,6 +590,7 @@ export async function cursorDispatch(opts) {
     modelResidueHazard: pinned
       ? `--model ${modelEntry} was passed; Cursor CLI writes ~/.cursor/cli-config.json and this changes later invocations on the machine`
       : null,
+    toolDeniesEnforced: enforcedDenies,
     toolDeniesUnenforced: unenforcedDenies,
     error: null,
     failure: null,
@@ -600,6 +603,8 @@ export async function cursorDispatch(opts) {
     model: modelEntry,
     pinned,
     bin,
+    resume: typeof opts.session === "string" && opts.session !== "",
+    toolDeniesEnforced: enforcedDenies,
     toolDeniesUnenforced: unenforcedDenies,
     modelResidueHazard: job.modelResidueHazard,
   };

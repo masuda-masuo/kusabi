@@ -333,3 +333,21 @@ export function disallowedToolsForAgent(agent) {
     (t) => !(t === "mcp__sunaba__sandbox_issue_write" && agent === "kusabi-investigate"),
   ).join(",");
 }
+
+/**
+ * Compute the requested deny names that are enforced: the keys of `tools`
+ * whose value is `false` (in caller's vocabulary and order) that are not in
+ * `unenforced`.
+ *
+ * @param {object|null|undefined} tools
+ * @param {string[]|null|undefined} unenforced
+ * @returns {string[]}
+ */
+export function toolDeniesEnforced(tools, unenforced) {
+  const unenforcedSet = new Set(unenforced ?? []);
+  return Object.entries(tools ?? {})
+    .filter(([, allowed]) => allowed === false)
+    .map(([name]) => name)
+    .filter((name) => !unenforcedSet.has(name));
+}
+

@@ -171,6 +171,7 @@ import { readAgentSystemPrompt } from "./agent-system-prompt.mjs";
 import { newJobId } from "./job-store.mjs";
 import { stateDirFor } from "./state-paths.mjs";
 import { runBackendDispatch } from "./backend-dispatch-core.mjs";
+import { toolDeniesEnforced } from "./tool-permissions.mjs";
 import { isUsableTimeoutS, runBackendProcess } from "./backend-process-runner.mjs";
 import {
   parseAgyResult,
@@ -812,6 +813,7 @@ export async function agyDispatch(opts) {
   const unenforcedDenies = Object.entries(opts.tools ?? {})
     .filter(([, allowed]) => allowed === false)
     .map(([name]) => name);
+  const enforcedDenies = toolDeniesEnforced(opts.tools, unenforcedDenies);
 
   // ---- job record (opencode-path shape + backend) ----
   const job = {
@@ -854,6 +856,7 @@ export async function agyDispatch(opts) {
     agyStatus: null,
     // Deny-map entries this backend cannot enforce (agy takes no permission
     // flags).  Empty array when nothing was asked for.
+    toolDeniesEnforced: enforcedDenies,
     toolDeniesUnenforced: unenforcedDenies,
     // The permission surface this run was actually governed by — recorded on
     // EVERY record, exactly like `toolDeniesUnenforced`, so a record can
@@ -891,7 +894,9 @@ export async function agyDispatch(opts) {
     backend: AGY_BACKEND,
     model: modelEntry,
     bin,
+    resume: typeof opts.session === "string" && opts.session !== "",
     jsonSchemaEnforced: job.jsonSchemaEnforced,
+    toolDeniesEnforced: enforcedDenies,
     toolDeniesUnenforced: unenforcedDenies,
     // The permission surface this spawn will run under — written BEFORE the
     // child starts so the trail and the record can never disagree about it.
@@ -1043,6 +1048,7 @@ export async function agyDispatch(opts) {
       }
 
       if (parsed !== null) {
+        if (state) state.terminalPayload = parsed;
         const agyStatus = typeof parsed.status === "string" ? parsed.status : null;
         // The tool calls headless agy auto-denied, taken defensively (entries
         // may lack display_name; the field may be absent on older CLIs).
@@ -1135,22 +1141,27 @@ export async function agyDispatch(opts) {
     // The run stays resumable even though no terminal `result` arrived:
     // the conversation id seen on `init` is the session.
     fallbackSessionId: ({ state }) => state.conversationIdFromInit ?? null,
-    finishedEvent: ({ job: j, code }) => ({
-      type: "companion.agy.finished",
-      status: j.status,
-      // Advisory: what the CLI claimed, next to what kusabi decided from the
-      // payload.  Recorded side by side on purpose — the two disagreeing is
-      // the normal case for a run with one failed tool call.
-      agyStatus: j.agyStatus,
-      sessionId: j.sessionID,
-      exitCode: code,
-      // The tool calls headless agy auto-denied, as measured on this run's
-      // terminal result ([] when none, or when the run never produced one).
-      agyDeniedActions: j.agyDeniedActions,
-      // The MCP tool behind an `mcp` denial, when it could be identified from
-      // the conversation record (null otherwise — non-`mcp` denials are fully
-      // named by `display_name` and never consult the database).
-      agyDeniedTool: j.agyDeniedTool,
-    }),
+    finishedEvent: ({ state, job: j, code }) => {
+      const payload = state?.terminalPayload ?? state?.resultEvent?.result ?? null;
+      const response = payload?.response;
+      return {
+        type: "companion.agy.finished",
+        status: j.status,
+        // Advisory: what the CLI claimed, next to what kusabi decided from the
+        // payload.  Recorded side by side on purpose — the two disagreeing is
+        // the normal case for a run with one failed tool call.
+        agyStatus: j.agyStatus,
+        sessionId: j.sessionID,
+        exitCode: code,
+        // The tool calls headless agy auto-denied, as measured on this run's
+        // terminal result ([] when none, or when the run never produced one).
+        agyDeniedActions: j.agyDeniedActions,
+        // The MCP tool behind an `mcp` denial, when it could be identified from
+        // the conversation record (null otherwise — non-`mcp` denials are fully
+        // named by `display_name` and never consult the database).
+        agyDeniedTool: j.agyDeniedTool,
+        assistantChars: typeof response === "string" ? response.length : 0,
+      };
+    },
   });
 }

@@ -1279,6 +1279,19 @@ describe("codexDispatch (fake codex)", () => {
     assert.deepEqual(job.toolDeniesUnenforced, ["sunaba_copy_project"]);
   });
 
+  it("shows toolDeniesEnforced and toolDeniesUnenforced on job and start event for a sandbox-enforced deny", async () => {
+    const { job } = await codexDispatch(ctx.dispatchOptions({
+      tools: { write: false },
+    }));
+    assert.deepEqual(job.toolDeniesEnforced, ["write"]);
+    assert.deepEqual(job.toolDeniesUnenforced, []);
+    const events = fs.readFileSync(path.join(jobDir(ctx.stateDir, job.id), "events.ndjson"), "utf8")
+      .trim().split("\n").map(JSON.parse);
+    const startEvent = events[0];
+    assert.deepEqual(startEvent.toolDeniesEnforced, ["write"]);
+    assert.deepEqual(startEvent.toolDeniesUnenforced, []);
+  });
+
   it("missing terminal message / non-JSON stream / empty result are distinguishable failures", async () => {
     ctx.setMode("no-result");
     const missing = await codexDispatch(ctx.dispatchOptions());

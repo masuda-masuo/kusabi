@@ -160,7 +160,7 @@ import {
   renderClaudeRepeatWatchdogError,
 } from "./claude-watchdogs.mjs";
 import { processStartToken } from "./process-identity.mjs";
-import { allowedToolsForAgent, applyToolDenies, disallowedToolsForAgent, sunabaProfileForAgent } from "./tool-permissions.mjs";
+import { allowedToolsForAgent, applyToolDenies, disallowedToolsForAgent, sunabaProfileForAgent, toolDeniesEnforced } from "./tool-permissions.mjs";
 
 export const CLAUDE_BACKEND = "claude";
 
@@ -1055,6 +1055,8 @@ export async function claudeDispatch(opts) {
   const systemPrompt = readAgentSystemPrompt(opts.agent);
   const allowedTools = applyToolDenies(allowedToolsForAgent(opts.agent), opts.tools);
   const disallowedTools = disallowedToolsForAgent(opts.agent);
+  const unenforcedDenies = [];
+  const enforcedDenies = toolDeniesEnforced(opts.tools, unenforcedDenies);
   const bin = claudeBin();
   // The job id is minted here, in pre-flight, so the generated MCP config
   // can be named after its job (kusabi #276) and stamp KAIBA_JOB on the
@@ -1128,6 +1130,8 @@ export async function claudeDispatch(opts) {
     // null when the stream never carried one.  Machine-readable — this is
     // the live quota feed, independent of whether the job ever fails.
     rateLimit: null,
+    toolDeniesEnforced: enforcedDenies,
+    toolDeniesUnenforced: unenforcedDenies,
     error: null,
     // Terminal-failure classification (kusabi #215): null for generic
     // failures; { kind: "quota-exhaustion", quota, backendBlocked, reset }
@@ -1185,6 +1189,9 @@ export async function claudeDispatch(opts) {
       backend: CLAUDE_BACKEND,
       model: modelEntry,
       bin,
+      resume: typeof opts.session === "string" && opts.session !== "",
+      toolDeniesEnforced: enforcedDenies,
+      toolDeniesUnenforced: unenforcedDenies,
     },
     bin,
     labels: { spawnErrorPrefix: `${CLAUDE_BACKEND} dispatch failed` },
@@ -1536,11 +1543,15 @@ export async function claudeDispatch(opts) {
     // event still leaves whatever `system`/`init` reported — the only source
     // of a session id when nothing else names one (kusabi #215 Job B item 5).
     fallbackSessionId: ({ state }) => state.streamAcc.sessionIdFromInit ?? null,
-    finishedEvent: ({ job: j, code }) => ({
-      type: "companion.claude.finished",
-      status: j.status,
-      sessionId: j.sessionID,
-      exitCode: code,
-    }),
+    finishedEvent: ({ state, job: j, code }) => {
+      const result = state.streamAcc.resultEvent?.result;
+      return {
+        type: "companion.claude.finished",
+        status: j.status,
+        sessionId: j.sessionID,
+        exitCode: code,
+        assistantChars: typeof result === "string" ? result.length : 0,
+      };
+    },
   });
 }
