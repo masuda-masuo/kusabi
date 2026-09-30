@@ -29,7 +29,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
 import { readJson } from "./state-paths.mjs";
-import { readChainControl } from "./chain-control.mjs";
+import { readChainControl, dispositionOf } from "./chain-control.mjs";
 import { mtimeOf, defaultSleep } from "./wait-common.mjs";
 
 /**
@@ -86,15 +86,6 @@ export class ChainWaitError extends Error {
 // state reading
 // ---------------------------------------------------------------------------
 
-/** The round's disposition, which is `{disposition, reason}` on live records
- * and a bare string on some older ones. */
-function dispositionOf(record) {
-  const value = record?.disposition;
-  if (typeof value === "string") return value;
-  if (value && typeof value.disposition === "string") return value.disposition;
-  return null;
-}
-
 /**
  * Read everything a wait decides on, in one shot.
  *
@@ -117,10 +108,7 @@ export function readChainSnapshot(chainsDir, chainId) {
   const chainJson = exists ? readJson(path.join(chainDir, "chain.json")) : null;
   const records = Array.isArray(chainJson?.records) ? chainJson.records : [];
 
-  let disposition = null;
-  for (let i = records.length - 1; i >= 0 && disposition === null; i -= 1) {
-    disposition = dispositionOf(records[i]);
-  }
+  const disposition = dispositionOf(records);
 
   const status = typeof control?.status === "string" ? control.status : "unknown";
   const rounds = records.length || (Number.isFinite(control?.round) ? control.round : 0);
