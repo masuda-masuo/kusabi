@@ -10,6 +10,7 @@ user-invocable: false
 - Use file paths and line numbers exactly as the worker reported them. Do not replace or supplement them
 - If the worker distinguished between "facts" and "conjecture/uncertainty", preserve that boundary. Do not convey estimates as certainties
 - Order findings by severity. If there are no findings, state "none" explicitly
+- The orchestrator's own verification and adjudication are presented separately from the worker's text, labelled as the orchestrator's. They never edit the worker's wording, paths or line numbers; a worker claim found wrong is quoted as reported and corrected beside it
 
 ## Model visualization (mandatory requirement of this plugin)
 
@@ -23,8 +24,8 @@ user-invocable: false
 
 ## Prohibition of substituting for failure
 
-- If the worker's job failed or was incomplete, do not substitute it with implementation on the orchestrator's side. Report it as a failure and stop
-- The same applies to salvage results: the job is to report the analysis result, not to have the orchestrator implement the continuation
+- If the worker's job failed or was incomplete, do not substitute it with implementation on the orchestrator's side. Report it as a failure. Recovery goes through diagnosis and re-delegation, within the bounds the `delegate` skill's Inspection section sets (reproduce the evidence first; bounded repair by the same worker or a narrow same-container job) — never through the orchestrator writing the missing work
+- The same applies to salvage results: the job is to report the analysis result; the continuation is re-delegated, not implemented by the orchestrator
 - If the companion returns a setup/authentication error, guide the user to run `kusabi-companion setup`. Do not improvise another authentication path
 
 ## Verification against reports (interface with the reviewer specification)
