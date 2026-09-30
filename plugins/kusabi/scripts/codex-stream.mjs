@@ -95,7 +95,9 @@ export function initCodexStreamAccumulator() {
  *   - `thread.started` — the thread id (top-level `thread_id`).
  *   - `item.completed` — assistant text from `item.agent_message.text`
  *     (terminal text for both the text and `--output-schema` framings);
- *     each completed item also counts one step (a message or a tool item).
+ *     counts as a step only for tool items (any item.type other than
+ *     agent_message and reasoning); sets lastTool ("shell" for
+ *     command_execution, item.tool for mcp_tool_call, else item.type).
  *   - `turn.completed` — the `usage` event kept as `usageEvent`; a later one
  *     replaces an earlier one.
  *
@@ -117,7 +119,18 @@ export function applyCodexStreamEvent(acc, evt, now = new Date().toISOString()) 
       const id = codexThreadIdFromEvent(evt);
       if (id) acc.threadId = id;
     } else if (type === "item.completed") {
-      acc.steps += 1;
+      const item = evt.item;
+      const itemType = typeof item?.type === "string" ? item.type : null;
+      if (itemType !== null && itemType !== "agent_message" && itemType !== "reasoning") {
+        acc.steps += 1;
+        if (itemType === "command_execution") {
+          acc.lastTool = "shell";
+        } else if (itemType === "mcp_tool_call") {
+          acc.lastTool = typeof item.tool === "string" && item.tool ? item.tool : itemType;
+        } else {
+          acc.lastTool = itemType;
+        }
+      }
       // The LAST agent message is the answer; earlier ones are commentary.
       // A turn can complete several agent_message items (phase commentary
       // before tool calls, then final_answer); concatenating them glued

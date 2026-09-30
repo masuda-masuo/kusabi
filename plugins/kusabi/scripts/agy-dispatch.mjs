@@ -919,6 +919,9 @@ export async function agyDispatch(opts) {
         return false;
       }
       applyAgyStreamEvent(streamAcc, evt);
+      if (streamAcc.conversationIdFromInit) {
+        j.sessionID = streamAcc.conversationIdFromInit;
+      }
       j.stats = {
         instrumented: true,
         events: streamAcc.events,

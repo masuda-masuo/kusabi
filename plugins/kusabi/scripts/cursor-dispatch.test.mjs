@@ -496,6 +496,13 @@ describe("cursor stream stats from tool_call", () => {
     assert.equal(acc.lastTool, null);
     assert.equal(acc.events, 4);
   });
+
+  it("a result line with model puts it in stats.models once", () => {
+    const acc = initCursorStreamAccumulator();
+    applyCursorStreamEvent(acc, { type: "result", model: "composer-1.5" });
+    applyCursorStreamEvent(acc, { type: "result", model: "composer-1.5" });
+    assert.deepEqual(acc.models, ["composer-1.5"]);
+  });
 });
 
 describe("cursorDispatch (fake cursor-agent)", () => {
