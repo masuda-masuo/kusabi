@@ -24,8 +24,8 @@ Moving to a fresh session triggers the implementation reflex — that reflex is 
 What does not change:
 
 - **Pass brief as file**, not inline — inline quoting = accident generator.
-- **Use wait command from `chain-detach`** for launched chain; `chain-wait` with explicit id for existing/resumed. Nonzero exit = diagnose, not re-dispatch.
-- **Codex session with `CODEX_THREAD_ID`: dispatch single-shot tasks via the kusabi-codex-notify `--launch-task` wrapper** — its watcher owns the single blocking `task-wait`; do not start a second wait. Wrapper invocation details live in `delegate-local`.
+- **Use wait command from `chain-detach`** for launched chain; `chain-wait` with explicit id for existing/resumed. Nonzero exit = diagnose, not re-dispatch. Exception: when a launch wrapper owns the wait (next bullet), do not start one yourself.
+- **Codex session with `CODEX_THREAD_ID`: dispatch chains and single-shot tasks via the kusabi-codex-notify wrapper** (`--launch` for a chain, `--launch-task` for a task) — its watcher owns the single blocking `chain-wait` / `task-wait`; do not start a second wait. Wrapper invocation details live in `delegate-local`.
 - **Fallback (non-Codex, no thread, or wrapper unavailable): direct `task-detach`**, then run the exact wait line it emits (`task-wait --next --since <ISO> ...`); `task-wait` watches task state and exits 0 on terminal status, non-zero on wait failure.
 - **`--timeout` vs `--watchdog`**: `--timeout` is an outer wall-clock bound that kills active work; `--watchdog` is inactivity detection. A short total timeout must not be used as a stall detector or quality criterion; prefer generous total bounds and activity evidence.
 - **Container prep = orchestrator job.** Implement workers denied `sandbox_initialize`/`publish`/issue writes. Hand them container id in brief (companion injects automatically).
