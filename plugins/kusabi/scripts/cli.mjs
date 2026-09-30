@@ -1,6 +1,8 @@
 // CLI argument parsing, model resolution, and deny-tools helpers.
 // Pure functions — no I/O, no imports from kusabi-companion.mjs.
 
+import { formatCodexSupportedModels } from "./codex-dispatch.mjs";
+
 export const WRITE_TOOL_NAMES = ["bash", "edit", "write", "patch", "task"];
 
 export function implementDenyTools() {
@@ -390,7 +392,7 @@ export function validateRoute(route) {
       throw new Error(
         `codex backend does not support the :variant suffix in model "${model}" — ` +
         "reasoning effort is fixed to high; use one of the exact supported seat ids: " +
-        "gpt-5.6-luna or gpt-5.6-sol"
+        formatCodexSupportedModels("or")
       );
     }
   }

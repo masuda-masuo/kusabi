@@ -10,7 +10,7 @@
 //
 // WHY a fifth backend: on 2026-09-20 the operator accepted an opt-in
 // trusted-seat evaluation model in which kusabi dispatches to the Codex CLI
-// (`codex exec`) for the exact seat models `gpt-5.6-luna` and `gpt-5.6-sol`.
+// (`codex exec`) for the exact seat models listed in `CODEX_SUPPORTED_MODELS`.
 // The backend reuses the shared process runner exactly like cursor/agy and
 // preserves exact model/reasoning provenance by cross-checking the CLI's own
 // rollout record after the process closes.
@@ -129,7 +129,7 @@ export const CODEX_BACKEND = "codex";
 // v1 is deliberately closed: an explicit pin must be ONE of these exact ids,
 // and provenance cross-checking compares the requested id byte-for-byte
 // against the model the CLI's own rollout records.
-export const CODEX_SUPPORTED_MODELS = ["gpt-5.6-luna", "gpt-5.6-sol"];
+export const CODEX_SUPPORTED_MODELS = ["gpt-5.6-luna", "gpt-5.6-sol", "gpt-6-luna", "gpt-6.1-sol"];
 
 // The default chain may contain the exact supported seat ids.  ONE tier with
 // both seats, first route first: this backend pins one model per phase and
@@ -149,6 +149,21 @@ export function codexBin() {
   return process.env.CODEX_BIN || "codex";
 }
 
+/**
+ * Format the list of supported codex seat models with a conjunction ("or" / "and").
+ *
+ * @param {string} [conjunction="or"]
+ * @returns {string} e.g. "a, b or c"
+ */
+export function formatCodexSupportedModels(conjunction = "or") {
+  if (CODEX_SUPPORTED_MODELS.length === 0) return "";
+  if (CODEX_SUPPORTED_MODELS.length === 1) return CODEX_SUPPORTED_MODELS[0];
+  if (CODEX_SUPPORTED_MODELS.length === 2) {
+    return `${CODEX_SUPPORTED_MODELS[0]} ${conjunction} ${CODEX_SUPPORTED_MODELS[1]}`;
+  }
+  return `${CODEX_SUPPORTED_MODELS.slice(0, -1).join(", ")} ${conjunction} ${CODEX_SUPPORTED_MODELS[CODEX_SUPPORTED_MODELS.length - 1]}`;
+}
+
 // =========================================================================
 // model syntax — pure
 // =========================================================================
@@ -156,7 +171,7 @@ export function codexBin() {
 /**
  * Validate a model entry for the codex backend.
  *
- * Accepted: exactly the supported seat ids (`gpt-5.6-luna`, `gpt-5.6-sol`).
+ * Accepted: exactly the supported seat ids (`CODEX_SUPPORTED_MODELS`).
  * A `:variant` suffix is rejected with an explicit error — reasoning effort
  * is fixed to `high` and never translated from a variant.  Any other id is
  * rejected too: v1 executes the exact seats and nothing else, so an unknown
@@ -174,13 +189,13 @@ export function validateCodexModel(value) {
     throw new Error(
       `codex backend does not support the :variant suffix in model "${v}" — ` +
       "reasoning effort is fixed to high; use one of the exact supported seat ids: " +
-      "gpt-5.6-luna or gpt-5.6-sol"
+      formatCodexSupportedModels("or")
     );
   }
   if (!CODEX_SUPPORTED_MODELS.includes(v)) {
     throw new Error(
       `codex backend does not support model "${v}" — v1 executes the exact seat ids ` +
-      "gpt-5.6-luna and gpt-5.6-sol, and an explicit pin is never substituted with another model"
+      `${formatCodexSupportedModels("and")}, and an explicit pin is never substituted with another model`
     );
   }
   return v;
@@ -202,7 +217,7 @@ export function validateCodexChain(chain) {
       } catch (err) {
         throw new Error(
           `codex backend: chain entry "${route}" is not a supported codex model — ` +
-          "configure models.chain with exact seat ids (gpt-5.6-luna or gpt-5.6-sol): " +
+          `configure models.chain with exact seat ids (${formatCodexSupportedModels("or")}): ` +
           err.message
         );
       }
