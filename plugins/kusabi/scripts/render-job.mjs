@@ -1,5 +1,9 @@
 // Job headers and status lines.
 
+function formatUsageValue(value) {
+  return typeof value === "number" && Number.isFinite(value) ? value : "n/a";
+}
+
 // POSIX single-quote shell quoting for a path rendered inside a command an
 // operator runs AS PRINTED.  Single quotes are closed, escaped and reopened
 // (`'` -> `'\''`), so spaces and special characters in a path can never
@@ -19,7 +23,7 @@ export function renderHeader(job) {
   const usageLine = (() => {
     const u = job.usage;
     if (!u || !u.available) return [];
-    const parts = [`${u.input} in / ${u.output} out`];
+    const parts = [`${formatUsageValue(u.input)} in / ${formatUsageValue(u.output)} out`];
     if (u.reasoning) parts.push(`${u.reasoning} reasoning`);
     return [`tokens: ${parts.join(", ")}`];
   })();

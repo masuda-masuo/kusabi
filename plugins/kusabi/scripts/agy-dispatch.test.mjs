@@ -802,15 +802,29 @@ describe("mapAgyUsage", () => {
     assert.equal(usage.cacheRead, 2441833);
     assert.equal(usage.total, 263020);
     // agy reports neither of these; 0 means "nothing to add to a running total".
-    assert.equal(usage.cacheWrite, 0);
-    assert.equal(usage.cost, 0);
+    assert.equal(usage.cacheWrite, null);
+    assert.equal(usage.cost, null);
   });
 
-  it("defaults every counter to 0 when the CLI reports no usage at all", () => {
+  it("maps every unreported counter to null when the CLI reports no usage at all", () => {
     const usage = mapAgyUsage({});
     for (const key of ["input", "output", "reasoning", "cacheRead", "cacheWrite", "total", "cost"]) {
+      assert.equal(usage[key], null, key);
+    }
+  });
+
+  it("preserves reported zero agy counters", () => {
+    const usage = mapAgyUsage({
+      usage: {
+        input_tokens: 0, output_tokens: 0, thinking_tokens: 0,
+        cache_read_tokens: 0, total_tokens: 0,
+      },
+    });
+    for (const key of ["input", "output", "reasoning", "cacheRead", "total"]) {
       assert.equal(usage[key], 0, key);
     }
+    assert.equal(usage.cacheWrite, null);
+    assert.equal(usage.cost, null);
   });
 });
 

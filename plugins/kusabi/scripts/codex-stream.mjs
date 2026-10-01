@@ -154,26 +154,22 @@ export function applyCodexStreamEvent(acc, evt, now = new Date().toISOString()) 
  * (codex-cli 0.154.0, same vocabulary codex-usage-ingest.mjs reads):
  * input_tokens, cached_input_tokens, cache_write_input_tokens, output_tokens.
  * `total_tokens` / `reasoning_tokens` / `cost_usd` are mapped when present;
- * total defaults to the sum of the four measured counters.
+ * no total is derived from the component counters.
  *
  * @param {object|null} result
  * @returns {object}
  */
 export function mapCodexUsage(result) {
   const u = result?.usage ?? {};
-  const input = u.input_tokens ?? 0;
-  const output = u.output_tokens ?? 0;
-  const cacheRead = u.cached_input_tokens ?? 0;
-  const cacheWrite = u.cache_write_input_tokens ?? 0;
   return {
     available: true,
-    input,
-    output,
-    reasoning: u.reasoning_tokens ?? 0,
-    cacheRead,
-    cacheWrite,
-    total: u.total_tokens ?? (input + output + cacheRead + cacheWrite),
-    cost: u.cost_usd ?? 0,
+    input: typeof u.input_tokens === "number" ? u.input_tokens : null,
+    output: typeof u.output_tokens === "number" ? u.output_tokens : null,
+    reasoning: typeof u.reasoning_tokens === "number" ? u.reasoning_tokens : null,
+    cacheRead: typeof u.cached_input_tokens === "number" ? u.cached_input_tokens : null,
+    cacheWrite: typeof u.cache_write_input_tokens === "number" ? u.cache_write_input_tokens : null,
+    total: typeof u.total_tokens === "number" ? u.total_tokens : null,
+    cost: typeof u.cost_usd === "number" ? u.cost_usd : null,
     model: result?.model ?? null,
   };
 }

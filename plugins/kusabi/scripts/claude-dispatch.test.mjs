@@ -362,16 +362,34 @@ describe("mapClaudeUsage", () => {
     assert.equal(usage.cacheWrite, 200);
     assert.equal(usage.cacheRead, 3000);
     assert.equal(usage.cost, 0.0042);
-    assert.equal(usage.reasoning, 0);
+    assert.equal(usage.reasoning, null);
   });
 
-  it("defaults missing counters to 0", () => {
+  it("maps every unreported counter to null", () => {
     const usage = mapClaudeUsage({ usage: {} });
+    assert.equal(usage.input, null);
+    assert.equal(usage.output, null);
+    assert.equal(usage.cacheWrite, null);
+    assert.equal(usage.cacheRead, null);
+    assert.equal(usage.total, null);
+    assert.equal(usage.cost, null);
+  });
+
+  it("preserves reported zero claude counters", () => {
+    const usage = mapClaudeUsage({
+      usage: {
+        input_tokens: 0, output_tokens: 0, cache_creation_input_tokens: 0,
+        cache_read_input_tokens: 0, total_tokens: 0,
+      },
+      total_cost_usd: 0,
+    });
     assert.equal(usage.input, 0);
     assert.equal(usage.output, 0);
     assert.equal(usage.cacheWrite, 0);
     assert.equal(usage.cacheRead, 0);
+    assert.equal(usage.total, 0);
     assert.equal(usage.cost, 0);
+    assert.equal(usage.reasoning, null);
   });
 });
 

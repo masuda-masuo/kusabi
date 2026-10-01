@@ -2068,7 +2068,7 @@ describe("chain-stats producer-derived cost coverage", () => {
       }),
     ];
     const chainTotals = computeChainTotals(records);
-    assert.equal(chainTotals.cost, 0, "the persistence producer uses zero when no phase cost was measured");
+    assert.equal(chainTotals.cost, null, "the persistence producer preserves no measured phase cost as null");
 
     const stats = computeStats([chain({ chainId: "producer-wholly-missing", rounds: records, chainTotals })]);
     const output = renderChainStats(stats);
@@ -2186,7 +2186,7 @@ describe("chain-stats adjudicated cost coverage contracts", () => {
       }),
     ];
     const chainTotals = computeChainTotals(records);
-    assert.equal(chainTotals.cost, 0, "the authoritative producer excludes strategist usage");
+    assert.equal(chainTotals.cost, null, "the authoritative producer excludes strategist usage");
 
     const stats = computeStats([
       chain({ chainId: "strategist-is-not-total-evidence", rounds: records, chainTotals }),
@@ -2295,7 +2295,7 @@ describe("chain-stats adjudicated cost coverage contracts", () => {
     assert.deepEqual(
       stats.filteredTotals,
       {
-        input: 80, output: 0, reasoning: 0, cacheRead: 0, cacheWrite: 0,
+        input: 80, output: null, reasoning: null, cacheRead: null, cacheWrite: null,
         cost: 3, costCoverage: { measured: 2, total: 3 },
       },
       "in-range cost and coverage must include strategist usage and exclude archived failed seats",

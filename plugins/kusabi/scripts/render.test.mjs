@@ -2762,3 +2762,26 @@ describe("renderChainShow TDD state", () => {
     assert.doesNotMatch(result, /tdd slice/);
   });
 });
+
+describe("usage null rendering", () => {
+  it("renders n/a for null token and cost fields without leaking null-like values", () => {
+    const output = renderChainShow(
+      {
+        chainId: "chain-null-usage",
+        chainTotals: {
+          input: null, output: null, reasoning: null,
+          cacheRead: null, cacheWrite: null, cost: null,
+        },
+      },
+      [{
+        round: 1,
+        implementUsage: {
+          available: true, input: null, output: null, reasoning: null, cost: null,
+        },
+      }],
+    );
+    assert.match(output, /implement: n\/a in \/ n\/a out, cost=n\/a/);
+    assert.match(output, /totals: n\/a in \/ n\/a out, cacheRead=n\/a cacheWrite=n\/a, cost=n\/a/);
+    assert.doesNotMatch(output, /input=null|output=null|cost=null|undefined|NaN/);
+  });
+});

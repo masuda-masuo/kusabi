@@ -44,9 +44,9 @@ describe("chain-persist source guards (kusabi #451)", () => {
 // =========================================================================
 
 describe("computeChainTotals", () => {
-  it("returns zero totals for empty records", () => {
+  it("returns null totals for empty records because nothing was measured", () => {
     const result = computeChainTotals([]);
-    assert.deepEqual(result, { input: 0, output: 0, reasoning: 0, cacheRead: 0, cacheWrite: 0, cost: 0 });
+    assert.deepEqual(result, { input: null, output: null, reasoning: null, cacheRead: null, cacheWrite: null, cost: null });
   });
 
   it("sums implement usage across a single record", () => {
@@ -115,6 +115,25 @@ describe("computeChainTotals", () => {
     const result = computeChainTotals([records[0]]);
     assert.equal(result.input, 10);
     assert.equal(result.output, 20);
+  });
+
+  it("sums numeric fields while skipping null fields independently", () => {
+    const result = computeChainTotals([
+      { implementUsage: { available: true, input: 10, output: null, cost: 0.1 } },
+      { reviewUsage: { available: true, input: null, output: 5, cost: null } },
+    ]);
+    assert.deepEqual(result, {
+      input: 10, output: 5, reasoning: null, cacheRead: null, cacheWrite: null, cost: 0.1,
+    });
+  });
+
+  it("returns null for fields that are null in every available usage record", () => {
+    const result = computeChainTotals([
+      { implementUsage: { available: true, input: null, output: null, cost: null } },
+    ]);
+    assert.deepEqual(result, {
+      input: null, output: null, reasoning: null, cacheRead: null, cacheWrite: null, cost: null,
+    });
   });
 });
 
@@ -348,9 +367,9 @@ describe("writeReviewRecord", () => {
     assert.match(text, /- \[high\] Null pointer \(src\/x\.js:42\)/);
     assert.match(text, /\| 1 \| high \| Null pointer \(src\/x\.js:42\) \| _fill_ \| _fill_ \|/);
     assert.match(text, /## 判例として \(fill at inspection\)/);
-    // Usage comes from the chain's existing chainTotals (zero here — nothing
-    // recomputed from records).
-    assert.match(text, /input=0 output=0 reasoning=0 cacheRead=0 cacheWrite=0 cost=\$0/);
+    // Usage comes from the chain's existing chainTotals: null means that no
+    // usage field was measured.
+    assert.match(text, /input=n\/a output=n\/a reasoning=n\/a cacheRead=n\/a cacheWrite=n\/a cost=n\/a/);
   });
 
   it("uses the given chainTotals verbatim instead of recomputing from rounds", () => {
