@@ -8,114 +8,15 @@
 // this function instead of dispatchWithFallback when `--backend claude` is
 // given; the chain phases stay backend-blind.
 //
-// v1 limits (deliberate, see docs/design/phase-chain.md §3.5.11):
-//   - ONE model per phase: `explicitModel` when given, else the first route
-//     of the tiered chain.  No tier ladder, no capacity fallback, no retry
-//     walk — a failed dispatch returns a failed job and the chain's existing
-//     escalate path handles it.  The whole chain is validated at command
-//     start (validateClaudeChain) and chain commands clamp later phases to
-//     the command-start model, so the model can never change — or fail —
-//     mid-chain.  The default chain is claude-native (CLAUDE_DEFAULT_CHAIN);
-//     the opencode built-in chain is never used by this backend.
-//   - Per-entry `claude/` prefixes (kusabi #192) are handled UPSTREAM:
-//     resolveDispatchBackend (kusabi-companion.mjs) strips the prefix before
-//     this module ever sees a chain or model, so claudeDispatch /
-//     validateClaudeChain / resolveClaudeModel receive only bare aliases and
-//     full model ids — exactly the pre-#192 shapes.  This module is
-//     intentionally prefix-unaware.
-//   - Session resume: the `session` option is honored \u2014 `--resume
-//     <session-id>` is appended to argv, so chain rework rounds, chain-resume,
-//     and `--session` / `--resume-last` continue the previous session instead
-//     of starting blank.  The session id recorded on the job record comes
-//     from the CLI's terminal result event, falling back to the stream's
-//     `system`/`init` event when the run died before a result (never from
-//     the `session` option); an
-//     opencode-shaped session id (`ses_*`) is rejected with a loud
-//     cross-backend error before anything is spawned.
-//   - `:variant` model suffixes are rejected with an explicit error (never
-//     silently ignored): `--allowedTools` has no variant concept and the
-//     opencode variant knob has no claude equivalent.
-//
-// Real event stream (kusabi #215 Job B): the child runs with
-// `--output-format stream-json --verbose` (the CLI refuses stream-json
-// without --verbose) and stdout is NDJSON, one event object per line — the
-// terminal `result` event carries the SAME shape the old `--output-format
-// json` single object did, so quota classification and usage mapping apply
-// unchanged.  Lines that fail to parse as JSON are skipped and counted,
-// never fatal: the real CLI has been observed printing a non-JSON warning
-// line ahead of the stream.  `job.stats` is populated from the parsed
-// events (events/steps/lastTool/lastActivity/models) and marked
-// `instrumented: true`; the on-disk job record is saved at a bounded
-// cadence while the child runs, so `kusabi status` shows live movement
-// instead of a frozen record.  `instrumented: false` now marks only
-// legacy/pre-#215 records — kusabi-companion.mjs's "not instrumented"
-// rendering is a reader concession to those, not something this dispatch
-// writes anymore.  `watchdogS` is LIVE: no parsed stream event for
-// `watchdogS` seconds kills the child's whole process group (the same kill
-// `timeoutS` uses) and the job finishes `status: "stalled"`, with the
-// opencode watchdog's own wording, so chains treat a stalled claude worker
-// exactly like a stalled opencode one.  `timeoutS` is unchanged — an
-// absolute wall-clock bound, independent of stream activity.  A stream
-// that ends with no terminal `result` event (killed, stalled, crashed)
-// still yields a failed job record carrying whatever was learned: the
-// session id from `system`/`init` when the CLI got that far, and the stats
-// accumulated up to that point.
-//
-// Pre-dispatch session-quota guard (kusabi #215): before any worker is
-// spawned, `claude -p --output-format json "/usage"` is asked how much of the
-// account's SESSION window is already spent — a free control-plane call (no
-// inference, no tokens, no quota; ~450ms measured).  At or above the
-// configured threshold the dispatch is REFUSED before the spawn and the job
-// is finalised with the same structured session-quota failure a mid-run
-// session limit produces, so the chain's provider-exhaustion stop needs no
-// new logic.  The guard fails OPEN in every other case, records what it saw
-// on the job record either way, and is off unless the config asks for it
-// (see resolveClaudeSessionGuard).
-//
-// Write-tool watchdog (kusabi #215 item 3): the silence watchdog above only
-// asks whether events ARRIVE, so a worker that reads files forever holds it
-// off indefinitely — the recorded incident was an implement job that ran
-// 256s, cost $2.39 and made zero edits.  On an implement-phase dispatch, and
-// only when `claude.writeWatchdog` is configured, a second clock measures the
-// time since the last FILE-MUTATING tool call: at `warnS` it warns once
-// (`companion.write-watchdog.warned`, also recorded on the job), and at
-// `killS` — opt-in on top of the warning, and only when it is later than
-// `warnS` — it kills the child's process group exactly as the silence
-// watchdog does, finishing the job `status: "stalled"` with its own distinct
-// error text.  Off by default, warn-only unless a kill bound is configured,
-// never killing on a malformed config, and fail-open throughout (see
-// resolveClaudeWriteWatchdog).
-// (now in claude-watchdogs.mjs)
-//
-// Repeat-tool watchdog (kusabi #234): both siblings measure TIME — the
-// silence watchdog the time since any parsed event, the write watchdog the
-// time since any file-mutating call — so a worker that calls the SAME tool
-// with the SAME arguments satisfies both clocks forever (chatty, writing,
-// and saying the same thing every time; the neighbour of the recorded #215
-// incident).  On an implement-phase dispatch, and only when
-// `claude.repeatWatchdog` is configured, a CHAIN counts consecutive
-// identical calls — keyed on `(tool name, deep-key-sorted
-// JSON.stringify(input))` at the same fold point the write watchdog already
-// observes, so it needs no new I/O.  At `threshold` it warns once
-// (`companion.repeat-watchdog.warned`, also recorded on the job), and at
-// `killThreshold` it kills the child's process group exactly as its siblings
-// do, finishing the job `status: "stalled"` with its own distinct error
-// text.  Untracked bookkeeping calls are transparent to the chain, denied
-// calls count, argument identity is always the FULL normalized string (only
-// the event preview is ever truncated), and an invalid config fails LOUDLY
-// at load — never off, never a killing configuration the operator did not
-// write (see resolveClaudeRepeatWatchdog).
-// (now in claude-watchdogs.mjs)
-//
-// The claude backend adapter, kept lean by a pure-move split (no behaviour
-// change): tool permission tables -> tool-permissions.mjs, agent system prompt
-// loading -> agent-system-prompt.mjs, the write/repeat watchdog helpers ->
-// claude-watchdogs.mjs, and process identity / safe kill -> process-identity.mjs.
-// What stays here: model syntax + clamp, arg construction / result parsing,
-// terminal quota classification, runClaudeProcess (spawn + the watchdog timers)
-// and claudeDispatch — the dispatchWithFallback-shaped entry point resolving to
-// `{ job, resultText, stateDir }`, picked by kusabi-companion.mjs for
-// `--backend claude`.  v1 limits unchanged (docs/design/phase-chain.md §3.5.11).
+// One model per phase; upstream resolves prefixes and validates/clamps the chain.
+// Resume records the CLI-reported session id and rejects cross-backend ids.
+// Silence, write, and repeat watchdogs have distinct stall diagnoses.
+// The session guard fails open except for a measured threshold refusal.
+// Rationale: docs/design/backend-dispatch.md#claude-quota-and-watchdogs
+// Repeat-call identity uses full deep-key-sorted inputs; denied calls count.
+// Untracked bookkeeping calls are transparent to the repeat chain (kusabi #234).
+// stream-json requires --verbose; malformed lines are counted and skipped.
+// Parsed events drive measured stats and bounded-cadence saves while the child runs.
 
 import process from "node:process";
 
@@ -162,13 +63,8 @@ import { allowedToolsForAgent, applyToolDenies, disallowedToolsForAgent, sunabaP
 
 export const CLAUDE_BACKEND = "claude";
 
-// The claude backend's default chain when the config has no models.chain /
-// models.phases.<phase> entry.  Claude-native shape (bare aliases): the
-// tier ladder is not walked in v1, so the first route is the model every
-// phase uses.  The opencode BUILTIN_DEFAULT_CHAIN is deliberately NOT
-// reused — its entries are provider/model:variant strings that the claude
-// backend rejects, so `--backend claude` must work out of the box with a
-// claude-shaped default instead of failing on a model the user never typed.
+// Claude-native default: the first route is used; no tier ladder is walked.
+// Rationale: docs/design/backend-dispatch.md#claude-model-selection
 export const CLAUDE_DEFAULT_CHAIN = [["sonnet"], ["opus"]];
 
 // The binary is resolved through CLAUDE_BIN so tests can point the dispatch
@@ -359,13 +255,9 @@ export function buildClaudeArgs({ model, allowedTools, disallowedTools, mcpConfi
 }
 
 /**
- * Parse the terminal `result` event — the shape `claude -p` prints as its
- * last `--output-format stream-json` line, and as its single
- * `--output-format json` object before kusabi #215 Job B (the two are the
- * same object).  Kept as a pure, exported parse for the legacy single-
- * object call shape and for unit tests; the dispatch itself now takes the
- * result event from the NDJSON stream (applyClaudeStreamEvent) and no
- * longer calls this.
+ * Parse a terminal result object from stream-json or single-object JSON.
+ * The dispatch folds NDJSON through applyClaudeStreamEvent; this pure parser
+ * supports the single-object call shape and unit tests.
  *
  * Contract shape: `{ type: "result", is_error, result, session_id,
  * usage: { input_tokens, output_tokens, cache_creation_input_tokens,
@@ -405,8 +297,7 @@ export function parseClaudeResult(stdout) {
  *     the final message, which is the claude-side equivalent of a failed
  *     fetch: the answer may exist, we just did not get it.
  *
- * A non-string `result` keeps its long-standing JSON.stringify rendering so a
- * job that does have a final message writes exactly the bytes it always has.
+ * Non-string results use JSON.stringify so their final-message bytes are preserved.
  *
  * @param {object|null} parsed — output of `parseClaudeResult`.
  * @returns {{ok: true, text: string}|{ok: false, error: string}}
@@ -451,28 +342,12 @@ export function mapClaudeUsage(result) {
 // terminal failure classification — quota exhaustion (kusabi #215)
 // =========================================================================
 //
-// An `is_error: true` result collapses today into a generic `error` job.
-// Quota exhaustion needs its own machine-readable classification: a
-// *session* limit (HTTP 429 + "session limit" text, real 2026-08-11
-// incident job-msnf4qph5ccd) means the WHOLE claude backend is blocked for
-// the account window — including the operator's own Claude Code session —
-// so retrying, or walking other claude models, is actively wrong; the
-// actionable response is switching the phase to the opencode backend
-// (a `--model <provider>/<model>` identifier carries its backend, kusabi
-// #210).  Other 429 kinds (per-model / per-request rate limits) do not
-// imply that.
-//
-// The classification is STRUCTURED on the job record (`job.failure`) so a
-// reader never has to grep prose.  `subtype` is deliberately NOT consulted:
-// a terminal payload can carry `subtype: "success"` next to
-// `is_error: true` — it must never influence success/failure.
+// Session quota blocks the account across Claude models; other 429 kinds do not.
+// Classification is structured on job.failure, never inferred from subtype.
+// Rationale: docs/design/backend-dispatch.md#claude-quota-and-watchdogs
 const SESSION_LIMIT_RE = /\bsession[\s_-]?limit\b/i;
-// Every alternative is a qualified multi-word phrase on purpose: a bare word
-// ("quota", "resets") matches unrelated failure prose — "disk quota exceeded",
-// "git reset failed" — and a false positive here does not merely mislabel, it
-// flips the job to provider-error and hard-stops the chain.  When in doubt,
-// leave the word out: an unclassified quota failure degrades to the generic
-// error path, which is survivable.
+// Qualified phrases avoid false positives that hard-stop a viable chain.
+// Rationale: docs/design/backend-dispatch.md#claude-quota-and-watchdogs
 const QUOTA_TEXT_RE = /\b(session[\s_-]?limit|rate[\s_-]?limit|spend[\s_-]?limit|daily[\s_-]?limit|monthly[\s_-]?limit|limit[\s_-]?(reached|exceeded)|too[\s_-]?many[\s_-]?requests)\b/i;
 // The kind said back to the operator must come from the text, never from
 // precedence: only an explicit rate-limit phrase may be called "rate".
@@ -542,11 +417,8 @@ const MAX_PLAUSIBLE_RESET_EPOCH_S = 1e12;
 function extractResetFromRateLimitInfo(rateLimit) {
   const resetsAt = rateLimit?.info?.resetsAt;
   if (typeof resetsAt !== "number" || !Number.isFinite(resetsAt)) return null;
-  // Plausibility bounds (cross-review of PR #219).  Any finite number used
-  // to pass: `0` rendered "1970-01-01T00:00:00.000Z" and a MILLISECOND-epoch
-  // value (the same field, wrong unit) rendered year 58579 — both presented
-  // to the operator as this quota's reset time.  A reset time we cannot
-  // believe is worse than none at all: the operator schedules around it.
+  // Reject implausible seconds: a misleading reset time is worse than none.
+  // (kusabi #219)
   if (resetsAt <= 0 || resetsAt > MAX_PLAUSIBLE_RESET_EPOCH_S) return null;
   return new Date(resetsAt * 1000).toISOString();
 }
@@ -733,13 +605,8 @@ export async function runClaudeProcess({
       let repeatChain = null;
       let repeatWarned = false;
 
-      // Write-tool watchdog (kusabi #215 item 3).  A SEPARATE interval from
-      // the silence watchdog on purpose: the two measure different clocks, and
-      // a fault in this one must not be able to take the silence kill down
-      // with it.  Same 250ms resolution, same group kill, and the whole body
-      // is wrapped — an exception thrown inside a timer callback is an
-      // uncaught exception that would kill the parent process, and this
-      // feature's contract is to fail open.
+      // Separate, fail-open timer: a write-watchdog fault must not break silence kill.
+      // Rationale: docs/design/backend-dispatch.md#claude-quota-and-watchdogs
       const writeWatchdogTimer = writeWatchdog && writeWatchdog.warnS > 0
         ? ctl.addInterval(() => {
             try {
@@ -773,10 +640,7 @@ export async function runClaudeProcess({
 
       return {
         onParsed(parsedLine) {
-          // The write clock resets ONLY on a file-mutating tool call (kusabi
-          // #215 item 3) — reads, searches and execs are exactly what the
-          // incident job did all day.  Wrapped: a detection bug must never
-          // break line delivery or the silence watchdog that shares this path.
+          // Only file-mutating calls reset this clock; detection fails open (kusabi #215).
           if (writeWatchdog) {
             try {
               if (eventHasClaudeWriteTool(parsedLine)) lastWriteAt = Date.now();
@@ -819,17 +683,9 @@ export async function runClaudeProcess({
           }
         },
         onClose() {
-          // Final write-clock reading (kusabi #215 item 3).  A polled interval
-          // can be beaten to the finish line: when this process is descheduled
-          // the child's whole output can arrive buffered together with its exit,
-          // and the close callback (poll phase) then clears the interval before
-          // the timers phase ever gets to observe the idle time.  The warning is
-          // an audit fact about the run, not a property of scheduler luck, so it
-          // is evaluated once more here — same condition, same measurement, so
-          // this can only emit a warning the interval would have emitted itself.
-          // Deliberately AFTER the final line is delivered (a write on the last
-          // line still resets the clock) and never on a run some other bound
-          // already killed: those carry their own diagnosis.
+          // Check idle once more after final line delivery, before close clears timers.
+          // Skip runs already diagnosed by another bound.
+          // Rationale: docs/design/backend-dispatch.md#claude-quota-and-watchdogs
           if (writeWatchdog && !writeWarned && !writeStalled && !repeatStalled && !ctl.isKilled()) {
             try {
               const idleMs = Date.now() - lastWriteAt;
@@ -917,15 +773,9 @@ export async function claudeDispatch(opts) {
     tail: "a session id that a claude job on this directory recorded",
   });
 
-  // ---- repeat-tool watchdog config (kusabi #234) ----
-  // Resolved in PRE-FLIGHT, unlike its two siblings: an invalid
-  // `claude.repeatWatchdog` VALUE must fail the dispatch LOUDLY before any
-  // job record exists, before anything is written or spawned — a config
-  // error is a loud throw, not a stuck "running" record, and never a
-  // silently-disarmed watchdog.  Only the config FILE read fails open (the
-  // siblings' discipline: reading a settings file must never be the thing
-  // that fails a dispatch); an unreadable file is not an invalid VALUE, and
-  // every invalid value throws from resolveClaudeRepeatWatchdog below.
+  // Invalid repeat-watchdog values throw before any job record or spawn.
+  // Only an unreadable config file fails open (kusabi #234).
+  // Rationale: docs/design/backend-dispatch.md#claude-preflight
   let repeatWatchdog;
   let repeatWatchdogConfig;
   try {
@@ -989,14 +839,9 @@ export async function claudeDispatch(opts) {
   const bin = claudeBin();
   const timeoutS = resolveBoundS(opts.timeoutS);
   const watchdogS = resolveBoundS(opts.watchdogS);
-  // The job id is minted here, in pre-flight, so the generated MCP config
-  // can be named after its job (kusabi #276) and stamp KAIBA_JOB on the
-  // kaiba entry (kusabi #391): the file lives in the job's OWN directory,
-  // so two dispatches in the same cwd whose spawn windows overlap each hand
-  // their claude process a config file only they write — one dispatch's
-  // profile can never overwrite another's.  The write is deliberately the
-  // LAST pre-flight step, after every throw-capable check above has passed,
-  // so a loud failure never leaves a stray config behind.
+  // Each job owns its MCP config, preventing overlapping dispatches overwriting it.
+  // Write only after all throw-capable preflight checks pass (kusabi #276, #391).
+  // Rationale: docs/design/backend-dispatch.md#claude-preflight
   const jobId = newJobId();
   const kaibaEntry = applyWorkerKaibaIdentity(rawKaibaEntry, jobId);
   const mcpConfigPath = writeClaudeMcpConfig(jobDir(stateDir, jobId), sunabaEntry, kaibaEntry);
@@ -1037,15 +882,8 @@ export async function claudeDispatch(opts) {
     modelVariant: null,
     startedAt: new Date().toISOString(),
     finishedAt: null,
-    // The child runs `--output-format stream-json --verbose`, so counters
-    // here are MEASURED from the parsed event stream, not structural
-    // (kusabi #215 Job B).  `instrumented: true` marks every dispatch this
-    // module makes from here on; `instrumented: false` now identifies only
-    // legacy/pre-#215 records on disk — kusabi-companion.mjs keeps its "not
-    // instrumented" rendering for those.  `lastActivity` starts null (no
-    // event has arrived yet); the serve-lifecycle idle-reap fallback
-    // (`stats.lastActivity ?? startedAt`) covers that gap the same way it
-    // always has.
+    // Counters are measured from parsed events; lastActivity is null until the first.
+    // Idle reaping falls back to startedAt while no event has arrived (kusabi #215).
     stats: {
       instrumented: true,
       events: 0,
@@ -1128,32 +966,16 @@ export async function claudeDispatch(opts) {
     labels: { spawnErrorPrefix: `${CLAUDE_BACKEND} dispatch failed` },
     // Same failure status/text the opencode path uses for timeouts.
     timeoutS,
-    // The SAME event types the opencode watchdog writes
-    // (prompt-execution.mjs), so stall auditing over events.ndjson is
-    // backend-agnostic and finally counts claude stalls too — until now the
-    // claude watchdog mirrored opencode's status and wording but left no
-    // trace in the trail at all.  There is deliberately no
-    // `companion.watchdog.declined-kill` counterpart: that event exists on
-    // opencode because a shared serve's pid may not be ours to signal, while
-    // this child is ours alone, so the kill always runs.
-    //
-    // Mirrors the opencode watchdog's own status and wording exactly (kusabi
-    // #215 Job B item 3), so a chain treats a stalled claude worker like a
-    // stalled opencode one.  The kill always ran (runClaudeProcess only sets
-    // `stalled` after killProcessGroup), so the wording always names it —
-    // there is no "declined kill" case here, unlike the opencode serve
-    // watchdog: this process is ours alone, nothing to verify ownership of.
+    // Shared watchdog event types/status/text keep stall auditing backend-agnostic.
+    // This child is ours alone: there is no declined-kill case.
+    // Rationale: docs/design/backend-dispatch.md#claude-quota-and-watchdogs
     watchdogS,
     stream,
     resultBackend: CLAUDE_BACKEND,
     beforeSpawn: async ({ job: j, stateDir: sd }) => {
-      // ---- pre-dispatch session-quota guard (kusabi #215) ----
-      // Runs AFTER the record exists (so a refusal is a finalised job record with
-      // a prompt and an audit trail, not a silent nothing) and BEFORE any worker
-      // is spawned — which is the whole point: at a spent session window the
-      // spawn is what costs money and takes the operator's own session down with
-      // it.  Wrapped end to end: the guard may cost a dispatch its worker, never
-      // the dispatch itself.
+      // Probe after recording the job/prompt and before spending quota on a worker.
+      // The guard is fail-open; refusals remain finalised, auditable jobs (kusabi #215).
+      // Rationale: docs/design/backend-dispatch.md#claude-quota-and-watchdogs
       let guard;
       try {
         guard = resolveClaudeSessionGuard(loadClaudeGuardConfig());
@@ -1219,8 +1041,7 @@ export async function claudeDispatch(opts) {
         writeWatchdog = { enabled: false, warnS: null, killS: null, reason: "phase-not-gated" };
       }
       if (writeWatchdog.enabled) {
-        // Recorded ONLY when armed: a dispatch with the feature off must leave a
-        // job record byte-identical to the pre-item-3 one (no new key at all).
+        // Add the watchdog key only when armed; disabled dispatches carry no new key.
         j.writeWatchdog = {
           warnS: writeWatchdog.warnS,
           killS: writeWatchdog.killS,
@@ -1243,9 +1064,7 @@ export async function claudeDispatch(opts) {
         repeatWatchdog = { enabled: false, threshold: null, killThreshold: null, reason: "phase-not-gated" };
       }
       if (repeatWatchdog.enabled) {
-        // Recorded ONLY when armed: an unarmed dispatch must leave a job record
-        // byte-identical to the pre-#234 one (no new key at all).  `count` is
-        // the chain length at the last recorded event (the warn, or the kill).
+        // Add the watchdog key only when armed; count tracks the last warn/kill event.
         j.repeatWatchdog = {
           threshold: repeatWatchdog.threshold,
           killThreshold: repeatWatchdog.killThreshold,
@@ -1273,11 +1092,7 @@ export async function claudeDispatch(opts) {
         writeWatchdog: writeWatchdog?.enabled
           ? { warnS: writeWatchdog.warnS, killS: writeWatchdog.killS }
           : null,
-        // Naming parity with the silence pair from day one (kusabi #215 finding
-        // 4): `companion.write-watchdog.{warned,fired,kill}`, so stall auditing
-        // over events.ndjson needs no second vocabulary.  The warn is ALSO put
-        // on the job record — a warning nobody can see in `kusabi status` is a
-        // warning that changes nothing.
+        // Shared audit vocabulary; also persist warnings for kusabi status (kusabi #215).
         onWriteWatchdog: ({ kind, idleS }) => {
           if (kind === "warned") {
             // Trail first, record second: this callback is wrapped end to end,
@@ -1308,11 +1123,7 @@ export async function claudeDispatch(opts) {
         repeatWatchdog: repeatWatchdog?.enabled
           ? { threshold: repeatWatchdog.threshold, killThreshold: repeatWatchdog.killThreshold }
           : null,
-        // Naming parity with the two siblings (kusabi #234):
-        // `companion.repeat-watchdog.{warned,fired,kill}`, so stall auditing
-        // over events.ndjson needs no third vocabulary.  The warn is ALSO put
-        // on the job record — a warning nobody can see in `kusabi status` is a
-        // warning that changes nothing.
+        // Shared audit vocabulary; also persist warnings for kusabi status (kusabi #234).
         onRepeatWatchdog: ({ kind, tool, count, argsPreview }) => {
           if (kind === "warned") {
             // Trail first, record second (the write watchdog's discipline): a
@@ -1410,19 +1221,8 @@ export async function claudeDispatch(opts) {
 
       const parsed = state.streamAcc.resultEvent;
       if (parsed.is_error === true) {
-        // Reached on exit 0 AND on a nonzero exit (cross-review of PR #219).
-        // The exit code decides nothing this payload does not already say: a
-        // terminal event with `is_error: true` names the failure, and whether
-        // it is quota exhaustion. Gating the classification on `code === 0`
-        // made the provider-exhaustion stop and its operator advice hostage to
-        // an exit code the real CLI is not documented to set either way — the
-        // one captured session-limit run exited 0, and a future build exiting 1
-        // on the same payload would have silently downgraded it to a generic
-        // error. The exit code is still recorded (companion.claude.finished).
-        //
-        // `subtype` is NEVER consulted here: a terminal payload can carry
-        // `subtype: "success"` next to `is_error: true` (real 2026-08-11
-        // session-limit payload) — the failure signal is is_error alone.
+        // Classify is_error on any exit code; subtype never overrides that signal.
+        // (kusabi #219)
         const failure = classifyClaudeTerminalFailure(parsed, { rateLimit: j.rateLimit });
         const detail = typeof parsed.result === "string" && parsed.result.trim()
           ? parsed.result.trim()
