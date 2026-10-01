@@ -8,157 +8,16 @@
 // `{ job, resultText, stateDir }`.  kusabi-companion.mjs picks this function
 // per phase; the chain phases stay backend-blind.
 //
-// WHY a third backend: agy draws on a separate quota pool (Gemini, metered
-// apart from both the opencode and the claude pool) and adds a third model
-// family, which is what cross-family review needs.  There is NO
-// read-only-phase restriction — any phase may route here.
-//
-// ---------------------------------------------------------------------------
-// The CLI contract (field-verified by a hand run, 2026-08-11)
-// ---------------------------------------------------------------------------
-//
-//   agy -p <prompt> --output-format stream-json --model <id> --print-timeout <duration>
-//         [--json-schema <schema>] [--conversation <id>]
-//
-// and an NDJSON event stream on stdout, one object per line, discriminated
-// by the `event` key (NOT `type` — that is the claude vocabulary; agy uses
-// `event`).  Three event kinds were field-verified on 2026-08-20:
-//
-//   {"event":"init","conversation_id":"<uuid>","init":{model,cwd,tools,
-//     permission_mode,json_schema}}                     — the conversation id
-//                                                         sits at the TOP level
-//   {"event":"step_update","step_update":{conversation_id,step_index,state,
-//     step_type,tool_name?,tool_info?,usage?,…}}        — repeated per step; a
-//                                                         tool step appears as
-//                                                         ACTIVE then DONE (or
-//                                                         ERROR), same index
-//   {"event":"result","result":{…}}                     — the terminal line; the
-//                                                         inner `result` object
-//                                                         is BYTE-SHAPE-IDENTICAL
-//                                                         to the whole object
-//                                                         `--output-format json`
-//                                                         used to print
-//
-// The terminal `result.result` payload therefore keeps that shape:
-//
-//   {"conversation_id":"<uuid>","status":"SUCCESS","response":"<text>",
-//    "duration_seconds":152.4,"num_turns":2,
-//    "structured_output":{…},"json_schema":{…},
-//    "usage":{"input_tokens":…,"output_tokens":…,"thinking_tokens":…,
-//             "cache_read_tokens":…,"total_tokens":…}}
-//
-// `structured_output` / `json_schema` appear only when `--json-schema` was
-// passed.  No flag outside that list is ever constructed here — in
-// particular NEVER `--dangerously-skip-permissions`: it is not needed (the
-// sunaba/shiori tools are auto-approved server-side) and the
-// orchestrator-side classifier blocks it.
-//
-// **The outer `status` field is NOT authoritative.**  A run whose transcript
-// contains any failed tool call reports `status: "ERROR"` even when
-// `response` and `structured_output` are complete and correct (observed: one
-// MCP kwarg validation error mid-run, full verdict delivered).  Success is
-// therefore decided by PAYLOAD PRESENCE — a non-empty `response`, or a
-// present `structured_output` — and `status` is recorded as advisory
-// metadata (`job.agyStatus`) only.  A missing/empty payload is a failed job
-// regardless of what `status` claims.  Reading it the other way round would
-// throw away completed, paid-for work on a mid-run tool typo.
-//
-// ---------------------------------------------------------------------------
-// v1 limits (deliberate; see docs/design/phase-chain.md §3.5.14)
-// ---------------------------------------------------------------------------
-//   - ONE model per phase: `explicitModel` when given, else the first route
-//     of the tiered chain.  No tier ladder, no capacity fallback, no retry
-//     walk — same shape as the claude backend's v1 (kusabi #184 Job A).
-//   - RESUME VIA `--conversation` (kusabi #316).  The CLI has always taken
-//     `--conversation <id>` (and `-c` / `--continue` for the most recent
-//     conversation); #199's survey simply did not list it, so v1 recorded
-//     the CLI's `conversation_id` as the job's `sessionID` and resumed
-//     nothing.  A resuming dispatch now passes the recorded id back:
-//     `agy -p <prompt> --output-format stream-json --model <id> --conversation
-//     <id>`.  One gate is NOT like the other backends': an agy
-//     `conversation_id` and a claude session id are BOTH bare UUIDs, so
-//     shape cannot tell them apart — this module resumes a session only
-//     when the caller states its provenance (an explicit signal, see
-//     `assertSessionResumable`), and fails closed otherwise.  The job store,
-//     where the distinguishing record lives, is consulted by the caller
-//     (kusabi-companion.mjs / the chain seams); this module never touches
-//     the store itself.
-//   - `:variant` suffixes are rejected: agy has no variant concept, and a
-//     silently ignored suffix is how an operator ends up billed for a model
-//     they did not ask for.
-//   - MODEL IDS ARE NOT ENUMERATED HERE.  The list drifts (as of 2026-08-10:
-//     gemini-3.6-flash-high|medium|low, gemini-3.5-flash-high|medium|low,
-//     gemini-3.1-pro-high|low, claude-sonnet-4-6, claude-opus-4-6-thinking,
-//     gpt-oss-120b-medium).  The agy CLI itself is the validator of record;
-//     kusabi validates only the SHAPE (non-empty, no `:variant`), so a model
-//     added upstream works the day it ships instead of the day kusabi is
-//     updated.
-//   - THE EVENT STREAM IS FOLDED WHILE IT RUNS (kusabi #332).  `stream-json`
-//     prints one event per line as it happens, so `job.stats` is MEASURED, not
-//     structural: `instrumented: true` with real `events`, `steps`, `lastTool`,
-//     `lastActivity`, `models` (the marker post-#215 claude records carry,
-//     which every reader already handles).  A tool step is counted ONCE per
-//     step_index — the same index is emitted ACTIVE then DONE (or ERROR) —
-//     and `lastTool` is the tool_name of the most recent tool line, ERROR
-//     included.  `watchdogS` is LIVE: no parsed event for that long kills the
-//     child's whole process group and the job finishes `stalled`, exactly like
-//     the claude silence watchdog.  The armed interval is floored at
-//     AGY_WATCHDOG_FLOOR_S (120s): the real CLI emits NOTHING — not even
-//     `init` — for the first ~11 seconds of a healthy run (measured
-//     2026-08-20), so a short interval would kill correct runs; the floor is
-//     enforced in code, never left to callers.  `timeoutS`, an absolute
-//     wall-clock bound, is the OUTER bound: the
-//     spawned process carries its own INNER bound (`--print-timeout`, kusabi
-//     #326) that kusabi sets so the outer one always expires first.  That
-//     ordering is what keeps the outer bound authoritative — a too-long job
-//     is classified through the `timedOut` path ("timed out after Ns")
-//     instead of arriving as a well-formed JSON object with an empty
-//     `response` that reads as "agy returned no payload".  The direction is
-//     deliberately REVERSED vs kusabi-companion.mjs's `DEFAULT_WATCHDOG_S =
-//     900`: there opencode's inner 600s `mcp_timeout` trips FIRST because
-//     its error is the more informative one; here agy's inner failure (an
-//     empty payload that names no cause) is the LESS informative one, so
-//     kusabi's own bound is the one that fires.
-//   - A BRIEF HAS A HARD CEILING HERE that the other backends do not have.
-//     The prompt rides argv, and Linux caps a single argv string at
-//     MAX_ARG_STRLEN (131072 bytes); past it the spawn fails with E2BIG.
-//     `checkAgyArgvSize` refuses such a dispatch before the spawn with an
-//     error that names the oversized element and the way out, rather than
-//     letting a raw errno surface as a generic dispatch failure.  It is a
-//     caller error (`status: "error"`), not a provider outage.
-//   - Per-dispatch tool permissions cannot be expressed: agy takes no
-//     allow/deny flags.  A deny map that reaches this dispatch (the chain
-//     phases pass implementDenyTools / reviewDenyTools unconditionally) is
-//     recorded on the job record as `toolDeniesUnenforced` rather than
-//     silently dropped; an operator-typed `--read-only` / `--deny` is
-//     rejected at command start instead (kusabi-companion.mjs), because a
-//     restriction that cannot be applied must never look applied.  What CAN
-//     be expressed is a PER-ROLE permission table: agy's allow-list lives in
-//     `<HOME>/.gemini/antigravity-cli/settings.json`, and HOME is derived
-//     from nothing else, so `agy.homes` (see resolveAgyHome) hands each role
-//     its own HOME — and with it its own allow-list, MCP config, and rules.
-//     A role with no configured home runs under the ambient HOME exactly as
-//     before; a configured home whose settings.json is unusable refuses the
-//     dispatch (fail closed) instead of widening back to the operator's own
-//     machine-wide table.
-//
-// ---------------------------------------------------------------------------
-// Assumptions this module makes and does NOT manage
-// ---------------------------------------------------------------------------
-// agy reaches sandbox containers through the sunaba MCP server, configured
-// in `<HOME>/.gemini/config/mcp_config.json` (`agy mcp add` writes it there;
-// the older `~/.gemini/antigravity-cli/mcp_config.json` path is gone) — the
-// same route Claude Code uses, and per-HOME like every other `.gemini` file
-// (see resolveAgyHome).  That file is the operator's; this dispatch neither
-// writes, validates, nor overrides it (contrast the claude backend, which
-// generates its own `--mcp-config`).  If sunaba is not configured there, the
-// worker simply has no container tools and says so in its own output.
-//
-// ---------------------------------------------------------------------------
-// Split modules (pure move refactor)
-// ---------------------------------------------------------------------------
-// Output and NDJSON event stream parsing live in agy-stream.mjs.
-// Per-role HOME resolution and denied_actions live in agy-home.mjs.
+// One model per phase, no tier ladder or retry; the CLI validates model ids.
+// Resume requires caller-proven agy provenance; ambiguous UUIDs fail closed.
+// Success depends on payload presence; CLI status and exit code are advisory.
+// The prompt and optional schema use argv; oversized elements refuse before spawn.
+// Timeout is the outer bound; the silence watchdog is floored for CLI startup.
+// Per-dispatch denies are recorded as unenforced. Configured role homes fail closed.
+// MCP configuration belongs to the operator; this adapter never writes or overrides it.
+// Rationale: docs/design/backend-dispatch.md#agy-transport-and-payloads
+// Stats count each tool step_index once, including ERROR; lastTool is tool_name.
+// sunaba MCP is configured in <HOME>/.gemini/config/mcp_config.json.
 
 import path from "node:path";
 import fs from "node:fs";
@@ -197,15 +56,8 @@ const PLUGIN_ROOT = path.resolve(HERE, "..");
 
 export const AGY_BACKEND = "agy";
 
-// The agy backend's default chain when the config has no models.chain /
-// models.phases.<phase> entry.  ONE tier on purpose: this backend walks no
-// ladder, so a multi-tier default would describe a climb that never happens.
-// The opencode BUILTIN_DEFAULT_CHAIN and CLAUDE_DEFAULT_CHAIN are both
-// deliberately NOT reused — their entries are other backends' model
-// spellings, so `--backend agy` must work out of the box with an agy-shaped
-// default instead of failing on a model the operator never typed.  The id
-// WILL drift (see the model-id note above); it is a starting point, not a
-// contract.
+// A single-tier agy-native default; other backends' model spellings are invalid here.
+// Rationale: docs/design/backend-dispatch.md#agy-model-selection
 export const AGY_DEFAULT_CHAIN = [["gemini-3.6-flash-high"]];
 
 // The agent whose output contract IS the review verdict.  When a dispatch
@@ -332,16 +184,8 @@ export function resolveAgyModel({ flag, phase, config }) {
  * The `--json-schema` argument for a dispatch, or null when the phase's
  * output contract is free text.
  *
- * This is PREVENTION for the review-verdict shape problem: when the phase's
- * contract IS the review verdict, the CLI enforces it, so the model cannot
- * hand back prose where the chain expects JSON.  The schema is not a new
- * artifact — it is `schemas/review-output.schema.json`, the EXISTING verdict
- * contract that the review prompt already embeds and `parseReviewResult`
- * already reads.  One contract, two enforcement points; there is no schema
- * registry and no per-phase schema config key (out of scope by design).
- *
- * Re-serialised compactly so argv is stable and the file's formatting is not
- * part of the invocation.
+ * The existing review schema is compactly serialized and enforced by the CLI.
+ * Rationale: docs/design/backend-dispatch.md#agy-review-schema
  *
  * @param {string|null|undefined} agent
  * @returns {string|null} Compact JSON schema text, or null.
@@ -373,36 +217,16 @@ export function buildAgyPrompt({ systemPrompt, promptText }) {
   return `<role>\n${systemPrompt}\n</role>\n\n${body}`;
 }
 
-// kusabi #326: the headroom given to agy's INNER bound (`--print-timeout`)
-// over kusabi's own outer `timeoutS`.
-//
-// WHY 300s: both timers start at process launch — kusabi's the instant
-// spawn() returns, agy's once its print-mode wait begins, which if
-// anything LAGS the spawn.  The ordering therefore holds whenever the
-// inner value exceeds the outer one, and the only thing the margin must
-// absorb is the skew between the two start points: sub-second in the worst
-// case.  300s is agy's OWN default print timeout — the smallest headroom
-// this module ever grants is the tool's own idea of a full wait budget,
-// two orders of magnitude above any plausible skew.
-//
-// The direction is deliberately REVERSED vs kusabi-companion.mjs's
-// `DEFAULT_WATCHDOG_S = 900`, where opencode's inner 600s `mcp_timeout` is
-// allowed to trip FIRST because the inner error is the more informative
-// one.  For agy the inner failure is the LESS informative one — a
-// well-formed JSON object with an empty `response`, which kusabi reads as
-// "returned no payload", with no mention of time.  So the inner bound is
-// set to lose the race, and the outer bound is the one that fires.
+// Headroom keeps agy's inner print timeout later than the outer timeout (kusabi #326).
+// Rationale: docs/design/backend-dispatch.md#agy-timeouts
 export const AGY_PRINT_TIMEOUT_MARGIN_S = 300;
 
 /**
  * Render a whole number of seconds the way Go's `time.Duration.String()`
  * would — the dialect agy itself prints (`--help` shows `5m0s`).
  *
- * Whole seconds only by construction (timeoutS is a whole number and so is
- * the margin), so no fractional part ever needs rendering.  The compound
- * h/m/s form is used rather than a bare seconds count because it is the
- * exact form the tool itself prints; whether a bare number is also
- * accepted is not established, so the safe spelling is the tool's own.
+ * Whole seconds use the CLI's own compound h/m/s spelling.
+ * Rationale: docs/design/backend-dispatch.md#agy-timeouts
  *
  * @param {number} totalSeconds
  * @returns {string}
@@ -439,12 +263,8 @@ export function formatGoDuration(totalSeconds) {
  * authoritative, so no inner bound is invented either — agy's own default
  * is then its business, not kusabi's.
  *
- * The prompt is on argv because that is the documented transport (unlike the
- * claude backend, which was field-verified to accept stdin).  The tradeoff
- * is real and accepted for v1: the prompt is visible in `ps` output on the
- * host for the life of the child.  Briefs are not secrets; credentials never
- * appear in one.  A stdin transport would need field verification against
- * the real CLI before it could replace this.
+ * The documented prompt transport is argv, visible in ps for the child's lifetime.
+ * Rationale: docs/design/backend-dispatch.md#agy-transport-and-payloads
  *
  * @param {object} opts
  * @param {string} opts.model
@@ -490,31 +310,14 @@ export function buildAgyArgs({ model, promptText, jsonSchema, conversationId, ti
 // argv size guard — pure
 // =========================================================================
 
-// Linux caps EACH SINGLE argv/env string at MAX_ARG_STRLEN = PAGE_SIZE * 32.
-// With the 4096-byte pages this project runs on that is 131072 bytes
-// (measured, not assumed).  This is NOT ARG_MAX (2097152 on the same host):
-// ARG_MAX bounds the argv+env TOTAL, and a single oversized brief hits the
-// per-string cap first by an order of magnitude.
-//
-// It matters HERE and nowhere else.  agy has no stdin prompt transport (field
-// verification, kusabi #199): the composed prompt rides `-p <promptText>` and
-// the schema rides `--json-schema <json>`, so both are single argv strings
-// subject to this cap.  The claude backend feeds its prompt over stdin and
-// opencode goes over HTTP — neither can reach this failure, and neither gets
-// a size check.
+// Linux's per-string argv cap, distinct from the argv+env total.
+// Rationale: docs/design/backend-dispatch.md#agy-argument-size
 export const AGY_MAX_ARG_STRLEN = 131072;
 
 // The size one agy argv element may reach before this backend refuses.
 //
-// MAX_ARG_STRLEN less a 1024-byte margin, for two reasons worth stating:
-//   - The kernel measures the string WITH its NUL terminator (`copy_strings`
-//     compares `strnlen_user`'s count, which includes it), so 131072 content
-//     bytes is already E2BIG *at* the documented limit — the usable maximum
-//     is 131071, and a guard set exactly at 131072 would still let one size
-//     through to the kernel.
-//   - Refusing a kilobyte early buys a legible, actionable error instead of a
-//     raw errno surfacing as a generic dispatch failure.  Nothing about a
-//     brief's usefulness turns on its last kilobyte.
+// Include the NUL terminator and refuse early with an actionable error.
+// Rationale: docs/design/backend-dispatch.md#agy-argument-size
 export const AGY_MAX_ARG_BYTES = AGY_MAX_ARG_STRLEN - 1024;
 
 // Human names for the argv elements a size refusal can name.  Keyed by the
@@ -710,17 +513,9 @@ export async function agyDispatch(opts) {
   const jsonSchema = agyJsonSchemaFor(opts.agent);
   const promptText = buildAgyPrompt({ systemPrompt, promptText: opts.promptText });
   const bin = agyBin();
-  // ---- the ONE per-role HOME decision (kusabi #542) ----
-  // agy's permission table is `<HOME>/.gemini/antigravity-cli/settings.json`,
-  // derived from HOME and nothing else — so the per-role restriction that the
-  // flag-less CLI cannot express IS expressible as a per-role HOME.  Resolve
-  // it ONCE here from `agy.homes` (resolveAgyHome); when it resolves to a
-  // home, verify that home's settings.json is usable BEFORE anything is
-  // spawned, and fail closed (throw, never a failed job) if it is not: a
-  // missing role table would silently fall back to the operator's own
-  // machine-wide table, running with MORE access than configured.  When it
-  // resolves to null the spawn is byte-identical to today's dispatch (no
-  // HOME override at all).
+  // Resolve role HOME once; validate its settings before creating a job or spawning.
+  // Configured but unusable settings fail closed to avoid widening permissions (kusabi #542).
+  // Rationale: docs/design/backend-dispatch.md#agy-role-permissions
   const homeConfig = loadAgyHomeConfig();
   const { home: agyHome, reason: agyHomeReason } = resolveAgyHome({
     phase: opts.phase,
@@ -749,16 +544,9 @@ export async function agyDispatch(opts) {
   // timer without `--print-timeout`, or the reverse — is impossible,
   // because there is only one resolution and both sites consume it.
   const timeoutS = resolveBoundS(opts.timeoutS);
-  // ---- the ONE watchdog decision (kusabi #332) ----
-  // `watchdogS` is resolved and floored ONCE here, and the SAME value feeds
-  // runAgyProcess (the armed interval) and the stall error text, so the two
-  // can never disagree about the interval.  agyWatchdogSeconds REFUSES every
-  // shape that is not a positive finite number (null arms NO watchdog) and
-  // raises any positive value below AGY_WATCHDOG_FLOOR_S up to the floor —
-  // the real CLI emits nothing, not even `init`, for the first ~11 seconds
-  // of a healthy run (measured 2026-08-20), so a shorter interval would
-  // kill correct runs.  The floor is enforced in code, never left to
-  // callers passing a sane value.
+  // Resolve and floor once; the armed interval and error text use the same value.
+  // The floor protects healthy runs during silent CLI startup (kusabi #332).
+  // Rationale: docs/design/backend-dispatch.md#agy-timeouts
   const watchdogS = agyWatchdogSeconds(opts.watchdogS);
   // `session` survived assertSessionResumable, so it is either absent or a
   // provenance-proven agy conversation id — the only shape that may become
@@ -801,11 +589,7 @@ export async function agyDispatch(opts) {
     modelVariant: null,
     startedAt: new Date().toISOString(),
     finishedAt: null,
-    // The stream is folded while the child runs (kusabi #332): the marker
-    // starts `true` because every dispatch this module makes now measures
-    // its stream, and the fold below replaces the zeros with measured
-    // values as events arrive.  `instrumented: false` keeps its meaning
-    // for records written before this change — they are never rewritten.
+    // Every dispatch measures the live stream; zeros are replaced as events arrive.
     stats: {
       instrumented: true,
       events: 0,
@@ -917,25 +701,11 @@ export async function agyDispatch(opts) {
     // The resolved value — the timer only fires when it is a positive
     // number, so this renders the same number the timer was armed with.
     timeoutS,
-    // The SAME event types the opencode and claude watchdogs write
-    // (prompt-execution.mjs, claude-dispatch.mjs), so stall auditing over
-    // events.ndjson is backend-agnostic and finally counts agy stalls too.
-    //
-    // The silence watchdog killed the group (kusabi #332).  Same `stalled`
-    // STATUS and the opencode/claude watchdog's own wording, so a chain
-    // treats a stalled agy worker exactly like a stalled opencode/claude
-    // one.  The kill always ran (runAgyProcess only sets `stalled` after
-    // killProcessGroup), so the wording always names it.  The interval the
-    // text names is the ARMED one — the floored value, never what the
-    // caller happened to pass.
+    // Shared watchdog event types/status/text keep stall auditing backend-agnostic.
+    // A stall means the group kill ran; error text uses the armed, floored interval.
     watchdogS,
-    // `resolveCompletedResult` selects a recovery source by backend and has
-    // none for agy (its transcripts are the CLI's own, in a location kusabi
-    // does not read): an empty payload therefore records
-    // `no-recovery-source-for-backend` instead of pretending to recover.
-    // Unreachable in practice — an empty payload is a FAILED job under the
-    // payload rule — but the shared path keeps the record shape identical
-    // across backends.
+    // agy has no readable recovery source; an empty payload already fails.
+    // Rationale: docs/design/backend-dispatch.md#agy-transport-and-payloads
     resultBackend: AGY_BACKEND,
     beforeSpawn: () => {
       // prompt.md is written BEFORE the size guard runs, on purpose: the operator
@@ -994,14 +764,8 @@ export async function agyDispatch(opts) {
       // signal as `status: "ERROR"`.  A nonzero exit with NO payload still
       // fails, and its error names the exit code.
       let parsed = null;
-      // The terminal payload is the stream's LAST `result` event's inner
-      // object — byte-shape-identical to what `--output-format json` used to
-      // print (measured 2026-08-20), so every downstream consumer receives
-      // the exact object it receives today.  When no terminal `result` event
-      // arrived, fall back to the LEGACY single-object reading: a stream that
-      // collapses to the old shape (a CLI build that ignores stream-json)
-      // still delivers its work; anything else is a failed job whose error
-      // names the exit code or the parse failure.
+      // Read the last result event's inner object; fall back to legacy single-object JSON.
+      // No usable payload fails with the exit code or parse diagnosis.
       const resultObj = state.resultEvent?.result ?? null;
       if (resultObj !== null && typeof resultObj === "object" && !Array.isArray(resultObj)) {
         parsed = resultObj;
@@ -1019,20 +783,9 @@ export async function agyDispatch(opts) {
         // The tool calls headless agy auto-denied, taken defensively (entries
         // may lack display_name; the field may be absent on older CLIs).
         const agyDeniedActions = agyDeniedActionNames(parsed);
-        // Denial diagnosis (kusabi #545): an `mcp` class names ONLY the class —
-        // which MCP tool was denied is not in the result, nor in cli.log.  The
-        // name lives as plaintext inside a protobuf BLOB in agy's conversation
-        // database, so when (and ONLY when) `mcp` is among the classes, read
-        // that database and record the tool.  The other classes (read_file,
-        // read_url, command, write_file, browser) are FULLY NAMED by
-        // `display_name`, and the last tool step of such a run belongs to a
-        // successful call — consulting the database for them would misattribute
-        // the denial.  `agyDeniedTool` is the string `<server>/<tool>` when
-        // identified, else null; it is present on every record from the initial
-        // write below, exactly like `agyHome`.  The lookup is defensive: any
-        // database failure yields null and the dispatch proceeds as today — this
-        // is diagnostic enrichment, not a gate, and never changes the terminal
-        // decision.
+        // Only mcp denials need conversation-DB lookup; other classes name the tool.
+        // Enrichment fails open and never changes the terminal decision (kusabi #545).
+        // Rationale: docs/design/backend-dispatch.md#agy-role-permissions
         let agyDeniedTool = null;
         let deniedToolUnresolved = false;
         if (agyDeniedActions.includes("mcp")) {
