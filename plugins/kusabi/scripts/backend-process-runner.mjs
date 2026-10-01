@@ -130,13 +130,15 @@ export function killProcessGroup(child) {
  *        down the kill.
  * @param {(line: string) => object|null} opts.parseLine — returns non-null
  *        for parsed events (which reset the silence clock), null for noise.
+ * @param {(ctl: {spawnedAt: number, now: () => number, kill: () => void, isKilled: () => boolean, addInterval: (fn: Function, ms: number) => NodeJS.Timeout, clearInterval: (timer: NodeJS.Timeout) => void}) => {onParsed?: (parsed: object) => void, onClose?: () => void}|void} [opts.extend]
+ *        — optional adapter extension hook called immediately after spawn.
  * @returns {Promise<{ code: number|null, stdout: string, stderr: string,
  *                     timedOut: boolean, stalled: boolean,
  *                     spawnError: Error|null }>}
  */
 export function runBackendProcess({
   bin, args, cwd, promptText, timeoutS, watchdogS,
-  env, onStart, onLine, onWatchdog, parseLine,
+  env, onStart, onLine, onWatchdog, parseLine, extend,
 }) {
   return new Promise((resolve) => {
     const hasStdin = typeof promptText === "string";
@@ -160,6 +162,7 @@ export function runBackendProcess({
     let stderr = "";
     let timedOut = false;
     let stalled = false;
+    let siblingKilled = false;
     let spawnError = null;
     let lineBuffer = "";
     // The silence clock starts at spawn, not at the first event: captured
@@ -168,13 +171,52 @@ export function runBackendProcess({
     // prints anything at all still trips the watchdog.
     let lastEventAt = spawnedAt;
 
+    const extraIntervals = new Set();
+    const ctl = {
+      spawnedAt,
+      now: () => Date.now(),
+      kill: () => {
+        siblingKilled = true;
+        killProcessGroup(child);
+      },
+      isKilled: () => timedOut || stalled || siblingKilled,
+      addInterval: (fn, ms) => {
+        const timer = setInterval(fn, ms);
+        extraIntervals.add(timer);
+        return timer;
+      },
+      clearInterval: (timer) => {
+        extraIntervals.delete(timer);
+        globalThis.clearInterval(timer);
+      },
+    };
+
+    let hooks = {};
+    if (typeof extend === "function") {
+      try {
+        hooks = extend(ctl) ?? {};
+      } catch {
+        /* best-effort */
+      }
+    }
+
     // Delivers one complete NDJSON line to the caller and resets the
     // silence clock the watchdog measures against.  Only a PARSED event
     // resets the clock: an unparseable prose line is stream noise, not
     // activity — it must not masquerade as an event and hold the watchdog
     // off.
     function deliverLine(line) {
-      if (parseLine(line) !== null) lastEventAt = Date.now();
+      const parsed = parseLine(line);
+      if (parsed !== null) {
+        lastEventAt = Date.now();
+        if (typeof hooks.onParsed === "function") {
+          try {
+            hooks.onParsed(parsed);
+          } catch {
+            /* wrapped: a throw must not break line delivery */
+          }
+        }
+      }
       if (typeof onLine === "function") {
         try { onLine(line); } catch { /* a stats-fold bug must not take down the dispatch */ }
       }
@@ -211,6 +253,10 @@ export function runBackendProcess({
     // value before passing it in; this site does not re-resolve.
     const timer = isUsableTimeoutS(timeoutS)
       ? setTimeout(() => {
+          // A run another bound already killed carries that bound's
+          // diagnosis; the timeout must not relabel it in the moment between
+          // the kill and the child's close.
+          if (stalled || siblingKilled) return;
           timedOut = true;
           killProcessGroup(child);
         }, timeoutS * 1000)
@@ -232,7 +278,13 @@ export function runBackendProcess({
     };
     const watchdogTimer = isUsableTimeoutS(watchdogS)
       ? setInterval(() => {
-          if (timedOut || stalled) return;
+          // `siblingKilled` joins the guard for one reason: once an adapter's
+          // own watchdog (via `ctl.kill`) has killed the group the stream
+          // stops, so silence would grow and this watchdog would report a
+          // stall it did not cause (and overwrite the adapter's distinct
+          // error text).  With no adapter kill, this reads exactly as it did
+          // before (kusabi #215 item 3, #234).
+          if (timedOut || stalled || siblingKilled) return;
           const silenceMs = Date.now() - lastEventAt;
           if (silenceMs > watchdogS * 1000) {
             stalled = true;
@@ -249,7 +301,16 @@ export function runBackendProcess({
     child.on("close", (code) => {
       if (timer) clearTimeout(timer);
       if (watchdogTimer) clearInterval(watchdogTimer);
+      for (const t of extraIntervals) globalThis.clearInterval(t);
+      extraIntervals.clear();
       if (lineBuffer) deliverLine(lineBuffer);
+      if (typeof hooks.onClose === "function") {
+        try {
+          hooks.onClose();
+        } catch {
+          /* best-effort */
+        }
+      }
       resolve({ code, stdout, stderr, timedOut, stalled, spawnError });
     });
   });

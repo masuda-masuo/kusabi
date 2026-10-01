@@ -366,6 +366,126 @@ describe("runBackendProcess", () => {
       result: { status: "ok" },
     });
   });
+
+  it("extension onParsed hook sees each parsed event and a throw does not stop later lines", async () => {
+    const seenEvents = [];
+    const seenLines = [];
+    const src = [
+      "console.log(JSON.stringify({ step: 1 }));",
+      "console.log(JSON.stringify({ step: 2 }));",
+      "console.log(JSON.stringify({ step: 3 }));",
+    ].join("\n");
+
+    const result = await runBackendProcess({
+      bin: process.execPath,
+      args: ["-e", src],
+      cwd: ctx.tmp,
+      parseLine: (line) => {
+        try {
+          return JSON.parse(line);
+        } catch {
+          return null;
+        }
+      },
+      onLine: (line) => seenLines.push(line),
+      extend: () => ({
+        onParsed: (parsed) => {
+          seenEvents.push(parsed);
+          if (parsed.step === 2) {
+            throw new Error("hook throw must not break line delivery");
+          }
+        },
+      }),
+    });
+
+    assert.equal(result.code, 0);
+    assert.deepEqual(seenEvents, [{ step: 1 }, { step: 2 }, { step: 3 }]);
+    assert.equal(seenLines.length, 3);
+    assert.deepEqual(
+      seenLines.map((l) => JSON.parse(l)),
+      [{ step: 1 }, { step: 2 }, { step: 3 }]
+    );
+  });
+
+  it("a sibling kill via the extension point kills the child and the silence watchdog does not then fire", async () => {
+    const watchdogEvents = [];
+    let extensionKilled = false;
+
+    const result = await runBackendProcess({
+      bin: process.execPath,
+      args: ["-e", "setTimeout(() => {}, 5000)"],
+      cwd: ctx.tmp,
+      watchdogS: 1,
+      parseLine: parseLineNothing,
+      onWatchdog: (e) => watchdogEvents.push(e),
+      extend: (ctl) => {
+        ctl.addInterval(() => {
+          extensionKilled = true;
+          ctl.kill();
+        }, 80);
+      },
+    });
+
+    assert.equal(extensionKilled, true);
+    assert.equal(result.stalled, false, "silence watchdog must not report stall when sibling killed child");
+    assert.deepEqual(watchdogEvents, [], "watchdog must not fire after sibling kill");
+  });
+
+  it("close hook runs after the last unterminated line is delivered", async () => {
+    const sequence = [];
+    const src = "process.stdout.write(JSON.stringify({ last: true }));";
+
+    const result = await runBackendProcess({
+      bin: process.execPath,
+      args: ["-e", src],
+      cwd: ctx.tmp,
+      parseLine: (line) => {
+        try {
+          return JSON.parse(line);
+        } catch {
+          return null;
+        }
+      },
+      onLine: (line) => {
+        sequence.push({ kind: "line", line });
+      },
+      extend: () => ({
+        onParsed: (parsed) => {
+          sequence.push({ kind: "parsed", parsed });
+        },
+        onClose: () => {
+          sequence.push({ kind: "close" });
+        },
+      }),
+    });
+
+    assert.equal(result.code, 0);
+    assert.deepEqual(sequence, [
+      { kind: "parsed", parsed: { last: true } },
+      { kind: "line", line: '{"last":true}' },
+      { kind: "close" },
+    ]);
+  });
+
+  it("extension intervals are automatically cleared on process close", async () => {
+    let tickCount = 0;
+    const result = await runBackendProcess({
+      bin: process.execPath,
+      args: ["-e", "setTimeout(() => {}, 120)"],
+      cwd: ctx.tmp,
+      parseLine: parseLineNothing,
+      extend: (ctl) => {
+        ctl.addInterval(() => {
+          tickCount++;
+        }, 20);
+      },
+    });
+
+    assert.equal(result.code, 0);
+    const countAtClose = tickCount;
+    await new Promise((resolve) => setTimeout(resolve, 60));
+    assert.equal(tickCount, countAtClose, "interval must not fire after child closes");
+  });
 });
 
 // =========================================================================
