@@ -35,70 +35,19 @@ import { describe, it, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
-import os from "node:os";
 import { stateDirFor, readJson, writeJson } from "./state-paths.mjs";
 import { stubInvestigationSeams } from "./fixtures.mjs";
-
-let driverModule = null;
-async function lunaDriver() {
-  if (driverModule === null) {
-    driverModule = await import("./luna-driver.mjs");
-  }
-  return driverModule;
-}
-
-function makeTemp(prefix) {
-  return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
-}
-
-const j = (obj) => JSON.stringify(obj);
-const line = (action, hash, body = {}) => j({ action, envelope_sha256: hash, ...body });
-const stream = (...lines) => lines.join("\n");
-
-/** A stateful fake coordinator: each dispatch pops the next canned stream. */
-function makeCoordinator(streams) {
-  const calls = [];
-  return {
-    calls,
-    dispatch: async (input) => {
-      const idx = calls.length;
-      calls.push(input);
-      const entry = streams[Math.min(idx, streams.length - 1)];
-      return typeof entry === "function" ? entry(input) : entry;
-    },
-  };
-}
-
-const runChainStream = (brief) => (input) =>
-  stream(line("run_chain", input.envelope.envelope_sha256, { brief }));
-
-const reworkChainStream = (brief) => (input) =>
-  stream(line("rework_chain", input.envelope.envelope_sha256, { brief }));
-
-const finishStream = (recommendation) => (input) =>
-  stream(line("finish", input.envelope.envelope_sha256, { recommendation }));
-
-/** Fake runChainLifecycle: records every invocation. */
-function makeChainFake() {
-  const calls = [];
-  return {
-    calls,
-    run: async (cwd, input, opts) => {
-      calls.push({ cwd, input, opts });
-      const id = input?.flags?.["chain-id"];
-      return id ? `Chain ${id} completed` : `chain-fake${calls.length}`;
-    },
-  };
-}
-
-function toolResponse(name) {
-  if (name === "sandbox_exec") return { status: "ok", output: "deadbeef1234\n" };
-  if (name === "verify_in_container") {
-    return { status: "ok", gate_passed: true, lint: [], types: [], tests: { full: { passed: 1, failed: 0, skipped: 0 } } };
-  }
-  if (name === "diff_in_container") return { status: "ok", output: "diff --git a/x b/x\n" };
-  return { status: "ok", output: "canned\n" };
-}
+import {
+  makeCoordinator,
+  runChainStream,
+  finishStream,
+  makeChainFake,
+  makeSolFake,
+  makeTemp,
+  toolResponse,
+  lunaDriver,
+  reworkChainStream,
+} from "./luna-test-fixtures.mjs";
 
 function makeToolFake() {
   const calls = [];
@@ -107,25 +56,6 @@ function makeToolFake() {
     callTool: async (name, args) => {
       calls.push({ name, args });
       return toolResponse(name);
-    },
-  };
-}
-
-/** Fake Sol seat: schema-valid `clear` verdict bound to the current gate envelope. */
-function makeSolFake() {
-  const calls = [];
-  return {
-    calls,
-    dispatch: async (input) => {
-      calls.push(input);
-      return JSON.stringify({
-        type: "verdict",
-        schema_version: 2, invariants: [{ id: "INV1", held: true }, { id: "INV2", held: true }, { id: "INV3", held: true }, { id: "INV4", held: true }, { id: "INV5", held: true }], criteria: [],
-        gate_id: input.envelope.gate_id,
-        envelope_sha256: input.envelope.envelope_sha256,
-        verdict: "clear",
-        summary: "sol:clear",
-      });
     },
   };
 }

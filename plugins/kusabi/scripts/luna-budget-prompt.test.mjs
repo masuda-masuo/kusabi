@@ -36,6 +36,7 @@ import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import { stateDirFor, readJson, writeJson } from "./state-paths.mjs";
+import { makeChainFake, makeSolFake, makeToolFake } from "./luna-test-fixtures.mjs";
 
 // ---------------------------------------------------------------------------
 // briefs
@@ -143,47 +144,6 @@ function fakeCodexContext(mode) {
 // ---------------------------------------------------------------------------
 // fakes for the non-coordinator seams
 // ---------------------------------------------------------------------------
-
-function makeChainFake() {
-  const calls = [];
-  return {
-    calls,
-    run: async (cwd, input, opts) => {
-      calls.push({ cwd, input, opts });
-      const id = input?.flags?.["chain-id"];
-      return id ? `Chain ${id} completed` : `chain-fake${calls.length}`;
-    },
-  };
-}
-
-function makeToolFake() {
-  const calls = [];
-  return {
-    calls,
-    callTool: async (name, args) => {
-      calls.push({ name, args });
-      return { status: "ok", output: "canned\n" };
-    },
-  };
-}
-
-function makeSolFake() {
-  const calls = [];
-  return {
-    calls,
-    dispatch: async (input) => {
-      calls.push(input);
-      return JSON.stringify({
-        type: "verdict",
-        schema_version: 2, invariants: [{ id: "INV1", held: true }, { id: "INV2", held: true }, { id: "INV3", held: true }, { id: "INV4", held: true }, { id: "INV5", held: true }], criteria: [],
-        gate_id: input.envelope.gate_id,
-        envelope_sha256: input.envelope.envelope_sha256,
-        verdict: "clear",
-        summary: "sol:clear",
-      });
-    },
-  };
-}
 
 // ---------------------------------------------------------------------------
 // harness

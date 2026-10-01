@@ -15,32 +15,7 @@ import { stubInvestigationSeams } from "./fixtures.mjs";
 import { notifyMissionTerminal, formatNotificationReason } from "./chain-notify.mjs";
 import { renderGateOrigins } from "./render-mission.mjs";
 import { TERMINAL_MISSION_DISPOSITIONS } from "./mission-store.mjs";
-
-const j = (obj) => JSON.stringify(obj);
-const line = (action, hash, body = {}) => j({ action, envelope_sha256: hash, ...body });
-const stream = (...lines) => lines.join("\n");
-
-function makeCoordinator(streams) {
-  const calls = [];
-  return {
-    calls,
-    dispatch: async (input) => {
-      const idx = calls.length;
-      calls.push(input);
-      const entry = streams[Math.min(idx, streams.length - 1)];
-      return typeof entry === "function" ? entry(input) : entry;
-    },
-  };
-}
-
-const runChainStream = (brief) => (input) =>
-  stream(line("run_chain", input.envelope.envelope_sha256, { brief }));
-
-const consultStream = (reason) => (input) =>
-  stream(line("consult_sol", input.envelope.envelope_sha256, { reason }));
-
-const finishStream = (recommendation) => (input) =>
-  stream(line("finish", input.envelope.envelope_sha256, { recommendation }));
+import { makeCoordinator, runChainStream, finishStream, consultStream } from "./luna-test-fixtures.mjs";
 
 const MISSING_DELIVERABLES_BRIEF = [
   "Orchestrator: gpt-5.6-sol | session luna-inner | 2026-09-23",

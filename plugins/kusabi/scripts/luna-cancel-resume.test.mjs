@@ -52,12 +52,21 @@ import { describe, it, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
-import os from "node:os";
 import { DatabaseSync } from "node:sqlite";
 import { stateDirFor, readJson, writeJson } from "./state-paths.mjs";
 import { stubInvestigationSeams } from "./fixtures.mjs";
 import { TERMINAL_MISSION_DISPOSITIONS } from "./mission-store.mjs";
 import { readMissionSnapshot } from "./luna-wait.mjs";
+import {
+  j,
+  line,
+  stream,
+  makeCoordinator,
+  finishStream,
+  makeTemp,
+  makeToolFake,
+  makeNotify,
+} from "./luna-test-fixtures.mjs";
 
 let cmdModule = null;
 async function lunaCancelResume() {
@@ -77,35 +86,11 @@ async function lunaCancelResume() {
   return cmdModule;
 }
 
-function makeTemp(prefix) {
-  return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
-}
-
 const DEAD_PID = 99999999; // a pid that cannot exist on this host (see chain-control.test.mjs)
 
 // ---------------------------------------------------------------------------
 // fakes
 // ---------------------------------------------------------------------------
-
-const j = (obj) => JSON.stringify(obj);
-const line = (action, hash, body = {}) => j({ action, envelope_sha256: hash, ...body });
-const stream = (...lines) => lines.join("\n");
-
-function makeCoordinator(streams) {
-  const calls = [];
-  return {
-    calls,
-    dispatch: async (input) => {
-      const idx = calls.length;
-      calls.push(input);
-      const entry = streams[Math.min(idx, streams.length - 1)];
-      return typeof entry === "function" ? entry(input) : entry;
-    },
-  };
-}
-
-const finishStream = (recommendation) => (input) =>
-  stream(line("finish", input.envelope.envelope_sha256, { recommendation }));
 
 function makeChainFake(run = null) {
   const calls = [];
@@ -116,17 +101,6 @@ function makeChainFake(run = null) {
       if (run) return run(cwd, input, opts);
       const id = input?.flags?.["chain-id"];
       return id ? `Chain ${id} completed` : "chain-fake";
-    },
-  };
-}
-
-function makeToolFake() {
-  const calls = [];
-  return {
-    calls,
-    callTool: async (name, args) => {
-      calls.push({ name, args });
-      return { status: "ok", output: "canned\n" };
     },
   };
 }
@@ -152,14 +126,6 @@ function makeSol() {
       calls.push(input);
       return verdictLine(input, "clear");
     },
-  };
-}
-
-function makeNotify() {
-  const calls = [];
-  return {
-    calls,
-    dispatch: async (info) => { calls.push(info); },
   };
 }
 

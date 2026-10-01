@@ -18,17 +18,13 @@ import { describe, it, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
-import os from "node:os";
 
 import {
   collectPostChainEvidence,
   formatUntrackedFileDiff,
 } from "./luna-driver.mjs";
 import { stateDirFor, writeJson } from "./state-paths.mjs";
-
-function makeTemp(prefix) {
-  return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
-}
+import { makeTemp } from "./luna-test-fixtures.mjs";
 
 describe("luna untracked post-chain evidence (kusabi #572)", () => {
   let root;

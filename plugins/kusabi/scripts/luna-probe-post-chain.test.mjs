@@ -10,6 +10,7 @@ import { runLunaMission, preflightBatchBudget } from "./luna-driver.mjs";
 import { loadCoordinatorSchema, renderCoordinatorContract } from "./luna-prompt.mjs";
 import { stubInvestigationSeams } from "./fixtures.mjs";
 import { stateDirFor, readJson } from "./state-paths.mjs";
+import { makeCoordinator, makeCompletedChainFake as makeChainFake } from "./luna-test-fixtures.mjs";
 
 const stream = (...lines) => lines.join("\n") + "\n";
 const line = (action, envelope_sha256, extra = {}) =>
@@ -47,30 +48,6 @@ const DEFAULT_BUDGET = {
   maxConsults: 3,
   maxRework: 1,
 };
-
-function makeCoordinator(streams) {
-  const calls = [];
-  return {
-    calls,
-    dispatch: async (input) => {
-      const idx = calls.length;
-      calls.push(input);
-      const entry = streams[Math.min(idx, streams.length - 1)];
-      return typeof entry === "function" ? entry(input) : entry;
-    },
-  };
-}
-
-function makeChainFake() {
-  const calls = [];
-  return {
-    calls,
-    run: async (cwd, input, opts) => {
-      calls.push({ cwd, input, opts });
-      return `Chain ${input?.flags?.["chain-id"] ?? calls.length} completed`;
-    },
-  };
-}
 
 function makeToolFake() {
   const calls = [];

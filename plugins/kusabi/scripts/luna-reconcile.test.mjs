@@ -37,9 +37,9 @@ import { describe, it, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
-import os from "node:os";
 import { DatabaseSync } from "node:sqlite";
 import { stateDirFor, readJson, writeJson } from "./state-paths.mjs";
+import { makeTemp } from "./luna-test-fixtures.mjs";
 
 let cmdModule = null;
 async function lunaResumeHandler() {
@@ -55,10 +55,6 @@ async function lunaResumeHandler() {
     cmdModule = mod;
   }
   return cmdModule;
-}
-
-function makeTemp(prefix) {
-  return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
 }
 
 const DEAD_PID = 99999999;

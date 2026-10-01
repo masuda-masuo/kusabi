@@ -26,9 +26,9 @@ import { describe, it, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
-import os from "node:os";
 import crypto from "node:crypto";
 import { stateDirFor, readJson } from "./state-paths.mjs";
+import { makeTemp } from "./luna-test-fixtures.mjs";
 
 let storeModule = null;
 async function missionStore() {
@@ -46,10 +46,6 @@ async function missionStore() {
     }
   }
   return storeModule;
-}
-
-function makeTemp(prefix) {
-  return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
 }
 
 describe("mission store (kusabi #530 criterion 3)", () => {

@@ -23,7 +23,6 @@ import { describe, it, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
-import os from "node:os";
 
 import {
   runLunaMission,
@@ -34,6 +33,13 @@ import { stateDirFor, readJson } from "./state-paths.mjs";
 import { renderMissionDigest } from "./render-mission.mjs";
 import { renderRemainingBudget } from "./luna-prompt.mjs";
 import { missionEvidenceItems } from "./luna-sol-gate.mjs";
+import {
+  j,
+  line,
+  stream,
+  makeCoordinator,
+  makeTemp,
+} from "./luna-test-fixtures.mjs";
 
 const MISSION_BRIEF = [
   "Orchestrator: gpt-5.6-sol | session luna-investigation-test | 2026-09-27",
@@ -51,27 +57,6 @@ const DEFAULT_SEATS = {
   coordinator: { provider: "codex", model: "gpt-6-luna" },
   auditor: { provider: "codex", model: "gpt-6.1-sol" },
 };
-
-function makeTemp(prefix) {
-  return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
-}
-
-const j = (obj) => JSON.stringify(obj);
-const line = (action, hash, body = {}) => j({ action, envelope_sha256: hash, ...body });
-const stream = (...lines) => lines.join("\n");
-
-function makeCoordinator(streams) {
-  const calls = [];
-  return {
-    calls,
-    dispatch: async (input) => {
-      const idx = calls.length;
-      calls.push(input);
-      const entry = streams[Math.min(idx, streams.length - 1)];
-      return typeof entry === "function" ? entry(input) : entry;
-    },
-  };
-}
 
 describe("luna investigation (kusabi #591)", () => {
   let root;
