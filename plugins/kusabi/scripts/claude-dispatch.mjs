@@ -125,7 +125,7 @@ import { assertSessionResumable } from "./backend-session-guard.mjs";
 import { firstRoute } from "./cli.mjs";
 import { newJobId, saveJob, jobDir, appendEvent } from "./job-store.mjs";
 import { stateDirFor } from "./state-paths.mjs";
-import { killProcessGroup } from "./backend-process-runner.mjs";
+import { isUsableTimeoutS, killProcessGroup, resolveBoundS } from "./backend-process-runner.mjs";
 import { runBackendDispatch } from "./backend-dispatch-core.mjs";
 import {
   claudeMcpSourcePath,
@@ -634,8 +634,10 @@ export function renderClaudeQuotaError(failure, detail, { resetFromRateFeed = fa
  * @param {string} opts.bin
  * @param {string[]} opts.args
  * @param {string} [opts.cwd]
- * @param {number} [opts.timeoutS]
- * @param {number} [opts.watchdogS] — silence bound in seconds; <= 0 disables it.
+ * @param {number|null} [opts.timeoutS] — absolute wall-clock bound in seconds;
+ *        arms only when isUsableTimeoutS holds (positive finite number).
+ * @param {number|null} [opts.watchdogS] — silence bound in seconds; arms
+ *        only when isUsableTimeoutS holds (positive finite number).
  * @param {string} [opts.promptText] — written to child stdin, then closed.
  * @param {(proc: {pid: number, startTime: string|null}) => void} [opts.onStart]
  *        — called once, synchronously, as soon as the child exists, with the
@@ -805,7 +807,7 @@ export function runClaudeProcess({ bin, args, cwd, timeoutS, watchdogS, promptTe
     child.stderr.on("data", (d) => { stderr += d; });
     child.on("error", (err) => { spawnError = err; });
 
-    const timer = timeoutS && timeoutS > 0
+    const timer = isUsableTimeoutS(timeoutS)
       ? setTimeout(() => {
           timedOut = true;
           killProcessGroup(child);
@@ -824,7 +826,7 @@ export function runClaudeProcess({ bin, args, cwd, timeoutS, watchdogS, promptTe
       if (typeof onWatchdog !== "function") return;
       try { onWatchdog(event); } catch { /* best-effort audit trail */ }
     };
-    const watchdogTimer = watchdogS && watchdogS > 0
+    const watchdogTimer = isUsableTimeoutS(watchdogS)
       ? setInterval(() => {
           // `writeStalled` and `repeatStalled` join the existing guards for
           // one reason: once a SIBLING watchdog has killed the group the
@@ -1058,6 +1060,8 @@ export async function claudeDispatch(opts) {
   const unenforcedDenies = [];
   const enforcedDenies = toolDeniesEnforced(opts.tools, unenforcedDenies);
   const bin = claudeBin();
+  const timeoutS = resolveBoundS(opts.timeoutS);
+  const watchdogS = resolveBoundS(opts.watchdogS);
   // The job id is minted here, in pre-flight, so the generated MCP config
   // can be named after its job (kusabi #276) and stamp KAIBA_JOB on the
   // kaiba entry (kusabi #391): the file lives in the job's OWN directory,
@@ -1196,7 +1200,7 @@ export async function claudeDispatch(opts) {
     bin,
     labels: { spawnErrorPrefix: `${CLAUDE_BACKEND} dispatch failed` },
     // Same failure status/text the opencode path uses for timeouts.
-    timeoutS: opts.timeoutS,
+    timeoutS,
     // The SAME event types the opencode watchdog writes
     // (prompt-execution.mjs), so stall auditing over events.ndjson is
     // backend-agnostic and finally counts claude stalls too — until now the
@@ -1212,7 +1216,7 @@ export async function claudeDispatch(opts) {
     // `stalled` after killProcessGroup), so the wording always names it —
     // there is no "declined kill" case here, unlike the opencode serve
     // watchdog: this process is ours alone, nothing to verify ownership of.
-    watchdogS: opts.watchdogS,
+    watchdogS,
     stream,
     resultBackend: CLAUDE_BACKEND,
     beforeSpawn: async ({ job: j, stateDir: sd }) => {
@@ -1334,8 +1338,8 @@ export async function claudeDispatch(opts) {
         bin,
         args,
         cwd: opts.cwd,
-        timeoutS: opts.timeoutS,
-        watchdogS: opts.watchdogS,
+        timeoutS,
+        watchdogS,
         promptText: opts.promptText || "",
         ...hooks,
         // Null unless the config armed it AND the phase is one that must edit.

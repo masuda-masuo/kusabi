@@ -30,6 +30,34 @@ export function isUsableTimeoutS(value) {
   return typeof value === "number" && Number.isFinite(value) && value > 0;
 }
 
+/**
+ * Resolve a timeout or watchdog bound for a CLI backend: the one place that
+ * decides whether a usable bound was supplied and what number it is.
+ *
+ * REFUSES rather than coerces.  A string (`"3600"`), `NaN`, zero, a
+ * negative number, `Infinity`, `-Infinity`, `null`, or an absent value is
+ * not a usable positive number of seconds, and none of them arms either bound.
+ * kusabi's own callers pass positive whole numbers (the CLI seam converts with
+ * `Number(...)`, the defaults are literals); any other shape is a caller
+ * bug, and the honest handling of a bug is to leave the bound unset —
+ * not to guess at a number the caller never explicitly resolved.  In
+ * particular, coercing `"3600"` would arm the outer timer while an inner
+ * or sibling bound stayed off wherever the coercion did not propagate — the
+ * half-armed state this resolver exists to remove across every CLI backend.
+ *
+ * Backends call this ONCE and hand the SAME value to all consumers, so every
+ * site consumes one decision instead of re-deciding.  Each site re-checks
+ * with the same predicate on that value, so even a direct call to one site
+ * cannot reach a different conclusion from the other.
+ *
+ * @param {unknown} value — the raw bound from the dispatch options.
+ * @returns {number|null} the resolved bound in seconds, or null when no
+ *          usable bound was supplied.
+ */
+export function resolveBoundS(value) {
+  return isUsableTimeoutS(value) ? value : null;
+}
+
 // =========================================================================
 // process-group kill
 // =========================================================================
