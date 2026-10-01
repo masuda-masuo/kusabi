@@ -2181,6 +2181,31 @@ describe("claudeDispatch (fake claude binary)", () => {
     }
   });
 
+  it("dispatch with timeoutS: Infinity does not arm a timer and completes normally", async () => {
+    ctx.restore();
+    ctx = fakeClaudeContext("ok");
+    const { job, resultText } = await claudeDispatch(ctx.dispatchOptions({ timeoutS: Infinity }));
+
+    assert.equal(job.status, "completed");
+    assert.equal(resultText, "implemented the thing per the brief");
+  });
+
+  it("dispatch with timeoutS: \"1\" (string) against a fake that stays alive longer than 1s is not killed as timed out", async () => {
+    ctx.restore();
+    const savedTicks = process.env.FAKE_CLAUDE_TICKS;
+    process.env.FAKE_CLAUDE_TICKS = "7"; // 7 * 200ms = 1.4s (> 1s)
+    try {
+      ctx = fakeClaudeContext("writes");
+      const { job } = await claudeDispatch(ctx.dispatchOptions({ timeoutS: "1" }));
+
+      assert.equal(job.status, "completed");
+      assert.equal(job.error, null);
+    } finally {
+      if (savedTicks === undefined) delete process.env.FAKE_CLAUDE_TICKS;
+      else process.env.FAKE_CLAUDE_TICKS = savedTicks;
+    }
+  });
+
   it("stream-json: the full realistic sequence yields real measured stats (kusabi #215 Job B, acceptance criteria 2 and 3)", async () => {
     ctx.restore();
     ctx = fakeClaudeContext("stream-full");
@@ -2280,6 +2305,25 @@ describe("claudeDispatch (fake claude binary)", () => {
     for (const pid of pids) {
       assert.equal(isAlive(pid), false, `pid ${pid} must be dead after the watchdog group kill`);
     }
+  });
+
+  it("runClaudeProcess called directly with watchdogS: \"1\" against a silent fake is not killed by watchdog", async () => {
+    ctx.restore();
+    ctx = fakeClaudeContext("slow");
+    const seen = [];
+    const result = await runClaudeProcess({
+      bin: claudeBin(),
+      args: ["-p"],
+      cwd: ctx.cwd,
+      watchdogS: "1",
+      timeoutS: 1.6,
+      promptText: "",
+      onWatchdog: (e) => seen.push(e),
+    });
+
+    assert.equal(result.stalled, false, "string watchdogS must not arm the silence watchdog");
+    assert.equal(result.timedOut, true, "outer timeout kills the silent child when watchdog is not armed");
+    assert.deepEqual(seen, [], "watchdog callbacks must not have been invoked");
   });
 
   // -----------------------------------------------------------------------

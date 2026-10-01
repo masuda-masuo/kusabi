@@ -32,13 +32,13 @@ import {
   buildAgyArgs,
   AGY_PRINT_TIMEOUT_MARGIN_S,
   formatGoDuration,
-  resolveAgyTimeoutS,
   runAgyProcess,
   AGY_MAX_ARG_STRLEN,
   AGY_MAX_ARG_BYTES,
   checkAgyArgvSize,
   agyDispatch,
 } from "./agy-dispatch.mjs";
+import { resolveBoundS } from "./backend-process-runner.mjs";
 import { assertSessionResumable } from "./backend-session-guard.mjs";
 import {
   parseAgyResult,
@@ -213,7 +213,7 @@ function secondsOfGoDuration(text) {
   return (Number(m[1] ?? 0) * 3600) + (Number(m[2] ?? 0) * 60) + Number(m[3]);
 }
 
-describe("resolveAgyTimeoutS \u2014 the ONE timeout decision (kusabi #328)", () => {
+describe("resolveBoundS \u2014 the ONE timeout decision (kusabi #328)", () => {
   it("refuses every shape that is not a usable positive number of seconds", () => {
     // The #328 case first: "3600" passed runAgyProcess's truthy guard and
     // failed buildAgyArgs's type guard \u2014 outer timer armed, inner bound
@@ -224,7 +224,7 @@ describe("resolveAgyTimeoutS \u2014 the ONE timeout decision (kusabi #328)", () 
       undefined, null, "", "3600", "1", NaN, 0, -5, -1.5,
       Infinity, -Infinity, true, false, {}, [], () => {},
     ]) {
-      assert.equal(resolveAgyTimeoutS(value), null, `value=${String(value)} must resolve to null`);
+      assert.equal(resolveBoundS(value), null, `value=${String(value)} must resolve to null`);
     }
   });
 
@@ -233,7 +233,7 @@ describe("resolveAgyTimeoutS \u2014 the ONE timeout decision (kusabi #328)", () 
     // default), 600 (salvage), operator overrides, and fractional positives
     // all arrive unchanged: nothing is coerced or rounded at the door.
     for (const value of [1, 20, 600, 1800, 3600, 9000, 12345, 0.5]) {
-      assert.equal(resolveAgyTimeoutS(value), value, `value=${value} must pass through`);
+      assert.equal(resolveBoundS(value), value, `value=${value} must pass through`);
     }
   });
 });
@@ -340,7 +340,7 @@ describe("buildAgyArgs", () => {
 // the two bound sites agree (kusabi #328)
 // =========================================================================
 //
-// resolveAgyTimeoutS, buildAgyArgs (`--print-timeout`, the INNER bound) and
+// resolveBoundS, buildAgyArgs (`--print-timeout`, the INNER bound) and
 // runAgyProcess (the OUTER timer) all decide with the SAME predicate
 // (isUsableTimeoutS).  The per-function tests above pin each one alone;
 // THIS test drives both sites from the SAME input and asserts the pair
@@ -404,7 +404,7 @@ describe("the two timeout bound sites agree — armed together or not at all", (
 // =========================================================================
 //
 // The pair test above drives both sites from the same input and asserts
-// they agree WITH EACH OTHER.  Nothing there pins resolveAgyTimeoutS: if
+// they agree WITH EACH OTHER.  Nothing there pins resolveBoundS: if
 // both sites drifted identically away from it — the #328 first round,
 // where both sites carried the same hand-copied `typeof === "number" &&
 // > 0` that accepted Infinity while the resolver's Number.isFinite refused
@@ -421,7 +421,7 @@ describe("each bound site agrees with the resolver, on the raw input (kusabi #33
   beforeEach(() => { ctx = fakeAgyContext(); });
   afterEach(() => { ctx.restore(); });
 
-  it("for every shape, resolveAgyTimeoutS resolves exactly when a direct site call arms its bound", async (t) => {
+  it("for every shape, resolveBoundS resolves exactly when a direct site call arms its bound", async (t) => {
     // [raw input, resolver output] — the resolver column is pinned to the
     // decisions measured on the #329 tree, so a resolver drift fails at
     // the first assert and a sites' drift fails at the site asserts, even
@@ -440,11 +440,11 @@ describe("each bound site agrees with the resolver, on the raw input (kusabi #33
       [1.5, 1.5],
     ];
     for (const [timeoutS, expected] of cases) {
-      const resolved = resolveAgyTimeoutS(timeoutS);
+      const resolved = resolveBoundS(timeoutS);
       // Object.is, so the NaN input's null outcome compares correctly.
       assert.ok(
         Object.is(resolved, expected),
-        `timeoutS=${String(timeoutS)}: resolveAgyTimeoutS returned ${String(resolved)} but the ` +
+        `timeoutS=${String(timeoutS)}: resolveBoundS returned ${String(resolved)} but the ` +
         `pinned decision is ${String(expected)} — the resolver drifted`,
       );
       const shouldArm = expected !== null;
@@ -722,7 +722,7 @@ describe("agyWatchdogSeconds — the floor", () => {
   });
 
   it("refuses every shape that is not a positive finite number — nothing armed from it", () => {
-    // Same discipline as resolveAgyTimeoutS (kusabi #328/#330): a string,
+    // Same discipline as resolveBoundS (kusabi #328/#330): a string,
     // NaN, zero, a negative, Infinity, absent — none of them arms a
     // watchdog at any interval.
     for (const value of [undefined, null, 0, -5, -120, NaN, "3600", "30", Infinity, -Infinity, true, false, {}, []]) {

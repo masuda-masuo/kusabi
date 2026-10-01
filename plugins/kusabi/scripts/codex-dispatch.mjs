@@ -98,7 +98,7 @@ import { readAgentSystemPrompt } from "./agent-system-prompt.mjs";
 import { toolDeniesEnforced, translateDenyTools } from "./tool-permissions.mjs";
 import { newJobId, jobDir } from "./job-store.mjs";
 import { stateDirFor } from "./state-paths.mjs";
-import { isUsableTimeoutS, runBackendProcess } from "./backend-process-runner.mjs";
+import { resolveBoundS, runBackendProcess } from "./backend-process-runner.mjs";
 import { runBackendDispatch } from "./backend-dispatch-core.mjs";
 import {
   codexMcpArgv,
@@ -572,8 +572,8 @@ export async function codexDispatch(opts) {
   const systemPrompt = readAgentSystemPrompt(opts.agent);
   const promptText = buildCodexPrompt({ systemPrompt, promptText: opts.promptText });
   const bin = codexBin();
-  const timeoutS = isUsableTimeoutS(opts.timeoutS) ? opts.timeoutS : null;
-  const watchdogS = isUsableTimeoutS(opts.watchdogS) ? opts.watchdogS : null;
+  const timeoutS = resolveBoundS(opts.timeoutS);
+  const watchdogS = resolveBoundS(opts.watchdogS);
   const jsonSchema = codexJsonSchemaFor(opts.agent);
   const codexMcpTools = codexMcpToolsForAgent(opts.agent, opts.tools);
   const codexMcpDefinitions = codexMcpTools === null

@@ -16,6 +16,7 @@ import { patchEnv } from "./fixtures.mjs";
 import {
   isUsableTimeoutS,
   killProcessGroup,
+  resolveBoundS,
   runBackendProcess,
 } from "./backend-process-runner.mjs";
 
@@ -36,6 +37,24 @@ describe("isUsableTimeoutS", () => {
       Infinity, -Infinity, true, false, {}, [], () => {},
     ]) {
       assert.equal(isUsableTimeoutS(value), false, `value=${String(value)} must not be usable`);
+    }
+  });
+});
+
+// =========================================================================
+// resolveBoundS — shared resolver
+// =========================================================================
+
+describe("resolveBoundS", () => {
+  it("returns null for non-positive-finite shapes", () => {
+    for (const value of ["3600", NaN, 0, -1, Infinity, -Infinity, null, undefined]) {
+      assert.equal(resolveBoundS(value), null, `value=${String(value)} must resolve to null`);
+    }
+  });
+
+  it("passes positive finite numbers through", () => {
+    for (const value of [1, 0.5, 3600]) {
+      assert.equal(resolveBoundS(value), value, `value=${value} must pass through`);
     }
   });
 });

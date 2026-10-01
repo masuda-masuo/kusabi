@@ -172,7 +172,7 @@ import { newJobId } from "./job-store.mjs";
 import { stateDirFor } from "./state-paths.mjs";
 import { runBackendDispatch } from "./backend-dispatch-core.mjs";
 import { toolDeniesEnforced } from "./tool-permissions.mjs";
-import { isUsableTimeoutS, runBackendProcess } from "./backend-process-runner.mjs";
+import { isUsableTimeoutS, resolveBoundS, runBackendProcess } from "./backend-process-runner.mjs";
 import {
   parseAgyResult,
   parseAgyStreamLine,
@@ -417,40 +417,6 @@ export function formatGoDuration(totalSeconds) {
   return `${out}${s % 60}s`;
 }
 
-// =========================================================================
-// timeoutS resolution — the ONE decision (kusabi #328)
-// =========================================================================
-
-/**
- * Resolve the OUTER timeout bound for an agy dispatch: the one place that
- * decides whether a usable timeout was supplied and what number it is.
- *
- * REFUSES rather than coerces.  A string (`"3600"`), `NaN`, zero, a
- * negative number, `Infinity`, `null`, or an absent value is not a usable
- * positive number of seconds, and none of them arms either bound.  kusabi's
- * own callers pass positive whole numbers (the CLI seam converts with
- * `Number(...)`, the defaults are literals); any other shape is a caller
- * bug, and the honest handling of a bug is to leave the timeout unset —
- * not to guess at a number the caller never explicitly resolved.  In
- * particular, coercing `"3600"` would arm the OUTER timer while the inner
- * bound stayed off wherever the coercion did not propagate — the
- * half-armed state this issue exists to remove, in a new suit.
- *
- * `agyDispatch` calls this ONCE and hands the SAME value to both consumers
- * (buildAgyArgs, runAgyProcess), so the two sites consume one decision
- * instead of re-deciding.  Each site re-checks with the same predicate on
- * that value, so even a direct call to one site cannot reach a different
- * conclusion from the other.
- *
- * @param {unknown} value — the raw `opts.timeoutS` from the dispatch options.
- * @returns {number|null} the resolved timeout in seconds, or null when no
- *          usable timeout was supplied.
- */
-export function resolveAgyTimeoutS(value) {
-  if (!isUsableTimeoutS(value)) return null;
-  return value;
-}
-
 /**
  * Build the argv for an `agy -p` dispatch.
  *
@@ -488,7 +454,7 @@ export function resolveAgyTimeoutS(value) {
  *        has proven to be an agy conversation (assertSessionResumable's
  *        provenance gate has already run); appends `--conversation <id>`.
  * @param {number|null} [opts.timeoutS] — the value agyDispatch already
- *        resolved (resolveAgyTimeoutS): a positive finite number, or null
+ *        resolved (resolveBoundS): a positive finite number, or null
  *        when none was supplied.  The guard below is the SAME predicate
  *        runAgyProcess arms its outer timer with, on the SAME value, so
  *        the two bound sites cannot reach different conclusions (kusabi
@@ -503,7 +469,7 @@ export function buildAgyArgs({ model, promptText, jsonSchema, conversationId, ti
     "--model", model,
   ];
   // The SAME predicate runAgyProcess arms its outer timer with and
-  // resolveAgyTimeoutS decides with — isUsableTimeoutS, the one rule in one
+  // resolveBoundS decides with — isUsableTimeoutS, the one rule in one
   // place (kusabi #328).  A truthy-only check would accept "3600" and render
   // `"3600" + 300` as "3600300" — the string half-arm, banned at the door;
   // a hand-copied `typeof === "number" && > 0` would accept Infinity, which
@@ -701,7 +667,7 @@ export function runAgyProcess({ bin, args, cwd, env, timeoutS, watchdogS, onStar
  *        permission flags, so it is RECORDED as unenforced rather than
  *        applied (see the module header).
  * @param {unknown} [opts.timeoutS] — the raw timeout; resolved ONCE here
- *        (resolveAgyTimeoutS).  A positive finite number arms both bounds
+ *        (resolveBoundS).  A positive finite number arms both bounds
  *        (the outer timer and `--print-timeout`); any other shape — a
  *        string, NaN, zero, negative, Infinity, null, absent — arms
  *        neither (kusabi #328).
@@ -777,12 +743,12 @@ export async function agyDispatch(opts) {
   // `timeoutS` is resolved and validated ONCE here, and the SAME value
   // feeds both consumers below: buildAgyArgs (the INNER bound,
   // `--print-timeout`) and runAgyProcess (the OUTER timer).
-  // resolveAgyTimeoutS REFUSES every shape that is not a positive finite
+  // resolveBoundS REFUSES every shape that is not a positive finite
   // number (strings, NaN, zero, negatives, Infinity, null, absent) and
   // returns null for them; null arms NEITHER bound.  Half-armed — an outer
   // timer without `--print-timeout`, or the reverse — is impossible,
   // because there is only one resolution and both sites consume it.
-  const timeoutS = resolveAgyTimeoutS(opts.timeoutS);
+  const timeoutS = resolveBoundS(opts.timeoutS);
   // ---- the ONE watchdog decision (kusabi #332) ----
   // `watchdogS` is resolved and floored ONCE here, and the SAME value feeds
   // runAgyProcess (the armed interval) and the stall error text, so the two

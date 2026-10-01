@@ -4,7 +4,7 @@
 // agy's output / NDJSON event stream, accumulator state, watchdog calculations,
 // usage mapping, and payload extraction.
 
-import { isUsableTimeoutS } from "./backend-process-runner.mjs";
+import { resolveBoundS } from "./backend-process-runner.mjs";
 import { collectAgyDeniedActions } from "./agy-home.mjs";
 
 // =========================================================================
@@ -197,7 +197,7 @@ export const AGY_WATCHDOG_FLOOR_S = 120;
  * unchanged at or above it — the armed interval is NEVER less than the
  * floor, whatever the caller passes.  Anything that is not a positive
  * finite number (absent, null, zero, negative, NaN, Infinity, a string)
- * arms NO watchdog at all: the same refusal discipline resolveAgyTimeoutS
+ * arms NO watchdog at all: the same refusal discipline resolveBoundS
  * applies to the outer bound, so the two bound decisions cannot disagree
  * about a shape.
  *
@@ -211,8 +211,9 @@ export const AGY_WATCHDOG_FLOOR_S = 120;
  *          when no usable interval was supplied.
  */
 export function agyWatchdogSeconds(value) {
-  if (!isUsableTimeoutS(value)) return null;
-  return Math.max(value, AGY_WATCHDOG_FLOOR_S);
+  const resolved = resolveBoundS(value);
+  if (resolved === null) return null;
+  return Math.max(resolved, AGY_WATCHDOG_FLOOR_S);
 }
 
 /**

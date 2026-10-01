@@ -79,7 +79,7 @@ import { firstRoute } from "./cli.mjs";
 import { readAgentSystemPrompt } from "./agent-system-prompt.mjs";
 import { newJobId } from "./job-store.mjs";
 import { stateDirFor } from "./state-paths.mjs";
-import { isUsableTimeoutS, runBackendProcess } from "./backend-process-runner.mjs";
+import { resolveBoundS, runBackendProcess } from "./backend-process-runner.mjs";
 import { runBackendDispatch } from "./backend-dispatch-core.mjs";
 import { toolDeniesEnforced } from "./tool-permissions.mjs";
 
@@ -549,8 +549,8 @@ export async function cursorDispatch(opts) {
   const systemPrompt = readAgentSystemPrompt(opts.agent);
   const promptText = buildCursorPrompt({ systemPrompt, promptText: opts.promptText });
   const bin = cursorBin();
-  const timeoutS = isUsableTimeoutS(opts.timeoutS) ? opts.timeoutS : null;
-  const watchdogS = isUsableTimeoutS(opts.watchdogS) ? opts.watchdogS : null;
+  const timeoutS = resolveBoundS(opts.timeoutS);
+  const watchdogS = resolveBoundS(opts.watchdogS);
   const args = buildCursorArgs({
     model: modelEntry,
     pinned,
