@@ -10,7 +10,21 @@ import fs from "node:fs";
 import path from "node:path";
 import { readJson } from "./state-paths.mjs";
 import { hasRepeatedAreas, inScopeFindingFiles, resolveReworkScope } from "./chain-rework.mjs";
-import { classifyEscalate } from "./chain-substance.mjs";
+import {
+  DISPOSITION_ORDER,
+  createDispositionCounts,
+  createEscalateSplit,
+  recordEscalate,
+  finalDisposition,
+  parseLenientTimeBound,
+  roundPassesTimeFilter,
+  extractRoundFindingsText,
+  hasPriorUnresolvedFinding,
+  parseTimeBound,
+  SEVERITY_ORDER,
+} from "./chain-metrics-core.mjs";
+
+export { parseTimeBound, SEVERITY_ORDER };
 
 // =========================================================================
 // I/O — collecting records from the state directory
@@ -226,13 +240,8 @@ export function computeStats(chains, opts = {}) {
 
   // Parse the bounds once. `null` means "not given, or not parseable as an
   // instant" -- the per-round comparison falls back to string ordering then.
-  const parseBound = (v) => {
-    if (v === undefined) return null;
-    const ms = Date.parse(v);
-    return Number.isFinite(ms) ? ms : null;
-  };
-  const sinceMs = parseBound(since);
-  const untilMs = parseBound(until);
+  const sinceMs = parseLenientTimeBound(since);
+  const untilMs = parseLenientTimeBound(until);
 
   // Collect all rounds with their chain index for provenance.
   // Rounds without startedAt are excluded when time filtering is active,
@@ -248,19 +257,9 @@ export function computeStats(chains, opts = {}) {
         noTimestampCount += 1;
         continue;
       }
-      // Compare as instants, not as strings.  `startedAt` is always written as
-      // UTC (`...Z`), but a human writing `--since` / `--compare` naturally
-      // reaches for local time (`2026-07-26T10:53:49+09:00`).  Lexicographic
-      // comparison puts that same instant on the wrong side of the cutoff --
-      // silently, with a plausible-looking table.  Unparseable bounds fall back
-      // to string comparison so a malformed flag degrades no worse than before.
-      const at = Date.parse(r.startedAt);
-      if (sinceMs !== null && Number.isFinite(at)) {
-        if (at < sinceMs) continue;
-      } else if (since !== undefined && r.startedAt && r.startedAt < since) continue;
-      if (untilMs !== null && Number.isFinite(at)) {
-        if (at >= untilMs) continue;
-      } else if (until !== undefined && r.startedAt && r.startedAt >= until) continue;
+      if (!roundPassesTimeFilter(r.startedAt, since, until, sinceMs, untilMs)) {
+        continue;
+      }
       allRounds.push({ chainIndex: ci, round: r });
     }
   }
@@ -286,16 +285,8 @@ export function computeStats(chains, opts = {}) {
   // anything) is not the same failure as substantive work that was rejected.
   // `escalateSplit` always sums to dispositionCounts.escalate, so the totals
   // below stay comparable with earlier reports.
-  const dispositionCounts = {
-    accept: 0,
-    "accept-with-followup": 0,
-    rework: 0,
-    strategize: 0,
-    escalate: 0,
-    discard: 0,
-    other: 0,
-  };
-  const escalateSplit = { substantive: 0, noWork: 0, unknown: 0 };
+  const dispositionCounts = createDispositionCounts();
+  const escalateSplit = createEscalateSplit();
 
   for (let ci = 0; ci < chains.length; ci++) {
     // Find the last round of this chain that passes time filters
@@ -303,23 +294,11 @@ export function computeStats(chains, opts = {}) {
       .filter((ar) => ar.chainIndex === ci)
       .map((ar) => ar.round);
     if (chainRounds.length === 0) continue;
-    const lastRound = chainRounds[chainRounds.length - 1];
-    const disp = lastRound.disposition?.disposition;
+    const disp = finalDisposition(chainRounds);
     if (disp && disp in dispositionCounts) {
       dispositionCounts[disp] += 1;
       if (disp === "escalate") {
-        // Classify over the SAME in-range rounds that produced the
-        // disposition, so the split never disagrees with the count.
-        // kusabi #380: classifyEscalate (chain-substance.mjs) now derives the
-        // substantive/no-work verdict from a round's closed stopReason when the
-        // record carries one; records without the field keep the original
-        // worktreeChanged heuristic unchanged (criterion #3).  The unknown
-        // sentinel and every non-completed reason fail closed into no-work,
-        // never into substantive.
-        const label = classifyEscalate(chainRounds);
-        if (label === "substantive") escalateSplit.substantive += 1;
-        else if (label === "no-work") escalateSplit.noWork += 1;
-        else escalateSplit.unknown += 1;
+        recordEscalate(escalateSplit, chainRounds);
       }
     } else {
       dispositionCounts.other += 1;
@@ -421,16 +400,6 @@ export function computeStats(chains, opts = {}) {
   }
 
   // ---- prior-unresolved heuristic ----
-  // Search for textual markers in findingsText (fallback) or finding titles.
-  const unresolvedPatterns = [
-    /prior\s+finding[,\s]*not\s+addressed/i,
-    /prior\s+finding\s*#\d+\s+unresolved/i,
-    /prior\s+finding.*unresolved/i,
-    /not\s+addressed\s*\(prior/i,
-    /previous\s+finding.*not\s+(?:addressed|resolved)/i,
-    /still\s+unresolved/i,
-  ];
-
   let priorUnresolvedCount = 0;
   let priorUnresolvedEligible = 0;
   let priorUnresolvedNA = 0;
@@ -447,20 +416,13 @@ export function computeStats(chains, opts = {}) {
     priorUnresolvedEligible += 1;
 
     // Source text: findingsText first, then fall back to finding titles
-    let textToSearch = round.findingsText || "";
-    if (!textToSearch && Array.isArray(round.findings)) {
-      textToSearch = round.findings
-        .map((f) => f.title || "")
-        .join(" ");
-    }
-
+    const textToSearch = extractRoundFindingsText(round);
     if (!textToSearch) {
       priorUnresolvedNA += 1;
       continue;
     }
 
-    const found = unresolvedPatterns.some((re) => re.test(textToSearch));
-    if (found) {
+    if (hasPriorUnresolvedFinding(textToSearch)) {
       priorUnresolvedCount += 1;
     }
   }
@@ -876,7 +838,7 @@ export function renderChainStats(stats, opts = {}) {
   const { dispositionCounts: dc } = stats;
   // Show all disposition buckets (including zero if any other bucket is non-zero)
   const totalDisps = Object.values(dc).reduce((a, b) => a + b, 0);
-  const dispOrder = ["accept", "accept-with-followup", "escalate", "rework", "strategize", "discard"];
+  const dispOrder = DISPOSITION_ORDER;
   for (const key of dispOrder) {
     if (dc[key] > 0 || totalDisps > 0) {
       // Escalates carry the substantive/no-work split (kusabi #165): an
@@ -1153,7 +1115,7 @@ export function renderComparison(statsBefore, statsAfter, cutoff) {
 
   // Final dispositions
   lines.push("  ── Dispositions ──");
-  const dispOrder = ["accept", "accept-with-followup", "escalate", "rework", "strategize", "discard"];
+  const dispOrder = DISPOSITION_ORDER;
   const totalB = Object.values(statsBefore.dispositionCounts).reduce((a, b) => a + b, 0);
   const totalA = Object.values(statsAfter.dispositionCounts).reduce((a, b) => a + b, 0);
   for (const key of dispOrder) {

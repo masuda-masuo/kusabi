@@ -26,23 +26,31 @@
 // no per-model price table to rot, but it must never be presented as
 // currency.
 
-import { classifyEscalate } from "./chain-substance.mjs";
+import {
+  finalDisposition,
+  createEscalateSplit,
+  recordEscalate,
+  parseTimeBound,
+  turnInWindow,
+  chainWindowKeyMs,
+  chainInWindow,
+  jobWindowKeyMs,
+  jobInWindow,
+  SEVERITY_ORDER,
+  REVIEW_SOURCE_VALUES,
+  computeDispositionSeverity,
+  computeReviewPathology,
+  emptyReviewPathology,
+} from "./chain-metrics-core.mjs";
 import { STOP_REASONS, UNKNOWN_STOP_REASON } from "./stop-reason.mjs";
 import { normalizeToolStats } from "./tool-stats.mjs";
+
+export { parseTimeBound, SEVERITY_ORDER };
 
 const WEIGHT_INPUT = 1;
 const WEIGHT_OUTPUT = 5;
 const WEIGHT_CACHE_WRITE = 1.25;
 const WEIGHT_CACHE_READ = 0.1;
-
-const DISPOSITIONS = new Set([
-  "accept",
-  "accept-with-followup",
-  "rework",
-  "strategize",
-  "escalate",
-  "discard",
-]);
 
 
 
@@ -50,59 +58,7 @@ const DISPOSITIONS = new Set([
 // time bounds — instant comparison only, never lexicographic string compare
 // ---------------------------------------------------------------------------
 
-/**
- * Parse a `--since`/`--until` bound to epoch ms. Returns undefined for an
- * absent bound. An unparseable bound is a fatal error — this surface never
- * degrades to string comparison the way chain-stats does.
- *
- * @param {string|undefined} value
- * @param {string} flagLabel  e.g. "--since"
- * @returns {number|undefined}
- */
-export function parseTimeBound(value, flagLabel) {
-  if (value === undefined || value === null || value === "") return undefined;
-  const ms = Date.parse(value);
-  if (!Number.isFinite(ms)) {
-    throw new Error(`${flagLabel}: not a parseable timestamp: ${value}`);
-  }
-  return ms;
-}
 
-function turnInWindow(t, sinceMs, untilMs, hasBound) {
-  if (!hasBound) return true;
-  if (t.ts_ms === null || t.ts_ms === undefined) return false;
-  if (sinceMs !== undefined && t.ts_ms < sinceMs) return false;
-  if (untilMs !== undefined && t.ts_ms >= untilMs) return false;
-  return true;
-}
-
-/**
- * A chain's window key: MIN(round.started_ms) over its rounds; if that is
- * unavailable, Date.parse(orch_date + "T00:00:00Z"); if that is also
- * unusable, null (undated).
- */
-function chainWindowKeyMs(chain, roundsByChain) {
-  const rounds = roundsByChain.get(chain.chain_id) || [];
-  let min;
-  for (const r of rounds) {
-    if (r.started_ms === null || r.started_ms === undefined) continue;
-    if (min === undefined || r.started_ms < min) min = r.started_ms;
-  }
-  if (min !== undefined) return min;
-  if (chain.orch_date) {
-    const ms = Date.parse(`${chain.orch_date}T00:00:00Z`);
-    if (Number.isFinite(ms)) return ms;
-  }
-  return null;
-}
-
-function chainInWindow(keyMs, sinceMs, untilMs, hasBound) {
-  if (!hasBound) return true;
-  if (keyMs === null || keyMs === undefined) return false;
-  if (sinceMs !== undefined && keyMs < sinceMs) return false;
-  if (untilMs !== undefined && keyMs >= untilMs) return false;
-  return true;
-}
 
 // ---------------------------------------------------------------------------
 // fetch — plain SELECTs, no filtering (filtering happens in JS below so the
@@ -253,21 +209,7 @@ function fetchToolStats(db) {
   return db.prepare("SELECT job_id, tool, count, success, failure FROM tool_stat").all();
 }
 
-/** A job's window key: started_ms, else finished_ms, else null (undated). */
-function jobWindowKeyMs(job) {
-  if (job.started_ms !== null && job.started_ms !== undefined) return job.started_ms;
-  if (job.finished_ms !== null && job.finished_ms !== undefined) return job.finished_ms;
-  return null;
-}
 
-function jobInWindow(job, sinceMs, untilMs, hasBound) {
-  if (!hasBound) return true;
-  const keyMs = jobWindowKeyMs(job);
-  if (keyMs === null) return false;
-  if (sinceMs !== undefined && keyMs < sinceMs) return false;
-  if (untilMs !== undefined && keyMs >= untilMs) return false;
-  return true;
-}
 
 function groupBy(rows, keyFn) {
   const m = new Map();
@@ -469,20 +411,7 @@ function roundBucket(n) {
   return n >= 4 ? "rounds=4+" : `rounds=${n}`;
 }
 
-/** Final disposition = disposition of the chain's LAST round (round = MAX(round)).
- * Same definition chain-stats.mjs already uses; the two surfaces must not
- * disagree about what "final" means. */
-function finalDisposition(chainId, roundsByChain) {
-  const rounds = roundsByChain.get(chainId) || [];
-  if (rounds.length === 0) return null;
-  let last = rounds[0];
-  for (const r of rounds) {
-    if (r.round > last.round) last = r;
-  }
-  const disp = last.disposition;
-  if (!disp) return null;
-  return DISPOSITIONS.has(disp) ? disp : "other";
-}
+
 
 function median(nums) {
   if (nums.length === 0) return null;
@@ -526,7 +455,7 @@ function computeBriefOutcome(inWindowChains, roundsByChain) {
     // worker that produced a change set (substantive) vs never produced one
     // (no-work) vs never recorded whether it did (unknown — old records /
     // pre-probe death).  substantive + noWork + unknown === escalated.
-    const escalateSplit = { escalated: 0, substantive: 0, noWork: 0, unknown: 0 };
+    const escalateSplit = createEscalateSplit({ includeEscalated: true });
     for (const c of chains) {
       const rounds = roundsByChain.get(c.chain_id) || [];
       if (rounds.length === 0) {
@@ -536,11 +465,7 @@ function computeBriefOutcome(inWindowChains, roundsByChain) {
       const smokeLabel = c.brief_has_smoke ? "Smoke present" : "Smoke absent";
       const disp = finalDisposition(c.chain_id, roundsByChain) ?? "(no disposition)";
       if (disp === "escalate") {
-        escalateSplit.escalated += 1;
-        const label = classifyEscalate(rounds);
-        if (label === "substantive") escalateSplit.substantive += 1;
-        else if (label === "no-work") escalateSplit.noWork += 1;
-        else escalateSplit.unknown += 1;
+        recordEscalate(escalateSplit, rounds);
       }
       const bucket = roundBucket(rounds.length);
       if (!table[smokeLabel]) table[smokeLabel] = {};
@@ -605,23 +530,7 @@ function computeBriefOutcome(inWindowChains, roundsByChain) {
  * two that are: `unparseable` (no JSON and no recoverable verdict token)
  * and `partial` (the stream ended before the verdict record — the safety
  * net that is not a goal, kusabi #202). */
-const REVIEW_PATHOLOGY_VERDICTS = new Set(["unparseable", "partial"]);
 
-/** Known severity vocabulary, in display order.  Unknown severities render
- * verbatim after these; NULL severity renders as its own "(no severity)"
- * bucket (the finding_files generation has no severity at all). */
-export const SEVERITY_ORDER = ["low", "medium", "high", "critical"];
-
-/** Known verdict_source vocabulary (kusabi #235): "probe" = the P3
- * empty-change-set discard written WITHOUT dispatching a review (not review
- * output); "recovered-from-token" = the review ran but its output was
- * unparseable and the verdict was recovered from the model token stream
- * (review output).  The issue's comment lists the vocabulary as non-
- * exhaustive ("probe" / "recovered-from-token" など), so ANY other non-NULL
- * value is an unrecognized future source: it is NOT known to be review
- * output and must not be folded into the review bucket at the report
- * surface — it gets its own "other" bucket with the raw value rendered. */
-const REVIEW_SOURCE_VALUES = new Set(["probe", "recovered-from-token"]);
 
 /**
  * Section A — escalate review-axis split (round-level).
@@ -699,108 +608,7 @@ function computeEscalateReviewAxis(inWindowRounds, verdictSourceAvailable) {
   };
 }
 
-/**
- * Section B — disposition × severity table (round-level).
- *
- * Per disposition (verbatim — an unknown disposition is its own row): the
- * round count and the finding count of those rounds, with the severity
- * breakdown.  The complementary distribution is the payload: if
- * accept-with-followup rounds carry exclusively low/medium findings while
- * rework carries the high/critical ones, the table shows it.  Known
- * severities are always present (zero is a measurement, and the zeros ARE
- * the signal); unknown severities render verbatim; NULL severity is its own
- * "(no severity)" bucket (the finding_files generation).
- *
- * @param {object[]} inWindowRounds
- * @param {Map<string, object[]>} findingsByRound  keyed by
- *   `${chain_id}\u0000${round}` — only in-window rounds are looked up.
- */
-function computeDispositionSeverity(inWindowRounds, findingsByRound) {
-  /** @type {Map<string, object>} */
-  const byDisposition = new Map();
-  for (const r of inWindowRounds) {
-    const disp = r.disposition === null || r.disposition === undefined ? "(no disposition)" : String(r.disposition);
-    let row = byDisposition.get(disp);
-    if (!row) {
-      row = { disposition: disp, rounds: 0, findings: 0, severities: {} };
-      byDisposition.set(disp, row);
-    }
-    row.rounds += 1;
-    const findings = findingsByRound.get(`${r.chain_id}\u0000${r.round}`) || [];
-    for (const f of findings) {
-      row.findings += 1;
-      const sev = f.severity === null || f.severity === undefined ? "(no severity)" : String(f.severity);
-      row.severities[sev] = (row.severities[sev] || 0) + 1;
-    }
-  }
-  const rows = [...byDisposition.values()];
-  for (const row of rows) {
-    // The four known severities always appear — a zero is a real count and
-    // the complement (e.g. no high/critical on accept-with-followup) is the
-    // point of the table.
-    for (const sev of SEVERITY_ORDER) {
-      if (row.severities[sev] === undefined) row.severities[sev] = 0;
-    }
-  }
-  rows.sort((a, b) => a.disposition.localeCompare(b.disposition));
-  return rows;
-}
 
-/**
- * Section C — review-output pathology rate (round-level, one number).
- *
- * Numerator: rounds whose verdict is in REVIEW_PATHOLOGY_VERDICTS and was
- * review-issued or unknown-source.  Denominator: rounds with a recorded
- * verdict that is review-issued or unknown-source — probe-issued verdicts
- * (the P3 empty-change-set discard, review never dispatched) are NOT review
- * output and are excluded from BOTH sides; their count is reported beside
- * the ratio so the exclusion is visible.  The same exclusion applies to an
- * unrecognized NON-NULL verdict_source (not in {probe,
- * recovered-from-token}): it is not known to be review output, so it must
- * not silently inflate the denominator — it is excluded from both sides,
- * counted (`otherIssued`) with the verbatim value(s) for disclosure.  A
- * store without the verdict_source column cannot tell probe-issued from
- * review-issued, so every verdict round is in the denominator and the ratio
- * is stated with that caveat.
- *
- * @param {object[]} inWindowRounds
- * @param {boolean} verdictSourceAvailable
- */
-function computeReviewPathology(inWindowRounds, verdictSourceAvailable) {
-  let pathologyCount = 0;
-  let denominator = 0;
-  let probeIssued = 0;
-  let otherIssued = 0;
-  const otherValues = new Set();
-  for (const r of inWindowRounds) {
-    if (r.verdict === null || r.verdict === undefined) continue; // no verdict at all — not review output
-    if (r.verdict_source === "probe") {
-      probeIssued += 1;
-      continue; // probe-issued verdicts are not review output — not pathology, not denominator
-    }
-    if (r.verdict_source !== null && r.verdict_source !== undefined && !REVIEW_SOURCE_VALUES.has(r.verdict_source)) {
-      // Unrecognized non-NULL source — the same failure class the probe
-      // exclusion exists for (a non-review verdict counted as review-issued
-      // would corrupt the very scorecard this section exists to produce).
-      // Excluded from both sides; counted with the verbatim value so the
-      // exclusion is visible, never silent.
-      otherIssued += 1;
-      otherValues.add(r.verdict_source);
-      continue;
-    }
-    denominator += 1;
-    if (REVIEW_PATHOLOGY_VERDICTS.has(String(r.verdict))) pathologyCount += 1;
-  }
-  return {
-    pathologyCount,
-    denominator,
-    pct: denominator === 0 ? null : (pathologyCount / denominator) * 100,
-    verdictSourceAvailable,
-    probeIssued,
-    otherIssued,
-    otherValues: [...otherValues].sort(),
-  };
-}
 
 // ---------------------------------------------------------------------------
 // section 8 — delegated jobs (#154)
@@ -1163,18 +971,7 @@ function emptyEscalateReviewAxis() {
   };
 }
 
-/** Empty section C shape (missing/empty stores) — no denominator to state. */
-function emptyReviewPathology() {
-  return {
-    pathologyCount: 0,
-    denominator: 0,
-    pct: null,
-    verdictSourceAvailable: false,
-    probeIssued: 0,
-    otherIssued: 0,
-    otherValues: [],
-  };
-}
+
 
 /**
  * Report for a missing database file — the caller must check
