@@ -118,14 +118,13 @@
 // `--backend claude`.  v1 limits unchanged (docs/design/phase-chain.md §3.5.11).
 
 import process from "node:process";
-import { spawn } from "node:child_process";
 
 import { assertSessionResumable } from "./backend-session-guard.mjs";
 
 import { firstRoute } from "./cli.mjs";
 import { newJobId, saveJob, jobDir, appendEvent } from "./job-store.mjs";
 import { stateDirFor } from "./state-paths.mjs";
-import { isUsableTimeoutS, killProcessGroup, resolveBoundS } from "./backend-process-runner.mjs";
+import { resolveBoundS, runBackendProcess } from "./backend-process-runner.mjs";
 import { runBackendDispatch } from "./backend-dispatch-core.mjs";
 import {
   claudeMcpSourcePath,
@@ -159,7 +158,6 @@ import {
   renderClaudeWriteWatchdogError,
   renderClaudeRepeatWatchdogError,
 } from "./claude-watchdogs.mjs";
-import { processStartToken } from "./process-identity.mjs";
 import { allowedToolsForAgent, applyToolDenies, disallowedToolsForAgent, sunabaProfileForAgent, toolDeniesEnforced } from "./tool-permissions.mjs";
 
 export const CLAUDE_BACKEND = "claude";
@@ -676,252 +674,179 @@ export function renderClaudeQuotaError(failure, detail, { resetFromRateFeed = fa
  *                     timedOut: boolean, stalled: boolean, writeStalled: boolean,
  *                     repeatStalled: boolean, spawnError: Error|null }>}
  */
-export function runClaudeProcess({ bin, args, cwd, timeoutS, watchdogS, promptText, onStart, onLine, onWatchdog, writeWatchdog = null, onWriteWatchdog, repeatWatchdog = null, onRepeatWatchdog }) {
-  return new Promise((resolve) => {
-    const spawnedAt = Date.now();
-    const child = spawn(bin, args, {
-      cwd,
-      env: { ...process.env, KUSABI_WORKER_CONTEXT: "1" },
-      stdio: ["pipe", "pipe", "pipe"],
-      // Own process group (session leader): the timeout kill targets the
-      // group, so claude's children die with it — no orphaned work keeps
-      // running in the shared container after the job is recorded timeout.
-      detached: true,
-    });
-    // Hand the pid and its identity token to the caller before the child can
-    // do any work, so a `cancel` issued a second later already has something
-    // to aim at.  Wrapped: a failed recording must degrade the stop lever,
-    // never take down the dispatch it was meant to protect.
-    if (typeof onStart === "function" && child.pid) {
-      try { onStart({ pid: child.pid, startTime: processStartToken(child.pid) }); } catch { /* best-effort */ }
-    }
-    // Prompt transport is stdin (I5).  The error handler is swallowed: a
-    // failed spawn surfaces through the child 'error' event (spawnError
-    // below), and an EPIPE on the write race would otherwise crash the
-    // parent with an unhandled 'error' on the stdin stream.
-    if (child.stdin) {
-      child.stdin.on("error", () => {});
-      child.stdin.end(promptText ?? "");
-    }
-    let stdout = "";
-    let stderr = "";
-    let timedOut = false;
-    let stalled = false;
-    let writeStalled = false;
-    let spawnError = null;
-    let lineBuffer = "";
-    // The silence clock starts at spawn (kusabi #215 Job B item 3, #619),
-    // captured before spawn() so a parent stalled during setup cannot
-    // shorten the measured idle.
-    let lastEventAt = spawnedAt;
-    // The write-tool clock (kusabi #215 item 3, #619).  Starts at spawn, like the
-    // silence clock: captured before spawn() so a parent stalled during setup
-    // cannot shorten the measured idle.  A worker that never writes anything
-    // at all must trip this, not be held off by the absence of a first write to
-    // measure from.
-    let lastWriteAt = spawnedAt;
-    let writeWarned = false;
-    // The repeat-tool chain (kusabi #234).  Count-based, so there is no
-    // clock and no timer: the chain folds synchronously at line delivery
-    // and the kill lands the instant the killThreshold-th identical call
-    // arrives.  `repeatChain` remembers the last tracked call's key and how
-    // many times it has appeared in a row.
-    let repeatChain = null;
-    let repeatWarned = false;
-    let repeatStalled = false;
+export async function runClaudeProcess({
+  bin,
+  args,
+  cwd,
+  timeoutS,
+  watchdogS,
+  promptText,
+  onStart,
+  onLine,
+  onWatchdog,
+  writeWatchdog = null,
+  onWriteWatchdog,
+  repeatWatchdog = null,
+  onRepeatWatchdog,
+  env,
+}) {
+  let writeStalled = false;
+  let repeatStalled = false;
 
-    // Delivers one complete NDJSON line to the caller and resets the
-    // silence clock the watchdog measures against — the clock starts at
-    // spawn (above), not at the first event, so a child that never prints
-    // anything at all still trips the watchdog.  Only a PARSED event
-    // resets the clock: an unparseable prose line (the real CLI's leading
-    // warning) is stream noise, not activity — it must not masquerade as
-    // an event and hold the watchdog off (kusabi #215 Job B item 3).
-    function deliverLine(line) {
-      const parsedLine = parseClaudeStreamLine(line);
-      if (parsedLine !== null) lastEventAt = Date.now();
-      // The write clock resets ONLY on a file-mutating tool call (kusabi
-      // #215 item 3) — reads, searches and execs are exactly what the
-      // incident job did all day.  Wrapped: a detection bug must never
-      // break line delivery or the silence watchdog that shares this path.
-      if (writeWatchdog && parsedLine !== null) {
-        try {
-          if (eventHasClaudeWriteTool(parsedLine)) lastWriteAt = Date.now();
-        } catch { /* fail open: no reset, never a broken stream */ }
-      }
-      // The repeat-tool chain folds at the SAME parsed-event point the
-      // write clock does (kusabi #234): every assistant event's tool_use
-      // blocks, in stream order.  Wrapped like the write fold — a detection
-      // bug must never break line delivery or the sibling watchdogs that
-      // share this path.
-      if (repeatWatchdog && parsedLine !== null) {
-        try {
-          foldClaudeRepeatCalls(parsedLine, (toolName, chainKey) => {
-            // Once ANY bound has killed the group the stream is winding
-            // down; no further chain work, and no event noise on a run
-            // another watchdog already diagnosed.
-            if (timedOut || stalled || writeStalled || repeatStalled) return;
-            repeatChain = claudeRepeatChainAdvance(repeatChain, chainKey);
-            if (!repeatWarned && repeatChain.count >= repeatWatchdog.threshold) {
-              // Exactly once per job, like the siblings' warnings: a
-              // repeating warning is noise the operator learns to ignore.
-              repeatWarned = true;
-              notifyRepeatWatchdog({
-                kind: "warned",
-                tool: toolName,
-                count: repeatChain.count,
-                argsPreview: claudeRepeatArgsPreview(chainKey),
+  const notifyWriteWatchdog = (event) => {
+    if (typeof onWriteWatchdog !== "function") return;
+    try { onWriteWatchdog(event); } catch { /* best-effort audit trail */ }
+  };
+  const notifyRepeatWatchdog = (event) => {
+    if (typeof onRepeatWatchdog !== "function") return;
+    try { onRepeatWatchdog(event); } catch { /* best-effort audit trail */ }
+  };
+
+  const result = await runBackendProcess({
+    bin,
+    args,
+    cwd,
+    env,
+    timeoutS,
+    watchdogS,
+    promptText: promptText ?? "",
+    onStart,
+    onLine,
+    onWatchdog,
+    parseLine: parseClaudeStreamLine,
+    extend: (ctl) => {
+      // The write-tool clock (kusabi #215 item 3, #619).  Starts at spawn, like the
+      // silence clock: captured before spawn() so a parent stalled during setup
+      // cannot shorten the measured idle.  A worker that never writes anything
+      // at all must trip this, not be held off by the absence of a first write to
+      // measure from.
+      let lastWriteAt = ctl.spawnedAt;
+      let writeWarned = false;
+
+      // The repeat-tool chain (kusabi #234).  Count-based, so there is no
+      // clock and no timer: the chain folds synchronously at line delivery
+      // and the kill lands the instant the killThreshold-th identical call
+      // arrives.  `repeatChain` remembers the last tracked call's key and how
+      // many times it has appeared in a row.
+      let repeatChain = null;
+      let repeatWarned = false;
+
+      // Write-tool watchdog (kusabi #215 item 3).  A SEPARATE interval from
+      // the silence watchdog on purpose: the two measure different clocks, and
+      // a fault in this one must not be able to take the silence kill down
+      // with it.  Same 250ms resolution, same group kill, and the whole body
+      // is wrapped — an exception thrown inside a timer callback is an
+      // uncaught exception that would kill the parent process, and this
+      // feature's contract is to fail open.
+      const writeWatchdogTimer = writeWatchdog && writeWatchdog.warnS > 0
+        ? ctl.addInterval(() => {
+            try {
+              // `repeatStalled` joins the guards for the same reason
+              // `writeStalled` is there: once a sibling has killed the group,
+              // this watchdog must not report (or overwrite) a stall it did
+              // not cause (kusabi #234).
+              if (ctl.isKilled() || writeStalled || repeatStalled) return;
+              const idleMs = Date.now() - lastWriteAt;
+              const idleS = Math.round(idleMs / 1000);
+              if (!writeWarned && idleMs > writeWatchdog.warnS * 1000) {
+                // Exactly once per job: a repeating warning is noise the
+                // operator learns to ignore (and is an explicit non-goal).
+                writeWarned = true;
+                notifyWriteWatchdog({ kind: "warned", idleS });
+              }
+              const killS = writeWatchdog.killS;
+              if (killS && idleMs > killS * 1000) {
+                writeStalled = true;
+                ctl.clearInterval(writeWatchdogTimer);
+                // Measured idle seconds here; the configured bound is what the
+                // job's error text names (renderClaudeWriteWatchdogError) —
+                // the same split the silence watchdog makes.
+                notifyWriteWatchdog({ kind: "fired", idleS });
+                ctl.kill();
+                notifyWriteWatchdog({ kind: "kill" });
+              }
+            } catch { /* fail open: never take the dispatch down */ }
+          }, 250)
+        : null;
+
+      return {
+        onParsed(parsedLine) {
+          // The write clock resets ONLY on a file-mutating tool call (kusabi
+          // #215 item 3) — reads, searches and execs are exactly what the
+          // incident job did all day.  Wrapped: a detection bug must never
+          // break line delivery or the silence watchdog that shares this path.
+          if (writeWatchdog) {
+            try {
+              if (eventHasClaudeWriteTool(parsedLine)) lastWriteAt = Date.now();
+            } catch { /* fail open: no reset, never a broken stream */ }
+          }
+          // The repeat-tool chain folds at the SAME parsed-event point the
+          // write clock does (kusabi #234): every assistant event's tool_use
+          // blocks, in stream order.  Wrapped like the write fold — a detection
+          // bug must never break line delivery or the sibling watchdogs that
+          // share this path.
+          if (repeatWatchdog) {
+            try {
+              foldClaudeRepeatCalls(parsedLine, (toolName, chainKey) => {
+                // Once ANY bound has killed the group the stream is winding
+                // down; no further chain work, and no event noise on a run
+                // another watchdog already diagnosed.
+                if (ctl.isKilled() || writeStalled || repeatStalled) return;
+                repeatChain = claudeRepeatChainAdvance(repeatChain, chainKey);
+                if (!repeatWarned && repeatChain.count >= repeatWatchdog.threshold) {
+                  // Exactly once per job, like the siblings' warnings: a
+                  // repeating warning is noise the operator learns to ignore.
+                  repeatWarned = true;
+                  notifyRepeatWatchdog({
+                    kind: "warned",
+                    tool: toolName,
+                    count: repeatChain.count,
+                    argsPreview: claudeRepeatArgsPreview(chainKey),
+                  });
+                }
+                if (repeatChain.count >= repeatWatchdog.killThreshold) {
+                  repeatStalled = true;
+                  // Measured count here; the configured thresholds ride in the
+                  // events and the record (the same split the siblings make).
+                  notifyRepeatWatchdog({ kind: "fired", tool: toolName, count: repeatChain.count });
+                  ctl.kill();
+                  notifyRepeatWatchdog({ kind: "kill" });
+                }
               });
-            }
-            if (repeatChain.count >= repeatWatchdog.killThreshold) {
-              repeatStalled = true;
-              // Measured count here; the configured thresholds ride in the
-              // events and the record (the same split the siblings make).
-              notifyRepeatWatchdog({ kind: "fired", tool: toolName, count: repeatChain.count });
-              killProcessGroup(child);
-              notifyRepeatWatchdog({ kind: "kill" });
-            }
-          });
-        } catch { /* fail open: no detection, never a broken stream */ }
-      }
-      if (typeof onLine === "function") {
-        try { onLine(line); } catch { /* a stats-fold bug must not take down the dispatch */ }
-      }
-    }
-
-    // UTF-8 decoding must be stream-level, not chunk-level: a multibyte
-    // character split across two "data" chunks decodes to U+FFFD under
-    // per-chunk toString(), corrupting the JSON line it sits in — and a
-    // corrupted terminal result line is a lost run (and a lost quota
-    // classification).  setEncoding routes chunks through a StringDecoder
-    // that holds partial byte sequences back until they complete.
-    child.stdout.setEncoding("utf8");
-    child.stderr.setEncoding("utf8");
-    child.stdout.on("data", (chunk) => {
-      stdout += chunk;
-      lineBuffer += chunk;
-      const lines = lineBuffer.split("\n");
-      lineBuffer = lines.pop(); // last element: an unterminated partial line, or ""
-      for (const line of lines) deliverLine(line);
-    });
-    child.stderr.on("data", (d) => { stderr += d; });
-    child.on("error", (err) => { spawnError = err; });
-
-    const timer = isUsableTimeoutS(timeoutS)
-      ? setTimeout(() => {
-          timedOut = true;
-          killProcessGroup(child);
-        }, timeoutS * 1000)
-      : null;
-    // Silence watchdog (kusabi #215 Job B): polled rather than a single
-    // deadline timer, since the bound restarts on every stream event.
-    // 250ms resolution keeps a small test watchdogS tight without adding
-    // meaningful overhead against the real multi-minute defaults.
-    // Reports each watchdog step to the caller so the stall lands in the
-    // job's audit trail AT THE MOMENT it is detected, not after the process
-    // has closed and the record is being finalized.  Wrapped: appending to
-    // an audit trail must never take down the kill that is the watchdog's
-    // actual job — note the "fired" notification runs BEFORE killProcessGroup.
-    const notifyWatchdog = (event) => {
-      if (typeof onWatchdog !== "function") return;
-      try { onWatchdog(event); } catch { /* best-effort audit trail */ }
-    };
-    const watchdogTimer = isUsableTimeoutS(watchdogS)
-      ? setInterval(() => {
-          // `writeStalled` and `repeatStalled` join the existing guards for
-          // one reason: once a SIBLING watchdog has killed the group the
-          // stream stops, so silence would grow and this watchdog would
-          // report a stall it did not cause (and overwrite the distinct
-          // error text).  With both siblings off, this reads exactly as it
-          // did before (kusabi #215 item 3, #234).
-          if (timedOut || stalled || writeStalled || repeatStalled) return;
-          const silenceMs = Date.now() - lastEventAt;
-          if (silenceMs > watchdogS * 1000) {
-            stalled = true;
-            clearInterval(watchdogTimer);
-            // Measured silence, rounded to seconds — the same quantity the
-            // opencode watchdog reports, not the configured bound.
-            notifyWatchdog({ kind: "fired", silenceS: Math.round(silenceMs / 1000) });
-            killProcessGroup(child);
-            notifyWatchdog({ kind: "kill" });
+            } catch { /* fail open: no detection, never a broken stream */ }
           }
-        }, 250)
-      : null;
-
-    // Write-tool watchdog (kusabi #215 item 3).  A SEPARATE interval from
-    // the silence watchdog on purpose: the two measure different clocks, and
-    // a fault in this one must not be able to take the silence kill down
-    // with it.  Same 250ms resolution, same group kill, and the whole body
-    // is wrapped — an exception thrown inside a timer callback is an
-    // uncaught exception that would kill the parent process, and this
-    // feature's contract is to fail open.
-    const notifyWriteWatchdog = (event) => {
-      if (typeof onWriteWatchdog !== "function") return;
-      try { onWriteWatchdog(event); } catch { /* best-effort audit trail */ }
-    };
-    const notifyRepeatWatchdog = (event) => {
-      if (typeof onRepeatWatchdog !== "function") return;
-      try { onRepeatWatchdog(event); } catch { /* best-effort audit trail */ }
-    };
-    const writeWatchdogTimer = writeWatchdog && writeWatchdog.warnS > 0
-      ? setInterval(() => {
-          try {
-            // `repeatStalled` joins the guards for the same reason
-            // `writeStalled` is there: once a sibling has killed the group,
-            // this watchdog must not report (or overwrite) a stall it did
-            // not cause (kusabi #234).
-            if (timedOut || stalled || writeStalled || repeatStalled) return;
-            const idleMs = Date.now() - lastWriteAt;
-            const idleS = Math.round(idleMs / 1000);
-            if (!writeWarned && idleMs > writeWatchdog.warnS * 1000) {
-              // Exactly once per job: a repeating warning is noise the
-              // operator learns to ignore (and is an explicit non-goal).
-              writeWarned = true;
-              notifyWriteWatchdog({ kind: "warned", idleS });
-            }
-            const killS = writeWatchdog.killS;
-            if (killS && idleMs > killS * 1000) {
-              writeStalled = true;
-              clearInterval(writeWatchdogTimer);
-              // Measured idle seconds here; the configured bound is what the
-              // job's error text names (renderClaudeWriteWatchdogError) —
-              // the same split the silence watchdog makes.
-              notifyWriteWatchdog({ kind: "fired", idleS });
-              killProcessGroup(child);
-              notifyWriteWatchdog({ kind: "kill" });
-            }
-          } catch { /* fail open: never take the dispatch down */ }
-        }, 250)
-      : null;
-
-    child.on("close", (code) => {
-      if (timer) clearTimeout(timer);
-      if (watchdogTimer) clearInterval(watchdogTimer);
-      if (writeWatchdogTimer) clearInterval(writeWatchdogTimer);
-      if (lineBuffer) deliverLine(lineBuffer);
-      // Final write-clock reading (kusabi #215 item 3).  A polled interval
-      // can be beaten to the finish line: when this process is descheduled
-      // the child's whole output can arrive buffered together with its exit,
-      // and the close callback (poll phase) then clears the interval before
-      // the timers phase ever gets to observe the idle time.  The warning is
-      // an audit fact about the run, not a property of scheduler luck, so it
-      // is evaluated once more here — same condition, same measurement, so
-      // this can only emit a warning the interval would have emitted itself.
-      // Deliberately AFTER the final line is delivered (a write on the last
-      // line still resets the clock) and never on a run some other bound
-      // already killed: those carry their own diagnosis.
-      if (writeWatchdog && !writeWarned && !writeStalled && !stalled && !repeatStalled && !timedOut) {
-        try {
-          const idleMs = Date.now() - lastWriteAt;
-          if (idleMs > writeWatchdog.warnS * 1000) {
-            writeWarned = true;
-            notifyWriteWatchdog({ kind: "warned", idleS: Math.round(idleMs / 1000) });
+        },
+        onClose() {
+          // Final write-clock reading (kusabi #215 item 3).  A polled interval
+          // can be beaten to the finish line: when this process is descheduled
+          // the child's whole output can arrive buffered together with its exit,
+          // and the close callback (poll phase) then clears the interval before
+          // the timers phase ever gets to observe the idle time.  The warning is
+          // an audit fact about the run, not a property of scheduler luck, so it
+          // is evaluated once more here — same condition, same measurement, so
+          // this can only emit a warning the interval would have emitted itself.
+          // Deliberately AFTER the final line is delivered (a write on the last
+          // line still resets the clock) and never on a run some other bound
+          // already killed: those carry their own diagnosis.
+          if (writeWatchdog && !writeWarned && !writeStalled && !repeatStalled && !ctl.isKilled()) {
+            try {
+              const idleMs = Date.now() - lastWriteAt;
+              if (idleMs > writeWatchdog.warnS * 1000) {
+                writeWarned = true;
+                notifyWriteWatchdog({ kind: "warned", idleS: Math.round(idleMs / 1000) });
+              }
+            } catch { /* fail open */ }
           }
-        } catch { /* fail open */ }
-      }
-      resolve({ code, stdout, stderr, timedOut, stalled, writeStalled, repeatStalled, spawnError });
-    });
+        },
+      };
+    },
   });
+
+  return {
+    ...result,
+    writeStalled,
+    repeatStalled,
+  };
 }
 
 // =========================================================================
