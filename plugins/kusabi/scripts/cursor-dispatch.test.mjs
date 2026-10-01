@@ -329,11 +329,19 @@ describe("parseCursorStreamLine / cursorPayload", () => {
     assert.equal(usage.available, true);
     assert.equal(usage.input, 10543);
     assert.equal(usage.output, 34);
-    assert.equal(usage.reasoning, 0);
+    assert.equal(usage.reasoning, null);
     assert.equal(usage.cacheRead, 5376);
     assert.equal(usage.cacheWrite, 0);
-    assert.equal(usage.total, 0);
-    assert.equal(usage.cost, 0);
+    assert.equal(usage.total, null);
+    assert.equal(usage.cost, null);
+  });
+
+  it("maps empty cursor usage fields to null", () => {
+    const usage = mapCursorUsage({});
+    assert.equal(usage.available, true);
+    for (const key of ["input", "output", "reasoning", "cacheRead", "cacheWrite", "total", "cost"]) {
+      assert.equal(usage[key], null, key);
+    }
   });
 });
 

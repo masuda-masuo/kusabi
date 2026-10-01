@@ -475,7 +475,7 @@ export function cursorPayload(parsed) {
  * backends already store.  Cursor reports camelCase counters (MEASURED):
  * inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens.  There is
  * no thinking/total field in the measured payload — `reasoning` and `total`
- * are 0, not a fourth shape.
+ * are null because those fields are not measured.
  *
  * @param {object|null} result
  * @returns {object}
@@ -484,13 +484,13 @@ export function mapCursorUsage(result) {
   const u = result?.usage ?? {};
   return {
     available: true,
-    input: u.inputTokens ?? 0,
-    output: u.outputTokens ?? 0,
-    reasoning: 0,
-    cacheRead: u.cacheReadTokens ?? 0,
-    cacheWrite: u.cacheWriteTokens ?? 0,
-    total: 0,
-    cost: 0,
+    input: typeof u.inputTokens === "number" ? u.inputTokens : null,
+    output: typeof u.outputTokens === "number" ? u.outputTokens : null,
+    reasoning: null,
+    cacheRead: typeof u.cacheReadTokens === "number" ? u.cacheReadTokens : null,
+    cacheWrite: typeof u.cacheWriteTokens === "number" ? u.cacheWriteTokens : null,
+    total: null,
+    cost: null,
     model: result?.model ?? null,
   };
 }

@@ -322,8 +322,9 @@ export function renderReviewRecord(record) {
   lines.push("## Usage");
   lines.push("");
   const t = rec.chainTotals ?? {};
-  const num = function (v) { return Number.isFinite(v) ? v : 0; };
-  lines.push(`input=${num(t.input)} output=${num(t.output)} reasoning=${num(t.reasoning)} cacheRead=${num(t.cacheRead)} cacheWrite=${num(t.cacheWrite)} cost=$${num(t.cost)}`);
+  const num = function (v) { return Number.isFinite(v) ? v : "n/a"; };
+  const cost = Number.isFinite(t.cost) ? "$" + t.cost : "n/a";
+  lines.push(`input=${num(t.input)} output=${num(t.output)} reasoning=${num(t.reasoning)} cacheRead=${num(t.cacheRead)} cacheWrite=${num(t.cacheWrite)} cost=${cost}`);
 
   return lines.join("\n");
 }

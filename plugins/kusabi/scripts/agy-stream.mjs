@@ -340,27 +340,25 @@ export function describeAgyResult(parsed) {
  *   cache_read_tokens → cacheRead
  *   total_tokens      → total       (agy-only; no other backend reports one)
  *
- * `cacheWrite` and `cost` are 0, not null: agy reports neither, and the
- * shape's consumers (`chain-stats`, `metrics-db`) sum these fields.  A 0
- * here means "reported as nothing to add", which is what an absent
- * cache-write counter means for a running total.
+ * `cacheWrite` and `cost` are null because agy reports neither;
+ * an absent counter is not a measured zero; null is skipped by aggregators.
  *
  * @param {object} result
- * @returns {{ available: boolean, input: number, output: number, reasoning: number,
- *             cacheRead: number, cacheWrite: number, total: number, cost: number,
+ * @returns {{ available: boolean, input: number|null, output: number|null, reasoning: number|null,
+ *             cacheRead: number|null, cacheWrite: number|null, total: number|null, cost: number|null,
  *             model: string|null }}
  */
 export function mapAgyUsage(result) {
   const u = result?.usage ?? {};
   return {
     available: true,
-    input: u.input_tokens ?? 0,
-    output: u.output_tokens ?? 0,
-    reasoning: u.thinking_tokens ?? 0,
-    cacheRead: u.cache_read_tokens ?? 0,
-    cacheWrite: 0,
-    total: u.total_tokens ?? 0,
-    cost: 0,
+    input: typeof u.input_tokens === "number" ? u.input_tokens : null,
+    output: typeof u.output_tokens === "number" ? u.output_tokens : null,
+    reasoning: typeof u.thinking_tokens === "number" ? u.thinking_tokens : null,
+    cacheRead: typeof u.cache_read_tokens === "number" ? u.cache_read_tokens : null,
+    cacheWrite: null,
+    total: typeof u.total_tokens === "number" ? u.total_tokens : null,
+    cost: null,
     model: result?.model ?? null,
   };
 }

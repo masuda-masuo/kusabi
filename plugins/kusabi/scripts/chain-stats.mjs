@@ -9,6 +9,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { readJson } from "./state-paths.mjs";
+import { usageFieldSum } from "./chain-persist.mjs";
 import { hasRepeatedAreas, inScopeFindingFiles, resolveReworkScope } from "./chain-rework.mjs";
 import {
   DISPOSITION_ORDER,
@@ -503,10 +504,11 @@ export function computeStats(chains, opts = {}) {
   };
 
   const overallTotals = {
-    input: 0, output: 0, reasoning: 0, cacheRead: 0, cacheWrite: 0,
+    input: null, output: null, reasoning: null, cacheRead: null, cacheWrite: null,
     cost: null,
     costCoverage: { measured: 0, total: 0 },
   };
+  const overallTokenUsages = [];
   const perChainTotals = []; // active chains only; cost is number | null
 
   const aggregateCostCoverage = (evidence, aggregateCost) => {
@@ -550,11 +552,7 @@ export function computeStats(chains, opts = {}) {
     const costCoverage = aggregateCostCoverage(evidence, aggregateCost);
 
     if (hasTotals) {
-      overallTotals.input += ct.input || 0;
-      overallTotals.output += ct.output || 0;
-      overallTotals.reasoning += ct.reasoning || 0;
-      overallTotals.cacheRead += ct.cacheRead || 0;
-      overallTotals.cacheWrite += ct.cacheWrite || 0;
+      overallTokenUsages.push(ct);
     }
     if (chainCost !== null) {
       overallTotals.cost = (overallTotals.cost ?? 0) + chainCost;
@@ -565,11 +563,11 @@ export function computeStats(chains, opts = {}) {
 
     perChainTotals.push({
       chainId: chain.chainId,
-      input: hasTotals ? ct.input || 0 : 0,
-      output: hasTotals ? ct.output || 0 : 0,
-      reasoning: hasTotals ? ct.reasoning || 0 : 0,
-      cacheRead: hasTotals ? ct.cacheRead || 0 : 0,
-      cacheWrite: hasTotals ? ct.cacheWrite || 0 : 0,
+      input: hasTotals ? usageFieldSum("input", [ct]) : null,
+      output: hasTotals ? usageFieldSum("output", [ct]) : null,
+      reasoning: hasTotals ? usageFieldSum("reasoning", [ct]) : null,
+      cacheRead: hasTotals ? usageFieldSum("cacheRead", [ct]) : null,
+      cacheWrite: hasTotals ? usageFieldSum("cacheWrite", [ct]) : null,
       cost: chainCost,
       costMeasured: chainCost !== null &&
         !costCoverage.unknown &&
@@ -583,18 +581,15 @@ export function computeStats(chains, opts = {}) {
   // use the same round usage records as those tokens, excluding archived
   // failed-seat records so the displayed scope stays internally consistent.
   const filteredTotals = {
-    input: 0, output: 0, reasoning: 0, cacheRead: 0, cacheWrite: 0,
+    input: null, output: null, reasoning: null, cacheRead: null, cacheWrite: null,
     cost: null,
     costCoverage: { measured: 0, total: 0 },
   };
+  const filteredTokenUsages = [];
   for (const { round } of allRounds) {
     for (const usage of tokenUsageRecordsForRound(round)) {
       if (usage.available === true) {
-        filteredTotals.input += usage.input || 0;
-        filteredTotals.output += usage.output || 0;
-        filteredTotals.reasoning += usage.reasoning || 0;
-        filteredTotals.cacheRead += usage.cacheRead || 0;
-        filteredTotals.cacheWrite += usage.cacheWrite || 0;
+        filteredTokenUsages.push(usage);
       }
     }
     for (const usage of tokenUsageRecordsForRound(round)) {
@@ -605,6 +600,16 @@ export function computeStats(chains, opts = {}) {
       }
     }
   }
+  overallTotals.input = usageFieldSum("input", overallTokenUsages);
+  overallTotals.output = usageFieldSum("output", overallTokenUsages);
+  overallTotals.reasoning = usageFieldSum("reasoning", overallTokenUsages);
+  overallTotals.cacheRead = usageFieldSum("cacheRead", overallTokenUsages);
+  overallTotals.cacheWrite = usageFieldSum("cacheWrite", overallTokenUsages);
+  filteredTotals.input = usageFieldSum("input", filteredTokenUsages);
+  filteredTotals.output = usageFieldSum("output", filteredTokenUsages);
+  filteredTotals.reasoning = usageFieldSum("reasoning", filteredTokenUsages);
+  filteredTotals.cacheRead = usageFieldSum("cacheRead", filteredTokenUsages);
+  filteredTotals.cacheWrite = usageFieldSum("cacheWrite", filteredTokenUsages);
 
   // ---- model distribution ----
   const modelCounts = {};
@@ -1044,6 +1049,8 @@ export function renderChainStats(stats, opts = {}) {
   // usage is in-range, while chainTotals necessarily cover each active chain
   // in full (including rounds outside a date boundary).
   lines.push("Token and cost totals:");
+  const formatToken = (value) =>
+    typeof value === "number" && Number.isFinite(value) ? value : "n/a";
   const formatCost = (cost, coverage) => {
     const value = typeof cost === "number" && Number.isFinite(cost)
       ? `$${cost.toFixed(4)}`
@@ -1054,11 +1061,11 @@ export function renderChainStats(stats, opts = {}) {
 
   const t = stats.filteredTotals;
   const tokensLine = [
-    `  in-range round totals: input=${t.input}`,
-    `output=${t.output}`,
+    `  in-range round totals: input=${formatToken(t.input)}`,
+    `output=${formatToken(t.output)}`,
   ];
   if (t.reasoning) tokensLine.push(`reasoning=${t.reasoning}`);
-  if (t.cacheRead || t.cacheWrite) tokensLine.push(`cacheRead=${t.cacheRead} cacheWrite=${t.cacheWrite}`);
+  if (t.cacheRead || t.cacheWrite) tokensLine.push(`cacheRead=${formatToken(t.cacheRead)} cacheWrite=${formatToken(t.cacheWrite)}`);
   tokensLine.push(`cost=${formatCost(t.cost, t.costCoverage)}`);
   lines.push(tokensLine.join(", "));
 
@@ -1080,7 +1087,7 @@ export function renderChainStats(stats, opts = {}) {
   }
 
   const ot = stats.overallTotals;
-  lines.push(`  whole active-chain totals: input=${ot.input}, output=${ot.output}, cost=${formatCost(ot.cost, ot.costCoverage)}`);
+  lines.push(`  whole active-chain totals: input=${formatToken(ot.input)}, output=${formatToken(ot.output)}, cost=${formatCost(ot.cost, ot.costCoverage)}`);
   lines.push("");
 
   return lines.join("\n");

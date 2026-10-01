@@ -623,11 +623,19 @@ describe("codex stream parsing", () => {
     assert.equal(usage.available, true);
     assert.equal(usage.input, 10543);
     assert.equal(usage.output, 34);
-    assert.equal(usage.reasoning, 0);
+    assert.equal(usage.reasoning, null);
     assert.equal(usage.cacheRead, 5376);
     assert.equal(usage.cacheWrite, 0);
-    assert.equal(usage.total, 10543 + 5376 + 34);
-    assert.equal(usage.cost, 0);
+    assert.equal(usage.total, null);
+    assert.equal(usage.cost, null);
+  });
+
+  it("maps empty codex usage fields to null", () => {
+    const usage = mapCodexUsage({});
+    assert.equal(usage.available, true);
+    for (const key of ["input", "output", "reasoning", "cacheRead", "cacheWrite", "total", "cost"]) {
+      assert.equal(usage[key], null, key);
+    }
   });
 });
 
@@ -1011,7 +1019,7 @@ describe("codexDispatch (fake codex)", () => {
     assert.equal(job.usage.output, 34);
     assert.equal(job.usage.cacheRead, 5376);
     assert.equal(job.usage.cacheWrite, 0);
-    assert.equal(job.usage.total, 10543 + 5376 + 34);
+    assert.equal(job.usage.total, null);
     assert.equal(job.reasoningEffort, "high");
     assert.equal(job.sandboxPolicy, "read-only");
     assert.equal(job.codexCommandTool, true, "the built-in command tool remains — never claim tool-free");

@@ -3,6 +3,14 @@
 import { effectiveStatus } from "./chain-control.mjs";
 import { renderEscalationDecisions } from "./render-prompt.mjs";
 
+function formatUsageValue(value) {
+  return typeof value === "number" && Number.isFinite(value) ? value : "n/a";
+}
+
+function formatUsageCost(value) {
+  return typeof value === "number" && Number.isFinite(value) ? "$" + value : "n/a";
+}
+
 /**
  * The discard reason to show for a probe-sourced discard (kusabi #299).
  *
@@ -498,27 +506,27 @@ export function renderChainShow(chain, rounds, unreadable = [], control = null, 
     // Implement usage
     if (round.implementUsage?.available) {
       const u = round.implementUsage;
-      const parts = [`implement: ${u.input || 0} in / ${u.output || 0} out`];
+      const parts = [`implement: ${formatUsageValue(u.input)} in / ${formatUsageValue(u.output)} out`];
       if (u.reasoning) parts.push(`${u.reasoning} reasoning`);
-      if (u.cost !== undefined) parts.push(`cost=$${u.cost}`);
+      if (u.cost !== undefined) parts.push(`cost=${formatUsageCost(u.cost)}`);
       lines.push(`  ${parts.join(", ")}`);
     }
 
     // Review usage
     if (round.reviewUsage?.available) {
       const u = round.reviewUsage;
-      const parts = [`review: ${u.input || 0} in / ${u.output || 0} out`];
+      const parts = [`review: ${formatUsageValue(u.input)} in / ${formatUsageValue(u.output)} out`];
       if (u.reasoning) parts.push(`${u.reasoning} reasoning`);
-      if (u.cost !== undefined) parts.push(`cost=$${u.cost}`);
+      if (u.cost !== undefined) parts.push(`cost=${formatUsageCost(u.cost)}`);
       lines.push(`  ${parts.join(", ")}`);
     }
 
     // Strategist data (Decision 4)
     if (round.strategistUsage?.available) {
       const u = round.strategistUsage;
-      const parts = [`strategist: ${u.input || 0} in / ${u.output || 0} out`];
+      const parts = [`strategist: ${formatUsageValue(u.input)} in / ${formatUsageValue(u.output)} out`];
       if (u.reasoning) parts.push(`${u.reasoning} reasoning`);
-      if (u.cost !== undefined) parts.push(`cost=$${u.cost}`);
+      if (u.cost !== undefined) parts.push(`cost=${formatUsageCost(u.cost)}`);
       if (u.model) parts.push(`model=${u.model}`);
       lines.push(`  ${parts.join(", ")}`);
     }
@@ -564,12 +572,12 @@ export function renderChainShow(chain, rounds, unreadable = [], control = null, 
   // Chain-wide totals
   if (chain?.chainTotals) {
     const t = chain.chainTotals;
-    const parts = [`totals: ${t.input || 0} in / ${t.output || 0} out`];
+    const parts = [`totals: ${formatUsageValue(t.input)} in / ${formatUsageValue(t.output)} out`];
     if (t.reasoning) parts.push(`${t.reasoning} reasoning`);
     if (t.cacheRead !== undefined || t.cacheWrite !== undefined) {
-      parts.push(`cacheRead=${t.cacheRead || 0} cacheWrite=${t.cacheWrite || 0}`);
+      parts.push(`cacheRead=${formatUsageValue(t.cacheRead)} cacheWrite=${formatUsageValue(t.cacheWrite)}`);
     }
-    if (t.cost !== undefined) parts.push(`cost=$${t.cost}`);
+    if (t.cost !== undefined) parts.push(`cost=${formatUsageCost(t.cost)}`);
     lines.push(parts.join(", "));
   }
 

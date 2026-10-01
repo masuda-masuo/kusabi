@@ -11,6 +11,23 @@ import { renderReviewRecord } from "./render.mjs";
 import { writeJson } from "./state-paths.mjs";
 
 /**
+ * Sum one usage field across a list of usage objects, following the null-aware
+ * rule: skip non-numbers; the result is null when no input was a number.
+ *
+ * @param {string} field
+ * @param {Array<object|null|undefined>} usages
+ * @returns {number|null}
+ */
+export function usageFieldSum(field, usages) {
+  let total = null;
+  for (const usage of usages) {
+    if (!usage || typeof usage[field] !== "number" || !Number.isFinite(usage[field])) continue;
+    total = (total === null ? 0 : total) + usage[field];
+  }
+  return total;
+}
+
+/**
  * Compute chain-wide usage totals from all round records.
  *
  * Archived review seats (kusabi #248) count too: a seat that died mid-stream
@@ -19,23 +36,25 @@ import { writeJson } from "./state-paths.mjs";
  * chain's reported cost quietly cheaper than the run actually was.
  */
 export function computeChainTotals(records) {
-  const chainTotals = { input: 0, output: 0, reasoning: 0, cacheRead: 0, cacheWrite: 0, cost: 0 };
+  const usages = [];
   for (const rec of records) {
     const seatUsages = Array.isArray(rec.reviewSeatFailures)
       ? rec.reviewSeatFailures.flatMap(function (s) { return [s?.reviewUsage, s?.reviewFirstUsage]; })
       : [];
     for (const usage of [rec.implementUsage, rec.reviewUsage, rec.reviewFirstUsage, ...seatUsages]) {
       if (usage && usage.available) {
-        chainTotals.input += usage.input || 0;
-        chainTotals.output += usage.output || 0;
-        chainTotals.reasoning += usage.reasoning || 0;
-        chainTotals.cacheRead += usage.cacheRead || 0;
-        chainTotals.cacheWrite += usage.cacheWrite || 0;
-        chainTotals.cost += usage.cost || 0;
+        usages.push(usage);
       }
     }
   }
-  return chainTotals;
+  return {
+    input: usageFieldSum("input", usages),
+    output: usageFieldSum("output", usages),
+    reasoning: usageFieldSum("reasoning", usages),
+    cacheRead: usageFieldSum("cacheRead", usages),
+    cacheWrite: usageFieldSum("cacheWrite", usages),
+    cost: usageFieldSum("cost", usages),
+  };
 }
 
 /**

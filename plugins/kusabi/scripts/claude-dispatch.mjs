@@ -428,19 +428,21 @@ export function claudeFinalMessage(parsed) {
  *   total_cost_usd                 → cost
  *
  * @param {object} result
- * @returns {{ available: boolean, input: number, output: number, reasoning: number,
- *             cacheRead: number, cacheWrite: number, cost: number, model: string|null }}
+ * @returns {{ available: boolean, input: number|null, output: number|null, reasoning: number|null,
+ *             cacheRead: number|null, cacheWrite: number|null, total: number|null, cost: number|null,
+ *             model: string|null }}
  */
 export function mapClaudeUsage(result) {
   const u = result?.usage ?? {};
   return {
     available: true,
-    input: u.input_tokens ?? 0,
-    output: u.output_tokens ?? 0,
-    reasoning: 0,
-    cacheRead: u.cache_read_input_tokens ?? 0,
-    cacheWrite: u.cache_creation_input_tokens ?? 0,
-    cost: result?.total_cost_usd ?? 0,
+    input: typeof u.input_tokens === "number" ? u.input_tokens : null,
+    output: typeof u.output_tokens === "number" ? u.output_tokens : null,
+    reasoning: null,
+    cacheRead: typeof u.cache_read_input_tokens === "number" ? u.cache_read_input_tokens : null,
+    cacheWrite: typeof u.cache_creation_input_tokens === "number" ? u.cache_creation_input_tokens : null,
+    total: typeof u.total_tokens === "number" ? u.total_tokens : (typeof result?.total_tokens === "number" ? result.total_tokens : null),
+    cost: typeof result?.total_cost_usd === "number" ? result.total_cost_usd : (typeof u.total_cost_usd === "number" ? u.total_cost_usd : null),
     model: result?.model ?? null,
   };
 }
