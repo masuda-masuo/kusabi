@@ -73,43 +73,44 @@
 // the exact gpt-6-luna seat through the codex backend, the real Sol
 // dispatch runs the exact gpt-6.1-sol seat through it).
 
+import {
+  finalizeMission, defaultGuardedServeStop, defaultMissionNotify,
+} from "./luna-mission-finalize.mjs";
+export { writeRecommendationFile } from "./luna-mission-finalize.mjs";
+import {
+  briefValidators, innerBriefValidationReport, defaultBaseline,
+  defaultInvestigationDispatch, runInvestigation, prepareStampedBrief,
+  dispatchInnerChain, executeReadProbe, completeConsult, recordEscalation, finishRefusal,
+} from "./luna-mission-actions.mjs";
+export { renderFactSheet, defaultInvestigationDispatch } from "./luna-mission-actions.mjs";
+import { runGate } from "./luna-mission-gates.mjs";
+import { createMissionContext } from "./luna-mission-context.mjs";
+import {
+  recordError, recordBriefCorrection, recordProbe,
+  recordAttempt, persistRoundAuditColumns, persistCoordinatorEnvelope, persistCoordinatorOutput,
+} from "./luna-mission-ledger.mjs";
+
 import fs from "node:fs";
 import path from "node:path";
-import { stateDirFor, readJson, writeJson } from "./state-paths.mjs";
+import { readJson } from "./state-paths.mjs";
 import { parseCoordinatorOutput } from "./coordinator-parse.mjs";
 import { buildAuditEnvelope, truncateEvidenceText } from "./audit-envelope.mjs";
-import { hasSectionHeading, parseDeliverables, stampInnerBriefSignature, parseOrchestratorSignature } from "./brief-parsing.mjs";
+import { hasSectionHeading, parseDeliverables } from "./brief-parsing.mjs";
 import { mintChainId } from "./chain-phases.mjs";
-import { CODEX_SUPPORTED_MODELS } from "./codex-dispatch.mjs";
 import {
   loadCoordinatorSchema,
   renderCoordinatorContract,
   renderRemainingBudget,
   renderBriefCorrections,
-  sanitizeBriefCorrectionDetail,
   renderEvidenceContents,
 } from "./luna-prompt.mjs";
 import {
-  mintMissionId,
-  assertMissionIdShape,
-  createMission,
-  readMissionRecord,
-  saveMissionRecord,
-  finalizeMissionControl,
-  missionStopRequested,
-  rearmMissionControl,
-  TERMINAL_MISSION_DISPOSITIONS,
-} from "./mission-store.mjs";
-import {
-  evaluateMissionGate,
-  realSolDispatch,
   probeEvidenceText,
   missionEvidenceItems,
   resolveLastPostChain,
   renderPendingSolRework,
 } from "./luna-sol-gate.mjs";
 export { renderPendingSolRework } from "./luna-sol-gate.mjs";
-import { renderRecommendation } from "./render-recommendation.mjs";
 
 /** The exact default seats of #530: coordinator codex/gpt-6-luna, auditor codex/gpt-6.1-sol. */
 export const DEFAULT_COORDINATOR_SEAT = { provider: "codex", model: "gpt-6-luna" };
@@ -252,61 +253,6 @@ export function resolveMissionSeat(requested, def, role, allowSubstitute) {
 export function validChainBrief(brief) {
   if (typeof brief !== "string" || brief === "") return false;
   return hasSectionHeading(brief, "Deliverables") && parseDeliverables(brief).length > 0;
-}
-
-// The cheap downstream brief validators the pre-seam refusal reuses — the
-// SAME functions the chain dispatch runs before any job or chain state
-// exists (kusabi #289/#302/#386 lint and kusabi #250/#302 smoke), so a brief
-// the mission refuses could never have dispatched downstream either.  Both
-// modules are heavy command modules; they are loaded lazily like every other
-// command surface this driver reaches (codex-dispatch, chain-cmd, ...), so
-// the mission driver itself never pays their static import cost.
-let _briefValidators = null;
-async function briefValidators() {
-  if (_briefValidators === null) {
-    const [briefLint, guards] = await Promise.all([
-      import("./brief-lint.mjs"),
-      import("./chain-brief-guards.mjs"),
-    ]);
-    _briefValidators = {
-      briefLintReport: briefLint.briefLintReport,
-      smokeViolationReport: guards.smokeViolationReport,
-      BRIEF_REFUSED_CODE: guards.BRIEF_REFUSED_CODE,
-    };
-  }
-  return _briefValidators;
-}
-
-/**
- * The precise refusal detail for a STAMPED inner-chain brief that fails the
- * deterministic pre-seam validation, or null when it is clean.
- *
- * Decision 5: before any chain state or seam call, the driver reuses the
- * same cheap downstream parse/lint/smoke validators — briefLintReport (the
- * #289/#302/#386 dispatch lint: a non-empty `## Deliverables`, zero-entry
- * `## Smoke` / `## Frozen Tests` headings, and Frozen Tests path-only
- * entries) and smokeViolationReport (the #250 lossy-command / no-entries
- * smoke violations).  The container is passed so the implement-phase
- * container-source rule cannot fire — the mission already resolved the
- * container the inner chain runs in, so that rule is the outer dispatch's to
- * enforce, not the inner brief's.  The signature rule cannot fire either:
- * this runs on the STAMPED brief, which by construction carries the
- * canonical line 1.
- *
- * Purely a read of the brief text: no smoke command is pre-run and
- * smokeBaselineReport is never duplicated (the downstream baseline keeps its
- * own execution at dispatch).
- *
- * @param {string} brief       The STAMPED inner-chain brief text.
- * @param {string} container   The mission's container id.
- * @returns {Promise<string|null>}
- */
-async function innerBriefValidationReport(brief, container) {
-  const { briefLintReport, smokeViolationReport } = await briefValidators();
-  const lint = briefLintReport({ brief, phase: null, container, chain: true });
-  const smoke = smokeViolationReport(brief);
-  if (lint === null && smoke === null) return null;
-  return [lint, smoke].filter(Boolean).join("\n");
 }
 
 /**
@@ -665,29 +611,6 @@ async function realCoordinatorDispatch({ cwd, missionId, missionDir, brief, enve
 }
 
 /**
- * The mission's one-time outer serve cleanup, using the same guarded
- * semantics the chain driver applies to its own serve-stop: stop the shared
- * serve only when no live jobs remain (liveRunningJobs applies the same
- * fossil rule as cmdServeStop).  The mission passes `keepServe: true` to
- * inner chains, so the chains never stop the serve themselves — the mission
- * is the single outer serve owner and must stop it exactly once, after all
- * inner work, when it actually invoked inner chain work.
- *
- * Best-effort by contract: a cleanup failure must never mask the mission's
- * terminal result (the caller wraps this).
- *
- * @param {string} cwd
- * @param {string} stateDir
- */
-async function defaultGuardedServeStop(cwd, stateDir) {
-  const { liveRunningJobs, cmdServeStop } = await import("./job-control-cmd.mjs");
-  const hasRunning = liveRunningJobs(stateDir).length > 0;
-  if (!hasRunning) {
-    cmdServeStop(cwd);
-  }
-}
-
-/**
  * Evaluate the deterministic brief correction outcome against the no-progress
  * rule (two consecutive identical correction details) and the maxBriefCorrections
  * budget (kusabi #578, #579).
@@ -728,116 +651,6 @@ function evaluateBriefCorrectionOutcome(record, budget) {
   }
 
   return null;
-}
-
-/**
- * Write the host-facing recommendation artifact for a terminal mission.
- * `finish` writes the recommendation; `escalate_to_host` writes the handoff
- * reason; the failure dispositions write their disposition and, when present,
- * a reason (e.g. the budget bound that was exhausted, or the fail-closed
- * cause of a sol-blocked gate).
- */
-export function writeRecommendationFile(missionDir, {
-  missionId,
-  disposition,
-  recommendation,
-  reason,
-  gate,
-  lastCorrectionDetail,
-  lastCoordinatorErrorDetail,
-  record,
-  briefText,
-  stateDir,
-}) {
-  const chains = {};
-  const chainIds = new Set();
-  if (Array.isArray(record?.chains)) {
-    for (const cid of record.chains) {
-      if (typeof cid === "string" && cid) chainIds.add(cid);
-    }
-  }
-  if (Array.isArray(record?.attempts)) {
-    for (const att of record.attempts) {
-      const cid = att?.chainId ?? att?.postChain?.chainId;
-      if (typeof cid === "string" && cid) chainIds.add(cid);
-    }
-  }
-  const effectiveStateDir = stateDir ?? (missionDir ? path.dirname(path.dirname(missionDir)) : null);
-  const chainControls = {};
-  for (const cid of chainIds) {
-    let chainJson = null;
-    try {
-      if (effectiveStateDir) {
-        chainJson = readJson(path.join(effectiveStateDir, "chains", cid, "chain.json"));
-      }
-    } catch {
-      chainJson = null;
-    }
-    chains[cid] = (chainJson && typeof chainJson === "object") ? chainJson : null;
-
-    let controlJson = null;
-    try {
-      if (effectiveStateDir) {
-        controlJson = readJson(path.join(effectiveStateDir, "chains", cid, "control.json"));
-      }
-    } catch {
-      controlJson = null;
-    }
-    chainControls[cid] = (controlJson && typeof controlJson === "object") ? controlJson : null;
-  }
-
-  const gateEnvelopes = {};
-  const gateIds = new Set();
-  if (gate?.gateId) gateIds.add(gate.gateId);
-  if (Array.isArray(record?.auditGates)) {
-    for (const g of record.auditGates) {
-      if (g?.gateId) gateIds.add(g.gateId);
-    }
-  }
-  for (const gid of gateIds) {
-    let envJson = null;
-    try {
-      if (missionDir) {
-        envJson = readJson(path.join(missionDir, "evidence", `gate-envelope-${gid}.json`));
-      }
-    } catch {
-      envJson = null;
-    }
-    gateEnvelopes[gid] = (envJson && typeof envJson === "object") ? envJson : null;
-  }
-
-  const content = renderRecommendation({
-    missionId,
-    disposition,
-    recommendation,
-    reason,
-    gate,
-    lastCorrectionDetail,
-    lastCoordinatorErrorDetail,
-    record,
-    briefText,
-    chains,
-    chainControls,
-    gateEnvelopes,
-  });
-
-  fs.writeFileSync(path.join(missionDir, "recommendation.md"), content, "utf8");
-}
-
-/**
- * The default terminal mission notification (kusabi #531): one inbox record,
- * one deduplicated kaiba agenda row.  See chain-notify.notifyMissionTerminal.
- */
-async function defaultMissionNotify({ missionId, disposition, container, cwdLabel, stateDir, reason }) {
-  const { notifyMissionTerminal } = await import("./chain-notify.mjs");
-  return notifyMissionTerminal({
-    stateDir,
-    missionId,
-    disposition,
-    container,
-    cwdLabel,
-    reason,
-  });
 }
 
 /**
@@ -954,124 +767,6 @@ export function preflightBatchBudget(requests, record, budget) {
 }
 
 /**
- * Render the investigation fact sheet artifact (kusabi #591).
- *
- * @param {object} input
- * @param {string|null} input.jobId
- * @param {string|null} input.actualModel
- * @param {object|string|null} input.baseline
- * @param {string} input.body
- * @returns {string}
- */
-export function renderFactSheet({ jobId, actualModel, baseline, body }) {
-  let baselineText = "";
-  if (typeof baseline === "string") {
-    baselineText = baseline;
-  } else if (baseline && typeof baseline === "object") {
-    const lines = [];
-    if (baseline.collected !== undefined) {
-      lines.push(`Collected tests: ${baseline.collected ?? "unavailable"}`);
-    }
-    if (baseline.gates && typeof baseline.gates === "object") {
-      if (baseline.gates.gate_passed !== undefined) {
-        lines.push(`Verify gate: ${baseline.gates.gate_passed ? "passed" : "failed"}`);
-      }
-      if (baseline.gates.lint !== undefined) {
-        lines.push(`Lint violations: ${baseline.gates.lint ?? "unavailable"}`);
-      }
-      if (baseline.gates.types !== undefined) {
-        lines.push(`Type violations: ${baseline.gates.types ?? "unavailable"}`);
-      }
-    } else if (baseline.gates !== undefined) {
-      lines.push(`Gates: ${typeof baseline.gates === "string" ? baseline.gates : JSON.stringify(baseline.gates)}`);
-    }
-    baselineText = lines.join("\n");
-  }
-
-  return [
-    `# Investigation fact sheet`,
-    ``,
-    `job: ${jobId ?? "unknown"}`,
-    `seat: ${actualModel ?? "unknown"}`,
-    ``,
-    `## Baseline`,
-    baselineText,
-    ``,
-    `## Report`,
-    body ?? "",
-  ].join("\n");
-}
-
-/**
- * Default investigation dispatch: routes through the plan phase's configured
- * model chain against the mission container, using agent kusabi-plan (kusabi #591).
- * Never defaults to a codex seat (any id in `CODEX_SUPPORTED_MODELS`).
- *
- * @param {object} input
- * @param {string} input.cwd
- * @param {string} input.missionId
- * @param {string} input.missionDir
- * @param {string} input.brief
- * @param {string} input.container
- * @param {Function} [input._dispatch]
- * @returns {Promise<{ jobId: string, requestedModel: string, actualModel: string, body: string }>}
- */
-export async function defaultInvestigationDispatch({
-  cwd,
-  brief,
-  container,
-  _dispatch = null,
-}) {
-  const instruction =
-    "Produce a fact sheet for this task: relevant code locations as file:line, risks, and candidate deliverables (paths).";
-  const prompt = `${(brief ?? "").trim()}\n\n${instruction}`;
-  const flags = { phase: "plan", container };
-
-  const { dispatchTaskJob } = await import("./task-cmd.mjs");
-  const { job, resultText } = await dispatchTaskJob(
-    cwd,
-    { flags, text: prompt, _dispatch },
-    {
-      excludedBackends: ["codex"],
-      exclusionErrorPrefix: "investigation has no non-codex seat available",
-      excludedRouteReason: "codex backend excluded before investigation dispatch",
-    },
-  );
-
-  if (job.status !== "completed") {
-    throw new Error(job.error || `investigation job ${job.id} failed with status ${job.status}`);
-  }
-
-  const body = (resultText ?? "").trim();
-  if (!body) {
-    throw new Error(`investigation job ${job.id} returned empty report body`);
-  }
-
-  const firstTier = Array.isArray(job.modelChain?.[0]) ? job.modelChain[0][0] : job.modelChain?.[0];
-  const requestedModel = firstTier ?? job.modelEntry ?? "unknown";
-  const actualModel = job.modelEntry ?? requestedModel;
-
-  if (
-    CODEX_SUPPORTED_MODELS.some((seat) => actualModel.includes(seat)) ||
-    job.backend === "codex"
-  ) {
-    throw new Error(`investigation cannot route to a codex seat (${actualModel})`);
-  }
-
-  return {
-    jobId: job.id,
-    requestedModel,
-    actualModel,
-    body: resultText,
-  };
-}
-
-async function defaultBaseline({ container, callTool }) {
-  const { measureBaseline } = await import("./chain-ops.mjs");
-  return measureBaseline({ callTool, container });
-}
-
-/**
  * Run a luna mission to a terminal host-facing outcome.
  *
  * The driver is re-entrant: with `input.missionId` naming an EXISTING mission
@@ -1113,383 +808,40 @@ async function defaultBaseline({ container, callTool }) {
  * @returns {Promise<string>} a terminal summary line.
  */
 export async function runLunaMission(input) {
-  const { cwd, missionFile, brief, container } = input;
-  const inject = input.inject ?? {};
-  const coordinatorDispatch =
-    inject.coordinatorDispatch ??
-    ((args) => realCoordinatorDispatch(args));
-  const runChainLifecycle =
-    inject.runChainLifecycle ??
-    (await import("./chain-cmd.mjs")).runChainLifecycle;
-  const callTool = inject.callTool ?? (await import("./sunaba-rpc.mjs")).callTool;
-  const guardedServeStop = inject.guardedServeStop ?? defaultGuardedServeStop;
-  const solDispatch = inject.solDispatch ?? realSolDispatch;
-  const notifyMissionTerminal = inject.notifyMissionTerminal ?? defaultMissionNotify;
-  const baselineSeam = inject.baseline ?? ((args) => defaultBaseline({ ...args, callTool }));
-  const investigationDispatchSeam =
-    inject.investigationDispatch ??
-    ((args) => defaultInvestigationDispatch(args));
-
-  // ---- exact seat resolution (refused BEFORE mission creation) ----
-  const coordinator = resolveMissionSeat(input.coordinator, DEFAULT_COORDINATOR_SEAT, "coordinator", input.allowSubstitute);
-  const auditor = resolveMissionSeat(input.auditor, DEFAULT_AUDITOR_SEAT, "auditor", input.allowSubstitute);
-
-  // ---- mission identity (refused before any filesystem write) ----
-  const missionId = input.missionId ?? mintMissionId();
-  assertMissionIdShape(missionId);
-
-  const budget = { ...DEFAULT_BUDGET, ...(input.budget ?? {}) };
-  const stateDir = stateDirFor(cwd);
-  const missionDir = path.join(stateDir, "missions", missionId);
-  const resuming = fs.existsSync(missionDir);
-
-  if (!resuming) {
-    createMission(stateDir, {
-      missionId,
-      container,
-      missionFile,
-      pid: process.pid,
-      coordinator,
-      auditor,
-    });
-  }
-  let record = readMissionRecord(missionDir);
-  if (!record || typeof record !== "object") {
-    throw new Error(`mission record missing or unreadable for ${missionId} (${missionDir}/mission.json)`);
-  }
-
-  if (resuming) {
-    // A mission that already reached a terminal disposition has already
-    // notified and must never dispatch again (luna-resume refuses terminal
-    // missions; this guard covers direct driver calls).  The one exception is
-    // a sol-blocked mission reopened by a recorded human override —
-    // cmdLunaResume clears the terminal disposition in that case BEFORE the
-    // driver runs, so a terminal disposition here means "already finished".
-    if (
-      typeof record.disposition === "string" &&
-      TERMINAL_MISSION_DISPOSITIONS.has(record.disposition)
-    ) {
-      return (
-        `mission ${missionId}: disposition=${record.disposition} ` +
-        `(already terminal; nothing dispatched)`
-      );
-    }
-    rearmMissionControl(missionDir);
-  }
-
-  // Persist the effective budget on the record so show/wait can explain a
-  // budget-exhausted termination (the bound and the counts that hit it).
-  record = { ...record, budget: { ...budget }, missionDir };
-  saveMissionRecord(missionDir, record);
-  // The coordinator error cap reuses the attempts budget: a coordinator that
-  // cannot produce an executable stream within the mission's bounded attempts
-  // budget fails closed as `coordinator-failed`.
-  const coordinatorErrorCap = Math.max(1, budget.maxAttempts);
-
-  // The next dispatch continues the persisted evidence numbering (resume):
-  // envelope files are named envelope-<N>.json, so the count of existing ones
-  // is the deterministic continuation point.
-  const evidenceDir = path.join(missionDir, "evidence");
-  let dispatchIndex = fs.existsSync(evidenceDir)
-    ? fs.readdirSync(evidenceDir).filter((f) => /^envelope-\d+\.json$/.test(f)).length
-    : 0;
+  const ctx = await createMissionContext(input, {
+    realCoordinatorDispatch, defaultGuardedServeStop, defaultMissionNotify,
+    defaultBaseline, defaultInvestigationDispatch, resolveMissionSeat,
+    DEFAULT_COORDINATOR_SEAT, DEFAULT_AUDITOR_SEAT, DEFAULT_BUDGET, capProbeOutput,
+  });
+  if (ctx.alreadyTerminal !== undefined) return ctx.alreadyTerminal;
+  const {
+    cwd, missionFile, brief, container, coordinatorDispatch,
+    callTool,
+    coordinator, auditor, missionId, budget, stateDir, missionDir,
+    coordinatorErrorCap, stopRequested,
+  } = ctx;
 
   let outcome = null; // { disposition, recommendation, handoffReason, reason }
   // True once the seam was invoked for a run_chain / rework_chain request —
   // the mission then owns the outer serve (keepServe: true) and must stop it
   // once.  A chain that failed inside the seam still touched the serve, so it
   // still counts; a mission that never invoked a chain has nothing to clean.
-  let invokedInnerChain = false;
-  let invokedInvestigation = false;
+  ctx.invokedInnerChain = false;
+  ctx.invokedInvestigation = false;
 
-  // The stop predicate keys off the recorded stop request (control.json
-  // stopRequestedAt).  It is checked immediately before every coordinator,
-  // Sol, and inner-chain dispatch and again after an inner chain returns.
-  const stopRequested = () => missionStopRequested(missionDir);
-
-  const recordError = (detail) => {
-    record = {
-      ...record,
-      coordinatorErrors: (record.coordinatorErrors ?? 0) + 1,
-      coordinatorErrorsDetails: [
-        ...(Array.isArray(record.coordinatorErrorsDetails) ? record.coordinatorErrorsDetails : []),
-        { at: new Date().toISOString(), detail },
-      ],
-    };
-    saveMissionRecord(missionDir, record);
-  };
-  // A deterministic pre-flight refusal of a Luna-authored brief is BOTH a
-  // coordinator error and a brief correction (kusabi #532 criterion 2): the
-  // counters agree by construction — one refusal, one of each — so a
-  // pure-brief-correction mission never double-counts elsewhere.  The
-  // correction is ALSO persisted as a structured `briefCorrectionsDetails`
-  // entry carrying the timestamp, the ORIGINAL coordinator action and the
-  // deterministic validator detail (sanitized + bounded by the shared
-  // luna-prompt transform, so the persisted record and the rendered feedback
-  // can never disagree), which the bounded renderer exposes to the next
-  // coordinator turn (kusabi #553 follow-up).
-  const recordBriefCorrection = (action, detail) => {
-    const sanitized = sanitizeBriefCorrectionDetail(detail);
-    const at = new Date().toISOString();
-    record = {
-      ...record,
-      briefCorrections: (record.briefCorrections ?? 0) + 1,
-      briefCorrectionsDetails: [
-        ...(Array.isArray(record.briefCorrectionsDetails) ? record.briefCorrectionsDetails : []),
-        { at, action, detail: sanitized },
-      ],
-    };
-    saveMissionRecord(missionDir, record);
-  };
-  // Only interventions the system can OBSERVE are recorded (kusabi #532
-  // criterion 2): escalate_to_host, overrides, and explicit manifest entries.
-  // Manual container work is never inferred.
-  const recordHostIntervention = (detail) => {
-    record = {
-      ...record,
-      hostInterventions: (record.hostInterventions ?? 0) + 1,
-      hostInterventionDetails: [
-        ...(Array.isArray(record.hostInterventionDetails) ? record.hostInterventionDetails : []),
-        { at: new Date().toISOString(), detail },
-      ],
-    };
-    saveMissionRecord(missionDir, record);
-  };
-  const recordProbe = (req, output) => {
-    const capped = capProbeOutput(output);
-    record = {
-      ...record,
-      probes: [
-        ...(Array.isArray(record.probes) ? record.probes : []),
-        {
-          action: "read_probe",
-          tool: req.tool,
-          path: req.path,
-          output: capped.output,
-          outputBytes: capped.outputBytes,
-          truncated: capped.truncated,
-          omittedBytes: capped.omittedBytes,
-          truncation: capped.truncation,
-          at: new Date().toISOString(),
-        },
-      ],
-    };
-    saveMissionRecord(missionDir, record);
-  };
-  const recordAttempt = ({ index, kind, chainId, brief: attemptBrief, output, postChain }) => {
-    const attemptRecord = {
-      index,
-      kind,
-      chainId,
-      brief: attemptBrief,
-      status: "completed",
-      output,
-      ...(postChain ? { postChain } : {}),
-      at: new Date().toISOString(),
-    };
-    record = {
-      ...record,
-      attempts: [
-        ...(Array.isArray(record.attempts) ? record.attempts : []),
-        attemptRecord,
-      ],
-      chains: [...(Array.isArray(record.chains) ? record.chains : []), chainId],
-    };
-    saveMissionRecord(missionDir, record);
-    const attemptFile = path.join(missionDir, "attempts", `attempt-${index}.json`);
-    fs.mkdirSync(path.dirname(attemptFile), { recursive: true });
-    writeJson(attemptFile, record.attempts[record.attempts.length - 1]);
-  };
-  const recordConsult = (req) => {
-    record = {
-      ...record,
-      consults: [
-        ...(Array.isArray(record.consults) ? record.consults : []),
-        { action: "consult_sol", reason: req.reason ?? "", at: new Date().toISOString() },
-      ],
-    };
-    saveMissionRecord(missionDir, record);
-  };
-  // Persist a freshly evaluated gate set (archival + the new gate record)
-  // BEFORE any further observable dispatch, so resume continues from a
-  // durable boundary.
-  const recordGates = (gates) => {
-    record = { ...record, auditGates: gates };
-    saveMissionRecord(missionDir, record);
-  };
-
-  /**
-   * Mirror a fired post-chain gate's audit columns onto the durable inner
-   * chain round the gate judged (kusabi #532 adjudication finding 5).  The
-   * round record lives in TWO durable mirrors \u2014 `round-<N>.json` and the
-   * terminal entry of `chain.json`'s `records` array (the array the metrics
-   * ingest reads) \u2014 and both are updated through the existing safe
-   * read/update/write boundary (readJson / atomic writeJson).  The mission
-   * gate record stays authoritative; this is a best-effort mirror that never
-   * changes the gate decision.
-   *
-   * Only when the target round is POSITIVELY identified: the chain's
-   * terminal record must be an object with a numeric `round`, and both
-   * `chain.json` and the `round-<N>.json` file must exist and parse.
-   * Absent or unreadable legacy records are left untouched.
-   */
-  const persistRoundAuditColumns = ({ chainId, gate, outcome }) => {
-    if (!gate || typeof gate !== "object") return;
-    const chainDir = path.join(stateDir, "chains", chainId);
-    const chainJson = readJson(path.join(chainDir, "chain.json"));
-    if (!chainJson || typeof chainJson !== "object") return;
-    const records = Array.isArray(chainJson.records) ? chainJson.records : [];
-    const terminal = records[records.length - 1];
-    if (!terminal || typeof terminal !== "object" || typeof terminal.round !== "number") return;
-    const roundRecord = readJson(path.join(chainDir, `round-${terminal.round}.json`));
-    if (!roundRecord || typeof roundRecord !== "object") return;
-
-    const auditColumns = {
-      auditVerdict: typeof gate.verdict === "string" ? gate.verdict : null,
-      auditBlocked: outcome === "sol-blocked" || outcome === "block",
-      auditShadowDisposition:
-        typeof gate.shadowDisposition === "string" ? gate.shadowDisposition : null,
-    };
-    writeJson(path.join(chainDir, `round-${terminal.round}.json`), {
-      ...roundRecord,
-      ...auditColumns,
-    });
-    writeJson(path.join(chainDir, "chain.json"), {
-      ...chainJson,
-      records: records.map((r, i) =>
-        i === records.length - 1 ? { ...r, ...auditColumns } : r,
-      ),
-    });
-  };
-
-  /**
-   * The single gate-evaluation helper: runs evaluateMissionGate, persists the
-   * gate records, and returns the outcome.  A "cancelled" outcome means a
-   * stop request landed before the Sol dispatch.
-   */
-  const runGate = async ({ phase, reason }) => {
-    const result = await evaluateMissionGate({
-      cwd,
-      missionId,
-      missionDir,
-      brief,
-      container,
-      auditor,
-      allowSubstitute: input.allowSubstitute,
-      sampling: input.sampling,
-      phase,
-      reason: reason ?? null,
-      record,
-      solDispatch,
-      stopRequested,
-      maxRework: budget.maxRework ?? DEFAULT_BUDGET.maxRework,
-    });
-    if (result.fired) recordGates(result.gates);
-    return result;
-  };
-
-  const alreadyCompleted = record.investigation?.status === "completed";
+  const alreadyCompleted = ctx.record.investigation?.status === "completed";
 
   if (!alreadyCompleted && outcome === null) {
     if (stopRequested()) {
       outcome = { disposition: "cancelled", recommendation: null, handoffReason: null, reason: "stop requested" };
     } else {
-      const startedAt = new Date().toISOString();
-      const failInvestigation = (cause, partial = {}) => {
-        const finishedAt = new Date().toISOString();
-        record = {
-          ...record,
-          investigation: {
-            status: "failed",
-            jobId: partial.jobId ?? null,
-            phase: "plan",
-            requestedModel: partial.requestedModel ?? null,
-            actualModel: partial.actualModel ?? null,
-            startedAt,
-            finishedAt,
-            factSheetPath: null,
-            baseline: partial.baseline ?? null,
-            error: cause,
-          },
-        };
-        saveMissionRecord(missionDir, record);
-        recordHostIntervention(`investigation failed: ${cause}`);
+      const investigation = await runInvestigation(ctx);
+      if (investigation !== null) {
         outcome = {
           disposition: "host-handoff",
           recommendation: null,
-          handoffReason: `investigation failed: ${cause}`,
+          handoffReason: investigation.handoffReason,
         };
-      };
-
-      let baselineRes = null;
-      try {
-        baselineRes = await baselineSeam({ cwd, container });
-        if (!baselineRes || typeof baselineRes !== "object") {
-          throw new Error("baseline measurement returned empty or invalid result");
-        }
-      } catch (err) {
-        const cause = err?.message ?? String(err);
-        failInvestigation(cause);
-      }
-
-      if (outcome === null) {
-        let dispatchRes = null;
-        if (!investigationDispatchSeam?._isStub) {
-          invokedInvestigation = true;
-        }
-        try {
-          dispatchRes = await investigationDispatchSeam({
-            cwd,
-            missionId,
-            missionDir,
-            brief,
-            container,
-          });
-          if (!dispatchRes || typeof dispatchRes !== "object") {
-            throw new Error("investigation dispatch returned invalid or empty result");
-          }
-          if (typeof dispatchRes.body !== "string" || dispatchRes.body.trim() === "") {
-            throw new Error("investigation returned empty report body");
-          }
-        } catch (err) {
-          const cause = err?.message ?? String(err);
-          failInvestigation(cause, {
-            jobId: dispatchRes?.jobId,
-            requestedModel: dispatchRes?.requestedModel,
-            actualModel: dispatchRes?.actualModel,
-            baseline: baselineRes,
-          });
-        }
-
-        if (outcome === null) {
-          const finishedAt = new Date().toISOString();
-          const factSheetRelative = "evidence/fact-sheet.md";
-          const factSheetFull = path.join(missionDir, factSheetRelative);
-          const factSheetContent = renderFactSheet({
-            jobId: dispatchRes.jobId,
-            actualModel: dispatchRes.actualModel,
-            baseline: baselineRes,
-            body: dispatchRes.body,
-          });
-          fs.mkdirSync(path.dirname(factSheetFull), { recursive: true });
-          fs.writeFileSync(factSheetFull, factSheetContent, "utf8");
-
-          record = {
-            ...record,
-            investigation: {
-              status: "completed",
-              jobId: dispatchRes.jobId,
-              phase: "plan",
-              requestedModel: dispatchRes.requestedModel,
-              actualModel: dispatchRes.actualModel,
-              startedAt,
-              finishedAt,
-              factSheetPath: factSheetRelative,
-              baseline: baselineRes,
-            },
-          };
-          saveMissionRecord(missionDir, record);
-        }
       }
     }
   }
@@ -1505,17 +857,17 @@ export async function runLunaMission(input) {
     }
 
     // A coordinator that burns the bounded error budget fails closed.
-    if ((record.coordinatorErrors ?? 0) >= coordinatorErrorCap) {
+    if ((ctx.record.coordinatorErrors ?? 0) >= coordinatorErrorCap) {
       outcome = {
         disposition: "coordinator-failed",
         recommendation: null,
         handoffReason: null,
-        reason: `coordinator error budget exhausted (${record.coordinatorErrors ?? 0}/${coordinatorErrorCap})`,
+        reason: `coordinator error budget exhausted (${ctx.record.coordinatorErrors ?? 0}/${coordinatorErrorCap})`,
       };
       break;
     }
 
-    dispatchIndex += 1;
+    ctx.dispatchIndex += 1;
     // The envelope is rebuilt for EVERY dispatch from the current record, so
     // the next coordinator request is bound to current evidence and prior
     // outcomes (refreshed after every observable action).
@@ -1529,12 +881,12 @@ export async function runLunaMission(input) {
         coordinator,
         auditor,
         allowSubstitute: input.allowSubstitute,
-        record,
-        dispatchIndex,
+        record: ctx.record,
+        dispatchIndex: ctx.dispatchIndex,
       });
     } catch (err) {
       const detail = `evidence envelope build failed: ${err.message}`;
-      recordError(detail);
+      recordError(ctx, detail);
       const firstLine = detail.split(/\r?\n/)[0];
       outcome = {
         disposition: "coordinator-failed",
@@ -1545,7 +897,7 @@ export async function runLunaMission(input) {
       };
       break;
     }
-    writeJson(path.join(missionDir, "evidence", `envelope-${dispatchIndex}.json`), envelope);
+    persistCoordinatorEnvelope(ctx, envelope);
 
     // A thrown dispatch must not leave the mission/control permanently
     // running: it is recorded as a coordinator error and terminates the
@@ -1561,13 +913,13 @@ export async function runLunaMission(input) {
         brief,
         container,
         envelope,
-        record: { ...record },
+        record: { ...ctx.record },
         coordinator,
         auditor,
       });
     } catch (err) {
       const detail = `coordinator dispatch failed: ${err.message}`;
-      recordError(detail);
+      recordError(ctx, detail);
       const firstLine = detail.split(/\r?\n/)[0];
       outcome = {
         disposition: "coordinator-failed",
@@ -1578,8 +930,7 @@ export async function runLunaMission(input) {
       };
       break;
     }
-    fs.mkdirSync(path.join(missionDir, "evidence"), { recursive: true });
-    fs.writeFileSync(path.join(missionDir, "evidence", `coordinator-output-${dispatchIndex}.txt`), String(rawOutput ?? ""), "utf8");
+    persistCoordinatorOutput(ctx, rawOutput);
 
     const parsed = parseCoordinatorOutput(String(rawOutput ?? ""), { envelopeSha256: envelope.envelope_sha256 });
     if (!parsed.valid) {
@@ -1592,7 +943,7 @@ export async function runLunaMission(input) {
       // "incomplete 0 rejected, 0 malformed" hid a truncated-record at the
       // `}{` join of concatenated codex messages (mission-mudmmnaub60f0b20).
       const first = parsed.errors[0];
-      recordError(
+      recordError(ctx,
         `coordinator stream invalid: ${parsed.incomplete ? "incomplete" : ""} ` +
         `${parsed.rejectedCount} rejected, ${parsed.malformedCount} malformed record(s)` +
         (first ? `; first: ${first.reason} at line ${first.line}` : "; no records"),
@@ -1613,7 +964,7 @@ export async function runLunaMission(input) {
       outcome = { disposition: "cancelled", recommendation: null, handoffReason: null, reason: "stop requested" };
       break mainLoop;
     }
-    const preflight = preflightBatchBudget(parsed.requests, record, budget);
+    const preflight = preflightBatchBudget(parsed.requests, ctx.record, budget);
     if (!preflight.ok) {
       outcome = {
         disposition: "budget-exhausted",
@@ -1634,20 +985,20 @@ export async function runLunaMission(input) {
       }
       switch (req.action) {
         case "read_probe": {
-          const finishedChains = Array.isArray(record.chains) ? record.chains.length : 0;
+          const finishedChains = Array.isArray(ctx.record.chains) ? ctx.record.chains.length : 0;
           if (finishedChains === 0) {
-            recordError(
+            recordError(ctx,
               "read_probe refused: no inner chain has finished in this mission (use the fact sheet in the evidence envelope, or run_chain)",
             );
             continue;
           }
-          const probeCount = Array.isArray(record.probes) ? record.probes.length : 0;
+          const probeCount = Array.isArray(ctx.record.probes) ? ctx.record.probes.length : 0;
           if (probeCount >= budget.maxProbes) {
             outcome = { disposition: "budget-exhausted", recommendation: null, handoffReason: null };
             break mainLoop;
           }
           if (!PROBE_TOOL_ALLOWLIST.has(req.tool)) {
-            recordError(`read_probe refused: tool "${req.tool}" is not on the driver allow-list`);
+            recordError(ctx, `read_probe refused: tool "${req.tool}" is not on the driver allow-list`);
             continue;
           }
           // Per-tool required-field enforcement AT THE DRIVER BOUNDARY, before
@@ -1657,51 +1008,32 @@ export async function runLunaMission(input) {
           // never fabricates a missing value.
           const missingFields = probeRequestMissingFields(req);
           if (missingFields.length > 0) {
-            recordError(
+            recordError(ctx,
               `read_probe refused: ${req.tool} requires ${missingFields.map((f) => `a non-empty \`${f}\``).join(" and ")}`,
             );
             continue;
           }
           let output;
           try {
-            output = await callTool(req.tool, probeArgsFor(req.tool, container, req));
+            output = await executeReadProbe(ctx, req, probeArgsFor);
           } catch (err) {
-            recordError(`read_probe failed: ${err.message}`);
+            recordError(ctx, `read_probe failed: ${err.message}`);
             continue;
           }
-          recordProbe(req, output);
+          recordProbe(ctx, req, output);
           continue;
         }
         case "run_chain":
         case "rework_chain": {
-          const attemptCount = Array.isArray(record.attempts) ? record.attempts.length : 0;
-          const chainCount = Array.isArray(record.chains) ? record.chains.length : 0;
+          const attemptCount = Array.isArray(ctx.record.attempts) ? ctx.record.attempts.length : 0;
+          const chainCount = Array.isArray(ctx.record.chains) ? ctx.record.chains.length : 0;
           // A budget breach terminates the mission and never creates another
           // chain.
           if (attemptCount >= budget.maxAttempts || chainCount >= budget.maxChains) {
             outcome = { disposition: "budget-exhausted", recommendation: null, handoffReason: null };
             break mainLoop;
           }
-          // Deterministic inner-brief signature (decisions 1-3): before every
-          // run_chain / rework_chain the driver owns the metadata — it strips
-          // any `Orchestrator:` line in the first five lines of the inner
-          // brief and prepends exactly one canonical line 1.  The canonical
-          // values are resolved here, never computed by the stamper: model =
-          // the ACTUAL coordinator seat (the persisted record's on resume,
-          // never the requested/default spelling), session = this mission id,
-          // date = the UTC YYYY-MM-DD of THIS dispatch (inject.now when
-          // provided, the current clock by default).  The stamped text is
-          // what the seam receives and what the parsed `orchestrator`
-          // attribution is read back from.
-          const stampModel = record?.coordinator?.actual ?? coordinator.actual;
-          const stampNow =
-            typeof inject.now === "function" ? inject.now() : new Date();
-          const stampDate = new Date(stampNow).toISOString().slice(0, 10);
-          const stampedBrief = stampInnerBriefSignature(req.brief ?? "", {
-            model: stampModel,
-            session: missionId,
-            date: stampDate,
-          });
+          const stampedBrief = prepareStampedBrief(ctx, req);
           if (!validChainBrief(stampedBrief) || (await innerBriefValidationReport(stampedBrief, container)) !== null) {
             // Decision 5: the pre-seam refusal is a BRIEF CORRECTION \u2014 one
             // precise defect named (never a generic message), no chain state
@@ -1712,8 +1044,8 @@ export async function runLunaMission(input) {
               report === null
                 ? `${req.action} refused: the inner chain brief fails deterministic validation`
                 : `${req.action} refused: the inner chain brief fails deterministic validation\n${report}`;
-            recordBriefCorrection(req.action, detail);
-            const correctionOutcome = evaluateBriefCorrectionOutcome(record, budget);
+            recordBriefCorrection(ctx, req.action, detail);
+            const correctionOutcome = evaluateBriefCorrectionOutcome(ctx.record, budget);
             if (correctionOutcome) {
               outcome = correctionOutcome;
               break mainLoop;
@@ -1723,7 +1055,7 @@ export async function runLunaMission(input) {
           }
           // PRE-DISPATCH GATE: the deterministic driver, never Luna, decides
           // whether the Sol seat must judge this dispatch.
-          const pre = await runGate({ phase: "pre-dispatch", reason: null });
+          const pre = await runGate(ctx, { phase: "pre-dispatch", reason: null });
           if (pre.outcome === "cancelled") {
             outcome = { disposition: "cancelled", recommendation: null, handoffReason: null, reason: "stop requested" };
             break mainLoop;
@@ -1742,7 +1074,7 @@ export async function runLunaMission(input) {
             // The audit demands rework before a fresh chain: the request is
             // refused (counted as a coordinator error, so a coordinator that
             // keeps proposing chains instead of a rework_chain fails closed).
-            recordError(`${req.action} refused: pre-dispatch Sol gate ${pre.gate.gateId} returned rework`);
+            recordError(ctx, `${req.action} refused: pre-dispatch Sol gate ${pre.gate.gateId} returned rework`);
             continue;
           }
           // Stop check immediately before the inner-chain dispatch (a stop
@@ -1752,39 +1084,23 @@ export async function runLunaMission(input) {
             break mainLoop;
           }
           const chainId = mintChainId();
-          invokedInnerChain = true;
+          ctx.invokedInnerChain = true;
           let chainOutput;
           try {
-            chainOutput = await runChainLifecycle(
-              cwd,
-              {
-                // The inner chain is linked to the mission (kusabi #532
-                // criterion 11): missionId is emitted on chain.json only in
-                // Luna mode — plain chains never carry the key.
-                flags: { container, "chain-id": chainId, keepServe: true, missionId },
-                // Decision 3: the seam receives the STAMPED brief (canonical
-                // line 1, never the raw Luna-authored text) and the parsed
-                // canonical signature as a non-null `orchestrator`
-                // attribution, so inner-chain attribution matches the
-                // stamped brief exactly.
-                text: stampedBrief,
-                orchestrator: parseOrchestratorSignature(stampedBrief),
-              },
-              {},
-            );
+            chainOutput = await dispatchInnerChain(ctx, stampedBrief, chainId);
           } catch (err) {
             const { BRIEF_REFUSED_CODE } = await briefValidators();
             if (err?.code === BRIEF_REFUSED_CODE) {
               const detail = `${req.action} refused by the chain seam: ${err.message}`;
-              recordBriefCorrection(req.action, detail);
-              const correctionOutcome = evaluateBriefCorrectionOutcome(record, budget);
+              recordBriefCorrection(ctx, req.action, detail);
+              const correctionOutcome = evaluateBriefCorrectionOutcome(ctx.record, budget);
               if (correctionOutcome) {
                 outcome = correctionOutcome;
                 break mainLoop;
               }
               continue;
             }
-            recordError(`${req.action} execution failed for chain ${chainId}: ${err.message}`);
+            recordError(ctx, `${req.action} execution failed for chain ${chainId}: ${err.message}`);
             continue;
           }
           const postChain = await collectPostChainEvidence({
@@ -1793,8 +1109,8 @@ export async function runLunaMission(input) {
             container,
             callTool,
           });
-          recordAttempt({
-            index: (Array.isArray(record.attempts) ? record.attempts.length : 0) + 1,
+          recordAttempt(ctx, {
+            index: (Array.isArray(ctx.record.attempts) ? ctx.record.attempts.length : 0) + 1,
             kind: req.action,
             chainId,
             brief: req.brief,
@@ -1808,13 +1124,13 @@ export async function runLunaMission(input) {
             break mainLoop;
           }
           // POST-CHAIN GATE: after each inner-chain terminal result.
-          const post = await runGate({ phase: "post-chain", reason: null });
+          const post = await runGate(ctx, { phase: "post-chain", reason: null });
           // The gate judged THIS inner chain: mirror its audit columns onto
           // the durable round the chain just completed (best-effort \u2014 a
           // missing/unreadable legacy round stays untouched; the mission gate
           // record remains authoritative).  Runs before any outcome branch so
           // clear / rework / block / fail-closed all leave the same trace.
-          persistRoundAuditColumns({ chainId, gate: post.gate, outcome: post.outcome });
+          persistRoundAuditColumns(ctx, { chainId, gate: post.gate, outcome: post.outcome });
           if (post.outcome === "cancelled") {
             outcome = { disposition: "cancelled", recommendation: null, handoffReason: null, reason: "stop requested" };
             break mainLoop;
@@ -1840,7 +1156,7 @@ export async function runLunaMission(input) {
           // gate (the pre-accept T11 gate still fires independently).  A
           // consult-only coordinator consumes no chain/probe budget, so the
           // consult bound is what stops it.
-          const consultCount = Array.isArray(record.consults) ? record.consults.length : 0;
+          const consultCount = Array.isArray(ctx.record.consults) ? ctx.record.consults.length : 0;
           if (consultCount >= budget.maxConsults) {
             outcome = {
               disposition: "budget-exhausted",
@@ -1852,7 +1168,7 @@ export async function runLunaMission(input) {
             };
             break mainLoop;
           }
-          const consult = await runGate({ phase: "consult", reason: req.reason ?? "" });
+          const consult = await runGate(ctx, { phase: "consult", reason: req.reason ?? "" });
           if (consult.outcome === "cancelled") {
             outcome = { disposition: "cancelled", recommendation: null, handoffReason: null, reason: "stop requested" };
             break mainLoop;
@@ -1867,7 +1183,7 @@ export async function runLunaMission(input) {
             };
             break mainLoop;
           }
-          recordConsult(req);
+          completeConsult(ctx, req);
           continue;
         }
         case "escalate_to_host": {
@@ -1875,9 +1191,7 @@ export async function runLunaMission(input) {
           // behind an approval gate (escalate_to_host must always be able to
           // write the host recommendation).  The handoff IS an observed host
           // intervention and is recorded explicitly (kusabi #532 criterion 2).
-          recordHostIntervention(
-            `escalate_to_host: ${req.reason ?? "host judgement required"}`,
-          );
+          recordEscalation(ctx, req);
           outcome = {
             disposition: "host-handoff",
             recommendation: null,
@@ -1886,14 +1200,15 @@ export async function runLunaMission(input) {
           break mainLoop;
         }
         case "finish": {
-          if (!RECOMMENDATION_VOCABULARY.has(req.recommendation)) {
-            recordError(`finish refused: recommendation "${req.recommendation}" is outside the closed vocabulary`);
+          const finishError = finishRefusal(req, RECOMMENDATION_VOCABULARY);
+          if (finishError !== null) {
+            recordError(ctx, finishError);
             continue;
           }
           // The terminal mandatory gate (T11) applies to approval-shaped
           // `recommend-accept` only; recommend-escalate is not gated.
           if (req.recommendation === "recommend-accept") {
-            const acceptGate = await runGate({ phase: "pre-accept", reason: null });
+            const acceptGate = await runGate(ctx, { phase: "pre-accept", reason: null });
             if (acceptGate.outcome === "cancelled") {
               outcome = { disposition: "cancelled", recommendation: null, handoffReason: null, reason: "stop requested" };
               break mainLoop;
@@ -1913,7 +1228,7 @@ export async function runLunaMission(input) {
               // the finish is refused and the coordinator gets another chance
               // to propose a bounded rework_chain (or the rework bound fails
               // the mission closed).
-              recordError(`finish recommend-accept refused: pre-accept Sol gate ${acceptGate.gate?.gateId} returned rework`);
+              recordError(ctx, `finish recommend-accept refused: pre-accept Sol gate ${acceptGate.gate?.gateId} returned rework`);
               continue;
             }
           }
@@ -1928,101 +1243,11 @@ export async function runLunaMission(input) {
           // Unreachable: the frozen parser only accepts the six verbs.  A
           // defensive fail-closed path — the mission must never execute a
           // verb the driver does not know.
-          recordError(`request action "${req.action}" is outside the driver's execution set`);
+          recordError(ctx, `request action "${req.action}" is outside the driver's execution set`);
           continue;
       }
     }
   }
 
-  // ---- terminal finalisation (sticky by construction: it happens once) ----
-  const terminationReason = outcome.handoffReason ?? outcome.reason ?? null;
-  // Terminal wall-clock timing (kusabi #532 criterion 2): finishedAt is set
-  // on terminal completion, and latencySeconds is the recorded wall clock
-  // (finishedAt − startedAt); only when the durable startedAt is parseable
-  // — a record without one gets finishedAt but never a fabricated latency.
-  const finishedAt = new Date().toISOString();
-  let latencySeconds;
-  if (typeof record.startedAt === "string" && record.startedAt) {
-    const startedMs = Date.parse(record.startedAt);
-    if (Number.isFinite(startedMs)) {
-      latencySeconds = (Date.parse(finishedAt) - startedMs) / 1000;
-    }
-  }
-  record = {
-    ...record,
-    status: "completed",
-    disposition: outcome.disposition,
-    recommendation: outcome.recommendation,
-    terminationReason,
-    finishedAt,
-    ...(latencySeconds !== undefined ? { latencySeconds } : {}),
-  };
-  saveMissionRecord(missionDir, record);
-  finalizeMissionControl(missionDir, outcome.disposition === "cancelled" ? "cancelled" : "completed");
-  const lastCoordinatorErrorDetail =
-    outcome.lastCoordinatorErrorDetail ??
-    (Array.isArray(record.coordinatorErrorsDetails) && record.coordinatorErrorsDetails.length > 0
-      ? record.coordinatorErrorsDetails[record.coordinatorErrorsDetails.length - 1]?.detail
-      : null);
-  writeRecommendationFile(missionDir, {
-    missionId,
-    disposition: outcome.disposition,
-    recommendation: outcome.recommendation,
-    reason: terminationReason,
-    gate: outcome.gate,
-    lastCorrectionDetail: outcome.lastCorrectionDetail,
-    lastCoordinatorErrorDetail,
-    record,
-    briefText: brief,
-    stateDir,
-  });
-
-  // ---- exactly one terminal notification per terminal mission ----
-  const notifyReason =
-    outcome.disposition === "sol-blocked" && outcome.gate
-      ? (() => {
-          const g = outcome.gate;
-          const vr = g?.verdictRecord;
-          const text =
-            (typeof vr?.block_reason === "string" && vr.block_reason.trim()) ||
-            (typeof vr?.summary === "string" && vr.summary.trim()) ||
-            terminationReason ||
-            "";
-          const verdict = typeof g?.verdict === "string" ? g.verdict : "none";
-          return g?.gateId ? `${g.gateId} ${verdict}: ${text}`.trim() : terminationReason;
-        })()
-      : terminationReason;
-
-  try {
-    await notifyMissionTerminal({
-      missionId,
-      disposition: outcome.disposition,
-      missionDir,
-      recommendation: outcome.recommendation,
-      container,
-      cwdLabel: path.basename(cwd),
-      stateDir,
-      reason: notifyReason ?? undefined,
-    });
-  } catch { /* best-effort — the terminal record is already durable */ }
-
-  // ---- one-time outer serve cleanup (the mission owns the serve because it
-  // passes keepServe: true to inner chains) ----
-  // Runs on every terminal path — including coordinator failures and chain
-  // failures — but only when inner chain work was actually invoked: a mission
-  // with no inner chain never invents cleanup work.  Best-effort: a cleanup
-  // failure must never mask the primary terminal result.
-  if (invokedInnerChain || invokedInvestigation) {
-    try {
-      await guardedServeStop(cwd, stateDir);
-    } catch { /* best-effort — never mask the terminal result */ }
-  }
-
-  return (
-    `mission ${missionId}: disposition=${outcome.disposition}` +
-    (outcome.recommendation ? ` recommendation=${outcome.recommendation}` : "") +
-    (outcome.disposition === "cancelled" ? ` (cancelled)` : "") +
-    (outcome.disposition === "sol-blocked" ? ` (${terminationReason ?? "sol-blocked"})` : "") +
-    ` (recommendation: ${path.join(missionDir, "recommendation.md")})`
-  );
+  return finalizeMission(ctx, outcome);
 }
