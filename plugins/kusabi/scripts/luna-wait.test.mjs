@@ -23,10 +23,10 @@ import { describe, it, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
-import os from "node:os";
 import { spawn } from "node:child_process";
 import { pathToFileURL } from "node:url";
 import { stateDirFor, writeJson } from "./state-paths.mjs";
+import { makeTemp } from "./luna-test-fixtures.mjs";
 
 let waitModule = null;
 async function lunaWait() {
@@ -44,10 +44,6 @@ async function lunaWait() {
     }
   }
   return waitModule;
-}
-
-function makeTemp(prefix) {
-  return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
 }
 
 /** Content + mtime of every file under a mission dir, for read-only checks. */

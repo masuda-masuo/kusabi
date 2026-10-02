@@ -30,10 +30,20 @@ import { describe, it, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
-import os from "node:os";
 import { spawnSync } from "node:child_process";
 import { stateDirFor, readJson, writeJson } from "./state-paths.mjs";
 import { stubInvestigationSeams } from "./fixtures.mjs";
+import {
+  line,
+  stream,
+  runChainStream,
+  readProbeStream,
+  finishStream,
+  makeTemp,
+  consultStream,
+  makeCompletedChainFake as makeChainFake,
+  clearSol,
+} from "./luna-test-fixtures.mjs";
 
 const COMPANION_SCRIPT = path.join(import.meta.dirname, "kusabi-companion.mjs");
 
@@ -53,17 +63,9 @@ async function lunaCmd() {
   return cmdModule;
 }
 
-function makeTemp(prefix) {
-  return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
-}
-
 // ---------------------------------------------------------------------------
 // fakes
 // ---------------------------------------------------------------------------
-
-const j = (obj) => JSON.stringify(obj);
-const line = (action, hash, body = {}) => j({ action, envelope_sha256: hash, ...body });
-const stream = (...lines) => lines.join("\n");
 
 /** Stateful fake coordinator: each dispatch pops the next canned stream. */
 function makeCoordinator(streams) {
@@ -80,33 +82,9 @@ function makeCoordinator(streams) {
   };
 }
 
-const runChainStream = (brief) => (input) =>
-  stream(line("run_chain", input.envelope.envelope_sha256, { brief }));
-
-const readProbeStream = (tool, probePath) => (input) =>
-  stream(line("read_probe", input.envelope.envelope_sha256, { tool, path: probePath }));
-
-const consultStream = (reason) => (input) =>
-  stream(line("consult_sol", input.envelope.envelope_sha256, { reason }));
-
-const finishStream = (recommendation) => (input) =>
-  stream(line("finish", input.envelope.envelope_sha256, { recommendation }));
-
 const throwingStream = (err) => () => {
   throw err;
 };
-
-/** Fake runChainLifecycle: records every invocation, returns a chain line. */
-function makeChainFake() {
-  const calls = [];
-  return {
-    calls,
-    run: async (cwd, input, opts) => {
-      calls.push({ cwd, input, opts });
-      return `Chain ${input?.flags?.["chain-id"] ?? calls.length} completed`;
-    },
-  };
-}
 
 /** Fake callTool: records invocations; the response is injectable per test. */
 function makeToolFake(respond = () => ({ status: "ok", output: "canned\n" })) {
@@ -119,25 +97,6 @@ function makeToolFake(respond = () => ({ status: "ok", output: "canned\n" })) {
     },
   };
 }
-
-/**
- * A verdict record bound to the envelope the driver handed the Sol seat —
- * the same deterministic fake pattern as the #531 Luna tests: the fake
- * mirrors the real seat, it can only judge the envelope it was given, so
- * gate_id and envelope_sha256 come from input.envelope.
- */
-const verdictLine = (input, verdict, extra = {}) =>
-  j({
-    type: "verdict",
-    schema_version: 2, invariants: [{ id: "INV1", held: true }, { id: "INV2", held: true }, { id: "INV3", held: true }, { id: "INV4", held: true }, { id: "INV5", held: true }], criteria: [],
-    gate_id: input.envelope.gate_id,
-    envelope_sha256: input.envelope.envelope_sha256,
-    verdict,
-    summary: `sol:${verdict}`,
-    ...extra,
-  });
-
-const clearSol = (input) => verdictLine(input, "clear");
 
 /** Fake Sol seat: records every dispatch; default handler returns a clear verdict. */
 function makeSol(handler = clearSol) {

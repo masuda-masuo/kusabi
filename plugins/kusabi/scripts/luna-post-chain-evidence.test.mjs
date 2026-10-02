@@ -17,7 +17,6 @@ import { describe, it, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
-import os from "node:os";
 
 import {
   runLunaMission,
@@ -37,6 +36,7 @@ import {
 } from "./luna-sol-gate.mjs";
 import { renderEvidenceContents } from "./luna-prompt.mjs";
 import { stateDirFor, readJson, writeJson } from "./state-paths.mjs";
+import { line, stream, makeCoordinator, makeTemp } from "./luna-test-fixtures.mjs";
 
 const MISSION_BRIEF = [
   "Orchestrator: gpt-5.6-sol | session luna-post-chain-test | 2026-09-24",
@@ -65,27 +65,6 @@ const VALID_RUN_CHAIN_BRIEF = [
   "",
   "- `node --test plugins/kusabi/scripts/luna-post-chain-evidence.test.mjs`",
 ].join("\n");
-
-function makeTemp(prefix) {
-  return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
-}
-
-const j = (obj) => JSON.stringify(obj);
-const line = (action, hash, body = {}) => j({ action, envelope_sha256: hash, ...body });
-const stream = (...lines) => lines.join("\n");
-
-function makeCoordinator(streams) {
-  const calls = [];
-  return {
-    calls,
-    dispatch: async (input) => {
-      const idx = calls.length;
-      calls.push(input);
-      const entry = streams[Math.min(idx, streams.length - 1)];
-      return typeof entry === "function" ? entry(input) : entry;
-    },
-  };
-}
 
 describe("luna post-chain evidence (kusabi #568)", () => {
   let root;

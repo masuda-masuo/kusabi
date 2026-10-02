@@ -40,6 +40,22 @@ import os from "node:os";
 import { stateDirFor, readJson, writeJson } from "./state-paths.mjs";
 import { parseCoordinatorOutput } from "./coordinator-parse.mjs";
 import { stubInvestigationSeams } from "./fixtures.mjs";
+import {
+  j,
+  line,
+  stream,
+  makeCoordinator,
+  runChainStream,
+  readProbeStream,
+  finishStream,
+  malformedJsonStream,
+  makeSolFake,
+  makeTemp,
+  consultStream,
+  escalateStream,
+  makeOrderedChainFake as makeChainFake,
+  toolResponse,
+} from "./luna-test-fixtures.mjs";
 
 let driverModule = null;
 async function lunaDriver() {
@@ -59,53 +75,9 @@ async function lunaDriver() {
   return driverModule;
 }
 
-function makeTemp(prefix) {
-  return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
-}
-
 // ---------------------------------------------------------------------------
 // fakes
 // ---------------------------------------------------------------------------
-
-const j = (obj) => JSON.stringify(obj);
-const line = (action, hash, body = {}) => j({ action, envelope_sha256: hash, ...body });
-const stream = (...lines) => lines.join("\n");
-
-/**
- * A stateful fake coordinator: each dispatch pops the next canned stream.
- * A stream entry may be a function of the driver's dispatch input — the
- * contract the driver must satisfy is that the input carries the CURRENT
- * envelope (`input.envelope.envelope_sha256`), so a stream can bind its
- * records to the hash the parser demands.
- */
-function makeCoordinator(streams) {
-  const calls = [];
-  return {
-    calls,
-    dispatch: async (input) => {
-      const idx = calls.length;
-      calls.push(input);
-      const entry = streams[Math.min(idx, streams.length - 1)];
-      return typeof entry === "function" ? entry(input) : entry;
-    },
-  };
-}
-
-/** The run_chain request bound to the current envelope, carrying Luna's brief. */
-const runChainStream = (brief) => (input) =>
-  stream(line("run_chain", input.envelope.envelope_sha256, { brief }));
-
-const readProbeStream = (tool, probePath) => (input) =>
-  stream(line("read_probe", input.envelope.envelope_sha256, { tool, path: probePath }));
-
-const finishStream = (recommendation) => (input) =>
-  stream(line("finish", input.envelope.envelope_sha256, { recommendation }));
-
-const consultStream = (reason) => (input) =>
-  stream(line("consult_sol", input.envelope.envelope_sha256, { reason }));
-
-const escalateStream = (reason) => (input) =>
-  stream(line("escalate_to_host", input.envelope.envelope_sha256, { reason }));
 
 const unknownActionStream = (action) => (input) =>
   stream(line(action, input.envelope.envelope_sha256));
@@ -113,49 +85,11 @@ const unknownActionStream = (action) => (input) =>
 const STALE_HASH = "f".repeat(64);
 const staleHashStream = () => stream(line("run_chain", STALE_HASH, { brief: VALID_RUN_CHAIN_BRIEF }));
 
-const malformedJsonStream = (input) =>
-  stream(`{"action":"run_chain","envelope_sha256":"${input.envelope.envelope_sha256}"`);
-
 const mixedStream = (input) =>
   stream(
     line("run_chain", input.envelope.envelope_sha256, { brief: VALID_RUN_CHAIN_BRIEF }),
     line("merge", input.envelope.envelope_sha256),
   );
-
-/**
- * Fake runChainLifecycle: records every invocation.  The driver must call the
- * seam with the chain id it wants (flags["chain-id"]) so the mission can
- * record inner-chain references deterministically — the seam itself validates
- * the shape (chain-[a-z0-9]+) exactly like the real runChainLifecycle does.
- *
- * An optional shared order log lets a test prove request ordering across the
- * fakes (a probe before a chain, for example).
- */
-function makeChainFake(sharedOrder = null) {
-  const calls = [];
-  const order = [];
-  return {
-    calls,
-    order,
-    run: async (cwd, input, opts) => {
-      calls.push({ cwd, input, opts });
-      const tag = `chain:${calls.length}`;
-      order.push(tag);
-      if (sharedOrder) sharedOrder.push(tag);
-      const id = input?.flags?.["chain-id"];
-      return id ? `Chain ${id} completed` : `chain-fake${calls.length}`;
-    },
-  };
-}
-
-function toolResponse(name) {
-  if (name === "sandbox_exec") return { status: "ok", output: "deadbeef1234\n" };
-  if (name === "verify_in_container") {
-    return { status: "ok", gate_passed: true, lint: [], types: [], tests: { full: { passed: 1, failed: 0, skipped: 0 } } };
-  }
-  if (name === "diff_in_container") return { status: "ok", output: "diff --git a/x b/x\n" };
-  return { status: "ok", output: "canned\n" };
-}
 
 function makeToolFake(sharedOrder = null) {
   const calls = [];
@@ -169,32 +103,6 @@ function makeToolFake(sharedOrder = null) {
       order.push(tag);
       if (sharedOrder) sharedOrder.push(tag);
       return toolResponse(name);
-    },
-  };
-}
-
-/**
- * Fake Sol seat (kusabi #531): returns a schema-valid `clear` verdict bound
- * to the CURRENT gate envelope (gate_id + envelope_sha256 come from
- * input.envelope).  The #531 driver must run a Sol gate whenever policy
- * requires one — the pre-accept T11 gate fires for `finish recommend-accept`
- * — so the shared harness injects this default so no existing #530 test can
- * accidentally reach a real Sol seat.
- */
-function makeSolFake() {
-  const calls = [];
-  return {
-    calls,
-    dispatch: async (input) => {
-      calls.push(input);
-      return JSON.stringify({
-        type: "verdict",
-        schema_version: 2, invariants: [{ id: "INV1", held: true }, { id: "INV2", held: true }, { id: "INV3", held: true }, { id: "INV4", held: true }, { id: "INV5", held: true }], criteria: [],
-        gate_id: input.envelope.gate_id,
-        envelope_sha256: input.envelope.envelope_sha256,
-        verdict: "clear",
-        summary: "sol:clear",
-      });
     },
   };
 }

@@ -29,10 +29,10 @@ import { describe, it, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
-import os from "node:os";
 import { spawnSync } from "node:child_process";
 import { stateDirFor, writeJson } from "./state-paths.mjs";
 import { parseArgs } from "./cli.mjs";
+import { makeTemp } from "./luna-test-fixtures.mjs";
 
 const COMPANION_SCRIPT = path.join(import.meta.dirname, "kusabi-companion.mjs");
 
@@ -52,10 +52,6 @@ async function lunaCmd() {
     }
   }
   return cmdModule;
-}
-
-function makeTemp(prefix) {
-  return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
 }
 
 const MISSION_BRIEF = [

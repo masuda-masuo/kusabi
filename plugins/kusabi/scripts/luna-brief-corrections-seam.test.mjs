@@ -52,6 +52,15 @@ import os from "node:os";
 import { createHash } from "node:crypto";
 import { stateDirFor, readJson, writeJson } from "./state-paths.mjs";
 import { stubInvestigationSeams } from "./fixtures.mjs";
+import {
+  makeCoordinator,
+  runChainStream,
+  readProbeStream,
+  finishStream,
+  malformedJsonStream,
+  makeChainFake,
+  makeSolFake,
+} from "./luna-test-fixtures.mjs";
 
 const sha256 = (text) => createHash("sha256").update(text, "utf8").digest("hex");
 
@@ -152,48 +161,6 @@ const CLEAN_SOL_LEDGER_JSON = '{"attempts":0,"chains":[],"probes":0,"consults":0
 // fakes (injected-coordinator harness)
 // ---------------------------------------------------------------------------
 
-const j = (obj) => JSON.stringify(obj);
-const line = (action, hash, body = {}) => j({ action, envelope_sha256: hash, ...body });
-const stream = (...lines) => lines.join("\n");
-
-/** Stateful fake coordinator: each dispatch pops the next canned stream. */
-function makeCoordinator(streams) {
-  const calls = [];
-  return {
-    calls,
-    dispatch: async (input) => {
-      const idx = calls.length;
-      calls.push(input);
-      const entry = streams[Math.min(idx, streams.length - 1)];
-      return typeof entry === "function" ? entry(input) : entry;
-    },
-  };
-}
-
-const runChainStream = (brief) => (input) =>
-  stream(line("run_chain", input.envelope.envelope_sha256, { brief }));
-
-const readProbeStream = (tool, probePath) => (input) =>
-  stream(line("read_probe", input.envelope.envelope_sha256, { tool, path: probePath }));
-
-const finishStream = (recommendation) => (input) =>
-  stream(line("finish", input.envelope.envelope_sha256, { recommendation }));
-
-const malformedJsonStream = (input) =>
-  stream(`{"action":"run_chain","envelope_sha256":"${input.envelope.envelope_sha256}"`);
-
-function makeChainFake() {
-  const calls = [];
-  return {
-    calls,
-    run: async (cwd, input, opts) => {
-      calls.push({ cwd, input, opts });
-      const id = input?.flags?.["chain-id"];
-      return id ? `Chain ${id} completed` : `chain-fake${calls.length}`;
-    },
-  };
-}
-
 function makeToolFake(output = "canned\n") {
   const calls = [];
   return {
@@ -201,24 +168,6 @@ function makeToolFake(output = "canned\n") {
     callTool: async (name, args) => {
       calls.push({ name, args });
       return { status: "ok", output };
-    },
-  };
-}
-
-function makeSolFake() {
-  const calls = [];
-  return {
-    calls,
-    dispatch: async (input) => {
-      calls.push(input);
-      return JSON.stringify({
-        type: "verdict",
-        schema_version: 2, invariants: [{ id: "INV1", held: true }, { id: "INV2", held: true }, { id: "INV3", held: true }, { id: "INV4", held: true }, { id: "INV5", held: true }], criteria: [],
-        gate_id: input.envelope.gate_id,
-        envelope_sha256: input.envelope.envelope_sha256,
-        verdict: "clear",
-        summary: "sol:clear",
-      });
     },
   };
 }

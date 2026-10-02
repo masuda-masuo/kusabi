@@ -66,78 +66,26 @@ import os from "node:os";
 import { stateDirFor, readJson } from "./state-paths.mjs";
 import { TERMINAL_MISSION_DISPOSITIONS } from "./mission-store.mjs";
 import { stubInvestigationSeams } from "./fixtures.mjs";
-
-let driverModule = null;
-async function lunaDriver() {
-  if (driverModule === null) {
-    driverModule = await import("./luna-driver.mjs");
-  }
-  return driverModule;
-}
-
-function makeTemp(prefix) {
-  return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
-}
+import {
+  j,
+  stream,
+  makeCoordinator,
+  runChainStream,
+  finishStream,
+  makeTemp,
+  makeNotify,
+  consultStream,
+  escalateStream,
+  makeOrderedChainFake as makeChainFake,
+  toolResponse,
+  lunaDriver,
+  reworkChainStream,
+  clearSol,
+} from "./luna-test-fixtures.mjs";
 
 // ---------------------------------------------------------------------------
 // fakes
 // ---------------------------------------------------------------------------
-
-const j = (obj) => JSON.stringify(obj);
-const line = (action, hash, body = {}) => j({ action, envelope_sha256: hash, ...body });
-const stream = (...lines) => lines.join("\n");
-
-/** Stateful fake coordinator: each dispatch pops the next canned stream. */
-function makeCoordinator(streams) {
-  const calls = [];
-  return {
-    calls,
-    dispatch: async (input) => {
-      const idx = calls.length;
-      calls.push(input);
-      const entry = streams[Math.min(idx, streams.length - 1)];
-      return typeof entry === "function" ? entry(input) : entry;
-    },
-  };
-}
-
-const runChainStream = (brief) => (input) =>
-  stream(line("run_chain", input.envelope.envelope_sha256, { brief }));
-const reworkChainStream = (brief) => (input) =>
-  stream(line("rework_chain", input.envelope.envelope_sha256, { brief }));
-const finishStream = (recommendation) => (input) =>
-  stream(line("finish", input.envelope.envelope_sha256, { recommendation }));
-const consultStream = (reason) => (input) =>
-  stream(line("consult_sol", input.envelope.envelope_sha256, { reason }));
-const escalateStream = (reason) => (input) =>
-  stream(line("escalate_to_host", input.envelope.envelope_sha256, { reason }));
-
-/** Fake runChainLifecycle: records every invocation; optional shared order log. */
-function makeChainFake(sharedOrder = null) {
-  const calls = [];
-  const order = [];
-  return {
-    calls,
-    order,
-    run: async (cwd, input, opts) => {
-      calls.push({ cwd, input, opts });
-      const tag = `chain:${calls.length}`;
-      order.push(tag);
-      if (sharedOrder) sharedOrder.push(tag);
-      const id = input?.flags?.["chain-id"];
-      return id ? `Chain ${id} completed` : `chain-fake${calls.length}`;
-    },
-  };
-}
-
-function toolResponse(name) {
-  if (name === "sandbox_exec") return { status: "ok", output: "deadbeef1234\n" };
-  if (name === "verify_in_container") {
-    return { status: "ok", gate_passed: true, lint: [], types: [], tests: { full: { passed: 1, failed: 0, skipped: 0 } } };
-  }
-  if (name === "diff_in_container") return { status: "ok", output: "diff --git a/x b/x\n" };
-  return { status: "ok", output: "canned\n" };
-}
 
 function makeToolFake(sharedOrder = null) {
   const calls = [];
@@ -170,7 +118,6 @@ const verdictLine = (input, verdict, extra = {}) =>
 const findingLine = (severity = "high") =>
   j({ type: "finding", severity, title: "Premise unverified", body: "The issue premise is not supported." });
 
-const clearSol = (input) => verdictLine(input, "clear");
 const reworkSol = (input) => verdictLine(input, "rework");
 const blockSol = (input) => verdictLine(input, "block");
 const throwSol = () => { throw new Error("Sol seat unavailable (quota)"); };
@@ -194,15 +141,6 @@ function makeSol(handler, sharedOrder = null) {
       if (sharedOrder) sharedOrder.push(`sol:${input.envelope.gate_id}`);
       return handler(input);
     },
-  };
-}
-
-/** Fake terminal notification: the driver must call it EXACTLY once per terminal mission. */
-function makeNotify() {
-  const calls = [];
-  return {
-    calls,
-    dispatch: async (info) => { calls.push(info); },
   };
 }
 

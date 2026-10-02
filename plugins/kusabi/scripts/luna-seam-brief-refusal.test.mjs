@@ -25,23 +25,7 @@ import {
 } from "./luna-driver.mjs";
 import { createFakeCallTool, stubInvestigationSeams } from "./fixtures.mjs";
 import { resolveOrchestratorRecord } from "./companion-config.mjs";
-
-const j = (obj) => JSON.stringify(obj);
-const line = (action, hash, body = {}) => j({ action, envelope_sha256: hash, ...body });
-const stream = (...lines) => lines.join("\n");
-
-function makeCoordinator(streams) {
-  const calls = [];
-  return {
-    calls,
-    dispatch: async (input) => {
-      const idx = calls.length;
-      calls.push(input);
-      const entry = streams[Math.min(idx, streams.length - 1)];
-      return typeof entry === "function" ? entry(input) : entry;
-    },
-  };
-}
+import { line, stream, makeCoordinator } from "./luna-test-fixtures.mjs";
 
 const VALID_BRIEF = [
   "Orchestrator: test-model | session s-1 | 2026-09-26",
