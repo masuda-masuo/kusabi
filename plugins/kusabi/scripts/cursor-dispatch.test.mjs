@@ -12,6 +12,7 @@ import os from "node:os";
 import path from "node:path";
 import fs from "node:fs";
 import { patchEnv } from "./fixtures.mjs";
+import { loggedArgs } from "./backend-dispatch-fixtures.mjs";
 
 import {
   CURSOR_BACKEND,
@@ -188,11 +189,6 @@ function fakeCursorContext() {
       fs.rmSync(tmp, { recursive: true, force: true });
     },
   };
-}
-
-function loggedArgs(argsLog) {
-  const text = fs.readFileSync(argsLog, "utf8").trim();
-  return text ? text.split("\n").map((l) => JSON.parse(l)) : [];
 }
 
 describe("cursorBin", () => {

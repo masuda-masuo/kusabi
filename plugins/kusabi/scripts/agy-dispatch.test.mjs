@@ -20,6 +20,7 @@ import fs from "node:fs";
 import { spawnSync } from "node:child_process";
 import { DatabaseSync } from "node:sqlite";
 import { patchEnv } from "./fixtures.mjs";
+import { loggedArgs, isAlive } from "./backend-dispatch-fixtures.mjs";
 
 import {
   AGY_DEFAULT_CHAIN,
@@ -1923,26 +1924,11 @@ function fakeAgyContext(mode = "ok") {
   };
 }
 
-function loggedArgs(argsLog) {
-  const text = fs.readFileSync(argsLog, "utf8").trim();
-  return text ? text.split("\n").map((l) => JSON.parse(l)) : [];
-}
-
 function loggedHomes(homeLog) {
   const text = fs.readFileSync(homeLog, "utf8").trim();
   return text ? text.split("\n") : [];
 }
 
-function isAlive(pid) {
-  try {
-    process.kill(pid, 0);
-    const stat = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
-    const state = stat.slice(stat.lastIndexOf(")") + 2, stat.lastIndexOf(")") + 3);
-    return state !== "Z" && state !== "X";
-  } catch {
-    return false;
-  }
-}
 
 describe("agyDispatch (fake agy binary)", () => {
   let ctx;
