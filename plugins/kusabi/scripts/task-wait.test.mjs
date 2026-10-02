@@ -10,6 +10,7 @@ import {
   TaskWaitError,
   readTaskSnapshot,
   jobDirCreatedAt,
+  DEFAULT_PROVIDER_ERROR_GRACE_MS,
 } from "./task-wait.mjs";
 
 const COMPANION_SCRIPT = path.join(import.meta.dirname, "kusabi-companion.mjs");
@@ -463,6 +464,117 @@ describe("task-wait --next appearance and selection", () => {
     assert.equal(result.jobId, newJobId);
     assert.equal(result.status, "completed");
     assert.notEqual(result.jobId, preJobId);
+  });
+});
+
+// ===========================================================================
+// task-wait --next provider-error ladder handling (kusabi #634)
+// ===========================================================================
+describe("task-wait --next provider-error ladder", () => {
+  let tmpDir;
+  let stateDir;
+
+  beforeEach(() => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-task-wait-ladder-"));
+    stateDir = path.join(tmpDir, "state");
+    fs.mkdirSync(path.join(stateDir, "jobs"), { recursive: true });
+  });
+
+  afterEach(() => {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it("follows provider-error through a second attempt to a completed attempt", async () => {
+    const first = "job-ladder-first";
+    const second = "job-ladder-second";
+    const third = "job-ladder-third";
+    const stamps = new Map([[first, 1_000], [second, 2_000], [third, 3_000]]);
+    const createdAt = (_stateDir, id) => stamps.get(id) ?? 0;
+    writeJob(stateDir, { id: first, kind: "task", status: "provider-error" });
+
+    let t = 0;
+    let sleeps = 0;
+    const sleep = async (ms) => {
+      t += ms;
+      sleeps += 1;
+      if (sleeps === 1) writeJob(stateDir, { id: second, kind: "task", status: "provider-error" });
+      if (sleeps === 2) writeJob(stateDir, { id: third, kind: "task", status: "completed" });
+    };
+
+    const result = await waitForTask({
+      stateDir, next: true, since: 0, createdAt, sleep, now: () => t,
+      pollIntervalMs: 1_000, providerErrorGraceMs: 30_000,
+    });
+
+    assert.equal(result.jobId, third);
+    assert.equal(result.status, "completed");
+  });
+
+  it("resolves the first provider-error after the grace window when no newer attempt appears", async () => {
+    const first = "job-ladder-exhausted";
+    writeJob(stateDir, { id: first, kind: "task", status: "provider-error" });
+
+    let t = 0;
+    const result = await waitForTask({
+      stateDir, next: true, since: 0, createdAt: (_stateDir, id) => id === first ? 1_000 : 0,
+      sleep: async (ms) => { t += ms; },
+      now: () => t,
+      pollIntervalMs: 10_000,
+      progressTimeoutMs: 5_000,
+      providerErrorGraceMs: 30_000,
+    });
+
+    assert.equal(result.jobId, first);
+    assert.equal(result.status, "provider-error");
+    assert.ok(t >= 30_000 && t < 60_000, `grace wait should be 30–59s, got ${t}`);
+  });
+
+  it("does not revisit equal-stamp provider-error attempts during the grace window", async () => {
+    const first = "job-ladder-equal-a";
+    const second = "job-ladder-equal-b";
+    writeJob(stateDir, { id: first, kind: "task", status: "provider-error" });
+    writeJob(stateDir, { id: second, kind: "task", status: "provider-error" });
+
+    let t = 0;
+    let createdAtCalls = 0;
+    const createdAt = (_stateDir, id) => {
+      createdAtCalls += 1;
+      return id === first || id === second ? 1_000 : 0;
+    };
+    const result = await waitForTask({
+      stateDir, next: true, since: 0, createdAt, now: () => t,
+      sleep: async (ms) => { t += ms; },
+      pollIntervalMs: 5_000,
+    });
+
+    assert.equal(result.status, "provider-error");
+    assert.ok(t >= DEFAULT_PROVIDER_ERROR_GRACE_MS && t < DEFAULT_PROVIDER_ERROR_GRACE_MS + 5_000,
+      `grace wait should be bounded to one poll beyond default, got ${t}`);
+    assert.ok(createdAtCalls <= 50, `candidate selection should remain bounded, got ${createdAtCalls} creation-stamp reads`);
+  });
+
+  it("keeps named provider-error waits immediate and other --next terminal states immediate", async () => {
+    const named = "job-ladder-named";
+    const nextError = "job-ladder-other-terminal";
+    writeJob(stateDir, { id: named, kind: "task", status: "provider-error" });
+    writeJob(stateDir, { id: nextError, kind: "task", status: "error" });
+    let sleeps = 0;
+    const shared = {
+      stateDir, now: () => 0,
+      sleep: async () => { sleeps += 1; },
+      createdAt: (_stateDir, id) => id === named ? 1_000 : 2_000,
+    };
+
+    const namedResult = await waitForTask({ ...shared, jobId: named, providerErrorGraceMs: 60_000 });
+    assert.equal(namedResult.status, "provider-error");
+    assert.equal(sleeps, 0);
+
+    const nextResult = await waitForTask({
+      ...shared, next: true, since: 0, providerErrorGraceMs: 60_000,
+    });
+    assert.equal(nextResult.jobId, nextError);
+    assert.equal(nextResult.status, "error");
+    assert.equal(sleeps, 0);
   });
 });
 
