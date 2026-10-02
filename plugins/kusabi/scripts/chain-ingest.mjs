@@ -53,30 +53,12 @@ import {
   deleteSourceFile,
 } from "./metrics-db.mjs";
 import { extractToolStats } from "./tool-stats.mjs";
+import { usageFieldSum } from "./chain-persist.mjs";
 
 function toBoolInt(v) {
   if (v === true) return 1;
   if (v === false) return 0;
   return null;
-}
-
-/**
- * Sum one usage field across every review attempt a round made: the final
- * attempt, the unparseable-retry's first attempt, and any review SEAT that
- * died and was replaced by chain-resume (kusabi #248).  Each side contributes
- * only when its usage object is usable (available === true, checked by the
- * caller) and the field is a number -- the same guard style as the pre-retry
- * columns.  When nothing contributes the result is null (the old
- * single-attempt value), so a round with a single review is byte-for-byte
- * identical to before.
- */
-function usageFieldSum(field, usages) {
-  let total = null;
-  for (const usage of usages) {
-    if (!usage || typeof usage[field] !== "number") continue;
-    total = (total === null ? 0 : total) + usage[field];
-  }
-  return total;
 }
 
 /**
@@ -234,6 +216,10 @@ export function parseChainRecord(chainJson, ctx = {}) {
     const reviewSeatUsages = (Array.isArray(rec.reviewSeatFailures) ? rec.reviewSeatFailures : [])
       .flatMap(function (s) { return [s?.reviewUsage, s?.reviewFirstUsage]; })
       .filter(function (u) { return u && u.available === true; });
+    // Every review attempt the round made: the final attempt, the
+    // unparseable-retry's first attempt, and any replaced seat (kusabi #248).
+    // usageFieldSum returns null when none of them carries the field, so a
+    // round with a single review ingests exactly as before.
     const reviewUsages = [reviewUsage, reviewFirstUsage, ...reviewSeatUsages];
     let startedMs = null;
     if (typeof rec.startedAt === "string") {
