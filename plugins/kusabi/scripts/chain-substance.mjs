@@ -86,11 +86,12 @@ export function classifyEscalate(rounds) {
  *   - null   — not measured / unknown data
  *
  * kusabi #380: when a round record carries a closed `stopReason`, the verdict
- * derives from it.  A "completed" round still defers to the worktree
- * measurement (the substance signal the chain layer supplies); every OTHER
- * closed reason — and the `unknown` sentinel — means the worker produced no
- * accepted change, so it is `false` (fail closed).  A record WITHOUT
- * `stopReason` (all history before this feature) keeps the original
+ * derives from it.  Both `stopReason` (chain.json records) and `stop_reason`
+ * (metrics round rows) are accepted.  A "completed" round still defers to the
+ * worktree measurement (the substance signal the chain layer supplies); every
+ * OTHER closed reason — and the `unknown` sentinel — means the worker produced
+ * no accepted change, so it is `false` (fail closed).  A record WITHOUT a
+ * stop reason (all history before this feature) keeps the original
  * `worktreeChanged` heuristic unchanged.
  *
  * @param {*} r  — one round record
@@ -98,8 +99,9 @@ export function classifyEscalate(rounds) {
  */
 export function roundWorkerProducedChange(r) {
   if (r === null || r === undefined) return null;
-  if (typeof r.stopReason === "string") {
-    if (r.stopReason === "completed") {
+  const stopReason = r.stopReason ?? r.stop_reason;
+  if (typeof stopReason === "string") {
+    if (stopReason === "completed") {
       return roundWorktreeChanged(r);
     }
     // provider-error / quota-exhausted / empty-completion / infra-death /

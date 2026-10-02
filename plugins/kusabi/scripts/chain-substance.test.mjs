@@ -175,4 +175,33 @@ describe("classifyEscalate", () => {
     assert.equal(roundWorkerProducedChange({ worktreeChanged: true }), true);
     assert.equal(roundWorkerProducedChange({}), null);
   });
+
+  it("kusabi #647 — SQL-shaped rows read stop_reason and camelCase wins when both are present", () => {
+    assert.equal(classifyEscalate([{ stop_reason: "infra-death", worktree_changed: 1 }]), "no-work");
+    assert.equal(classifyEscalate([{ stop_reason: "completed", worktree_changed: 1 }]), "substantive");
+    assert.equal(classifyEscalate([{ stop_reason: null, worktree_changed: 1 }]), "substantive");
+
+    // Both spellings present: camelCase stopReason wins over snake_case stop_reason
+    assert.equal(
+      classifyEscalate([{ stopReason: "completed", stop_reason: "infra-death", worktree_changed: 1 }]),
+      "substantive",
+    );
+    assert.equal(
+      classifyEscalate([{ stopReason: "infra-death", stop_reason: "completed", worktree_changed: 1 }]),
+      "no-work",
+    );
+
+    // Direct check on roundWorkerProducedChange
+    assert.equal(roundWorkerProducedChange({ stop_reason: "infra-death", worktree_changed: 1 }), false);
+    assert.equal(roundWorkerProducedChange({ stop_reason: "completed", worktree_changed: 1 }), true);
+    assert.equal(roundWorkerProducedChange({ stop_reason: null, worktree_changed: 1 }), true);
+    assert.equal(
+      roundWorkerProducedChange({ stopReason: "completed", stop_reason: "infra-death", worktree_changed: 1 }),
+      true,
+    );
+    assert.equal(
+      roundWorkerProducedChange({ stopReason: "infra-death", stop_reason: "completed", worktree_changed: 1 }),
+      false,
+    );
+  });
 });

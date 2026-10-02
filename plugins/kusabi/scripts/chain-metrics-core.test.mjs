@@ -184,15 +184,13 @@ describe("chain-metrics-core", () => {
       assert.equal(classifyEscalate([{ stopReason: "completed", worktreeChanged: false }]), "no-work");
       assert.equal(classifyEscalate([{ stopReason: "provider-error", worktreeChanged: true }]), "no-work");
 
-      // SQL rows: worktree_changed integer.  The SQL path does not consult
-      // stop_reason today, so a non-completed SQL round still classifies by
-      // worktree_changed alone — unlike the raw JSON path above.  That
-      // divergence between the two report surfaces is pinned here as-is and
-      // tracked in kusabi #647; this refactor must not change report output.
+      // SQL rows: worktree_changed integer.  Both report surfaces (raw JSON
+      // and SQL rows) now agree: a non-completed stop_reason fails closed
+      // to "no-work" even when worktree_changed is 1 (kusabi #647).
       assert.equal(classifyEscalate([{ worktree_changed: 1 }]), "substantive");
       assert.equal(classifyEscalate([{ worktree_changed: 0 }]), "no-work");
       assert.equal(classifyEscalate([{ stop_reason: "completed", worktree_changed: 1 }]), "substantive");
-      assert.equal(classifyEscalate([{ stop_reason: "infra-death", worktree_changed: 1 }]), "substantive");
+      assert.equal(classifyEscalate([{ stop_reason: "infra-death", worktree_changed: 1 }]), "no-work");
     });
 
     it("records escalate correctly into split objects", () => {
