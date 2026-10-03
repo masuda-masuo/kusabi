@@ -414,11 +414,11 @@ describe("resolveCodexModel", () => {
   it("falls back to the codex-native default chain of exact seat ids", () => {
     const r = resolveCodexModel({ config: null });
     assert.deepEqual(r.chain, CODEX_DEFAULT_CHAIN);
-    assert.equal(r.model, "gpt-5.6-luna");
+    assert.equal(r.model, "gpt-6-luna");
   });
 
   it("the default chain is ONE tier holding the exact seat ids", () => {
-    assert.deepEqual(CODEX_DEFAULT_CHAIN, [["gpt-5.6-luna", "gpt-5.6-sol"]]);
+    assert.deepEqual(CODEX_DEFAULT_CHAIN, [["gpt-6-luna", "gpt-6.1-sol"]]);
   });
 });
 
@@ -907,7 +907,7 @@ describe("CLI argument layer", () => {
     });
     assert.equal(viaFlag.dispatch, codexDispatch);
     assert.equal(viaFlag.backend, "codex");
-    assert.equal(viaFlag.model, "gpt-5.6-luna");
+    assert.equal(viaFlag.model, "gpt-6-luna");
     assert.equal(viaFlag.explicitModel, null);
 
     const viaModel = resolveDispatchBackend({

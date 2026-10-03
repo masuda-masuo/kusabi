@@ -135,7 +135,9 @@ export const CODEX_SUPPORTED_MODELS = ["gpt-5.6-luna", "gpt-5.6-sol", "gpt-6-lun
 // both seats, first route first: this backend pins one model per phase and
 // never walks a fallback after a terminal failure, so the tier carries
 // interchangeable routes exactly like the other pinning backends' defaults.
-export const CODEX_DEFAULT_CHAIN = [["gpt-5.6-luna", "gpt-5.6-sol"]];
+// The 6-series seats are the default (kusabi #641); the 5.6 seats stay
+// accepted as explicit pins.
+export const CODEX_DEFAULT_CHAIN = [["gpt-6-luna", "gpt-6.1-sol"]];
 
 
 // The sandbox every invocation runs in (measured `-s read-only`).
