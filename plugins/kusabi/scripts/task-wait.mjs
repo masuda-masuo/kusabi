@@ -50,6 +50,7 @@ export const TERMINAL_TASK_STATUSES = new Set([
 export const DEFAULT_POLL_INTERVAL_MS = 2_000;
 export const DEFAULT_APPEAR_TIMEOUT_MS = 120_000;
 export const DEFAULT_PROGRESS_TIMEOUT_MS = 2 * 60 * 60 * 1000;
+export const DEFAULT_PROVIDER_ERROR_GRACE_MS = 30_000;
 
 /**
  * Every way the wait itself failed.  `code` is the machine-readable half:
@@ -183,7 +184,8 @@ export function formatTaskDigest(snapshot, { waitedMs = 0 } = {}) {
 
 /**
  * The `--next` selection rule, built once per wait — the job analogue of the
- * chain selector in chain-wait.mjs.
+ * chain selector in chain-wait.mjs. Under --next, a terminal provider-error
+ * follows newer ladder attempts during the #634 grace window.
  *
  * With an explicit `since` stamp: any job whose directory was created at or
  * after it, terminal or not.  That is the precise tool, and it is what keeps
@@ -258,8 +260,10 @@ async function waitForTaskToAppear({ candidates, stateDir, since, pollIntervalMs
  * Block until a task job reaches a terminal state.
  *
  * Resolves with `{ ...snapshot, digest }` when the job is terminal, whatever
- * its status.  Throws TaskWaitError when the WAIT failed: unknown job id,
- * nothing appeared in --next mode, or the job record stalled.
+ * its status. Under --next, provider-error follows newer ladder attempts
+ * during the #634 grace window before resolving to the last provider-error.
+ * Throws TaskWaitError when the WAIT failed: unknown job id, nothing appeared
+ * in --next mode, or the job record stalled.
  *
  * Everything the loop cannot decide from files is injected — `sleep` and `now`
  * are the seams the tests fake.
@@ -273,6 +277,7 @@ async function waitForTaskToAppear({ candidates, stateDir, since, pollIntervalMs
  * @param {number} [opts.appearTimeoutMs]   - also bounds a job dir that exists
  *                                            but never got a job.json record.
  * @param {number} [opts.progressTimeoutMs]
+ * @param {number} [opts.providerErrorGraceMs] - --next provider-error ladder grace.
  * @param {(ms: number) => Promise<void>} [opts.sleep]
  * @param {() => number} [opts.now]
  * @param {(jobId: string) => void} [opts.reportIgnored]
@@ -286,6 +291,7 @@ export async function waitForTask({
   pollIntervalMs = DEFAULT_POLL_INTERVAL_MS,
   appearTimeoutMs = DEFAULT_APPEAR_TIMEOUT_MS,
   progressTimeoutMs = DEFAULT_PROGRESS_TIMEOUT_MS,
+  providerErrorGraceMs = DEFAULT_PROVIDER_ERROR_GRACE_MS,
   sleep = defaultSleep,
   now = Date.now,
   reportIgnored = reportIgnoredDefault,
@@ -322,10 +328,35 @@ export async function waitForTask({
 
   let fingerprint = null;
   let lastProgressAt = startedAt;
+  let providerErrorSeenAt = null;
+  const followedJobIds = new Set([id]);
 
   for (;;) {
     const snapshot = readTaskSnapshot(stateDir, id);
-    if (snapshot.terminal) return done(snapshot);
+    if (snapshot.terminal) {
+      if (candidates !== null && snapshot.status === "provider-error") {
+        const lockedAt = createdAt(stateDir, id);
+        const target = candidates().find((candidate) =>
+          candidate.createdAt >= lockedAt && !followedJobIds.has(candidate.id)
+        );
+        if (target) {
+          id = target.id;
+          followedJobIds.add(id);
+          fingerprint = null;
+          lastProgressAt = now();
+          providerErrorSeenAt = null;
+          continue;
+        }
+        providerErrorSeenAt ??= now();
+        if (now() - providerErrorSeenAt < providerErrorGraceMs) {
+          // Waiting for the capacity ladder is not task progress and must not
+          // consume the ordinary progress-stall timeout.
+          await sleep(pollIntervalMs);
+          continue;
+        }
+      }
+      return done(snapshot);
+    }
 
     if (snapshot.fingerprint !== fingerprint) {
       fingerprint = snapshot.fingerprint;
@@ -341,9 +372,12 @@ export async function waitForTask({
     if (!snapshot.exists) {
       if (candidates !== null) {
         const lockedAt = createdAt(stateDir, id);
-        const target = candidates().find((c) => c.createdAt >= lockedAt && c.id !== id);
+        const target = candidates().find((c) =>
+          c.createdAt >= lockedAt && !followedJobIds.has(c.id)
+        );
         if (target) {
           id = target.id;
+          followedJobIds.add(id);
           continue;
         }
       }
