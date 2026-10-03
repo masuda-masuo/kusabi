@@ -445,11 +445,12 @@ describe("buildCodexArgs — the measured fresh/resume contract", () => {
   it("resume argv is byte-exact: exec resume <thread> + config-carried sandbox/approval, no -s, no -a", () => {
     const argv = buildCodexArgs({ model: "gpt-5.6-sol", cwd: "/repo", sessionId: THREAD_ID, jsonSchema: null });
     assert.deepEqual(argv, [
-      "exec", "resume", THREAD_ID,
+      "exec",
+      "-C", "/repo",
+      "resume", THREAD_ID,
       "--ignore-user-config",
       "--ignore-rules",
       "--skip-git-repo-check",
-      "-C", "/repo",
       "-m", "gpt-5.6-sol",
       "-c", 'model_reasoning_effort="high"',
       "-c", "mcp_servers={}",
@@ -458,6 +459,9 @@ describe("buildCodexArgs — the measured fresh/resume contract", () => {
       "--json",
       "-",
     ]);
+    const c = argv.indexOf("-C");
+    const r = argv.indexOf("resume");
+    assert.ok(c >= 0 && r > c && argv.lastIndexOf("-C") === c, "-C precedes resume and does not appear after it");
     assert.equal(argv.includes("-s"), false, "resume has no --sandbox flag");
     assert.equal(argv.includes("-a"), false, "-a is never passed to codex exec");
   });
@@ -1138,8 +1142,10 @@ describe("codexDispatch (fake codex)", () => {
     assert.equal(job.sessionID, THREAD_ID);
     const argv = loggedArgs(ctx.argsLog)[0];
     assert.equal(argv[0], "exec");
-    assert.equal(argv[1], "resume");
-    assert.equal(argv[2], THREAD_ID);
+    assert.equal(argv[1], "-C");
+    assert.equal(argv[2], ctx.cwd);
+    assert.equal(argv[3], "resume");
+    assert.equal(argv[4], THREAD_ID);
     assert.equal(argv.includes("-s"), false, "no --sandbox on resume");
     assert.equal(argv.includes("-a"), false, "never -a");
     assert.ok(argv.includes('sandbox_mode="read-only"'));
@@ -1180,8 +1186,10 @@ describe("codexDispatch (fake codex)", () => {
     assert.equal(second.job.sessionID, THREAD_ID);
     const argv = loggedArgs(ctx.argsLog)[0];
     assert.equal(argv[0], "exec");
-    assert.equal(argv[1], "resume");
-    assert.equal(argv[2], THREAD_ID);
+    assert.equal(argv[1], "-C");
+    assert.equal(argv[2], ctx.cwd);
+    assert.equal(argv[3], "resume");
+    assert.equal(argv[4], THREAD_ID);
   });
 
   it("resume provenance mismatch (model) fails closed even though the original session matched", async () => {

@@ -329,11 +329,10 @@ export function buildCodexPrompt({ systemPrompt, promptText }) {
 export function buildCodexArgs({ model, cwd, sessionId, jsonSchema, mcpServers = null, mcpEnabled = false }) {
   const mcpGranted = mcpEnabled || (mcpServers && Object.keys(mcpServers).length > 0);
   const mcpOverrides = mcpGranted ? codexMcpArgv(mcpServers) : [];
-  const common = [
+  const isolationFlags = [
     "--ignore-user-config",
     "--ignore-rules",
     "--skip-git-repo-check",
-    "-C", cwd,
   ];
   const modelAndEffort = [
     "-m", model,
@@ -345,12 +344,17 @@ export function buildCodexArgs({ model, cwd, sessionId, jsonSchema, mcpServers =
   const schemaArgs = jsonSchema ? ["--output-schema", jsonSchema] : [];
 
   if (typeof sessionId === "string" && sessionId !== "") {
-    // Resume: no `-s` (the resume subcommand has no --sandbox) and no `-a`
+    // Resume: `-C <cwd>` is passed at the `exec` level before `resume`
+    // because `-C` is an exec-level option; `codex exec resume` rejects
+    // it (kusabi #659, measured on codex-cli 0.159.3).
+    // No `-s` (the resume subcommand has no --sandbox) and no `-a`
     // (never passed to `codex exec`).  The sandbox and approval policy ride
     // as config overrides; the thread id is passed explicitly.
     return [
-      "exec", "resume", sessionId,
-      ...common,
+      "exec",
+      "-C", cwd,
+      "resume", sessionId,
+      ...isolationFlags,
       ...modelAndEffort,
       "-c", `sandbox_mode="${CODEX_SANDBOX_POLICY}"`,
       "-c", 'approval_policy="never"',
@@ -361,7 +365,8 @@ export function buildCodexArgs({ model, cwd, sessionId, jsonSchema, mcpServers =
   }
   return [
     "exec",
-    ...common,
+    ...isolationFlags,
+    "-C", cwd,
     "-s", CODEX_SANDBOX_POLICY,
     ...jsonOut,
     ...modelAndEffort,
