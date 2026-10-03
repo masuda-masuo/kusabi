@@ -174,9 +174,15 @@ export function listChainIds(chainsDir) {
   }
 }
 
-/** Creation stamp of a chain directory; birthtime where the filesystem keeps
- * one, ctime otherwise.  0 when it cannot be read at all. */
+/** Creation stamp of a chain: prefer control.json's startedAt because --since
+ * comes from Date.now() and file timestamps can drift from that clock under load (kusabi #620).
+ * Fall back to directory birthtime, then ctime, or 0 when it cannot be read. */
 export function chainDirCreatedAt(chainsDir, chainId) {
+  const control = readChainControl(path.join(chainsDir, chainId));
+  if (typeof control?.startedAt === "string") {
+    const startedAt = Date.parse(control.startedAt);
+    if (Number.isFinite(startedAt)) return startedAt;
+  }
   try {
     const stat = fs.statSync(path.join(chainsDir, chainId));
     return Number.isFinite(stat.birthtimeMs) && stat.birthtimeMs > 0 ? stat.birthtimeMs : stat.ctimeMs;
@@ -322,7 +328,7 @@ export function describeSnapshot(snapshot) {
 /**
  * The `--next` selection rule, built once per wait.
  *
- * Selection with an explicit `since` stamp: any chain created at or after it,
+ * Selection with an explicit `since` stamp: any chain with a creation stamp at or after it,
  * terminal or not.  That is the precise tool, and it is unchanged.  Mid-wait
  * re-selection applies in both branches while the locked chain is still
  * recordless: a newer eligible chain that appears wins (kusabi #309), and

@@ -654,10 +654,11 @@ describe("waitForChain --next", () => {
 
   it("with an explicit --since stamp, an already-created chain still counts", async () => {
     const dir = makeChainDir(chainsDir, "chain-stamped");
-    writeControl(dir, { ...runningControl("chain-stamped"), status: "completed" });
+    const startedAt = new Date().toISOString();
+    writeControl(dir, { ...runningControl("chain-stamped"), status: "completed", startedAt });
 
     const result = await waitForChain({
-      chainsDir, next: true, since: Date.now() - 60_000,
+      chainsDir, next: true, since: Date.parse(startedAt) - 60_000,
       sleep: NEVER_SLEEP, probeProcess: ALIVE, pollIntervalMs: 1,
     });
     assert.equal(result.chainId, "chain-stamped");
@@ -764,7 +765,7 @@ describe("waitForChain --next debris exclusion (kusabi #298)", () => {
         // for the newer dir (dirs created in the same millisecond tie).
         await new Promise((resolve) => setTimeout(resolve, 10));
         const dir = makeChainDir(chainsDir, "chain-later");
-        writeControl(dir, runningControl("chain-later"));
+        writeControl(dir, { ...runningControl("chain-later"), startedAt: new Date().toISOString() });
       }
       if (sleeps === 2) {
         writeControl(path.join(chainsDir, "chain-later"), { ...runningControl("chain-later"), status: "completed" });
@@ -1294,9 +1295,10 @@ describe("chain-wait CLI", () => {
     await new Promise((resolve) => setTimeout(resolve, 2_600));
     const realDir = path.join(chainsDir, "chain-real");
     fs.mkdirSync(realDir, { recursive: true });
-    writeControl(realDir, runningControl("chain-real"));
+    const startedAt = new Date().toISOString();
+    writeControl(realDir, { ...runningControl("chain-real"), startedAt });
     await new Promise((resolve) => setTimeout(resolve, 1_200));
-    writeControl(realDir, { ...runningControl("chain-real"), status: "completed" });
+    writeControl(realDir, { ...runningControl("chain-real"), status: "completed", startedAt });
 
     const status = await new Promise((resolve) => {
       child.on("close", (code) => resolve(code));
@@ -1400,5 +1402,56 @@ describe("sol-blocked terminal recognition (kusabi #524/#528)", () => {
     writeControl(dir, runningControl("chain-rework-still"));
     writeChainJson(dir, { chainId: "chain-rework-still", records: [{ round: 1, disposition: { disposition: "rework" } }] });
     assert.equal(readChainSnapshot(chainsDir, "chain-rework-still").terminal, false);
+  });
+});
+
+
+describe("chain-wait --next creation stamp (#620)", () => {
+  let tmp;
+  let chainsDir;
+
+  beforeEach(() => {
+    ({ tmp, chainsDir } = makeChainsDir());
+  });
+
+  afterEach(() => {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  });
+
+  it("uses control.json startedAt for --since when directory stamps fall on opposite sides", async () => {
+    const since = Date.parse("2026-10-01T00:00:00.000Z");
+    const lateChainId = "chain-record-late";
+    const earlyChainId = "chain-record-early";
+    for (const [chainId, startedAt] of [
+      [lateChainId, "2026-10-02T00:00:00.000Z"],
+      [earlyChainId, "2026-09-30T00:00:00.000Z"],
+    ]) {
+      const dir = makeChainDir(chainsDir, chainId);
+      writeControl(dir, { ...runningControl(chainId), status: "completed", startedAt });
+    }
+
+    const result = await waitForChain({ chainsDir, next: true, since });
+    assert.equal(result.chainId, lateChainId);
+    assert.equal(chainDirCreatedAt(chainsDir, lateChainId), Date.parse("2026-10-02T00:00:00.000Z"));
+    assert.equal(chainDirCreatedAt(chainsDir, earlyChainId), Date.parse("2026-09-30T00:00:00.000Z"));
+  });
+
+  it("falls back to directory stamps when startedAt is missing or unparseable", () => {
+    for (const [chainId, startedAt] of [["chain-no-started-at", undefined], ["chain-invalid-started-at", "not-a-date"]]) {
+      const dir = makeChainDir(chainsDir, chainId);
+      const control = { ...runningControl(chainId) };
+      if (startedAt === undefined) delete control.startedAt;
+      else control.startedAt = startedAt;
+      writeControl(dir, control);
+      const stat = fs.statSync(dir);
+      const expected = Number.isFinite(stat.birthtimeMs) && stat.birthtimeMs > 0 ? stat.birthtimeMs : stat.ctimeMs;
+      assert.equal(chainDirCreatedAt(chainsDir, chainId), expected, chainId);
+    }
+
+    const recordlessId = "chain-no-control-record";
+    const dir = makeChainDir(chainsDir, recordlessId);
+    const stat = fs.statSync(dir);
+    const expected = Number.isFinite(stat.birthtimeMs) && stat.birthtimeMs > 0 ? stat.birthtimeMs : stat.ctimeMs;
+    assert.equal(chainDirCreatedAt(chainsDir, recordlessId), expected, recordlessId);
   });
 });
