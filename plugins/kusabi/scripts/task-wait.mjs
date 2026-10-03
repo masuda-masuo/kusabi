@@ -128,9 +128,15 @@ export function listJobIds(stateDir) {
   }
 }
 
-/** Creation stamp of a job directory; birthtime where the filesystem keeps
- * one, ctime otherwise.  0 when it cannot be read at all. */
+/** Creation stamp of a job: prefer job.json's startedAt because --since
+ * comes from Date.now() and file timestamps can drift from that clock under load (kusabi #620).
+ * Fall back to directory birthtime, then ctime, or 0 when it cannot be read. */
 export function jobDirCreatedAt(stateDir, jobId) {
+  const job = loadJob(stateDir, jobId);
+  if (typeof job?.startedAt === "string") {
+    const startedAt = Date.parse(job.startedAt);
+    if (Number.isFinite(startedAt)) return startedAt;
+  }
   try {
     const stat = fs.statSync(jobDir(stateDir, jobId));
     return Number.isFinite(stat.birthtimeMs) && stat.birthtimeMs > 0 ? stat.birthtimeMs : stat.ctimeMs;
@@ -187,7 +193,7 @@ export function formatTaskDigest(snapshot, { waitedMs = 0 } = {}) {
  * chain selector in chain-wait.mjs. Under --next, a terminal provider-error
  * follows newer ladder attempts during the #634 grace window.
  *
- * With an explicit `since` stamp: any job whose directory was created at or
+ * With an explicit `since` stamp: any job whose creation stamp is at or
  * after it, terminal or not.  That is the precise tool, and it is what keeps
  * `--next --since` from latching an older preexisting job.
  *

@@ -376,12 +376,11 @@ describe("task-wait --next appearance and selection", () => {
       finishedAt: "2026-09-01T00:05:00.000Z",
     });
 
-    // The selector compares the job DIRECTORY stamp (not startedAt) against
-    // --since, inclusively.  Taking --since from the clock right after the
-    // write can land in the same millisecond as the older dir (kusabi #533),
-    // so derive it from that dir's own stamp and step strictly past it.
-    const olderStamp = jobDirCreatedAt(workspaceStateDir, olderJobId);
-    const sinceIso = new Date(Math.floor(olderStamp) + 1).toISOString();
+    // --since and startedAt share the Date.now() clock.  Step past this
+    // record's startedAt so it remains the older candidate even if directory
+    // timestamps drift under load (kusabi #620).
+    const olderStartedAt = Date.parse("2026-09-01T00:00:00.000Z");
+    const sinceIso = new Date(olderStartedAt + 1).toISOString();
     const env = { ...process.env };
     delete env.KUSABI_WORKER_CONTEXT;
     env.KUSABI_STATE_DIR = stateRootDir;
@@ -919,5 +918,55 @@ describe("task-wait torn-read resilience", () => {
       assert.match(err.message, new RegExp(jobId));
       return true;
     });
+  });
+});
+
+
+describe("task-wait --next creation stamp (#620)", () => {
+  let tmpDir;
+  let stateRootDir;
+  let workspaceStateDir;
+
+  beforeEach(() => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-task-wait-stamp-"));
+    stateRootDir = path.join(tmpDir, "state");
+    workspaceStateDir = computeWorkspaceStateDir(stateRootDir, tmpDir);
+    fs.mkdirSync(path.join(workspaceStateDir, "jobs"), { recursive: true });
+  });
+
+  afterEach(() => {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it("uses job.json startedAt for --since when directory stamps fall on opposite sides", async () => {
+    const since = Date.parse("2026-10-01T00:00:00.000Z");
+    const lateJobId = "job-record-late";
+    const earlyJobId = "job-record-early";
+    writeJob(workspaceStateDir, {
+      id: lateJobId, kind: "task", status: "completed",
+      startedAt: "2026-10-02T00:00:00.000Z",
+    });
+    writeJob(workspaceStateDir, {
+      id: earlyJobId, kind: "task", status: "completed",
+      startedAt: "2026-09-30T00:00:00.000Z",
+    });
+
+    const result = await waitForTask({ stateDir: workspaceStateDir, next: true, since });
+    assert.equal(result.jobId, lateJobId);
+    assert.equal(jobDirCreatedAt(workspaceStateDir, lateJobId), Date.parse("2026-10-02T00:00:00.000Z"));
+    assert.equal(jobDirCreatedAt(workspaceStateDir, earlyJobId), Date.parse("2026-09-30T00:00:00.000Z"));
+  });
+
+  it("falls back to directory stamps when startedAt is missing or unparseable", () => {
+    for (const [jobId, startedAt] of [["job-no-started-at", undefined], ["job-invalid-started-at", "not-a-date"]]) {
+      const dir = path.join(workspaceStateDir, "jobs", jobId);
+      fs.mkdirSync(dir, { recursive: true });
+      const job = { id: jobId, kind: "task", status: "completed" };
+      if (startedAt !== undefined) job.startedAt = startedAt;
+      fs.writeFileSync(path.join(dir, "job.json"), JSON.stringify(job), "utf8");
+      const stat = fs.statSync(dir);
+      const expected = Number.isFinite(stat.birthtimeMs) && stat.birthtimeMs > 0 ? stat.birthtimeMs : stat.ctimeMs;
+      assert.equal(jobDirCreatedAt(workspaceStateDir, jobId), expected, jobId);
+    }
   });
 });
