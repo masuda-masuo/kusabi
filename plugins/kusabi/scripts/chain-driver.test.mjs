@@ -3473,10 +3473,9 @@ describe("CLI smoke baseline (kusabi #292)", () => {
       });
     }
 
-    // No ## Smoke section: the smoke baseline runs nothing, so the only
-    // container calls a refused chain could have made are the ones this
-    // block counts.
-    const BRIEF = "# Task\n\nOrchestrator: test-model | session s-1 | 2026-08-16\n\n## Deliverables\n\n- `src/x.mjs`\n";
+    // A minimal ## Smoke section satisfies the dispatch lint (kusabi #662);
+    // the stub returns SMOKE_EXIT=0.
+    const BRIEF = "# Task\n\nOrchestrator: test-model | session s-1 | 2026-08-16\n\n## Deliverables\n\n- `src/x.mjs`\n\n## Smoke\n\n- `true` exit 0\n";
     const SESSION = "123e4567-e89b-12d3-a456-426614174000";
     const FOREIGN = "123e4567-e89b-12d3-a456-426614174001";
     const AGY_OWNED = "123e4567-e89b-12d3-a456-426614174002";

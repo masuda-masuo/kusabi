@@ -22,6 +22,10 @@ const VALID_CHAIN_BRIEF = [
   "## Deliverables",
   "",
   "- `deliverable.txt`",
+  "",
+  "## Smoke",
+  "",
+  "- `true` exit 0",
 ].join("\n");
 
 const MISSION_BRIEF = [

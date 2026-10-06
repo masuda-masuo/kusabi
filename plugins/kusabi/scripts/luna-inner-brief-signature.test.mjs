@@ -131,6 +131,24 @@ const LOSSY_SMOKE_BRIEF = [
   "- `node --test plugins/kusabi/scripts/luna-wait.test.mjs` — check `that`",
 ].join("\n");
 
+// A coordinator-style bare-word Deliverables brief (kusabi #662).
+const BARE_WORD_DELIVERABLES_BRIEF = [
+  "## Deliverables",
+  "",
+  "- Update plugins/kusabi/scripts/a.mjs with shared logic",
+  "",
+  "## Smoke",
+  "",
+  "- `node --test plugins/kusabi/scripts/a.test.mjs`",
+].join("\n");
+
+// An implement brief missing ## Smoke (kusabi #662).
+const MISSING_SMOKE_BRIEF = [
+  "## Deliverables",
+  "",
+  "- `plugins/kusabi/scripts/a.mjs`",
+].join("\n");
+
 // A Frozen Tests bullet carrying leftover prose the frozen oracle cannot see.
 const FROZEN_QUALIFIER_BRIEF = [
   "## Deliverables",
@@ -454,6 +472,16 @@ describe("luna driver deterministic inner-brief signature (decisions 1-3, 5-6)",
       name: "## Frozen Tests bullet with leftover prose outside the path",
       brief: FROZEN_QUALIFIER_BRIEF,
       detail: /Frozen Tests/i,
+    },
+    {
+      name: "bare-word Deliverables entry (kusabi #662)",
+      brief: BARE_WORD_DELIVERABLES_BRIEF,
+      detail: /Deliverables/i,
+    },
+    {
+      name: "missing ## Smoke heading (kusabi #662)",
+      brief: MISSING_SMOKE_BRIEF,
+      detail: /Smoke/i,
     },
   ];
 

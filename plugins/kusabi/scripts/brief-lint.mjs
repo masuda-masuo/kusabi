@@ -76,9 +76,14 @@ export function readBriefFile(flags, text) {
  * probe machine-reads, `## Smoke` and `## Frozen Tests`: a heading that parses
  * to nothing declares a check that cannot run, and its probe (P4/P5) reads the
  * BRIEF, so the failure repeats every round and no worker edit can fix it.
- * Absence still refuses nothing there — both sections stay optional — and the
- * membership test comes from `zeroEntrySections`, i.e. the probes' own
- * parsers, so a brief this lint accepts cannot fail P3/P4/P5 on that rule.
+ * For `## Frozen Tests`, absence still refuses nothing (the section stays
+ * optional).  For `## Smoke`, absence refuses when chain || phase === "implement"
+ * (kusabi #662); other phases keep Smoke optional.  Membership test for zero-entry
+ * headings comes from `zeroEntrySections`, i.e. the probes' own parsers, so a
+ * brief this lint accepts cannot fail P3/P4/P5 on that rule.
+ *
+ * kusabi #662 also refuses Deliverables entries whose unquoted first token is a
+ * bare word without `/` or `.` (e.g. `Update`, `Ensure`).
  *
  * @param {object} opts
  * @param {string|null|undefined} opts.brief      The brief text.
@@ -87,6 +92,40 @@ export function readBriefFile(flags, text) {
  * @param {boolean} [opts.chain=false]            True when a chain is starting.
  * @returns {string|null}
  */
+function extractSectionItems(text) {
+  if (!text) return [];
+  const lines = text.split("\n");
+  const items = [];
+  let inCodeBlock = false;
+  for (let li = 0; li < lines.length; li++) {
+    const line = lines[li];
+    const trimmed = line.trim();
+    if (trimmed.startsWith("```")) {
+      inCodeBlock = !inCodeBlock;
+      continue;
+    }
+    if (inCodeBlock) {
+      if (trimmed !== "") {
+        items.push({ content: trimmed, source: "code-block", raw: line, lineNumber: li + 1 });
+      }
+      continue;
+    }
+    let bulletMatch = trimmed.match(/^[-*+]\s+(.*)/);
+    if (bulletMatch) {
+      const content = bulletMatch[1].trim();
+      if (content) items.push({ content, source: "bullet", raw: line, lineNumber: li + 1 });
+      continue;
+    }
+    bulletMatch = trimmed.match(/^\d+[.)]\s+(.*)/);
+    if (bulletMatch) {
+      const content = bulletMatch[1].trim();
+      if (content) items.push({ content, source: "bullet", raw: line, lineNumber: li + 1 });
+      continue;
+    }
+  }
+  return items;
+}
+
 export function briefLintReport({ brief, phase = null, container = null, chain = false }) {
   const isImplement = chain || phase === "implement";
   const problems = [];
@@ -96,6 +135,50 @@ export function briefLintReport({ brief, phase = null, container = null, chain =
       "  - `## Deliverables` is absent or parses to zero entries: the deliverables probe reads that " +
       "section, and a round that changes none of the files it names is discarded. Add the section " +
       "and list the files that must change, one per bullet, each path backtick-quoted."
+    );
+  }
+
+  // ---- bare-word Deliverables entry (kusabi #662) ----
+  if (isImplement) {
+    const deliverablesItems = extractSectionItems(sectionText(brief, "Deliverables"));
+    for (const item of deliverablesItems) {
+      const content = item.content.trim();
+      const backtickMatch = content.match(/^`([^`]+)`/);
+      let isQuoted = false;
+      let pathToken = null;
+      if (backtickMatch) {
+        isQuoted = true;
+        pathToken = backtickMatch[1];
+      } else {
+        const tokens = content.split(/\s+/);
+        pathToken = tokens[0];
+      }
+      if (!pathToken) continue;
+      pathToken = pathToken.replace(/[,;.:!?]+$/, "").trim();
+      const isPathLike = pathToken.includes("/") || pathToken.includes(".");
+      pathToken = pathToken.replace(/\/+$/, "");
+
+      if (!isQuoted && !isPathLike) {
+        const rawLine = item.raw ? item.raw.trim() : item.content;
+        const formattedLine = rawLine.length > 120 ? `${rawLine.slice(0, 120)}…` : rawLine;
+        problems.push(
+          "  - `## Deliverables` entry has a bare word as its path: \"" + formattedLine + "\". " +
+          "The deliverables probe reads the first token as a file path, so a bare word causes every round to fail P3. " +
+          "Deliverables entries must start with a file path; backtick-quote bare root names like `Dockerfile`. " +
+          "Accepted shape: `- path/to/file.ext — what changes`."
+        );
+      }
+    }
+  }
+
+  // ---- Smoke required for implement (kusabi #662) ----
+  if (isImplement && !hasSectionHeading(brief, "Smoke")) {
+    problems.push(
+      "  - `## Smoke` is absent: the smoke probe reads that section to verify behaviour before " +
+      "accepting a round. Add a `## Smoke` section with at least one cheap deterministic command " +
+      "that exercises the changed behaviour, as a bullet with a backtick-quoted command and " +
+      "optional `exit <N>`, or a fenced code block; mark a line that is red on the untouched " +
+      "checkout (new file, new test) with `baseline-red`."
     );
   }
 

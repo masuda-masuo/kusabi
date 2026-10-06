@@ -124,6 +124,10 @@ const VALID_RUN_CHAIN_BRIEF = [
   "## Deliverables",
   "",
   "- `plugins/kusabi/scripts/luna-wait.mjs` — the #530 wait surface.",
+  "",
+  "## Smoke",
+  "",
+  "- `true` exit 0",
 ].join("\n");
 
 const DEFAULT_SEATS = {

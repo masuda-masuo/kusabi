@@ -3998,9 +3998,10 @@ describe("brief lint and container delivery (kusabi #289)", () => {
   const COMPANION_SCRIPT = path.join(import.meta.dirname, "kusabi-companion.mjs");
   const SIGNATURE = "Orchestrator: claude-fable-5 | session wsl-test-1 | 2026-08-16";
   const DELIVERABLES = "## Deliverables\n\n- `plugins/kusabi/scripts/kusabi-companion.mjs`\n";
+  const SMOKE = "## Smoke\n\n- `node --check plugins/kusabi/scripts/kusabi-companion.mjs`\n";
   // The shape of the brief in the live incident: signed, with deliverables,
   // and with nothing anywhere that names a container.
-  const NO_WORKPLACE = `# Task\n\n${SIGNATURE}\n\n${DELIVERABLES}`;
+  const NO_WORKPLACE = `# Task\n\n${SIGNATURE}\n\n${DELIVERABLES}\n${SMOKE}`;
 
   describe("briefLintReport", () => {
     it("passes an implement brief whose container comes from --container", () => {
@@ -4075,7 +4076,7 @@ describe("brief lint and container delivery (kusabi #289)", () => {
     });
 
     it("requires deliverables and a signature when a chain starts, listing every miss at once", () => {
-      const report = briefLintReport({ brief: "# Task\n\nImplement it.\n", container: "cid-1", chain: true });
+      const report = briefLintReport({ brief: `# Task\n\nImplement it.\n\n${SMOKE}`, container: "cid-1", chain: true });
       assert.ok(report);
       assert.match(report, /2 problems found/);
       assert.match(report, /## Deliverables/);
@@ -4184,12 +4185,11 @@ describe("brief lint and container delivery (kusabi #289)", () => {
       assert.ok(report.includes(`Its lines were not recognised as entries (first line: "${expectedQuoted}").`));
     });
 
-    it("does NOT refuse a brief whose Smoke / Frozen Tests headings are ABSENT", () => {
-      // Absence is not emptiness: both sections stay optional (a #302
-      // non-goal), and their probes trivially pass when nothing is declared.
+    it("refuses an implement brief whose Smoke is ABSENT, while keeping it optional for other phases", () => {
+      // Smoke is required for implement (kusabi #662); other phases keep it optional.
       const brief = `# Task\n\n${SIGNATURE}\n\n${DELIVERABLES}`;
-      assert.equal(briefLintReport({ brief, phase: "implement", container: "cid-1" }), null);
-      assert.equal(briefLintReport({ brief, container: "cid-1", chain: true }), null);
+      assert.match(briefLintReport({ brief, phase: "implement", container: "cid-1" }), /## Smoke/);
+      assert.match(briefLintReport({ brief, container: "cid-1", chain: true }), /## Smoke/);
       for (const phase of ["draft", "investigate", "review", "respond", "salvage", "gofer"]) {
         assert.equal(
           briefLintReport({ brief: `# Task\n\n${SIGNATURE}\n\nLook into it.\n`, phase, container: null }),
@@ -4213,7 +4213,7 @@ describe("brief lint and container delivery (kusabi #289)", () => {
       // refuses absent-or-zero-entries, so the new loop must not add a second
       // line for the same defect.
       const report = briefLintReport({
-        brief: `# Task\n\n${SIGNATURE}\n\n## Deliverables\n\nTo be decided by the worker.\n`,
+        brief: `# Task\n\n${SIGNATURE}\n\n## Deliverables\n\nTo be decided by the worker.\n\n${SMOKE}`,
         phase: "implement",
         container: "cid-1",
       });
@@ -4233,7 +4233,7 @@ describe("brief lint and container delivery (kusabi #289)", () => {
 
     it("counts one problem in the singular", () => {
       const report = briefLintReport({
-        brief: `# Task\n\n${DELIVERABLES}`,
+        brief: `# Task\n\n${DELIVERABLES}\n${SMOKE}`,
         phase: "implement",
         container: "cid-1",
       });
@@ -4295,6 +4295,7 @@ describe("brief lint and container delivery (kusabi #289)", () => {
     it("returns null for the same bullet reduced to a path alone", () => {
       const brief = [
         "# Task", "", SIGNATURE, "", DELIVERABLES,
+        "## Smoke", "", "- `node --check plugins/kusabi/scripts/kusabi-companion.mjs`", "",
         "## Frozen Tests", "",
         "- `tests/test_style.py`", "",
       ].join("\n");
@@ -4310,6 +4311,7 @@ describe("brief lint and container delivery (kusabi #289)", () => {
       // ITEMS, not the heading line.
       const brief = [
         "# Task", "", SIGNATURE, "", DELIVERABLES,
+        "## Smoke", "", "- `node --check plugins/kusabi/scripts/kusabi-companion.mjs`", "",
         "## Frozen Tests (do not touch)", "",
         "- `tests/test_style.py`", "",
       ].join("\n");
@@ -4319,7 +4321,7 @@ describe("brief lint and container delivery (kusabi #289)", () => {
     it("does NOT refuse a qualifying Frozen line that lives in an ABSENT section", () => {
       // Absence is not emptiness: with no `## Frozen Tests` heading at all there
       // is nothing to qualify, so the rule is silent (#302 non-goal).
-      const brief = `# Task\n\n${SIGNATURE}\n\n${DELIVERABLES}`;
+      const brief = `# Task\n\n${SIGNATURE}\n\n${DELIVERABLES}\n${SMOKE}`;
       assert.equal(briefLintReport({ brief, phase: "implement", container: "cid-1" }), null);
     });
 
@@ -4330,6 +4332,8 @@ describe("brief lint and container delivery (kusabi #289)", () => {
         "# Task", "", SIGNATURE, "",
         "## Deliverables", "",
         "- `src/foo.js` the store layer", "",
+        "## Smoke", "",
+        "- `npm test`", "",
       ].join("\n");
       assert.equal(
         briefLintReport({ brief, phase: "implement", container: "cid-1" }),
@@ -4389,6 +4393,7 @@ describe("brief lint and container delivery (kusabi #289)", () => {
     it("does NOT qualify a code-block line that is the path alone", () => {
       const brief = [
         "# Task", "", SIGNATURE, "", DELIVERABLES,
+        "## Smoke", "", "- `npm test`", "",
         "## Frozen Tests", "",
         "```",
         "tests/test_style.py",
@@ -4422,6 +4427,8 @@ describe("brief lint and container delivery (kusabi #289)", () => {
         "## Deliverables", "",
         "- test/a.test.mjs",
         "- test/b.test.mjs", "",
+        "## Smoke", "",
+        "- `npm test`", "",
         "## Frozen Tests", "",
         "- test/a.test.mjs",
         "- test/b.test.mjs", "",
@@ -4468,6 +4475,8 @@ describe("brief lint and container delivery (kusabi #289)", () => {
         "# Task", "", SIGNATURE, "",
         "## Deliverables", "",
         "- src/a.mjs", "",
+        "## Smoke", "",
+        "- `npm test`", "",
         "## Frozen Tests", "",
         "- test/a.test.mjs", "",
       ].join("\n");
@@ -4480,6 +4489,8 @@ describe("brief lint and container delivery (kusabi #289)", () => {
         "## Deliverables", "",
         "- src/a.mjs",
         "- test/a.test.mjs", "",
+        "## Smoke", "",
+        "- `npm test`", "",
       ].join("\n");
       assert.equal(briefLintReport({ brief, phase: "implement", container: "cid-1" }), null);
     });
@@ -4516,6 +4527,8 @@ describe("brief lint and container delivery (kusabi #289)", () => {
         "## Deliverables", "",
         "- src/a.mjs",
         "- test/a.test.mjs", "",
+        "## Smoke", "",
+        "- `npm test`", "",
         "## Frozen Tests", "",
         "- test/a.test.mjs", "",
       ].join("\n");
@@ -4614,6 +4627,7 @@ describe("brief lint and container delivery (kusabi #289)", () => {
       const brief = [
         "# Task", "", SIGNATURE, "", DELIVERABLES,
         "## Workplace", "", "Container `cid-1`.", "",
+        "## Smoke", "", "- `npm test`", "",
         "## Acceptance criteria", "", "- ok", "",
         "## Premises", "",
         "- store and transcript names agree — measured: host sqlite over all 163 sessions, 163/163 — guard: Acceptance criteria 1", "",
@@ -4625,6 +4639,7 @@ describe("brief lint and container delivery (kusabi #289)", () => {
       const brief = [
         "# Task", "", SIGNATURE, "", DELIVERABLES,
         "## Workplace", "", "Container `cid-1`.", "",
+        "## Smoke", "", "- `npm test`", "",
         "## Acceptance criteria", "", "- ok", "",
       ].join("\n");
       assert.equal(briefLintReport({ brief, phase: "implement", container: "cid-1" }), null);
@@ -4656,6 +4671,7 @@ describe("brief lint and container delivery (kusabi #289)", () => {
       const brief = [
         "# Task", "", SIGNATURE, "", DELIVERABLES,
         "## Workplace", "", "Container `cid-1`.", "",
+        "## Smoke", "", "- `npm test`", "",
         "## Spec", "", "temporary logs were in /tmp/sample/debug.log", "",
         "## Acceptance criteria", "", "- ok", "",
       ].join("\n");
@@ -4816,8 +4832,9 @@ describe("brief lint and container delivery (kusabi #289)", () => {
       "",
     ].join("\n");
 
-    it("delivers the container id into the worker prompt of task --phase implement --container", () => {
+    it("delivers the container id into the worker prompt of task --phase implement --container", async () => {
       const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-289-deliver-"));
+      let server;
       try {
         const binPath = path.join(tmp, "fake-claude.mjs");
         fs.writeFileSync(binPath, FAKE_CLAUDE, "utf8");
@@ -4836,21 +4853,24 @@ describe("brief lint and container delivery (kusabi #289)", () => {
           "utf8",
         );
 
+        const stub = await startDetachStub();
+        server = stub.server;
+
         const env = { ...process.env };
         delete env.KUSABI_WORKER_CONTEXT;
         env.KUSABI_STATE_DIR = stateDir;
-        env.KUSABI_SUNABA_URL = "http://127.0.0.1:9/mcp";
+        env.KUSABI_SUNABA_URL = stub.url;
         env.CLAUDE_BIN = binPath;
         env.KUSABI_CLAUDE_MCP_SOURCE = mcpSource;
         env.FAKE_CLAUDE_STDIN_LOG = stdinLog;
 
-        const result = spawnSync(
-          process.execPath,
+        const result = await runNodeAsync(
+          COMPANION_SCRIPT,
           [
-            COMPANION_SCRIPT, "task", "--phase", "implement", "--container", "cid-289",
+            "task", "--phase", "implement", "--container", "cid-289",
             "--brief-file", briefFile(tmp, NO_WORKPLACE),
           ],
-          { encoding: "utf8", cwd: tmp, env, timeout: 30_000 },
+          { cwd: tmp, env, killAfterMs: 30_000 },
         );
 
         const prompt = fs.readFileSync(stdinLog, "utf8");
@@ -4862,6 +4882,10 @@ describe("brief lint and container delivery (kusabi #289)", () => {
         assert.match(prompt, /<task>/);
         assert.ok(prompt.includes(SIGNATURE), prompt.slice(0, 400));
       } finally {
+        if (server) {
+          server.close();
+          server.closeAllConnections?.();
+        }
         fs.rmSync(tmp, { recursive: true, force: true });
       }
     });
