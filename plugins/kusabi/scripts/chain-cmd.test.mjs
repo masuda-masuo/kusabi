@@ -277,7 +277,8 @@ describe("session-provenance wiring (kusabi #321)", () => {
 
 const CHAIN_BRIEF_NO_SMOKE =
   "# Task\n\nOrchestrator: test-model | session s-1 | 2026-08-23\n\n" +
-  "## Deliverables\n\n- `plugins/kusabi/scripts/x.mjs`\n";
+  "## Deliverables\n\n- `plugins/kusabi/scripts/x.mjs`\n\n" +
+  "## Smoke\n\n- `npm test`\n";
 
 describe("cmdChain --chain-id (kusabi #514)", () => {
   const chainCmdSource = fs.readFileSync(path.join(import.meta.dirname, "chain-cmd.mjs"), "utf8");
@@ -367,10 +368,24 @@ describe("cmdChain --chain-id (kusabi #514)", () => {
 
       await assert.rejects(
         () =>
-          cmdChain(fx.cwd, {
-            flags: { container: "cid-1", "chain-id": "chain-pre" },
-            text: CHAIN_BRIEF_NO_SMOKE,
-          }),
+          cmdChain(
+            fx.cwd,
+            {
+              flags: { container: "cid-1", "chain-id": "chain-pre" },
+              text: CHAIN_BRIEF_NO_SMOKE,
+            },
+            {
+              inject: {
+                callTool: async (name, params) => {
+                  const cmd = params?.commands?.[0] ?? "";
+                  if (cmd.includes("SMOKE_EXIT=")) return { output: "SMOKE_EXIT=0\n" };
+                  if (cmd === "git rev-parse HEAD") return { output: "abc123\n" };
+                  if (cmd.startsWith("git status --porcelain")) return { output: "" };
+                  return { output: "" };
+                },
+              },
+            },
+          ),
         /chain id already exists: chain-pre/,
       );
 
@@ -476,7 +491,10 @@ describe("runChainLifecycle seam (kusabi #526)", () => {
   // the container RPC and the backend dispatch seams; production callers get
   // the real implementations).  Each run gets its own tmp workspace and its
   // own state root so the pinned --chain-id does not collide.
-  const BRIEF = "# Task\n\nOrchestrator: test-model | session s-1 | 2026-08-23\n\n## Deliverables\n\n- `src/foo.js`\n";
+  const BRIEF =
+    "# Task\n\nOrchestrator: test-model | session s-1 | 2026-08-23\n\n" +
+    "## Deliverables\n\n- `src/foo.js`\n\n" +
+    "## Smoke\n\n- `npm test`\n";
   const APPROVE = JSON.stringify({
     schema_version: 1, verdict: "approve", findings: [], summary: "ok", next_steps: [],
   });
@@ -569,6 +587,7 @@ describe("runChainLifecycle seam (kusabi #526)", () => {
       if (cmd.startsWith("cd /workspace &&") && cmd.includes("TMPIDX=")) {
         return { output: "ERROR_NO_INDEX\n" };
       }
+      if (cmd.includes("SMOKE_EXIT=")) return { output: "SMOKE_EXIT=0\n" };
       if (cmd === "git rev-parse HEAD") return { output: "abc123\n" };
       if (cmd === "git status --porcelain") return { output: " M src/foo.js\n" };
       if (cmd === "git log --oneline -5") return { output: "abc123 latest change\n" };
