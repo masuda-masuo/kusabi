@@ -90,6 +90,9 @@ CREATE TABLE IF NOT EXISTS chain (
   brief_deliverable_count INTEGER,
   brief_has_smoke INTEGER,
   brief_smoke_count INTEGER,
+  smoke_lines INTEGER,
+  smoke_baseline_red INTEGER,
+  smoke_observes_change INTEGER,
   -- kusabi #532: the mission id of the luna mission that owns this inner
   -- chain.  Emitted only under Luna mode (persistChainState with missionId);
   -- a plain chain keeps NULL — absence is a fact, never false.
@@ -388,6 +391,9 @@ export function openMetricsDb(dbPath) {
   ensureColumn(db, "job", "reasoning_effort", "TEXT");
   ensureColumn(db, "job", "substituted", "INTEGER");
   ensureColumn(db, "chain", "mission_id", "TEXT");
+  ensureColumn(db, "chain", "smoke_lines", "INTEGER");
+  ensureColumn(db, "chain", "smoke_baseline_red", "INTEGER");
+  ensureColumn(db, "chain", "smoke_observes_change", "INTEGER");
   ensureColumn(db, "round", "audit_verdict", "TEXT");
   ensureColumn(db, "round", "audit_blocked", "INTEGER");
   ensureColumn(db, "round", "audit_shadow_disposition", "TEXT");
@@ -568,13 +574,15 @@ export function upsertChain(db, row) {
        model_chain_json, max_rounds, strategized,
        totals_input, totals_output, totals_reasoning, totals_cache_read, totals_cache_write, totals_cost,
        brief_text, brief_chars, brief_lines, brief_bullets,
-       brief_has_deliverables, brief_deliverable_count, brief_has_smoke, brief_smoke_count, mission_id)
+       brief_has_deliverables, brief_deliverable_count, brief_has_smoke, brief_smoke_count,
+       smoke_lines, smoke_baseline_red, smoke_observes_change, mission_id)
     VALUES
       ($chainId, $workspaceSlug, $orchModel, $orchSession, $orchDate, $backend, $baseSha, $model,
        $modelChainJson, $maxRounds, $strategized,
        $totalsInput, $totalsOutput, $totalsReasoning, $totalsCacheRead, $totalsCacheWrite, $totalsCost,
        $briefText, $briefChars, $briefLines, $briefBullets,
-       $briefHasDeliverables, $briefDeliverableCount, $briefHasSmoke, $briefSmokeCount, $missionId)
+       $briefHasDeliverables, $briefDeliverableCount, $briefHasSmoke, $briefSmokeCount,
+       $smokeLines, $smokeBaselineRed, $smokeObservesChange, $missionId)
   `).run({
     chainId: row.chainId,
     workspaceSlug: row.workspaceSlug ?? null,
@@ -604,6 +612,9 @@ export function upsertChain(db, row) {
     briefDeliverableCount: row.briefDeliverableCount ?? null,
     briefHasSmoke: row.briefHasSmoke ?? null,
     briefSmokeCount: row.briefSmokeCount ?? null,
+    smokeLines: row.smokeLines ?? null,
+    smokeBaselineRed: row.smokeBaselineRed ?? null,
+    smokeObservesChange: row.smokeObservesChange ?? null,
     // Mission linkage (kusabi #532): the owning luna mission's id, or NULL
     // for a plain chain — absence is a fact, never false.
     missionId: row.missionId ?? null,

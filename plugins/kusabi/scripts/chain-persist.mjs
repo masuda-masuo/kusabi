@@ -77,6 +77,7 @@ export function persistChainState({
   maxRounds, brief, orchestrator, records, baseSha, chainTotals,
   strategized, chainFollowupDraft, interrupted = false, verifyBaseline = null,
   strategy = null, requirementsFile = null, missionId = null,
+  smokeObservation = null,
 }) {
   if (interrupted) {
     roundRecord.interrupted = true;
@@ -127,6 +128,8 @@ export function persistChainState({
     // Chain-start verify baseline (kusabi #173): captured on the pristine
     // base before round-1 implement, reused verbatim by chain-resume.
     verifyBaseline,
+    // Dispatch-time smoke observation summary (kusabi #665).
+    smokeObservation: smokeObservation ?? null,
     // Incremental TDD strategy (kusabi #502): strategy and requirements file
     // persisted on chain.json so chain-show renders strategy info.
     ...(strategy ? { strategy, requirementsFile } : {}),

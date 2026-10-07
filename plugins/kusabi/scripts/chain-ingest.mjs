@@ -191,6 +191,9 @@ export function parseChainRecord(chainJson, ctx = {}) {
     briefDeliverableCount: briefText !== null ? parseDeliverables(briefText).length : null,
     briefHasSmoke: briefText !== null ? (hasSectionHeading(briefText, "Smoke") ? 1 : 0) : null,
     briefSmokeCount: briefText !== null ? parseSmoke(briefText).length : null,
+    smokeLines: typeof chainJson.smokeObservation?.lines === "number" ? chainJson.smokeObservation.lines : null,
+    smokeBaselineRed: typeof chainJson.smokeObservation?.baselineRed === "number" ? chainJson.smokeObservation.baselineRed : null,
+    smokeObservesChange: toBoolInt(chainJson.smokeObservation?.observesChange),
   };
 
   const roundRows = [];

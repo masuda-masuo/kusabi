@@ -144,6 +144,9 @@ function fetchChains(db) {
     "brief_has_smoke", "brief_chars", "brief_has_deliverables",
   ];
   if (hasBackend) cols.push("backend");
+  if (tableHasColumn(db, "chain", "smoke_lines")) cols.push("smoke_lines");
+  if (tableHasColumn(db, "chain", "smoke_baseline_red")) cols.push("smoke_baseline_red");
+  if (tableHasColumn(db, "chain", "smoke_observes_change")) cols.push("smoke_observes_change");
   return db.prepare(`SELECT ${cols.join(", ")} FROM chain`).all();
 }
 
@@ -473,6 +476,27 @@ function computeBriefOutcome(inWindowChains, roundsByChain) {
       table[smokeLabel][disp][bucket] += 1;
     }
 
+    let smokeSplit = null;
+    const hasAnySmokeObs = chains.some(
+      (c) => c.smoke_observes_change !== null && c.smoke_observes_change !== undefined
+    );
+    if (hasAnySmokeObs) {
+      const yes = { total: 0, byDisp: {} };
+      const no = { total: 0, byDisp: {} };
+      const unknown = { total: 0, byDisp: {} };
+      for (const c of chains) {
+        const rounds = roundsByChain.get(c.chain_id) || [];
+        if (rounds.length === 0) continue;
+        const disp = finalDisposition(c.chain_id, roundsByChain) ?? "(no disposition)";
+        let target = unknown;
+        if (c.smoke_observes_change === 1) target = yes;
+        else if (c.smoke_observes_change === 0) target = no;
+        target.total += 1;
+        target.byDisp[disp] = (target.byDisp[disp] || 0) + 1;
+      }
+      smokeSplit = { yes, no, unknown };
+    }
+
     const briefChars = chains
       .map((c) => c.brief_chars)
       .filter((v) => v !== null && v !== undefined);
@@ -484,6 +508,7 @@ function computeBriefOutcome(inWindowChains, roundsByChain) {
       chainsWithNoRounds,
       escalateSplit,
       table,
+      ...(smokeSplit ? { smokeObservesChange: smokeSplit } : {}),
       briefChars: {
         min: briefChars.length ? Math.min(...briefChars) : null,
         median: median(briefChars),
