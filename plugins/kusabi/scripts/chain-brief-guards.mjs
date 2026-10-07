@@ -465,42 +465,105 @@ export function baselineRefusalError(report) {
  * @param {string}   opts.container  Container the worker will be handed.
  * @returns {Promise<string|null>}
  */
-export async function smokeBaselineReport({ brief, callTool, container }) {
+/**
+ * Summarize how the dispatch-time smoke run observes a change (kusabi #665).
+ *
+ * Pure: takes the parsed smoke entries and the baseline observations.
+ *
+ * @param {{entries: Array<{command: string, expectedExit?: number, baselineRed?: boolean}>,
+ *          observed: Array<{command: string, observed: number|string, diagnostic?: string}>}} opts
+ * @returns {{lines: number, baselineRed: number, observesChange: boolean|null}}
+ */
+export function summarizeSmokeObservation({ entries, observed } = {}) {
+  const entriesArr = Array.isArray(entries) ? entries : [];
+  const observedArr = Array.isArray(observed) ? observed : [];
+  if (entriesArr.length === 0) {
+    return { lines: 0, baselineRed: 0, observesChange: null };
+  }
+  let baselineRed = 0;
+  for (const entry of entriesArr) {
+    if (!entry.baselineRed) continue;
+    const obs = observedArr.find((o) => o && o.command === entry.command);
+    if (!obs || typeof obs.observed !== "number") continue;
+    const expectedExit = typeof entry.expectedExit === "number" ? entry.expectedExit : 0;
+    if (obs.observed !== expectedExit) {
+      baselineRed++;
+    }
+  }
+  return {
+    lines: entriesArr.length,
+    baselineRed,
+    observesChange: baselineRed > 0,
+  };
+}
+
+/**
+ * Render the dispatch-time warning when no Smoke line can observe the change
+ * (kusabi #665), or null when at least one line is measured baseline-red or
+ * no smoke exists.
+ *
+ * @param {{lines: number, baselineRed: number, observesChange: boolean|null}|null|undefined} summary
+ * @returns {string|null}
+ */
+export function renderSmokeNoObservationWarning(summary) {
+  if (!summary || !(summary.lines > 0) || summary.baselineRed !== 0) {
+    return null;
+  }
+  const nLines = summary.lines === 1 ? "1 line" : `${summary.lines} lines`;
+  return (
+    `warning: no \`## Smoke\` line can observe this change — all ${nLines} already pass on the untouched checkout and none is \`baseline-red\`. ` +
+    "If the change alters behaviour, add a line that is red now and must turn green, marked `baseline-red`; for a behaviour-preserving refactor, ignore this."
+  );
+}
+
+/**
+ * Run the declared smoke against the untouched checkout and evaluate both the
+ * dispatch-time baseline report (refusal) and the observation summary (warning
+ * / record) in a single measurement run (kusabi #665).
+ *
+ * @param {object} opts
+ * @param {string|null|undefined} opts.brief
+ * @param {Function} opts.callTool   The RPC callTool function (injectable).
+ * @param {string}   opts.container  Container the worker will be handed.
+ * @returns {Promise<{report: string|null, summary: {lines: number, baselineRed: number, observesChange: boolean|null}}>}
+ */
+export async function measureSmokeBaseline({ brief, callTool, container }) {
   const entries = parseSmoke(brief ?? "");
-  if (entries.length === 0) return null;
+  if (entries.length === 0) {
+    return {
+      report: null,
+      summary: summarizeSmokeObservation({ entries: [], observed: [] }),
+    };
+  }
 
   const before = await captureGitStatusPorcelain(callTool, container);
   const observed = await runSmokeEntries({ entries, callTool, container });
   const after = await captureGitStatusPorcelain(callTool, container);
 
-  // The probe judges only the entries the annotation does not cover (kusabi
-  // #315): a `baseline-red` entry is EXPECTED to mismatch at base, so the
-  // probe's mismatch-is-fail rule would refuse exactly the case the
-  // annotation licenses.  (When every entry is annotated the probe sees an
-  // empty list and passes trivially; the renderers below carry the whole
-  // verdict for those entries.)  An unmeasurable annotated entry is refused
-  // by the ordinary renderer, fail-closed: the annotation licenses a measured
-  // mismatch and nothing else.
   const unannotated = entries.filter((entry) => !entry.baselineRed);
   const probe = checkSmokeProbe(unannotated, observed, unannotated.length > 0);
 
-  // The renderer names the entries that missed their expectation — it runs
-  // whenever it has anything to say, because with an all-annotated brief the
-  // probe passes trivially while an annotated entry's unmeasurable run still
-  // has to be refused.  Should the probe ever go red for something the
-  // per-entry walk cannot see, the probe's own detail carries the failure
-  // rather than nothing.
   const smokeReport = renderSmokeBaselineReport({ entries, observed })
     ?? (probe.passed ? null : `${SMOKE_BASELINE_HEADER}\n  - ${probe.detail}`);
-  // An annotated entry that PASSED at base is the annotation's claim gone
-  // stale — a refusal with its own message, never the already-red one, whose
-  // remedy (fix the command or the baseline) is the opposite of the right
-  // one here (drop the annotation, or fix the brief).
   const wrongAnnotationReport = renderSmokeWrongAnnotationReport({ entries, observed });
   const dirtReport = renderSmokeDirtReport({ before, after });
 
-  // A red smoke, a wrongly-annotated entry AND a dirtied tree are all the
-  // author's to fix: all are reported, never one hiding the other.
-  if (!smokeReport && !wrongAnnotationReport && !dirtReport) return null;
-  return [smokeReport, wrongAnnotationReport, dirtReport].filter(Boolean).join("\n\n");
+  const report = (!smokeReport && !wrongAnnotationReport && !dirtReport)
+    ? null
+    : [smokeReport, wrongAnnotationReport, dirtReport].filter(Boolean).join("\n\n");
+  const summary = summarizeSmokeObservation({ entries, observed });
+
+  return { report, summary };
+}
+
+/**
+ * Thin wrapper around measureSmokeBaseline returning only the report (refusal text),
+ * keeping the historical signature and behavior byte-identical (kusabi #292, #665).
+ *
+ * @param {object} opts
+ * @returns {Promise<string|null>}
+ */
+export async function smokeBaselineReport(opts) {
+  const { report } = await measureSmokeBaseline(opts);
+  return report;
 }

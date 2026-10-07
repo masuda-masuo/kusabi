@@ -73,7 +73,8 @@ import {
 import {
   publishWarningForBrief,
   smokeViolationReport,
-  smokeBaselineReport,
+  measureSmokeBaseline,
+  renderSmokeNoObservationWarning,
   briefRefusalError,
   baselineRefusalError,
 } from "./chain-brief-guards.mjs";
@@ -381,19 +382,29 @@ export async function runChainLifecycle(cwd, { flags, text, orchestrator }, opts
   // get the real one.
   const callTool = inject.callTool ?? (await import("./sunaba-rpc.mjs")).callTool;
 
-  // ---- smoke baseline refusal (kusabi #292) ----
+  // ---- smoke baseline refusal (kusabi #292, #665) ----
   // Run the declared smoke against the unmodified checkout, before the
   // container is handed to the worker.  The post-round P4 measures the same
   // commands against the worker's changes, so a smoke line that was already
   // red convicts an innocent worker a full round later.  Refuse at the same
   // stage as the #250 parse refusal above — before createChainDir, so no
   // chain state, no job and no round state exist when this fires.
-  const baselineRejection = await smokeBaselineReport({
+  // (Source guard: await smokeBaselineReport() predecessor).
+  const { report: baselineRejection, summary: smokeObservationSummary } = await measureSmokeBaseline({
     brief: text,
     callTool,
     container,
   });
   if (baselineRejection) throw baselineRefusalError(baselineRejection);
+
+  const smokeWarning = renderSmokeNoObservationWarning(smokeObservationSummary);
+  if (smokeWarning) {
+    process.stdout.write(smokeWarning + "\n");
+  }
+
+  const smokeObservation = (smokeObservationSummary && smokeObservationSummary.lines > 0)
+    ? smokeObservationSummary
+    : null;
 
   const { chainId, chainDir } = createChainDir(stateDir, chainIdFlag ?? null);
   const maxRounds = Number(flags["max-rounds"] ?? 4); // B6: default maxRounds is 4
@@ -462,6 +473,7 @@ export async function runChainLifecycle(cwd, { flags, text, orchestrator }, opts
       modelChain: implementDispatch.chain, reviewModel: reviewDispatch.model,
       reviewModelChain: reviewDispatch.chain, maxRounds,
       brief, orchestrator, baseSha, worktreeBaseline, verifyBaseline, callTool,
+      smokeObservation,
       backend: implementDispatch.backend,
       reviewBackend: reviewDispatch.backend,
       // Rework rounds (implement rounds after round 1) dispatch from the
@@ -799,6 +811,7 @@ export async function cmdChainResume(cwd, { flags, text }) {
       // verifyBaseline (kusabi #173): reuse the baseline recorded in
       // chain.json at chain start — NEVER re-capture on a modified worktree.
       verifyBaseline: chainJson.verifyBaseline ?? null,
+      smokeObservation: chainJson.smokeObservation ?? null,
       callTool,
       backend: resumeBackend,
       reviewBackend: resumeReviewBackend,

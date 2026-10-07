@@ -56,7 +56,7 @@ import {
   runFrozenProbe,
   runCollectedProbe,
 } from "./chain-probes.mjs";
-import { smokeBaselineReport, smokeViolationReport } from "./chain-brief-guards.mjs";
+import { smokeBaselineReport, smokeViolationReport, measureSmokeBaseline, renderSmokeNoObservationWarning } from "./chain-brief-guards.mjs";
 import { readBriefFile, briefLintReport } from "./brief-lint.mjs";
 import {
   resolveOrchestratorRecord,
@@ -468,8 +468,14 @@ export async function cmdTaskDetach(cwd, { flags, text }, opts = {}) {
   // callTool is injectable (opts.callTool) for tests, mirroring opts.spawn.
   if (container) {
     const callTool = opts.callTool || (await import("./sunaba-rpc.mjs")).callTool;
-    const baselineRejection = await smokeBaselineReport({ brief: pre.text, callTool, container });
+    const { report: baselineRejection, summary } = await measureSmokeBaseline({ brief: pre.text, callTool, container });
     if (baselineRejection) throw new Error(baselineRejection);
+    if (pre.phase === "implement") {
+      const warning = renderSmokeNoObservationWarning(summary);
+      if (warning) {
+        process.stdout.write(warning + "\n");
+      }
+    }
   }
 
   // Pre-flight checks passed! Create log file in stateDir

@@ -12,6 +12,7 @@
 // environment); cost is RELATIVE UNITS, never dollars.
 
 import { SEVERITY_ORDER } from "./metrics-report.mjs";
+import { DISPOSITION_ORDER } from "./chain-metrics-core.mjs";
 import { STOP_REASONS, UNKNOWN_STOP_REASON } from "./stop-reason.mjs";
 import { listToolStats } from "./tool-stats.mjs";
 
@@ -268,6 +269,28 @@ function renderBriefOutcomeTable(table) {
   return lines;
 }
 
+function formatSmokeObservesChangeCategory(cat, data) {
+  if (!data) return `${cat} 0`;
+  const disps = Object.keys(data.byDisp || {}).sort((a, b) => {
+    const ia = DISPOSITION_ORDER.indexOf(a);
+    const ib = DISPOSITION_ORDER.indexOf(b);
+    if (ia !== -1 && ib !== -1) return ia - ib;
+    if (ia !== -1) return -1;
+    if (ia === -1 && ib !== -1) return 1;
+    return a.localeCompare(b);
+  });
+  if (disps.length === 0) return `${cat} ${data.total}`;
+  const dispStr = disps.map((d) => `${d} ${data.byDisp[d]}`).join(", ");
+  return `${cat} ${data.total} (${dispStr})`;
+}
+
+function renderSmokeObservesChangeLine(split) {
+  const yesStr = formatSmokeObservesChangeCategory("yes", split.yes);
+  const noStr = formatSmokeObservesChangeCategory("no", split.no);
+  const unkStr = formatSmokeObservesChangeCategory("unknown", split.unknown);
+  return `    smoke_observes_change: ${yesStr}, ${noStr}, ${unkStr}`;
+}
+
 function renderBriefOutcome(blocks) {
   const lines = [
     "Brief metrics vs outcome (raw chain counts, always stratified by orch_model — never comparable across models):",
@@ -295,6 +318,9 @@ function renderBriefOutcome(blocks) {
         if (es.unknown > 0) parts.push(`unknown ${fmtCount(es.unknown)}`);
         lines.push(`    escalated chains: ${fmtCount(es.escalated)} (${parts.join(", ")})`);
       }
+    }
+    if (b.smokeObservesChange) {
+      lines.push(renderSmokeObservesChangeLine(b.smokeObservesChange));
     }
     lines.push(`    brief_chars: min ${fmtNum(b.briefChars.min)}  median ${fmtNum(b.briefChars.median)}  max ${fmtNum(b.briefChars.max)}`);
     lines.push(
