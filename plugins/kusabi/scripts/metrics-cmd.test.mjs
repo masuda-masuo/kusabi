@@ -217,7 +217,7 @@ describe("cmdMetricsIngest", () => {
           dryRun: true,
           db: dbPath,
           "transcript-dir": path.join(tmpDir, "transcripts"),
-          "cursor-usage-dir": path.join(tmpDir, "cursor"),
+          "codex-usage-dir": path.join(tmpDir, "codex"),
           "state-root": tmpDir,
         },
       });

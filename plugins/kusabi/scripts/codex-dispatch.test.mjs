@@ -1,7 +1,7 @@
 // codex-dispatch.test.mjs — tests for the Codex CLI dispatch backend
 // (kusabi #527).
 //
-// Spawn-based tests follow the cursor-dispatch.test.mjs pattern: CODEX_BIN
+// Spawn-based tests follow the agy-dispatch.test.mjs pattern: CODEX_BIN
 // points at a fake `codex` script in a temp dir, KUSABI_STATE_DIR points at
 // a temp state root.  THE REAL `codex` BINARY IS NEVER REQUIRED.
 //
@@ -896,11 +896,11 @@ describe("CLI argument layer", () => {
 
   it("an unknown backend still errors naming the full list including codex", () => {
     assert.throws(() => resolveBackend({ backend: "bogus" }), /unknown backend: bogus/);
-    assert.throws(() => resolveBackend({ backend: "bogus" }), /Use --backend opencode\|claude\|agy\|cursor\|codex/);
+    assert.throws(() => resolveBackend({ backend: "bogus" }), /Use --backend opencode\|claude\|agy\|codex/);
   });
 
   it("codex is a member of BACKENDS, not a special case beside it", () => {
-    assert.deepEqual(BACKENDS, ["opencode", "claude", "agy", "cursor", "codex"]);
+    assert.deepEqual(BACKENDS, ["opencode", "claude", "agy", "codex"]);
   });
 
   it("--backend codex and --model codex/<seat> reach codexDispatch", () => {

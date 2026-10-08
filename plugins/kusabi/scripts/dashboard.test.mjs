@@ -383,10 +383,10 @@ describe("dashboard costSummary against an ingested db", () => {
     try {
       const stateRoot = path.join(tmp, "state");
       const transcriptDir = path.join(tmp, "transcripts");
-      const cursorUsageDir = path.join(tmp, "cursor-usage");
+      const codexUsageDir = path.join(tmp, "codex-usage");
       const dbPath = path.join(tmp, "metrics.db");
       fs.mkdirSync(transcriptDir, { recursive: true });
-      fs.mkdirSync(cursorUsageDir, { recursive: true });
+      fs.mkdirSync(codexUsageDir, { recursive: true });
       const jobDir = path.join(stateRoot, "ws-hash-1", "jobs", "job-complete01");
       fs.mkdirSync(jobDir, { recursive: true });
       writeJson(path.join(jobDir, "job.json"), {
@@ -406,7 +406,7 @@ describe("dashboard costSummary against an ingested db", () => {
         COMPANION, "metrics-ingest",
         "--state-root", stateRoot,
         "--transcript-dir", transcriptDir,
-        "--cursor-usage-dir", cursorUsageDir,
+        "--codex-usage-dir", codexUsageDir,
         "--db", dbPath,
       ], { encoding: "utf8", timeout: 30_000 });
       assert.equal(ingest.status, 0, ingest.stdout + ingest.stderr);

@@ -1,5 +1,5 @@
 // metrics-report.mjs — query/compute surface over the metrics store built by
-// metrics-db.mjs / transcript-ingest.mjs / cursor-usage-ingest.mjs / chain-ingest.mjs.
+// metrics-db.mjs / transcript-ingest.mjs / codex-usage-ingest.mjs / chain-ingest.mjs.
 //
 // Pure reader. Every function here takes an already-open database handle
 // (opened by the caller with `openMetricsDbReadOnly` from metrics-db.mjs —
@@ -101,8 +101,7 @@ function isStoreEmpty(db) {
 
 function computeFreshness(db, dbPath) {
   const lastIngestRun = db.prepare("SELECT MAX(ingested_at) AS m FROM source_file").get().m ?? null;
-  // MAX(turn.ts) covers every ingested turn row, including cursor-usage
-  // samples — the label is "newest ingested turn", not "transcript".
+  // MAX(turn.ts) covers every ingested turn row — the label is "newest ingested turn", not "transcript".
   const newestTranscriptTurn = db.prepare("SELECT MAX(ts) AS m FROM turn").get().m ?? null;
   const newestChainRound = db.prepare("SELECT MAX(started_at) AS m FROM round").get().m ?? null;
   const newestChainDate = db.prepare("SELECT MAX(orch_date) AS m FROM chain").get().m ?? null;
@@ -431,14 +430,14 @@ function emptyBucketRow() {
  * Stratification key for one chain's `orch_model` (kusabi #252).
  *
  * The stored value is whatever the orchestrator signed itself as, and the
- * same orchestrator signs two ways: `cursor-grok-4.6` from the model id and
- * `Cursor Grok 4.6` from the display name.  Grouping verbatim split one
+ * same orchestrator signs two ways: `claude-sonnet-4` from the model id and
+ * `Claude Sonnet 4` from the display name.  Grouping verbatim split one
  * orchestrator into two strata of 3 and 1 chains, which is a worse lie than
  * the normalisation costs: lowercase, whitespace runs to `-`.
  *
  * Key only — the stored value stays verbatim, and every other section that
  * prints `orch_model` per chain keeps printing it verbatim (same principle
- * as Hazard B in cursor-usage-ingest.mjs).  A null/undefined model keeps its
+ * as in usage ingest).  A null/undefined model keeps its
  * long-standing `(unknown)` bucket rather than being normalised into one.
  */
 function orchModelStratumKey(orchModel) {
@@ -914,74 +913,6 @@ function computeBackendSplit(inWindowChains, inWindowJobs, roundsByChain) {
 }
 
 // ---------------------------------------------------------------------------
-// Cursor sampled output vs window output occupancy — display only, never
-// rewrites turn.output
-//
-// This used to divide the sampled sum by
-// cursor_session_counter.total_output_tokens and print the quotient as
-// "coverage" against a "reported cumulative".  That premise was wrong
-// (kusabi #253): the field is the output currently OCCUPYING the context
-// window, and it DECREASES when compaction evicts earlier output (measured
-// 45,976 → 36,842 inside one session), so the quotient was a ratio of
-// nothing and read as 222% even on correctly collapsed data.  The sink
-// payload carries no honest cumulative denominator, so the two numbers are
-// printed side by side and never divided.
-// ---------------------------------------------------------------------------
-
-/**
- * Whole-store (not window-scoped): `sampledOutput` sums turn.output over
- * request_id LIKE 'cursor:%'; `windowOutput` sums the latest-ts
- * `context_window.total_output_tokens` reading per session (window
- * occupancy — non-cumulative, may decrease).  Returns null when the table is
- * missing or empty so Claude-only stores keep their previous JSON/text shape
- * (aside from the freshness label).
- */
-function computeCursorSampledOutput(db) {
-  if (!tableExists(db, "cursor_session_counter")) return null;
-  const counters = db.prepare(
-    "SELECT session_id, total_output_tokens, ts FROM cursor_session_counter",
-  ).all();
-  if (counters.length === 0) return null;
-
-  const turnRows = db.prepare(
-    "SELECT session_id, output FROM turn WHERE request_id LIKE 'cursor:%'",
-  ).all();
-
-  const sampledBySession = new Map();
-  let sampledTotal = 0;
-  for (const t of turnRows) {
-    const out = typeof t.output === "number" ? t.output : 0;
-    sampledTotal += out;
-    if (!t.session_id) continue;
-    sampledBySession.set(t.session_id, (sampledBySession.get(t.session_id) ?? 0) + out);
-  }
-
-  let windowTotal = 0;
-  const sessions = [];
-  for (const c of counters) {
-    const sampled = sampledBySession.get(c.session_id) ?? 0;
-    const windowOutput = typeof c.total_output_tokens === "number" ? c.total_output_tokens : null;
-    if (typeof windowOutput === "number") windowTotal += windowOutput;
-    sessions.push({
-      sessionId: c.session_id,
-      sessionIdShort: `${(c.session_id || "").slice(0, 8)}...`,
-      sampledOutput: sampled,
-      windowOutput,
-      windowOutputTs: c.ts ?? null,
-    });
-  }
-  sessions.sort((a, b) => String(a.sessionId).localeCompare(String(b.sessionId)));
-
-  return {
-    sampledOutput: sampledTotal,
-    // A sum of per-session occupancy snapshots taken at different instants:
-    // a rough scale indicator, not a total anything was measured at.
-    windowOutput: windowTotal,
-    sessions,
-  };
-}
-
-// ---------------------------------------------------------------------------
 // top-level report
 // ---------------------------------------------------------------------------
 
@@ -1123,7 +1054,6 @@ export function computeReport(db, opts = {}) {
   const reviewPathology = computeReviewPathology(inWindowRounds, verdictSourceAvailable);
   const delegatedJobs = computeDelegatedJobs(inWindowJobs);
   const byBackend = computeBackendSplit(inWindowChains, inWindowJobs, roundsByChain);
-  const cursorSampledOutput = computeCursorSampledOutput(db);
   const stopReasonBreakdown = computeStopReasonBreakdown(inWindowJobs, inWindowRounds);
   const toolStats = computeToolStatsSection(inWindowJobs, fetchToolStats(db));
 
@@ -1161,7 +1091,6 @@ export function computeReport(db, opts = {}) {
     // audit_gate tables.  Present on every non-missing report; the renderers
     // emit its text only when mission rows exist.
     missions: computeMissionsSection(db),
-    ...(cursorSampledOutput ? { cursorSampledOutput } : {}),
   };
 }
 

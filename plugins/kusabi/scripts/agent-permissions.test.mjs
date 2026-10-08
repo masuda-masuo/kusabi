@@ -774,7 +774,7 @@ describe("kusabi #529 — Luna/Sol seat registration (no-tool seats)", () => {
 // stream framing, substitution flag, exact requested/actual provenance) and
 // must never let an unenforced deny list stand in for "no tools".  The real
 // `codex` binary is never required — CODEX_BIN points at a fake script
-// (cursor-dispatch precedent: "no test may ever require" the real binary).
+// (backend-dispatch precedent: "no test may ever require" the real binary).
 // ---------------------------------------------------------------------------
 
 const SEAT_THREAD_ID = "thread-529-seat-0001";

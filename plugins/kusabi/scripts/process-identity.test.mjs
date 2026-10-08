@@ -1,8 +1,8 @@
 // process-identity.test.mjs — tests for process identity token recording and verification (kusabi #601).
 //
 // Pins Acceptance Criteria 1–3:
-//   1. A job record written by the agy dispatch path and by the cursor dispatch
-//      path carries a non-null process.startTime equal to processStartToken(pid);
+//   1. A job record written by the agy dispatch path carries a non-null
+//      process.startTime equal to processStartToken(pid);
 //      stopRecordedProcess on such a record for a live fake process does not
 //      return unverifiable, and the process is stopped.
 //   2. codex still records a token (same shape), now from the runner.
@@ -18,7 +18,6 @@ import process from "node:process";
 
 import { runBackendProcess } from "./backend-process-runner.mjs";
 import { agyDispatch } from "./agy-dispatch.mjs";
-import { cursorDispatch } from "./cursor-dispatch.mjs";
 import { codexDispatch } from "./codex-dispatch.mjs";
 import { processStartToken, stopRecordedProcess, readProcessStat } from "./process-identity.mjs";
 import { listJobs } from "./job-store.mjs";
@@ -76,62 +75,6 @@ setTimeout(() => { process.exit(0); }, 30000);
       timeoutS: null,
       watchdogS: null,
       tiers: [["gemini-3.6-flash-high"]],
-      round: 1,
-      explicitModel: null,
-    },
-    cleanup() {
-      restoreEnv();
-      fs.rmSync(tmp, { recursive: true, force: true });
-    },
-  };
-}
-
-function createFakeCursorEnv() {
-  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "fake-cursor-identity-"));
-  const binPath = path.join(tmp, "fake-cursor");
-  const stateRoot = path.join(tmp, "state");
-  const cwd = path.join(tmp, "cwd");
-  const fakeHome = path.join(tmp, "home");
-  fs.mkdirSync(cwd, { recursive: true });
-  fs.mkdirSync(fakeHome, { recursive: true });
-
-  const script = `#!/usr/bin/env node
-import fs from "node:fs";
-const NL = String.fromCharCode(10);
-const chunks = [];
-for await (const chunk of process.stdin) chunks.push(chunk);
-fs.writeSync(1, JSON.stringify({
-  session_id: "cursor-identity-test-session",
-  type: "thinking",
-  subtype: "delta"
-}) + NL);
-setTimeout(() => { process.exit(0); }, 30000);
-`;
-  fs.writeFileSync(binPath, script, { encoding: "utf8", mode: 0o755 });
-
-  const restoreEnv = patchEnv({
-    CURSOR_BIN: binPath,
-    KUSABI_STATE_DIR: stateRoot,
-    HOME: fakeHome,
-  });
-
-  const stateDir = stateDirFor(cwd);
-
-  return {
-    tmp,
-    cwd,
-    stateDir,
-    options: {
-      cwd,
-      kind: "task",
-      title: "cursor identity test",
-      promptText: "Say the token.",
-      agent: null,
-      phase: null,
-      tools: null,
-      timeoutS: null,
-      watchdogS: null,
-      tiers: [["default"]],
       round: 1,
       explicitModel: null,
     },
@@ -275,28 +218,6 @@ describe("dispatch backend process identity (kusabi #601)", () => {
     const env = createFakeAgyEnv();
     try {
       const pending = agyDispatch(env.options);
-      const running = await waitForRunningJob(env.stateDir);
-
-      assert.ok(typeof running.process.pid === "number" && running.process.pid > 0);
-      assert.ok(typeof running.process.startTime === "string" && running.process.startTime.length > 0);
-      assert.equal(running.process.startTime, processStartToken(running.process.pid));
-      assert.equal(running.process.startTime, readProcessStat(running.process.pid).startTime);
-
-      const stop = await stopRecordedProcess(running.process);
-      assert.notEqual(stop.outcome, "unverifiable");
-      assert.equal(stop.outcome, "stopped");
-      assert.equal(stop.signalled, true);
-
-      await pending;
-    } finally {
-      env.cleanup();
-    }
-  });
-
-  it("criterion 1: cursor dispatch records non-null process.startTime equal to processStartToken(pid) and stopRecordedProcess stops it", async () => {
-    const env = createFakeCursorEnv();
-    try {
-      const pending = cursorDispatch(env.options);
       const running = await waitForRunningJob(env.stateDir);
 
       assert.ok(typeof running.process.pid === "number" && running.process.pid > 0);

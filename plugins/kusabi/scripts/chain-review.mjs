@@ -443,7 +443,7 @@ export async function runReviewPhase({
       // resolves no role home (phase null) and can never select
       // `homes.review`; only the manual `task --phase review` path reached
       // it.  This field is safe to set here: every backend on this path
-      // (opencode via selectRoutes, claude, agy, cursor) resolves its model
+      // (opencode via selectRoutes, claude, agy, codex) resolves its model
       // from `tiers`/`explicitModel`, never from `phase`, so carrying the
       // seat identity cannot re-route model selection.
       phase: "review",

@@ -1,7 +1,7 @@
 // metrics-db.mjs — schema definition, DB open/migrate, and row upsert helpers.
 //
 // Owns all SQL for the metrics store.  Nothing else in this feature opens a
-// database handle or writes SQL: transcript-ingest.mjs, cursor-usage-ingest.mjs
+// database handle or writes SQL: transcript-ingest.mjs, codex-usage-ingest.mjs
 // and chain-ingest.mjs receive an already-open `db` and only ever call the
 // upsert* functions exported here.  That split is what makes the ingest
 // modules testable against an in-memory database (openMetricsDb(":memory:"))
@@ -234,20 +234,6 @@ CREATE TABLE IF NOT EXISTS tool_stat (
   success INTEGER,
   failure INTEGER,
   PRIMARY KEY (job_id, tool)
-);
-
--- Cursor statusline sink's context_window.total_output_tokens, stored
--- separately because the session table is shared with Claude transcript rows
--- and must not grow Cursor-only columns.  Value is the latest-ts non-null
--- reading.  That field is the output currently OCCUPYING the context window,
--- not a cumulative session counter: it decreases when compaction evicts
--- earlier output (kusabi #253 — measured 45,976 → 36,842 inside one
--- session).  Not used to rewrite turn.output, and never a ratio denominator
--- — the report prints it beside the sampled sum.
-CREATE TABLE IF NOT EXISTS cursor_session_counter (
-  session_id TEXT PRIMARY KEY,
-  total_output_tokens INTEGER,
-  ts TEXT
 );
 
 -- kusabi #532: luna mission rows.  A mission is a luna-arm dispatch surface
@@ -735,8 +721,7 @@ export function upsertFinding(db, row) {
  * REPLACEMENT review's -- the pre-replacement rows sit at idx values the new
  * parse may no longer emit, and they would live in the store forever.  The
  * caller deletes this round's rows, then re-inserts the current record's --
- * the same delete-then-insert contract `deleteCursorTurnsForSession` uses --
- * which is what makes a re-ingest converge instead of accumulating.  Matches
+ * the delete-then-insert contract -- which is what makes a re-ingest converge instead of accumulating.  Matches
  * on the round primary key (chain_id, round), the same granularity as the
  * round-row upsert; other rounds and other chains are untouched.
  *
@@ -851,91 +836,6 @@ export function replaceToolStatsForJob(db, jobId, stats) {
       failure: s?.failure ?? 0,
     });
   }
-}
-
-// ---------------------------------------------------------------------------
-// cursor_session_counter — latest-ts CLI cumulative output (display only)
-// ---------------------------------------------------------------------------
-
-/**
- * @param {import("node:sqlite").DatabaseSync} db
- * @param {string} sessionId
- * @returns {{ session_id: string, total_output_tokens: number|null, ts: string|null } | undefined}
- */
-export function getCursorSessionCounter(db, sessionId) {
-  return db.prepare(`
-    SELECT session_id, total_output_tokens, ts
-    FROM cursor_session_counter WHERE session_id = $sessionId
-  `).get({ sessionId });
-}
-
-function tsMsOf(ts) {
-  if (typeof ts !== "string" || !ts) return null;
-  const ms = Date.parse(ts);
-  return Number.isNaN(ms) ? null : ms;
-}
-
-/**
- * Store the CLI-reported window output occupancy for a Cursor session (the
- * latest `context_window.total_output_tokens`, which is not cumulative and
- * may decrease -- see the table comment above).  The
- * incoming row wins only when it is at least as new as the stored one
- * (equal ts replaces, for idempotent re-ingest of the same snapshot).
- * Monotonicity of the token value is not assumed — newest ts is the rule.
- * An incoming row with no parseable ts never overwrites a stored row that
- * has one.
- *
- * @param {import("node:sqlite").DatabaseSync} db
- * @param {{ sessionId: string, totalOutputTokens: number|null, ts: string|null }} row
- */
-export function upsertCursorSessionCounter(db, row) {
-  const existing = getCursorSessionCounter(db, row.sessionId);
-  if (existing) {
-    const existingMs = tsMsOf(existing.ts);
-    const incomingMs = tsMsOf(row.ts);
-    if (existingMs !== null && incomingMs !== null && existingMs > incomingMs) {
-      return;
-    }
-    if (existingMs !== null && incomingMs === null) {
-      return;
-    }
-  }
-  db.prepare(`
-    INSERT OR REPLACE INTO cursor_session_counter (session_id, total_output_tokens, ts)
-    VALUES ($sessionId, $totalOutputTokens, $ts)
-  `).run({
-    sessionId: row.sessionId,
-    totalOutputTokens: row.totalOutputTokens ?? null,
-    ts: row.ts ?? null,
-  });
-}
-
-/**
- * Delete every cursor-sourced turn row of one session.
- *
- * Needed because `INSERT OR REPLACE` can only overwrite request_ids the new
- * parse still produces.  When cursor-usage-ingest re-reads a file with a
- * changed turn-emission rule (kusabi #252 collapses runs of repeated
- * `current_usage` snapshots into one turn), the pre-change rows sit at line
- * numbers the new parse no longer emits, and a finished session's jsonl
- * never changes again -- so without an explicit delete they would live in
- * the store forever.  The caller deletes, then re-inserts the whole file's
- * turns, which is what makes a re-ingest converge instead of accumulating.
- *
- * Matches on the `session_id` column plus a `'cursor:%'` request_id prefix
- * rather than a LIKE over the session id itself, so a session id containing
- * `%` or `_` cannot widen the delete.  Claude transcript turns of the same
- * session id (there are none in practice) are untouched by the prefix.
- *
- * @param {import("node:sqlite").DatabaseSync} db
- * @param {string} sessionId
- * @returns {number} rows deleted
- */
-export function deleteCursorTurnsForSession(db, sessionId) {
-  const result = db.prepare(
-    "DELETE FROM turn WHERE session_id = $sessionId AND request_id LIKE 'cursor:%'",
-  ).run({ sessionId });
-  return Number(result.changes ?? 0);
 }
 
 /**

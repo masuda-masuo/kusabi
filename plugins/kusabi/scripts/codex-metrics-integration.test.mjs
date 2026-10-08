@@ -116,7 +116,6 @@ describe("cmdMetricsIngest — Codex usage integration", () => {
           db: dbPath,
           "codex-usage-dir": codexDir,
           "transcript-dir": path.join(tmpDir, "no-such-transcripts"),
-          "cursor-usage-dir": path.join(tmpDir, "no-such-cursor"),
           "state-root": tmpDir,
         },
       });
@@ -155,7 +154,6 @@ describe("cmdMetricsIngest — Codex usage integration", () => {
         db: dbPath,
         "codex-usage-dir": codexDir,
         "transcript-dir": path.join(tmpDir, "no-such-transcripts"),
-        "cursor-usage-dir": path.join(tmpDir, "no-such-cursor"),
         "state-root": tmpDir,
       };
 
@@ -191,7 +189,6 @@ describe("cmdMetricsIngest — Codex usage integration", () => {
           db: dbPath,
           // No --codex-usage-dir: should use CODEX_HOME/sessions
           "transcript-dir": path.join(tmpDir, "no-such-transcripts"),
-          "cursor-usage-dir": path.join(tmpDir, "no-such-cursor"),
           "state-root": tmpDir,
         },
       });
@@ -217,7 +214,6 @@ describe("cmdMetricsIngest — Codex usage integration", () => {
           db: dbPath,
           "codex-usage-dir": codexDir,
           "transcript-dir": path.join(tmpDir, "no-such-transcripts"),
-          "cursor-usage-dir": path.join(tmpDir, "no-such-cursor"),
           "state-root": tmpDir,
         },
       });
@@ -242,7 +238,6 @@ describe("cmdMetricsIngest — Codex usage integration", () => {
           db: dbPath,
           "codex-usage-dir": codexDir,
           "transcript-dir": path.join(tmpDir, "no-such-transcripts"),
-          "cursor-usage-dir": path.join(tmpDir, "no-such-cursor"),
           "state-root": tmpDir,
         },
       });
@@ -263,7 +258,6 @@ describe("cmdMetricsIngest — Codex usage integration", () => {
           db: dbPath,
           "codex-usage-dir": path.join(tmpDir, "nonexistent-codex-" + Date.now()),
           "transcript-dir": path.join(tmpDir, "no-such-transcripts"),
-          "cursor-usage-dir": path.join(tmpDir, "no-such-cursor"),
           "state-root": tmpDir,
         },
       });

@@ -17,7 +17,6 @@ import {
   upsertChain,
   upsertRound,
   upsertJob,
-  upsertCursorSessionCounter,
   replaceToolStatsForJob,
 } from "./metrics-db.mjs";
 
@@ -1221,7 +1220,7 @@ describe("per-phase backend attribution (kusabi #195)", () => {
 });
 
 describe("freshness label", () => {
-  it("renders 'newest ingested turn' (MAX(turn.ts) includes cursor samples)", () => {
+  it("renders 'newest ingested turn' (MAX(turn.ts) includes ingested samples)", () => {
     const db = openMetricsDb(":memory:");
     const text = renderReportText(computeReport(db, { dbPath: ":memory:" }));
     assert.match(text, /newest ingested turn:/);
@@ -1229,179 +1228,6 @@ describe("freshness label", () => {
   });
 });
 
-// The section this replaces printed `sampled / total_output_tokens` as a
-// "coverage" percentage with a `!` outlier flag.  kusabi #253 retired the
-// ratio (the denominator is window occupancy, not a cumulative counter), so
-// these tests assert the two values are reported side by side and that no
-// ratio or flag comes back.
-describe("Cursor sampled output and window output occupancy", () => {
-  it("omits the section (and the JSON key) when the counter table is empty", () => {
-    const db = buildFixture();
-    const report = computeReport(db, { dbPath: ":memory:" });
-    assert.equal(report.cursorSampledOutput, undefined);
-    const text = renderReportText(report);
-    assert.doesNotMatch(text, /Cursor sampled output/);
-    const parsed = JSON.parse(renderReportJson(report));
-    assert.equal("cursorSampledOutput" in parsed, false);
-  });
-
-  it("omits the section on a store whose counter table does not exist", () => {
-    const db = buildFixture();
-    db.exec("DROP TABLE cursor_session_counter");
-    const report = computeReport(db, { dbPath: ":memory:" });
-    assert.equal(report.cursorSampledOutput, undefined);
-    assert.doesNotMatch(renderReportText(report), /Cursor sampled output/);
-  });
-
-  it("reports sampled output and window occupancy as plain values, with no ratio and no flag", () => {
-    const db = openMetricsDb(":memory:");
-    const sessionId = "d73008ab-1111-2222-3333-444444444444";
-    upsertSession(db, {
-      sessionId,
-      firstTs: "2026-08-14T10:00:10.000Z",
-      firstTsMs: Date.parse("2026-08-14T10:00:10.000Z"),
-    });
-    upsertTurn(db, {
-      requestId: `cursor:${sessionId}#1`,
-      sessionId,
-      ts: "2026-08-14T10:00:10.000Z",
-      tsMs: Date.parse("2026-08-14T10:00:10.000Z"),
-      output: 20,
-      isSidechain: 0,
-      isSynthetic: 0,
-    });
-    upsertTurn(db, {
-      requestId: `cursor:${sessionId}#2`,
-      sessionId,
-      ts: "2026-08-14T10:00:20.000Z",
-      tsMs: Date.parse("2026-08-14T10:00:20.000Z"),
-      output: 30,
-      isSidechain: 0,
-      isSynthetic: 0,
-    });
-    upsertCursorSessionCounter(db, {
-      sessionId,
-      totalOutputTokens: 80,
-      ts: "2026-08-14T10:00:20.000Z",
-    });
-
-    const report = computeReport(db, { dbPath: ":memory:" });
-    assert.ok(report.cursorSampledOutput);
-    assert.equal(report.cursorSampledOutput.sampledOutput, 50);
-    assert.equal(report.cursorSampledOutput.windowOutput, 80);
-    // The retired ratio and flag must not come back in any shape.
-    assert.equal("coveragePct" in report.cursorSampledOutput, false);
-    assert.equal("anomaly" in report.cursorSampledOutput, false);
-    assert.equal(report.cursorSampledOutput.sessions.length, 1);
-    assert.equal(report.cursorSampledOutput.sessions[0].sessionIdShort, "d73008ab...");
-    assert.equal(report.cursorSampledOutput.sessions[0].sampledOutput, 50);
-    assert.equal(report.cursorSampledOutput.sessions[0].windowOutput, 80);
-    assert.equal("coveragePct" in report.cursorSampledOutput.sessions[0], false);
-    assert.equal("anomaly" in report.cursorSampledOutput.sessions[0], false);
-
-    const text = renderReportText(report);
-    assert.match(text, /Cursor sampled output and window output occupancy:/);
-    assert.match(text, /sampled output 50 {2}latest window output occupancy 80/);
-    assert.match(text, /d73008ab\.\.\. {2}sampled 50 {2}window occupancy 80/);
-    const cursorSection = text.slice(text.indexOf("Cursor sampled output"));
-    assert.doesNotMatch(cursorSection, /%/);
-    assert.doesNotMatch(cursorSection, /!/);
-    assert.doesNotMatch(cursorSection, /coverage/i);
-    assert.doesNotMatch(cursorSection, /reported cumulative/i);
-    // The non-cumulative caveat is the whole reason both numbers are shown.
-    assert.match(cursorSection, /NOT a cumulative session total/);
-    assert.match(cursorSection, /compaction/);
-  });
-
-  it("prints both numbers unflagged when window occupancy is below the sampled sum", () => {
-    // Not an anomaly any more: occupancy drops on compaction while the
-    // sampled sum only grows, so sampled > occupancy is the expected shape
-    // of a long session, not a defect to flag.
-    const db = openMetricsDb(":memory:");
-    const sessionId = "sess-below-1";
-    upsertSession(db, {
-      sessionId,
-      firstTs: "2026-08-14T10:00:00.000Z",
-      firstTsMs: Date.parse("2026-08-14T10:00:00.000Z"),
-    });
-    upsertTurn(db, {
-      requestId: `cursor:${sessionId}#1`,
-      sessionId,
-      ts: "2026-08-14T10:00:00.000Z",
-      tsMs: Date.parse("2026-08-14T10:00:00.000Z"),
-      output: 90,
-      isSidechain: 0,
-      isSynthetic: 0,
-    });
-    upsertCursorSessionCounter(db, {
-      sessionId,
-      totalOutputTokens: 80,
-      ts: "2026-08-14T10:00:00.000Z",
-    });
-
-    const report = computeReport(db, { dbPath: ":memory:" });
-    assert.equal(report.cursorSampledOutput.sampledOutput, 90);
-    assert.equal(report.cursorSampledOutput.windowOutput, 80);
-    const text = renderReportText(report);
-    const cursorSection = text.slice(text.indexOf("Cursor sampled output"));
-    assert.match(cursorSection, /sess-bel\.\.\. {2}sampled 90 {2}window occupancy 80/);
-    assert.doesNotMatch(cursorSection, /!/);
-    assert.doesNotMatch(cursorSection, /%/);
-  });
-
-  it("renders n/a for a session whose window occupancy reading is absent", () => {
-    const db = openMetricsDb(":memory:");
-    const sessionId = "sess-null-window";
-    upsertTurn(db, {
-      requestId: `cursor:${sessionId}#1`,
-      sessionId,
-      ts: "2026-08-14T10:00:00.000Z",
-      tsMs: Date.parse("2026-08-14T10:00:00.000Z"),
-      output: 25,
-      isSidechain: 0,
-      isSynthetic: 0,
-    });
-    upsertCursorSessionCounter(db, {
-      sessionId,
-      totalOutputTokens: null,
-      ts: "2026-08-14T10:00:00.000Z",
-    });
-    const report = computeReport(db, { dbPath: ":memory:" });
-    assert.equal(report.cursorSampledOutput.sessions[0].windowOutput, null);
-    assert.match(renderReportText(report), /sess-nul\.\.\. {2}sampled 25 {2}window occupancy n\/a/);
-  });
-
-  it("does not count non-cursor turns in sampled output", () => {
-    const db = openMetricsDb(":memory:");
-    const sessionId = "cursor-sess";
-    upsertTurn(db, {
-      requestId: "claude-req-1",
-      sessionId: "claude-sess",
-      ts: "2026-08-14T10:00:00.000Z",
-      tsMs: Date.parse("2026-08-14T10:00:00.000Z"),
-      output: 1000,
-      isSidechain: 0,
-      isSynthetic: 0,
-    });
-    upsertTurn(db, {
-      requestId: `cursor:${sessionId}#1`,
-      sessionId,
-      ts: "2026-08-14T10:00:00.000Z",
-      tsMs: Date.parse("2026-08-14T10:00:00.000Z"),
-      output: 10,
-      isSidechain: 0,
-      isSynthetic: 0,
-    });
-    upsertCursorSessionCounter(db, {
-      sessionId,
-      totalOutputTokens: 40,
-      ts: "2026-08-14T10:00:00.000Z",
-    });
-    const report = computeReport(db, { dbPath: ":memory:" });
-    assert.equal(report.cursorSampledOutput.sampledOutput, 10);
-    assert.equal(report.cursorSampledOutput.windowOutput, 40);
-  });
-});
 
 describe("Brief-metrics strata — orch_model key normalisation (kusabi #252)", () => {
   function chainSignedAs(db, chainId, orchModel) {
@@ -1793,7 +1619,7 @@ function seedTimedJob(db, row) {
 }
 
 describe("tool-stats coverage — opencode SSE only (kusabi #384)", () => {
-  it("a mixed window reports the opencode job's tools only and excludes the cursor failed job", () => {
+  it("a mixed window reports the opencode job's tools only and excludes the agy failed job", () => {
     const db = openMetricsDb(":memory:");
     seedTimedJob(db, {
       jobId: "job-opencode",
@@ -1805,16 +1631,16 @@ describe("tool-stats coverage — opencode SSE only (kusabi #384)", () => {
       bash: { count: 4, success: 4, failure: 0 },
     });
     seedTimedJob(db, {
-      jobId: "job-cursor",
-      backend: "cursor",
+      jobId: "job-agy",
+      backend: "agy",
       status: "error",
       stopReason: "error",
       startedAt: "2026-08-01T11:00:00.000Z",
       startedMs: Date.parse("2026-08-01T11:00:00.000Z"),
     });
     // Coverage is job.backend, never inferred from tool_stat: leftover rows
-    // on a cursor job must not enter either total.
-    replaceToolStatsForJob(db, "job-cursor", {
+    // on an agy job must not enter either total.
+    replaceToolStatsForJob(db, "job-agy", {
       bash: { count: 9, success: 0, failure: 9 },
       edit: { count: 1, success: 0, failure: 1 },
     });
@@ -1825,7 +1651,7 @@ describe("tool-stats coverage — opencode SSE only (kusabi #384)", () => {
     assert.equal(report.toolStats.coverage.coveredJobCount, 1);
     assert.equal(report.toolStats.all.bash.count, 4);
     assert.equal(report.toolStats.all.edit.count, 0);
-    // Cursor failed job is absent from failed-jobs totals (its 9 bash / 1 edit
+    // Agy failed job is absent from failed-jobs totals (its 9 bash / 1 edit
     // do not appear; the opencode job did not fail).
     assert.equal(report.toolStats.failedJobs.bash.count, 0);
     assert.equal(report.toolStats.failedJobs.edit.count, 0);
@@ -1838,11 +1664,11 @@ describe("tool-stats coverage — opencode SSE only (kusabi #384)", () => {
     assert.doesNotMatch(text, /no covered jobs in this window/);
   });
 
-  it("an all-cursor window prints the coverage line and no covered jobs, not a zero-filled table", () => {
+  it("an all-agy window prints the coverage line and no covered jobs, not a zero-filled table", () => {
     const db = openMetricsDb(":memory:");
     seedTimedJob(db, {
-      jobId: "job-cursor",
-      backend: "cursor",
+      jobId: "job-agy",
+      backend: "agy",
       status: "error",
       stopReason: "error",
     });

@@ -19,7 +19,6 @@ import {
 } from "./chain-control.mjs";
 import { CLAUDE_BACKEND } from "./claude-dispatch.mjs";
 import { AGY_BACKEND } from "./agy-dispatch.mjs";
-import { CURSOR_BACKEND } from "./cursor-dispatch.mjs";
 import { CODEX_BACKEND } from "./codex-dispatch.mjs";
 import fs from "node:fs";
 import path from "node:path";
@@ -48,14 +47,14 @@ async function stopRunningJob(stateDir, job) {
   // Records written before the backend split carry no `backend` field and
   // are opencode by definition (same rule every other reader uses).
   const backend = job.backend ?? "opencode";
-  // Spawned-CLI backends (claude, agy, cursor) are stopped the same way and for
+  // Spawned-CLI backends (claude, agy, codex) are stopped the same way and for
   // the same reason: their job records have no session to abort, so the
   // recorded process is the only lever.  Keyed on the recorded-process shape
   // rather than on one backend's name — routing an agy job to the opencode
   // path would try to abort a session that does not exist and then report
   // success, which is precisely the false confirmation kusabi #209 exists to
   // prevent.
-  if (backend === CLAUDE_BACKEND || backend === AGY_BACKEND || backend === CURSOR_BACKEND || backend === CODEX_BACKEND) {
+  if (backend === CLAUDE_BACKEND || backend === AGY_BACKEND || backend === CODEX_BACKEND) {
     return stopSpawnedCliJob(job, backend);
   }
   return stopOpencodeJob(stateDir, job);

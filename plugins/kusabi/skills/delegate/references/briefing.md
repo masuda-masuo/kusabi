@@ -58,7 +58,7 @@ Place machine-read sections (`Deliverables`, `Smoke`, `Frozen Tests`) first.
 - **Evidence files under `/tmp` must prove themselves in `## Smoke`.** Any evidence path under `/tmp` named in `## Workplace` must be read by at least one `## Smoke` command (e.g. a non-empty check); the dispatch lint refuses a brief where none does. The check needs no implementation, so the dispatch-time smoke baseline then refuses unusable evidence before a round is spent (the incident: an empty SQLite file whose content lived in the uncopied `-wal` sidecar). Example Smoke line:
 
   ```
-  python -c "import sqlite3;assert sqlite3.connect('/tmp/cursor-store-sample/store.db').execute('select count(*) from blobs').fetchone()[0]>0"
+  python -c "import sqlite3;assert sqlite3.connect('/tmp/sqlite-store-sample/store.db').execute('select count(*) from blobs').fetchone()[0]>0"
   ```
 - **Optional section**: Omit `## Premises` when there are no premises; an empty heading is refused by dispatch lint.
 

@@ -9,7 +9,7 @@ description: Reflect a merged kusabi change into the running local installation 
 copy, and four places do not follow it on their own: the agent definitions distributed
 to the opencode config directory (a copy), the Claude Code plugin cache (a snapshot
 copy taken at install time), an already-running serve process (holds the old
-definitions in memory), and the membership of the Cursor-side links written by
+definitions in memory), and the membership of the Codex-side links written by
 install-cli (each link's content follows the working copy, but a name newly added to
 the link set has no link until install-cli runs again). Each keeps working quietly
 with stale content — that silence is the dangerous part.
@@ -23,15 +23,15 @@ with stale content — that silence is the dangerous part.
    copies.
 4. **Relink the plugin cache**: run `<skill base>/../../scripts/relink-plugin-cache.sh`
    (shipped next to the companion). Idempotent — run it every time.
-5. **Re-run `install-cli`** when the Cursor-facing surface changed — the shim, or a
-   name added to the set of skills/rules it links. Idempotent, seconds.
+5. **Re-run `install-cli`** when the orchestrator-facing surface changed — the shim, or a
+   name added to the set of skills it links. Idempotent, seconds.
 
 What is actually required depends on what changed:
 
 | Changed | Required | Verify by |
 |---|---|---|
 | `scripts/*.mjs` | 1 only | `--help` shows the change |
-| a name added to the install-cli link set (skills or `rules/`), or the shim | 1 → 5 | the new link exists under `~/.cursor/skills` / `~/.cursor/rules` (and `~/.codex/skills` for Codex) |
+| a name added to the install-cli link set (skills), or the shim | 1 → 5 | the new link exists under `~/.codex/skills` |
 | `opencode-agents/*.md` | 1 → 2 → 3 | grep the changed wording in the distributed copies |
 | `skills/` `commands/` | 1 → 4 → **new session** | the skill list of a fresh session |
 | `docs/` `README` | 1 only | — |

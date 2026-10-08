@@ -108,7 +108,7 @@ export function quotaReplacementRefusal(failure) {
   return (
     "review seat died of quota exhaustion on " + backend + quota +
     ". Buying the same seat cannot work. Route the replacement with " +
-    "--backend opencode|claude|agy|cursor or --model <id> (a different backend or model)."
+    "--backend opencode|claude|agy|codex or --model <id> (a different backend or model)."
   );
 }
 

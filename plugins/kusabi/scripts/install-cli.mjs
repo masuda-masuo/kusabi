@@ -1,7 +1,7 @@
 // install-cli: the `kusabi-companion install-cli` surface.
 //
-// Writes the PATH-independent companion shim and wires Cursor's user-level
-// skill/rule discovery paths to the plugin's own artifacts.  Extracted from
+// Writes the PATH-independent companion shim and wires Codex's user-level
+// skill discovery paths to the plugin's own artifacts.  Extracted from
 // kusabi-companion.mjs unchanged (kusabi #264): same output strings, same
 // exit codes.
 //
@@ -81,17 +81,8 @@ function pathHasDir(dir) {
     });
 }
 
-// Cursor discovers user-level skills at <cursorDir>/skills/<name>/SKILL.md and
-// alwaysApply rules at <cursorDir>/rules/*.mdc (kusabi #247).  `--plugin-dir`
-// covers a working copy under development; a default `cursor-agent` launch and
-// the IDE chat see neither, so install-cli symlinks the two orchestrator-facing
-// skills into the user directory.  Symlinks, not copies: a plugin update then
-// reaches Cursor without a reinstall.
-const CURSOR_SKILL_NAMES = ["delegate", "kusabi-result-handling"];
-const CURSOR_RULE_FILE = "kusabi-delegate.mdc";
-
 // Codex discovers user-level skills at <codexDir>/skills/<name>/SKILL.md (kusabi
-// #477).  The same plugin skills that Cursor needs are wired here, using the
+// #477).  The orchestrator-facing plugin skills are wired here, using the
 // same ensureSymlink / formatSymlinkLine helpers.
 const CODEX_SKILL_NAMES = ["delegate", "kusabi-result-handling"];
 
@@ -105,10 +96,6 @@ const CODEX_NOTIFY_PLUGIN_DIR_NAME = "kusabi-codex-notify";
 /** The plugin root (`plugins/kusabi`), resolved from the companion script, never cwd. */
 function pluginRootDir(selfPath) {
   return path.dirname(path.dirname(selfPath));
-}
-
-function cursorUserDir() {
-  return process.env.KUSABI_CURSOR_DIR || path.join(os.homedir(), ".cursor");
 }
 
 function codexUserDir() {
@@ -135,7 +122,7 @@ function codexNotifyPluginSourceDir(selfPath) {
  * `current`.
  *
  * A missing SOURCE is reported as `missing` and nothing is created: a link
- * to a path that does not exist resolves to nothing for Cursor while the
+ * to a path that does not exist resolves to nothing while the
  * install output claims `created`, so a broken plugin checkout would be
  * reported as a success (kusabi #256).
  *
@@ -263,54 +250,9 @@ export function formatSymlinkLine(res) {
 }
 
 /**
- * Wire Cursor's user-level discovery paths to the plugin's own skills.
- *
- * A machine with no `~/.cursor` simply has no Cursor: that is information,
- * not a warning, and nothing is created there.  An explicit
- * KUSABI_CURSOR_DIR is a request, so that directory IS created.  Per-artifact
- * failures are reported and the rest continues — install-cli's primary job
- * (the shim) has already succeeded by the time this runs.
- *
- * @param {{ rule?: boolean, selfPath?: string }} [opts]
- * @returns {{lines: string[], failed: boolean}} One line per artifact (or one
- *   skip line); `failed` when any artifact rendered an `error:` line.
- */
-function wireCursorSkills({ rule = false, selfPath } = {}) {
-  const explicit = Boolean(process.env.KUSABI_CURSOR_DIR);
-  const cursorDir = cursorUserDir();
-  if (!explicit && !fs.existsSync(cursorDir)) {
-    return {
-      lines: [`cursor skills: skipped (${cursorDir} not found — no Cursor user directory on this machine)`],
-      failed: false,
-    };
-  }
-  const pluginDir = pluginRootDir(selfPath);
-  const results = CURSOR_SKILL_NAMES.map((name) => ensureSymlink(
-    path.join(pluginDir, "skills", name),
-    path.join(cursorDir, "skills", name),
-  ));
-  if (rule) {
-    results.push(ensureSymlink(
-      path.join(pluginDir, "rules", CURSOR_RULE_FILE),
-      path.join(cursorDir, "rules", CURSOR_RULE_FILE),
-    ));
-  }
-  return {
-    lines: results.map(formatSymlinkLine),
-    // Any rendered `error:` line — a missing source (broken checkout) or a
-    // destination-side failure — decides the exit code (kusabi #256, #258):
-    // when install-cli's output reports an error, the caller must not read
-    // success from `$?`.  The shim itself, install-cli's primary job, is
-    // already written by the time we get here, but the wiring is still
-    // incomplete, so the exit code follows the output.
-    failed: results.some((r) => r.state === "missing" || r.state === "error"),
-  };
-}
-
-/**
  * Wire Codex's user-level discovery paths to the plugin's own skills (kusabi #477).
  *
- * Mirrors wireCursorSkills: Codex looks under <codexDir>/skills/<name>/SKILL.md.
+ * Codex looks under <codexDir>/skills/<name>/SKILL.md.
  * A machine with no `~/.codex` simply has no Codex: that is information, not a
  * warning, and nothing is created there.  An explicit KUSABI_CODEX_DIR is a
  * request, so that directory IS created.
@@ -375,7 +317,7 @@ function wireCodexNotifyPlugin({ selfPath } = {}) {
   };
 }
 
-export function cmdInstallCli({ flags, selfPath } = {}) {
+export function cmdInstallCli({ selfPath } = {}) {
   const binDir = companionBinDir();
   const shim = companionShimPath(binDir);
   const expected = renderCompanionShim(selfPath);
@@ -401,8 +343,6 @@ export function cmdInstallCli({ flags, selfPath } = {}) {
   if (!pathHasDir(binDir)) {
     lines.push(`warning: ${binDir} is not on PATH; add it so \`${SHIM_NAME}\` can be found`);
   }
-  const cursor = wireCursorSkills({ rule: Boolean(flags?.cursorRule), selfPath });
-  lines.push(...cursor.lines);
   const codex = wireCodexSkills({ selfPath });
   lines.push(...codex.lines);
   const codexNotify = wireCodexNotifyPlugin({ selfPath });
@@ -411,5 +351,5 @@ export function cmdInstallCli({ flags, selfPath } = {}) {
   // Any rendered `error:` line means the wiring is incomplete; reporting it
   // on stdout and still exiting 0 would let a broken install read as a
   // successful one (kusabi #256, #258).
-  return (cursor.failed || codex.failed || codexNotify.failed) ? { text, exitCode: 1 } : text;
+  return (codex.failed || codexNotify.failed) ? { text, exitCode: 1 } : text;
 }

@@ -36,7 +36,6 @@ import { jobDir, saveJob, latestJob, appendEvent } from "./job-store.mjs";
 import { runPrompt, finalizeIncompleteCompletedRun } from "./prompt-execution.mjs";
 import { translateDenyTools } from "./tool-permissions.mjs";
 import { AGY_BACKEND } from "./agy-dispatch.mjs";
-import { CURSOR_BACKEND } from "./cursor-dispatch.mjs";
 import { CODEX_BACKEND } from "./codex-dispatch.mjs";
 import {
   parseReviewResult,
@@ -305,7 +304,7 @@ export function resolveTaskPreflight(cwd, { flags, text }, opts = {}) {
   // which is in hand HERE, not in the dispatch. The owner record of the session
   // names its backend (records without the backend field predate the split ->
   // opencode); no owner means the id's provenance is unknown, and CLI
-  // dispatches (claude, cursor, codex, agy) fail closed rather than passing an
+  // dispatches (claude, codex, agy) fail closed rather than passing an
   // unproven id to resume flags. The opencode dispatch ignores the signal.
   let sessionProvenance = null;
   if (session) {
@@ -347,20 +346,13 @@ export function resolveTaskPreflight(cwd, { flags, text }, opts = {}) {
       "Run the task on the opencode or claude backend, which enforce it."
     );
   }
-  if (tools && backend === CURSOR_BACKEND) {
-    throw new Error(
-      `${flags.readOnly ? "--read-only" : "--deny"} is not supported on the cursor backend — ` +
-      "the Cursor CLI has no per-job tool permission flags, so the restriction cannot be applied. " +
-      "Run the task on the opencode or claude backend, which enforce it."
-    );
-  }
   // The codex backend runs EVERY invocation in the fixed read-only sandbox
   // (`-s read-only`, measured 2026-09-20), so `--read-only` states what the
   // invocation already enforces and is accepted.  `--deny` is a different
   // claim: the codex CLI has no per-job tool-deny flags, so a tool-level deny
   // kusabi cannot enforce must be rejected, never recorded as applied.
   // Phase-level deny maps from the chain are recorded on the job as
-  // `toolDeniesUnenforced` (codexDispatch), exactly like agy/cursor.
+  // `toolDeniesUnenforced` (codexDispatch), exactly like agy.
   if (tools && backend === CODEX_BACKEND && flags.deny) {
     throw new Error(
       `--deny is not supported on the codex backend — ` +

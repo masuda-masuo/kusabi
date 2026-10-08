@@ -493,32 +493,6 @@ function renderDelegatedJobs(section) {
 }
 
 /**
- * Render the Cursor sampled-output sum beside the latest window-occupancy
- * reading.  Returns [] when the store has no cursor_session_counter rows, so
- * Claude-only text stays byte-identical aside from the freshness label.
- *
- * The two numbers are printed side by side and never divided — see
- * `computeCursorSampledOutput` (kusabi #253).  Do not reintroduce a ratio or
- * an outlier flag here: there is no denominator in the payload that would
- * make either one mean something.
- */
-function renderCursorSampledOutput(section) {
-  if (!section) return [];
-  const lines = [
-    "Cursor sampled output and window output occupancy:",
-    `  sampled output ${fmtInt(section.sampledOutput)}  latest window output occupancy ${fmtInt(section.windowOutput)}`,
-    "  Sampled output is the sum of the statusline samples ingested as turns, and undercounts (calls between two refreshes are never seen).",
-    "  Window output occupancy is what Cursor last reported the context window holding, NOT a cumulative session total: it drops when compaction evicts earlier output, so the two are shown side by side and are not a ratio.",
-  ];
-  for (const s of section.sessions) {
-    lines.push(
-      `  ${s.sessionIdShort}  sampled ${fmtInt(s.sampledOutput)}  window occupancy ${fmtInt(s.windowOutput)}`,
-    );
-  }
-  return lines;
-}
-
-/**
  * Render the by-backend split (kusabi #184).  Returns [] — no section at
  * all — when the window contains at most one distinct backend, so a
  * single-backend history renders byte-identically to before the split.
@@ -653,11 +627,6 @@ export function renderReportText(report) {
   if (toolLines.length > 0) {
     lines.push("");
     lines.push(...toolLines);
-  }
-  const cursorLines = renderCursorSampledOutput(report.cursorSampledOutput);
-  if (cursorLines.length > 0) {
-    lines.push("");
-    lines.push(...cursorLines);
   }
   const backendSplitLines = renderBackendSplit(report.byBackend);
   if (backendSplitLines.length > 0) {

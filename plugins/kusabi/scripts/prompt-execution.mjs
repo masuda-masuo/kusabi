@@ -10,7 +10,6 @@ import { writeJson, stateRoot } from "./state-paths.mjs";
 import { durationS } from "./render.mjs";
 import { parseModel, selectRoutes, splitRouteBackend } from "./cli.mjs";
 import { agyDispatch } from "./agy-dispatch.mjs";
-import { cursorDispatch } from "./cursor-dispatch.mjs";
 
 let _cachedClaudeDispatch = null;
 async function getClaudeDispatch() {
@@ -1180,7 +1179,6 @@ export async function dispatchWithFallback(opts) {
     _runPrompt,
     _agyDispatch,
     _claudeDispatch,
-    _cursorDispatch,
     _codexDispatch,
     _backendDispatch,
     ...runPromptOpts
@@ -1207,7 +1205,7 @@ export async function dispatchWithFallback(opts) {
   const candidates = routeCandidates.filter((candidate) => {
     const { backend: candidateBackend } = splitRouteBackend(candidate);
     if (excludedBackendSet.has(candidateBackend)) return false;
-    if (explicitRestrictions && (candidateBackend === "agy" || candidateBackend === "cursor")) {
+    if (explicitRestrictions && candidateBackend === "agy") {
       skippedRestrictedRoutes.push({
         route: candidate,
         reason: `explicit tool restriction cannot be applied on the ${candidateBackend} backend; candidate skipped`,
@@ -1313,16 +1311,6 @@ export async function dispatchWithFallback(opts) {
       result = await doClaude({
         ...runPromptOpts,
         ...(explicitRestrictions ? { tools: await translateDenyToolsForFallback(runPromptOpts.tools) } : {}),
-        session: currentSession,
-        sessionProvenance: currentSessionProvenance,
-        explicitModel: modelStr,
-        model: modelStr,
-        tiers: [[modelStr]],
-      });
-    } else if (candidateBackend === "cursor") {
-      const doCursor = _backendDispatch ? _backendDispatch("cursor") : (_cursorDispatch || cursorDispatch);
-      result = await doCursor({
-        ...runPromptOpts,
         session: currentSession,
         sessionProvenance: currentSessionProvenance,
         explicitModel: modelStr,

@@ -3,7 +3,7 @@
 // Split out of claude-dispatch.mjs (pure move, no behaviour change): reads an
 // opencode agent definition md under plugins/kusabi/opencode-agents/ and
 // strips the leading YAML frontmatter to yield the body passed via
-// `--append-system-prompt`.  Imported by the claude, agy, cursor and codex
+// `--append-system-prompt`.  Imported by the claude, agy, and codex
 // backends.
 
 import path from "node:path";

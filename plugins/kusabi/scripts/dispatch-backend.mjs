@@ -31,13 +31,6 @@ import {
   AGY_BACKEND,
 } from "./agy-dispatch.mjs";
 import {
-  cursorDispatch,
-  resolveCursorModel,
-  validateCursorModel,
-  validateCursorChain,
-  CURSOR_BACKEND,
-} from "./cursor-dispatch.mjs";
-import {
   codexDispatch,
   resolveCodexModel,
   validateCodexModel,
@@ -50,7 +43,7 @@ import { latestJob } from "./job-store.mjs";
 // dispatch backend selection (kusabi #184)
 // ---------------------------------------------------------------------------
 
-export const BACKENDS = ["opencode", "claude", "agy", "cursor", "codex"];
+export const BACKENDS = ["opencode", "claude", "agy", "codex"];
 
 /**
  * Resolve the dispatch backend from the `--backend` flag.  Resolved ONCE at
@@ -59,7 +52,7 @@ export const BACKENDS = ["opencode", "claude", "agy", "cursor", "codex"];
  * without the field are treated as `"opencode"` by readers.
  *
  * @param {object} flags — parsed flags (may carry `backend`).
- * @returns {"opencode"|"claude"|"agy"|"cursor"}
+ * @returns {"opencode"|"claude"|"agy"|"codex"}
  * @throws {Error} For any unknown backend value.
  */
 export function resolveBackend(flags) {
@@ -86,7 +79,6 @@ export function resolveBackend(flags) {
 export function backendDispatch(backend) {
   if (backend === CLAUDE_BACKEND) return claudeDispatch;
   if (backend === AGY_BACKEND) return agyDispatch;
-  if (backend === CURSOR_BACKEND) return cursorDispatch;
   if (backend === CODEX_BACKEND) return codexDispatch;
   return dispatchWithFallback;
 }
@@ -105,7 +97,7 @@ export function backendDispatch(backend) {
  * @returns {boolean}
  */
 export function backendPinsModel(backend) {
-  return backend === CLAUDE_BACKEND || backend === AGY_BACKEND || backend === CURSOR_BACKEND || backend === CODEX_BACKEND;
+  return backend === CLAUDE_BACKEND || backend === AGY_BACKEND || backend === CODEX_BACKEND;
 }
 
 /**
@@ -288,9 +280,6 @@ function resolveDispatchBackendForPhase({ flags, phase, config, backendFlag }) {
   if (flagBackend === "agy" || namedBackend === "agy") {
     return resolveAgyPhaseDispatch({ flags, phase, config, modelSpec });
   }
-  if (flagBackend === "cursor" || namedBackend === "cursor") {
-    return resolveCursorPhaseDispatch({ flags, phase, config, modelSpec });
-  }
   if (flagBackend === "codex" || namedBackend === "codex") {
     return resolveCodexPhaseDispatch({ flags, phase, config, modelSpec });
   }
@@ -316,9 +305,6 @@ function resolveDispatchBackendForPhase({ flags, phase, config, backendFlag }) {
       if (startBackend === "agy") {
         return resolveAgyPhaseDispatch({ flags, phase, config, modelSpec });
       }
-      if (startBackend === "cursor") {
-        return resolveCursorPhaseDispatch({ flags, phase, config, modelSpec });
-      }
       if (startBackend === "codex") {
         return resolveCodexPhaseDispatch({ flags, phase, config, modelSpec });
       }
@@ -334,7 +320,6 @@ function resolveDispatchBackendForPhase({ flags, phase, config, backendFlag }) {
 
   if (backend === "claude") return resolveClaudePhaseDispatch({ flags, phase, config, modelSpec });
   if (backend === "agy") return resolveAgyPhaseDispatch({ flags, phase, config, modelSpec });
-  if (backend === "cursor") return resolveCursorPhaseDispatch({ flags, phase, config, modelSpec });
   if (backend === "codex") return resolveCodexPhaseDispatch({ flags, phase, config, modelSpec });
   return resolveOpencodePhaseDispatch({ phase, config, modelSpec, namedBackend, flagBackend });
 }
@@ -439,46 +424,8 @@ function resolveAgyPhaseDispatch({ flags, phase, config, modelSpec }) {
 }
 
 /**
- * The cursor branch of the decision (kusabi #374) — the same shape as the
- * agy branch, one backend over.  Reached whether the identifier named
- * cursor, `--backend cursor` forced it, or the phase's chain entries carry
- * the `cursor/` prefix.
- */
-function resolveCursorPhaseDispatch({ flags, phase, config, modelSpec }) {
-  const resolved = resolveCursorModel({ flag: undefined, phase, config });
-  const chain = stripBackendPrefixChain(resolved.chain);
-
-  if (!modelSpec) {
-    if (flags.backend === "cursor" && isMixedChain(resolved.chain)) {
-      const chainKey = (phase && config?.models?.phases?.[phase])
-        ? `models.phases.${phase}`
-        : (config?.models?.chain ? "models.chain" : "the built-in default chain");
-      throw new Error(
-        `--backend cursor conflicts with the chain of the ${phase ?? "task"} phase ` +
-        `(${chainKey}: ${JSON.stringify(resolved.chain)}) — an explicit --backend forces every phase ` +
-        `onto that backend; remove --backend cursor or point ${chainKey} at cursor entries`
-      );
-    }
-    validateCursorChain(chain);
-    const model = resolved.model == null ? undefined : splitRouteBackend(String(resolved.model)).route;
-    if (model != null) validateCursorModel(model);
-    return { dispatch: cursorDispatch, backend: "cursor", model, explicitModel: null, chain };
-  }
-
-  const model = modelSpec.model;
-  try {
-    validateCursorModel(model);
-  } catch (err) {
-    throw flagError(
-      `--model "${flags.model}" ${modelSpec.backend ? "names" : "resolves on"} the cursor backend: ${err.message}`
-    );
-  }
-  return { dispatch: cursorDispatch, backend: "cursor", model, explicitModel: model, chain };
-}
-
-/**
  * The codex branch of the decision (kusabi #527) — the same shape as the
- * cursor branch, one backend over.  Reached whether the identifier named
+ * agy branch, one backend over.  Reached whether the identifier named
  * codex, `--backend codex` forced it, or the phase's chain entries carry the
  * `codex/` prefix.
  *
@@ -567,7 +514,7 @@ function resolveOpencodePhaseDispatch({ phase, config, modelSpec, namedBackend, 
   const resolved = resolveModel({ flag: modelSpec?.model, phase, config });
   let chain = resolved.chain;
   if (namedBackend === "opencode"
-    && (chainNamesBackend(chain, "claude") || chainNamesBackend(chain, "agy") || chainNamesBackend(chain, "cursor") || chainNamesBackend(chain, "codex"))) {
+    && (chainNamesBackend(chain, "claude") || chainNamesBackend(chain, "agy") || chainNamesBackend(chain, "codex"))) {
     // Only reachable when the identifier chose opencode over a chain native
     // to another backend: those entries are that backend's model ids and
     // must never be walked as opencode routes by the fallback ladder.

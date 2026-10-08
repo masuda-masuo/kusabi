@@ -7,6 +7,7 @@ import {
   implementDenyTools,
   reviewDenyTools,
 } from "./cli.mjs";
+import { resolveBackend } from "./dispatch-backend.mjs";
 
 // parseArgs
 // ---------------------------------------------------------------------------
@@ -44,11 +45,6 @@ describe("parseArgs", () => {
     const result = parseArgs([]);
     assert.deepEqual(result.flags, {});
     assert.equal(result.text, "");
-  });
-
-  it("parses --cursor-usage-dir as a value flag", () => {
-    const result = parseArgs(["--cursor-usage-dir", "/tmp/cu"]);
-    assert.equal(result.flags["cursor-usage-dir"], "/tmp/cu");
   });
 
   it("treats -h as a boolean flag", () => {
@@ -675,8 +671,8 @@ describe("resolveChainBackend", () => {
       /claude backend does not support the :variant suffix/,
     );
     assert.throws(
-      () => resolveChainBackend(["cursor/default:max"]),
-      /cursor backend does not support the :variant suffix/,
+      () => resolveChainBackend(["codex/gpt-5.6-luna:max"]),
+      /codex backend does not support the :variant suffix/,
     );
     assert.throws(
       () => resolveChainBackend(["agy/"]),
@@ -695,16 +691,16 @@ describe("validateRoute (kusabi #470)", () => {
     assert.deepEqual(validateRoute("provider/model"), { route: "provider/model", backend: "opencode" });
   });
 
-  it("accepts valid prefixed routes for agy, claude, cursor", () => {
+  it("accepts valid prefixed routes for agy, claude, codex", () => {
     assert.deepEqual(validateRoute("agy/gemini-3.8-flash-high"), { route: "gemini-3.8-flash-high", backend: "agy" });
     assert.deepEqual(validateRoute("claude/opus"), { route: "opus", backend: "claude" });
-    assert.deepEqual(validateRoute("cursor/default"), { route: "default", backend: "cursor" });
+    assert.deepEqual(validateRoute("codex/gpt-5.6-luna"), { route: "gpt-5.6-luna", backend: "codex" });
   });
 
   it("rejects :variant on non-opencode backends", () => {
     assert.throws(() => validateRoute("agy/gemini:high"), /agy backend does not support the :variant suffix/);
     assert.throws(() => validateRoute("claude/sonnet:max"), /claude backend does not support the :variant suffix/);
-    assert.throws(() => validateRoute("cursor/model:fast"), /cursor backend does not support the :variant suffix/);
+    assert.throws(() => validateRoute("codex/gpt-5.6-luna:fast"), /codex backend does not support the :variant suffix/);
   });
 
   it("rejects empty prefix models", () => {
@@ -804,5 +800,21 @@ describe("isMixedChain", () => {
   it("returns true when entries span multiple backends", () => {
     assert.equal(isMixedChain(["claude/opus", "opencode/x:max"]), true);
     assert.equal(isMixedChain([["opencode/a:max"], ["agy/gemini-3.6-flash-high"]]), true);
+  });
+});
+
+describe("Criterion 3: rejection of cursor backend and prefixes", () => {
+  it("rejects --backend cursor with existing unknown-backend error", () => {
+    const val = "cursor";
+    assert.throws(
+      () => resolveBackend({ backend: val }),
+      new RegExp(`unknown backend: ${val}\\. Use --backend opencode\\|claude\\|agy\\|codex`),
+    );
+  });
+
+  it("treats cursor/x as an opencode route, rejecting :variant if invalid opencode", () => {
+    const res = splitRouteBackend("cursor/x");
+    assert.equal(res.backend, "opencode");
+    assert.equal(res.route, "cursor/x");
   });
 });

@@ -30,14 +30,14 @@ export function parseArgs(argv) {
     } else if (
       arg === "--auto" || arg === "--read-only" || arg === "--resume-last" ||
       arg === "--wait" || arg === "--background" || arg === "--keep-serve" || arg === "--help" || arg === "-h" ||
-      arg === "--force" || arg === "--dry-run" || arg === "--json" || arg === "--cursor-rule" ||
+      arg === "--force" || arg === "--dry-run" || arg === "--json" ||
       arg === "--next" || arg === "--full" || arg === "--allow-substitute"
     ) {
       const key = arg.startsWith("--")
         ? arg.slice(2).replace(/-([a-z])/g, (_, c) => c.toUpperCase())
         : arg.slice(1);
       flags[key] = true;
-    } else if (arg === "--base" || arg === "--model" || arg === "--agent" || arg === "--session" || arg === "--timeout" || arg === "--deny" || arg === "--watchdog" || arg === "--phase" || arg === "--container" || arg === "--prior" || arg === "--max-rounds" || arg === "--brief-file" || arg === "--since" || arg === "--until" || arg === "--compare" || arg === "--transcript-dir" || arg === "--cursor-usage-dir" || arg === "--codex-usage-dir" || arg === "--state-root" || arg === "--db" || arg === "--backend" || arg === "--poll-interval" || arg === "--appear-timeout" || arg === "--progress-timeout" || arg === "--port" || arg === "--strategy" || arg === "--requirements-file" || arg === "--chain-id" || arg === "--mission-file" || arg === "--mission-id" || arg === "--coordinator-model" || arg === "--auditor-model" || arg === "--audit-override" || arg === "--audit-override-reason" || arg === "--audit-override-by" || arg === "--sample-rate" || arg === "--salt") {
+    } else if (arg === "--base" || arg === "--model" || arg === "--agent" || arg === "--session" || arg === "--timeout" || arg === "--deny" || arg === "--watchdog" || arg === "--phase" || arg === "--container" || arg === "--prior" || arg === "--max-rounds" || arg === "--brief-file" || arg === "--since" || arg === "--until" || arg === "--compare" || arg === "--transcript-dir" || arg === "--codex-usage-dir" || arg === "--state-root" || arg === "--db" || arg === "--backend" || arg === "--poll-interval" || arg === "--appear-timeout" || arg === "--progress-timeout" || arg === "--port" || arg === "--strategy" || arg === "--requirements-file" || arg === "--chain-id" || arg === "--mission-file" || arg === "--mission-id" || arg === "--coordinator-model" || arg === "--auditor-model" || arg === "--audit-override" || arg === "--audit-override-reason" || arg === "--audit-override-by" || arg === "--sample-rate" || arg === "--salt") {
       const flagName = arg.slice(2);
       const val = argv[++i];
       if (val === undefined || (typeof val === "string" && val.startsWith("--"))) {
@@ -210,7 +210,6 @@ export function firstRoute(chain) {
 
 export const CLAUDE_ENTRY_PREFIX = "claude/";
 export const AGY_ENTRY_PREFIX = "agy/";
-export const CURSOR_ENTRY_PREFIX = "cursor/";
 export const CODEX_ENTRY_PREFIX = "codex/";
 
 /**
@@ -221,12 +220,11 @@ export const CODEX_ENTRY_PREFIX = "codex/";
  * `provider/model[:variant]` route), which is what keeps every pre-prefix
  * config byte-identical.
  *
- * @type {ReadonlyArray<{ prefix: string, backend: "claude"|"agy"|"cursor" }>}
+ * @type {ReadonlyArray<{ prefix: string, backend: "claude"|"agy"|"codex" }>}
  */
 export const BACKEND_ENTRY_PREFIXES = [
   { prefix: CLAUDE_ENTRY_PREFIX, backend: "claude" },
   { prefix: AGY_ENTRY_PREFIX, backend: "agy" },
-  { prefix: CURSOR_ENTRY_PREFIX, backend: "cursor" },
   { prefix: CODEX_ENTRY_PREFIX, backend: "codex" },
 ];
 
@@ -252,7 +250,6 @@ export const BACKEND_RESUME_SUPPORT = {
   opencode: true,
   claude: true,
   agy: true,
-  cursor: true, // MEASURED 2026-08-23: --resume <session_id> carries context
   codex: true, // MEASURED 2026-09-20: `codex exec resume` under the same CODEX_HOME preserves the thread id
 };
 
@@ -355,11 +352,11 @@ export function chainNamesBackend(chain, backend) {
  * Validate a single route string against its backend syntax (kusabi #470).
  *
  * opencode routes: provider/model[:variant] (via parseModel)
- * agy / claude / cursor: plain model ids (no :variant suffix)
+ * agy / claude / codex: plain model ids (no :variant suffix)
  * Empty prefix (e.g. "agy/") is rejected by splitRouteBackend.
  *
  * @param {string} route
- * @returns {{ route: string, backend: "opencode"|"claude"|"agy"|"cursor" }}
+ * @returns {{ route: string, backend: "opencode"|"claude"|"agy"|"codex" }}
  * @throws {Error} On invalid model syntax, :variant suffix for non-opencode, or empty prefix.
  */
 export function validateRoute(route) {
@@ -378,13 +375,6 @@ export function validateRoute(route) {
       throw new Error(
         `claude backend does not support the :variant suffix in model "${model}" — ` +
         "use a bare alias (opus, sonnet, haiku) or a full model id (e.g. claude-sonnet-4-5)"
-      );
-    }
-  } else if (backend === "cursor") {
-    if (model.includes(":")) {
-      throw new Error(
-        `cursor backend does not support the :variant suffix in model "${model}" — ` +
-        "use a plain cursor model id or the literal default"
       );
     }
   } else if (backend === "codex") {
@@ -432,7 +422,7 @@ export function isMixedChain(chain) {
  * Every route is validated against its own backend syntax (validateRoute).
  *
  * @param {(string|string[])[]} chain
- * @returns {"opencode"|"claude"|"agy"|"cursor"} The chain's starting backend
+ * @returns {"opencode"|"claude"|"agy"|"codex"} The chain's starting backend
  * @throws {Error} On per-route bad spelling or empty model prefix.
  */
 export function resolveChainBackend(chain) {
