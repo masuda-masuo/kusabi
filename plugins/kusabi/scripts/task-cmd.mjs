@@ -37,6 +37,7 @@ import { runPrompt, finalizeIncompleteCompletedRun } from "./prompt-execution.mj
 import { translateDenyTools } from "./tool-permissions.mjs";
 import { AGY_BACKEND } from "./agy-dispatch.mjs";
 import { CODEX_BACKEND } from "./codex-dispatch.mjs";
+import { CODEX_MCP_AGENTS } from "./codex-mcp.mjs";
 import {
   parseReviewResult,
   buildReviewRepairPrompt,
@@ -323,12 +324,16 @@ export function resolveTaskPreflight(cwd, { flags, text }, opts = {}) {
     for (const name of flags.deny.split(",").filter(Boolean)) tools[name] = false;
   }
   // The user-facing deny map speaks the opencode vocabulary (bash, edit,
-  // write, ...); on the claude backend the tools that exist are the sunaba_*
-  // ones, so --read-only / --deny must be translated or they would silently
-  // no-op while the write tools stay granted (kusabi #184 finding 2).
+  // write, ...); on the claude and codex MCP backends the tools that exist are
+  // the sunaba_* ones, so --read-only / --deny must be translated or they would
+  // silently no-op while the write tools stay granted (kusabi #184 finding 2,
+  // kusabi #661). Bare no-MCP tasks retain the raw opencode tool names to preserve
+  // host sandbox restrictions.
   // Phase-level deny maps (implementDenyTools / reviewDenyTools) are passed
   // inside the chain phases and are intentionally NOT translated.
-  if (tools && backend === "claude") tools = translateDenyTools(tools);
+  if (tools && (backend === "claude" || (backend === "codex" && CODEX_MCP_AGENTS.has(agent)))) {
+    tools = translateDenyTools(tools);
+  }
   // The agy CLI takes no allow/deny flags at all (kusabi #199), so there is
   // nothing to translate the map INTO: a restriction the operator typed
   // cannot be applied.  Reject it rather than run unrestricted while the
