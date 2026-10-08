@@ -763,7 +763,6 @@ export async function finishRound(
     chainTotals, strategized: ctx.strategized, chainFollowupDraft,
     verifyBaseline: effectiveVerifyBaseline,
     smokeObservation: ctx.smokeObservation ?? null,
-    strategy: ctx.strategy ?? null, requirementsFile: ctx.requirementsFile ?? null,
     // Mission linkage (kusabi #532): emitted only under Luna mode; a plain
     // chain serialization stays byte-identical when the key is absent.
     ...(missionId ? { missionId } : {}),
@@ -882,7 +881,6 @@ export async function finishRound(
       chainTotals: updatedTotals, strategized: true, chainFollowupDraft,
       verifyBaseline: effectiveVerifyBaseline,
       smokeObservation: ctx.smokeObservation ?? null,
-      strategy: ctx.strategy ?? null, requirementsFile: ctx.requirementsFile ?? null,
       ...(missionId ? { missionId } : {}),
     });
   }

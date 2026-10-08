@@ -41,6 +41,8 @@ Two phases exist only as `task --phase` invocations — chain never dispatches t
 
 Neither loop changes worker contract: test-author writes only tests, plan writes nothing. Cheap pre-implementation gates. Record in review record whether pre-phase used/skipped.
 
+- **Slice at the issue, before any brief.** Split work that leaves a worker many independent decisions (edge cases, error forms, output shape, arithmetic) into sub-issues; one sub-issue = one brief = one chain, dispatched in dependency order. Size by decisions left to the worker, not by bytes or file count. Give a behaviour slice the test-first loop (test-author → `## Frozen Tests` → implement). Slicing is the orchestrator's decision — kusabi no longer automates it (incremental-TDD strategy removed; see tag v0.1.0). Measured: a 6 KB test-author brief freezing a 7-point contract with 12+ required cases ended with zero files after 33k–47k output tokens on a cheap seat (#502); a 51-file removal in one chain ran past the 1-hour implement bound.
+
 ## Model selection
 
 Model resolves from config or built-in chain; explicit `--model` = exception. Escalate to stronger model when:
