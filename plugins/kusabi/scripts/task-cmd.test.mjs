@@ -478,6 +478,23 @@ describe("resolveTaskPreflight codex capability honesty", () => {
       );
       assert.equal(pre.backend, "codex");
       assert.ok(pre.tools);
+      // Bare no-MCP task retains raw opencode tool names
+      assert.equal(pre.tools.write, false);
+      assert.equal(pre.tools.bash, false);
+    });
+  });
+
+  it("--backend codex with --read-only and MCP agent translates tools to MCP names", () => {
+    withStateRoot(({ tmp, stateRoot }) => {
+      const pre = resolveTaskPreflight(
+        tmp,
+        { flags: { backend: "codex", readOnly: true, agent: "kusabi-implement" }, text: BRIEF },
+        { stateRoot },
+      );
+      assert.equal(pre.backend, "codex");
+      assert.equal(pre.agent, "kusabi-implement");
+      assert.equal(pre.tools.mcp__sunaba__write_file, false);
+      assert.equal(pre.tools.mcp__sunaba__sandbox_exec, false);
     });
   });
 

@@ -95,7 +95,7 @@ import process from "node:process";
 
 import { firstRoute, WRITE_TOOL_NAMES } from "./cli.mjs";
 import { readAgentSystemPrompt } from "./agent-system-prompt.mjs";
-import { toolDeniesEnforced, translateDenyTools } from "./tool-permissions.mjs";
+import { toolDeniesEnforced, normalizeDenyName } from "./tool-permissions.mjs";
 import { newJobId, jobDir } from "./job-store.mjs";
 import { stateDirFor } from "./state-paths.mjs";
 import { resolveBoundS, runBackendProcess } from "./backend-process-runner.mjs";
@@ -602,23 +602,19 @@ export async function codexDispatch(opts) {
   const codexSandboxEnforcedDenies = codexMcpEnabled
     ? []
     : deniedToolNames.filter((name) => WRITE_TOOL_NAMES.includes(name));
-  const translatedDeniedToolNames = Object.entries(translateDenyTools(opts.tools) ?? {})
+  const normalizedDeniedToolNames = Object.entries(opts.tools ?? {})
     .filter(([, allowed]) => allowed === false)
-    .map(([name]) => name.startsWith("sunaba_") ? `mcp__sunaba__${name.slice("sunaba_".length)}` : name);
+    .map(([name]) => normalizeDenyName(name));
   const grantedMcpToolNames = new Set(
     Object.entries(codexMcpToolsForAgent(opts.agent) ?? {}).flatMap(([server, names]) =>
       names.includes("*") ? [] : names.map((name) => `mcp__${server}__${name}`)),
   );
   const codexMcpEnforcedDenies = codexMcpEnabled
-    ? translatedDeniedToolNames.filter((name) => grantedMcpToolNames.has(name))
+    ? normalizedDeniedToolNames.filter((name) => grantedMcpToolNames.has(name))
     : [];
   const enforcedMcpDenies = new Set(codexMcpEnforcedDenies);
   const unenforcedDenies = codexMcpEnabled
-    ? deniedToolNames.filter((name) => {
-      const translated = translateDenyTools({ [name]: false });
-      const normalized = Object.keys(translated ?? {}).map((key) => key.startsWith("sunaba_") ? `mcp__sunaba__${key.slice("sunaba_".length)}` : key);
-      return !normalized.some((key) => enforcedMcpDenies.has(key));
-    })
+    ? deniedToolNames.filter((name) => !enforcedMcpDenies.has(normalizeDenyName(name)))
     : deniedToolNames.filter((name) => !WRITE_TOOL_NAMES.includes(name));
   const enforcedDenies = toolDeniesEnforced(opts.tools, unenforcedDenies);
 

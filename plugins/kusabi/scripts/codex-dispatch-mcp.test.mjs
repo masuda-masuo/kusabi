@@ -39,14 +39,25 @@ describe("Codex worker MCP allowlists", () => {
   });
 
   it("applies phase and user deny maps before writing enabled_tools", () => {
-    const actual = codexMcpToolsForAgent("kusabi-implement", {
+    // Phase-default opencode deny names (write) do not remove sunaba MCP tools (kusabi #661)
+    const phaseActual = codexMcpToolsForAgent("kusabi-implement", {
       write: false,
       sunaba_sandbox_exec: false,
       sunaba_copy_project: false,
     });
-    assert.ok(!actual.sunaba.includes("write_file"));
-    assert.ok(!actual.sunaba.includes("sandbox_exec"));
-    assert.ok(actual.sunaba.includes("read_file_range"));
+    assert.ok(phaseActual.sunaba.includes("write_file"));
+    assert.ok(!phaseActual.sunaba.includes("sandbox_exec"));
+    assert.ok(phaseActual.sunaba.includes("read_file_range"));
+
+    // User/operator restrictions translated to MCP names remove the target tool
+    const userActual = codexMcpToolsForAgent("kusabi-implement", {
+      mcp__sunaba__write_file: false,
+      sunaba_sandbox_exec: false,
+      sunaba_copy_project: false,
+    });
+    assert.ok(!userActual.sunaba.includes("write_file"));
+    assert.ok(!userActual.sunaba.includes("sandbox_exec"));
+    assert.ok(userActual.sunaba.includes("read_file_range"));
   });
 
   it("delivers implement grants as valid argv overrides on fresh and resume shapes", () => {

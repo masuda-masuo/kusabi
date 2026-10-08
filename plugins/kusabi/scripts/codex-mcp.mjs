@@ -12,7 +12,6 @@ import process from "node:process";
 import {
   allowedToolsForAgent,
   applyToolDenies,
-  translateDenyTools,
   DISALLOWED_TOOLS,
 } from "./tool-permissions.mjs";
 import { kusabiOpencodeConfigHome } from "./state-paths.mjs";
@@ -53,7 +52,7 @@ export function codexMcpToolsForAgent(agent, tools = null) {
 
   const deniedAllowlist = applyToolDenies(
     allowedToolsForAgent(agent),
-    translateDenyTools(tools),
+    tools,
   );
   const disallowed = new Set(DISALLOWED_TOOLS);
   const servers = {};

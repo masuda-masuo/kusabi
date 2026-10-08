@@ -29,6 +29,15 @@ async function getCodexDispatch() {
   return _cachedCodexDispatch;
 }
 
+let _cachedCodexMcpAgents = null;
+async function getCodexMcpAgents() {
+  if (!_cachedCodexMcpAgents) {
+    const mod = await import("./codex-mcp.mjs");
+    _cachedCodexMcpAgents = mod.CODEX_MCP_AGENTS;
+  }
+  return _cachedCodexMcpAgents;
+}
+
 let _cachedTranslateDenyTools = null;
 async function translateDenyToolsForFallback(tools) {
   if (!_cachedTranslateDenyTools) {
@@ -1298,8 +1307,11 @@ export async function dispatchWithFallback(opts) {
       });
     } else if (candidateBackend === "codex") {
       const doCodex = _backendDispatch ? _backendDispatch("codex") : (_codexDispatch || (await getCodexDispatch()));
+      const codexMcpAgents = await getCodexMcpAgents();
+      const shouldTranslate = explicitRestrictions && codexMcpAgents.has(runPromptOpts.agent);
       result = await doCodex({
         ...runPromptOpts,
+        ...(shouldTranslate ? { tools: await translateDenyToolsForFallback(runPromptOpts.tools) } : {}),
         session: currentSession,
         sessionProvenance: currentSessionProvenance,
         explicitModel: modelStr,
