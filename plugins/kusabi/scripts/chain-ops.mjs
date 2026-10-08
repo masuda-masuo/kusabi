@@ -49,7 +49,6 @@ import {
   publishWarningForBrief,
   smokeViolationReport,
 } from "./chain-brief-guards.mjs";
-import { loadTddState } from "./tdd-chain.mjs";
 
 // The helpers this module used to import from kusabi-companion.mjs now live in
 // the split library modules (pure move refactor): config in companion-config.mjs,
@@ -332,19 +331,8 @@ export function cmdChainShow(cwd, { text }) {
     unfilled = 0;
   }
 
-  // ---- load TDD chain state (kusabi #502) ----
-  let tddState = null;
-  if (chainJson?.strategy === "incremental-tdd") {
-    try {
-      tddState = loadTddState(chainDir);
-    } catch {
-      tddState = null;
-    }
-  }
-
   return renderChainShow(chainJson, rounds, unreadable, chainControlEarly, {
     unfilledCount: unfilled,
-    tddState,
   });
 }
 

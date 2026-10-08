@@ -193,7 +193,7 @@ export async function cmdChain(cwd, { flags, text }, opts = {}) {
  * Everything that must hold before a worker is handed a container runs
  * here, in the order `chain` always ran it: the runtime publish guard, the
  * lossy-smoke refusal, chain-id validation, phase/backend/model resolution,
- * the session-provenance refusal, the container and strategy validation,
+ * the session-provenance refusal, the container validation,
  * the dispatch-time brief lint, the smoke baseline, chain
  * id/directory/control creation, signal handling, the failed-route reset,
  * the base SHA / worktree / verify baseline captures, `runChainDriver`, and
@@ -329,42 +329,6 @@ export async function runChainLifecycle(cwd, { flags, text, orchestrator }, opts
   const container = flags.container;
   if (!container) throw new Error("chain requires --container <cid>");
 
-  // ---- incremental-tdd strategy (kusabi #502) ----
-  // When --strategy incremental-tdd is passed with --requirements-file,
-  // parse the requirements, build a slice plan, and persist TDD state.
-  // The ordinary chain loop is NOT used; instead the caller must use the
-  // tdd-chain executor (chain-resume-aware) which owns sequential slices.
-  const strategy = flags.strategy || null;
-  if (strategy && strategy !== "incremental-tdd") {
-    throw new Error(`unknown strategy: ${strategy}. Supported: incremental-tdd`);
-  }
-  let tddChainState = null;
-  if (strategy === "incremental-tdd") {
-    const reqFile = flags["requirements-file"];
-    if (!reqFile) {
-      throw new Error("--strategy incremental-tdd requires --requirements-file <path>");
-    }
-    const reqPath = path.isAbsolute(reqFile) ? reqFile : path.resolve(cwd, reqFile);
-    if (!fs.existsSync(reqPath)) {
-      throw new Error(`requirements file not found: ${reqPath}`);
-    }
-    const reqText = fs.readFileSync(reqPath, "utf8");
-    const { parseRequirements, buildSlicePlan, createTddChainState } = await import("./tdd-chain.mjs");
-    const requirements = parseRequirements(reqText);
-    if (requirements.length === 0) {
-      throw new Error(`no requirements found in ${reqPath}`);
-    }
-    const planResult = buildSlicePlan(requirements);
-    if (!planResult.ok) {
-      throw new Error(`failed to build slice plan: ${planResult.error}`);
-    }
-    tddChainState = createTddChainState({
-      chainId: "placeholder",
-      requirementsFile: reqPath,
-      plan: planResult.plan,
-    });
-    process.stdout.write(`incremental-tdd: ${requirements.length} requirements, ${planResult.plan.length} slices\n`);
-  }
 
   // ---- dispatch-time brief lint (kusabi #289) ----
   // A chain being started is an implement dispatch, so it carries the
@@ -416,12 +380,6 @@ export async function runChainLifecycle(cwd, { flags, text, orchestrator }, opts
     pid: process.pid,
   }));
 
-  // ---- persist TDD chain state (kusabi #502) ----
-  if (tddChainState) {
-    const { persistTddState } = await import("./tdd-chain.mjs");
-    tddChainState.chainId = chainId;
-    persistTddState(chainDir, tddChainState);
-  }
 
   // ---- SIGTERM/SIGINT handler feeds the same predicate as the file-based stop ----
   let signalReceived = false;
@@ -511,8 +469,6 @@ export async function runChainLifecycle(cwd, { flags, text, orchestrator }, opts
       signalReceived: () => signalReceived,
       keepServe: !!flags.keepServe,
       resume: null,
-      strategy: flags.strategy || null,
-      requirementsFile: tddChainState?.requirementsFile ?? null,
       // Mission linkage (kusabi #532): the owning luna mission's id, present
       // only when the caller (the luna driver) supplies it — a plain chain
       // keeps chain.json byte-identical.
@@ -824,8 +780,6 @@ export async function cmdChainResume(cwd, { flags, text }) {
       signalReceived: () => signalReceived,
       keepServe: !!flags.keepServe,
       resume: position,
-      strategy: chainJson.strategy ?? null,
-      requirementsFile: chainJson.requirementsFile ?? null,
       // Mission linkage (kusabi #532): carried across a resume from the
       // stored chain.json so a resumed inner chain keeps its mission link.
       missionId: chainJson.missionId ?? null,
