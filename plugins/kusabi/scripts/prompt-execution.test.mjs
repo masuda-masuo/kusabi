@@ -567,7 +567,7 @@ describe("dispatchWithFallback", () => {
     );
   });
 
-  it("fake-dispatch: opencode quota failure does not walk to cursor when explicit --deny restriction is present (kusabi #482)", async () => {
+  it("fake-dispatch: opencode quota failure does not walk to agy when explicit --deny restriction is present (kusabi #482)", async () => {
     let opencodeCalls = 0;
     const fakeRunner = async () => {
       opencodeCalls++;
@@ -576,16 +576,16 @@ describe("dispatchWithFallback", () => {
       });
     };
 
-    let cursorCalled = false;
-    const fakeCursorDispatch = async () => {
-      cursorCalled = true;
-      return fakeResult("completed", { backend: "cursor", resultText: "unrestricted cursor run" });
+    let agyCalled = false;
+    const fakeAgyDispatch = async () => {
+      agyCalled = true;
+      return fakeResult("completed", { backend: "agy", resultText: "unrestricted agy run" });
     };
 
     const { job } = await dispatchWithFallback({
       _runPrompt: fakeRunner,
-      _cursorDispatch: fakeCursorDispatch,
-      tiers: [["opencode/free", "cursor/default"]],
+      _agyDispatch: fakeAgyDispatch,
+      tiers: [["opencode/free", "agy/gemini-3.8-flash-high"]],
       round: 1,
       kind: "task",
       promptText: "audit task",
@@ -594,7 +594,7 @@ describe("dispatchWithFallback", () => {
     });
 
     assert.equal(opencodeCalls, 1, "opencode candidate was attempted");
-    assert.equal(cursorCalled, false, "cursor candidate must never be invoked when explicit restriction is present");
+    assert.equal(agyCalled, false, "agy candidate must never be invoked when explicit restriction is present");
     assert.notEqual(job.status, "completed", "must not report success/unrestricted execution");
     const explanation = [
       job.error,
@@ -603,8 +603,8 @@ describe("dispatchWithFallback", () => {
     ].filter(Boolean).join(" ");
     assert.match(
       explanation,
-      /(?:cannot apply|restriction cannot be applied|not supported on the cursor backend|no per-job tool permission flags|cannot enforce explicit restriction)/i,
-      "terminal result must explain that cursor cannot apply the explicit restriction"
+      /(?:cannot apply|restriction cannot be applied|not supported on the agy backend|no per-job tool permission flags|cannot enforce explicit restriction)/i,
+      "terminal result must explain that agy cannot apply the explicit restriction"
     );
   });
 
@@ -745,7 +745,7 @@ describe("dispatchWithFallback", () => {
     assert.equal(resultText, "agy review complete");
   });
 
-  it("fake-dispatch: phase-default implementDenyTools continues to reach cursor fallback when no explicit restriction was given (kusabi #482)", async () => {
+  it("fake-dispatch: phase-default implementDenyTools continues to reach agy fallback when no explicit restriction was given (kusabi #482)", async () => {
     let opencodeCalls = 0;
     const fakeRunner = async () => {
       opencodeCalls++;
@@ -754,23 +754,23 @@ describe("dispatchWithFallback", () => {
       });
     };
 
-    let cursorCalled = false;
-    let cursorOptsReceived = null;
-    const fakeCursorDispatch = async (opts) => {
-      cursorCalled = true;
-      cursorOptsReceived = opts;
+    let agyCalled = false;
+    let agyOptsReceived = null;
+    const fakeAgyDispatch = async (opts) => {
+      agyCalled = true;
+      agyOptsReceived = opts;
       return fakeResult("completed", {
-        id: "cursor-job-phase-default",
-        backend: "cursor",
-        resultText: "cursor implement complete",
+        id: "agy-job-phase-default",
+        backend: "agy",
+        resultText: "agy implement complete",
       });
     };
 
     const phaseTools = implementDenyTools();
     const { job, resultText } = await dispatchWithFallback({
       _runPrompt: fakeRunner,
-      _cursorDispatch: fakeCursorDispatch,
-      tiers: [["opencode/free", "cursor/default"]],
+      _agyDispatch: fakeAgyDispatch,
+      tiers: [["opencode/free", "agy/gemini-3.8-flash-high"]],
       round: 1,
       phase: "implement",
       kind: "task",
@@ -779,11 +779,11 @@ describe("dispatchWithFallback", () => {
     });
 
     assert.equal(opencodeCalls, 1);
-    assert.equal(cursorCalled, true, "cursor candidate is called for phase-default deny map");
-    assert.deepEqual(cursorOptsReceived.tools, phaseTools, "cursor receives phase-default tools map");
+    assert.equal(agyCalled, true, "agy candidate is called for phase-default deny map");
+    assert.deepEqual(agyOptsReceived.tools, phaseTools, "agy receives phase-default tools map");
     assert.equal(job.status, "completed");
-    assert.equal(job.backend, "cursor");
-    assert.equal(resultText, "cursor implement complete");
+    assert.equal(job.backend, "agy");
+    assert.equal(resultText, "agy implement complete");
   });
 
   it("every route fails → returns provider-error with exhaustive error", async () => {

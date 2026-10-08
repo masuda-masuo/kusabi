@@ -134,7 +134,7 @@ export async function runImplementPhase({
 }) {
   // Session lineage guard (kusabi #199 shape, #316 resume): a session is
   // carried into a backend only when the backend can resume one AND the
-  // session's provenance is established. For CLI backends (agy, claude, cursor,
+  // session's provenance is established. For CLI backends (agy, claude,
   // codex) both halves matter: the dispatch itself refuses an unproven session
   // without the caller's provenance signal (assertSessionResumable), so a chain
   // that forwarded an unproven session would throw at dispatch instead of running

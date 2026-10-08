@@ -2,7 +2,7 @@
 //
 // Backend contract: a function with the SAME call/return shape as
 // `dispatchWithFallback` (prompt-execution.mjs) and `claudeDispatch` /
-// `agyDispatch` / `cursorDispatch`: it receives the dispatch options object
+// `agyDispatch`: it receives the dispatch options object
 // (cwd, kind, title, promptText, agent, phase, session, sessionProvenance,
 // tools, timeoutS, watchdogS, tiers, round, explicitModel) and resolves to
 // `{ job, resultText, stateDir }`.  kusabi-companion.mjs picks this function
@@ -11,7 +11,7 @@
 // WHY a fifth backend: on 2026-09-20 the operator accepted an opt-in
 // trusted-seat evaluation model in which kusabi dispatches to the Codex CLI
 // (`codex exec`) for the exact seat models listed in `CODEX_SUPPORTED_MODELS`.
-// The backend reuses the shared process runner exactly like cursor/agy and
+// The backend reuses the shared process runner exactly like agy and
 // preserves exact model/reasoning provenance by cross-checking the CLI's own
 // rollout record after the process closes.
 //
@@ -270,7 +270,7 @@ export function resolveCodexModel({ flag, phase, config }) {
 /**
  * Compose the prompt text handed to `codex exec` on stdin.
  * Codex has no `--append-system-prompt` in the measured argv list, so the
- * agent's role body is prepended inside a `<role>` block (agy/cursor pattern).
+ * agent's role body is prepended inside a `<role>` block (agy pattern).
  *
  * @param {object} opts
  * @param {string|null} [opts.systemPrompt]

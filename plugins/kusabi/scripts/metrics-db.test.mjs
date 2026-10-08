@@ -24,14 +24,14 @@ import {
   upsertFinding,
   upsertJob,
   countRows,
-  upsertCursorSessionCounter,
-  getCursorSessionCounter,
 } from "./metrics-db.mjs";
+import { computeReport } from "./metrics-report.mjs";
+import { cmdMetricsIngest } from "./metrics-cmd.mjs";
 
 describe("openMetricsDb", () => {
   it("creates all tables on an in-memory database", () => {
     const db = openMetricsDb(":memory:");
-    for (const table of ["source_file", "session", "turn", "chain", "round", "finding", "job", "cursor_session_counter"]) {
+    for (const table of ["source_file", "session", "turn", "chain", "round", "finding", "job"]) {
       assert.equal(countRows(db, table), 0, `expected empty ${table}`);
     }
   });
@@ -741,50 +741,60 @@ describe("round.verdict_source migration (kusabi #235)", () => {
   });
 });
 
-describe("upsertCursorSessionCounter / getCursorSessionCounter", () => {
-  it("stores a row and returns it; unknown sessionId is undefined", () => {
-    const db = openMetricsDb(":memory:");
-    assert.equal(getCursorSessionCounter(db, "nope"), undefined);
-    upsertCursorSessionCounter(db, {
-      sessionId: "sess-c",
-      totalOutputTokens: 80,
-      ts: "2026-08-14T10:00:20.000Z",
-    });
-    assert.equal(countRows(db, "cursor_session_counter"), 1);
-    const row = getCursorSessionCounter(db, "sess-c");
-    assert.equal(row.total_output_tokens, 80);
-    assert.equal(row.ts, "2026-08-14T10:00:20.000Z");
-  });
+describe("Criterion 4: backward compatibility with pre-existing Cursor data", () => {
+  it("an existing metrics.db containing Cursor data and cursor_session_counter table continues to open, ingest, and report cleanly", () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-metrics-cursor-compat-"));
+    const dbPath = path.join(tmpDir, "metrics.db");
+    try {
+      const db = openMetricsDb(dbPath);
+      // Emulate existing database with legacy cursor_session_counter table and data
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS cursor_session_counter (
+          session_id TEXT PRIMARY KEY,
+          total_output_tokens INTEGER,
+          ts TEXT
+        );
+        INSERT INTO cursor_session_counter (session_id, total_output_tokens, ts)
+        VALUES ('cursor-legacy-session', 1234, '2026-08-14T10:00:00.000Z');
+      `);
+      upsertSession(db, {
+        sessionId: "cursor-legacy-session",
+        sessionSource: "env",
+        startedAt: "2026-08-14T09:00:00.000Z",
+      });
+      upsertTurn(db, {
+        requestId: "cursor:0:1",
+        sessionId: "cursor-legacy-session",
+        ts: "2026-08-14T09:01:00.000Z",
+        input: 100,
+        output: 50,
+        cacheRead: 0,
+        cacheWrite: 0,
+        model: "claude-3-5-sonnet",
+      });
+      db.close();
 
-  it("re-upserting the same session_id at the same ts replaces, does not duplicate", () => {
-    const db = openMetricsDb(":memory:");
-    upsertCursorSessionCounter(db, { sessionId: "sess-c", totalOutputTokens: 30, ts: "2026-08-14T10:00:10.000Z" });
-    upsertCursorSessionCounter(db, { sessionId: "sess-c", totalOutputTokens: 30, ts: "2026-08-14T10:00:10.000Z" });
-    assert.equal(countRows(db, "cursor_session_counter"), 1);
-    assert.equal(getCursorSessionCounter(db, "sess-c").total_output_tokens, 30);
-  });
+      // Running ingest on this DB runs cleanly without errors
+      const output = cmdMetricsIngest(tmpDir, {
+        flags: {
+          db: dbPath,
+          "transcript-dir": path.join(tmpDir, "transcripts"),
+          "codex-usage-dir": path.join(tmpDir, "codex"),
+          "state-root": tmpDir,
+        },
+      });
+      assert.ok(output.includes("Metrics ingest"));
 
-  it("keeps the newest-ts value; an older incoming row is ignored (monotonicity of tokens is not assumed)", () => {
-    const db = openMetricsDb(":memory:");
-    upsertCursorSessionCounter(db, { sessionId: "sess-c", totalOutputTokens: 80, ts: "2026-08-14T10:00:20.000Z" });
-    upsertCursorSessionCounter(db, { sessionId: "sess-c", totalOutputTokens: 999, ts: "2026-08-14T10:00:10.000Z" });
-    const row = getCursorSessionCounter(db, "sess-c");
-    assert.equal(row.total_output_tokens, 80);
-    assert.equal(row.ts, "2026-08-14T10:00:20.000Z");
-
-    upsertCursorSessionCounter(db, { sessionId: "sess-c", totalOutputTokens: 40, ts: "2026-08-14T10:00:30.000Z" });
-    const later = getCursorSessionCounter(db, "sess-c");
-    assert.equal(later.total_output_tokens, 40);
-    assert.equal(later.ts, "2026-08-14T10:00:30.000Z");
-  });
-
-  it("does not let a ts-less incoming row overwrite a stored row that has a ts", () => {
-    const db = openMetricsDb(":memory:");
-    upsertCursorSessionCounter(db, { sessionId: "sess-c", totalOutputTokens: 80, ts: "2026-08-14T10:00:20.000Z" });
-    upsertCursorSessionCounter(db, { sessionId: "sess-c", totalOutputTokens: 1, ts: null });
-    const row = getCursorSessionCounter(db, "sess-c");
-    assert.equal(row.total_output_tokens, 80);
-    assert.equal(row.ts, "2026-08-14T10:00:20.000Z");
+      // Querying report on this DB runs cleanly without errors
+      const reopened = openMetricsDb(dbPath);
+      const report = computeReport(reopened, { dbPath });
+      assert.ok(report);
+      assert.equal(report.status, "ok");
+      assert.equal(report.window.turnsInWindow, 1);
+      reopened.close();
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
   });
 });
 

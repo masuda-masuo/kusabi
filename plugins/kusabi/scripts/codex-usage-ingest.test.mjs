@@ -737,7 +737,7 @@ describe("ingestCodexUsageDirectory", () => {
     fs.rmSync(dir, { recursive: true, force: true });
   });
 
-  it("source_file cache key is distinct from Claude and Cursor keys", () => {
+  it("source_file cache key is distinct from Claude and legacy keys", () => {
     const dir = makeTempCodexDir();
     fs.writeFileSync(path.join(dir, "session.jsonl"), buildBasicLines(), "utf8");
 
@@ -747,9 +747,9 @@ describe("ingestCodexUsageDirectory", () => {
     // Source file should be recorded with a codex-specific key suffix
     const sf = db.prepare("SELECT path FROM source_file").get();
     assert.ok(sf, "source_file row must exist");
-    assert.ok(sf.path.includes("codex"), "source_file path must contain 'codex' suffix to be distinct from Claude/Cursor");
-    // Must NOT match cursor-usage key pattern
-    assert.ok(!sf.path.includes("#cu-v"), "must not use cursor-usage key suffix");
+    assert.ok(sf.path.includes("codex"), "source_file path must contain 'codex' suffix to be distinct from Claude");
+    // Must NOT match legacy key pattern
+    assert.ok(!sf.path.includes("#cu-v"), "must not use legacy key suffix");
 
     fs.rmSync(dir, { recursive: true, force: true });
   });

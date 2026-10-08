@@ -425,13 +425,7 @@ describe("resolveOrchestratorRecord (kusabi #227)", () => {
 
   it("reads process.env when no env object is passed", () => {
     const saved = process.env[ORCH_SESSION_ENV];
-    // With the env var deleted, the 1-arg call falls through to the cursor
-    // usage dir — on a dev host that dir can hold a REAL session whose cwd
-    // matches this repo (container-green, host-red).  Pin it to a
-    // nonexistent dir so the signature assertion stays hermetic.
-    const savedDir = process.env.KUSABI_CURSOR_USAGE_DIR;
     try {
-      process.env.KUSABI_CURSOR_USAGE_DIR = path.join(import.meta.dirname, "no-such-cursor-usage-dir");
       process.env[ORCH_SESSION_ENV] = ENV_UUID;
       assert.equal(resolveOrchestratorRecord(SIGNED).session, ENV_UUID);
       delete process.env[ORCH_SESSION_ENV];
@@ -439,8 +433,6 @@ describe("resolveOrchestratorRecord (kusabi #227)", () => {
     } finally {
       if (saved === undefined) delete process.env[ORCH_SESSION_ENV];
       else process.env[ORCH_SESSION_ENV] = saved;
-      if (savedDir === undefined) delete process.env.KUSABI_CURSOR_USAGE_DIR;
-      else process.env.KUSABI_CURSOR_USAGE_DIR = savedDir;
     }
   });
 
@@ -459,153 +451,6 @@ describe("resolveOrchestratorRecord (kusabi #227)", () => {
   });
 });
 
-describe("resolveOrchestratorRecord cursor-statusline fallback (kusabi #237)", () => {
-  const SIGNED = "Orchestrator: claude-fable-5 | session cc-20260811-215 | 2026-08-12\n\nDo the work.";
-  const UNSIGNED = "Just a normal brief with no orchestrator line.\n\nDo the work.";
-  const ENV_UUID = "edafbf9f-03ae-4bce-ba2e-8d2d07af5f58";
-  const CURSOR_UUID = "d73008ab-aaaa-bbbb-cccc-ddddeeeeffff";
-  const CWD = "/home/masuda/dev/projects/claude";
-  const NOW = Date.parse("2026-08-14T12:00:00.000Z");
-
-  let tmpDir;
-
-  beforeEach(() => {
-    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-orch-cursor-"));
-  });
-
-  afterEach(() => {
-    fs.rmSync(tmpDir, { recursive: true, force: true });
-  });
-
-  function writeUsage(id, rec) {
-    fs.writeFileSync(path.join(tmpDir, `${id}.jsonl`), `${JSON.stringify(rec)}\n`);
-  }
-
-  function freshCursor(overrides = {}) {
-    writeUsage(CURSOR_UUID, {
-      ts: "2026-08-14T11:50:00.000Z",
-      session_id: CURSOR_UUID,
-      cwd: CWD,
-      model: { id: "default", display_name: "Auto" },
-      context_window: null,
-      ...overrides,
-    });
-  }
-
-  const cursorOpts = () => ({ dir: tmpDir, cwd: CWD, now: NOW });
-
-  it("env still wins even when a matching cursor session exists (byte-identical to #227)", () => {
-    freshCursor();
-    const record = resolveOrchestratorRecord(
-      SIGNED,
-      { [ORCH_SESSION_ENV]: ENV_UUID, KUSABI_CURSOR_USAGE_DIR: tmpDir },
-      cursorOpts(),
-    );
-    assert.deepEqual(record, {
-      model: "claude-fable-5",
-      session: ENV_UUID,
-      date: "2026-08-12",
-      sessionSource: "env",
-    });
-  });
-
-  it("without env and without cursor state the signature record is unchanged", () => {
-    const record = resolveOrchestratorRecord(SIGNED, {});
-    assert.deepEqual(record, parseOrchestratorSignature(SIGNED));
-    assert.ok(!("sessionSource" in record));
-  });
-
-  it("without env and without cursor state an unsigned brief is still null", () => {
-    assert.equal(resolveOrchestratorRecord(UNSIGNED, {}), null);
-  });
-
-  it("no env + cwd-matching fresh session records sessionSource cursor-statusline", () => {
-    freshCursor();
-    const record = resolveOrchestratorRecord(SIGNED, {}, cursorOpts());
-    assert.deepEqual(record, {
-      model: "claude-fable-5",
-      session: CURSOR_UUID,
-      date: "2026-08-12",
-      sessionSource: "cursor-statusline",
-    });
-  });
-
-  it("unsigned brief still persists a cursor session with null model/date", () => {
-    freshCursor();
-    const record = resolveOrchestratorRecord(UNSIGNED, {}, cursorOpts());
-    assert.deepEqual(record, {
-      model: null,
-      session: CURSOR_UUID,
-      date: null,
-      sessionSource: "cursor-statusline",
-    });
-  });
-
-  it("does not fire when the only sessions have a different cwd", () => {
-    freshCursor({ cwd: "/some/other/project" });
-    const record = resolveOrchestratorRecord(SIGNED, {}, cursorOpts());
-    assert.deepEqual(record, parseOrchestratorSignature(SIGNED));
-    assert.ok(!("sessionSource" in record));
-  });
-
-  it("does not fire when the matching session's last-line ts is older than 24h", () => {
-    freshCursor({ ts: "2026-08-13T11:00:00.000Z" });
-    const record = resolveOrchestratorRecord(SIGNED, {}, cursorOpts());
-    assert.deepEqual(record, parseOrchestratorSignature(SIGNED));
-  });
-
-  it("picks the newest of several cwd-matching sessions", () => {
-    writeUsage("older", {
-      ts: "2026-08-14T10:00:00.000Z",
-      session_id: "older",
-      cwd: CWD,
-    });
-    writeUsage("newer", {
-      ts: "2026-08-14T11:40:00.000Z",
-      session_id: "newer",
-      cwd: CWD,
-    });
-    writeUsage("neighbour", {
-      ts: "2026-08-14T11:59:00.000Z",
-      session_id: "neighbour",
-      cwd: "/elsewhere",
-    });
-    const record = resolveOrchestratorRecord(SIGNED, {}, cursorOpts());
-    assert.equal(record.session, "newer");
-    assert.equal(record.sessionSource, "cursor-statusline");
-  });
-
-  it("resolves the usage dir from KUSABI_CURSOR_USAGE_DIR on the injected env", () => {
-    freshCursor();
-    const record = resolveOrchestratorRecord(
-      SIGNED,
-      { KUSABI_CURSOR_USAGE_DIR: tmpDir },
-      { cwd: CWD, now: NOW },
-    );
-    assert.equal(record.session, CURSOR_UUID);
-    assert.equal(record.sessionSource, "cursor-statusline");
-  });
-
-  it("a whitespace-only env var falls through to the cursor branch", () => {
-    freshCursor();
-    const record = resolveOrchestratorRecord(
-      SIGNED,
-      { [ORCH_SESSION_ENV]: "  ", KUSABI_CURSOR_USAGE_DIR: tmpDir },
-      { cwd: CWD, now: NOW },
-    );
-    assert.equal(record.sessionSource, "cursor-statusline");
-    assert.equal(record.session, CURSOR_UUID);
-  });
-
-  it("missing usage dir is treated as no cursor state, not an exception", () => {
-    const record = resolveOrchestratorRecord(
-      SIGNED,
-      {},
-      { dir: path.join(tmpDir, "absent"), cwd: CWD, now: NOW },
-    );
-    assert.deepEqual(record, parseOrchestratorSignature(SIGNED));
-  });
-});
 
 // PHASE_AGENTS — maps phase names to agent definition filenames
 // ---------------------------------------------------------------------------
@@ -793,17 +638,17 @@ describe("metrics-ingest / metrics-report — delegated jobs (#154)", () => {
   let tmpDir;
   let stateRoot;
   let transcriptDir;
-  let cursorUsageDir;
+  let codexUsageDir;
   let dbPath;
 
   beforeEach(() => {
     tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-test-metrics-jobs-"));
     stateRoot = path.join(tmpDir, "state");
     transcriptDir = path.join(tmpDir, "transcripts");
-    cursorUsageDir = path.join(tmpDir, "cursor-usage");
+    codexUsageDir = path.join(tmpDir, "codex-usage");
     dbPath = path.join(tmpDir, "metrics.db");
     fs.mkdirSync(transcriptDir, { recursive: true });
-    fs.mkdirSync(cursorUsageDir, { recursive: true });
+    fs.mkdirSync(codexUsageDir, { recursive: true });
 
     const jobsDir = path.join(stateRoot, "ws-hash-1", "jobs");
     const completeDir = path.join(jobsDir, "job-complete01");
@@ -853,7 +698,7 @@ describe("metrics-ingest / metrics-report — delegated jobs (#154)", () => {
       "metrics-ingest",
       "--state-root", stateRoot,
       "--transcript-dir", transcriptDir,
-      "--cursor-usage-dir", cursorUsageDir,
+      "--codex-usage-dir", codexUsageDir,
       "--db", dbPath,
     ]);
     assert.equal(ingest.status, 0, `ingest failed: ${ingest.stdout} ${ingest.stderr}`);
@@ -881,11 +726,11 @@ describe("metrics-ingest / metrics-report — delegated jobs (#154)", () => {
 
   it("re-running metrics-ingest skips both jobs as unchanged (idempotent and cheap)", () => {
     const first = runCompanion([
-      "metrics-ingest", "--state-root", stateRoot, "--transcript-dir", transcriptDir, "--cursor-usage-dir", cursorUsageDir, "--db", dbPath,
+      "metrics-ingest", "--state-root", stateRoot, "--transcript-dir", transcriptDir, "--codex-usage-dir", codexUsageDir, "--db", dbPath,
     ]);
     assert.equal(first.status, 0);
     const second = runCompanion([
-      "metrics-ingest", "--state-root", stateRoot, "--transcript-dir", transcriptDir, "--cursor-usage-dir", cursorUsageDir, "--db", dbPath,
+      "metrics-ingest", "--state-root", stateRoot, "--transcript-dir", transcriptDir, "--codex-usage-dir", codexUsageDir, "--db", dbPath,
     ]);
     assert.equal(second.status, 0);
     assert.match(second.stdout, /jobs skipped \(unchanged\):\s+2/);
@@ -896,7 +741,7 @@ describe("metrics-ingest / metrics-report — delegated jobs (#154)", () => {
     const emptyRoot = path.join(tmpDir, "empty-state");
     fs.mkdirSync(emptyRoot, { recursive: true });
     const result = runCompanion([
-      "metrics-ingest", "--state-root", emptyRoot, "--transcript-dir", transcriptDir, "--cursor-usage-dir", cursorUsageDir, "--dry-run",
+      "metrics-ingest", "--state-root", emptyRoot, "--transcript-dir", transcriptDir, "--codex-usage-dir", codexUsageDir, "--dry-run",
     ]);
     assert.equal(result.status, 0, `dry-run failed: ${result.stdout} ${result.stderr}`);
     assert.match(result.stdout, /Jobs \(delegated single-shot task\/review jobs\):/);
@@ -905,132 +750,6 @@ describe("metrics-ingest / metrics-report — delegated jobs (#154)", () => {
   });
 });
 
-// metrics-ingest — cursor-usage jsonl + missing-dir warnings (#237)
-// ---------------------------------------------------------------------------
-
-describe("metrics-ingest — cursor-usage and missing-dir warnings (#237)", () => {
-  const COMPANION_SCRIPT = path.join(import.meta.dirname, "kusabi-companion.mjs");
-  let tmpDir;
-
-  beforeEach(() => {
-    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-test-metrics-cursor-"));
-  });
-
-  afterEach(() => {
-    fs.rmSync(tmpDir, { recursive: true, force: true });
-  });
-
-  function runCompanion(args) {
-    return spawnSync(process.execPath, [COMPANION_SCRIPT, ...args], {
-      encoding: "utf8",
-      timeout: 30_000,
-    });
-  }
-
-  it("--help lists --cursor-usage-dir", () => {
-    const result = runCompanion(["--help"]);
-    assert.equal(result.status, 0, result.stderr);
-    assert.match(result.stdout, /--cursor-usage-dir <path> \(metrics-ingest: default ~\/\.kusabi\/cursor-usage\)/);
-  });
-
-  it("--help enumerates all five backends including cursor and codex", () => {
-    const result = runCompanion(["--help"]);
-    assert.equal(result.status, 0, result.stderr);
-    assert.match(result.stdout, /--backend opencode\|claude\|agy\|cursor\|codex/);
-    assert.match(result.stdout, /cursor\/, or codex\/ prefix/);
-  });
-
-  it("warns when transcript-dir and cursor-usage-dir do not exist, and reports cursor files/sessions/turns", () => {
-    const missingTranscript = path.join(tmpDir, "no-claude");
-    const cursorDir = path.join(tmpDir, "cu237");
-    const emptyState = path.join(tmpDir, "state");
-    const dbPath = path.join(tmpDir, "m237.db");
-    fs.mkdirSync(cursorDir, { recursive: true });
-    fs.mkdirSync(emptyState, { recursive: true });
-
-    const sessionId = "d73008ab-1111-2222-3333-444444444444";
-    const rec = (ts, usage) => JSON.stringify({
-      ts,
-      session_id: sessionId,
-      model: { id: "default", display_name: "Auto" },
-      cwd: "/workspace",
-      context_window: usage === null
-        ? { current_usage: null }
-        : { current_usage: {
-          input_tokens: usage.input,
-          output_tokens: usage.output,
-          cache_read_input_tokens: usage.cacheRead,
-          cache_creation_input_tokens: usage.cacheWrite,
-        } },
-    });
-    fs.writeFileSync(path.join(cursorDir, `${sessionId}.jsonl`), [
-      rec("2026-08-14T10:00:00.000Z", null),
-      rec("2026-08-14T10:00:05.000Z", null),
-      rec("2026-08-14T10:00:10.000Z", { input: 10, output: 2, cacheRead: 3, cacheWrite: 4 }),
-      rec("2026-08-14T10:00:20.000Z", { input: 11, output: 5, cacheRead: 6, cacheWrite: 7 }),
-    ].join("\n") + "\n", "utf8");
-
-    const ingest = runCompanion([
-      "metrics-ingest",
-      "--state-root", emptyState,
-      "--transcript-dir", missingTranscript,
-      "--cursor-usage-dir", cursorDir,
-      "--db", dbPath,
-    ]);
-    assert.equal(ingest.status, 0, `ingest failed: ${ingest.stdout} ${ingest.stderr}`);
-    assert.match(ingest.stdout, new RegExp(`warning: transcript dir not found: ${missingTranscript.replace(/\\/g, "\\\\")}`));
-    assert.doesNotMatch(ingest.stdout, /warning: cursor-usage dir not found/);
-    assert.match(ingest.stdout, /Cursor usage:/);
-    assert.match(ingest.stdout, /files scanned:\s+1/);
-    assert.match(ingest.stdout, /sessions:\s+1/);
-    assert.match(ingest.stdout, /turns:\s+2/);
-
-    const second = runCompanion([
-      "metrics-ingest",
-      "--state-root", emptyState,
-      "--transcript-dir", missingTranscript,
-      "--cursor-usage-dir", cursorDir,
-      "--db", dbPath,
-    ]);
-    assert.equal(second.status, 0, second.stderr);
-    assert.match(second.stdout, /files skipped \(unchanged\):\s+1/);
-    assert.match(second.stdout, /turns:\s+0/);
-  });
-
-  it("warns when cursor-usage-dir is missing and does not warn when the dir exists but is empty", () => {
-    const transcriptDir = path.join(tmpDir, "transcripts");
-    const missingCursor = path.join(tmpDir, "no-cursor");
-    const emptyCursor = path.join(tmpDir, "empty-cursor");
-    const emptyState = path.join(tmpDir, "state");
-    fs.mkdirSync(transcriptDir, { recursive: true });
-    fs.mkdirSync(emptyCursor, { recursive: true });
-    fs.mkdirSync(emptyState, { recursive: true });
-
-    const missing = runCompanion([
-      "metrics-ingest",
-      "--state-root", emptyState,
-      "--transcript-dir", transcriptDir,
-      "--cursor-usage-dir", missingCursor,
-      "--dry-run",
-    ]);
-    assert.equal(missing.status, 0, missing.stderr);
-    assert.match(missing.stdout, new RegExp(`warning: cursor-usage dir not found: ${missingCursor.replace(/\\/g, "\\\\")}`));
-    assert.doesNotMatch(missing.stdout, /warning: transcript dir not found/);
-
-    const empty = runCompanion([
-      "metrics-ingest",
-      "--state-root", emptyState,
-      "--transcript-dir", transcriptDir,
-      "--cursor-usage-dir", emptyCursor,
-      "--dry-run",
-    ]);
-    assert.equal(empty.status, 0, empty.stderr);
-    assert.doesNotMatch(empty.stdout, /warning: transcript dir not found/);
-    assert.doesNotMatch(empty.stdout, /warning: cursor-usage dir not found/);
-    assert.match(empty.stdout, /Cursor usage:/);
-    assert.match(empty.stdout, /files scanned:\s+0/);
-  });
-});
 
 // standalone review — --container rejection (kusabi #153 #2)
 // ---------------------------------------------------------------------------
@@ -2124,7 +1843,7 @@ describe("chain-resume CLI", () => {
       const result = runResume(["chain-quota"], { stateDir: path.join(tmp, "state"), cwd: tmp });
       assert.notEqual(result.status, 0);
       assert.match(result.stdout, /quota exhaustion/);
-      assert.match(result.stdout, /--backend opencode\|claude\|agy\|cursor/);
+      assert.match(result.stdout, /--backend opencode\|claude\|agy\|codex/);
       assert.doesNotMatch(result.stdout, /does not support --backend/);
     } finally {
       fs.rmSync(tmp, { recursive: true, force: true });
@@ -2148,7 +1867,7 @@ describe("chain-resume CLI", () => {
       assert.notEqual(same.status, 0);
       assert.match(same.stdout, /quota exhaustion/);
 
-      const reroute = runResume(["--backend", "cursor", "chain-quota"], {
+      const reroute = runResume(["--backend", "codex", "chain-quota"], {
         stateDir: path.join(tmp, "state"), cwd: tmp,
       });
       assert.notEqual(reroute.status, 0);
@@ -3107,213 +2826,6 @@ describe("install-cli shim", () => {
   });
 });
 
-// install-cli: Cursor user-level skill discovery (kusabi #247)
-// ---------------------------------------------------------------------------
-// Cursor finds user skills at <cursorDir>/skills/<name>/SKILL.md and rules at
-// <cursorDir>/rules/*.mdc -- neither comes from the plugin manifest, so a
-// default `cursor-agent` launch sees nothing without this wiring. Tests point
-// HOME and KUSABI_CURSOR_DIR at tmp dirs; the real ~/.cursor is never touched.
-
-describe("install-cli cursor skill wiring", () => {
-  const COMPANION_SCRIPT = path.join(import.meta.dirname, "kusabi-companion.mjs");
-  const PLUGIN_DIR = path.dirname(import.meta.dirname);
-  const SKILLS = ["delegate", "kusabi-result-handling"];
-  let tmpHome;
-  let binDir;
-  let cursorDir;
-
-  beforeEach(() => {
-    tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-install-cursor-home-"));
-    binDir = path.join(tmpHome, "bin");
-    cursorDir = path.join(tmpHome, "cursor");
-  });
-
-  afterEach(() => {
-    fs.rmSync(tmpHome, { recursive: true, force: true });
-  });
-
-  function run(args = [], extraEnv = {}) {
-    const env = {
-      ...process.env,
-      HOME: tmpHome,
-      KUSABI_BIN_DIR: binDir,
-      KUSABI_CURSOR_DIR: cursorDir,
-      OPENCODE_BIN: "/nonexistent-opencode-bin",
-      ...extraEnv,
-    };
-    for (const key of Object.keys(extraEnv)) {
-      if (extraEnv[key] === undefined) delete env[key];
-    }
-    return spawnSync(process.execPath, [COMPANION_SCRIPT, "install-cli", ...args], {
-      encoding: "utf8",
-      env,
-      timeout: 10_000,
-    });
-  }
-
-  // Paths land in the output verbatim; escape them before building a matcher.
-  const rx = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  const skillSrc = (name) => path.join(PLUGIN_DIR, "skills", name);
-  const skillLink = (name) => path.join(cursorDir, "skills", name);
-
-  it("creates both skill symlinks and reports one line per artifact", () => {
-    const result = run();
-    assert.equal(result.status, 0, result.stderr + result.stdout);
-    for (const name of SKILLS) {
-      const link = skillLink(name);
-      assert.ok(fs.lstatSync(link).isSymbolicLink(), `${link} is not a symlink`);
-      assert.equal(fs.realpathSync(link), fs.realpathSync(skillSrc(name)));
-      assert.ok(fs.existsSync(path.join(link, "SKILL.md")), `${link}/SKILL.md not reachable`);
-      assert.match(result.stdout, new RegExp(`^created: ${rx(link)} -> ${rx(skillSrc(name))}$`, "m"));
-    }
-  });
-
-  it("reports current and changes nothing on a re-run (idempotent)", () => {
-    assert.equal(run().status, 0);
-    const before = SKILLS.map((name) => fs.readlinkSync(skillLink(name)));
-    const second = run();
-    assert.equal(second.status, 0, second.stderr + second.stdout);
-    SKILLS.forEach((name, i) => {
-      assert.match(second.stdout, new RegExp(`^current: ${rx(skillLink(name))} -> `, "m"));
-      assert.equal(fs.readlinkSync(skillLink(name)), before[i]);
-    });
-    assert.doesNotMatch(second.stdout, /^(created|updated|conflict|error):/m);
-  });
-
-  it("wires ~/.cursor when it exists and KUSABI_CURSOR_DIR is unset", () => {
-    const homeCursor = path.join(tmpHome, ".cursor");
-    fs.mkdirSync(homeCursor, { recursive: true });
-    const result = run([], { KUSABI_CURSOR_DIR: undefined });
-    assert.equal(result.status, 0, result.stderr + result.stdout);
-    for (const name of SKILLS) {
-      const link = path.join(homeCursor, "skills", name);
-      assert.equal(fs.realpathSync(link), fs.realpathSync(skillSrc(name)));
-      assert.match(result.stdout, new RegExp(`^created: ${rx(link)} -> `, "m"));
-    }
-  });
-
-  it("skips with one informational line when there is no cursor directory", () => {
-    const result = run([], { KUSABI_CURSOR_DIR: undefined });
-    assert.equal(result.status, 0, result.stderr + result.stdout);
-    const skips = result.stdout.split("\n").filter((l) => l.startsWith("cursor skills: skipped"));
-    assert.equal(skips.length, 1, result.stdout);
-    assert.ok(skips[0].includes(path.join(tmpHome, ".cursor")), skips[0]);
-    assert.ok(!fs.existsSync(path.join(tmpHome, ".cursor")), "skip must not create ~/.cursor");
-    // A machine without Cursor is information, not a warning or an error.
-    // (The one warning that may appear is the pre-existing PATH one.)
-    assert.doesNotMatch(result.stdout, /^(error|conflict):/m);
-    assert.doesNotMatch(result.stdout, /^warning:.*\.cursor/m);
-  });
-
-  it("wires KUSABI_CURSOR_DIR (creating it) and leaves HOME untouched", () => {
-    const result = run();
-    assert.equal(result.status, 0, result.stderr + result.stdout);
-    assert.ok(fs.lstatSync(skillLink("delegate")).isSymbolicLink());
-    assert.ok(!fs.existsSync(path.join(tmpHome, ".cursor")), "HOME must not be touched");
-  });
-
-  it("leaves a real directory at the target untouched and reports conflict", () => {
-    const link = skillLink("delegate");
-    fs.mkdirSync(link, { recursive: true });
-    fs.writeFileSync(path.join(link, "SKILL.md"), "mine\n");
-    const result = run();
-    assert.equal(result.status, 0, result.stderr + result.stdout);
-    assert.match(result.stdout, new RegExp(`^conflict: ${rx(link)} `, "m"));
-    assert.ok(!fs.lstatSync(link).isSymbolicLink());
-    assert.equal(fs.readFileSync(path.join(link, "SKILL.md"), "utf8"), "mine\n");
-    // The conflict does not stop the other artifact.
-    assert.match(result.stdout, new RegExp(`^created: ${rx(skillLink("kusabi-result-handling"))} -> `, "m"));
-  });
-
-  it("replaces a symlink pointing elsewhere and names the old target (updated)", () => {
-    const other = path.join(tmpHome, "elsewhere");
-    fs.mkdirSync(other, { recursive: true });
-    fs.mkdirSync(path.join(cursorDir, "skills"), { recursive: true });
-    const link = skillLink("delegate");
-    fs.symlinkSync(other, link);
-    const result = run();
-    assert.equal(result.status, 0, result.stderr + result.stdout);
-    assert.match(
-      result.stdout,
-      new RegExp(`^updated: ${rx(link)} -> ${rx(skillSrc("delegate"))} \\(was ${rx(other)}\\)$`, "m"),
-    );
-    assert.equal(fs.realpathSync(link), fs.realpathSync(skillSrc("delegate")));
-  });
-
-  it("treats a relative symlink to the same target as current", () => {
-    const skillsDir = path.join(cursorDir, "skills");
-    fs.mkdirSync(skillsDir, { recursive: true });
-    const link = skillLink("delegate");
-    fs.symlinkSync(path.relative(skillsDir, skillSrc("delegate")), link);
-    const result = run();
-    assert.equal(result.status, 0, result.stderr + result.stdout);
-    assert.match(result.stdout, new RegExp(`^current: ${rx(link)} -> `, "m"));
-  });
-
-  it("reports a per-artifact error, continues, and exits non-zero (kusabi #258)", () => {
-    // A regular file where skills/ should be: every symlink under it fails.
-    fs.mkdirSync(cursorDir, { recursive: true });
-    fs.writeFileSync(path.join(cursorDir, "skills"), "not a directory\n");
-    const result = run();
-    // Any rendered error line — destination-side failure here — must drive
-    // the exit code (kusabi #258), just like a missing source does.
-    assert.notEqual(result.status, 0, result.stdout + result.stderr);
-    const errors = result.stdout.split("\n").filter((l) => l.startsWith("error: "));
-    assert.equal(errors.length, SKILLS.length, result.stdout);
-    assert.match(result.stdout, /^created: .*kusabi-companion$/m);
-  });
-
-  it("installs the alwaysApply rule only with --cursor-rule", () => {
-    const link = path.join(cursorDir, "rules", "kusabi-delegate.mdc");
-    const plain = run();
-    assert.equal(plain.status, 0, plain.stderr + plain.stdout);
-    assert.ok(!fs.existsSync(path.join(cursorDir, "rules")), "no rules dir without the flag");
-    assert.doesNotMatch(plain.stdout, /kusabi-delegate\.mdc/);
-
-    const withRule = run(["--cursor-rule"]);
-    assert.equal(withRule.status, 0, withRule.stderr + withRule.stdout);
-    assert.match(withRule.stdout, new RegExp(`^created: ${rx(link)} -> `, "m"));
-    assert.equal(
-      fs.realpathSync(link),
-      fs.realpathSync(path.join(PLUGIN_DIR, "rules", "kusabi-delegate.mdc")),
-    );
-  });
-
-  it("rejects --cursor-rule on other subcommands", () => {
-    const result = spawnSync(process.execPath, [COMPANION_SCRIPT, "status", "--cursor-rule"], {
-      encoding: "utf8",
-      env: { ...process.env, HOME: tmpHome, OPENCODE_BIN: "/nonexistent-opencode-bin" },
-      timeout: 10_000,
-    });
-    assert.notEqual(result.status, 0);
-    assert.match(result.stdout + result.stderr, /--cursor-rule is only supported by install-cli/);
-  });
-
-  it("the plugin rule is frontmatter + body with alwaysApply and no absolute paths", () => {
-    const raw = fs.readFileSync(path.join(PLUGIN_DIR, "rules", "kusabi-delegate.mdc"), "utf8");
-    const m = raw.match(/^---\n([\s\S]*?)\n---\n([\s\S]*)$/);
-    assert.ok(m, "rule does not parse as frontmatter + body");
-    const [, front, body] = m;
-    assert.match(front, /^description: \S/m);
-    assert.match(front, /^alwaysApply: true$/m);
-    const bodyLines = body.trim().split("\n");
-    assert.ok(bodyLines.length > 0 && body.trim().length > 0, "rule body is empty");
-    assert.ok(bodyLines.length <= 15, `rule body is ${bodyLines.length} lines, want <= 15`);
-    // Machine-independence: no absolute path and no environment-overlay refs.
-    assert.doesNotMatch(raw, /(^|\s)~?\/[A-Za-z0-9_.-]/m, "rule contains an absolute filesystem path");
-    assert.doesNotMatch(raw, /MEMORY\.md|kairanban/);
-  });
-
-  it("--help documents --cursor-rule and the extended install-cli behaviour", () => {
-    const result = spawnSync(process.execPath, [COMPANION_SCRIPT, "--help"], {
-      encoding: "utf8",
-      timeout: 10_000,
-    });
-    assert.equal(result.status, 0, result.stderr);
-    assert.match(result.stdout, /^ {2}--cursor-rule /m);
-    assert.match(result.stdout, /^ {2}install-cli .*\.cursor\/skills/m);
-  });
-});
 
 describe("setup companion-shim diagnosis", () => {
   const COMPANION_SCRIPT = path.join(import.meta.dirname, "kusabi-companion.mjs");
@@ -3923,14 +3435,14 @@ describe("install-cli with a missing skill source (kusabi #256)", () => {
 
   it("reports an error line per skill, creates no link, and exits non-zero", () => {
     const script = brokenCheckoutScript();
-    const cursorDir = path.join(tmp, "cursor");
+    const codexDir = path.join(tmp, "codex");
     const result = spawnSync(process.execPath, [script, "install-cli"], {
       encoding: "utf8",
       env: {
         ...process.env,
         HOME: tmp,
         KUSABI_BIN_DIR: path.join(tmp, "bin"),
-        KUSABI_CURSOR_DIR: cursorDir,
+        KUSABI_CODEX_DIR: codexDir,
         OPENCODE_BIN: "/nonexistent-opencode-bin",
       },
       timeout: 15_000,
@@ -3941,7 +3453,7 @@ describe("install-cli with a missing skill source (kusabi #256)", () => {
     for (const line of errors) {
       assert.match(line, /symlink source does not exist/);
     }
-    assert.ok(!fs.existsSync(path.join(cursorDir, "skills")), "no dangling link may be created");
+    assert.ok(!fs.existsSync(path.join(codexDir, "skills")), "no dangling link may be created");
     // The shim — install-cli's primary job — is still written and reported.
     assert.match(result.stdout, /^created: .*kusabi-companion$/m);
   });
@@ -3953,16 +3465,16 @@ describe("install-cli with a missing skill source (kusabi #256)", () => {
     // `error` — and a rendered error line must drive the exit code just like
     // a missing source does.
     const script = path.join(import.meta.dirname, "kusabi-companion.mjs");
-    const cursorDir = path.join(tmp, "cursor");
-    fs.mkdirSync(cursorDir, { recursive: true });
-    fs.writeFileSync(path.join(cursorDir, "skills"), "a file, not a directory");
+    const codexDir = path.join(tmp, "codex");
+    fs.mkdirSync(codexDir, { recursive: true });
+    fs.writeFileSync(path.join(codexDir, "skills"), "a file, not a directory");
     const result = spawnSync(process.execPath, [script, "install-cli"], {
       encoding: "utf8",
       env: {
         ...process.env,
         HOME: tmp,
         KUSABI_BIN_DIR: path.join(tmp, "bin"),
-        KUSABI_CURSOR_DIR: cursorDir,
+        KUSABI_CODEX_DIR: codexDir,
         OPENCODE_BIN: "/nonexistent-opencode-bin",
       },
       timeout: 15_000,
@@ -3971,7 +3483,7 @@ describe("install-cli with a missing skill source (kusabi #256)", () => {
     const errors = result.stdout.split("\n").filter((l) => l.startsWith("error: "));
     assert.equal(errors.length, 2, result.stdout);
     for (const line of errors) {
-      assert.ok(line.includes(cursorDir), line);
+      assert.ok(line.includes(codexDir), line);
     }
     // The shim — install-cli's primary job — is still written and reported.
     assert.match(result.stdout, /^created: .*kusabi-companion$/m);

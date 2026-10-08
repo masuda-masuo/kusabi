@@ -88,17 +88,17 @@ describe("CLI documentation contracts", () => {
     assert.throws(() => checkBackendLists(readme, [...BACKENDS, "newbackend"]),
       /documented --backend choices/);
     assert.throws(() => checkBackendLists(help, BACKENDS.map((name) =>
-      name === "cursor" ? "renamed" : name)), /documented --backend choices/);
+      name === "codex" ? "renamed" : name)), /documented --backend choices/);
   });
 
   it("detects missing, extra, and renamed prefixes without snapshotting prose", () => {
     const paragraph = modelParagraph(readme);
-    assert.throws(() => checkPrefixes(paragraph.replace("`cursor/`", "Cursor")),
+    assert.throws(() => checkPrefixes(paragraph.replace("`codex/`", "Codex")),
       /documented model prefixes/);
     assert.throws(() => checkPrefixes(paragraph + " `other/`"),
       /documented model prefixes/);
     assert.throws(() => checkPrefixes(paragraph, BACKEND_ENTRY_PREFIXES.map((entry) =>
-      entry.backend === "cursor" ? { ...entry, prefix: "renamed/" } : entry)),
+      entry.backend === "codex" ? { ...entry, prefix: "renamed/" } : entry)),
     /documented model prefixes/);
     checkPrefixes(paragraph.replace("for example", "for instance"));
   });

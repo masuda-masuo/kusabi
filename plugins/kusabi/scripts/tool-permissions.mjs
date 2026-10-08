@@ -3,8 +3,8 @@
 // Split out of claude-dispatch.mjs (pure move, no behaviour change): the
 // hardcoded agent allowlists, the opencode→claude deny translation, the
 // sunaba profile mapping, and the belt-and-braces DISALLOWED_TOOLS list that
-// must never run in a worker session.  Shared by the claude, codex, agy and
-// cursor backends, so the dependency graph stops routing every backend
+// must never run in a worker session.  Shared by the claude, codex, and agy
+// backends, so the dependency graph stops routing every backend
 // through the claude adapter.  Pure: no imports, no I/O.
 
 // =========================================================================

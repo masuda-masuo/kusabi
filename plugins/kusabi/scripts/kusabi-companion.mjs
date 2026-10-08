@@ -264,7 +264,7 @@ function usage() {
     "  luna-cancel Record a stop request on a luna mission: no coordinator, auditor, or inner-chain seat is dispatched after it (the stop propagates to a live inner chain; a stale inner chain finalises through the existing chain stop lever)",
     "  luna-resume Resume a luna mission from its persisted state: refuses while the mission process or a recorded Luna/Sol job is genuinely live, settles stale chains/jobs deterministically, and only a matching human audit override (--audit-override <gateId> --audit-override-reason <reason> --audit-override-by <actor>) lets a sol-blocked mission proceed",
     "  evaluation Replay a named luna mission or plain chain from durable records alone and report the replayed audit-gate results (read-only, no LLM, no dispatch): mission-* -> mission replay, chain-* -> plain-chain replay",
-    "  metrics-ingest  Ingest transcripts + Cursor usage + Codex usage + chain records + delegated-job records into a durable SQLite store (read-only source, no LLM)",
+    "  metrics-ingest  Ingest transcripts + Codex usage + chain records + delegated-job records into a durable SQLite store (read-only source, no LLM)",
     "  metrics-report  Query/report over the SQLite metrics store (read-only, no LLM, never ingests)",
     "  dashboard  Serve a read-only local JSON API over the state root and metrics.db (no LLM, no writes)",
     "  chain-cancel  Request a running chain to stop (file-based, works across processes)",
@@ -273,7 +273,7 @@ function usage() {
     "  cancel     Cancel a running job",
     "  serve-stop Stop the background opencode server and remove its state file",
     "  install-agents  Copy phase agent definitions and skills to kusabi's opencode config dir (<state root>/opencode-config/opencode), or OPENCODE_AGENT_DIR / OPENCODE_SKILL_DIR",
-    "  install-cli  Write a kusabi-companion shim to $KUSABI_BIN_DIR (default ~/.local/bin), and symlink the delegate / kusabi-result-handling skills into $KUSABI_CURSOR_DIR/skills (default ~/.cursor/skills) and $KUSABI_CODEX_DIR/skills (default ~/.codex/skills) when those directories exist",
+    "  install-cli  Write a kusabi-companion shim to $KUSABI_BIN_DIR (default ~/.local/bin), and symlink the delegate / kusabi-result-handling skills into $KUSABI_CODEX_DIR/skills (default ~/.codex/skills) when that directory exists",
     "  salvage    Salvage a dead job (inspect progress and produce structured report)",
     "  baseline   Report collected test count, gate states, and optional smoke baseline for a container (read-only, no LLM)",
     "  help       Show this help message",
@@ -281,15 +281,13 @@ function usage() {
     "Flags:",
     "  --read-only, --resume-last",
     "  --base <ref> (review: branch diff base; task: diff base for --phase review --container, rejected elsewhere), --agent <id>, --phase <name> (draft|investigate|implement|review|respond|salvage|gofer|test-author|plan)",
-    "  --model <identifier> (task/chain: the identifier CARRIES its backend and decides it for the phases it pins — claude/<model> (bare alias opus|sonnet|haiku or a full model id; a :variant suffix is rejected) runs those phases on claude, codex/<model> (one of the exact seat ids " + formatCodexSupportedModels("or") + "; a :variant suffix is rejected) runs them on codex, provider/model[:variant] runs them on opencode, and a bare alias with no / names no backend, so the phase keeps its configured backend. The model is always validated against the backend the same identifier chose. A pinned model is the ONLY candidate: no fallback to the configured chain is attempted, so a pinned route that fails terminally ends the dispatch instead of silently running a different model)",
-    "  --backend opencode|claude|agy|cursor|codex (task/chain: force EVERY phase onto that backend; default opencode. Redundant when --model names a backend — a --backend that disagrees with such a --model is a contradiction and is rejected, naming both. With neither, the config chain entries decide: models.phases.<phase> (or models.chain) entries may carry a claude/, agy/, cursor/, or codex/ prefix for per-phase backend mixing; one phase's chain must be single-backend. agy resumes via --conversation: --session/--resume-last are accepted when the job store proves the id an agy conversation, and --read-only/--deny are rejected on it. codex runs every invocation in a fixed read-only sandbox with reasoning effort high: --read-only is accepted, --deny is rejected, and the model must be one of the exact seat ids (" + formatCodexSupportedModels("or") + "). chain-resume accepts --backend/--model only to route a quota-exhausted review seat onto a different backend or model)",
+    "  --backend opencode|claude|agy|codex (task/chain: force EVERY phase onto that backend; default opencode. Redundant when --model names a backend — a --backend that disagrees with such a --model is a contradiction and is rejected, naming both. With neither, the config chain entries decide: models.phases.<phase> (or models.chain) entries may carry a claude/, agy/, or codex/ prefix for per-phase backend mixing; one phase's chain must be single-backend. agy resumes via --conversation: --session/--resume-last are accepted when the job store proves the id an agy conversation, and --read-only/--deny are rejected on it. codex runs every invocation in a fixed read-only sandbox with reasoning effort high: --read-only is accepted, --deny is rejected, and the model must be one of the exact seat ids (" + formatCodexSupportedModels("or") + "). chain-resume accepts --backend/--model only to route a quota-exhausted review seat onto a different backend or model)",
     "  --session <id>, --timeout <s>, --watchdog <s>, --deny <tools>",
     "  --brief-file <path> (task / chain: read the brief from a file; exclusive with inline text)",
     "  --container <cid> (chain/task: container to run deterministic probes in; NOT supported by review)",
     "  --keep-serve (chain / chain-resume: keep the serve alive after the chain finishes)",
     "  --full (result: show the full stored result body instead of the compact default)",
     "  --force (serve-stop: force kill the serve even when jobs are running)",
-    "  --cursor-rule (install-cli: also symlink the alwaysApply kusabi-delegate rule into <cursor dir>/rules; opt-in, since it taxes every conversation on the machine)",
     "  --prior <text> (review: prior findings for anti-ratchet)",
     "  --max-rounds <N> (chain: max rounds, default 4)",
     "  --chain-id <id> (chain / chain-detach: run the chain under this id instead of minting one — caller-owned: must be unique per concurrent dispatch. The id becomes a path segment under chains/, so it must match chain-[a-z0-9]+ and its directory must not already exist \u2014 a malformed id is refused before any filesystem write. chain-detach hands the SAME id back: the emitted wait line is `chain-wait <id>`, which waits for the chain by name \u2014 no --next, no --since, and no recency race with another orchestrator working the same repo)",
@@ -312,7 +310,6 @@ function usage() {
     "  --until <ISO> (chain-stats: end of time range, exclusive)",
     "  --compare <ISO> (chain-stats: show before/after comparison at cutoff)",
     "  --transcript-dir <path> (metrics-ingest: default ~/.claude/projects)",
-    "  --cursor-usage-dir <path> (metrics-ingest: default ~/.kusabi/cursor-usage)",
     "  --codex-usage-dir <path> (metrics-ingest: default $CODEX_HOME/sessions or ~/.codex/sessions)",
     "  --state-root <path> (metrics-ingest: default the kusabi state root, ~/.kusabi)",
     "  --db <path> (metrics-ingest: default <state-root>/metrics.db)",
@@ -413,12 +410,6 @@ async function main() {
   // subcommand it would be silently ignored — reject it out loud instead.
   if (parsed.flags.backend && subcommand !== "task" && subcommand !== "task-detach" && subcommand !== "taskDetach" && subcommand !== "chain" && subcommand !== "chain-detach" && subcommand !== "chainDetach" && subcommand !== "chain-resume" && subcommand !== "chainResume") {
     throw new Error(`--backend is only supported by task and chain (got subcommand ${subcommand ?? "(none)"})`);
-  }
-
-  // --cursor-rule is an install-cli placement decision; anywhere else it would
-  // be silently ignored, so reject it the same way --backend is.
-  if (parsed.flags.cursorRule && subcommand !== "install-cli") {
-    throw new Error(`--cursor-rule is only supported by install-cli (got subcommand ${subcommand ?? "(none)"})`);
   }
 
   // The chain-wait bounds are wait decisions; on any other subcommand they
@@ -540,7 +531,7 @@ async function main() {
     case "install-agents":
       return cmdInstallAgents();
     case "install-cli":
-      return cmdInstallCli({ ...parsed, selfPath: COMPANION_SCRIPT });
+      return cmdInstallCli({ selfPath: COMPANION_SCRIPT });
     case "salvage":
       return cmdSalvage(cwd, parsed);
     case "baseline":

@@ -7,8 +7,8 @@
 // IMPORT DIRECTION: Unlike chain-cmd.mjs, chain-ops.mjs, and task-cmd.mjs,
 // this module does NOT import kusabi-companion.mjs. It has no cycle with
 // companion: it calls only leaf modules (chain-stats.mjs, metrics-db.mjs,
-// transcript-ingest.mjs, cursor-usage-ingest.mjs, chain-ingest.mjs,
-// metrics-report.mjs, dashboard.mjs, state-paths.mjs, cursor-statusline-sink.mjs).
+// transcript-ingest.mjs, codex-usage-ingest.mjs, chain-ingest.mjs,
+// metrics-report.mjs, dashboard.mjs, state-paths.mjs).
 //
 // This module does NOT import chain-driver.mjs, chain-cmd.mjs, chain-ops.mjs,
 // task-cmd.mjs, chain-phases.mjs, or chain-review.mjs.
@@ -27,7 +27,6 @@ import {
 } from "./chain-stats.mjs";
 import { openMetricsDb, openMetricsDbReadOnly } from "./metrics-db.mjs";
 import { ingestTranscriptDirectory } from "./transcript-ingest.mjs";
-import { ingestCursorUsageDirectory } from "./cursor-usage-ingest.mjs";
 import { ingestCodexUsageDirectory } from "./codex-usage-ingest.mjs";
 import { ingestChainDirectory, ingestJobDirectory } from "./chain-ingest.mjs";
 import { ingestMissionDirectory } from "./mission-ingest.mjs";
@@ -38,7 +37,6 @@ import {
   renderMissingText,
 } from "./metrics-render.mjs";
 import { startDashboard } from "./dashboard.mjs";
-import { cursorUsageDir } from "./cursor-statusline-sink.mjs";
 
 // ---------------------------------------------------------------------------
 // chain-stats
@@ -94,7 +92,7 @@ export function cmdChainStats(cwd, { flags }) {
 // ---------------------------------------------------------------------------
 
 /**
- * Ingest Claude Code transcripts, Cursor usage jsonl (#237), kusabi chain
+ * Ingest Claude Code transcripts, Codex usage, kusabi chain
  * records, and delegated-job records (#154) into a durable SQLite metrics
  * store.  This is the ingest + store step only (issues #83 / #81) -- no
  * reporting/rendering here; that is a follow-up PR.
@@ -106,7 +104,6 @@ export function cmdChainStats(cwd, { flags }) {
 export function cmdMetricsIngest(cwd, { flags }) {
   const home = os.homedir();
   const transcriptDir = flags["transcript-dir"] || path.join(home, ".claude", "projects");
-  const cursorDir = flags["cursor-usage-dir"] || cursorUsageDir();
   const codexDir = flags["codex-usage-dir"] || path.join(process.env.CODEX_HOME || path.join(home, ".codex"), "sessions");
   const metricsStateRoot = flags["state-root"] || stateRoot();
   const dryRun = !!flags.dryRun;
@@ -115,7 +112,6 @@ export function cmdMetricsIngest(cwd, { flags }) {
   const db = openMetricsDb(dbPath);
 
   let transcriptSummary;
-  let cursorSummary;
   let codexSummary;
   let chainSummary;
   let jobSummary;
@@ -123,7 +119,6 @@ export function cmdMetricsIngest(cwd, { flags }) {
   db.exec("BEGIN");
   try {
     transcriptSummary = ingestTranscriptDirectory(db, transcriptDir);
-    cursorSummary = ingestCursorUsageDirectory(db, cursorDir);
     codexSummary = ingestCodexUsageDirectory(db, codexDir);
     chainSummary = ingestChainDirectory(db, metricsStateRoot);
     jobSummary = ingestJobDirectory(db, metricsStateRoot);
@@ -161,20 +156,6 @@ export function cmdMetricsIngest(cwd, { flags }) {
   lines.push(`  I/O failures (whole file unreadable): ${transcriptSummary.ioFailures}`);
   lines.push(`  parse failures (malformed JSON):       ${transcriptSummary.parseFailures}`);
   lines.push(`  records skipped (no requestId):        ${transcriptSummary.noRequestIdRecords} (overlaps with <synthetic> above, not additional data loss)`);
-  lines.push("");
-  lines.push("Cursor usage:");
-  lines.push(`  cursor-usage dir:          ${cursorDir}`);
-  if (!fs.existsSync(cursorDir)) {
-    lines.push(`warning: cursor-usage dir not found: ${cursorDir}`);
-  }
-  lines.push(`  files scanned:             ${cursorSummary.filesScanned}`);
-  lines.push(`  files skipped (unchanged): ${cursorSummary.filesSkippedUnchanged}`);
-  lines.push(`  sessions:                  ${cursorSummary.sessions}`);
-  lines.push(`  turns:                     ${cursorSummary.turns}`);
-  lines.push(`  usage lines collapsed as repeated snapshots: ${cursorSummary.collapsedRepeats}`);
-  lines.push(`  stale turn rows deleted before re-insert:    ${cursorSummary.staleTurnsRemoved}`);
-  lines.push(`  I/O failures (whole file unreadable): ${cursorSummary.ioFailures}`);
-  lines.push(`  parse failures (malformed JSON):       ${cursorSummary.parseFailures}`);
   lines.push("");
   lines.push("Codex usage:");
   lines.push(`  codex-usage dir:           ${codexDir}`);

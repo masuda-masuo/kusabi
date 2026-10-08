@@ -1,7 +1,7 @@
 // codex-usage-ingest.mjs — parse Codex JSONL usage files into turn/session
 // rows, and a directory walker that feeds them into the metrics store.
 //
-// Split by design (same as transcript-ingest.mjs and cursor-usage-ingest.mjs):
+// Split by design (same as transcript-ingest.mjs):
 // `parseCodexUsageContent` is a pure function (string in, structured turns out)
 // so it is unit-testable with inline fixtures and no files on disk.
 // `ingestCodexUsageDirectory` is the only piece that touches the filesystem or
@@ -400,7 +400,7 @@ function walkJsonlFiles(dir) {
  * `parseCodexUsageContent`, and upsert session/turn rows into `db`.
  *
  * Source file skip-cache uses a versioned key (`codex-usage:v1:<path>`) that
- * is distinct from the cursor-usage key (`#cu-v2`) and the Claude transcript
+ * is distinct from the Claude transcript
  * key.  A missing directory yields a zeroed summary (the CLI warns).  An
  * existing empty directory is also zeros.
  *

@@ -5,8 +5,8 @@ Status: Design finalized + field-verified up to the phase chain, auto-chain (cha
 
 ## 1. Purpose and positioning
 
-A plugin for delegating tasks from an orchestrator (Claude Code, Cursor) to background worker models (opencode, claude, agy, cursor).
-Establishes a division of labor where Claude Code or Cursor serves as the **orchestrator** (planning, inspection/acceptance by the orchestrator, publish decisions) while worker backends serve as the **worker** (investigation, implementation, review).
+A plugin for delegating tasks from an orchestrator (Claude Code, Codex) to background worker models (opencode, claude, agy, codex).
+Establishes a division of labor where Claude Code or Codex serves as the **orchestrator** (planning, inspection/acceptance by the orchestrator, publish decisions) while worker backends serve as the **worker** (investigation, implementation, review).
 
 The motivation is cost structure: deepseek v4 Flash is cheap (zen's free-tier deepseek-v4-flash-free is also available) and empirically does better work than Haiku. This creates a structure where investigation and first-pass implementation run at essentially no cost, and only finishing work pays a small amount to Pro.
 
@@ -15,9 +15,9 @@ Derived from: openai/codex-plugin-cc (Apache-2.0). Prompt assets (adversarial-re
 ## 2. Architecture
 
 ```
-Claude Code / Cursor (orchestrator)
+Claude Code / Codex (orchestrator)
   └─ /kusabi:task / skill / CLI shim → kusabi-companion (context firewall)
-       └─ worker backends (opencode serve, claude -p, agy, cursor-agent)
+       └─ worker backends (opencode serve, claude -p, agy, codex exec)
             └─ MCP: sunaba / shiori (configured in opencode.json or CLI configs)
                  └─ sunaba container (orchestrator passes --container; worker receives container_id)
 ```

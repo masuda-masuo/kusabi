@@ -55,7 +55,6 @@ import {
 import { resolveModelBackend, BUILTIN_DEFAULT_CHAIN } from "./cli.mjs";
 import { CLAUDE_DEFAULT_CHAIN } from "./claude-dispatch.mjs";
 import { AGY_DEFAULT_CHAIN } from "./agy-dispatch.mjs";
-import { CURSOR_DEFAULT_CHAIN, DEFAULT_CURSOR_MODEL } from "./cursor-dispatch.mjs";
 import { CODEX_DEFAULT_CHAIN } from "./codex-dispatch.mjs";
 
 // The helpers this module used to import from kusabi-companion.mjs now live in
@@ -138,10 +137,10 @@ export function renderChainBanner({ chainId, tierCount, reworkTierCount, reworkK
  *
  * @param {object} opts
  * @param {string|null|undefined} [opts.session] — the --session flag value.
- * @param {"opencode"|"claude"|"agy"|"cursor"|"codex"|null|undefined} [opts.provenance] — the
+ * @param {"opencode"|"claude"|"agy"|"codex"|null|undefined} [opts.provenance] — the
  *        backend the job store established as the session's owner, or null
  *        when no owner record exists.
- * @param {"opencode"|"claude"|"agy"|"cursor"|"codex"} opts.implementBackend — the resolved
+ * @param {"opencode"|"claude"|"agy"|"codex"} opts.implementBackend — the resolved
  *        implement backend of the chain about to start.
  * @returns {string|null}
  */
@@ -533,9 +532,6 @@ export async function runChainLifecycle(cwd, { flags, text, orchestrator }, opts
  * @returns {{ model: string|null, chain: Array }}
  */
 function defaultReviewResolution(backend) {
-  if (backend === "cursor") {
-    return { model: DEFAULT_CURSOR_MODEL, chain: CURSOR_DEFAULT_CHAIN };
-  }
   if (backend === "codex") {
     return { model: CODEX_DEFAULT_CHAIN[0][0], chain: CODEX_DEFAULT_CHAIN };
   }

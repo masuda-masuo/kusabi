@@ -2,7 +2,7 @@
 //
 // On every terminal chain disposition this writes a durable inbox file under
 // the workspace state dir and best-effort appends one kaiba agenda row.
-// This is NOT a Cursor hook — it fires from finalizeChainControl() so it
+// This fires from finalizeChainControl() so it
 // covers every terminal path (completed / cancelled / failed) regardless of
 // whether chain-wait or any session-bound watcher is armed.
 

@@ -761,7 +761,7 @@ describe("resolveChainResume", () => {
     assert.equal(result.ok, false);
     assert.match(result.error, /already finished/);
     assert.match(result.error, /quota exhaustion/);
-    assert.match(result.error, /--backend opencode\|claude\|agy\|cursor/);
+    assert.match(result.error, /--backend opencode\|claude\|agy\|codex/);
   });
 
   it("allows chain-resume for a quota-exhausted seat when --backend names a different route", () => {
@@ -789,7 +789,7 @@ describe("resolveChainResume", () => {
           },
         })],
       }),
-      explicitRoute: { backend: "cursor" },
+      explicitRoute: { backend: "codex" },
     });
     assert.equal(result.ok, true, result.error);
     assert.equal(result.position.phase, "review");
@@ -977,7 +977,7 @@ describe("classifyReviewSeatReplacement", () => {
     });
     assert.equal(result.eligible, false);
     assert.match(result.detail, /quota exhaustion/);
-    assert.match(result.detail, /--backend opencode\|claude\|agy\|cursor/);
+    assert.match(result.detail, /--backend opencode\|claude\|agy\|codex/);
     assert.match(result.detail, /--model/);
   });
 
@@ -1001,7 +1001,7 @@ describe("classifyReviewSeatReplacement", () => {
     });
     const refused = classifyReviewSeatReplacement({ records: [record] }, { explicitRoute: { backend: "agy" } });
     assert.equal(refused.eligible, false);
-    const allowed = classifyReviewSeatReplacement({ records: [record] }, { explicitRoute: { backend: "cursor" } });
+    const allowed = classifyReviewSeatReplacement({ records: [record] }, { explicitRoute: { backend: "codex" } });
     assert.equal(allowed.eligible, true);
     assert.equal(allowed.detail, null);
   });
@@ -1026,13 +1026,13 @@ describe("classifyReviewSeatReplacement", () => {
     });
     const allowed = classifyReviewSeatReplacement(
       { records: [record] },
-      { explicitRoute: { model: "cursor/default" } },
+      { explicitRoute: { model: "codex/gpt-5.6-luna" } },
     );
     assert.equal(allowed.eligible, true);
-    assert.equal(explicitRouteDiffersFromRecord(record, { model: "cursor/default" }), true);
+    assert.equal(explicitRouteDiffersFromRecord(record, { model: "codex/gpt-5.6-luna" }), true);
     assert.equal(explicitRouteDiffersFromRecord(record, { backend: "agy" }), false);
     assert.equal(recordQuotaExhaustion(record), failure);
-    assert.match(quotaReplacementRefusal(failure), /--backend opencode\|claude\|agy\|cursor/);
+    assert.match(quotaReplacementRefusal(failure), /--backend opencode\|claude\|agy\|codex/);
   });
 });
 

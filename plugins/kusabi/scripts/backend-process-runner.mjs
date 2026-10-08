@@ -1,6 +1,6 @@
 // backend-process-runner.mjs — shared subprocess lifecycle for CLI backends.
 //
-// Extracted from agy-dispatch.mjs and cursor-dispatch.mjs (kusabi #462) to
+// Extracted from agy-dispatch.mjs (kusabi #462) to
 // eliminate duplicated spawn, stdout line framing, timeout, silence-watchdog,
 // process-group termination, and close/error plumbing.
 //
@@ -88,14 +88,12 @@ export function killProcessGroup(child) {
  * silence-watchdog bounds.  The caller decides what each line means (via
  * `parseLine`) and what happens to the job record (via `onLine`, `onWatchdog`).
  *
- * Two adapters share this lifecycle:
+ * Adapters share this lifecycle:
  *   - agy: prompt on argv, no stdin; `parseLine` = `parseAgyStreamLine`.
- *   - cursor: prompt on stdin, no argv payload; `parseLine` = `parseCursorStreamLine`.
+ *   - codex: prompt on stdin, no argv payload.
  *
  * The `parseLine` function determines which lines are "parsed events" that
  * reset the silence clock.  Return non-null for events, null for noise.
- * Both `parseAgyStreamLine` and `parseCursorStreamLine` already have this
- * shape.
  *
  * @param {object} opts
  * @param {string} opts.bin — the binary to spawn.
@@ -222,7 +220,7 @@ export function runBackendProcess({
       }
     }
 
-    // Write the prompt to stdin when the caller supplies one (cursor pattern).
+    // Write the prompt to stdin when the caller supplies one (stdin pattern).
     // When no prompt is given, stdin is "ignore" and this block is skipped.
     if (hasStdin && child.stdin) {
       child.stdin.on("error", () => {});
