@@ -8,6 +8,7 @@ import {
   collectContainerBaseContext,
   CHANGE_SCOPE_CONTAINER_PATH,
   CHANGE_SCOPE_HOST_PATH,
+  READ_OUTPUT_PAGE_LIMIT,
   collectChangeScope,
   assertContainerBaseRef,
   collectContainerReviewInput,
@@ -666,5 +667,401 @@ describe("change-scope wiring into review and probe phases (kusabi #379)", () =>
     assert.ok(!commands.some((c) => c.includes("change-scope.mjs")), "collectReviewContext must not invoke change-scope.mjs");
     // roundRecord is untouched and context is collected
     assert.equal(reviewCtx.chainStatusObserved, true);
+  });
+});
+
+describe("change-scope transport regression and fallback coverage (kusabi #667)", () => {
+  const FIXTURE_CHANGE_SCOPE = {
+    formatVersion: 1,
+    repositoryRoot: "/workspace",
+    input: { base: "base-sha-123", head: "HEAD" },
+    resolved: {
+      baseSha: "base-sha-123",
+      headSha: "head-sha-456",
+      mergeBaseSha: "base-sha-123",
+    },
+    paths: {
+      committed: ["src/committed.js"],
+      staged: ["src/staged.js"],
+      unstaged: ["src/unstaged.js"],
+      untracked: ["src/untracked.js"],
+    },
+  };
+
+  it("explicit truncated flag throws even if partial output happens to be valid JSON", async () => {
+    const callTool = async (toolName) => {
+      if (toolName === "copy_file") return { status: "ok" };
+      if (toolName === "sandbox_exec") {
+        return {
+          status: "ok",
+          output: JSON.stringify(FIXTURE_CHANGE_SCOPE),
+          truncated: true,
+          has_more: false,
+        };
+      }
+      return { output: "" };
+    };
+
+    await assert.rejects(
+      () => collectChangeScope({ container: "cid-trunc", callTool, base: "base-sha-123" }),
+      /change-scope output was truncated in container cid-trunc/,
+    );
+  });
+
+  it("explicit unresolvable has_more flag throws", async () => {
+    const callTool = async (toolName) => {
+      if (toolName === "copy_file") return { status: "ok" };
+      if (toolName === "sandbox_exec") {
+        return {
+          status: "ok",
+          output: '{"formatVersion": 1',
+          truncated: true,
+          has_more: true,
+          next_offset: null,
+        };
+      }
+      return { output: "" };
+    };
+
+    await assert.rejects(
+      () => collectChangeScope({ container: "cid-hasmore", callTool, base: "base-sha-123" }),
+      /change-scope output was truncated in container cid-hasmore/,
+    );
+  });
+
+  it("legacy TypeError fallback uses commands with full verbosity and page limit and succeeds", async () => {
+    const executed = [];
+    const callTool = async (toolName, params) => {
+      if (toolName === "copy_file") return { status: "ok" };
+      if (toolName === "sandbox_exec") {
+        executed.push(params);
+        if (params.argv) {
+          throw new TypeError("mock callTool expects params.commands");
+        }
+        return {
+          status: "ok",
+          output: JSON.stringify(FIXTURE_CHANGE_SCOPE),
+          truncated: false,
+          has_more: false,
+        };
+      }
+      return { output: "" };
+    };
+
+    const scope = await collectChangeScope({
+      container: "cid-fallback",
+      callTool,
+      base: "base-sha-123",
+      head: "HEAD",
+    });
+
+    assert.equal(executed.length, 2);
+    assert.ok(executed[0].argv);
+    assert.ok(executed[1].commands);
+    assert.equal(executed[1].verbose, "full");
+    assert.ok(executed[1].limit >= 1000);
+    assert.equal(executed[1].max_output_tokens, 0);
+    assert.equal(scope.formatVersion, 1);
+    assert.deepEqual(scope.paths.committed, ["src/committed.js"]);
+  });
+
+  it("multi-page output via read_output is reassembled into complete JSON", async () => {
+    const fullJson = JSON.stringify(FIXTURE_CHANGE_SCOPE, null, 2);
+    const lines = fullJson.split("\n");
+    const mid = Math.floor(lines.length / 2);
+    const page1 = lines.slice(0, mid).join("\n");
+    const page2 = lines.slice(mid).join("\n");
+
+    const calls = [];
+    const callTool = async (toolName, params) => {
+      calls.push({ toolName, params });
+      if (toolName === "copy_file") return { status: "ok" };
+      if (toolName === "sandbox_exec") {
+        return {
+          status: "ok",
+          output: page1,
+          output_id: "oid-paged",
+          has_more: true,
+          next_offset: mid,
+          truncated: true,
+        };
+      }
+      if (toolName === "read_output") {
+        assert.equal(params.output_id, "oid-paged");
+        assert.equal(params.offset, mid);
+        return {
+          status: "ok",
+          output: page2,
+          has_more: false,
+          next_offset: null,
+          truncated: false,
+        };
+      }
+      return { output: "" };
+    };
+
+    const scope = await collectChangeScope({
+      container: "cid-pages",
+      callTool,
+      base: "base-sha-123",
+    });
+
+    assert.equal(scope.formatVersion, 1);
+    assert.deepEqual(scope.paths.committed, ["src/committed.js"]);
+    assert.equal(calls.filter((c) => c.toolName === "read_output").length, 1);
+  });
+
+  it("multi-page output via sandbox_exec offset is reassembled when read_output is unavailable", async () => {
+    const fullJson = JSON.stringify(FIXTURE_CHANGE_SCOPE, null, 2);
+    const lines = fullJson.split("\n");
+    const mid = Math.floor(lines.length / 2);
+    const page1 = lines.slice(0, mid).join("\n");
+    const page2 = lines.slice(mid).join("\n");
+
+    const calls = [];
+    const callTool = async (toolName, params) => {
+      calls.push({ toolName, params });
+      if (toolName === "copy_file") return { status: "ok" };
+      if (toolName === "sandbox_exec") {
+        if (!params.offset) {
+          return {
+            status: "ok",
+            output: page1,
+            has_more: true,
+            next_offset: mid,
+            truncated: true,
+          };
+        }
+        return {
+          status: "ok",
+          output: page2,
+          has_more: false,
+          next_offset: null,
+          truncated: false,
+        };
+      }
+      return { output: "" };
+    };
+
+    const scope = await collectChangeScope({
+      container: "cid-exec-pages",
+      callTool,
+      base: "base-sha-123",
+    });
+
+    assert.equal(scope.formatVersion, 1);
+    assert.deepEqual(scope.paths.committed, ["src/committed.js"]);
+    assert.equal(calls.filter((c) => c.toolName === "sandbox_exec").length, 2);
+  });
+
+  it("multi-page read_output contract: rejects illegal limit, preserves saved output_id across pages, and avoids rerun", async () => {
+    const committedFiles = [];
+    for (let i = 0; i < 90; i++) {
+      committedFiles.push(`file_${String(i).padStart(3, "0")}.txt`);
+    }
+    const fullScope = {
+      formatVersion: 1,
+      repositoryRoot: "/workspace",
+      input: { base: "base-sha-123", head: "HEAD" },
+      resolved: {
+        baseSha: "base-sha-123",
+        headSha: "head-sha-456",
+        mergeBaseSha: "base-sha-123",
+      },
+      paths: {
+        committed: committedFiles,
+        staged: [],
+        unstaged: [],
+        untracked: [],
+      },
+    };
+
+    const fullJson = JSON.stringify(fullScope, null, 2);
+    const lines = fullJson.split("\n");
+    const p1End = 30;
+    const p2End = 65;
+    const page1 = lines.slice(0, p1End).join("\n");
+    const page2 = lines.slice(p1End, p2End).join("\n");
+    const page3 = lines.slice(p2End).join("\n");
+
+    const savedOutputId = "out-cached-original-capture-42";
+    const calls = [];
+    const callTool = async (toolName, params) => {
+      calls.push({ toolName, params });
+      if (toolName === "copy_file") return { status: "ok" };
+
+      if (toolName === "sandbox_exec") {
+        return {
+          status: "ok",
+          exit_code: 0,
+          output: page1,
+          output_id: savedOutputId,
+          has_more: true,
+          next_offset: p1End,
+          truncated: true,
+        };
+      }
+
+      if (toolName === "read_output") {
+        // Strict Sunaba contract enforcement: 1 <= limit <= 1000 and offset >= 0
+        if (typeof params?.limit !== "number" || params.limit < 1 || params.limit > 1000) {
+          return {
+            status: "error",
+            error: "offset >= 0 and 1 <= limit <= 1000 required",
+          };
+        }
+        if (typeof params?.offset !== "number" || params.offset < 0) {
+          return {
+            status: "error",
+            error: "offset >= 0 and 1 <= limit <= 1000 required",
+          };
+        }
+        if (params?.output_id !== savedOutputId) {
+          return {
+            status: "error",
+            error: `Output ID ${params?.output_id} not found`,
+          };
+        }
+
+        if (params.offset === p1End) {
+          // Response omits output_id: verify caller preserves original capture ID for subsequent pages
+          return {
+            status: "ok",
+            offset: p1End,
+            output: page2,
+            has_more: true,
+            next_offset: p2End,
+            truncated: true,
+          };
+        }
+
+        if (params.offset === p2End) {
+          // Final page completes capture
+          return {
+            status: "ok",
+            offset: p2End,
+            output: page3,
+            has_more: false,
+            next_offset: null,
+            truncated: false,
+          };
+        }
+
+        return {
+          status: "error",
+          error: `Unexpected offset ${params.offset}`,
+        };
+      }
+
+      return { output: "" };
+    };
+
+    const scope = await collectChangeScope({
+      container: "cid-cache-contract",
+      callTool,
+      base: "base-sha-123",
+      head: "HEAD",
+    });
+
+    assert.equal(READ_OUTPUT_PAGE_LIMIT, 1000);
+
+    const execCalls = calls.filter((c) => c.toolName === "sandbox_exec");
+    const readCalls = calls.filter((c) => c.toolName === "read_output");
+
+    // Must need at least three pages total (1 sandbox_exec + 2 read_output)
+    assert.equal(execCalls.length, 1, "sandbox_exec must be called only once and not rerun while cache is available");
+    assert.equal(readCalls.length, 2, "must fetch at least two follow-up pages via read_output");
+
+    // All follow-up pages use that same saved ID with increasing offsets
+    for (const call of readCalls) {
+      assert.equal(call.params.output_id, savedOutputId, "all follow-up pages must use the original capture's saved ID");
+      assert.ok(
+        typeof call.params.limit === "number" && call.params.limit >= 1 && call.params.limit <= 1000,
+        `read_output limit must be legal (<= 1000), got ${call.params.limit}`,
+      );
+    }
+    assert.equal(readCalls[0].params.offset, p1End);
+    assert.equal(readCalls[1].params.offset, p2End);
+    assert.ok(readCalls[1].params.offset > readCalls[0].params.offset, "follow-up page offsets must increase");
+
+    // Compare full resulting scope including final path
+    assert.equal(scope.formatVersion, 1);
+    assert.equal(scope.resolved.baseSha, "base-sha-123");
+    assert.equal(scope.resolved.headSha, "head-sha-456");
+    assert.equal(scope.paths.committed.length, 90);
+    assert.equal(scope.paths.committed[0], "file_000.txt");
+    const finalPath = "file_089.txt";
+    assert.equal(scope.paths.committed[scope.paths.committed.length - 1], finalPath);
+    assert.deepEqual(scope.paths.committed, committedFiles);
+  });
+
+  it("non-progressing next_offset in paged output terminates loop and fails closed", async () => {
+    let readCount = 0;
+    const callTool = async (toolName) => {
+      if (toolName === "copy_file") return { status: "ok" };
+      if (toolName === "sandbox_exec") {
+        return {
+          status: "ok",
+          output: '{"formatVersion": 1,',
+          output_id: "oid-loop",
+          has_more: true,
+          next_offset: 10,
+          truncated: true,
+        };
+      }
+      if (toolName === "read_output") {
+        readCount++;
+        return {
+          status: "ok",
+          offset: 10,
+          output: '"paths": {',
+          has_more: true,
+          next_offset: 10,
+          truncated: true,
+        };
+      }
+      return { output: "" };
+    };
+
+    await assert.rejects(
+      () => collectChangeScope({ container: "cid-loop", callTool, base: "base-sha-123" }),
+      /change-scope output was truncated in container cid-loop/,
+    );
+    assert.equal(readCount, 1, "must break immediately and not loop infinitely on non-progressing offset");
+  });
+
+  it("invalid non-integer next_offset in paged output terminates loop and fails closed", async () => {
+    let readCount = 0;
+    const callTool = async (toolName) => {
+      if (toolName === "copy_file") return { status: "ok" };
+      if (toolName === "sandbox_exec") {
+        return {
+          status: "ok",
+          output: '{"formatVersion": 1,',
+          output_id: "oid-nan",
+          has_more: true,
+          next_offset: 10,
+          truncated: true,
+        };
+      }
+      if (toolName === "read_output") {
+        readCount++;
+        return {
+          status: "ok",
+          offset: 10,
+          output: '"paths": {',
+          has_more: true,
+          next_offset: NaN,
+          truncated: true,
+        };
+      }
+      return { output: "" };
+    };
+
+    await assert.rejects(
+      () => collectChangeScope({ container: "cid-nan", callTool, base: "base-sha-123" }),
+      /change-scope output was truncated in container cid-nan/,
+    );
+    assert.equal(readCount, 1, "must break immediately and not loop infinitely on invalid offset");
   });
 });
