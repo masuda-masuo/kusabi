@@ -85,6 +85,8 @@ export async function collectContainerBaseContext(callTool, container) {
 }
 
 export const CHANGE_SCOPE_CONTAINER_PATH = "/tmp/kusabi-change-scope.mjs";
+export const CHANGE_SCOPE_PAGE_LIMIT = 1000000;
+export const READ_OUTPUT_PAGE_LIMIT = 1000;
 export const CHANGE_SCOPE_HOST_PATH = fileURLToPath(new URL("change-scope.mjs", import.meta.url));
 
 /**
@@ -124,10 +126,14 @@ export async function collectChangeScope({ callTool, container, base, head = "HE
   }
 
   let execResult;
+  let usedCommands = false;
   try {
     execResult = await callTool("sandbox_exec", {
       container_id: container,
       argv: ["node", CHANGE_SCOPE_CONTAINER_PATH, "--base", base, "--head", head],
+      verbose: "full",
+      limit: CHANGE_SCOPE_PAGE_LIMIT,
+      max_output_tokens: 0,
     });
   } catch (err) {
     // If a mock callTool throws TypeError (e.g. legacy test stubs expecting params.commands[0]),
@@ -137,7 +143,11 @@ export async function collectChangeScope({ callTool, container, base, head = "HE
         execResult = await callTool("sandbox_exec", {
           container_id: container,
           commands: [`node ${CHANGE_SCOPE_CONTAINER_PATH} --base ${base} --head ${head}`],
+          verbose: "full",
+          limit: CHANGE_SCOPE_PAGE_LIMIT,
+          max_output_tokens: 0,
         });
+        usedCommands = true;
       } catch (fallbackErr) {
         throw new Error(`change-scope failed in container ${container}: ${fallbackErr.message}`);
       }
@@ -150,22 +160,111 @@ export async function collectChangeScope({ callTool, container, base, head = "HE
     const detail = (execResult.error || execResult.stderr || execResult.output || "").trim();
     throw new Error(`change-scope failed with exit code ${execResult.exit_code}: ${detail}`);
   }
+  if (execResult?.status === "error") {
+    const detail = (execResult.error || execResult.stderr || execResult.output || "").trim();
+    throw new Error(`change-scope failed in container ${container}: ${detail}`);
+  }
 
-  const raw = (execResult?.output ?? "").trim();
-  if (!raw) {
+  let raw = execResult?.output ?? "";
+  let currentResult = execResult;
+  let savedOutputId = execResult?.output_id ?? null;
+
+  while (
+    currentResult?.has_more === true &&
+    Number.isInteger(currentResult?.next_offset) &&
+    currentResult.next_offset >= 0
+  ) {
+    let nextResult = null;
+    if (savedOutputId) {
+      try {
+        const readResult = await callTool("read_output", {
+          container_id: container,
+          output_id: savedOutputId,
+          offset: currentResult.next_offset,
+          limit: READ_OUTPUT_PAGE_LIMIT,
+        });
+        if (readResult && readResult.status !== "error" && typeof readResult.output === "string") {
+          nextResult = readResult;
+        }
+      } catch {
+        // read_output may not be supported
+      }
+    }
+
+    if (!nextResult) {
+      try {
+        const pageParams = usedCommands
+          ? {
+              container_id: container,
+              commands: [`node ${CHANGE_SCOPE_CONTAINER_PATH} --base ${base} --head ${head}`],
+              verbose: "full",
+              limit: CHANGE_SCOPE_PAGE_LIMIT,
+              offset: currentResult.next_offset,
+              max_output_tokens: 0,
+            }
+          : {
+              container_id: container,
+              argv: ["node", CHANGE_SCOPE_CONTAINER_PATH, "--base", base, "--head", head],
+              verbose: "full",
+              limit: CHANGE_SCOPE_PAGE_LIMIT,
+              offset: currentResult.next_offset,
+              max_output_tokens: 0,
+            };
+        nextResult = await callTool("sandbox_exec", pageParams);
+        if (nextResult?.output_id) {
+          savedOutputId = nextResult.output_id;
+        }
+      } catch {
+        break;
+      }
+    }
+
+    if (nextResult && typeof nextResult.output === "string") {
+      if (typeof nextResult.exit_code === "number" && nextResult.exit_code !== 0) {
+        const detail = (nextResult.error || nextResult.stderr || nextResult.output || "").trim();
+        throw new Error(`change-scope failed with exit code ${nextResult.exit_code}: ${detail}`);
+      }
+      if (nextResult.status === "error") {
+        const detail = (nextResult.error || nextResult.stderr || nextResult.output || "").trim();
+        throw new Error(`change-scope failed in container ${container}: ${detail}`);
+      }
+      if (nextResult.output_id) {
+        savedOutputId = nextResult.output_id;
+      }
+      raw = raw.length > 0 ? `${raw}
+${nextResult.output}` : nextResult.output;
+      if (
+        nextResult.has_more === true &&
+        (!Number.isInteger(nextResult.next_offset) || nextResult.next_offset <= currentResult.next_offset)
+      ) {
+        currentResult = nextResult;
+        break;
+      }
+      currentResult = nextResult;
+    } else {
+      break;
+    }
+  }
+
+  if (currentResult?.truncated === true || currentResult?.has_more === true) {
+    throw new Error(`change-scope output was truncated in container ${container}`);
+  }
+
+  const trimmed = raw.trim();
+  if (!trimmed) {
     const detail = (execResult?.error || execResult?.stderr || "").trim();
     throw new Error(`change-scope produced empty output${detail ? `: ${detail}` : ""}`);
   }
 
   let parsed;
   try {
-    parsed = JSON.parse(raw);
+    parsed = JSON.parse(trimmed);
   } catch (err) {
     throw new Error(`change-scope produced invalid JSON: ${err.message}`);
   }
 
   if (!parsed || parsed.formatVersion !== 1 || !parsed.resolved || !parsed.paths) {
-    throw new Error(`change-scope JSON contract mismatch (formatVersion must be 1): ${raw.slice(0, 100)}`);
+    throw new Error(`change-scope JSON contract mismatch (formatVersion must be 1): ${trimmed.slice(0, 100)}`);
   }
 
   return parsed;
