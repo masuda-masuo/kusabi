@@ -97,7 +97,7 @@ Everything else is a companion subcommand, invoked directly as
 
 | Subcommand | What it does |
 | --- | --- |
-| `chain [--brief-file <path>]` | **Auto chain** — run implement → review → rework until acceptance or escalate. Requires `--container <cid>`. Optional: `--model <identifier>`, `--backend opencode|claude|agy|codex`, `--brief-file <path>`, `--max-rounds <N>` (default 4), `--session <id>`, `--keep-serve`. When `--model` is omitted the model and backend are resolved from the config file or built-in default chain. |
+| `chain [--brief-file <path>]` | **Auto chain** — run implement → review → rework until acceptance or escalate. Requires `--container <cid>`. Optional: `--model <identifier>`, `--backend opencode|claude|agy|codex`, `--brief-file <path>`, `--max-rounds <N>` (default 2), `--session <id>`, `--keep-serve`. When `--model` is omitted the model and backend are resolved from the config file or built-in default chain. |
 | `chain-resume <chainId>` | Resume a cancelled chain from its last recorded phase boundary, or buy a replacement review seat for a chain that escalated on a dead review seat over green probes (reads `chain.json` / `control.json`; same chain lifecycle as `chain`). Optional: `--keep-serve`; `--backend` / `--model` are accepted only when routing a quota-exhausted review seat to a replacement. |
 | `chain-show` | Compact plain-text digest of a chain (read-only, no LLM) |
 | `chain-stats` | Aggregate every chain record and print a summary (read-only, no LLM) |

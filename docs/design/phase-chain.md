@@ -70,7 +70,7 @@ Launched in foreground with `chain --container <cid> --model <m> [--max-rounds N
 
 #### 3.5.1 Round structure
 
-Each round r (1..maxRounds, default 4) flows as follows:
+Each round r (1..maxRounds, default 2) flows as follows:
 
 1. **implement**: implement with the `kusabi-implement` agent. r=1 gets the full brief; r≥2 gets only the previous round's findings + the brief's acceptance criteria. The previous session's trial-and-error log is not carried over. The companion injects the `--container` ID into every implement prompt (mirroring the review-side injection), so briefs no longer need to carry it.
    - Every dispatch in the chain (implement, review, strategist) goes through `dispatchWithFallback`. When a dispatch ends as `provider-error`, the companion re-dispatches on the next unused route of the same tier — same round, same container, same brief. Routes that fail with a capacity reason (`free_tier_limit`, `account_rate_limit`) or a catalog miss (`UnknownError` whose `data.message` contains `Model not found`, kusabi #431) are remembered for the rest of the process (`terminal: true`). HTTP 401/403/429/5xx stay non-terminal (#233) and still climb within the dispatch. Fallbacks do not consume rounds. `--model` remains a pin (#361): a pinned identifier is the only candidate.
@@ -463,7 +463,7 @@ Launched with `chain-stats [--since <ISO>] [--until <ISO>] [--compare <ISO>]`. R
 
 On escalate, include remaining findings + history (each round's verdict/probes/disposition/tier/resume method) in the final output. publish is never called from the chain (not on the allow list). When the terminal round carries a structured `findings` array (kusabi #336), the escalate terminal output — both the `renderEscalateOutcome` handover and `chain-show` for the escalated chain — renders each finding's body and its recommendation as a decision for the orchestrator: severity-ordered (critical → high → medium → low → unknown, stable within a severity), budget-bounded by `ESCALATION_DECISIONS_BUDGET`, with an explicit instruction that a one-line answer per item is enough. Pre-#336 records without a structured `findings` array degrade to the one-line `findingsText` list; a round with no findings at all states that plainly.
 
-The chain now defaults to 4 max rounds (was 3). With the default ladder, rework 1 stays on the cheapest tier, so a 4-round chain reaches the same top tier as the old 3-round chain while spending the same number of paid rounds.
+The chain defaults to 2 max rounds: one implement round and one bounded rework (kusabi #681, 2026-10-10; it was 4, and 3 before that). Measured on plain chains 2026-09-08..10-09: 9 of ~210 chains went past round 1 and rework rescued 2 of them (one at round 2, one at round 3). Further rounds are the orchestrator's send-it-back decision, or an explicit `--max-rounds N`. Records written without `maxRounds` resume with 4, the default they were created under.
 
 ### 3.5.7 Chain lifecycle and stop lever — implemented
 
