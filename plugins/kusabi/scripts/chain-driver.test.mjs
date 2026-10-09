@@ -3275,6 +3275,25 @@ describe("CLI smoke baseline (kusabi #292)", () => {
     }
   });
 
+  it("defaults to 2 max rounds when --max-rounds is omitted (kusabi #681)", async () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-default-max-rounds-"));
+    const { server, url } = await startSunabaStub({ toolResult: { output: "SMOKE_EXIT=0\n" } });
+    try {
+      const briefPath = path.join(tmp, "brief.md");
+      fs.writeFileSync(briefPath, "# Task\n\nOrchestrator: test-model | session s-1 | 2026-10-10\n\n## Deliverables\n\n- `src/x.mjs`\n\n## Smoke\n\n- `npm test`\n");
+      const stateRootDir = path.join(tmp, "state");
+      const result = await runCompanion(
+        ["chain", "--container", "cid-1", "--brief-file", briefPath],
+        { cwd: tmp, stateRootDir, url },
+      );
+
+      assert.match(result.stdout, /^Chain .*maxRounds=2 /m);
+    } finally {
+      server.close();
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
   it("refuses a passing smoke that dirtied the worktree, before any round state", async () => {
     // Green exit code, but the smoke wrote: the baseline's own execution
     // dirtied the tree the worker would be handed, so the dispatch must be

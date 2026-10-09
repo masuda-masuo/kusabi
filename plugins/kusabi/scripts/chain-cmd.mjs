@@ -370,7 +370,7 @@ export async function runChainLifecycle(cwd, { flags, text, orchestrator }, opts
     : null;
 
   const { chainId, chainDir } = createChainDir(stateDir, chainIdFlag ?? null);
-  const maxRounds = Number(flags["max-rounds"] ?? 4); // B6: default maxRounds is 4
+  const maxRounds = Number(flags["max-rounds"] ?? 2); // default 2 = one bounded rework (kusabi #681; was 4)
   const brief = text;
 
   // ---- initialise chain control record (file-based stop lever) ----

@@ -286,7 +286,7 @@ function usage() {
     "  --full (result: show the full stored result body instead of the compact default)",
     "  --force (serve-stop: force kill the serve even when jobs are running)",
     "  --prior <text> (review: prior findings for anti-ratchet)",
-    "  --max-rounds <N> (chain: max rounds, default 4)",
+    "  --max-rounds <N> (chain: max rounds, default 2)",
     "  --chain-id <id> (chain / chain-detach: run the chain under this id instead of minting one — caller-owned: must be unique per concurrent dispatch. The id becomes a path segment under chains/, so it must match chain-[a-z0-9]+ and its directory must not already exist \u2014 a malformed id is refused before any filesystem write. chain-detach hands the SAME id back: the emitted wait line is `chain-wait <id>`, which waits for the chain by name \u2014 no --next, no --since, and no recency race with another orchestrator working the same repo)",
     "  --mission-file <path> (luna / luna-detach: the mission brief file; required. The mission brief is the outer brief — inner chains get their own brief from the coordinator's run_chain request)",
     "  --mission-id <id> (luna / luna-detach: run the mission under this id instead of minting one. The id becomes a path segment under missions/, so it must match mission-[a-z0-9]+. luna-detach hands the SAME id back: the emitted wait line is `luna-wait <id>`, which waits for the mission by name — no recency selection)",
