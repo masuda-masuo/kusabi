@@ -67,16 +67,14 @@ Then run `kusabi-companion setup` to verify the CLI and server come up.
 
 ## Phase agents
 
-kusabi ships 7 agent definitions (`plugins/kusabi/opencode-agents/`) that are automatically installed by `setup`:
+kusabi ships 5 agent definitions (`plugins/kusabi/opencode-agents/`) that are automatically installed by `setup`:
 
 | Agent | Phase role | Permission profile |
 |---|---|---|
-| `kusabi-draft` | Draft — research + issue creation | read-only + shiori + issue_write |
 | `kusabi-investigate` | investigate — deep dive, root cause | read-only + shiori + issue_write |
 | `kusabi-implement` | implement — code + verify | writes happen only via sunaba container tools (sunaba_edit_file/write_file); host bash/edit/write/patch and sunaba_copy_project/sunaba_copy_file **deny** |
 | `kusabi-review` | review — adversarial review | verify/lint/type_check **allow**, sandbox_exec/sandbox_write/issue_write/pr_review_write **deny** (deliverable is structured report, not issue comments) |
 | `kusabi-respond` | respond — address review findings | code write; issue_write **deny** |
-| `kusabi-salvage` | salvage — recover stalled / dead jobs | read-only + structured report |
 | `kusabi-gofer` | gofer — evidence-gathering errands | sandbox_exec + run_python + read/verify tools **allow**; host write/shiori/sunaba mutation **deny** |
 
 Run `kusabi-companion setup` or `kusabi-companion install-agents` to copy them to `OPENCODE_AGENT_DIR`. Legacy `oc-*` names are automatically cleaned up. The same command also copies kusabi's opencode skills (`plugins/kusabi/opencode-skills/`) to `OPENCODE_SKILL_DIR`, copy-and-overwrite only — the destination is never pruned. Both defaults follow opencode's own config dir (`$XDG_CONFIG_HOME/opencode`, else `~/.config/opencode`), which is where opencode actually scans. Note that `OPENCODE_SKILL_DIR` / `OPENCODE_AGENT_DIR` are placement overrides that opencode itself does not read (see `docs/design/phase-chain.md` §3.8).
@@ -109,7 +107,6 @@ Everything else is a companion subcommand, invoked directly as
 | `dashboard` | Read-only local HTML + JSON over the state root and metrics.db (default http://127.0.0.1:8752). How to read each signal: `docs/design/dashboard.md`. |
 | `serve-stop` | Stop the background opencode server and remove its state file; declines with running jobs unless `--force` |
 | `install-agents` | Copy phase agent definitions to `OPENCODE_AGENT_DIR` and opencode skills to `OPENCODE_SKILL_DIR` |
-| `salvage <job-id>` | Recover a dead/stalled job: reads its prompt + events, launches a salvage agent to produce a structured report |
 
 The `kusabi:opencode-worker` subagent forwards delegation requests to `task` so the main orchestrator thread never carries the work.
 

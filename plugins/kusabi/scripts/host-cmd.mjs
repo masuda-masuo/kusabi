@@ -2,12 +2,10 @@
 //
 // Extracted from kusabi-companion.mjs:
 // - cmdInstallAgents (with copyDirTree, opencodeConfigDir, destDirState)
-// - cmdSalvage
 //
 // IMPORT DIRECTION: Unlike chain-cmd.mjs, chain-ops.mjs, and task-cmd.mjs,
 // this module does NOT import kusabi-companion.mjs. It has no cycle with
-// companion: it calls only leaf modules (cli.mjs, render.mjs, state-paths.mjs,
-// job-store.mjs, prompt-execution.mjs).
+// companion: it calls only leaf modules (state-paths.mjs).
 //
 // This module does NOT import chain-driver.mjs, chain-cmd.mjs, chain-ops.mjs,
 // task-cmd.mjs, metrics-cmd.mjs, chain-phases.mjs, or chain-review.mjs.
@@ -18,11 +16,7 @@ import path from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
 
-import { parseModel } from "./cli.mjs";
-import { renderHeader } from "./render.mjs";
-import { stateDirFor, kusabiOpencodeConfigHome } from "./state-paths.mjs";
-import { jobDir, saveJob, loadJob } from "./job-store.mjs";
-import { runPrompt } from "./prompt-execution.mjs";
+import { kusabiOpencodeConfigHome } from "./state-paths.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const PLUGIN_ROOT = path.resolve(HERE, "..");
@@ -93,7 +87,16 @@ export function cmdInstallAgents() {
 
   fs.mkdirSync(dest, { recursive: true });
   // Remove stale legacy agent definitions from install target
-  const stale = ["oc-draft.md", "oc-investigate.md", "oc-implement.md", "oc-review.md", "oc-respond.md", "oc-salvage.md"];
+  const stale = [
+    "oc-draft.md",
+    "oc-investigate.md",
+    "oc-implement.md",
+    "oc-review.md",
+    "oc-respond.md",
+    "oc-salvage.md",
+    "kusabi-draft.md",
+    "kusabi-salvage.md",
+  ];
   let removed = 0;
   for (const f of stale) {
     const target = path.join(dest, f);
@@ -179,59 +182,4 @@ export function cmdInstallAgents() {
   }
 
   return lines.join("\n");
-}
-
-export async function cmdSalvage(cwd, { flags, text }) {
-  const deadJobId = text.split(/\s+/).filter(Boolean)[0];
-  if (!deadJobId) throw new Error("salvage requires a dead job ID");
-  const stateDir = stateDirFor(cwd);
-  const deadJob = loadJob(stateDir, deadJobId);
-  if (!deadJob) throw new Error(`no such job: ${deadJobId}`);
-
-  // read dead job artifacts
-  const deadDir = jobDir(stateDir, deadJobId);
-  const originalBrief = fs.readFileSync(path.join(deadDir, "prompt.md"), "utf8");
-  const eventsRaw = fs.readFileSync(path.join(deadDir, "events.ndjson"), "utf8")
-    .split("\n").filter(Boolean).slice(-50)
-    .map((l) => JSON.parse(l));
-
-  // build salvage prompt
-  const promptText = [
-    `## Dead job info`,
-    `- job ID: ${deadJob.id}`,
-    `- kind: ${deadJob.kind}`,
-    `- phase: ${deadJob.phase ?? "(none)"}`,
-    `- status: ${deadJob.status}`,
-    `- error: ${deadJob.error ?? "(none)"}`,
-    `- models used: ${(deadJob.stats?.models ?? []).join(", ") || "(none)"}`,
-    `- container ID: ${flags.container ?? "(not provided)"}`,
-    `- Original brief:`,
-    originalBrief,
-    `## Recent events (${eventsRaw.length} items)`,
-    eventsRaw.map((e) => JSON.stringify(e)).join("\n"),
-  ].join("\n\n");
-
-  const { job, resultText } = await runPrompt({
-    cwd,
-    kind: "salvage",
-    title: `salvage: ${deadJobId}`,
-    promptText,
-    agent: "kusabi-salvage",
-    phase: "salvage",
-    model: parseModel(flags.model),
-    tools: Object.fromEntries(
-      ["bash", "edit", "write", "patch", "task", "skill"].map((t) => [t, false])
-    ),
-    timeoutS: Number(flags.timeout ?? 600),
-    watchdogS: 0,
-  });
-
-  // record salvagedFrom
-  job.salvagedFrom = deadJobId;
-  saveJob(stateDir, job);
-
-  if (job.status !== "completed") {
-    return `${renderHeader(job)}${job.error ?? ""}`;
-  }
-  return `${renderHeader(job)}${resultText || "(empty report)"}`;
 }

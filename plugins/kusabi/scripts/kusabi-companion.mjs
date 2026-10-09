@@ -54,10 +54,10 @@ import {
   cmdMetricsReport,
   cmdDashboard,
 } from "./metrics-cmd.mjs";
-// host-cmd (kusabi #445): host maintenance command surfaces (install-agents,
-// salvage). Unlike chain-cmd, chain-ops, and task-cmd, host-cmd.mjs is NOT on
+// host-cmd (kusabi #445): host maintenance command surfaces (install-agents).
+// Unlike chain-cmd, chain-ops, and task-cmd, host-cmd.mjs is NOT on
 // a cycle with companion: it does not import companion.
-import { cmdInstallAgents, cmdSalvage } from "./host-cmd.mjs";
+import { cmdInstallAgents } from "./host-cmd.mjs";
 // job-control-cmd (split): the cancel / serve-stop command surfaces.
 import { cmdCancel, cmdServeStop } from "./job-control-cmd.mjs";
 // eval-cmd (split): the read-only `evaluation` replay surface.
@@ -274,13 +274,12 @@ function usage() {
     "  serve-stop Stop the background opencode server and remove its state file",
     "  install-agents  Copy phase agent definitions and skills to kusabi's opencode config dir (<state root>/opencode-config/opencode), or OPENCODE_AGENT_DIR / OPENCODE_SKILL_DIR",
     "  install-cli  Write a kusabi-companion shim to $KUSABI_BIN_DIR (default ~/.local/bin), and symlink the delegate / kusabi-result-handling skills into $KUSABI_CODEX_DIR/skills (default ~/.codex/skills) when that directory exists",
-    "  salvage    Salvage a dead job (inspect progress and produce structured report)",
     "  baseline   Report collected test count, gate states, and optional smoke baseline for a container (read-only, no LLM)",
     "  help       Show this help message",
     "",
     "Flags:",
     "  --read-only, --resume-last",
-    "  --base <ref> (review: branch diff base; task: diff base for --phase review --container, rejected elsewhere), --agent <id>, --phase <name> (draft|investigate|implement|review|respond|salvage|gofer|test-author|plan)",
+    "  --base <ref> (review: branch diff base; task: diff base for --phase review --container, rejected elsewhere), --agent <id>, --phase <name> (investigate|implement|review|respond|gofer|test-author|plan)",
     "  --backend opencode|claude|agy|codex (task/chain: force EVERY phase onto that backend; default opencode. Redundant when --model names a backend — a --backend that disagrees with such a --model is a contradiction and is rejected, naming both. With neither, the config chain entries decide: models.phases.<phase> (or models.chain) entries may carry a claude/, agy/, or codex/ prefix for per-phase backend mixing; one phase's chain must be single-backend. agy resumes via --conversation: --session/--resume-last are accepted when the job store proves the id an agy conversation, and --read-only/--deny are rejected on it. codex runs every invocation in a fixed read-only sandbox with reasoning effort high: --read-only is accepted, --deny is rejected, and the model must be one of the exact seat ids (" + formatCodexSupportedModels("or") + "). chain-resume accepts --backend/--model only to route a quota-exhausted review seat onto a different backend or model)",
     "  --session <id>, --timeout <s>, --watchdog <s>, --deny <tools>",
     "  --brief-file <path> (task / chain: read the brief from a file; exclusive with inline text)",
@@ -343,13 +342,12 @@ function usage() {
 // subcommand only reads or stops existing state.
 //   task         -> dispatchWithFallback (cmdTask)
 //   review       -> runPrompt            (cmdReview)
-//   salvage      -> runPrompt            (cmdSalvage)
 //   chain        -> dispatchWithFallback via runImplementPhase, per round (cmdChain)
 //   chain-resume -> same as chain, from a saved position (cmdChainResume)
 //   luna         -> runLunaMission (cmdLuna)
 //   luna-detach  -> spawns a detached luna child (cmdLunaDetach)
 //   luna-resume  -> resumes a mission's driver from saved state (cmdLunaResume)
-const JOB_CREATING_SUBCOMMANDS = new Set(["task", "review", "salvage", "chain", "chain-resume", "chainResume", "chain-detach", "chainDetach", "task-detach", "taskDetach", "luna", "luna-detach", "lunaDetach", "luna-resume", "lunaResume"]);
+const JOB_CREATING_SUBCOMMANDS = new Set(["task", "review", "chain", "chain-resume", "chainResume", "chain-detach", "chainDetach", "task-detach", "taskDetach", "luna", "luna-detach", "lunaDetach", "luna-resume", "lunaResume"]);
 
 async function main() {
   const [subcommand, ...argv] = process.argv.slice(2);
@@ -530,8 +528,6 @@ async function main() {
       return cmdInstallAgents();
     case "install-cli":
       return cmdInstallCli({ selfPath: COMPANION_SCRIPT });
-    case "salvage":
-      return cmdSalvage(cwd, parsed);
     case "baseline":
       return cmdBaseline(cwd, parsed);
     case "chain":
@@ -585,7 +581,7 @@ async function main() {
     case "dashboard":
       return cmdDashboard(cwd, parsed);
     default:
-      throw new Error(`unknown subcommand: ${subcommand ?? "(none)"}. Use setup|task|review|chain|baseline|chain-detach|task-detach|task-wait|chain-resume|chain-show|chain-wait|chain-stats|metrics-ingest|metrics-report|dashboard|chain-cancel|status|result|cancel|serve-stop|install-agents|install-cli|salvage|luna|luna-detach|luna-wait|luna-show|luna-cancel|luna-resume|evaluation`);
+      throw new Error(`unknown subcommand: ${subcommand ?? "(none)"}. Use setup|task|review|chain|baseline|chain-detach|task-detach|task-wait|chain-resume|chain-show|chain-wait|chain-stats|metrics-ingest|metrics-report|dashboard|chain-cancel|status|result|cancel|serve-stop|install-agents|install-cli|luna|luna-detach|luna-wait|luna-show|luna-cancel|luna-resume|evaluation`);
   }
 }
 

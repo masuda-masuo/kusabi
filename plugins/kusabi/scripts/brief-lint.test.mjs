@@ -33,9 +33,7 @@ describe("briefLintReport — Rule A: Smoke section required for implement (kusa
       "review",
       "test-author",
       "investigate",
-      "draft",
       "respond",
-      "salvage",
       "gofer",
     ];
     for (const phase of nonImplementPhases) {

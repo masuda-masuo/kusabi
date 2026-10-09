@@ -572,14 +572,14 @@ describe("resolveTaskPreflight phase guard (coordinate stays unknown until #530)
             { flags: { phase: "coordinate", container: "cid-1" }, text: BRIEF },
             { stateRoot },
           ),
-        /unknown phase: coordinate\. Use draft\|investigate\|implement\|review\|respond\|salvage\|gofer\|test-author\|plan/,
+        /unknown phase: coordinate\. Use investigate\|implement\|review\|respond\|gofer\|test-author\|plan/,
       );
     });
   });
 
   it("keeps accepting every ordinary worker phase", () => {
     withStateRoot(({ tmp, stateRoot }) => {
-      for (const phase of ["draft", "investigate", "implement", "review", "respond", "salvage", "gofer", "test-author", "plan"]) {
+      for (const phase of ["investigate", "implement", "review", "respond", "gofer", "test-author", "plan"]) {
         const pre = resolveTaskPreflight(
           tmp,
           { flags: { phase, container: "cid-1" }, text: BRIEF },
