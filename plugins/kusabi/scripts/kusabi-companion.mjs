@@ -45,14 +45,13 @@ import {
   DEFAULT_AUDITOR_SEAT,
 } from "./luna-cmd.mjs";
 // metrics-cmd (kusabi #443): the look-at-recorded-work command surfaces
-// (chain-stats, metrics-ingest, metrics-report, dashboard). Unlike chain-cmd,
+// (chain-stats, metrics-ingest, metrics-report). Unlike chain-cmd,
 // chain-ops, and task-cmd, metrics-cmd.mjs is NOT on a cycle with companion:
 // it does not import companion.
 import {
   cmdChainStats,
   cmdMetricsIngest,
   cmdMetricsReport,
-  cmdDashboard,
 } from "./metrics-cmd.mjs";
 // host-cmd (kusabi #445): host maintenance command surfaces (install-agents).
 // Unlike chain-cmd, chain-ops, and task-cmd, host-cmd.mjs is NOT on
@@ -266,7 +265,6 @@ function usage() {
     "  evaluation Replay a named luna mission or plain chain from durable records alone and report the replayed audit-gate results (read-only, no LLM, no dispatch): mission-* -> mission replay, chain-* -> plain-chain replay",
     "  metrics-ingest  Ingest transcripts + Codex usage + chain records + delegated-job records into a durable SQLite store (read-only source, no LLM)",
     "  metrics-report  Query/report over the SQLite metrics store (read-only, no LLM, never ingests)",
-    "  dashboard  Serve a read-only local JSON API over the state root and metrics.db (no LLM, no writes)",
     "  chain-cancel  Request a running chain to stop (file-based, works across processes)",
     "  status     List recent jobs or show one by ID",
     "  result     Show completed job result (latest, or by ID; --full for the full body)",
@@ -318,9 +316,6 @@ function usage() {
     "  --json (metrics-report: emit the report as one JSON document instead of text)",
     "  --sample-rate <0..1> (evaluation: deterministic T12 sampling rate for the replay; recorded policyInput.sampling always wins)",
     "  --salt <string> (evaluation: sampling salt for the replay, default v1)",
-    "  --port <N> (dashboard: listen port, default 8752; 0 binds an ephemeral port)",
-    "  --state-root <path> (dashboard: default the kusabi state root, ~/.kusabi)",
-    "  --db <path> (dashboard: default <state-root>/metrics.db)",
     "  -h, --help",
     "",
     "Unknown flags cause an error. Use -- to treat subsequent tokens as literal text.",
@@ -429,7 +424,7 @@ async function main() {
 
   // The luna mission flags (kusabi #530) are mission-creation decisions; on
   // any other subcommand they would be silently ignored — reject them out
-  // loud, exactly like --backend and --port above.  The value flags are
+  // loud, exactly like --backend above.  The value flags are
   // stored under their kebab keys, but the boolean --allow-substitute is
   // stored under the camelCase key parseArgs derives, so it is checked
   // separately.
@@ -483,7 +478,7 @@ async function main() {
 
   // The luna-resume audit-override flags (kusabi #531) are human-override
   // decisions; on any other subcommand they would be silently ignored —
-  // reject them out loud, exactly like --backend and --port above.
+  // reject them out loud, exactly like --backend above.
   if (
     subcommand !== "luna-resume" && subcommand !== "lunaResume" &&
     (parsed.flags["audit-override"] !== undefined ||
@@ -493,16 +488,12 @@ async function main() {
     throw new Error(`--audit-override* is only supported by luna-resume (got subcommand ${subcommand ?? "(none)"})`);
   }
 
-  if (parsed.flags.port !== undefined && subcommand !== "dashboard") {
-    throw new Error(`--port is only supported by dashboard (got subcommand ${subcommand ?? "(none)"})`);
-  }
-
   if (parsed.flags["state-root"] !== undefined) {
     const stateRootOk = new Set([
-      "metrics-ingest", "metricsIngest", "metrics-report", "metricsReport", "dashboard",
+      "metrics-ingest", "metricsIngest", "metrics-report", "metricsReport",
     ]);
     if (!stateRootOk.has(subcommand)) {
-      throw new Error(`--state-root is only supported by metrics-ingest, metrics-report and dashboard (got subcommand ${subcommand ?? "(none)"})`);
+      throw new Error(`--state-root is only supported by metrics-ingest and metrics-report (got subcommand ${subcommand ?? "(none)"})`);
     }
   }
 
@@ -578,10 +569,8 @@ async function main() {
     case "metrics-report":
     case "metricsReport":
       return cmdMetricsReport(cwd, parsed);
-    case "dashboard":
-      return cmdDashboard(cwd, parsed);
     default:
-      throw new Error(`unknown subcommand: ${subcommand ?? "(none)"}. Use setup|task|review|chain|baseline|chain-detach|task-detach|task-wait|chain-resume|chain-show|chain-wait|chain-stats|metrics-ingest|metrics-report|dashboard|chain-cancel|status|result|cancel|serve-stop|install-agents|install-cli|luna|luna-detach|luna-wait|luna-show|luna-cancel|luna-resume|evaluation`);
+      throw new Error(`unknown subcommand: ${subcommand ?? "(none)"}. Use setup|task|review|chain|baseline|chain-detach|task-detach|task-wait|chain-resume|chain-show|chain-wait|chain-stats|metrics-ingest|metrics-report|chain-cancel|status|result|cancel|serve-stop|install-agents|install-cli|luna|luna-detach|luna-wait|luna-show|luna-cancel|luna-resume|evaluation`);
   }
 }
 

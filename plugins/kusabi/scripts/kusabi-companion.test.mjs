@@ -4463,7 +4463,7 @@ describe("brief lint and container delivery (kusabi #289)", () => {
       try {
         const resultPort = run(["baseline", "cid-1", "--port", "8080"], tmp);
         assert.notEqual(resultPort.status, 0);
-        assert.match(resultPort.stdout, /--port is only supported by dashboard/);
+        assert.match(resultPort.stdout, /unknown flag: --port/);
 
         const resultBackend = run(["baseline", "cid-1", "--backend", "claude"], tmp);
         assert.notEqual(resultBackend.status, 0);

@@ -1,14 +1,13 @@
 // metrics-cmd: the look-at-recorded-work command surfaces (kusabi #443).
 //
-// Extracted from kusabi-companion.mjs: the inspection / reporting / dashboard
-// commands (cmdChainStats, cmdMetricsIngest, cmdMetricsReport, cmdDashboard)
-// and their helper (dashboardPortFlag).
+// Extracted from kusabi-companion.mjs: the inspection / reporting
+// commands (cmdChainStats, cmdMetricsIngest, cmdMetricsReport).
 //
 // IMPORT DIRECTION: Unlike chain-cmd.mjs, chain-ops.mjs, and task-cmd.mjs,
 // this module does NOT import kusabi-companion.mjs. It has no cycle with
 // companion: it calls only leaf modules (chain-stats.mjs, metrics-db.mjs,
 // transcript-ingest.mjs, codex-usage-ingest.mjs, chain-ingest.mjs,
-// metrics-report.mjs, dashboard.mjs, state-paths.mjs).
+// metrics-report.mjs, state-paths.mjs).
 //
 // This module does NOT import chain-driver.mjs, chain-cmd.mjs, chain-ops.mjs,
 // task-cmd.mjs, chain-phases.mjs, or chain-review.mjs.
@@ -36,7 +35,6 @@ import {
   renderReportJson,
   renderMissingText,
 } from "./metrics-render.mjs";
-import { startDashboard } from "./dashboard.mjs";
 
 // ---------------------------------------------------------------------------
 // chain-stats
@@ -256,31 +254,3 @@ export function cmdMetricsReport(cwd, { flags }) {
   }
 }
 
-export function dashboardPortFlag(flags, fallback = 8752) {
-  const raw = flags.port;
-  if (raw === undefined) return fallback;
-  const n = Number(raw);
-  if (!Number.isFinite(n) || !Number.isInteger(n) || n < 0 || n > 65535) {
-    throw new Error(`--port expects a TCP port number, got: ${raw}`);
-  }
-  return n;
-}
-
-export async function cmdDashboard(_cwd, { flags }) {
-  const root = flags["state-root"] || stateRoot();
-  const dbPath = flags.db || path.join(root, "metrics.db");
-  const port = dashboardPortFlag(flags);
-  const { server, port: bound } = await startDashboard({
-    stateRoot: root,
-    dbPath,
-    port,
-  });
-  const dbLabel = fs.existsSync(dbPath) ? dbPath : "missing";
-  process.stdout.write(
-    `dashboard: listening on http://127.0.0.1:${bound} (state root ${root}, db ${dbLabel})\n`,
-  );
-  await new Promise((resolve) => {
-    server.on("close", resolve);
-  });
-  return "";
-}
