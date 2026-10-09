@@ -8,8 +8,6 @@ import {
   cmdChainStats,
   cmdMetricsIngest,
   cmdMetricsReport,
-  dashboardPortFlag,
-  cmdDashboard,
 } from "./metrics-cmd.mjs";
 import { stateDirFor } from "./state-paths.mjs";
 
@@ -100,41 +98,6 @@ describe("metrics-cmd exports", () => {
     assert.equal(typeof cmdChainStats, "function");
     assert.equal(typeof cmdMetricsIngest, "function");
     assert.equal(typeof cmdMetricsReport, "function");
-    assert.equal(typeof dashboardPortFlag, "function");
-    assert.equal(typeof cmdDashboard, "function");
-  });
-});
-
-describe("dashboardPortFlag", () => {
-  it("returns fallback when port is undefined", () => {
-    assert.equal(dashboardPortFlag({}), 8752);
-    assert.equal(dashboardPortFlag({}, 9000), 9000);
-  });
-
-  it("parses valid port numbers and numeric strings", () => {
-    assert.equal(dashboardPortFlag({ port: 8080 }), 8080);
-    assert.equal(dashboardPortFlag({ port: "3000" }), 3000);
-    assert.equal(dashboardPortFlag({ port: 0 }), 0);
-    assert.equal(dashboardPortFlag({ port: 65535 }), 65535);
-  });
-
-  it("rejects invalid port values", () => {
-    assert.throws(
-      () => dashboardPortFlag({ port: -1 }),
-      /--port expects a TCP port number, got: -1/,
-    );
-    assert.throws(
-      () => dashboardPortFlag({ port: 65536 }),
-      /--port expects a TCP port number, got: 65536/,
-    );
-    assert.throws(
-      () => dashboardPortFlag({ port: 80.5 }),
-      /--port expects a TCP port number, got: 80.5/,
-    );
-    assert.throws(
-      () => dashboardPortFlag({ port: "abc" }),
-      /--port expects a TCP port number, got: abc/,
-    );
   });
 });
 

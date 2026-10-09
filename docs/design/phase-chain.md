@@ -1251,7 +1251,7 @@ rounds through the same path — it exits non-zero instead of running. The job-c
 `task`, `review`, `chain`, `chain-resume`, `chain-detach` (and alias
 `chainDetach`). Everything else (`status`, `result`, `cancel`, `serve-stop`,
 `chain-cancel`, `chain-show`, `chain-wait`, `chain-stats`, `metrics-ingest`,
-`metrics-report`, `dashboard`, `install-agents`, `install-cli`, `baseline`,
+`metrics-report`, `install-agents`, `install-cli`, `baseline`,
 `setup`, `help`) stays allowed — the guard is against *spawning* a job, not
 against reading or stopping one. The refusal message states both the reason
 and the alternative (a denial without an alternative pushes a confused
