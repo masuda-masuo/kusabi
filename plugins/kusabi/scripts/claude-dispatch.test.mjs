@@ -320,7 +320,7 @@ describe("disallowedToolsForAgent", () => {
   });
 
   it("denies issue write for every non-investigate agent (incl. review and no agent)", () => {
-    for (const agent of ["kusabi-review", null, undefined, "kusabi-draft"]) {
+    for (const agent of ["kusabi-review", null, undefined, "kusabi-implement"]) {
       assert.ok(
         disallowedToolsForAgent(agent).split(",").includes("mcp__sunaba__sandbox_issue_write"),
         `agent ${agent} must deny issue write`,
@@ -718,7 +718,7 @@ describe("allowedToolsForAgent", () => {
   });
 
   it("rejects agents with no v1 allowlist", () => {
-    assert.throws(() => allowedToolsForAgent("kusabi-draft"), /no permission allowlist/);
+    assert.throws(() => allowedToolsForAgent("unknown-agent"), /no permission allowlist/);
     assert.throws(() => allowedToolsForAgent("custom-agent"), /no permission allowlist/);
   });
 
@@ -796,7 +796,7 @@ describe("allowedToolsForAgent", () => {
   });
 
   it("no v1 allowlist still thrown for unknown agents (error text names test-author and plan)", () => {
-    assert.throws(() => allowedToolsForAgent("kusabi-draft"), /no permission allowlist/);
+    assert.throws(() => allowedToolsForAgent("unknown-agent"), /no permission allowlist/);
     assert.throws(() => allowedToolsForAgent("custom-agent"), /no permission allowlist/);
   });
 
@@ -914,7 +914,7 @@ describe("sunabaProfileForAgent", () => {
   });
 
   it("gives unknown agents NO profile (the full list is the safe default)", () => {
-    assert.equal(sunabaProfileForAgent("kusabi-draft"), null);
+    assert.equal(sunabaProfileForAgent("unknown-agent"), null);
     assert.equal(sunabaProfileForAgent("custom-agent"), null);
   });
 });
@@ -2509,7 +2509,7 @@ describe("claudeDispatch (fake claude binary)", () => {
 
   it("rejects an agent with no v1 allowlist", async () => {
     await assert.rejects(
-      () => claudeDispatch(ctx.dispatchOptions({ agent: "kusabi-draft" })),
+      () => claudeDispatch(ctx.dispatchOptions({ agent: "kusabi-gofer" })),
       /no permission allowlist/,
     );
   });
@@ -3846,7 +3846,7 @@ describe("resolveClaudeWriteWatchdog", () => {
 describe("writeWatchdogAppliesToPhase", () => {
   it("is armed for implement only — every read-shaped phase is exempt", () => {
     assert.equal(writeWatchdogAppliesToPhase("implement"), true);
-    for (const phase of ["review", "investigate", "draft", "respond", "salvage", "gofer", "strategize"]) {
+    for (const phase of ["review", "investigate", "respond", "gofer", "strategize"]) {
       assert.equal(writeWatchdogAppliesToPhase(phase), false, `${phase} must never trip the write watchdog`);
     }
   });

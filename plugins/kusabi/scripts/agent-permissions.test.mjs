@@ -22,7 +22,7 @@ import { patchEnv } from "./fixtures.mjs";
  *
  * @param {Record<string, string>} permission - Parsed permission mapping,
  *   e.g. { "*": "deny", "sunaba_read_file_range": "allow" }.
- * @param {string} roleName - Role name (e.g. "implement", "draft").
+ * @param {string} roleName - Role name (e.g. "implement", "investigate").
  * @returns {string[]} List of violation descriptions (empty = all clear).
  */
 export function checkAgentPermissions(permission, roleName) {
@@ -88,13 +88,13 @@ export function checkAgentPermissions(permission, roleName) {
     violations.push(`"sunaba_run_python" granted to "${roleName}", but only implement/respond/gofer may have it`);
   }
 
-  // 7. sunaba_sandbox_issue_write: exclusive to draft/investigate — both the
-  //    negative check (nobody else may have it) and the positive check (those
-  //    two MUST have it).
-  if ((roleName === "draft" || roleName === "investigate") && permission["sunaba_sandbox_issue_write"] !== "allow") {
-    violations.push(`"sunaba_sandbox_issue_write" missing from "${roleName}" (draft/investigate must have it)`);
-  } else if (permission["sunaba_sandbox_issue_write"] === "allow" && roleName !== "draft" && roleName !== "investigate") {
-    violations.push(`"sunaba_sandbox_issue_write" granted to "${roleName}", but only draft/investigate may have it`);
+  // 7. sunaba_sandbox_issue_write: exclusive to investigate — both the
+  //    negative check (nobody else may have it) and the positive check (investigate
+  //    MUST have it).
+  if (roleName === "investigate" && permission["sunaba_sandbox_issue_write"] !== "allow") {
+    violations.push(`"sunaba_sandbox_issue_write" missing from "${roleName}" (investigate must have it)`);
+  } else if (permission["sunaba_sandbox_issue_write"] === "allow" && roleName !== "investigate") {
+    violations.push(`"sunaba_sandbox_issue_write" granted to "${roleName}", but only investigate may have it`);
   }
 
   // 8. kaiba permissions (kusabi #279, #391): `kaiba_recall`,
@@ -193,7 +193,7 @@ export function parseFrontmatter(content) {
   return result;
 }
 /**
- * Derive role name from a file path like "kusabi-draft.md".
+ * Derive role name from a file path like "kusabi-implement.md".
  *
  * @param {string} filePath - Absolute or relative file path.
  * @returns {string}
@@ -396,22 +396,6 @@ describe("agent permission allowlists", () => {
       assert.ok(violations.some(v => v.includes("sunaba_sandbox_issue_write")));
     });
 
-    it('"sunaba_sandbox_issue_write" on draft passes', () => {
-      const violations = checkAgentPermissions(
-        {
-          "*": "deny",
-          "sunaba_read_file_range": "allow",
-          "sunaba_search_in_container": "allow",
-          "sunaba_list_files": "allow",
-          "sunaba_diff_in_container": "allow",
-          "sunaba_issue_view": "allow",
-          "sunaba_sandbox_issue_write": "allow",
-        },
-        "draft",
-      );
-      assert.deepEqual(violations, []);
-    });
-
     it('"sunaba_sandbox_issue_write" on investigate passes', () => {
       const violations = checkAgentPermissions(
         {
@@ -509,21 +493,6 @@ describe("agent permission allowlists", () => {
         "respond",
       );
       assert.ok(violations.some(v => v.includes("sunaba_run_python") && v.includes("missing")));
-    });
-
-    it("draft missing sunaba_sandbox_issue_write", () => {
-      const violations = checkAgentPermissions(
-        {
-          "*": "deny",
-          "sunaba_read_file_range": "allow",
-          "sunaba_search_in_container": "allow",
-          "sunaba_list_files": "allow",
-          "sunaba_diff_in_container": "allow",
-          "sunaba_issue_view": "allow",
-        },
-        "draft",
-      );
-      assert.ok(violations.some(v => v.includes("sunaba_sandbox_issue_write") && v.includes("missing")));
     });
 
     it("investigate missing sunaba_sandbox_issue_write", () => {

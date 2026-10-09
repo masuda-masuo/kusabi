@@ -6,7 +6,6 @@ import os from "node:os";
 
 import {
   cmdInstallAgents,
-  cmdSalvage,
 } from "./host-cmd.mjs";
 
 describe("host-cmd extraction invariants (kusabi #445)", () => {
@@ -97,32 +96,6 @@ describe("host-cmd extraction invariants (kusabi #445)", () => {
 describe("host-cmd exports", () => {
   it("exports all expected command functions", () => {
     assert.equal(typeof cmdInstallAgents, "function");
-    assert.equal(typeof cmdSalvage, "function");
-  });
-});
-
-describe("cmdSalvage validation", () => {
-  it("requires dead job ID", async () => {
-    await assert.rejects(
-      () => cmdSalvage("/workspace", { flags: {}, text: "" }),
-      /salvage requires a dead job ID/,
-    );
-    await assert.rejects(
-      () => cmdSalvage("/workspace", { flags: {}, text: "   " }),
-      /salvage requires a dead job ID/,
-    );
-  });
-
-  it("throws when job is not found", async () => {
-    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-salvage-test-"));
-    try {
-      await assert.rejects(
-        () => cmdSalvage(tmpDir, { flags: {}, text: "non-existent-job-123" }),
-        /no such job: non-existent-job-123/,
-      );
-    } finally {
-      fs.rmSync(tmpDir, { recursive: true, force: true });
-    }
   });
 });
 
@@ -203,6 +176,16 @@ describe("cmdInstallAgents", () => {
     assert.match(msg, /they are no longer read by kusabi's serve and may be removed by hand/);
     assert.ok(fs.existsSync(path.join(personalAgentDir, "kusabi-implement.md")), "personal file not deleted");
     assert.ok(fs.existsSync(path.join(personalAgentDir, "kusabi-review.md")), "personal file 2 not deleted");
+  });
+
+  it("removes stale kusabi-draft.md and kusabi-salvage.md from install target", () => {
+    const kusabiAgentDir = path.join(tmpStateDir, "opencode-config", "opencode", "agent");
+    fs.mkdirSync(kusabiAgentDir, { recursive: true });
+    fs.writeFileSync(path.join(kusabiAgentDir, "kusabi-draft.md"), "stale draft");
+    fs.writeFileSync(path.join(kusabiAgentDir, "kusabi-salvage.md"), "stale salvage");
+    cmdInstallAgents();
+    assert.ok(!fs.existsSync(path.join(kusabiAgentDir, "kusabi-draft.md")), "kusabi-draft.md unlinked");
+    assert.ok(!fs.existsSync(path.join(kusabiAgentDir, "kusabi-salvage.md")), "kusabi-salvage.md unlinked");
   });
 });
 

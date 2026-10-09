@@ -2255,7 +2255,7 @@ describe("finishedUnknownSignal", () => {
 
 describe("phaseRequiresOutput", () => {
   it("write-producing phases require output", () => {
-    for (const phase of ["implement", "test-author", "investigate", "gofer", "draft", "respond", "salvage", null]) {
+    for (const phase of ["implement", "test-author", "investigate", "gofer", "respond", null]) {
       assert.equal(phaseRequiresOutput(phase, "task"), true, `phase=${phase}`);
     }
   });

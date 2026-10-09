@@ -456,8 +456,8 @@ describe("resolveOrchestratorRecord (kusabi #227)", () => {
 // ---------------------------------------------------------------------------
 
 describe("PHASE_AGENTS", () => {
-  it("contains 9 entries", () => {
-    assert.equal(Object.keys(PHASE_AGENTS).length, 9);
+  it("contains 7 entries", () => {
+    assert.equal(Object.keys(PHASE_AGENTS).length, 7);
   });
 
   it("maps gofer to kusabi-gofer", () => {
@@ -465,12 +465,10 @@ describe("PHASE_AGENTS", () => {
   });
 
   it("maps all known phases", () => {
-    assert.equal(PHASE_AGENTS.draft, "kusabi-draft");
     assert.equal(PHASE_AGENTS.investigate, "kusabi-investigate");
     assert.equal(PHASE_AGENTS.implement, "kusabi-implement");
     assert.equal(PHASE_AGENTS.review, "kusabi-review");
     assert.equal(PHASE_AGENTS.respond, "kusabi-respond");
-    assert.equal(PHASE_AGENTS.salvage, "kusabi-salvage");
     assert.equal(PHASE_AGENTS["test-author"], "kusabi-test-author");
     assert.equal(PHASE_AGENTS.plan, "kusabi-plan");
   });
@@ -596,10 +594,10 @@ describe("worker-context guard (KUSABI_WORKER_CONTEXT)", () => {
     assert.match(result.stdout, /worker context/i);
   });
 
-  it("refuses salvage under the marker with a non-zero exit", () => {
-    const result = runCompanion(["salvage", "job-does-not-exist"], { workerContext: true });
+  it("salvage is an unknown subcommand", () => {
+    const result = runCompanion(["salvage", "job-does-not-exist"]);
     assert.notEqual(result.status, 0);
-    assert.match(result.stdout, /worker context/i);
+    assert.match(result.stdout, /unknown subcommand: salvage/);
   });
 
   it("refuses chain under the marker with a non-zero exit", () => {
@@ -3559,7 +3557,7 @@ describe("brief lint and container delivery (kusabi #289)", () => {
 
     it("refuses a brief with no signature line, for every phase", () => {
       const brief = `# Task\n\n${DELIVERABLES}\n## Workplace\n\nContainer \`cid-1\`.\n`;
-      for (const phase of ["draft", "investigate", "implement", "review", "respond", "salvage", "gofer"]) {
+      for (const phase of ["investigate", "implement", "review", "respond", "gofer"]) {
         const report = briefLintReport({ brief, phase, container: "cid-1" });
         assert.ok(report, `${phase} must be refused`);
         assert.ok(
@@ -3572,7 +3570,7 @@ describe("brief lint and container delivery (kusabi #289)", () => {
     it("adds nothing but the signature line to the non-implement phases", () => {
       // Non-goal of #289: investigate/review/... keep the brief requirements
       // they already had.  No Deliverables, no Workplace, no container.
-      for (const phase of ["draft", "investigate", "review", "respond", "salvage", "gofer"]) {
+      for (const phase of ["investigate", "review", "respond", "gofer"]) {
         assert.equal(
           briefLintReport({ brief: `# Task\n\n${SIGNATURE}\n\nLook into it.\n`, phase, container: null }),
           null,
@@ -3702,7 +3700,7 @@ describe("brief lint and container delivery (kusabi #289)", () => {
       const brief = `# Task\n\n${SIGNATURE}\n\n${DELIVERABLES}`;
       assert.match(briefLintReport({ brief, phase: "implement", container: "cid-1" }), /## Smoke/);
       assert.match(briefLintReport({ brief, container: "cid-1", chain: true }), /## Smoke/);
-      for (const phase of ["draft", "investigate", "review", "respond", "salvage", "gofer"]) {
+      for (const phase of ["investigate", "review", "respond", "gofer"]) {
         assert.equal(
           briefLintReport({ brief: `# Task\n\n${SIGNATURE}\n\nLook into it.\n`, phase, container: null }),
           null,
@@ -5362,6 +5360,38 @@ describe("result command compact/default vs --full (kusabi #478)", () => {
     assert.equal(res.status, 0, `expected parser acceptance, got: ${res.stderr}`);
     assert.match(res.stdout, /no such job/);
     assert.doesNotMatch(res.stdout, /unknown flag/);
+  });
+
+  it("renders a stored job record with phase salvage in status and result (#670)", () => {
+    const jobId = "job-salvage-stored";
+    const jobDirectory = path.join(workspaceStateDir, "jobs", jobId);
+    fs.mkdirSync(jobDirectory, { recursive: true });
+    fs.writeFileSync(
+      path.join(jobDirectory, "job.json"),
+      JSON.stringify({
+        id: jobId,
+        kind: "salvage",
+        phase: "salvage",
+        status: "completed",
+        title: "salvage: dead-job-123",
+        salvagedFrom: "dead-job-123",
+        startedAt: "2026-09-01T00:00:00.000Z",
+        finishedAt: "2026-09-01T00:05:00.000Z",
+      }),
+      "utf8",
+    );
+    fs.writeFileSync(path.join(jobDirectory, "result.md"), "# Salvage Report\nEverything recovered\n", "utf8");
+
+    const statusRes = runCompanion(["status", jobId]);
+    assert.equal(statusRes.status, 0, statusRes.stderr);
+    assert.match(statusRes.stdout, /job-salvage-stored/);
+    assert.match(statusRes.stdout, /phase:\s*salvage/);
+
+    const resultRes = runCompanion(["result", jobId]);
+    assert.equal(resultRes.status, 0, resultRes.stderr);
+    assert.match(resultRes.stdout, /job-salvage-stored/);
+    assert.match(resultRes.stdout, /phase:\s*salvage/);
+    assert.match(resultRes.stdout, /Everything recovered/);
   });
 });
 

@@ -10,7 +10,6 @@ Long sessions cause context pollution, so work is split into phases, with **each
 
 | Phase | Role | shiori | Code write | issue_write |
 |---|---|---|---|---|
-| Draft | Duplicate check (horizontal) + issue creation | ○ | ✕ | ○ (artifact) |
 | investigate | Deep issue dive, root cause identification | ○ | ✕ | ○ (brief appendix) |
 | implement | Implementation + verify based on brief | ✕ | ○ | ✕ |
 | review | Adversarial review of PR | ○ | ✕ | ✕ |
@@ -1249,7 +1248,7 @@ companion's CLI entry (`main()` in `kusabi-companion.mjs`) checks the marker
 before dispatch: if set and the subcommand is **job-creating** — reaches
 `runPrompt`/`dispatchWithFallback`, or starts a chain, which dispatches
 rounds through the same path — it exits non-zero instead of running. The job-creating set, enumerated from the dispatch table rather than guessed:
-`task`, `review`, `salvage`, `chain`, `chain-resume`, `chain-detach` (and alias
+`task`, `review`, `chain`, `chain-resume`, `chain-detach` (and alias
 `chainDetach`). Everything else (`status`, `result`, `cancel`, `serve-stop`,
 `chain-cancel`, `chain-show`, `chain-wait`, `chain-stats`, `metrics-ingest`,
 `metrics-report`, `dashboard`, `install-agents`, `install-cli`, `baseline`,
