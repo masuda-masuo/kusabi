@@ -12,6 +12,10 @@ import {
   renderProviderExhaustedOutcome,
   handleProviderExhaustion,
 } from "./chain-outcomes.mjs";
+import {
+  roundDiscardReason,
+  roundChangedColumn,
+} from "./render.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const PLUGIN_ROOT = path.resolve(HERE, "..");
@@ -140,66 +144,79 @@ describe("renderEscalateOutcome", () => {
   // round's worktreeChanged makes false BY CONSTRUCTION, so the column states
   // the recorded dirty-vs-base fact instead of a bare NO).
 
-  it("probe-discarded round: first line states the probe-discard wording, never the reviewer's", () => {
+  function buildDiscardFixture({
+    roundRecord: roundRecordOverrides = {},
+    record: recordOverrides = {},
+    records = null,
+    dispositionReason = "reviewer discarded the work",
+  } = {}) {
     const roundRecord = {
       findingsText: "issue",
       verdict: "discard",
-      verdictSource: "probe",
-      worktreeDirtyVsBase: true,
+      ...roundRecordOverrides,
     };
-    const records = [
-      { resumeMethod: { type: "continue_session" }, modelEntry: "test/gpt-4", verdict: "discard", verdictSource: "probe", worktreeDirtyVsBase: true, worktreeChanged: false, probesGreen: true },
+    const recs = records ?? [
+      {
+        resumeMethod: { type: "continue_session" },
+        modelEntry: "test/gpt-4",
+        verdict: "discard",
+        worktreeChanged: false,
+        probesGreen: true,
+        ...roundRecordOverrides,
+        ...recordOverrides,
+      },
     ];
-    const disposition = { disposition: "escalate", reason: "reviewer discarded the work" };
+    return {
+      roundRecord,
+      records: recs,
+      disposition: { disposition: "escalate", reason: dispositionReason },
+    };
+  }
+
+  const discardCases = {
+    probeDirty: buildDiscardFixture({
+      roundRecord: { verdictSource: "probe", worktreeDirtyVsBase: true },
+      record: { verdictSource: "probe", worktreeDirtyVsBase: false },
+    }),
+    probeDirtyMulti: buildDiscardFixture({
+      roundRecord: { verdictSource: "probe", worktreeDirtyVsBase: null },
+      records: [
+        { resumeMethod: { type: "continue_session" }, modelEntry: "test/gpt-4", verdict: "discard", verdictSource: "probe", worktreeDirtyVsBase: true, worktreeChanged: false, probesGreen: true },
+        { resumeMethod: { type: "fresh_session", detail: "retry" }, modelEntry: "test/gpt-4o", verdict: "discard", verdictSource: "probe", worktreeDirtyVsBase: false, worktreeChanged: false, probesGreen: true },
+      ],
+    }),
+    probeClean: buildDiscardFixture({
+      roundRecord: { verdictSource: "probe", worktreeDirtyVsBase: false },
+    }),
+    reviewer: buildDiscardFixture(),
+  };
+
+  it("probe-discarded round: first line states the probe-discard wording, never the reviewer's", () => {
+    const { roundRecord, records, disposition } = discardCases.probeDirty;
     const result = renderEscalateOutcome({ chainId, round: 1, disposition, orchestrator: null, roundRecord, records });
-    assert.ok(result.includes("Chain chain-esc789 escalated at round 1: empty round discarded by probe; worktree still DIRTY vs the chain base"));
-    assert.doesNotMatch(result, /reviewer discarded the work/);
+    assert.ok(result.includes(`Chain ${chainId} escalated at round 1: ${roundDiscardReason(roundRecord, disposition.reason)}`));
+    assert.doesNotMatch(result, new RegExp(disposition.reason));
   });
 
   it("probe-discarded round: the changed flag states dirty-vs-base, not a bare NO", () => {
-    const roundRecord = {
-      findingsText: "issue",
-      verdict: "discard",
-      verdictSource: "probe",
-      worktreeDirtyVsBase: true,
-    };
-    const records = [
-      { resumeMethod: { type: "continue_session" }, modelEntry: "test/gpt-4", verdict: "discard", verdictSource: "probe", worktreeDirtyVsBase: true, worktreeChanged: false, probesGreen: true },
-    ];
-    const disposition = { disposition: "escalate", reason: "reviewer discarded the work" };
-    const result = renderEscalateOutcome({ chainId, round: 1, disposition, orchestrator: null, roundRecord, records });
-    assert.ok(result.includes("Round 1: model=test/gpt-4, verdict=discard, probesGreen=true, changed=NO (worktree DIRTY vs chain base), resume=continue_session"));
+    const { roundRecord, records, disposition } = discardCases.probeDirtyMulti;
+    const result = renderEscalateOutcome({ chainId, round: 2, disposition, orchestrator: null, roundRecord, records });
+    assert.ok(result.includes(`Round 1: model=test/gpt-4, verdict=discard, probesGreen=true, changed=${roundChangedColumn(records[0])}, resume=continue_session`));
+    assert.ok(result.includes(`Round 2: model=test/gpt-4o, verdict=discard, probesGreen=true, changed=${roundChangedColumn(records[1])}, resume=fresh_session: retry`));
   });
 
   it("probe-discarded round on a clean tree: first line and changed flag say CLEAN", () => {
-    const roundRecord = {
-      findingsText: "issue",
-      verdict: "discard",
-      verdictSource: "probe",
-      worktreeDirtyVsBase: false,
-    };
-    const records = [
-      { resumeMethod: { type: "continue_session" }, modelEntry: "test/gpt-4", verdict: "discard", verdictSource: "probe", worktreeDirtyVsBase: false, worktreeChanged: false, probesGreen: true },
-    ];
-    const disposition = { disposition: "escalate", reason: "reviewer discarded the work" };
+    const { roundRecord, records, disposition } = discardCases.probeClean;
     const result = renderEscalateOutcome({ chainId, round: 1, disposition, orchestrator: null, roundRecord, records });
-    assert.ok(result.includes("Chain chain-esc789 escalated at round 1: empty round discarded by probe; worktree CLEAN vs the chain base"));
-    assert.ok(result.includes("changed=NO (worktree CLEAN vs chain base), resume=continue_session"));
+    assert.ok(result.includes(`Chain ${chainId} escalated at round 1: ${roundDiscardReason(roundRecord, disposition.reason)}`));
+    assert.ok(result.includes(`changed=${roundChangedColumn(records[0])}, resume=continue_session`));
   });
 
   it("a reviewer-verdict discard keeps the recorded reason and a bare changed=NO", () => {
-    const roundRecord = {
-      findingsText: "issue",
-      verdict: "discard",
-      worktreeChanged: false,
-    };
-    const records = [
-      { resumeMethod: { type: "continue_session" }, modelEntry: "test/gpt-4", verdict: "discard", worktreeChanged: false, probesGreen: true },
-    ];
-    const disposition = { disposition: "escalate", reason: "reviewer discarded the work" };
+    const { roundRecord, records, disposition } = discardCases.reviewer;
     const result = renderEscalateOutcome({ chainId, round: 1, disposition, orchestrator: null, roundRecord, records });
-    assert.ok(result.includes("Chain chain-esc789 escalated at round 1: reviewer discarded the work"));
-    assert.ok(result.includes("changed=NO, resume=continue_session"));
+    assert.ok(result.includes(`Chain ${chainId} escalated at round 1: ${roundDiscardReason(roundRecord, disposition.reason)}`));
+    assert.ok(result.includes(`changed=${roundChangedColumn(records[0])}, resume=continue_session`));
   });
 
   // ---- kusabi #336: the escalate handover carries the decisions, not just a
@@ -299,7 +316,7 @@ describe("renderMaxRoundsOutcome", () => {
       { resumeMethod: { type: "continue_session" }, modelEntry: "test/gpt-4", verdict: "discard", verdictSource: "probe", worktreeDirtyVsBase: true, worktreeChanged: false, probesGreen: true },
     ];
     const result = renderMaxRoundsOutcome({ chainId, maxRounds: 1, records, orchestrator: null });
-    assert.ok(result.includes("Round 1: model=test/gpt-4, verdict=discard, probesGreen=true, changed=NO (worktree DIRTY vs chain base), resume=continue_session"));
+    assert.ok(result.includes(`Round 1: model=test/gpt-4, verdict=discard, probesGreen=true, changed=${roundChangedColumn(records[0])}, resume=continue_session`));
   });
 });
 
