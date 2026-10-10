@@ -36,11 +36,29 @@ describe("openMetricsDb", () => {
     }
   });
 
-  it("is safe to call twice against the same path (CREATE TABLE IF NOT EXISTS)", () => {
+  it("is safe to re-execute CREATE TABLE IF NOT EXISTS for source_file on the existing in-memory handle", () => {
     const db = openMetricsDb(":memory:");
     assert.doesNotThrow(() => {
       db.exec("CREATE TABLE IF NOT EXISTS source_file (path TEXT PRIMARY KEY, size INTEGER, mtime_ms REAL, ingested_at TEXT)");
     });
+  });
+
+  it("is idempotent when reopening a current-schema file-backed database", () => {
+    const dbPath = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-reopen-test-")), "metrics.db");
+    let db1, db2;
+    try {
+      db1 = openMetricsDb(dbPath);
+      const schema = db1.prepare("SELECT type, name, sql FROM sqlite_master ORDER BY type, name").all();
+      assert.ok(schema.length > 0);
+      db1.close();
+      db1 = null;
+      assert.doesNotThrow(() => { db2 = openMetricsDb(dbPath); });
+      assert.deepEqual(db2.prepare("SELECT type, name, sql FROM sqlite_master ORDER BY type, name").all(), schema);
+    } finally {
+      try { db1?.close(); } catch { /* ignore */ }
+      try { db2?.close(); } catch { /* ignore */ }
+      fs.rmSync(path.dirname(dbPath), { recursive: true, force: true });
+    }
   });
 });
 
@@ -249,13 +267,6 @@ describe("finding.source migration on a pre-existing database file", () => {
 
     fs.rmSync(path.dirname(dbPath), { recursive: true, force: true });
   });
-
-  it("openMetricsDb is idempotent on a database that already has the source column", () => {
-    const dbPath = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-migrate-test-")), "metrics.db");
-    openMetricsDb(dbPath); // creates fresh, already has source
-    assert.doesNotThrow(() => openMetricsDb(dbPath)); // re-open must not fail trying to re-add the column
-    fs.rmSync(path.dirname(dbPath), { recursive: true, force: true });
-  });
 });
 
 describe("round.worktree_changed migration (kusabi #165)", () => {
@@ -311,13 +322,6 @@ describe("round.worktree_changed migration (kusabi #165)", () => {
     const newRow = db.prepare("SELECT worktree_changed FROM round WHERE chain_id = ?").get("chain-new");
     assert.equal(newRow.worktree_changed, 0);
 
-    fs.rmSync(path.dirname(dbPath), { recursive: true, force: true });
-  });
-
-  it("openMetricsDb is idempotent on a database that already has the column", () => {
-    const dbPath = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-migrate-test-")), "metrics.db");
-    openMetricsDb(dbPath);
-    assert.doesNotThrow(() => openMetricsDb(dbPath));
     fs.rmSync(path.dirname(dbPath), { recursive: true, force: true });
   });
 });
@@ -515,13 +519,6 @@ describe("chain/round/job backend migration (kusabi #184 Job C)", () => {
     const newJob = db.prepare("SELECT backend FROM job WHERE job_id = ?").get("job-new");
     assert.equal(newJob.backend, "opencode");
 
-    fs.rmSync(path.dirname(dbPath), { recursive: true, force: true });
-  });
-
-  it("openMetricsDb is idempotent on a database that already has the backend columns", () => {
-    const dbPath = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-migrate-test-")), "metrics.db");
-    openMetricsDb(dbPath);
-    assert.doesNotThrow(() => openMetricsDb(dbPath));
     fs.rmSync(path.dirname(dbPath), { recursive: true, force: true });
   });
 
