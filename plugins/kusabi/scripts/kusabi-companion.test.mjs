@@ -4460,25 +4460,123 @@ describe("brief lint and container delivery (kusabi #289)", () => {
     });
   });
 
-  describe("wiring (source guards)", () => {
-    // cmdTask lives in task-cmd.mjs (kusabi #437); these pin the two orderings the change is
-    // about, the way the #204 review-input wiring test does.
-    const taskCmdSource = fs.readFileSync(path.join(import.meta.dirname, "task-cmd.mjs"), "utf8");
-    const cmdTaskSource = taskCmdSource.slice(
-      taskCmdSource.indexOf("async function cmdTask("),
-      taskCmdSource.indexOf("async function cmdReview("),
-    );
+  describe("wiring (caller observations)", () => {
+    const taskCwd = process.cwd();
+    const containerId = "cid-737";
+    const changedPath = "plugins/kusabi/scripts/kusabi-companion.test.mjs";
+    const headSha = "7370000000000000000000000000000000000000";
 
-    it("cmdTask prefixes the dispatched prompt with the container workspace header", () => {
-      assert.ok(cmdTaskSource.includes("withContainerWorkspace(taskPromptText, flags.container)"));
-      assert.ok(cmdTaskSource.includes("promptText: taskPromptText"));
+    function makeCmdTaskHarness() {
+      const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-737-cmdtask-"));
+      const previousStateDir = process.env.KUSABI_STATE_DIR;
+      process.env.KUSABI_STATE_DIR = path.join(tmp, "state");
+      const events = [];
+      const fakeJob = {
+        id: "job-task-737",
+        status: "completed",
+        error: null,
+      };
+      const callTool = async (tool, params = {}) => {
+        const command = params?.commands?.[0] ?? params?.argv?.join(" ") ?? "";
+        events.push({ kind: "tool", tool, containerId: params.container_id, command });
+        if (tool === "verify_in_container") {
+          return {
+            gate_passed: true,
+            status: "ok",
+            tests: { full: { status: "ok", passed: 1, total: 1 } },
+            lint: [],
+            types: [],
+          };
+        }
+        if (command === "git rev-parse HEAD") return { output: headSha + "\n" };
+        if (command === "git status --porcelain") return { output: " M " + changedPath + "\n" };
+        if (command.includes("SMOKE_EXIT=")) return { output: "SMOKE_EXIT=0\n" };
+        return { output: "" };
+      };
+      const dispatch = async (args) => {
+        events.push({ kind: "dispatch", args });
+        return { job: fakeJob, resultText: "task complete" };
+      };
+      const run = (text) => cmdTask(
+        taskCwd,
+        { flags: { phase: "implement", container: containerId }, text, _dispatch: dispatch },
+        { callTool },
+      );
+      return {
+        events,
+        fakeJob,
+        run,
+        async close() {
+          if (previousStateDir === undefined) delete process.env.KUSABI_STATE_DIR;
+          else process.env.KUSABI_STATE_DIR = previousStateDir;
+          fs.rmSync(tmp, { recursive: true, force: true });
+        },
+      };
+    }
+
+    function validCallerBrief() {
+      return [
+        "# Task", "", SIGNATURE, "",
+        "## Deliverables", "", "- `" + changedPath + "`", "",
+        "## Smoke", "", "- `node --version`", "",
+        "## Workplace", "", "Use the supplied container.", "",
+        "## Acceptance criteria", "", "- The task completes with green probes.", "",
+      ].join("\n");
+    }
+
+    it("cmdTask prefixes the dispatched prompt with the container workspace header", async () => {
+      const harness = makeCmdTaskHarness();
+      try {
+        const result = await harness.run(validCallerBrief());
+        const dispatchEvents = harness.events.filter((event) => event.kind === "dispatch");
+        assert.equal(result.exitCode, 0, result.text);
+        assert.equal(harness.fakeJob.probesGreen, true, "the completed task must have green actual probes");
+        assert.equal(dispatchEvents.length, 1, "cmdTask must dispatch exactly once");
+        const dispatched = dispatchEvents[0].args;
+        assert.ok(dispatched.promptText.startsWith("The workspace lives inside container `cid-737`."));
+        assert.ok(dispatched.promptText.includes("<task>\n" + validCallerBrief() + "\n</task>"));
+        assert.equal(dispatched.kind, "task");
+        const toolEvents = harness.events.filter((event) => event.kind === "tool");
+        assert.ok(toolEvents.length > 0, "successful container I/O must be observed");
+        assert.ok(toolEvents.every((event) => event.containerId === "cid-737"), JSON.stringify(toolEvents));
+        const dispatchIndex = harness.events.findIndex((event) => event.kind === "dispatch");
+        assert.ok(harness.events.slice(0, dispatchIndex).some((event) => event.kind === "tool"), "container I/O must precede dispatch");
+        assert.ok(toolEvents.some((event) => event.command === "git rev-parse HEAD"), JSON.stringify(toolEvents));
+        assert.ok(toolEvents.some((event) => event.command === "git status --porcelain"), JSON.stringify(toolEvents));
+        assert.ok(harness.fakeJob.probeResults.some((probe) => probe.probe === "P2: verify gate" && probe.passed));
+      } finally {
+        await harness.close();
+      }
     });
 
-    it("cmdTask lints before it reads the container and before it dispatches", () => {
-      const lintAt = cmdTaskSource.indexOf("briefLintReport(");
-      assert.ok(lintAt > 0, "cmdTask must call the lint");
-      assert.ok(lintAt < cmdTaskSource.indexOf("let taskBaseSha"), "the lint precedes the container read");
-      assert.ok(lintAt < cmdTaskSource.indexOf("await dispatch({"), "the lint precedes the dispatch");
+    it("cmdTask lints before it reads the container and before it dispatches", async () => {
+      const harness = makeCmdTaskHarness();
+      try {
+        const missingDeliverables = [
+          "# Task", "", SIGNATURE, "",
+          "## Smoke", "", "- `node --version`", "",
+          "## Workplace", "", "Use the supplied container.", "",
+          "## Acceptance criteria", "", "- The task completes with green probes.", "",
+        ].join("\n");
+        await assert.rejects(
+          harness.run(missingDeliverables),
+          (error) => {
+            assert.match(error.message, /brief rejected before dispatch/);
+            assert.match(error.message, /## Deliverables/);
+            return true;
+          },
+        );
+        assert.deepEqual(harness.events, [], "lint refusal must happen before all container calls and dispatch");
+
+        const control = await harness.run(validCallerBrief());
+        assert.equal(control.exitCode, 0, control.text);
+        assert.equal(harness.fakeJob.probesGreen, true, "valid control must complete with green probes");
+        const dispatchEvents = harness.events.filter((event) => event.kind === "dispatch");
+        assert.equal(dispatchEvents.length, 1, "valid control must dispatch exactly once");
+        assert.ok(harness.events.some((event) => event.kind === "tool"), "valid control must perform container I/O");
+      } finally {
+        await harness.close();
+      }
     });
 
     it("the chain lifecycle lints before any chain state exists", () => {
