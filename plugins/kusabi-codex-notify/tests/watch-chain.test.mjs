@@ -72,6 +72,65 @@ import * as registerWatchApi from "../scripts/register-watch.mjs";
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const REGISTER_SCRIPT = path.join(__dirname, "..", "scripts", "register-watch.mjs");
 
+function readQueueInvocations(queueLogDir) {
+  try {
+    const files = fs.readdirSync(queueLogDir);
+    const invocations = [];
+    for (const file of files) {
+      if (file.endsWith(".json")) {
+        invocations.push(JSON.parse(fs.readFileSync(path.join(queueLogDir, file), "utf8")));
+      }
+    }
+    return invocations;
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Write a durable kusabi job record the mock companion's task-wait and the
+ * watcher's readTaskJob both read.  `startedAt` is retained as ordinary job
+ * metadata so selector tests can verify it is not used for --since binding.
+ */
+function writeMockJobFiles(
+  { workspaceDir, kusabiStateDir },
+  jobId,
+  {
+    status = "running",
+    phase = "implement",
+    backend = "opencode",
+    modelEntry = "opencode-go/deepseek-v4-flash:max",
+    fallbacks = null,
+    container = null,
+    startedAt = null,
+    failure = null,
+    customWorkspace = null,
+  } = {}
+) {
+  const ws = path.resolve(customWorkspace || workspaceDir);
+  const hash = crypto.createHash("sha256").update(ws).digest("hex").slice(0, 12);
+  const jobDir = path.join(kusabiStateDir, hash, "jobs", jobId);
+  fs.mkdirSync(jobDir, { recursive: true });
+  const job = {
+    id: jobId,
+    kind: "task",
+    title: "test task",
+    status,
+    phase,
+    backend,
+    modelEntry,
+    startedAt: startedAt || new Date().toISOString(),
+    finishedAt: status !== "running" ? new Date().toISOString() : null,
+    cwd: ws,
+    sessionID: "ses-test-123",
+  };
+  if (fallbacks) job.fallbacks = fallbacks;
+  if (container) job.container = container;
+  if (failure) job.failure = failure;
+  fs.writeFileSync(path.join(jobDir, "job.json"), JSON.stringify(job), "utf8");
+  return jobDir;
+}
+
 describe("kusabi-codex-notify unit and integration tests", () => {
   let tmpRoot;
   let stateDir;
@@ -211,18 +270,7 @@ if (process.env.TEST_CODEX_FAIL === "closed" || thread === "closed-thread") {
   });
 
   function getQueueInvocations() {
-    try {
-      const files = fs.readdirSync(queueLogDir);
-      const invocations = [];
-      for (const file of files) {
-        if (file.endsWith(".json")) {
-          invocations.push(JSON.parse(fs.readFileSync(path.join(queueLogDir, file), "utf8")));
-        }
-      }
-      return invocations;
-    } catch {
-      return [];
-    }
+    return readQueueInvocations(queueLogDir);
   }
 
   function setupMockChainFiles(chainId, { status = "completed", disposition = "accept", container = "1d90ea9e70b6", customWorkspace = null } = {}) {
@@ -264,34 +312,8 @@ if (process.env.TEST_CODEX_FAIL === "closed" || thread === "closed-thread") {
     );
   }
 
-  /**
-   * Write a durable kusabi job record the mock companion's task-wait and the
-   * watcher's readTaskJob both read.  `startedAt` is retained as ordinary job
-   * metadata so selector tests can verify it is not used for --since binding.
-   */
-  function setupMockJobFiles(jobId, { status = "running", phase = "implement", backend = "opencode", modelEntry = "opencode-go/deepseek-v4-flash:max", fallbacks = null, container = null, startedAt = null, failure = null, customWorkspace = null } = {}) {
-    const ws = path.resolve(customWorkspace || workspaceDir);
-    const hash = crypto.createHash("sha256").update(ws).digest("hex").slice(0, 12);
-    const jobDir = path.join(kusabiStateDir, hash, "jobs", jobId);
-    fs.mkdirSync(jobDir, { recursive: true });
-    const job = {
-      id: jobId,
-      kind: "task",
-      title: "test task",
-      status,
-      phase,
-      backend,
-      modelEntry,
-      startedAt: startedAt || new Date().toISOString(),
-      finishedAt: status !== "running" ? new Date().toISOString() : null,
-      cwd: ws,
-      sessionID: "ses-test-123",
-    };
-    if (fallbacks) job.fallbacks = fallbacks;
-    if (container) job.container = container;
-    if (failure) job.failure = failure;
-    fs.writeFileSync(path.join(jobDir, "job.json"), JSON.stringify(job), "utf8");
-    return jobDir;
+  function setupMockJobFiles(jobId, options) {
+    return writeMockJobFiles({ workspaceDir, kusabiStateDir }, jobId, options);
   }
 
   it("success: registers, blocking waits, and delivers exactly one notification with required fields", async () => {
@@ -2214,43 +2236,11 @@ if (process.env.TEST_CODEX_FAIL === "closed" || thread === "closed-thread") {
   });
 
   function getQueueInvocations() {
-    try {
-      const files = fs.readdirSync(queueLogDir);
-      const invocations = [];
-      for (const file of files) {
-        if (file.endsWith(".json")) {
-          invocations.push(JSON.parse(fs.readFileSync(path.join(queueLogDir, file), "utf8")));
-        }
-      }
-      return invocations;
-    } catch {
-      return [];
-    }
+    return readQueueInvocations(queueLogDir);
   }
 
-  function setupMockJobFiles(jobId, { status = "running", phase = "implement", backend = "opencode", modelEntry = "opencode-go/deepseek-v4-flash:max", fallbacks = null, container = null, startedAt = null, failure = null, customWorkspace = null } = {}) {
-    const ws = path.resolve(customWorkspace || workspaceDir);
-    const hash = crypto.createHash("sha256").update(ws).digest("hex").slice(0, 12);
-    const jobDir = path.join(kusabiStateDir, hash, "jobs", jobId);
-    fs.mkdirSync(jobDir, { recursive: true });
-    const job = {
-      id: jobId,
-      kind: "task",
-      title: "test task",
-      status,
-      phase,
-      backend,
-      modelEntry,
-      startedAt: startedAt || new Date().toISOString(),
-      finishedAt: status !== "running" ? new Date().toISOString() : null,
-      cwd: ws,
-      sessionID: "ses-test-123",
-    };
-    if (fallbacks) job.fallbacks = fallbacks;
-    if (container) job.container = container;
-    if (failure) job.failure = failure;
-    fs.writeFileSync(path.join(jobDir, "job.json"), JSON.stringify(job), "utf8");
-    return jobDir;
+  function setupMockJobFiles(jobId, options) {
+    return writeMockJobFiles({ workspaceDir, kusabiStateDir }, jobId, options);
   }
 
   /** Chain fixture helper for cross-kind tests (mirrors the chain suite). */
@@ -3262,18 +3252,7 @@ if (process.env.TEST_CLI_HOLD === "1" && argv1 === "register-watch.mjs") {
   });
 
   function getQueueInvocations() {
-    try {
-      const files = fs.readdirSync(queueLogDir);
-      const invocations = [];
-      for (const file of files) {
-        if (file.endsWith(".json")) {
-          invocations.push(JSON.parse(fs.readFileSync(path.join(queueLogDir, file), "utf8")));
-        }
-      }
-      return invocations;
-    } catch {
-      return [];
-    }
+    return readQueueInvocations(queueLogDir);
   }
 
   function setupMockJobFiles(jobId, { status = "running", phase = "implement" } = {}) {
