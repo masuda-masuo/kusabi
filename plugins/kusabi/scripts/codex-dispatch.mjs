@@ -70,7 +70,7 @@
 //   - `--read-only` is the FIXED invocation boundary (`-s read-only`); the
 //     sandbox is always read-only, and `--read-only` on the command line is
 //     accepted because it states what the invocation already enforces.
-//   - For Luna/Sol coordinator and auditor seats, no MCP servers are
+//   - For non-worker Codex invocations, no MCP servers are
 //     configured (`mcp_servers={}`), but Codex retains its BUILT-IN COMMAND
 //     TOOL inside the sandbox.
 //   - Worker seats get only the job-owned MCP tables derived from Claude's
@@ -379,10 +379,9 @@ export function buildCodexArgs({ model, cwd, sessionId, jsonSchema, mcpServers =
 /**
  * Fail-closed check on a RESOLVED codexDispatch result: a job that did not
  * reach status "completed" is a dispatch/seat failure, never an empty
- * stream.  The Luna coordinator and Sol audit seams share this check so a
- * failed Codex job surfaces as a dispatch/audit-seat failure naming the job
- * id, status and recorded error — it must never be parsed as an empty
- * coordinator/verdict stream (the mission-mucn5qb2a76e2095 mislabel).
+ * stream. Structured Codex callers share this check so a failed job
+ * surfaces as a dispatch failure naming the job id, status, and recorded
+ * error rather than an empty result.
  *
  * Throws when the job is not completed; otherwise returns the result
  * unchanged so the caller keeps the public `{ job, resultText, stateDir }`

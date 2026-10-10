@@ -566,12 +566,11 @@ describe("codex stream parsing", () => {
     assert.equal(acc.usageEvent.type, "turn.completed");
   });
 
-  it("a turn with commentary messages before the final answer yields ONLY the final answer (mission-mudmmnaub60f0b20)", async () => {
+  it("a turn with commentary messages before the final answer yields ONLY the final answer (mission-mudmmnaub60f0b20)", () => {
     // Measured shape of the incident: two commentary agent messages (the
     // second a draft of the batch, the first cut off mid-record) and then
     // the final answer.  Concatenating them produced `}{` joins and a
-    // truncated record, so the coordinator parser refused the whole batch.
-    const { parseCoordinatorOutput } = await import("./coordinator-parse.mjs");
+    // truncated record that a structured-output consumer refused.
     const hash = "e".repeat(64);
     const rec = (p, withTool = true) =>
       JSON.stringify(withTool
@@ -584,9 +583,6 @@ describe("codex stream parsing", () => {
     applyCodexStreamEvent(acc, { type: "item.completed", item: { type: "agent_message", text: final } });
     applyCodexStreamEvent(acc, { type: "item.completed", item: { type: "agent_message", text: final } });
     assert.equal(acc.assistantText, final);
-    const parsed = parseCoordinatorOutput(acc.assistantText, { envelopeSha256: hash });
-    assert.equal(parsed.valid, true, JSON.stringify(parsed.errors));
-    assert.equal(parsed.requests.length, 3);
   });
 
   it("malformed events never throw", () => {

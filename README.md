@@ -282,8 +282,8 @@ split (or without the field) are treated as `opencode` by readers.
   `:variant` suffix or any other id is rejected. Every invocation runs in a
   dedicated job-owned HOME/CODEX_HOME (no inherited config/rules/sessions or
   MCP files; the minimum auth symlink to the operator's own cache is the only
-  bridge) and the fixed read-only sandbox. Luna and Sol stay MCP-less and keep
-  the empty `mcp_servers={}` override. Worker agents
+  bridge) and the fixed read-only sandbox. Non-worker Codex invocations stay
+  MCP-less and keep the empty `mcp_servers={}` override. Worker agents
   (`kusabi-implement`, `kusabi-review`, `kusabi-plan`,
   `kusabi-test-author`) instead get a
   explicit `-c mcp_servers.<name>.<key>=...` argv overrides whose MCP

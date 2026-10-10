@@ -7,7 +7,6 @@ import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import os from "node:os";
 
-import { PHASE_AGENTS } from "./companion-config.mjs";
 import { codexDispatch } from "./codex-dispatch.mjs";
 import { stateDirFor } from "./state-paths.mjs";
 import { loadJob } from "./job-store.mjs";
@@ -661,47 +660,6 @@ describe("test-author and plan agent files", () => {
 // that grants no tools (no MCP servers, read-only sandbox, toolDenies null)
 // with exact requested/actual provenance.
 // ---------------------------------------------------------------------------
-
-describe("kusabi #529 — Luna/Sol seat registration (no-tool seats)", () => {
-  it("registers the coordinate phase agent in PHASE_AGENTS", () => {
-    assert.equal(PHASE_AGENTS.coordinate, "kusabi-coordinate");
-  });
-
-  it("the coordinate seat agent file exists", () => {
-    const seatPath = join(AGENTS_DIR, "kusabi-coordinate.md");
-    assert.ok(existsSync(seatPath), "kusabi-coordinate.md is missing — the Luna seat contract is not defined");
-  });
-
-  it("kusabi-coordinate: the seat grants NO sunaba/MCP tools at all — \"*\": deny is the authority boundary", () => {
-    const seatPath = join(AGENTS_DIR, "kusabi-coordinate.md");
-    const fm = parseFrontmatter(readFileSync(seatPath, "utf8"));
-    assert.ok(fm !== null, "could not parse frontmatter");
-    const permission = fm.permission;
-    assert.ok(permission !== null && typeof permission === "object");
-    // "*": deny is the authority boundary.  The seat is dispatched with no
-    // MCP servers at all, so the definition grants zero tools.
-    assert.equal(Object.keys(permission)[0], "*");
-    assert.equal(permission["*"], "deny");
-    // Zero tools: no entry other than "*" may be "allow" — read tools
-    // included.  A grant of sunaba_read_file_range / search / list / diff /
-    // issue_view would be a container-read capability the seats must not
-    // have; evidence arrives in the prompt / read-only evidence tree.
-    const allowed = Object.entries(permission)
-      .filter(([name]) => name !== "*")
-      .filter(([, value]) => value === "allow")
-      .map(([name]) => name);
-    assert.deepEqual(allowed, [], `coordinate seat must not allow ANY tool, got: ${allowed.join(", ")}`);
-    for (const readTool of [
-      "sunaba_read_file_range",
-      "sunaba_search_in_container",
-      "sunaba_list_files",
-      "sunaba_diff_in_container",
-      "sunaba_issue_view",
-    ]) {
-      assert.notEqual(permission[readTool], "allow", `coordinate seat must NOT be granted ${readTool}`);
-    }
-  });
-});
 
 // ---------------------------------------------------------------------------
 // The per-mission codex seat dispatch record: the job must record the no-tool

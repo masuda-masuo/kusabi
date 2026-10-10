@@ -31,13 +31,13 @@ export function parseArgs(argv) {
       arg === "--auto" || arg === "--read-only" || arg === "--resume-last" ||
       arg === "--wait" || arg === "--background" || arg === "--keep-serve" || arg === "--help" || arg === "-h" ||
       arg === "--force" || arg === "--dry-run" || arg === "--json" ||
-      arg === "--next" || arg === "--full" || arg === "--allow-substitute"
+      arg === "--next" || arg === "--full"
     ) {
       const key = arg.startsWith("--")
         ? arg.slice(2).replace(/-([a-z])/g, (_, c) => c.toUpperCase())
         : arg.slice(1);
       flags[key] = true;
-    } else if (arg === "--base" || arg === "--model" || arg === "--agent" || arg === "--session" || arg === "--timeout" || arg === "--deny" || arg === "--watchdog" || arg === "--phase" || arg === "--container" || arg === "--prior" || arg === "--max-rounds" || arg === "--brief-file" || arg === "--since" || arg === "--until" || arg === "--compare" || arg === "--transcript-dir" || arg === "--codex-usage-dir" || arg === "--state-root" || arg === "--db" || arg === "--backend" || arg === "--poll-interval" || arg === "--appear-timeout" || arg === "--progress-timeout" || arg === "--chain-id" || arg === "--mission-file" || arg === "--mission-id" || arg === "--coordinator-model" || arg === "--auditor-model" || arg === "--audit-override" || arg === "--audit-override-reason" || arg === "--audit-override-by" || arg === "--sample-rate" || arg === "--salt") {
+    } else if (arg === "--base" || arg === "--model" || arg === "--agent" || arg === "--session" || arg === "--timeout" || arg === "--deny" || arg === "--watchdog" || arg === "--phase" || arg === "--container" || arg === "--prior" || arg === "--max-rounds" || arg === "--brief-file" || arg === "--since" || arg === "--until" || arg === "--compare" || arg === "--transcript-dir" || arg === "--codex-usage-dir" || arg === "--state-root" || arg === "--db" || arg === "--backend" || arg === "--poll-interval" || arg === "--appear-timeout" || arg === "--progress-timeout" || arg === "--chain-id") {
       const flagName = arg.slice(2);
       const val = argv[++i];
       if (val === undefined || (typeof val === "string" && val.startsWith("--"))) {

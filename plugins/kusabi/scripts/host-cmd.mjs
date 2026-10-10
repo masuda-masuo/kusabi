@@ -97,6 +97,7 @@ export function cmdInstallAgents() {
     "kusabi-draft.md",
     "kusabi-salvage.md",
     "kusabi-investigate.md",
+    "kusabi-coordinate.md",
   ];
   let removed = 0;
   for (const f of stale) {
