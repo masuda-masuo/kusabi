@@ -1280,9 +1280,15 @@ describe("chain-wait CLI", () => {
     const env = { ...process.env };
     delete env.KUSABI_WORKER_CONTEXT;
     env.KUSABI_STATE_DIR = path.join(tmp, "state");
+    // --appear-timeout is the FAILURE bound only: on success the wait returns
+    // as soon as chain-real completes (~3.8 s in).  It was 4 s, which left
+    // ~1.4 s for chain-real to appear after the wait started; under
+    // full-suite load the test's own timers lagged past that and the wait
+    // declared the recordless debris stalled first (kusabi #708).  15 s keeps
+    // the success path just as fast and removes the race.
     const child = spawn(process.execPath, [
       COMPANION_SCRIPT, "chain-wait", "--next",
-      "--appear-timeout", "4", "--poll-interval", "1",
+      "--appear-timeout", "15", "--poll-interval", "1",
     ], { cwd: tmp, env, stdio: ["ignore", "pipe", "pipe"] });
 
     let stdout = "";
