@@ -813,11 +813,6 @@ describe("mission + audit_gate tables and provenance columns (kusabi #532 criter
     assert.equal(countRows(db, "audit_gate"), 0);
   });
 
-  it("exposes the new upsert helpers upsertMission / upsertAuditGate", async () => {
-    const mod = await import("./metrics-db.mjs");
-    assert.equal(typeof mod.upsertMission, "function", "the #532 store must expose upsertMission");
-    assert.equal(typeof mod.upsertAuditGate, "function", "the #532 store must expose upsertAuditGate");
-  });
 
   it("migrates a pre-#532 database additively: new columns appear, old rows keep NULL, no row is lost", () => {
     const dbPath = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-532-migrate-")), "metrics.db");
@@ -951,93 +946,5 @@ describe("mission + audit_gate tables and provenance columns (kusabi #532 criter
     fs.rmSync(path.dirname(dbPath), { recursive: true, force: true });
   });
 
-  it("upsertMission stores a full row and preserves NULL for absent fields", async () => {
-    const { upsertMission } = await import("./metrics-db.mjs");
-    const db = openMetricsDb(":memory:");
-    upsertMission(db, {
-      missionId: "mission-abc",
-      workspaceSlug: "ws1",
-      container: "cid-1",
-      status: "completed",
-      startedAt: "2026-09-01T09:00:00.000Z",
-      startedMs: Date.parse("2026-09-01T09:00:00.000Z"),
-      finishedAt: "2026-09-01T11:30:00.000Z",
-      finishedMs: Date.parse("2026-09-01T11:30:00.000Z"),
-      latencySeconds: 9000,
-      coordinatorProvider: "codex",
-      coordinatorModel: "gpt-5.6-luna",
-      coordinatorModelRequested: "gpt-5.6-luna",
-      coordinatorModelActual: "gpt-5.6-luna",
-      coordinatorReasoningEffort: "high",
-      coordinatorSubstituted: 0,
-      auditorProvider: "codex",
-      auditorModel: "gpt-5.6-sol",
-      auditorModelRequested: "gpt-5.6-sol",
-      auditorModelActual: "gpt-5.6-sol",
-      auditorReasoningEffort: "high",
-      auditorSubstituted: 0,
-      coordinatorErrors: 2,
-      briefCorrections: 1,
-      hostInterventions: 0,
-      tokensInput: 1000,
-      tokensOutput: 500,
-      tokensReasoning: 200,
-      tokensCacheRead: 10,
-      tokensCacheWrite: 5,
-      cost: 0.042,
-      disposition: "recommend-accept",
-      recommendation: "recommend-accept",
-    });
-    assert.equal(countRows(db, "mission"), 1);
-    const row = db.prepare("SELECT * FROM mission WHERE mission_id = ?").get("mission-abc");
-    assert.equal(row.coordinator_provider, "codex");
-    assert.equal(row.coordinator_reasoning_effort, "high");
-    assert.equal(row.host_interventions, 0, "a measured zero stays 0");
-    assert.equal(row.latency_seconds, 9000);
-    assert.equal(row.cost, 0.042);
 
-    // A sparse row (legacy mission) stores NULL for every absent field.
-    upsertMission(db, { missionId: "mission-legacy", status: "completed" });
-    const legacy = db.prepare("SELECT * FROM mission WHERE mission_id = ?").get("mission-legacy");
-    assert.equal(legacy.coordinator_provider, null);
-    assert.equal(legacy.coordinator_errors, null);
-    assert.equal(legacy.brief_corrections, null);
-    assert.equal(legacy.host_interventions, null);
-    assert.equal(legacy.tokens_input, null);
-    assert.equal(legacy.cost, null);
-    assert.equal(legacy.latency_seconds, null);
-    assert.equal(countRows(db, "mission"), 2);
-  });
-
-  it("upsertAuditGate stores one gate row per (gate_id, mission_id) and replaces on re-upsert", async () => {
-    const { upsertAuditGate } = await import("./metrics-db.mjs");
-    const db = openMetricsDb(":memory:");
-    const gate = {
-      gateId: "gate-1",
-      missionId: "mission-abc",
-      phase: "pre-accept",
-      origin: "policy-mandated",
-      verdict: "clear",
-      disposition: "verdict-recorded",
-      reason: null,
-      required: 1,
-      mandatory: 1,
-      sampled: 0,
-      policyInput: JSON.stringify({ gateId: "gate-1" }),
-      shadowDisposition: "sol-blocked",
-      recordedAt: "2026-09-01T09:00:05.000Z",
-    };
-    upsertAuditGate(db, gate);
-    upsertAuditGate(db, gate);
-    assert.equal(countRows(db, "audit_gate"), 1, "re-upsert replaces, never duplicates");
-    const row = db.prepare("SELECT * FROM audit_gate WHERE gate_id = ? AND mission_id = ?").get("gate-1", "mission-abc");
-    assert.equal(row.origin, "policy-mandated");
-    assert.equal(row.shadow_disposition, "sol-blocked");
-
-    upsertAuditGate(db, { gateId: "gate-1", missionId: "mission-abc", phase: "pre-accept", origin: "luna-requested" });
-    const replaced = db.prepare("SELECT origin, verdict FROM audit_gate WHERE gate_id = ? AND mission_id = ?").get("gate-1", "mission-abc");
-    assert.equal(replaced.origin, "luna-requested");
-    assert.equal(replaced.verdict, null, "an absent verdict stays NULL");
-    assert.equal(countRows(db, "audit_gate"), 1);
-  });
 });

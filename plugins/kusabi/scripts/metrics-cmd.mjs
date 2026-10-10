@@ -28,7 +28,6 @@ import { openMetricsDb, openMetricsDbReadOnly } from "./metrics-db.mjs";
 import { ingestTranscriptDirectory } from "./transcript-ingest.mjs";
 import { ingestCodexUsageDirectory } from "./codex-usage-ingest.mjs";
 import { ingestChainDirectory, ingestJobDirectory } from "./chain-ingest.mjs";
-import { ingestMissionDirectory } from "./mission-ingest.mjs";
 import { computeReport, missingStoreReport } from "./metrics-report.mjs";
 import {
   renderReportText,
@@ -113,14 +112,12 @@ export function cmdMetricsIngest(cwd, { flags }) {
   let codexSummary;
   let chainSummary;
   let jobSummary;
-  let missionSummary;
   db.exec("BEGIN");
   try {
     transcriptSummary = ingestTranscriptDirectory(db, transcriptDir);
     codexSummary = ingestCodexUsageDirectory(db, codexDir);
     chainSummary = ingestChainDirectory(db, metricsStateRoot);
     jobSummary = ingestJobDirectory(db, metricsStateRoot);
-    missionSummary = ingestMissionDirectory(db, metricsStateRoot);
     db.exec("COMMIT");
   } catch (err) {
     db.exec("ROLLBACK");
@@ -196,19 +193,6 @@ export function cmdMetricsIngest(cwd, { flags }) {
   lines.push(`  jobs ingested:             ${jobSummary.jobsIngested}`);
   lines.push(`  jobs without usage.json (ended before usage was written): ${jobSummary.jobsMissingUsage}`);
   lines.push("");
-  // Luna missions (kusabi #532): mission + audit_gate rows from
-  // <state-root>/<slug>/missions/mission-<id>/mission.json.  Reported even
-  // when every number is 0, so "no missions on disk" is visible rather than
-  // a silent absence.
-  lines.push("Missions (luna):");
-  lines.push(`  state root:                ${metricsStateRoot}`);
-  lines.push(`  missions scanned:         ${missionSummary.missionsScanned}`);
-  lines.push(`  missions skipped (unchanged): ${missionSummary.filesSkippedUnchanged}`);
-  lines.push(`  I/O failures (mission.json unreadable): ${missionSummary.ioFailures}`);
-  lines.push(`  parse failures (malformed JSON / no mission id): ${missionSummary.parseFailures}`);
-  lines.push(`  missions ingested:        ${missionSummary.missionsIngested}`);
-  lines.push(`  audit gates ingested:     ${missionSummary.gatesIngested}`);
-
   return lines.join("\n");
 }
 
