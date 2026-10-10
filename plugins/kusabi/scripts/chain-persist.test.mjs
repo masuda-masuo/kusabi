@@ -156,7 +156,6 @@ describe("persistChainState interrupted round", () => {
     brief: "Implement X.",
     orchestrator: null,
     baseSha: "abc123",
-    strategized: false,
     chainFollowupDraft: null,
   };
 
@@ -430,10 +429,11 @@ describe("persistChainState omits removed mission linkage", () => {
       chainTotals: computeChainTotals([roundRecord]),
       chainId: "chain-link", container: "cid-1", model: "fake/model",
       modelChain: [["fake/model"]], maxRounds: 4, brief: "Implement X.",
-      orchestrator: null, baseSha: "abc123", strategized: false,
+      orchestrator: null, baseSha: "abc123",
       chainFollowupDraft: null, missionId: "mission-abc",
     });
     const chainJson = readJson(path.join(chainDir, "chain.json"));
+    assert.equal(chainJson.strategized, false);
     assert.equal("missionId" in chainJson, false);
     fs.rmSync(tmp, { recursive: true, force: true });
   });
@@ -450,7 +450,7 @@ describe("persistChainState omits removed mission linkage", () => {
         chainTotals: computeChainTotals([roundRecord]),
         chainId: "chain-link", container: "cid-1", model: "fake/model",
         modelChain: [["fake/model"]], maxRounds: 4, brief: "Implement X.",
-        orchestrator: null, baseSha: "abc123", strategized: false,
+        orchestrator: null, baseSha: "abc123",
         chainFollowupDraft: null,
       });
     });

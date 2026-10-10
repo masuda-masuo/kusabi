@@ -76,7 +76,7 @@ function emit(obj) {
   fs.writeSync(1, JSON.stringify(obj) + NL);
 }
 
-// Read stdin if present (for cursor-like backends)
+// Read stdin when provided by a backend that sends prompts through stdin
 const chunks = [];
 process.stdin.on("data", (chunk) => chunks.push(chunk));
 process.stdin.on("end", () => {
@@ -201,7 +201,7 @@ describe("runBackendProcess", () => {
     assert.ok(capturedPid > 0);
   });
 
-  it("writes promptText to stdin when provided (cursor pattern)", async () => {
+  it("writes promptText to stdin when provided", async () => {
     await runBackendProcess({
       bin: ctx.binPath,
       args: [],

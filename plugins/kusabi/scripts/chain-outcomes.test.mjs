@@ -391,58 +391,7 @@ describe("renderProviderExhaustedOutcome", () => {
     assert.ok(result.includes("(no error detail)"));
   });
 
-  it("handles strategize phase exhaustion", () => {
-    const result = renderProviderExhaustedOutcome({
-      chainId,
-      round: 2,
-      phase: "strategize",
-      jobError: "All routes exhausted:\n  route/p — rate_limit at attempt 3",
-      records: [],
-    });
 
-    assert.ok(result.includes("strategize provider exhausted"));
-  });
-
-  it("strategize provider-error: each round appears exactly once", () => {
-    // The strategize provider-error handler used to push the round record a
-    // second time, duplicating it in `records`.  The fix (removing that push)
-    // lives in cmdChain, which this test does NOT reach: cmdChain is not
-    // exported and driving it would require mocking every phase.  This test
-    // only covers the downstream half -- that the renderer does not itself
-    // duplicate rounds.  Re-introducing the duplicate push in cmdChain would
-    // still pass here.  Making that path testable is tracked separately.
-    const records = [
-      {
-        round: 1,
-        modelEntry: "provider/model-a",
-        verdict: "needs-attention",
-        probesGreen: true,
-        resumeMethod: { type: "continue_session" },
-      },
-      {
-        round: 2,
-        modelEntry: "provider/model-b",
-        verdict: "needs-attention",
-        probesGreen: true,
-        resumeMethod: { type: "continue_session" },
-      },
-    ];
-
-    const result = renderProviderExhaustedOutcome({
-      chainId,
-      round: 3,
-      phase: "strategize",
-      jobError: "All routes exhausted:\n  route/p — rate_limit at attempt 3",
-      records,
-    });
-
-    // Each prior round must appear exactly once in the rendered output.
-    // The current (aborted) round shows in the header as "stopped at round 3".
-    assert.equal((result.match(/Round 1/g) || []).length, 1);
-    assert.equal((result.match(/Round 2/g) || []).length, 1);
-    // The current round appears only in the header, not as a "Round 3:" line.
-    assert.ok(result.includes("stopped at round 3"));
-  });
 
   it("quota-classified exhaustion shows the classification and NOT the generic retry advice (kusabi #215)", () => {
     const jobError = "claude dispatch failed: You've hit your session limit · resets 1:20am (Asia/Tokyo) — " +
@@ -504,7 +453,6 @@ describe("handleProviderExhaustion", () => {
     brief: "Test brief",
     orchestrator: "test-orchestrator",
     baseSha: "abc1234",
-    strategized: false,
   };
 
   function makeRecords(rounds) {
@@ -563,10 +511,8 @@ describe("handleProviderExhaustion", () => {
       "outcome names the review phase");
   });
 
-  // ---- strategize (the bug PR #119 fixed) ----
-
-  it("strategize provider-error: the round appears exactly once in records (no duplicate)", () => {
-    // round 3 has already been pushed by phase 7 — simulate that state
+  it("review provider-error: an already-recorded round appears exactly once", () => {
+    // Model a round that is already present when provider exhaustion is handled
     const records = makeRecords([1, 2]);
     const roundRecord = { round: 3, modelEntry: "provider/model-3", verdict: null };
     records.push(roundRecord);
@@ -574,7 +520,7 @@ describe("handleProviderExhaustion", () => {
     const result = handleProviderExhaustion({
       records,
       roundRecord,
-      phase: "strategize",
+      phase: "review",
       jobError: "All routes exhausted",
       chainFollowupDraft: null,
       ...baseState,
@@ -585,8 +531,8 @@ describe("handleProviderExhaustion", () => {
     const round3Entries = result.records.filter((r) => r.round === 3);
     assert.equal(round3Entries.length, 1, "round 3 must appear exactly once");
     assert.equal(round3Entries[0].tierAfter, undefined, "tierAfter is no longer written (kusabi #683)");
-    assert.ok(result.outcome.includes("strategize provider exhausted"),
-      "outcome names the strategize phase");
+    assert.ok(result.outcome.includes("review provider exhausted"),
+      "outcome names the review phase");
   });
 
   // ---- persisted state ----
@@ -605,6 +551,7 @@ describe("handleProviderExhaustion", () => {
 
     const round2InState = result.chainState.records.filter((r) => r.round === 2);
     assert.equal(round2InState.length, 1, "chainState records must contain round 2 exactly once");
+    assert.equal(result.chainState.strategized, false);
     assert.equal(round2InState[0].tierAfter, undefined, "tierAfter is no longer written (kusabi #683)");
   });
 
@@ -622,25 +569,9 @@ describe("handleProviderExhaustion", () => {
 
     const round2InState = result.chainState.records.filter((r) => r.round === 2);
     assert.equal(round2InState.length, 1, "chainState records must contain round 2 exactly once");
+    assert.equal(result.chainState.strategized, false);
   });
 
-  it("persisted chainState for strategize contains the round exactly once", () => {
-    const records = makeRecords([1]);
-    const roundRecord = { round: 2, modelEntry: "provider/model-2" };
-    records.push(roundRecord); // already recorded by phase 7
-
-    const result = handleProviderExhaustion({
-      records, roundRecord,
-      phase: "strategize",
-      jobError: "error detail",
-      chainFollowupDraft: null,
-      ...baseState, round: 2,
-    });
-
-    // chainState records must contain round 2 exactly once
-    const round2InState = result.chainState.records.filter((r) => r.round === 2);
-    assert.equal(round2InState.length, 1, "chainState records must contain round 2 exactly once");
-  });
 
   it("chainState carries reviewModel / reviewModelChain verbatim (mixed-chain resume context)", () => {
     // persistChainState persists both; handleProviderExhaustion must too, or
@@ -736,13 +667,13 @@ describe("handleProviderExhaustion", () => {
 
   // ---- the push decision is derived, not supplied ----
 
-  it("never duplicates a round that is already in records, whatever the phase", () => {
+  it("never duplicates a round already in records for a live phase", () => {
     // The caller used to pass a roundAlreadyRecorded flag.  A call site that got
     // it wrong would silently duplicate the round (the PR #119 defect) and no
     // test of this function could have caught it, because the function would
     // have been doing exactly what it was told.  The decision is now derived
     // from records, so there is no flag left to get wrong.
-    for (const phase of ["implement", "review", "strategize"]) {
+    for (const phase of ["implement", "review"]) {
       const records = makeRecords([1]);
       const roundRecord = { round: 2, modelEntry: "provider/model-2" };
       records.push(roundRecord);
@@ -761,7 +692,7 @@ describe("handleProviderExhaustion", () => {
   });
 
   it("pushes a round that is not yet in records, whatever the phase", () => {
-    for (const phase of ["implement", "review", "strategize"]) {
+    for (const phase of ["implement", "review"]) {
       const records = makeRecords([1]);
       const roundRecord = { round: 2, modelEntry: "provider/model-2" };
 
@@ -784,7 +715,6 @@ describe("handleProviderExhaustion", () => {
     const phases = [
       { phase: "implement",  alreadyRecorded: false },
       { phase: "review",     alreadyRecorded: false },
-      { phase: "strategize", alreadyRecorded: true },
     ];
 
     for (const { phase, alreadyRecorded } of phases) {

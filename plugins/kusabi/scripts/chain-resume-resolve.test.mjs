@@ -147,7 +147,6 @@ describe("resolveChainResume", () => {
     assert.equal(p.round, 3);
     assert.equal(p.roundRecord, partial);
     assert.equal(p.reworkCount, 2);           // carried, not incremented
-    assert.equal(p.strategized, true);
     assert.equal(p.session, "sess-3");
     assert.equal(p.baseSha, "abc123");
   });

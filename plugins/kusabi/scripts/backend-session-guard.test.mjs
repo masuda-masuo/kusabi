@@ -4,7 +4,7 @@ import assert from "node:assert/strict";
 import { assertSessionResumable } from "./backend-session-guard.mjs";
 
 describe("assertSessionResumable (Spec 1 shared guard)", () => {
-  const backends = ["claude", "cursor", "agy", "codex"];
+  const backends = ["claude", "agy", "codex"];
   const UUID = "123e4567-e89b-12d3-a456-426614174000";
 
   for (const backend of backends) {
@@ -77,7 +77,7 @@ describe("assertSessionResumable (Spec 1 shared guard)", () => {
       });
 
       it("rejects a session attributed to another backend, naming both", () => {
-        const otherBackend = backend === "claude" ? "cursor" : "claude";
+        const otherBackend = backend === "claude" ? "codex" : "claude";
         const expectedError =
           `session ${UUID} cannot be resumed on the ${backend} backend — ` +
           `the job store attributes it to the ${otherBackend} backend. ` +

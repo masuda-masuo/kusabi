@@ -518,7 +518,7 @@ export async function finishRound(
       reviewModel, reviewModelChain,
       reworkModel, reworkModelChain, reworkBackend,
       maxRounds, brief, orchestrator, baseSha: effectiveBaseSha,
-      strategized: false, chainFollowupDraft: null,
+      chainFollowupDraft: null,
       verifyBaseline: effectiveVerifyBaseline,
     });
     writeJson(path.join(chainDir, "round-" + round + ".json"), roundRecord);
@@ -722,7 +722,7 @@ export async function finishRound(
     reviewModel, reviewModelChain,
     reworkModel, reworkModelChain, reworkBackend,
     maxRounds, brief, orchestrator, records, baseSha: effectiveBaseSha,
-    chainTotals, strategized: false, chainFollowupDraft,
+    chainTotals, chainFollowupDraft,
     verifyBaseline: effectiveVerifyBaseline,
     smokeObservation: ctx.smokeObservation ?? null,
   });

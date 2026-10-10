@@ -75,7 +75,7 @@ export function persistChainState({
   reviewModel = null, reviewModelChain = null,
   reworkModel = null, reworkModelChain = null, reworkBackend = null,
   maxRounds, brief, orchestrator, records, baseSha, chainTotals,
-  strategized, chainFollowupDraft, interrupted = false, verifyBaseline = null,
+  chainFollowupDraft, interrupted = false, verifyBaseline = null,
   smokeObservation = null,
 }) {
   if (interrupted) {
@@ -122,7 +122,7 @@ export function persistChainState({
     records,
     baseSha,
     chainTotals,
-    strategized,
+    strategized: false,
     followupIssueDraft: chainFollowupDraft,
     // Chain-start verify baseline (kusabi #173): captured on the pristine
     // base before round-1 implement, reused verbatim by chain-resume.
