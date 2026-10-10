@@ -232,13 +232,13 @@ describe("large change-scope transport regression (kusabi #667)", () => {
     it("models Sunaba 50-line paging, 100-line summary truncation, and full verbose bypass", async () => {
       const { callTool } = makeSunabaFake({ tempRepoDir, baseSha, headSha });
 
-      // Default call: 50 lines, summary truncated (111 lines > 100 max_lines), has_more: true
+      // Default call: 50 lines, summary truncated (exceeds 100 max_lines), has_more: true
       const defaultPage = await callTool("sandbox_exec", {
         container_id: "cid-test",
         argv: ["node", CHANGE_SCOPE_CONTAINER_PATH, "--base", baseSha, "--head", headSha],
       });
       assert.equal(defaultPage.shown, 50);
-      assert.equal(defaultPage.total_lines, 111);
+      assert.ok(defaultPage.total_lines > 100);
       assert.equal(defaultPage.truncated, true);
       assert.equal(defaultPage.has_more, true);
       assert.equal(defaultPage.next_offset, 50);
@@ -251,12 +251,13 @@ describe("large change-scope transport regression (kusabi #667)", () => {
         verbose: "full",
         limit: 200,
       });
-      assert.equal(fullCapture.shown, 111);
-      assert.equal(fullCapture.total_lines, 111);
+      assert.equal(fullCapture.shown, defaultPage.total_lines);
+      assert.equal(fullCapture.total_lines, defaultPage.total_lines);
       assert.equal(fullCapture.truncated, false);
       assert.equal(fullCapture.has_more, false);
       assert.equal(fullCapture.next_offset, null);
-      assert.doesNotThrow(() => JSON.parse(fullCapture.output));
+      const parsedScope = JSON.parse(fullCapture.output);
+      assert.equal(parsedScope.paths.committed.length, NUM_COMMITTED_FILES);
 
       // read_output retrieves subsequent page by output_id
       const page2 = await callTool("read_output", {
@@ -317,92 +318,61 @@ describe("large change-scope transport regression (kusabi #667)", () => {
   });
 
   describe("acceptance criterion 3: malformed JSON and nonzero execution remain errors", () => {
-    it("nonzero execution in sandbox_exec fails closed without porcelain substitution", async () => {
-      const { callTool } = makeSunabaFake({
-        tempRepoDir,
-        baseSha,
-        headSha,
-        execOverride: (params) => {
-          const fullCmd = params?.commands?.[0] ?? params?.argv?.join(" ") ?? "";
-          if (fullCmd.includes("change-scope.mjs")) {
-            return {
-              status: "error",
-              exit_code: 1,
-              stderr: "git rev-list fatal: bad object ref",
-              output: "",
-            };
-          }
-          return null;
+    const errorCases = [
+      {
+        name: "nonzero execution in sandbox_exec fails closed without porcelain substitution",
+        container: "cid-fail-exit",
+        response: {
+          status: "error",
+          exit_code: 1,
+          stderr: "git rev-list fatal: bad object ref",
+          output: "",
         },
-      });
-
-      await assert.rejects(
-        () => collectChangeScope({ callTool, container: "cid-fail-exit", base: baseSha, head: headSha }),
-        /change-scope failed with exit code 1: git rev-list fatal: bad object ref/,
-      );
-
-      await assert.rejects(
-        () => collectContainerReviewInput({ container: "cid-fail-exit", callTool, base: baseSha }),
-        /change-scope failed with exit code 1: git rev-list fatal: bad object ref/,
-      );
-    });
-
-    it("genuinely malformed JSON output fails closed without synthetic scope or porcelain fallback", async () => {
-      const { callTool } = makeSunabaFake({
-        tempRepoDir,
-        baseSha,
-        headSha,
-        execOverride: (params) => {
-          const fullCmd = params?.commands?.[0] ?? params?.argv?.join(" ") ?? "";
-          if (fullCmd.includes("change-scope.mjs")) {
-            return {
-              status: "ok",
-              exit_code: 0,
-              output: "{ unclosed_json_syntax: [",
-            };
-          }
-          return null;
+        expected: /change-scope failed with exit code 1: git rev-list fatal: bad object ref/,
+      },
+      {
+        name: "genuinely malformed JSON output fails closed without synthetic scope or porcelain fallback",
+        container: "cid-fail-json",
+        response: {
+          status: "ok",
+          exit_code: 0,
+          output: "{ unclosed_json_syntax: [",
         },
-      });
-
-      await assert.rejects(
-        () => collectChangeScope({ callTool, container: "cid-fail-json", base: baseSha, head: headSha }),
-        /change-scope produced invalid JSON/,
-      );
-
-      await assert.rejects(
-        () => collectContainerReviewInput({ container: "cid-fail-json", callTool, base: baseSha }),
-        /change-scope produced invalid JSON/,
-      );
-    });
-
-    it("JSON contract mismatch fails closed (formatVersion must be 1)", async () => {
-      const { callTool } = makeSunabaFake({
-        tempRepoDir,
-        baseSha,
-        headSha,
-        execOverride: (params) => {
-          const fullCmd = params?.commands?.[0] ?? params?.argv?.join(" ") ?? "";
-          if (fullCmd.includes("change-scope.mjs")) {
-            return {
-              status: "ok",
-              exit_code: 0,
-              output: JSON.stringify({ formatVersion: 999, resolved: {}, paths: {} }),
-            };
-          }
-          return null;
+        expected: /change-scope produced invalid JSON/,
+      },
+      {
+        name: "JSON contract mismatch fails closed (formatVersion must be 1)",
+        container: "cid-fail-contract",
+        response: {
+          status: "ok",
+          exit_code: 0,
+          output: JSON.stringify({ formatVersion: 999, resolved: {}, paths: {} }),
         },
+        expected: /change-scope JSON contract mismatch/,
+      },
+    ];
+
+    for (const { name, container, response, expected } of errorCases) {
+      it(name, async () => {
+        const { callTool } = makeSunabaFake({
+          tempRepoDir,
+          baseSha,
+          headSha,
+          execOverride: (params) => {
+            const fullCmd = params?.commands?.[0] ?? params?.argv?.join(" ") ?? "";
+            return fullCmd.includes("change-scope.mjs") ? response : null;
+          },
+        });
+
+        await assert.rejects(
+          () => collectChangeScope({ callTool, container, base: baseSha, head: headSha }),
+          expected,
+        );
+        await assert.rejects(
+          () => collectContainerReviewInput({ container, callTool, base: baseSha }),
+          expected,
+        );
       });
-
-      await assert.rejects(
-        () => collectChangeScope({ callTool, container: "cid-fail-contract", base: baseSha, head: headSha }),
-        /change-scope JSON contract mismatch/,
-      );
-
-      await assert.rejects(
-        () => collectContainerReviewInput({ container: "cid-fail-contract", callTool, base: baseSha }),
-        /change-scope JSON contract mismatch/,
-      );
-    });
+    }
   });
 });

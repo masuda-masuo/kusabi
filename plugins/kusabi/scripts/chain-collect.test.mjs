@@ -492,77 +492,55 @@ describe("change-scope wiring into review and probe phases (kusabi #379)", () =>
     },
   };
 
-  it("change-scope invalid JSON fails closed in collectContainerReviewInput (throws, does not substitute porcelain)", async () => {
-    const callTool = async (toolName, params) => {
+  function makeChangeScopeMock(changeScopeOutput) {
+    return async (toolName, params) => {
       if (toolName !== "sandbox_exec") return { output: "" };
       const cmd = params.commands?.[0] ?? params.argv?.join(" ") ?? "";
       if (cmd.includes("change-scope.mjs")) {
-        return { output: "not valid json {{" };
+        return { output: changeScopeOutput };
       }
       if (cmd.startsWith("git rev-parse --verify") || cmd === "git rev-parse HEAD") return { output: "base123\n" };
       if (cmd === "git status --porcelain") return { output: " M porcelain-file.js\n" };
       return { output: "" };
     };
+  }
 
-    await assert.rejects(
-      () => collectContainerReviewInput({ container: "cid-fail-json", callTool, base: "base123" }),
-      /change-scope produced invalid JSON/,
-    );
-  });
+  const failClosedCases = [
+    {
+      name: "change-scope invalid JSON fails closed in collectContainerReviewInput (throws, does not substitute porcelain)",
+      container: "cid-fail-json",
+      output: "not valid json {{",
+      expected: /change-scope produced invalid JSON/,
+    },
+    {
+      name: "change-scope empty stdout fails closed in collectContainerReviewInput (throws, does not substitute porcelain)",
+      container: "cid-fail-empty-task",
+      output: "",
+      expected: /change-scope produced empty output/,
+    },
+    {
+      name: "change-scope empty stdout fails closed for container cid123 (no production special-case)",
+      container: "cid123",
+      output: "",
+      expected: /change-scope produced empty output/,
+    },
+    {
+      name: "change-scope formatVersion contract mismatch fails closed in collectContainerReviewInput",
+      container: "cid-fail-contract",
+      output: JSON.stringify({ formatVersion: 2, resolved: {}, paths: {} }),
+      expected: /change-scope JSON contract mismatch/,
+    },
+  ];
 
-  it("change-scope empty stdout fails closed in collectContainerReviewInput (throws, does not substitute porcelain)", async () => {
-    const callTool = async (toolName, params) => {
-      if (toolName !== "sandbox_exec") return { output: "" };
-      const cmd = params.commands?.[0] ?? params.argv?.join(" ") ?? "";
-      if (cmd.includes("change-scope.mjs")) {
-        return { output: "" };
-      }
-      if (cmd.startsWith("git rev-parse --verify") || cmd === "git rev-parse HEAD") return { output: "base123\n" };
-      if (cmd === "git status --porcelain") return { output: " M porcelain-file.js\n" };
-      return { output: "" };
-    };
-
-    await assert.rejects(
-      () => collectContainerReviewInput({ container: "cid-fail-empty-task", callTool, base: "base123" }),
-      /change-scope produced empty output/,
-    );
-  });
-
-  it("change-scope empty stdout fails closed for container cid123 (no production special-case)", async () => {
-    const callTool = async (toolName, params) => {
-      if (toolName !== "sandbox_exec") return { output: "" };
-      const cmd = params.commands?.[0] ?? params.argv?.join(" ") ?? "";
-      if (cmd.includes("change-scope.mjs")) {
-        return { output: "" };
-      }
-      if (cmd.startsWith("git rev-parse --verify") || cmd === "git rev-parse HEAD") return { output: "base123\n" };
-      if (cmd === "git status --porcelain") return { output: " M porcelain-file.js\n" };
-      return { output: "" };
-    };
-
-    await assert.rejects(
-      () => collectContainerReviewInput({ container: "cid123", callTool, base: "base123" }),
-      /change-scope produced empty output/,
-    );
-  });
-
-
-  it("change-scope formatVersion contract mismatch fails closed in collectContainerReviewInput", async () => {
-    const callTool = async (toolName, params) => {
-      if (toolName !== "sandbox_exec") return { output: "" };
-      const cmd = params.commands?.[0] ?? params.argv?.join(" ") ?? "";
-      if (cmd.includes("change-scope.mjs")) {
-        return { output: JSON.stringify({ formatVersion: 2, resolved: {}, paths: {} }) };
-      }
-      if (cmd.startsWith("git rev-parse --verify") || cmd === "git rev-parse HEAD") return { output: "base123\n" };
-      return { output: "" };
-    };
-
-    await assert.rejects(
-      () => collectContainerReviewInput({ container: "cid-fail-contract", callTool, base: "base123" }),
-      /change-scope JSON contract mismatch/,
-    );
-  });
+  for (const { name, container, output, expected } of failClosedCases) {
+    it(name, async () => {
+      const callTool = makeChangeScopeMock(output);
+      await assert.rejects(
+        () => collectContainerReviewInput({ container, callTool, base: "base123" }),
+        expected,
+      );
+    });
+  }
 
   it("collectContainerReviewInput records change-scope invocation, contains JSON, and runs no git diff", async () => {
     const invocations = [];
