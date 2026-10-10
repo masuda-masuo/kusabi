@@ -790,10 +790,8 @@ describe("runChainDriver resume", () => {
     fs.rmSync(tmp, { recursive: true, force: true });
   });
 
-  // ---- kusabi #532: a normally completed non-TDD Luna inner chain persists
-  // its mission link through the ordinary round loop's finishRound
-  // persistence; an ordinary chain omits the key (byte-identical). ----
-  it("a normally completed non-TDD Luna inner chain persists missionId; an ordinary chain omits the key", async () => {
+  // ---- Removed chain mission linkage ----
+  it("a stale missionId option is ignored by a normally completed chain", async () => {
     async function runFreshChainWith({ missionId }) {
       const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-532-missionid-"));
       const chainDir = path.join(tmp, "chains", "chain-mid");
@@ -809,28 +807,25 @@ describe("runChainDriver resume", () => {
         brief: BRIEF,
         callTool: fakeResumeCallTool(),
         dispatchWithFallback: dispatch,
-        // The luna driver threads the owning mission id; a plain chain omits it.
+        // A stale option from an older caller is ignored.
         ...(missionId ? { missionId } : {}),
       });
       return { tmp, chainDir, text };
     }
 
-    // Luna inner chain: the standard (non-TDD) loop accepts and chain.json
-    // carries the mission link from BOTH the normal finishRound persist and
-    // the terminal record.
+    // A stale caller option is ignored by the ordinary round loop.
     const luna = await runFreshChainWith({ missionId: "mission-abc" });
     try {
       assert.match(luna.text, /accepted at round 1/);
       const lunaChainJson = readJson(path.join(luna.chainDir, "chain.json"));
-      assert.equal(lunaChainJson.missionId, "mission-abc",
-        "a normally completed Luna inner chain must persist its mission link");
+      assert.equal("missionId" in lunaChainJson, false,
+        "missionId is no longer written to chain.json");
       assert.equal(lunaChainJson.records[0].implementJobId, "job-imp-1");
     } finally {
       fs.rmSync(luna.tmp, { recursive: true, force: true });
     }
 
-    // Ordinary chain: same loop, no missionId option — the key must not
-    // appear at all (a null/false key would change the serialization).
+    // Plain chain: same loop without the stale option also omits the key.
     const plain = await runFreshChainWith({ missionId: null });
     try {
       assert.match(plain.text, /accepted at round 1/);

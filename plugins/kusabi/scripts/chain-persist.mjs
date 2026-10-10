@@ -76,7 +76,6 @@ export function persistChainState({
   reworkModel = null, reworkModelChain = null, reworkBackend = null,
   maxRounds, brief, orchestrator, records, baseSha, chainTotals,
   strategized, chainFollowupDraft, interrupted = false, verifyBaseline = null,
-  missionId = null,
   smokeObservation = null,
 }) {
   if (interrupted) {
@@ -130,10 +129,6 @@ export function persistChainState({
     verifyBaseline,
     // Dispatch-time smoke observation summary (kusabi #665).
     smokeObservation: smokeObservation ?? null,
-    // Mission linkage (kusabi #532): the owning luna mission's id, emitted
-    // ONLY under Luna mode.  A plain chain serialization is byte-identical
-    // when the key is absent — it must never appear as null/false.
-    ...(missionId ? { missionId } : {}),
   });
 }
 

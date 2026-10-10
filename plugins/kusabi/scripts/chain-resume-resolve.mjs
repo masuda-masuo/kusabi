@@ -352,6 +352,12 @@ export function resolveChainResume({ control, chainJson, explicitRoute = null })
   }
 
   const lastDisposition = last.disposition?.disposition;
+  if (lastDisposition === "sol-blocked") {
+    return {
+      ok: false,
+      error: `cannot resume chain: last round ${last.round} was blocked by the removed Sol gate (sol-blocked); manual inspection required`,
+    };
+  }
   if (lastDisposition) {
     // ---- replacement review seat (kusabi #248) ----
     // The ONE terminal disposition that is resumable: an escalate caused by a
