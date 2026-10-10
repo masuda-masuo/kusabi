@@ -96,6 +96,7 @@ export function cmdInstallAgents() {
     "oc-salvage.md",
     "kusabi-draft.md",
     "kusabi-salvage.md",
+    "kusabi-investigate.md",
   ];
   let removed = 0;
   for (const f of stale) {

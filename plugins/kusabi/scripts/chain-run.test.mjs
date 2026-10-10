@@ -113,25 +113,9 @@ describe("buildImplementText", () => {
     assert.ok(result.includes("## Acceptance criteria"));
   });
 
-  it("round 2+ includes strategist recommendation when present", () => {
-    const prev = {
-      findingsText: "findings...",
-      strategistRecommendation: "Use a Map instead of indexing a list",
-    };
-    const result = buildImplementText({ round: 2, brief, previousRecord: prev });
-    assert.ok(result.includes("Strategist recommendation"));
-    assert.ok(result.includes("Use a Map instead of indexing a list"));
-  });
-
   it("round 2+ with no previousRecord returns brief", () => {
     const result = buildImplementText({ round: 2, brief, previousRecord: null });
     assert.equal(result, brief);
-  });
-
-  it("round 2+ without strategistRecommendation omits the section", () => {
-    const prev = { findingsText: "some findings" };
-    const result = buildImplementText({ round: 2, brief, previousRecord: prev });
-    assert.ok(!result.includes("Strategist recommendation"));
   });
 
   it("includes body and recommendation of a prior finding when structured findings exist", () => {

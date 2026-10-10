@@ -88,13 +88,9 @@ export function checkAgentPermissions(permission, roleName) {
     violations.push(`"sunaba_run_python" granted to "${roleName}", but only implement/respond/gofer may have it`);
   }
 
-  // 7. sunaba_sandbox_issue_write: exclusive to investigate — both the
-  //    negative check (nobody else may have it) and the positive check (investigate
-  //    MUST have it).
-  if (roleName === "investigate" && permission["sunaba_sandbox_issue_write"] !== "allow") {
-    violations.push(`"sunaba_sandbox_issue_write" missing from "${roleName}" (investigate must have it)`);
-  } else if (permission["sunaba_sandbox_issue_write"] === "allow" && roleName !== "investigate") {
-    violations.push(`"sunaba_sandbox_issue_write" granted to "${roleName}", but only investigate may have it`);
+  // 7. sunaba_sandbox_issue_write: nobody may have it
+  if (permission["sunaba_sandbox_issue_write"] === "allow") {
+    violations.push(`"sunaba_sandbox_issue_write" granted to "${roleName}", but nobody may have it`);
   }
 
   // 8. kaiba permissions (kusabi #279, #391): `kaiba_recall`,
@@ -379,7 +375,7 @@ describe("agent permission allowlists", () => {
       assert.deepEqual(violations, []);
     });
 
-    it('"sunaba_sandbox_issue_write" granted to wrong role', () => {
+    it('"sunaba_sandbox_issue_write" granted to any role is rejected', () => {
       const violations = checkAgentPermissions(
         {
           "*": "deny",
@@ -394,22 +390,6 @@ describe("agent permission allowlists", () => {
       );
       assert.ok(violations.length > 0);
       assert.ok(violations.some(v => v.includes("sunaba_sandbox_issue_write")));
-    });
-
-    it('"sunaba_sandbox_issue_write" on investigate passes', () => {
-      const violations = checkAgentPermissions(
-        {
-          "*": "deny",
-          "sunaba_read_file_range": "allow",
-          "sunaba_search_in_container": "allow",
-          "sunaba_list_files": "allow",
-          "sunaba_diff_in_container": "allow",
-          "sunaba_issue_view": "allow",
-          "sunaba_sandbox_issue_write": "allow",
-        },
-        "investigate",
-      );
-      assert.deepEqual(violations, []);
     });
 
     // --- kaiba is read-only for every phase ---
@@ -495,20 +475,6 @@ describe("agent permission allowlists", () => {
       assert.ok(violations.some(v => v.includes("sunaba_run_python") && v.includes("missing")));
     });
 
-    it("investigate missing sunaba_sandbox_issue_write", () => {
-      const violations = checkAgentPermissions(
-        {
-          "*": "deny",
-          "sunaba_read_file_range": "allow",
-          "sunaba_search_in_container": "allow",
-          "sunaba_list_files": "allow",
-          "sunaba_diff_in_container": "allow",
-          "sunaba_issue_view": "allow",
-        },
-        "investigate",
-      );
-      assert.ok(violations.some(v => v.includes("sunaba_sandbox_issue_write") && v.includes("missing")));
-    });
   });
 
   // --- Parser correctness (findings 2 and 3) ------------------------------------

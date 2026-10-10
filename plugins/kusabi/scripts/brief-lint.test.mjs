@@ -32,7 +32,6 @@ describe("briefLintReport — Rule A: Smoke section required for implement (kusa
       "plan",
       "review",
       "test-author",
-      "investigate",
       "respond",
       "gofer",
     ];

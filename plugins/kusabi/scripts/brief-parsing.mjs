@@ -328,8 +328,7 @@ export function parseDeliverables(briefText) {
 /**
  * Parse an optional `## Frozen Tests` section from a brief text.
  *
- * `Frozen Tests` is the canonical heading spelling (the investigate agent
- * writes it, `plugins/kusabi/opencode-agents/kusabi-investigate.md`).  Item
+ * `Frozen Tests` is the canonical heading spelling.  Item
  * syntax and path extraction are EXACTLY the Deliverables set — both go
  * through parsePathSection — so a brief author has one rule to learn, and
  * the annotated heading `## Frozen Tests (do not touch)` is recognised for

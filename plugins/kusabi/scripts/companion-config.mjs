@@ -73,7 +73,6 @@ export function resolveOrchestratorRecord(briefText, env = process.env) {
  */
 
 export const PHASE_AGENTS = {
-  investigate: "kusabi-investigate",
   implement: "kusabi-implement",
   review: "kusabi-review",
   respond: "kusabi-respond",

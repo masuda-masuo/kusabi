@@ -277,7 +277,7 @@ function usage() {
     "",
     "Flags:",
     "  --read-only, --resume-last",
-    "  --base <ref> (review: branch diff base; task: diff base for --phase review --container, rejected elsewhere), --agent <id>, --phase <name> (investigate|implement|review|respond|gofer|test-author|plan)",
+    "  --base <ref> (review: branch diff base; task: diff base for --phase review --container, rejected elsewhere), --agent <id>, --phase <name> (implement|review|respond|gofer|test-author|plan)",
     "  --backend opencode|claude|agy|codex (task/chain: force EVERY phase onto that backend; default opencode. Redundant when --model names a backend — a --backend that disagrees with such a --model is a contradiction and is rejected, naming both. With neither, the config chain entries decide: models.phases.<phase> (or models.chain) entries may carry a claude/, agy/, or codex/ prefix for per-phase backend mixing; one phase's chain must be single-backend. agy resumes via --conversation: --session/--resume-last are accepted when the job store proves the id an agy conversation, and --read-only/--deny are rejected on it. codex runs every invocation in a fixed read-only sandbox with reasoning effort high: --read-only is accepted, --deny is rejected, and the model must be one of the exact seat ids (" + formatCodexSupportedModels("or") + "). chain-resume accepts --backend/--model only to route a quota-exhausted review seat onto a different backend or model)",
     "  --session <id>, --timeout <s>, --watchdog <s>, --deny <tools>",
     "  --brief-file <path> (task / chain: read the brief from a file; exclusive with inline text)",
