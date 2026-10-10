@@ -264,4 +264,26 @@ describe("probeClaudeSessionUsage — direct", () => {
     assert.equal(probe.percent, null);
     assert.match(probe.detail, /could not start/);
   });
+
+  it("elapsedMs is unaffected when wall clock jumps backward (kusabi #723)", async (t) => {
+    let wall = 1_000_000_000;
+    t.mock.method(Date, "now", () => {
+      wall -= 50_000;
+      return wall;
+    });
+    let mono = 100;
+    const now = () => {
+      mono += 25;
+      return mono;
+    };
+    const probe = await probeClaudeSessionUsage({
+      bin: path.join(os.tmpdir(), "kusabi-no-such-claude-binary-xyz"),
+      timeoutMs: 2000,
+      now,
+    });
+    assert.equal(probe.readable, false);
+    assert.equal(probe.reason, "spawn-failed");
+    assert.ok(probe.elapsedMs >= 0, `elapsedMs (${probe.elapsedMs}) must not be negative`);
+    assert.equal(probe.elapsedMs, 25);
+  });
 });

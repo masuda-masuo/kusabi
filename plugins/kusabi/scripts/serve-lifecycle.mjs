@@ -114,7 +114,7 @@ export async function serverHealthy(server) {
  * failure path kills the process it spawned before throwing, so no live
  * serve ever outlives a call that did not record it in server.json.
  */
-export async function ensureServer(cwd) {
+export async function ensureServer(cwd, { now = () => performance.now() } = {}) {
   const stateDir = stateDirFor(cwd);
   const serverFile = path.join(stateDir, "server.json");
   const timeoutMs = serverReadyTimeoutMs();
@@ -132,7 +132,7 @@ export async function ensureServer(cwd) {
       if (err?.code !== "EEXIST") throw err;
       // Another caller is starting a serve.  Wait (bounded) for its
       // server.json to appear and become healthy, then reuse it.
-      const published = await waitForPublishedHealthy(serverFile, lockDir, timeoutMs);
+      const published = await waitForPublishedHealthy(serverFile, lockDir, timeoutMs, { now });
       if (published) return { ...published, stateDir };
       if (lockIsStale(lockDir, timeoutMs)) {
         // The holder gave up (or died) without publishing: a lock older than
@@ -147,7 +147,7 @@ export async function ensureServer(cwd) {
     }
     if (acquired) {
       try {
-        return await startServer({ stateDir, serverFile, cwd, timeoutMs });
+        return await startServer({ stateDir, serverFile, cwd, timeoutMs, now });
       } finally {
         try { fs.rmdirSync(lockDir); } catch { /* best-effort */ }
       }
@@ -158,9 +158,9 @@ export async function ensureServer(cwd) {
 // Wait for the lock holder to publish a healthy server.json.  Returns the
 // published record when it appears, or null when the holder releases the
 // lock without publishing (failed start-up) or the wait bound expires.
-async function waitForPublishedHealthy(serverFile, lockDir, timeoutMs) {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
+export async function waitForPublishedHealthy(serverFile, lockDir, timeoutMs, { now = () => performance.now() } = {}) {
+  const deadline = now() + timeoutMs;
+  while (now() < deadline) {
     const published = readJson(serverFile);
     if (published && (await serverHealthy(published))) return published;
     if (!fs.existsSync(lockDir)) return null;
@@ -181,7 +181,7 @@ function lockIsStale(lockDir, timeoutMs) {
 // record is written to server.json (the lock holder's finally releases the
 // lock afterwards); on any failure the spawned child is killed before the
 // error propagates, so a live serve is never left unrecorded.
-async function startServer({ stateDir, serverFile, cwd, timeoutMs }) {
+async function startServer({ stateDir, serverFile, cwd, timeoutMs, now = () => performance.now() }) {
   const port = await freePort();
   const password = crypto.randomBytes(16).toString("hex");
   const logFile = path.join(stateDir, "server.log");
@@ -208,9 +208,9 @@ async function startServer({ stateDir, serverFile, cwd, timeoutMs }) {
   });
 
   const server = { port, password, pid: child.pid, cwd, startedAt: new Date().toISOString() };
-  const deadline = Date.now() + timeoutMs;
+  const deadline = now() + timeoutMs;
   try {
-    while (Date.now() < deadline) {
+    while (now() < deadline) {
       if (await serverHealthy(server)) {
         writeJson(serverFile, server);
         return { ...server, stateDir };

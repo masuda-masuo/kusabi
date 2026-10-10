@@ -170,18 +170,24 @@ function sessionResetFrom(prose, matchIndex) {
  * @param {string} opts.bin — the resolved claude binary (claudeBin()).
  * @param {string} [opts.cwd]
  * @param {number} [opts.timeoutMs]
+ * @param {() => number} [opts.now=performance.now] — monotonic clock for elapsed time.
  * @returns {Promise<{ readable: true, percent: number, reset: string|null, reason: null,
  *                     detail: null, elapsedMs: number }
  *                  | { readable: false, percent: null, reset: null,
  *                      reason: "spawn-failed"|"timeout"|"exit-nonzero"|"unparsed",
  *                      detail: string, elapsedMs: number }>}
  */
-export function probeClaudeSessionUsage({ bin, cwd, timeoutMs = usageProbeTimeoutMs() } = {}) {
+export function probeClaudeSessionUsage({
+  bin,
+  cwd,
+  timeoutMs = usageProbeTimeoutMs(),
+  now = () => performance.now(),
+} = {}) {
   return new Promise((resolve) => {
-    const startedAt = Date.now();
+    const startedAt = now();
     const unreadable = (reason, detail) => resolve({
       readable: false, percent: null, reset: null, reason, detail,
-      elapsedMs: Date.now() - startedAt,
+      elapsedMs: Math.round(now() - startedAt),
     });
 
     let child;
@@ -242,7 +248,7 @@ export function probeClaudeSessionUsage({ bin, cwd, timeoutMs = usageProbeTimeou
         unreadable("unparsed", `no "Current session: NN% used" reading in: ${stdout.trim().slice(0, 300) || "(empty stdout)"}`);
         return;
       }
-      resolve({ readable: true, percent, reset, reason: null, detail: null, elapsedMs: Date.now() - startedAt });
+      resolve({ readable: true, percent, reset, reason: null, detail: null, elapsedMs: Math.round(now() - startedAt) });
     });
   });
 }

@@ -177,7 +177,10 @@ function stopResult(outcome, pid, signalled, reason, survivors = []) {
  *   - `no-record`        — the record names no pid at all.
  *   - `alive`            — signalled, and something in the group survived.
  */
-export async function stopRecordedProcess(recorded, { waitMs, pollMs = KILL_CONFIRM_POLL_MS } = {}) {
+export async function stopRecordedProcess(
+  recorded,
+  { waitMs, pollMs = KILL_CONFIRM_POLL_MS, now = () => performance.now() } = {},
+) {
   const pid = Number(recorded?.pid);
   if (!Number.isInteger(pid) || pid <= 0) {
     return stopResult("no-record", null, false, "the job record carries no process id");
@@ -223,12 +226,12 @@ export async function stopRecordedProcess(recorded, { waitMs, pollMs = KILL_CONF
     return stopResult("alive", pid, false, `SIGKILL to process group ${pid} failed: ${err?.code ?? err?.message ?? err}`);
   }
 
-  const deadline = Date.now() + (waitMs ?? killConfirmWaitMs());
+  const deadline = now() + (waitMs ?? killConfirmWaitMs());
   for (;;) {
     if (groupIsGone(pid)) {
       return stopResult("stopped", pid, true, `process group ${pid} is gone`);
     }
-    if (Date.now() >= deadline) {
+    if (now() >= deadline) {
       const survivors = processGroupMembers(pid) ?? [];
       return stopResult(
         "alive",
