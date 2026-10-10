@@ -8,6 +8,7 @@ import {
   __testProbeBindings,
   buildTaskReviewInput,
   cmdReview,
+  cmdTask,
   cmdTaskDetach,
   resolveTaskPreflight,
 } from "./task-cmd.mjs";
@@ -45,8 +46,19 @@ describe("probe function local bindings", () => {
 describe("buildTaskReviewInput", () => {
   function containerTool(overrides = {}) {
     const commands = [];
-    const callTool = async (tool, params) => {
-      const cmd = params.commands?.[0] ?? params.argv?.join(" ") ?? "";
+    const toolCalls = [];
+    const callTool = async (tool, params = {}) => {
+      toolCalls.push({ tool, params });
+      if (tool === "verify_in_container") {
+        return overrides[tool] ?? {
+          gate_passed: true,
+          status: "ok",
+          tests: { full: { status: "ok", passed: 1, total: 1 } },
+          lint: [],
+          types: [],
+        };
+      }
+      const cmd = params?.commands?.[0] ?? params?.argv?.join(" ") ?? "";
       commands.push(cmd);
       if (cmd.includes("change-scope.mjs")) {
         const base = cmd.includes("c355fa61a7fee5402ed7ba999bd2fe2eeb46a842")
@@ -67,9 +79,10 @@ describe("buildTaskReviewInput", () => {
       if (cmd === "git status --porcelain") return { output: " M src/foo.js\n" };
       if (cmd === "git log --oneline -5") return { output: "deadbee latest\n" };
       if (cmd.startsWith("git rev-parse --verify")) return { output: "c355fa61a7fee5402ed7ba999bd2fe2eeb46a842\n" };
+      if (cmd.includes("SMOKE_EXIT=")) return { output: "SMOKE_EXIT=0\n" };
       return { output: "" };
     };
-    return { commands, callTool };
+    return { commands, toolCalls, callTool };
   }
 
   it("builds the container review input for --phase review --container", async () => {
@@ -157,14 +170,248 @@ describe("buildTaskReviewInput", () => {
     assert.equal(await buildTaskReviewInput({ phase: null, flags: { container: "cid123" }, callTool }), null);
   });
 
-  it("is what cmdTask appends to the task prompt (source guard)", async () => {
-    // cmdTask lives in task-cmd.mjs (kusabi #437); this pins the wiring —
-    // the review input is built before dispatch and concatenated onto the prompt that is sent.
-    const source = fs.readFileSync(path.join(import.meta.dirname, "task-cmd.mjs"), "utf8");
-    const cmdTaskSource = source.slice(source.indexOf("async function cmdTask("), source.indexOf("async function cmdReview("));
-    assert.ok(cmdTaskSource.includes("await buildTaskReviewInput({ phase, flags })"));
-    assert.ok(cmdTaskSource.includes("promptText: taskPromptText"));
-    assert.ok(cmdTaskSource.includes("${taskReviewInput}"));
+  it("appends container review input with resolved base to cmdTask prompt", async () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-test-cmdtask-review-"));
+    const cwd = path.join(tmp, "ws");
+    fs.mkdirSync(cwd, { recursive: true });
+    const stateRoot = path.join(tmp, "state");
+    fs.mkdirSync(stateRoot, { recursive: true });
+    const prevStateEnv = process.env.KUSABI_STATE_DIR;
+    process.env.KUSABI_STATE_DIR = stateRoot;
+    try {
+      const { commands, toolCalls, callTool } = containerTool();
+      const dispatches = [];
+      const fakeJob = {
+        id: "job-review-test-1",
+        status: "completed",
+        startedAt: "2026-10-10T00:00:00.000Z",
+        finishedAt: "2026-10-10T00:01:00.000Z",
+      };
+      const fakeDispatch = async (dispatchArgs) => {
+        dispatches.push(dispatchArgs);
+        return {
+          job: fakeJob,
+          resultText: "review complete",
+        };
+      };
+
+      const taskText = "Orchestrator: test-model | session test-session | 2026-09-12\n\nreview the change";
+
+      const res = await cmdTask(
+        cwd,
+        {
+          flags: { phase: "review", container: "cid123", base: "c355fa6" },
+          text: taskText,
+          _dispatch: fakeDispatch,
+        },
+        {
+          stateRoot,
+          callTool,
+        },
+      );
+
+      assert.equal(res.exitCode, 0, res.text);
+      assert.equal(fakeJob.probesGreen, true, "job.probesGreen must be true for green container review");
+      const p1 = fakeJob.probeResults?.find((p) => p.probe === "P1: HEAD clean");
+      assert.ok(p1, "P1: HEAD clean probe must exist");
+      assert.equal(p1.passed, true);
+      assert.equal(p1.detail, "HEAD matches base deadbeefcafe");
+      const p2 = fakeJob.probeResults?.find((p) => p.probe === "P2: verify gate");
+      assert.ok(p2, "P2: verify gate probe must exist");
+      assert.equal(p2.passed, true);
+
+      assert.equal(dispatches.length, 1, "exactly one dispatch should occur");
+      const sent = dispatches[0];
+
+      // Dispatched prompt includes original task, container, resolved base, and review input marker/path
+      assert.ok(sent.promptText.includes("<task>\n" + taskText + "\n</task>"), "prompt includes original task");
+      assert.ok(sent.promptText.includes("cid123"), "prompt includes container");
+      assert.ok(
+        sent.promptText.includes("c355fa61a7fee5402ed7ba999bd2fe2eeb46a842"),
+        "prompt includes resolved base commit",
+      );
+      assert.ok(sent.promptText.includes("## Review target"), "prompt includes review target heading");
+      assert.ok(sent.promptText.includes("src/foo.js"), "prompt includes marker/path from collected review input");
+      assert.ok(sent.promptText.includes("`diff_in_container`"), "prompt includes diff instruction");
+
+      // Confirm no git diff capture
+      assert.ok(!sent.promptText.includes("diff --git"), "prompt must not inline git diff");
+      assert.ok(
+        !commands.some((c) => c.startsWith("git diff")),
+        `no git diff may be captured, got: ${JSON.stringify(commands)}`,
+      );
+
+      // Verify toolCalls requested expected container and resolved base
+      assert.ok(toolCalls.length > 0, "toolCalls must not be empty");
+      assert.ok(
+        toolCalls.every((c) => c.params?.container_id === "cid123"),
+        "all container tool calls must target container cid123",
+      );
+      assert.ok(
+        toolCalls.some((c) => c.tool === "verify_in_container"),
+        "verify_in_container must be called",
+      );
+      assert.ok(
+        commands.some((c) => c.includes("c355fa61a7fee5402ed7ba999bd2fe2eeb46a842")),
+        "commands must reference the resolved base commit",
+      );
+
+      // Negative control inside this registration: injected verify gate false must be observable as exitCode 1 and probesGreen false
+      const failTool = containerTool({
+        verify_in_container: {
+          gate_passed: false,
+          status: "failed",
+          tests: { full: { status: "failed", passed: 0, total: 1 } },
+          lint: [],
+          types: [],
+        },
+      });
+      const failJob = {
+        id: "job-review-fail-1",
+        status: "completed",
+        startedAt: "2026-10-10T00:00:00.000Z",
+        finishedAt: "2026-10-10T00:01:00.000Z",
+      };
+      const failDispatch = async () => ({ job: failJob, resultText: "review complete" });
+
+      const failRes = await cmdTask(
+        cwd,
+        {
+          flags: { phase: "review", container: "cid123", base: "c355fa6" },
+          text: taskText,
+          _dispatch: failDispatch,
+        },
+        {
+          stateRoot,
+          callTool: failTool.callTool,
+        },
+      );
+
+      assert.equal(failRes.exitCode, 1, "injected verify failure must result in exitCode 1");
+      assert.equal(failJob.probesGreen, false, "injected verify failure must mark probesGreen false");
+      const failP2 = failJob.probeResults?.find((p) => p.probe === "P2: verify gate");
+      assert.ok(failP2, "P2 probe must exist in failing run");
+      assert.equal(failP2.passed, false, "P2 probe must be marked not passed");
+    } finally {
+      if (prevStateEnv === undefined) delete process.env.KUSABI_STATE_DIR;
+      else process.env.KUSABI_STATE_DIR = prevStateEnv;
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("leaves cmdTask prompt free of review input for non-review or containerless flows", async () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-test-cmdtask-noreview-"));
+    const cwd = path.join(tmp, "ws");
+    fs.mkdirSync(cwd, { recursive: true });
+    const stateRoot = path.join(tmp, "state");
+    fs.mkdirSync(stateRoot, { recursive: true });
+    const prevStateEnv = process.env.KUSABI_STATE_DIR;
+    process.env.KUSABI_STATE_DIR = stateRoot;
+    try {
+      const { callTool, toolCalls } = containerTool();
+
+      // Case 1: containerless review flow
+      const dispatches1 = [];
+      const fakeJob1 = {
+        id: "job-containerless",
+        status: "completed",
+        startedAt: "2026-10-10T00:00:00.000Z",
+        finishedAt: "2026-10-10T00:01:00.000Z",
+      };
+      const fakeDispatch1 = async (args) => {
+        dispatches1.push(args);
+        return {
+          job: fakeJob1,
+          resultText: "done",
+        };
+      };
+      const reviewBrief = "Orchestrator: test-model | session test-session | 2026-09-12\n\nreview the change";
+      const res1 = await cmdTask(
+        cwd,
+        {
+          flags: { phase: "review" },
+          text: reviewBrief,
+          _dispatch: fakeDispatch1,
+        },
+        { stateRoot, callTool },
+      );
+      assert.equal(res1.exitCode, 0, res1.text);
+      assert.equal(dispatches1.length, 1);
+      assert.ok(
+        !dispatches1[0].promptText.includes("## Review target"),
+        "containerless review must not have review input in prompt",
+      );
+      assert.ok(
+        !dispatches1[0].promptText.includes("`diff_in_container`"),
+        "containerless review must not have diff_in_container in prompt",
+      );
+      assert.equal(toolCalls.length, 0, "containerless review must make zero container tool calls");
+
+      // Case 2: non-review phase with container (implement)
+      const dispatches2 = [];
+      const fakeJob2 = {
+        id: "job-implement",
+        status: "completed",
+        startedAt: "2026-10-10T00:00:00.000Z",
+        finishedAt: "2026-10-10T00:01:00.000Z",
+      };
+      const fakeDispatch2 = async (args) => {
+        dispatches2.push(args);
+        return {
+          job: fakeJob2,
+          resultText: "done",
+        };
+      };
+      const implementBrief = [
+        "Orchestrator: test-model | session test-session | 2026-09-12",
+        "",
+        "implement the change",
+        "",
+        "## Deliverables",
+        "- `src/foo.js`",
+        "",
+        "## Smoke",
+        "- `npm test`",
+        "",
+      ].join("\n");
+      const res2 = await cmdTask(
+        cwd,
+        {
+          flags: { phase: "implement", container: "cid123" },
+          text: implementBrief,
+          _dispatch: fakeDispatch2,
+        },
+        { stateRoot, callTool },
+      );
+      assert.equal(res2.exitCode, 0, res2.text);
+      assert.equal(fakeJob2.probesGreen, true, "implement container probes must pass");
+      const p1_2 = fakeJob2.probeResults?.find((p) => p.probe === "P1: HEAD clean");
+      assert.ok(p1_2, "P1 probe must exist in implement run");
+      assert.equal(p1_2.passed, true);
+      assert.equal(p1_2.detail, "HEAD matches base deadbeefcafe");
+      const p2_2 = fakeJob2.probeResults?.find((p) => p.probe === "P2: verify gate");
+      assert.ok(p2_2, "P2 probe must exist in implement run");
+      assert.equal(p2_2.passed, true);
+
+      assert.equal(dispatches2.length, 1);
+      assert.ok(
+        !dispatches2[0].promptText.includes("## Review target"),
+        "implement phase must not have review input in prompt",
+      );
+      assert.ok(
+        !dispatches2[0].promptText.includes("- Base commit:"),
+        "implement phase must not have base commit review input in prompt",
+      );
+      assert.ok(toolCalls.length > 0, "implement with container must invoke container tools");
+      assert.ok(
+        toolCalls.every((c) => c.params?.container_id === "cid123"),
+        "all container tool calls must target container cid123",
+      );
+    } finally {
+      if (prevStateEnv === undefined) delete process.env.KUSABI_STATE_DIR;
+      else process.env.KUSABI_STATE_DIR = prevStateEnv;
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
   });
 });
 
@@ -281,6 +528,21 @@ describe("resolveTaskPreflight lossy-smoke refusal option", () => {
     }
   }
 
+  async function withStateRootAsync(fn) {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-task-preflight-"));
+    const stateRoot = path.join(tmp, "state");
+    fs.mkdirSync(stateRoot, { recursive: true });
+    const prevStateEnv = process.env.KUSABI_STATE_DIR;
+    process.env.KUSABI_STATE_DIR = stateRoot;
+    try {
+      return await fn({ tmp, stateRoot });
+    } finally {
+      if (prevStateEnv === undefined) delete process.env.KUSABI_STATE_DIR;
+      else process.env.KUSABI_STATE_DIR = prevStateEnv;
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  }
+
   it("skips smokeViolationReport when refuseOnLossySmoke is false (foreground task)", () => {
     withStateRoot(({ tmp, stateRoot }) => {
       const pre = resolveTaskPreflight(
@@ -318,15 +580,59 @@ describe("resolveTaskPreflight lossy-smoke refusal option", () => {
     });
   });
 
-  it("cmdTask caller opts out of lossy-smoke refusal; cmdTaskDetach opts in (source guard)", () => {
-    const source = fs.readFileSync(path.join(import.meta.dirname, "task-cmd.mjs"), "utf8");
-    const taskIdx = source.indexOf("export async function cmdTask(");
-    const detachIdx = source.indexOf("export async function cmdTaskDetach(");
-    assert.ok(taskIdx >= 0 && detachIdx >= 0);
-    const taskBlock = source.slice(taskIdx, taskIdx + 800);
-    const detachBlock = source.slice(detachIdx, detachIdx + 900);
-    assert.match(taskBlock, /refuseOnLossySmoke:\s*false/);
-    assert.match(detachBlock, /refuseOnLossySmoke:\s*true/);
+  it("cmdTask dispatches with lossy brief while cmdTaskDetach rejects before spawn", async () => {
+    await withStateRootAsync(async ({ tmp, stateRoot }) => {
+      // 1. Foreground cmdTask with LOSSY_BRIEF reaches fake dispatch
+      const dispatches = [];
+      const fakeDispatch = async (opts) => {
+        dispatches.push(opts);
+        return {
+          job: {
+            id: "job-fg-lossy",
+            status: "completed",
+            startedAt: "2026-10-10T00:00:00.000Z",
+            finishedAt: "2026-10-10T00:01:00.000Z",
+          },
+          resultText: "fg completed",
+        };
+      };
+
+      const fgRes = await cmdTask(
+        tmp,
+        { flags: { phase: "review" }, text: LOSSY_BRIEF, _dispatch: fakeDispatch },
+        { stateRoot },
+      );
+      assert.equal(fgRes.exitCode, 0, fgRes.text);
+      assert.equal(dispatches.length, 1, "foreground cmdTask must reach dispatch with lossy brief");
+      assert.ok(dispatches[0].promptText.includes("review the change"));
+
+      // 2. cmdTaskDetach rejects LOSSY_BRIEF before fake spawn
+      let spawnCalls = 0;
+      const fakeSpawn = () => {
+        spawnCalls++;
+        return { pid: 424243, unref() {} };
+      };
+
+      await assert.rejects(
+        () =>
+          cmdTaskDetach(
+            tmp,
+            { flags: { phase: "review" }, text: LOSSY_BRIEF },
+            { stateRoot, spawn: fakeSpawn },
+          ),
+        /brief rejected before dispatch: the ## Smoke section/,
+      );
+      assert.equal(spawnCalls, 0, "cmdTaskDetach must reject lossy brief with zero spawn calls");
+
+      // 3. Clean detach control proves fake spawn seam is reachable
+      const banner = await cmdTaskDetach(
+        tmp,
+        { flags: { phase: "review" }, text: CLEAN_BRIEF },
+        { stateRoot, spawn: fakeSpawn },
+      );
+      assert.equal(spawnCalls, 1, "cmdTaskDetach spawns exactly once when brief is clean");
+      assert.match(banner, /^Detached task launched \(pid 424243\)\./m);
+    });
   });
 });
 // cmdTaskDetach — smoke baseline refusal before spawn (kusabi #513)

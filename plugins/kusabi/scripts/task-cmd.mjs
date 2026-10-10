@@ -535,7 +535,7 @@ export async function cmdTask(cwd, { flags, text, _dispatch = null }, opts = {})
         // ---- record baseSha before dispatching the job if --container (for probe comparison) ----
         if (flags.container) {
           try {
-            const { callTool } = await import("./sunaba-rpc.mjs");
+            const callTool = opts.callTool || (await import("./sunaba-rpc.mjs")).callTool;
             const gitRev = await callTool("sandbox_exec", {
               container_id: flags.container,
               commands: ["git rev-parse HEAD"],
@@ -553,7 +553,7 @@ export async function cmdTask(cwd, { flags, text, _dispatch = null }, opts = {})
         // no --container to run it in) executes nothing extra and dispatches
         // exactly as before.
         if (flags.container) {
-          const { callTool } = await import("./sunaba-rpc.mjs");
+          const callTool = opts.callTool || (await import("./sunaba-rpc.mjs")).callTool;
           const baselineRejection = await smokeBaselineReport({
             brief: briefText,
             callTool,
@@ -569,7 +569,7 @@ export async function cmdTask(cwd, { flags, text, _dispatch = null }, opts = {})
   // ---- deterministic probes (when --container given) ----
   if (flags.container) {
     try {
-      const { callTool } = await import("./sunaba-rpc.mjs");
+      const callTool = opts.callTool || (await import("./sunaba-rpc.mjs")).callTool;
       const container = flags.container;
       const probeResults = [];
 
@@ -694,7 +694,7 @@ export async function dispatchTaskJob(cwd, { flags, text, _dispatch = null }, op
     await opts.beforeDispatch({ pre, text, phase, flags });
   }
 
-  const taskReviewInput = await buildTaskReviewInput({ phase, flags });
+  const taskReviewInput = await buildTaskReviewInput({ phase, flags, callTool: opts.callTool });
   const guardrails = fs.readFileSync(path.join(PLUGIN_ROOT, "prompts", "task-guardrails.md"), "utf8").trim();
   let taskPromptText = taskReviewInput
     ? `${guardrails}\n\n<task>\n${text}\n</task>\n\n${taskReviewInput}`
