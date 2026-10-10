@@ -77,7 +77,31 @@ describe("ensureSymlink (kusabi #256)", () => {
     assert.deepEqual(fs.readdirSync(linkDir), ["delegate"]);
   });
 
-  it("sweeps a stale staging entry from a crashed run before replacing (kusabi #258)", () => {
+  const staleStagingCases = [
+    {
+      // The replace branch sweeps residue regardless of the dead pid.
+      name: "sweeps a stale staging entry from a crashed run before replacing (kusabi #258)",
+      initialTarget: "other",
+      staleTarget: "other",
+      state: "updated",
+    },
+    {
+      // A current link must sweep residue too, or it survives forever.
+      name: "sweeps a stale staging entry when the link is already current (kusabi #258)",
+      initialTarget: "source",
+      staleTarget: "source",
+      state: "current",
+    },
+    {
+      // The create branch must sweep residue beside the freshly created link.
+      name: "sweeps a stale staging entry when no link exists yet (kusabi #258)",
+      initialTarget: null,
+      staleTarget: "other",
+      state: "created",
+    },
+  ];
+
+  function prepareStaleStagingCase({ initialTarget, staleTarget }) {
     const source = path.join(tmp, "skills", "delegate");
     const other = path.join(tmp, "elsewhere");
     fs.mkdirSync(source, { recursive: true });
@@ -85,63 +109,25 @@ describe("ensureSymlink (kusabi #256)", () => {
     const linkDir = path.join(tmp, "cursor", "skills");
     fs.mkdirSync(linkDir, { recursive: true });
     const link = path.join(linkDir, "delegate");
-    fs.symlinkSync(other, link);
-    // Residue from a crashed previous run: a staging symlink left under a
-    // pid that is provably dead — a short-lived child, already exited and
-    // reaped by spawnSync.  The replace must sweep it regardless of pid.
+    if (initialTarget) fs.symlinkSync(initialTarget === "source" ? source : other, link);
+    // A short-lived child is exited and reaped by spawnSync, so its staging
+    // symlink uses a pid that is provably dead.
     const deadPid = spawnSync(process.execPath, ["-e", ""]).pid;
     const stale = path.join(linkDir, `delegate.kusabi-tmp-${deadPid}`);
-    fs.symlinkSync(other, stale);
+    fs.symlinkSync(staleTarget === "source" ? source : other, stale);
+    return { source, link, linkDir, stale };
+  }
 
-    const res = ensureSymlink(source, link);
-    assert.equal(res.state, "updated");
-    assert.equal(fs.realpathSync(link), fs.realpathSync(source));
-    assert.ok(!fs.existsSync(stale), "stale staging entry must be swept");
-    assert.deepEqual(fs.readdirSync(linkDir), ["delegate"]);
-  });
-
-  it("sweeps a stale staging entry when the link is already current (kusabi #258)", () => {
-    const source = path.join(tmp, "skills", "delegate");
-    fs.mkdirSync(source, { recursive: true });
-    const linkDir = path.join(tmp, "cursor", "skills");
-    fs.mkdirSync(linkDir, { recursive: true });
-    const link = path.join(linkDir, "delegate");
-    fs.symlinkSync(source, link);
-    // Residue from a crashed replace beside a link that already points at the
-    // right target: the current branch must still sweep it, or it would
-    // survive forever (no replace ever happens again to clean it up).
-    const deadPid = spawnSync(process.execPath, ["-e", ""]).pid;
-    const stale = path.join(linkDir, `delegate.kusabi-tmp-${deadPid}`);
-    fs.symlinkSync(source, stale);
-
-    const res = ensureSymlink(source, link);
-    assert.equal(res.state, "current");
-    assert.equal(fs.realpathSync(link), fs.realpathSync(source));
-    assert.ok(!fs.existsSync(stale), "stale staging entry must be swept on the current branch");
-    assert.deepEqual(fs.readdirSync(linkDir), ["delegate"]);
-  });
-
-  it("sweeps a stale staging entry when no link exists yet (kusabi #258)", () => {
-    const source = path.join(tmp, "skills", "delegate");
-    const other = path.join(tmp, "elsewhere");
-    fs.mkdirSync(source, { recursive: true });
-    fs.mkdirSync(other, { recursive: true });
-    const linkDir = path.join(tmp, "cursor", "skills");
-    fs.mkdirSync(linkDir, { recursive: true });
-    const link = path.join(linkDir, "delegate");
-    // No link at all — e.g. the old one was removed after the crash — so this
-    // run takes the create branch: it must still sweep the crashed run's
-    // residue rather than leave it next to the freshly created link.
-    const deadPid = spawnSync(process.execPath, ["-e", ""]).pid;
-    const stale = path.join(linkDir, `delegate.kusabi-tmp-${deadPid}`);
-    fs.symlinkSync(other, stale);
-
-    const res = ensureSymlink(source, link);
-    assert.equal(res.state, "created");
-    assert.equal(fs.realpathSync(link), fs.realpathSync(source));
-    assert.ok(!fs.existsSync(stale), "stale staging entry must be swept on the create branch");
-    assert.deepEqual(fs.readdirSync(linkDir), ["delegate"]);
-  });
+  for (const testCase of staleStagingCases) {
+    it(testCase.name, () => {
+      const { source, link, linkDir, stale } = prepareStaleStagingCase(testCase);
+      const res = ensureSymlink(source, link);
+      assert.equal(res.state, testCase.state);
+      assert.equal(fs.realpathSync(link), fs.realpathSync(source));
+      assert.ok(!fs.existsSync(stale), "stale staging entry must be swept");
+      assert.deepEqual(fs.readdirSync(linkDir), ["delegate"]);
+    });
+  }
 
   it("leaves a stale staging entry for a different link name alone (kusabi #258)", () => {
     const source = path.join(tmp, "skills", "delegate");
