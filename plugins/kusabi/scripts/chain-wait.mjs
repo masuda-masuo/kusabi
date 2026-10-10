@@ -403,11 +403,18 @@ function reportIgnoredDefault(chainId) {
  * Selection is the rule above; the newest eligible chain id wins.
  */
 async function waitForChainToAppear({
-  candidates, chainsDir, since, pollIntervalMs, appearTimeoutMs, sleep, now, startedAt,
+  candidates, chainsDir, since, pollIntervalMs, appearTimeoutMs, sleep, now, startedAt, onLocked,
 }) {
   for (;;) {
+    // List the ids BEFORE selecting: a chain that appears between this listing
+    // and the selection is then never mistaken for one that was present at
+    // lock time (it is either the locked chain itself or newer by observation).
+    const idsBeforeSelection = new Set(listChainIds(chainsDir));
     const list = candidates();
-    if (list.length > 0) return list[0].id;
+    if (list.length > 0) {
+      onLocked(idsBeforeSelection);
+      return list[0].id;
+    }
 
     if (now() - startedAt >= appearTimeoutMs) {
       const scope = since == null
@@ -437,8 +444,9 @@ async function waitForChainToAppear({
  * chain id (usage), a named chain that never appeared (no-chain-appeared),
  * nothing appeared in appear-mode (no-chain-appeared), or the chain stalled.
  *
- * Everything the loop cannot decide from files is injected — `sleep`, `now`,
- * and the liveness prober are the seams the tests fake.
+ * Everything the loop cannot decide from files is injected — `sleep`, the
+ * monotonic `now` clock, the wall clock, and the liveness prober are the seams
+ * the tests fake.
  *
  * @param {object} opts
  * @param {string} opts.chainsDir            - `<stateDir>/chains`.
@@ -451,7 +459,8 @@ async function waitForChainToAppear({
  * @param {number} [opts.progressTimeoutMs]
  * @param {(pid: number|null) => "alive"|"gone"|"unverifiable"} [opts.probeProcess]
  * @param {(ms: number) => Promise<void>} [opts.sleep]
- * @param {() => number} [opts.now]
+ * @param {() => number} [opts.now]           - monotonic elapsed-time clock.
+ * @param {() => number} [opts.wallNow]       - epoch clock for chain stamps.
  * @param {(chainId: string) => void} [opts.reportIgnored] - told once per chain
  *                                     dir skipped as debris (default: one
  *                                     stderr line).
@@ -466,13 +475,16 @@ export async function waitForChain({
   progressTimeoutMs = DEFAULT_PROGRESS_TIMEOUT_MS,
   probeProcess = probeChainProcess,
   sleep = defaultSleep,
-  now = Date.now,
+  now = () => performance.now(),
+  wallNow = Date.now,
   reportIgnored = reportIgnoredDefault,
   createdAt = chainDirCreatedAt,
 } = {}) {
-  const startedAt = now();
+  const elapsedStartedAt = now();
+  const startedAt = wallNow();
 
   let id = chainId;
+  let lockedRecordlessIds = new Set();
   // The --next selection rule.  It is also consulted while the wait holds a
   // recordless chain, so a newer chain directory that appears mid-wait wins
   // over the empty dir (kusabi #298).
@@ -489,7 +501,8 @@ export async function waitForChain({
       chainsDir, since, startedAt, appearTimeoutMs, reportIgnored, createdAt,
     });
     id = await waitForChainToAppear({
-      candidates, chainsDir, since, pollIntervalMs, appearTimeoutMs, sleep, now, startedAt,
+      candidates, chainsDir, since, pollIntervalMs, appearTimeoutMs, sleep, now, startedAt: elapsedStartedAt,
+      onLocked: (idsBeforeSelection) => { lockedRecordlessIds = idsBeforeSelection; },
     });
   } else {
     if (!id) {
@@ -514,7 +527,7 @@ export async function waitForChain({
     // launcher returned, so poll until it appears or the appear window
     // elapses instead of throwing immediately.
     while (!fs.existsSync(path.join(chainsDir, id))) {
-      if (now() - startedAt >= appearTimeoutMs) {
+      if (now() - elapsedStartedAt >= appearTimeoutMs) {
         throw new ChainWaitError(
           `no chain appeared within ${Math.round(appearTimeoutMs / 1000)}s for chain ${id} ` +
           `(searched ${chainsDir}) — the launcher may still be in its pre-flight, or it ` +
@@ -527,7 +540,7 @@ export async function waitForChain({
     }
   }
 
-  const done = (snapshot) => ({ ...snapshot, digest: formatWaitDigest(snapshot, { waitedMs: now() - startedAt }) });
+  const done = (snapshot) => ({ ...snapshot, digest: formatWaitDigest(snapshot, { waitedMs: now() - elapsedStartedAt }) });
   const stall = (snapshot, staleMs, reason) => new ChainWaitError(
     `chain ${snapshot.chainId} stalled: last observed ${describeSnapshot(snapshot)}, `
     + `unchanged for ${Math.round(staleMs / 1000)}s (${reason}). `
@@ -537,7 +550,7 @@ export async function waitForChain({
   );
 
   let fingerprint = null;
-  let lastProgressAt = startedAt;
+  let lastProgressAt = elapsedStartedAt;
 
   for (;;) {
     const snapshot = readChainSnapshot(chainsDir, id);
@@ -578,23 +591,30 @@ export async function waitForChain({
       // NAMED chain is the caller's explicit choice and is never traded away.
       if (candidates !== null) {
         const lockedAt = createdAt(chainsDir, id);
-        // A switch target must be at least as new as the locked dir — the
-        // same-stamp case is a real chain born in the same millisecond as the
-        // empty dir — and must be neither the locked dir itself nor one this
-        // wait already traded away: an abandoned dir is never revisited.
+        // A chain observed after this recordless dir was locked is newer by
+        // observation order even if its wall-clock creation stamp moved
+        // backward. For dirs already present at lock time, retain the
+        // same-stamp rule and reject older stamps. Never choose the locked dir
+        // itself or one this wait already traded away.
+        // Listed BEFORE the selection, for the same reason as at first lock:
+        // the switch target's own lock set must not absorb a chain that
+        // appears between the selection and the listing.
+        const idsBeforeSelection = new Set(listChainIds(chainsDir));
         const target = candidates().find(
-          (c) => c.createdAt >= lockedAt && c.id !== id && !abandoned.has(c.id),
+          (c) => c.id !== id && !abandoned.has(c.id)
+            && (!lockedRecordlessIds.has(c.id) || c.createdAt >= lockedAt),
         );
         if (target) {
           abandoned.add(id);
           id = target.id;
+          lockedRecordlessIds = idsBeforeSelection;
           continue;
         }
       }
-      if (now() - startedAt >= appearTimeoutMs) {
+      if (now() - elapsedStartedAt >= appearTimeoutMs) {
         throw stall(
           snapshot,
-          now() - startedAt,
+          now() - elapsedStartedAt,
           `no control record in ${snapshot.chainDir} after ${Math.round(appearTimeoutMs / 1000)}s`,
         );
       }
