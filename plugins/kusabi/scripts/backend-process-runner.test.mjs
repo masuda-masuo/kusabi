@@ -282,35 +282,41 @@ describe("runBackendProcess", () => {
   });
 
   it("a stalled parent does not defer the silence watchdog clock (kusabi #619)", async () => {
-    // Deterministic bounds rationale:
-    // 1. Clock starts before spawn (t = 0).
-    // 2. onStart stalls the parent thread synchronously for 800ms (t = 0..800ms).
-    // 3. The silence watchdog polls every 250ms starting when setup returns at t = 800ms.
-    // 4. At the first poll tick (t ~= 800 + 250 = 1050ms), elapsed silence from spawn
-    //    is 1050ms > watchdogS (1000ms). The watchdog fires and kills the child group.
-    //    If tick 1 is slightly delayed, tick 2 fires at 1300ms.
-    // 5. The child lives 1700ms without emitting anything. This provides a 650ms safety
-    //    margin after the first poll (1050ms) and 400ms after the second poll (1300ms)
-    //    to ensure the child cannot exit naturally before the watchdog fires.
-    // 6. Before fix #619, the clock was initialized after onStart (t = 800ms). The 250ms
-    //    polls observed silence of 250ms (at 1050ms), 500ms (at 1300ms), and 750ms (at
-    //    1550ms). The child exited naturally at 1700ms before the 4th poll at 1800ms
-    //    could observe >= 1000ms, deterministically causing stalled === false (exit 0).
-    // 7. Therefore, with the fix stalled is deterministically true; without it, false.
+    // Load-independent assertion (kusabi #677).  The old version raced the
+    // watchdog against a child that exited on its own after 1700 ms, so a
+    // parent whose timers lagged > 650 ms under full-suite load saw the child
+    // exit first and read stalled === false.
+    //
+    // Now the child never exits on its own (the watchdog kills it), and the
+    // test reads the silence the watchdog itself measured:
+    // - With the fix the clock starts before spawn, so the silence at the
+    //   first poll after the 2500 ms stall is >= 2500 ms → silenceS >= 3
+    //   (Math.round of >= 2.5 s).  Load only delays the poll, which makes the
+    //   measured silence LONGER, never shorter.
+    // - Without the fix the clock starts after onStart returns, so the
+    //   watchdog fires once ~1000 ms of post-stall silence has passed and
+    //   reports silenceS 1 (or 2 under heavy timer lag) — never >= 3.
+    const fired = [];
     const result = await runBackendProcess({
       bin: process.execPath,
-      args: ["-e", "setTimeout(() => {}, 1700)"],
+      args: ["-e", "setInterval(() => {}, 1000)"],
       cwd: ctx.tmp,
       watchdogS: 1,
       parseLine: parseLineNothing,
+      onWatchdog: (event) => { if (event.kind === "fired") fired.push(event); },
       onStart: () => {
-        const end = Date.now() + 800;
-        while (Date.now() < end) { /* busy wait */ }
+        const end = Date.now() + 2500;
+        while (Date.now() < end) { /* busy wait: the stalled parent */ }
       },
     });
     assert.equal(result.stalled, true);
     assert.equal(result.timedOut, false);
     assert.equal(result.spawnError, null);
+    assert.equal(fired.length, 1);
+    assert.ok(
+      fired[0].silenceS >= 3,
+      `the silence clock must include the parent's 2500 ms stall; watchdog measured ${fired[0].silenceS}s`,
+    );
   });
 
   it("onLine errors do not crash the process runner (stats-fold safety)", async () => {
