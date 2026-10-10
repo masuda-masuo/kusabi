@@ -156,7 +156,7 @@ describe("sunaba-rpc SSE and unwrap", () => {
     assert.equal(result.exit_code, 0);
   });
 
-  it("unwrapResult returns raw result when content is empty", async () => {
+  it("unwrapResult returns raw result when content is absent", async () => {
     const { unwrapResult } = await import("./sunaba-rpc.mjs");
     const result = unwrapResult({ someField: "direct" });
     assert.deepEqual(result, { someField: "direct" });
