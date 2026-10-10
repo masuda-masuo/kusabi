@@ -810,8 +810,8 @@ export async function claudeDispatch(opts) {
   // loud throw, not a stuck "running" record) ----
   // The agent decides the sunaba tool profile: the generated config's URL
   // carries `?profile=<name>` so the session only ever loads that profile's
-  // tool definitions (kusabi #274).  Agents with no profile (investigate,
-  // anything unknown) keep the full list.  Extraction and validation stay
+  // tool definitions (kusabi #274).  Agents with no profile (anything
+  // unknown) keep the full list.  Extraction and validation stay
   // AHEAD of every other pre-flight step: a missing or malformed
   // `mcpServers.sunaba` entry must fail the dispatch loudly before anything
   // is written or spawned (kusabi #276).
@@ -1029,8 +1029,8 @@ export async function claudeDispatch(opts) {
       // Resolved independently of the session guard above (its own config read,
       // its own try/catch): the two guards must not be able to break each other,
       // and this one is the destructive one.  Off unless BOTH the config asks
-      // for it and the phase is one whose deliverable is an edit — a review or
-      // investigate job legitimately never writes a file.
+      // for it and the phase is one whose deliverable is an edit — a review
+      // job legitimately never writes a file.
       try {
         writeWatchdog = resolveClaudeWriteWatchdog(loadClaudeGuardConfig());
       } catch (err) {

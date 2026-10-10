@@ -524,32 +524,6 @@ export function renderEscalationDecisions(findings, opts = {}) {
   return text;
 }
 
-export function renderStrategistPrompt({ brief, rounds } = {}) {
-  const lines = [];
-
-  lines.push("## Acceptance criteria");
-  lines.push("");
-  lines.push(brief || "(not provided)");
-  lines.push("");
-
-  const safeRounds = Array.isArray(rounds) ? rounds : [];
-  for (const rnd of safeRounds) {
-    lines.push("## Findings from round " + (rnd.round || "?"));
-    lines.push("");
-    lines.push(rnd.findingsText || "(none)");
-    lines.push("");
-  }
-
-  lines.push("## Instruction");
-  lines.push("");
-  lines.push("The same file area has been flagged for two consecutive rounds — the current approach is stalled.");
-  lines.push("Recommend exactly ONE structural change: keep WHAT (the acceptance criteria) fixed, change HOW.");
-  lines.push("Reply with a short recommendation (goal-level, not a patch). Return it in your final report; you cannot post to issues in this mode.");
-  lines.push("");
-
-  return lines.join("\n");
-}
-
 export function renderFollowupDraft({ chainId, briefTitle, findings } = {}) {
   const lines = [];
   lines.push("## Follow-up issue draft (not posted — orchestrator judgement required)");

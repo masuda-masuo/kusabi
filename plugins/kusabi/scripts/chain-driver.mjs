@@ -233,7 +233,7 @@ export function resolveResumeDispatches({ resumeBackend, resumeReviewBackend, mo
  *        would measure the round's changes, not the base.
  * @param {Function} opts.callTool
  * @param {Function} [opts.dispatchWithFallback] — injection seam for the
- *        IMPLEMENT phase and the strategist (defaults to the real
+ *        IMPLEMENT phase (defaults to the real
  *        dispatchWithFallback; phase functions receive it as their own
  *        _dispatchWithFallback seam).  claudeDispatch when the chain's
  *        implement phase runs on the claude backend (kusabi #184).
@@ -382,7 +382,6 @@ export async function runChainDriver({
     missionId,
     // Mutable cross-round state (owned by the loop, mutated by finishRound)
     records,
-    strategized: resume ? resume.strategized : false,
     reworkCount,
     currentTierIndex,
   };
@@ -655,7 +654,7 @@ export async function runChainDriver({
           reviewModel, reviewModelChain,
           reworkModel, reworkModelChain, reworkBackend,
           maxRounds, brief, orchestrator, baseSha: effectiveBaseSha,
-          strategized: ctx.strategized, chainFollowupDraft: null,
+          strategized: false, chainFollowupDraft: null,
           verifyBaseline: effectiveVerifyBaseline,
         });
         writeJson(path.join(chainDir, "round-" + round + ".json"), roundRecord);
@@ -710,7 +709,7 @@ export async function runChainDriver({
           reviewModel, reviewModelChain,
           reworkModel, reworkModelChain, reworkBackend,
           maxRounds, brief, orchestrator, records, baseSha: effectiveBaseSha,
-          chainTotals: partialTotals, strategized: ctx.strategized, chainFollowupDraft: null,
+          chainTotals: partialTotals, strategized: false, chainFollowupDraft: null,
           interrupted: true,
           verifyBaseline: effectiveVerifyBaseline,
           smokeObservation: ctx.smokeObservation ?? null,

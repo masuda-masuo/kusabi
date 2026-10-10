@@ -308,18 +308,7 @@ describe("disallowedToolsForAgent", () => {
     }
   });
 
-  it("exempts issue write for kusabi-investigate only", () => {
-    const csv = disallowedToolsForAgent("kusabi-investigate");
-    const tools = csv.split(",");
-    assert.ok(!tools.includes("mcp__sunaba__sandbox_issue_write"));
-    // Everything else stays denied.
-    for (const tool of FULL) {
-      if (tool === "mcp__sunaba__sandbox_issue_write") continue;
-      assert.ok(tools.includes(tool), `${tool} must be disallowed, got: ${csv}`);
-    }
-  });
-
-  it("denies issue write for every non-investigate agent (incl. review and no agent)", () => {
+  it("denies issue write for every agent (incl. review and no agent)", () => {
     for (const agent of ["kusabi-review", null, undefined, "kusabi-implement"]) {
       assert.ok(
         disallowedToolsForAgent(agent).split(",").includes("mcp__sunaba__sandbox_issue_write"),
@@ -703,33 +692,19 @@ describe("allowedToolsForAgent", () => {
     assert.ok(!csv.includes("mcp__sunaba__sandbox_issue_write"));
   });
 
-  it("maps investigate to its own allowlist with issue write (mirrors kusabi-investigate.md)", () => {
-    const csv = allowedToolsForAgent("kusabi-investigate");
-    assert.equal(csv, ALLOWED_TOOLS.investigate);
-    // The standalone investigate deliverable is appending the brief to the
-    // issue — the issue-write grant must NOT be lost on the claude backend
-    // (kusabi #184 finding 3).  The chain strategist keeps the review-shaped
-    // toolset because its phase passes reviewDenyTools(), which denies this
-    // tool by exact match.
-    assert.ok(csv.includes("mcp__sunaba__sandbox_issue_write"));
-    assert.ok(csv.includes("mcp__shiori__*"));
-    assert.ok(csv.includes("mcp__sunaba__sandbox_exec"));
-    assert.ok(!csv.includes("mcp__sunaba__write_file"));
-  });
-
   it("rejects agents with no v1 allowlist", () => {
     assert.throws(() => allowedToolsForAgent("unknown-agent"), /no permission allowlist/);
     assert.throws(() => allowedToolsForAgent("custom-agent"), /no permission allowlist/);
   });
 
-  it("grants kaiba recall, agenda and progress to all three supported agents — never remember or agenda_edit (kusabi #279, #391)", () => {
+  it("grants kaiba recall, agenda and progress to supported agents — never remember or agenda_edit (kusabi #279, #391)", () => {
     // Write permission follows the inspection hierarchy: every agent
     // dispatched here has its output inspected, so it reads the store,
     // records in-flight progress notes, and reports durable facts for the
     // orchestrator to file.  On the store's first day workers filed review
     // summaries and completion reports, which the prompt-level contract
     // failed to prevent — so the grant itself is the guard now.
-    for (const agent of ["kusabi-implement", "kusabi-review", "kusabi-investigate"]) {
+    for (const agent of ["kusabi-implement", "kusabi-review"]) {
       const csv = allowedToolsForAgent(agent);
       assert.ok(csv.includes("mcp__kaiba__recall"), `${agent} must allow mcp__kaiba__recall`);
       assert.ok(csv.includes("mcp__kaiba__agenda"), `${agent} must allow mcp__kaiba__agenda`);
@@ -905,12 +880,6 @@ describe("sunabaProfileForAgent", () => {
 
   it("maps review to the review profile", () => {
     assert.equal(sunabaProfileForAgent("kusabi-review"), "review");
-  });
-
-  it("gives investigate NO profile — no single profile covers its allowlist", () => {
-    // Its allowlist is the review-shaped read tools PLUS sandbox_issue_write;
-    // the unfiltered list is the correct cover (kusabi #274 acceptance 4).
-    assert.equal(sunabaProfileForAgent("kusabi-investigate"), null);
   });
 
   it("gives unknown agents NO profile (the full list is the safe default)", () => {
@@ -1682,17 +1651,6 @@ describe("claudeDispatch (fake claude binary)", () => {
     assert.match(args[16], /^You are the "review" phase worker/);
   });
 
-  it("investigate agent: issue write is exempt from --disallowedTools but stays out of the review allowlist", async () => {
-    await claudeDispatch(ctx.dispatchOptions({
-      agent: "kusabi-investigate",
-    }));
-    const args = JSON.parse(fs.readFileSync(ctx.argsLog, "utf8").trim());
-    const denied = args[12].split(",");
-    assert.ok(!denied.includes("mcp__sunaba__sandbox_issue_write"), "investigate deliverable must stay allowed");
-    assert.ok(denied.includes("mcp__sunaba__publish"));
-    assert.ok(denied.includes("mcp__sunaba__sandbox_pr_review_write"));
-  });
-
   // ---- sunaba tool profiles (kusabi #274) ----
   //
   // The default fixture's sunaba entry is stdio, and the invocation-shape
@@ -1735,12 +1693,6 @@ describe("claudeDispatch (fake claude binary)", () => {
     useHttpSunabaSource("http://127.0.0.1:8750/mcp?token=abc");
     await claudeDispatch(ctx.dispatchOptions({ agent: "kusabi-implement" }));
     assert.equal(generatedSunabaUrl(), "http://127.0.0.1:8750/mcp?token=abc&profile=implement");
-  });
-
-  it("investigate agent: no profile parameter — the full tool list is its cover", async () => {
-    useHttpSunabaSource();
-    await claudeDispatch(ctx.dispatchOptions({ agent: "kusabi-investigate" }));
-    assert.equal(generatedSunabaUrl(), "http://127.0.0.1:8750/mcp");
   });
 
   it("leaves a profile named in the source config untouched", async () => {
@@ -3846,7 +3798,7 @@ describe("resolveClaudeWriteWatchdog", () => {
 describe("writeWatchdogAppliesToPhase", () => {
   it("is armed for implement only — every read-shaped phase is exempt", () => {
     assert.equal(writeWatchdogAppliesToPhase("implement"), true);
-    for (const phase of ["review", "investigate", "respond", "gofer", "strategize"]) {
+    for (const phase of ["review", "respond", "gofer"]) {
       assert.equal(writeWatchdogAppliesToPhase(phase), false, `${phase} must never trip the write watchdog`);
     }
   });

@@ -13,7 +13,6 @@ import {
   renderBaseFacts,
   renderContainerReviewInput,
   renderFollowupDraft,
-  renderStrategistPrompt,
   renderReviewRecord,
   renderEscalationDecisions,
   recoverVerdictFromText,
@@ -1431,71 +1430,6 @@ describe("renderBaseFacts", () => {
     assert.match(result, /Base commit: \(unavailable\)/);
     assert.match(result, /empty change set/);
     assert.match(result, /Review ONLY this change set/);
-  });
-});
-
-// renderStrategistPrompt — Decision 4 strategist prompt builder
-// ---------------------------------------------------------------------------
-
-describe("renderStrategistPrompt", () => {
-  const sampleBrief = "Implement feature X\n\nAcceptance criteria:\n- Works on all platforms\n- Performance within limits";
-
-  it("includes acceptance criteria verbatim", () => {
-    const result = renderStrategistPrompt({
-      brief: sampleBrief,
-      rounds: [
-        { round: 1, findingsText: "[low] Style issue (src/a.js:10)" },
-        { round: 2, findingsText: "[low] Same style issue (src/a.js:10)" },
-      ],
-    });
-    assert.ok(result.includes("Implement feature X"));
-    assert.ok(result.includes("Works on all platforms"));
-  });
-
-  it("includes both rounds' findings verbatim", () => {
-    const result = renderStrategistPrompt({
-      brief: sampleBrief,
-      rounds: [
-        { round: 1, findingsText: "[low] Style issue (src/a.js:10)" },
-        { round: 2, findingsText: "[low] Same style issue (src/a.js:10)" },
-      ],
-    });
-    assert.ok(result.includes("Findings from round 1"));
-    assert.ok(result.includes("Findings from round 2"));
-    assert.ok(result.includes("[low] Style issue (src/a.js:10)"));
-    assert.ok(result.includes("[low] Same style issue (src/a.js:10)"));
-  });
-
-  it("contains the one-structural-change instruction", () => {
-    const result = renderStrategistPrompt({
-      brief: sampleBrief,
-      rounds: [
-        { round: 1, findingsText: "finding" },
-        { round: 2, findingsText: "finding" },
-      ],
-    });
-    assert.ok(result.includes("Recommend exactly ONE structural change"));
-    assert.ok(result.includes("keep WHAT (the acceptance criteria) fixed, change HOW"));
-    assert.ok(result.includes("you cannot post to issues in this mode"));
-  });
-
-  it("handles missing brief gracefully", () => {
-    const result = renderStrategistPrompt({
-      rounds: [{ round: 1, findingsText: "finding" }],
-    });
-    assert.ok(result.includes("Acceptance criteria"));
-    assert.ok(result.includes("(not provided)"));
-  });
-
-  it("handles missing rounds gracefully (never throws)", () => {
-    const result = renderStrategistPrompt({ brief: "test" });
-    assert.ok(result.includes("Acceptance criteria"));
-    assert.ok(result.includes("test"));
-  });
-
-  it("handles no arguments gracefully (never throws)", () => {
-    const result = renderStrategistPrompt();
-    assert.ok(result.includes("Acceptance criteria"));
   });
 });
 

@@ -184,7 +184,7 @@ describe("resolveChainResume", () => {
     assert.equal(p.session, "sess-2");
   });
 
-  it("does not consume a rework after a strategize disposition", () => {
+  it("refuses to resume an old chain whose last complete round is strategize", () => {
     const control = {
       chainId: "chain-test", container: "cid-1", pid: 0,
       status: "cancelled", round: 2, finishedAt: new Date().toISOString(),
@@ -204,11 +204,9 @@ describe("resolveChainResume", () => {
     const chainJson = baseChainJson({ records: [complete], strategized: true });
     const result = resolveChainResume({ control, chainJson });
 
-    assert.equal(result.ok, true);
-    assert.equal(result.position.phase, "implement");
-    assert.equal(result.position.round, 3);
-    assert.equal(result.position.reworkCount, 1); // strategize consumed none
-    assert.equal(result.position.currentTierIndex, 1);
+    assert.equal(result.ok, false);
+    assert.match(result.error, /strategize/);
+    assert.match(result.error, /removed/);
   });
 
   it("errors for a cancelled chain whose last round was accepted", () => {

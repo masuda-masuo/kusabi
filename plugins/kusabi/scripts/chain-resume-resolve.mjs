@@ -269,10 +269,9 @@ export function classifyReviewSeatReplacement(chainJson, { explicitRoute } = {})
  *   - Last record has implement done but no review/disposition (an
  *     interrupted round persisted at stop time) → resume at that round's
  *     REVIEW phase, continuing the persisted partial record.
- *   - Last record is complete with disposition rework/strategize → resume at
- *     the NEXT round's IMPLEMENT phase (rework: with the escalated
- *     tier/reworkCount; strategize: with the fresh-session lever from the
- *     record's pendingReworkStrategy).
+ *   - Last record is complete with disposition rework → resume at
+ *     the NEXT round's IMPLEMENT phase (with the escalated
+ *     tier/reworkCount).
  *   - Terminal dispositions (accept / accept-with-followup / escalate) mean
  *     the chain already finished — error.  ONE exception (kusabi #248): an
  *     `escalate` that classifyReviewSeatReplacement finds eligible — probes
@@ -408,6 +407,12 @@ export function resolveChainResume({ control, chainJson, explicitRoute = null })
         error: `chain ended in refused-brief-defect at round ${last.round} \u2014 the brief is defective; fix the brief and re-dispatch a new chain (resume would re-run the same defective brief)`,
       };
     }
+    if (lastDisposition === "strategize") {
+      return {
+        ok: false,
+        error: `cannot resume chain: last round ${last.round} ended in "strategize", which has been removed; manual inspection required`,
+      };
+    }
     const nextRound = (last.round ?? records.length) + 1;
     // ---- budget-derived guard (kusabi #60 step 2) ----
     // Mirrors the driver's budget semantics: maxRounds buys design/full
@@ -439,8 +444,8 @@ export function resolveChainResume({ control, chainJson, explicitRoute = null })
         round: nextRound,
         roundRecord: null,
         records,
-        // A rework consumed one rework; a strategize did not.
-        reworkCount: (last.reworkCount ?? 0) + (lastDisposition === "rework" ? 1 : 0),
+        // A rework consumed one rework.
+        reworkCount: (last.reworkCount ?? 0) + 1,
         currentTierIndex: last.tierAfter ?? last.tierBefore ?? 0,
         strategized,
         session: last.sessionID ?? undefined,

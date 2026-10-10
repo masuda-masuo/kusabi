@@ -220,8 +220,8 @@ export async function cmdChain(cwd, { flags, text }, opts = {}) {
  *        callers omit it and get the defaults below.
  * @param {Function} [opts.inject.callTool]  — default: the live sunaba RPC
  *        callTool (used for every baseline, probe and container call).
- * @param {Function} [opts.inject.dispatchWithFallback]  — the implement /
- *        strategist dispatch seam (default: the resolved implement phase
+ * @param {Function} [opts.inject.dispatchWithFallback]  — the implement
+ *        dispatch seam (default: the resolved implement phase
  *        dispatch).
  * @param {Function} [opts.inject.reviewDispatchWithFallback]  — the review
  *        dispatch seam (default: the resolved review phase dispatch).
@@ -284,7 +284,7 @@ export async function runChainLifecycle(cwd, { flags, text, orchestrator }, opts
   // each from models.phases.<phase> with fallback to models.chain, then the
   // built-in default.  A `claude/<model>` entry prefix selects the claude
   // backend for that phase; `--backend` forces every phase onto one backend
-  // (flag wins).  The strategist follows the implement resolution.  The
+  // (flag wins).  The
   // :variant rejection for the claude backend and the single-backend-per-
   // phase invariant also happen here, so a bad config fails with a clear
   // error and a nonzero exit before createChainDir / before any job is
@@ -443,7 +443,7 @@ export async function runChainLifecycle(cwd, { flags, text, orchestrator }, opts
       reworkModelChain: reworkDispatch.chain,
       reworkBackend: reworkDispatch.backend,
       // A model-pinning backend (claude, agy) clamps later phases (rework
-      // implement, review, strategist) to the phase's command-start model —
+      // implement, review) to the phase's command-start model —
       // neither has a tier ladder, so the model never changes mid-chain
       // (kusabi #184 finding 1).  Each phase clamps to ITS OWN resolved
       // model, so implement and review can run on different backends with

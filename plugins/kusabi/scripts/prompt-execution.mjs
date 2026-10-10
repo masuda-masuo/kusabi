@@ -229,7 +229,7 @@ export const READ_ONLY_PHASES = Object.freeze(["plan", "review"]);
  *
  * The standalone `review` command (kind "review") and the read-only
  * plan/review phases may legitimately finish with nothing written; every
- * other phase (implement, test-author, investigate, gofer, respond, ...)
+ * other phase (implement, test-author, gofer, respond, ...)
  * must.
  *
  * @param {string|null} phase — job phase, or null.

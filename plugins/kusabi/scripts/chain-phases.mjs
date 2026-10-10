@@ -38,9 +38,6 @@
 // classifyReviewSeatReplacement, archiveFailedReviewSeat) live in
 // chain-resume-resolve.mjs (kusabi #441).
 //
-// Strategize prompt assembly and dispatch (runStrategizePhase)
-// lives in chain-strategize.mjs (kusabi #455).
-//
 // Rework scheduling, path-normalised stall detection, and tier escalation
 // (normalizeFilePath, hasRepeatedAreas, resolveReworkScope,
 // inScopeFindingFiles, applyTierEscalation, recordReworkEscalation)

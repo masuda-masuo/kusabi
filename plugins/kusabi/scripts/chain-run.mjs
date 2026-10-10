@@ -85,7 +85,7 @@ export function withContainerWorkspace(text, container) {
  * replaced by the scope sentence + the FULL per-finding rendering of the
  * scoped subset (`renderPriorFindings` over a record-shaped subset — bodies,
  * recommendations and the same budget bound as the full-scope path), keeping
- * the rest of the prompt structure (instruction / strategist / acceptance
+ * the rest of the prompt structure (instruction / acceptance
  * criteria) unchanged.
  */
 export function buildImplementText({ round, brief, previousRecord, container, reworkScope }) {
@@ -93,10 +93,6 @@ export function buildImplementText({ round, brief, previousRecord, container, re
   if (round === 1) {
     text = brief;
   } else if (previousRecord) {
-    let strategistSection = "";
-    if (previousRecord.strategistRecommendation) {
-      strategistSection = "\n\n## Strategist recommendation (structural change for this rework)\n" + previousRecord.strategistRecommendation + "\n";
-    }
     const scope = reworkScope || { scope: "full", findings: [] };
     let priorFindingsText;
     if (scope.scope === "full") {
@@ -112,7 +108,7 @@ export function buildImplementText({ round, brief, previousRecord, container, re
       // treatment the full path gives the whole set, not a one-line summary.
       priorFindingsText = scopeSentence + "\n\n" + renderPriorFindings({ findings: scope.findings });
     }
-    text = "## Prior findings\n" + priorFindingsText + "\n\n## Instruction\nResolve each prior finding in this round. If a finding cannot be fully resolved, you must explain why and report what remains." + strategistSection + "\n\n## Acceptance criteria\n" + brief;
+    text = "## Prior findings\n" + priorFindingsText + "\n\n## Instruction\nResolve each prior finding in this round. If a finding cannot be fully resolved, you must explain why and report what remains.\n\n## Acceptance criteria\n" + brief;
   } else {
     text = brief;
   }

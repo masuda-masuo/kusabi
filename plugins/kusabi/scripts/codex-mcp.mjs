@@ -32,7 +32,6 @@ export const CODEX_MCP_AGENTS = new Set([
   "kusabi-review",
   "kusabi-plan",
   "kusabi-test-author",
-  "kusabi-investigate",
 ]);
 
 function bareMcpToolName(name) {
@@ -61,8 +60,7 @@ export function codexMcpToolsForAgent(agent, tools = null) {
     const parsed = bareMcpToolName(name);
     if (!parsed) continue;
     const tool = `mcp__${parsed.server}__${parsed.tool}`;
-    // Codex must never receive a hardcoded disallowed tool, including the
-    // investigate-only Claude exception for issue writes.
+    // Codex must never receive a hardcoded disallowed tool.
     if (disallowed.has(tool)) continue;
     const list = servers[parsed.server] ?? (servers[parsed.server] = []);
     const bare = parsed.tool === "*" ? "*" : parsed.tool;

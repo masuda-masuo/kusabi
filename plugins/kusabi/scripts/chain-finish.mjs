@@ -31,9 +31,6 @@ import {
   recordReworkEscalation,
 } from "./chain-rework.mjs";
 import {
-  runStrategizePhase,
-} from "./chain-strategize.mjs";
-import {
   quotaExhaustionReason,
 } from "./chain-quota.mjs";
 import {
@@ -326,7 +323,7 @@ async function runRevalidationProbePhase({ baseSha, container, brief, callTool, 
  *   effectiveBaseSha, effectiveVerifyBaseline, reviewModel, reviewModelChain,
  *   reworkModel, reworkModelChain, reworkBackend, reviewDispatch,
  *   injectedDispatch, reworkTierCount) plus mutable cross-round state
- *   (records, strategized, reworkCount, currentTierIndex).
+ *   (records, reworkCount, currentTierIndex).
  * @returns {Promise<{done: boolean, text?: string}>}
  */
 export async function finishRound(
@@ -337,13 +334,13 @@ export async function finishRound(
     chainDir, chainId, container, cwd, model, modelChain, maxRounds, brief, orchestrator, callTool,
     flagsModel, reviewFlagsModel, effectiveReviewChain,
     effectiveBaseSha, effectiveVerifyBaseline, reviewModel, reviewModelChain,
-    reworkModel, reworkModelChain, reworkBackend, reviewDispatch, injectedDispatch,
+    reworkModel, reworkModelChain, reworkBackend, reviewDispatch,
     reworkTierCount,
     // Mission linkage (kusabi #532): threaded from runChainDriver's ctx so a
     // normally completed Luna inner chain persists it; null on plain chains.
     missionId,
     // Mutable cross-round state
-    records, strategized, reworkCount, currentTierIndex,
+    records, reworkCount, currentTierIndex,
   } = ctx;
 
   const {
@@ -528,7 +525,7 @@ export async function finishRound(
       reviewModel, reviewModelChain,
       reworkModel, reworkModelChain, reworkBackend,
       maxRounds, brief, orchestrator, baseSha: effectiveBaseSha,
-      strategized, chainFollowupDraft: null,
+      strategized: false, chainFollowupDraft: null,
       // Mission linkage (kusabi #532): a failed Luna inner chain keeps its
       // mission attribution on the terminal chain.json write.
       missionId,
@@ -587,7 +584,6 @@ export async function finishRound(
       maxRounds,
       repeatedAreas: chainRepeatedAreas,
       findingSeverities,
-      strategizeEligible: !strategized,
       oracleViolation,
       // Whether the P5/P6 oracle probes executed is probe truth: it moves
       // with the marker through the closure — recorded value on the first
@@ -732,7 +728,6 @@ export async function finishRound(
       roundRecord,
       currentTierIndex,
       reworkCount,
-      strategized,
       tierCount: reworkTierCount,
       // Anchoring-override evidence (#62): verdict, probes and the
       // cross-round repeated-areas signal from the finished round.
@@ -745,9 +740,6 @@ export async function finishRound(
     pendingReworkStrategy = escalation.strategy;
     ctx.reworkCount += 1;
     ctx.currentTierIndex = escalation.currentTierIndex;
-  } else if (disposition.disposition === "strategize") {
-    // Strategize doesn't consume a rework count, but it sets strategized=true
-    // which affects the next rework strategy.
   }
 
   // Record the pending rework strategy on the round record so the next
@@ -760,7 +752,7 @@ export async function finishRound(
     reviewModel, reviewModelChain,
     reworkModel, reworkModelChain, reworkBackend,
     maxRounds, brief, orchestrator, records, baseSha: effectiveBaseSha,
-    chainTotals, strategized: ctx.strategized, chainFollowupDraft,
+    chainTotals, strategized: false, chainFollowupDraft,
     verifyBaseline: effectiveVerifyBaseline,
     smokeObservation: ctx.smokeObservation ?? null,
     // Mission linkage (kusabi #532): emitted only under Luna mode; a plain
@@ -829,60 +821,5 @@ export async function finishRound(
     ) };
   }
 
-  // ---- phase 9: strategize (structural re-diagnosis before next rework) ----
-  if (disposition.disposition === "strategize") {
-    const { strategistJobStatus, strategistJobError, strategistJobFailure } = await runStrategizePhase({
-      cwd, chainId, round, brief, previousRecord, roundRecord, modelChain,
-      _dispatchWithFallback: injectedDispatch,
-    });
-
-    // ---- stop on strategize provider exhaustion ----
-    if (strategistJobStatus === "provider-error") {
-      // roundRecord was already pushed onto records during phase 7;
-      // handleProviderExhaustion detects that and does not push again.
-      const { chainState, outcome } = handleProviderExhaustion({
-        records, roundRecord,
-        currentTierIndex: ctx.currentTierIndex, phase: "strategize", jobError: strategistJobError,
-        jobFailure: strategistJobFailure,
-        chainId, round, container, model, modelChain,
-        reviewModel, reviewModelChain,
-        reworkModel, reworkModelChain, reworkBackend,
-        maxRounds, brief, orchestrator, baseSha: effectiveBaseSha,
-        strategized: ctx.strategized, chainFollowupDraft,
-        // Mission linkage (kusabi #532): a failed Luna inner chain keeps its
-        // mission attribution on the terminal chain.json write.
-        missionId,
-        verifyBaseline: effectiveVerifyBaseline,
-      });
-      writeJson(path.join(chainDir, "round-" + round + ".json"), roundRecord);
-      writeJson(path.join(chainDir, "chain.json"), chainState);
-      finalizeChainControl({ chainDir, status: "failed", round });
-      return { done: true, text: finaliseProvisionalChain(outcome, "failed", round, ctx) };
-    }
-
-    ctx.strategized = true;
-
-    // The next round must use a fresh session to break anchoring
-    // (docs/design/phase-chain.md §3.4).
-    // Set a pendingReworkStrategy so the loop picks it up at phase 1.
-    roundRecord.pendingReworkStrategy = {
-      tierDelta: 0,
-      newSession: true,
-      reason: "strategized: new session (anchoring break per docs/design/phase-chain.md §3.4)",
-    };
-
-    // Re-persist after strategize updates roundRecord and strategized flag
-    const updatedTotals = computeChainTotals(records);
-    persistChainState({
-      chainDir, round, roundRecord, chainId, container, model, modelChain,
-      reviewModel, reviewModelChain,
-      reworkModel, reworkModelChain, reworkBackend,
-      maxRounds, brief, orchestrator, records, baseSha: effectiveBaseSha,
-      chainTotals: updatedTotals, strategized: true, chainFollowupDraft,
-      verifyBaseline: effectiveVerifyBaseline,
-      smokeObservation: ctx.smokeObservation ?? null,
-      ...(missionId ? { missionId } : {}),
-    });
-  }
   return { done: false };
 }

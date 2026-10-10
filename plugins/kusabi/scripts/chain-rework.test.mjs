@@ -192,7 +192,6 @@ describe("recordReworkEscalation", () => {
       roundRecord,
       currentTierIndex: 0,
       reworkCount: 1, // 2nd rework: tierDelta +1
-      strategized: false,
       tierCount: 1,
     });
 
@@ -211,7 +210,6 @@ describe("recordReworkEscalation", () => {
       roundRecord,
       currentTierIndex: 0,
       reworkCount: 1, // 2nd rework: tierDelta +1, clamped on a 1-tier chain
-      strategized: false,
       tierCount: 1,
     });
 
@@ -228,7 +226,6 @@ describe("recordReworkEscalation", () => {
       roundRecord,
       currentTierIndex: 0,
       reworkCount: 1, // 2nd rework: tierDelta +1 -> tier 1 of 2, no clamp
-      strategized: false,
       tierCount: 2,
     });
 
@@ -241,7 +238,6 @@ describe("recordReworkEscalation", () => {
       roundRecord,
       currentTierIndex: 0,
       reworkCount: 0, // 1st rework: tierDelta 0
-      strategized: false,
       tierCount: 2,
     });
 
@@ -256,7 +252,6 @@ describe("recordReworkEscalation", () => {
       roundRecord,
       currentTierIndex: 0,
       reworkCount: 1, // 2nd rework: tierDelta +1 -> tier 1 of 2
-      strategized: false,
       tierCount: 2,
     });
 
@@ -274,7 +269,6 @@ describe("recordReworkEscalation", () => {
       roundRecord,
       currentTierIndex: 0,
       reworkCount: 1,
-      strategized: false,
       tierCount: 1,
     });
     roundRecord.tierAfter = escalation.currentTierIndex;
@@ -292,7 +286,6 @@ describe("recordReworkEscalation", () => {
       roundRecord,
       currentTierIndex: 0,
       reworkCount: 0,
-      strategized: false,
       tierCount: 2,
       chainVerdict: "approve",
       chainRepeatedAreas: false,
@@ -312,7 +305,6 @@ describe("recordReworkEscalation", () => {
       roundRecord,
       currentTierIndex: 0,
       reworkCount: 0,
-      strategized: false,
       tierCount: 2,
       chainVerdict: "needs-attention",
       chainRepeatedAreas: true,
@@ -331,7 +323,6 @@ describe("recordReworkEscalation", () => {
       roundRecord,
       currentTierIndex: 0,
       reworkCount: 0,
-      strategized: false,
       tierCount: 2,
     });
     assert.equal(result.strategy.newSession, false);

@@ -33,8 +33,8 @@
 // (a big diff, a slow verify, a wide search sweep) do not trip it.
 export const CLAUDE_WRITE_WATCHDOG_DEFAULT_WARN_S = 300;
 
-// Phases whose deliverable IS a file edit.  Review / investigate /
-// respond / gofer / plan legitimately never write, so the watchdog
+// Phases whose deliverable IS a file edit.  Review / respond / gofer /
+// plan legitimately never write, so the watchdog
 // must never be armed for them.  Chain REWORK rounds are covered: they dispatch
 // through runImplementPhase (chain-phases.mjs), which passes
 // `phase: "implement"` for every round — `models.phases.rework` selects the

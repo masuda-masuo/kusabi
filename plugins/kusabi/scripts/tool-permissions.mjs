@@ -94,18 +94,6 @@ const REVIEW_ALLOWED_TOOLS = [
   "mcp__kaiba__progress",
 ];
 
-// kusabi-investigate.md grants issue write: the standalone investigate
-// deliverable is appending the brief to the target issue.  The chain
-// strategist dispatches with the same agent but passes reviewDenyTools(),
-// which denies sunaba_sandbox_issue_write — normalized to the claude name
-// and removed from this list by applyToolDenies, so the strategist keeps
-// the review-shaped toolset while a standalone `task --phase investigate`
-// can write the issue (kusabi #184 finding 3).
-const INVESTIGATE_ALLOWED_TOOLS = [
-  ...REVIEW_ALLOWED_TOOLS,
-  "mcp__sunaba__sandbox_issue_write",
-];
-
 // kusabi-plan.md is read-only planning and shiori-✕ (see the §3.1 row in
 // docs/design/phase-chain.md, the body paragraph, kusabi-plan.md, and the
 // code comment below).  It shares the review-shaped read/verify toolset but
@@ -129,7 +117,6 @@ const TEST_AUTHOR_ALLOWED_TOOLS = IMPLEMENT_ALLOWED_TOOLS.filter(
 export const ALLOWED_TOOLS = {
   implement: IMPLEMENT_ALLOWED_TOOLS.join(","),
   review: REVIEW_ALLOWED_TOOLS.join(","),
-  investigate: INVESTIGATE_ALLOWED_TOOLS.join(","),
   plan: PLAN_ALLOWED_TOOLS.join(","),
   testAuthor: TEST_AUTHOR_ALLOWED_TOOLS.join(","),
 };
@@ -137,15 +124,10 @@ export const ALLOWED_TOOLS = {
 /**
  * Resolve the allowed-tools CSV for an agent name.
  *
- * v1 hardcodes three allowlists (implement, review, investigate), each
- * mirroring the corresponding opencode agent permission table.  `kusabi-review`
- * and `kusabi-investigate` are distinct lists: the strategist phase
- * dispatches with the investigate agent but a review-shaped DENY map
- * (reviewDenyTools — issue writes denied), so its effective toolset is the
- * review one; a standalone `task --phase investigate` passes no deny map and
- * keeps the issue-write grant.  A bare `task` (no agent) gets the implement
- * list — the worker toolset, matching the opencode default agent's full tool
- * access.
+ * v1 hardcodes the implement, review, test-author, and plan allowlists,
+ * each mirroring the corresponding opencode agent permission table. A bare
+ * `task` (no agent) gets the implement list — the worker toolset, matching the
+ * opencode default agent's full tool access.
  *
  * @param {string|null|undefined} agent
  * @returns {string} CSV of allowed tool names.
@@ -157,9 +139,6 @@ export function allowedToolsForAgent(agent) {
   }
   if (agent === "kusabi-review") {
     return ALLOWED_TOOLS.review;
-  }
-  if (agent === "kusabi-investigate") {
-    return ALLOWED_TOOLS.investigate;
   }
   if (agent === "kusabi-test-author") {
     // test-author writes test files (same deliverable shape as implement), so
@@ -179,7 +158,7 @@ export function allowedToolsForAgent(agent) {
   }
   throw new Error(
     `claude backend: no permission allowlist for agent "${agent}" ` +
-    "(v1 hardcodes the implement, review, investigate, test-author, and plan allowlists only)"
+    "(v1 hardcodes the implement, review, test-author, and plan allowlists only)"
   );
 }
 
@@ -193,11 +172,6 @@ export function allowedToolsForAgent(agent) {
  * definitions the way opencode's permission deny does (kusabi #274).  A
  * null profile means the unfiltered list — always correct, merely larger,
  * so it is the safe default for anything not mapped here.
- *
- * `kusabi-investigate` gets NO profile deliberately: its allowlist spans
- * the review-shaped read tools PLUS `sandbox_issue_write`, which no single
- * sunaba profile covers — the full list is the correct cover (kusabi #274
- * acceptance 4).
  *
  * @param {string|null|undefined} agent
  * @returns {string|null} Profile name, or null for the unfiltered list.
@@ -298,12 +272,7 @@ export function applyToolDenies(csv, tools) {
 // session even if an allowlist bug or a settings leak would grant them.
 // `Bash`/`Edit`/`Write`/`NotebookEdit` are the CLI's own built-in tools — a
 // kusabi worker acts exclusively through the sunaba MCP tools, so they are
-// denied outright.  `mcp__sunaba__sandbox_issue_write` is the ONE exception:
-// a standalone `task --phase investigate` (agent kusabi-investigate)
-// delivers by appending the brief to the issue.  The chain strategist also
-// dispatches with the investigate agent, but its review-shaped deny map
-// still strips issue write from the allowlist — the exception cannot grant
-// it there.
+// denied outright.
 export const DISALLOWED_TOOLS = [
   "mcp__sunaba__publish",
   "mcp__sunaba__sandbox_issue_write",
@@ -321,17 +290,13 @@ export const DISALLOWED_TOOLS = [
 ];
 
 /**
- * Resolve the `--disallowedTools` CSV for an agent.  The issue-write tool is
- * exempted for kusabi-investigate only (its deliverable is the issue write);
- * every other agent denies it.
+ * Resolve the `--disallowedTools` CSV for an agent.
  *
- * @param {string|null|undefined} agent
+ * @param {string|null|undefined} [_agent]
  * @returns {string}
  */
-export function disallowedToolsForAgent(agent) {
-  return DISALLOWED_TOOLS.filter(
-    (t) => !(t === "mcp__sunaba__sandbox_issue_write" && agent === "kusabi-investigate"),
-  ).join(",");
+export function disallowedToolsForAgent() {
+  return DISALLOWED_TOOLS.join(",");
 }
 
 /**

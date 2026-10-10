@@ -71,7 +71,6 @@ kusabi ships 5 agent definitions (`plugins/kusabi/opencode-agents/`) that are au
 
 | Agent | Phase role | Permission profile |
 |---|---|---|
-| `kusabi-investigate` | investigate — deep dive, root cause | read-only + shiori + issue_write |
 | `kusabi-implement` | implement — code + verify | writes happen only via sunaba container tools (sunaba_edit_file/write_file); host bash/edit/write/patch and sunaba_copy_project/sunaba_copy_file **deny** |
 | `kusabi-review` | review — adversarial review | verify/lint/type_check **allow**, sandbox_exec/sandbox_write/issue_write/pr_review_write **deny** (deliverable is structured report, not issue comments) |
 | `kusabi-respond` | respond — address review findings | code write; issue_write **deny** |
@@ -285,7 +284,7 @@ split (or without the field) are treated as `opencode` by readers.
   bridge) and the fixed read-only sandbox. Luna and Sol stay MCP-less and keep
   the empty `mcp_servers={}` override. Worker agents
   (`kusabi-implement`, `kusabi-review`, `kusabi-plan`,
-  `kusabi-test-author`, and the existing investigate allowlist) instead get a
+  `kusabi-test-author`) instead get a
   explicit `-c mcp_servers.<name>.<key>=...` argv overrides whose MCP
   `enabled_tools` are derived from the Claude backend's exported allowlist,
   with hardcoded disallowed tools removed. Endpoint and command values come

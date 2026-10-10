@@ -178,14 +178,16 @@ describe("cmdInstallAgents", () => {
     assert.ok(fs.existsSync(path.join(personalAgentDir, "kusabi-review.md")), "personal file 2 not deleted");
   });
 
-  it("removes stale kusabi-draft.md and kusabi-salvage.md from install target", () => {
+  it("removes stale kusabi-draft.md, kusabi-salvage.md and kusabi-investigate.md from install target", () => {
     const kusabiAgentDir = path.join(tmpStateDir, "opencode-config", "opencode", "agent");
     fs.mkdirSync(kusabiAgentDir, { recursive: true });
     fs.writeFileSync(path.join(kusabiAgentDir, "kusabi-draft.md"), "stale draft");
     fs.writeFileSync(path.join(kusabiAgentDir, "kusabi-salvage.md"), "stale salvage");
+    fs.writeFileSync(path.join(kusabiAgentDir, "kusabi-investigate.md"), "stale investigate");
     cmdInstallAgents();
     assert.ok(!fs.existsSync(path.join(kusabiAgentDir, "kusabi-draft.md")), "kusabi-draft.md unlinked");
     assert.ok(!fs.existsSync(path.join(kusabiAgentDir, "kusabi-salvage.md")), "kusabi-salvage.md unlinked");
+    assert.ok(!fs.existsSync(path.join(kusabiAgentDir, "kusabi-investigate.md")), "kusabi-investigate.md unlinked");
   });
 });
 

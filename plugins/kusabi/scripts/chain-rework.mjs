@@ -219,16 +219,15 @@ export function applyTierEscalation({ currentTierIndex, tierDelta, tierCount }) 
  * @param {object} opts.roundRecord       - Current round record (mutated: tierClamped/tierClampReason).
  * @param {number} opts.currentTierIndex  - Tier index before this escalation.
  * @param {number} opts.reworkCount       - Reworks done so far (pre-increment).
- * @param {boolean} opts.strategized      - Whether a strategize already ran.
  * @param {number} opts.tierCount         - Number of tiers in modelChain.
  * @param {string} [opts.chainVerdict]    - Finished round's review verdict (anchoring-override evidence, #62).
  * @param {boolean} [opts.chainRepeatedAreas] - Same file area flagged across rounds.
  * @param {boolean} [opts.probesGreen]    - Finished round's deterministic probes passed.
  * @returns {{ currentTierIndex: number, strategy: { tierDelta: number, newSession: boolean, reason: string } }}
  */
-export function recordReworkEscalation({ roundRecord, currentTierIndex, reworkCount, strategized, tierCount, chainVerdict, chainRepeatedAreas, probesGreen }) {
+export function recordReworkEscalation({ roundRecord, currentTierIndex, reworkCount, tierCount, chainVerdict, chainRepeatedAreas, probesGreen }) {
   const strategy = deriveReworkStrategy({
-    reworkCount, strategized,
+    reworkCount,
     verdict: chainVerdict, probesGreen, repeatedAreas: chainRepeatedAreas,
   });
   const { tierIndex, clamped, reason } = applyTierEscalation({

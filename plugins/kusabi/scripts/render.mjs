@@ -20,7 +20,6 @@ export {
   renderGroupedFindingsText,
   renderPriorFindings,
   renderEscalationDecisions,
-  renderStrategistPrompt,
   renderFollowupDraft,
 } from "./render-prompt.mjs";
 

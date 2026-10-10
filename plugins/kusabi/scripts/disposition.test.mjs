@@ -173,8 +173,8 @@ describe("deriveDisposition", () => {
   it("the zero-findings row does not preempt the repeatedAreas rows", () => {
     // repeatedAreas names a concrete stall, which is the more informative
     // thing to tell the operator; those rows keep their own reasons.
-    const strategize = deriveDisposition({ verdict: "needs-attention", probesGreen: true, round: 2, maxRounds: 3, repeatedAreas: true, strategizeEligible: true });
-    assert.equal(strategize.disposition, "strategize");
+    const escalateWithEligible = deriveDisposition({ verdict: "needs-attention", probesGreen: true, round: 2, maxRounds: 3, repeatedAreas: true, strategizeEligible: true });
+    assert.deepEqual(escalateWithEligible, { disposition: "escalate", reason: "same file area flagged for two consecutive rounds" });
     const escalate = deriveDisposition({ verdict: "needs-attention", probesGreen: true, round: 2, maxRounds: 3, repeatedAreas: true });
     assert.deepEqual(escalate, { disposition: "escalate", reason: "same file area flagged for two consecutive rounds" });
   });
@@ -221,12 +221,11 @@ describe("deriveDisposition", () => {
     assert.deepEqual(result, { disposition: "rework", reason: "needs-attention" });
   });
 
-  // ---- Decision 4 strategize tests ----
+  // ---- repeatedAreas stagnation tests ----
 
-  it("strategize: repeatedAreas + strategizeEligible true", () => {
+  it("escalate: repeatedAreas with needs-attention (stale strategizeEligible ignored)", () => {
     const result = deriveDisposition({ verdict: "needs-attention", probesGreen: true, round: 2, maxRounds: 3, repeatedAreas: true, strategizeEligible: true });
-    assert.equal(result.disposition, "strategize");
-    assert.match(result.reason, /same file area flagged twice/);
+    assert.deepEqual(result, { disposition: "escalate", reason: "same file area flagged for two consecutive rounds" });
   });
 
   it("escalate (unchanged): repeatedAreas + strategizeEligible false", () => {
@@ -240,7 +239,7 @@ describe("deriveDisposition", () => {
     assert.deepEqual(result, { disposition: "escalate", reason: "same file area flagged for two consecutive rounds" });
   });
 
-  it("accept-with-followup takes precedence over strategize: repeatedAreas + all-minor", () => {
+  it("accept-with-followup takes precedence over repeatedAreas: repeatedAreas + all-minor", () => {
     const result = deriveDisposition({ verdict: "needs-attention", probesGreen: true, round: 2, maxRounds: 3, repeatedAreas: true, findingSeverities: ["low", "medium"], strategizeEligible: true });
     assert.deepEqual(result, { disposition: "accept-with-followup", reason: "probes green; remaining findings all minor" });
   });
@@ -257,9 +256,9 @@ describe("deriveDisposition", () => {
 
   // ---- kusabi#117: approve + probes red must also see repeatedAreas ----
 
-  it("strategize: approve + probes red + repeatedAreas + strategizeEligible + round < maxRounds", () => {
+  it("escalate: approve + probes red + repeatedAreas + round < maxRounds", () => {
     const result = deriveDisposition({ verdict: "approve", probesGreen: false, round: 1, maxRounds: 3, repeatedAreas: true, strategizeEligible: true });
-    assert.deepEqual(result, { disposition: "strategize", reason: "deterministic probes failed and same file area flagged twice; structural re-diagnosis before next rework" });
+    assert.deepEqual(result, { disposition: "escalate", reason: "deterministic probes failed; same file area flagged for two consecutive rounds" });
   });
 
   it("escalate: approve + probes red + repeatedAreas + strategizeEligible false", () => {
@@ -267,7 +266,7 @@ describe("deriveDisposition", () => {
     assert.deepEqual(result, { disposition: "escalate", reason: "deterministic probes failed; same file area flagged for two consecutive rounds" });
   });
 
-  it("escalate (not strategize): approve + probes red + repeatedAreas + strategizeEligible true but round === maxRounds", () => {
+  it("escalate: approve + probes red + repeatedAreas + round === maxRounds", () => {
     const result = deriveDisposition({ verdict: "approve", probesGreen: false, round: 3, maxRounds: 3, repeatedAreas: true, strategizeEligible: true });
     assert.deepEqual(result, { disposition: "escalate", reason: "deterministic probes failed; same file area flagged for two consecutive rounds; max rounds (3) reached" });
   });
@@ -385,7 +384,6 @@ describe("deriveReworkStrategy", () => {
   it("1st rework: same tier, continue session, keep artifacts", () => {
     const result = deriveReworkStrategy({
       reworkCount: 0,
-      strategized: false,
     });
     assert.equal(result.tierDelta, 0);
     assert.equal(result.newSession, false);
@@ -397,7 +395,6 @@ describe("deriveReworkStrategy", () => {
   it("2nd rework: +1 tier, new session, keep artifacts", () => {
     const result = deriveReworkStrategy({
       reworkCount: 1,
-      strategized: false,
     });
     assert.equal(result.tierDelta, 1);
     assert.equal(result.newSession, true);
@@ -409,7 +406,6 @@ describe("deriveReworkStrategy", () => {
   it("3rd rework: +1 tier, new session, keep artifacts", () => {
     const result = deriveReworkStrategy({
       reworkCount: 2,
-      strategized: false,
     });
     assert.equal(result.tierDelta, 1);
     assert.equal(result.newSession, true);
@@ -422,7 +418,6 @@ describe("deriveReworkStrategy", () => {
   it("artifacts carried over on 1st rework (no restore)", () => {
     const result = deriveReworkStrategy({
       reworkCount: 0,
-      strategized: false,
     });
     // No restoreBase property exists in the return value
     assert.equal(Object.prototype.hasOwnProperty.call(result, "restoreBase"), false);
@@ -431,7 +426,6 @@ describe("deriveReworkStrategy", () => {
   it("artifacts carried over on 2nd rework (no restore)", () => {
     const result = deriveReworkStrategy({
       reworkCount: 1,
-      strategized: false,
     });
     assert.equal(Object.prototype.hasOwnProperty.call(result, "restoreBase"), false);
   });
@@ -440,22 +434,10 @@ describe("deriveReworkStrategy", () => {
   it("new session with artifacts kept: newSession=true, no restoreBase", () => {
     const result = deriveReworkStrategy({
       reworkCount: 1,
-      strategized: false,
     });
     // Default 2nd rework: new session, keep artifacts
     assert.equal(result.newSession, true);
     assert.equal(Object.prototype.hasOwnProperty.call(result, "restoreBase"), false);
-  });
-
-  // Strategized forces fresh session
-  it("strategized forces new session on 1st rework", () => {
-    const result = deriveReworkStrategy({
-      reworkCount: 0,
-      strategized: true,
-    });
-    assert.equal(result.newSession, true); // Would be false without strategized
-    assert.equal(result.tierDelta, 0);
-    assert.match(result.reason, /new session.*strategized/);
   });
 
   // AC5: every remaining parameter is exercised by the tests
@@ -471,14 +453,6 @@ describe("deriveReworkStrategy", () => {
     // Covered by "3rd rework" test
   });
 
-  it("strategized=true is exercised", () => {
-    // Covered by "strategized forces new session" test
-  });
-
-  it("strategized=false is exercised in default ladder tests", () => {
-    // Covered by 1st/2nd/3rd rework tests
-  });
-
   // ---- Anchoring override (kusabi #62) ----
   // On the FIRST rework, machine-refuted success claims and cross-round
   // repetition force a NEW session with the tier unchanged.  The lever
@@ -488,7 +462,6 @@ describe("deriveReworkStrategy", () => {
   it("anchoring override: approve + probes red on 1st rework forces a new session with same tier", () => {
     const result = deriveReworkStrategy({
       reworkCount: 0,
-      strategized: false,
       verdict: "approve",
       probesGreen: false,
       repeatedAreas: false,
@@ -504,7 +477,6 @@ describe("deriveReworkStrategy", () => {
   it("anchoring override: repeatedAreas on 1st rework forces a new session with same tier", () => {
     const result = deriveReworkStrategy({
       reworkCount: 0,
-      strategized: false,
       verdict: "needs-attention",
       probesGreen: false,
       repeatedAreas: true,
@@ -517,7 +489,6 @@ describe("deriveReworkStrategy", () => {
   it("anchoring override: both triggers on 1st rework name both in the reason", () => {
     const result = deriveReworkStrategy({
       reworkCount: 0,
-      strategized: false,
       verdict: "approve",
       probesGreen: false,
       repeatedAreas: true,
@@ -531,7 +502,6 @@ describe("deriveReworkStrategy", () => {
   it("no override: needs-attention + probes red on 1st rework still continues the session", () => {
     const result = deriveReworkStrategy({
       reworkCount: 0,
-      strategized: false,
       verdict: "needs-attention",
       probesGreen: false,
       repeatedAreas: false,
@@ -544,7 +514,6 @@ describe("deriveReworkStrategy", () => {
   it("no override: approve + probes green on 1st rework is not triggered (not machine-refuted)", () => {
     const result = deriveReworkStrategy({
       reworkCount: 0,
-      strategized: false,
       verdict: "approve",
       probesGreen: true,
       repeatedAreas: false,
@@ -557,7 +526,6 @@ describe("deriveReworkStrategy", () => {
   it("override does not change the 2nd rework ladder row", () => {
     const result = deriveReworkStrategy({
       reworkCount: 1,
-      strategized: false,
       verdict: "approve",
       probesGreen: false,
       repeatedAreas: true,
@@ -1194,7 +1162,6 @@ describe("deriveDisposition — Sol audit veto (sol-blocked)", () => {
       { input: { verdict: "approve", probesGreen: false }, expected: { disposition: "rework", reason: "deterministic probes failed" } },
       { input: { verdict: "needs-attention", probesGreen: false, findingSeverities: ["low"] }, expected: { disposition: "rework", reason: "needs-attention" } },
       { input: { verdict: "needs-attention", probesGreen: true, findingSeverities: ["low", "medium"] }, expected: { disposition: "accept-with-followup", reason: "probes green; remaining findings all minor" } },
-      { input: { verdict: "needs-attention", probesGreen: true, repeatedAreas: true, strategizeEligible: true }, expected: { disposition: "strategize", reason: "same file area flagged twice; structural re-diagnosis before next rework" } },
       { input: { verdict: "needs-attention", probesGreen: false, round: 3, maxRounds: 3, findingSeverities: ["low"] }, expected: { disposition: "escalate", reason: "max rounds (3) reached without acceptance" } },
       { input: { verdict: "discard", probesGreen: true }, expected: { disposition: "escalate", reason: "reviewer discarded the work" } },
       { input: { verdict: "approve-partial", probesGreen: true }, expected: { disposition: "escalate", reason: "approve-partial: unverified items remain" } },

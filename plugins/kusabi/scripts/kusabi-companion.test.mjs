@@ -456,8 +456,8 @@ describe("resolveOrchestratorRecord (kusabi #227)", () => {
 // ---------------------------------------------------------------------------
 
 describe("PHASE_AGENTS", () => {
-  it("contains 7 entries", () => {
-    assert.equal(Object.keys(PHASE_AGENTS).length, 7);
+  it("contains 6 entries", () => {
+    assert.equal(Object.keys(PHASE_AGENTS).length, 6);
   });
 
   it("maps gofer to kusabi-gofer", () => {
@@ -465,7 +465,6 @@ describe("PHASE_AGENTS", () => {
   });
 
   it("maps all known phases", () => {
-    assert.equal(PHASE_AGENTS.investigate, "kusabi-investigate");
     assert.equal(PHASE_AGENTS.implement, "kusabi-implement");
     assert.equal(PHASE_AGENTS.review, "kusabi-review");
     assert.equal(PHASE_AGENTS.respond, "kusabi-respond");
@@ -3557,7 +3556,7 @@ describe("brief lint and container delivery (kusabi #289)", () => {
 
     it("refuses a brief with no signature line, for every phase", () => {
       const brief = `# Task\n\n${DELIVERABLES}\n## Workplace\n\nContainer \`cid-1\`.\n`;
-      for (const phase of ["investigate", "implement", "review", "respond", "gofer"]) {
+      for (const phase of ["implement", "review", "respond", "gofer"]) {
         const report = briefLintReport({ brief, phase, container: "cid-1" });
         assert.ok(report, `${phase} must be refused`);
         assert.ok(
@@ -3570,7 +3569,7 @@ describe("brief lint and container delivery (kusabi #289)", () => {
     it("adds nothing but the signature line to the non-implement phases", () => {
       // Non-goal of #289: investigate/review/... keep the brief requirements
       // they already had.  No Deliverables, no Workplace, no container.
-      for (const phase of ["investigate", "review", "respond", "gofer"]) {
+      for (const phase of ["review", "respond", "gofer"]) {
         assert.equal(
           briefLintReport({ brief: `# Task\n\n${SIGNATURE}\n\nLook into it.\n`, phase, container: null }),
           null,
@@ -3700,7 +3699,7 @@ describe("brief lint and container delivery (kusabi #289)", () => {
       const brief = `# Task\n\n${SIGNATURE}\n\n${DELIVERABLES}`;
       assert.match(briefLintReport({ brief, phase: "implement", container: "cid-1" }), /## Smoke/);
       assert.match(briefLintReport({ brief, container: "cid-1", chain: true }), /## Smoke/);
-      for (const phase of ["investigate", "review", "respond", "gofer"]) {
+      for (const phase of ["review", "respond", "gofer"]) {
         assert.equal(
           briefLintReport({ brief: `# Task\n\n${SIGNATURE}\n\nLook into it.\n`, phase, container: null }),
           null,
