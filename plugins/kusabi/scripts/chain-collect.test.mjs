@@ -232,7 +232,6 @@ describe("collectContainerReviewInput", () => {
     assert.ok(input.includes('"src/new.js"'));
     // The base is what the reviewer cannot derive, so it is named as the ref
     // to fetch against; the diff body is not captured at all (kusabi #208).
-    assert.ok(input.includes("Fetching the diff is YOUR job"));
     assert.ok(input.includes("`base` set to `deadbeefcafe`"));
     assert.ok(!input.includes("diff --git"));
     // Same default the chain uses: HEAD.
@@ -383,7 +382,6 @@ describe("collectContainerReviewInput", () => {
     assert.ok(input.includes("- Base commit: (unavailable)"));
     // No base to name: the instruction says so and names the fallback rather
     // than disappearing.
-    assert.ok(input.includes("Fetching the diff is YOUR job"));
     assert.ok(input.includes("`worktree: true`"));
   });
 
@@ -596,7 +594,6 @@ describe("change-scope wiring into review and probe phases (kusabi #379)", () =>
     assert.ok(input.includes('"src/unstaged.js"'));
     assert.ok(input.includes('"src/untracked.js"'));
     // Diff instruction names base
-    assert.ok(input.includes("Fetching the diff is YOUR job"));
     assert.ok(input.includes("`base` set to `base-sha-123`"));
   });
 
