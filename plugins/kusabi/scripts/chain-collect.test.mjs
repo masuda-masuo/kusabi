@@ -474,23 +474,35 @@ describe("base ref reaches the reviewer as an instruction, not a capture", () =>
 // change-scope wiring into review and probe phases (kusabi #379)
 // ---------------------------------------------------------------------------
 
-describe("change-scope wiring into review and probe phases (kusabi #379)", () => {
-  const FIXTURE_CHANGE_SCOPE = {
-    formatVersion: 1,
-    repositoryRoot: "/workspace",
-    input: { base: "base-sha-123", head: "HEAD" },
-    resolved: {
-      baseSha: "base-sha-123",
-      headSha: "head-sha-456",
-      mergeBaseSha: "base-sha-123",
-    },
-    paths: {
-      committed: ["src/committed.js"],
-      staged: ["src/staged.js"],
-      unstaged: ["src/unstaged.js"],
-      untracked: ["src/untracked.js"],
-    },
+const FIXTURE_CHANGE_SCOPE = Object.freeze({
+  formatVersion: 1,
+  repositoryRoot: "/workspace",
+  input: Object.freeze({ base: "base-sha-123", head: "HEAD" }),
+  resolved: Object.freeze({
+    baseSha: "base-sha-123",
+    headSha: "head-sha-456",
+    mergeBaseSha: "base-sha-123",
+  }),
+  paths: Object.freeze({
+    committed: Object.freeze(["src/committed.js"]),
+    staged: Object.freeze(["src/staged.js"]),
+    unstaged: Object.freeze(["src/unstaged.js"]),
+    untracked: Object.freeze(["src/untracked.js"]),
+  }),
+});
+
+function splitJsonIntoTwoPages(payload) {
+  const fullJson = JSON.stringify(payload, null, 2);
+  const lines = fullJson.split("\n");
+  const mid = Math.floor(lines.length / 2);
+  return {
+    mid,
+    page1: lines.slice(0, mid).join("\n"),
+    page2: lines.slice(mid).join("\n"),
   };
+}
+
+describe("change-scope wiring into review and probe phases (kusabi #379)", () => {
 
   function makeChangeScopeMock(changeScopeOutput) {
     return async (toolName, params) => {
@@ -649,23 +661,6 @@ describe("change-scope wiring into review and probe phases (kusabi #379)", () =>
 });
 
 describe("change-scope transport regression and fallback coverage (kusabi #667)", () => {
-  const FIXTURE_CHANGE_SCOPE = {
-    formatVersion: 1,
-    repositoryRoot: "/workspace",
-    input: { base: "base-sha-123", head: "HEAD" },
-    resolved: {
-      baseSha: "base-sha-123",
-      headSha: "head-sha-456",
-      mergeBaseSha: "base-sha-123",
-    },
-    paths: {
-      committed: ["src/committed.js"],
-      staged: ["src/staged.js"],
-      unstaged: ["src/unstaged.js"],
-      untracked: ["src/untracked.js"],
-    },
-  };
-
   it("explicit truncated flag throws even if partial output happens to be valid JSON", async () => {
     const callTool = async (toolName) => {
       if (toolName === "copy_file") return { status: "ok" };
@@ -744,11 +739,7 @@ describe("change-scope transport regression and fallback coverage (kusabi #667)"
   });
 
   it("multi-page output via read_output is reassembled into complete JSON", async () => {
-    const fullJson = JSON.stringify(FIXTURE_CHANGE_SCOPE, null, 2);
-    const lines = fullJson.split("\n");
-    const mid = Math.floor(lines.length / 2);
-    const page1 = lines.slice(0, mid).join("\n");
-    const page2 = lines.slice(mid).join("\n");
+    const { mid, page1, page2 } = splitJsonIntoTwoPages(FIXTURE_CHANGE_SCOPE);
 
     const calls = [];
     const callTool = async (toolName, params) => {
@@ -790,11 +781,7 @@ describe("change-scope transport regression and fallback coverage (kusabi #667)"
   });
 
   it("multi-page output via sandbox_exec offset is reassembled when read_output is unavailable", async () => {
-    const fullJson = JSON.stringify(FIXTURE_CHANGE_SCOPE, null, 2);
-    const lines = fullJson.split("\n");
-    const mid = Math.floor(lines.length / 2);
-    const page1 = lines.slice(0, mid).join("\n");
-    const page2 = lines.slice(mid).join("\n");
+    const { mid, page1, page2 } = splitJsonIntoTwoPages(FIXTURE_CHANGE_SCOPE);
 
     const calls = [];
     const callTool = async (toolName, params) => {
@@ -973,73 +960,59 @@ describe("change-scope transport regression and fallback coverage (kusabi #667)"
     assert.deepEqual(scope.paths.committed, committedFiles);
   });
 
-  it("non-progressing next_offset in paged output terminates loop and fails closed", async () => {
-    let readCount = 0;
-    const callTool = async (toolName) => {
-      if (toolName === "copy_file") return { status: "ok" };
-      if (toolName === "sandbox_exec") {
-        return {
-          status: "ok",
-          output: '{"formatVersion": 1,',
-          output_id: "oid-loop",
-          has_more: true,
-          next_offset: 10,
-          truncated: true,
-        };
-      }
-      if (toolName === "read_output") {
-        readCount++;
-        return {
-          status: "ok",
-          offset: 10,
-          output: '"paths": {',
-          has_more: true,
-          next_offset: 10,
-          truncated: true,
-        };
-      }
-      return { output: "" };
-    };
+  const offsetErrorCases = [
+    {
+      name: "non-progressing next_offset in paged output terminates loop and fails closed",
+      container: "cid-loop",
+      outputId: "oid-loop",
+      nextOffset: 10,
+      expected: /change-scope output was truncated in container cid-loop/,
+      readCountDiagnostic: "must break immediately and not loop infinitely on non-progressing offset",
+    },
+    {
+      name: "invalid non-integer next_offset in paged output terminates loop and fails closed",
+      container: "cid-nan",
+      outputId: "oid-nan",
+      nextOffset: NaN,
+      expected: /change-scope output was truncated in container cid-nan/,
+      readCountDiagnostic: "must break immediately and not loop infinitely on invalid offset",
+    },
+  ];
 
-    await assert.rejects(
-      () => collectChangeScope({ container: "cid-loop", callTool, base: "base-sha-123" }),
-      /change-scope output was truncated in container cid-loop/,
-    );
-    assert.equal(readCount, 1, "must break immediately and not loop infinitely on non-progressing offset");
-  });
+  for (const tc of offsetErrorCases) {
+    it(tc.name, async () => {
+      let readCount = 0;
+      const callTool = async (toolName) => {
+        if (toolName === "copy_file") return { status: "ok" };
+        if (toolName === "sandbox_exec") {
+          return {
+            status: "ok",
+            output: '{"formatVersion": 1,',
+            output_id: tc.outputId,
+            has_more: true,
+            next_offset: 10,
+            truncated: true,
+          };
+        }
+        if (toolName === "read_output") {
+          readCount++;
+          return {
+            status: "ok",
+            offset: 10,
+            output: '"paths": {',
+            has_more: true,
+            next_offset: tc.nextOffset,
+            truncated: true,
+          };
+        }
+        return { output: "" };
+      };
 
-  it("invalid non-integer next_offset in paged output terminates loop and fails closed", async () => {
-    let readCount = 0;
-    const callTool = async (toolName) => {
-      if (toolName === "copy_file") return { status: "ok" };
-      if (toolName === "sandbox_exec") {
-        return {
-          status: "ok",
-          output: '{"formatVersion": 1,',
-          output_id: "oid-nan",
-          has_more: true,
-          next_offset: 10,
-          truncated: true,
-        };
-      }
-      if (toolName === "read_output") {
-        readCount++;
-        return {
-          status: "ok",
-          offset: 10,
-          output: '"paths": {',
-          has_more: true,
-          next_offset: NaN,
-          truncated: true,
-        };
-      }
-      return { output: "" };
-    };
-
-    await assert.rejects(
-      () => collectChangeScope({ container: "cid-nan", callTool, base: "base-sha-123" }),
-      /change-scope output was truncated in container cid-nan/,
-    );
-    assert.equal(readCount, 1, "must break immediately and not loop infinitely on invalid offset");
-  });
+      await assert.rejects(
+        () => collectChangeScope({ container: tc.container, callTool, base: "base-sha-123" }),
+        tc.expected,
+      );
+      assert.equal(readCount, 1, tc.readCountDiagnostic);
+    });
+  }
 });
