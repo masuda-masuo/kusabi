@@ -18,6 +18,7 @@ import {
   probeEvidenceIncomplete,
   providerStatusFromError,
   resetFailedRoutes,
+  runPrompt,
 } from "./prompt-execution.mjs";
 import { stateDirFor } from "./state-paths.mjs";
 import { loadJob, saveJob } from "./job-store.mjs";
@@ -2996,3 +2997,322 @@ describe("cmdTask recovered/no-final finalization (kusabi #496)", () => {
     assert.equal(job.probeResults, undefined, "no probe truth was recorded");
   });
 });
+
+// =========================================================================
+// kusabi #724 — monotonic silence watchdog (in-process elapsed time)
+// =========================================================================
+
+function silentServeSource({ emitInitial = true } = {}) {
+  return `#!/usr/bin/env node
+import http from "node:http";
+import fs from "node:fs";
+
+const argv = process.argv.slice(2);
+const port = Number(argv[argv.indexOf("--port") + 1]);
+let nextSession = 0;
+const EMIT_INITIAL = ${JSON.stringify(emitInitial)};
+
+function sse(res, event) {
+  res.write("data: " + JSON.stringify(event) + "\\n\\n");
+}
+
+const server = http.createServer((req, res) => {
+  res.on("error", () => {});
+  const url = new URL(req.url, "http://127.0.0.1:" + port);
+  req.on("data", () => {});
+  req.on("end", () => {
+    if (req.method === "GET" && url.pathname === "/session") {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end("[]");
+      return;
+    }
+    if (req.method === "POST" && url.pathname === "/session") {
+      const id = "ses-" + (++nextSession);
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ id }));
+      return;
+    }
+    const segs = url.pathname.split("/");
+    const sessionId = segs[2];
+    if (req.method === "POST" && segs[3] === "prompt_async") {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end("{}");
+      return;
+    }
+    if (req.method === "POST" && segs[3] === "abort") {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end("{}");
+      return;
+    }
+    if (req.method === "GET" && segs[3] === "message") {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end("[]");
+      return;
+    }
+    if (req.method === "GET" && url.pathname === "/event") {
+      res.writeHead(200, { "content-type": "text/event-stream" });
+      res.flushHeaders();
+      const id = "ses-" + nextSession;
+      if (EMIT_INITIAL) {
+        sse(res, {
+          type: "session.status",
+          properties: { sessionID: id, status: { type: "busy" } },
+        });
+      }
+      return;
+    }
+    res.writeHead(404, { "content-type": "application/json" });
+    res.end("{}");
+  });
+});
+server.listen(port, "127.0.0.1");
+setInterval(() => {}, 1000);
+`;
+}
+
+function silentServeContext({ emitInitial = true } = {}) {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-724-test-"));
+  const binPath = path.join(tmp, "fake-serve.mjs");
+  fs.writeFileSync(binPath, silentServeSource({ emitInitial }), "utf8");
+  fs.chmodSync(binPath, 0o755);
+  const stateRoot = path.join(tmp, "state");
+  const cwd = path.join(tmp, "cwd");
+  fs.mkdirSync(cwd, { recursive: true });
+  const restoreEnv = patchEnv({
+    OPENCODE_BIN: binPath,
+    KUSABI_STATE_DIR: stateRoot,
+    KUSABI_SERVE_READY_TIMEOUT_MS: "8000",
+  });
+  const stateDir = stateDirFor(cwd);
+  return {
+    tmp,
+    cwd,
+    stateDir,
+    restore() {
+      restoreEnv();
+    },
+    killAll() {
+      try {
+        const rec = JSON.parse(fs.readFileSync(path.join(stateDir, "server.json"), "utf8"));
+        try { process.kill(rec.pid, "SIGKILL"); } catch { /* already gone */ }
+      } catch { /* no record written */ }
+    },
+    rm() {
+      try { fs.rmSync(tmp, { recursive: true, force: true }); } catch { /* best-effort */ }
+    },
+  };
+}
+
+describe("runPrompt monotonic silence watchdog (kusabi #724)", () => {
+  it("watchdog firing decision is unaffected when Date.now jumps backward during active silence window", async (t) => {
+    const ctx = silentServeContext();
+    const intervals = [];
+    t.mock.method(globalThis, "setInterval", (fn, ms) => {
+      const item = { fn, ms };
+      intervals.push(item);
+      return item;
+    });
+    t.mock.method(globalThis, "clearInterval", () => {});
+
+    let wall = 1_700_000_000_000;
+    t.mock.method(Date, "now", () => wall);
+
+    let mono = 1_000;
+    const now = () => mono;
+
+    try {
+      const pending = runPrompt({
+        cwd: ctx.cwd,
+        kind: "task",
+        title: "monotonic watchdog backward jump test",
+        promptText: "test prompt",
+        timeoutS: 60,
+        watchdogS: 10,
+        now,
+      });
+
+      let eventsPath = null;
+      for (let i = 0; i < 100; i++) {
+        const jobsDir = path.join(ctx.stateDir, "jobs");
+        if (fs.existsSync(jobsDir)) {
+          const list = fs.readdirSync(jobsDir);
+          if (list.length > 0) {
+            const ep = path.join(jobsDir, list[0], "events.ndjson");
+            if (fs.existsSync(ep) && fs.readFileSync(ep, "utf8").includes("session.status")) {
+              eventsPath = ep;
+              break;
+            }
+          }
+        }
+        await new Promise((r) => setTimeout(r, 20));
+      }
+      assert.ok(eventsPath, "initial event must be recorded in events.ndjson");
+      assert.ok(intervals.length >= 2, "watchdog interval must be registered");
+      const watchdogTick = intervals[1].fn;
+
+      // Active silence window: initial event landed, lastActivityMono = 1000.
+      // Jump Date.now backward by 100 seconds (WSL wall-clock backward step).
+      wall -= 100_000;
+
+      // Advance monotonic clock by only 4s (silence = 4s <= 10s watchdogS).
+      mono += 4_000;
+      watchdogTick();
+      await new Promise((r) => setTimeout(r, 20));
+      assert.ok(
+        !fs.readFileSync(eventsPath, "utf8").includes("companion.watchdog.fired"),
+        "watchdog must not fire when monotonic silence has not exceeded threshold",
+      );
+
+      // Advance monotonic clock past watchdogS (now elapsed silence = 15s > 10s).
+      // Under Date.now(), silenceMs would be negative and the watchdog would never fire.
+      // Under monotonic clock, the watchdog fires regardless of the wall-clock backward jump.
+      mono += 11_000;
+      watchdogTick();
+
+      const { job } = await pending;
+      assert.equal(job.status, "stalled");
+      assert.ok(job.error.includes("watchdog: no events for 10s"));
+
+      const events = fs.readFileSync(eventsPath, "utf8").trim().split("\n").map(JSON.parse);
+      const firedEvent = events.find((e) => e.type === "companion.watchdog.fired");
+      assert.ok(firedEvent, "companion.watchdog.fired must be in the audit trail");
+      assert.equal(firedEvent.silenceS, 15);
+    } finally {
+      ctx.killAll();
+      ctx.restore();
+      ctx.rm();
+    }
+  });
+
+  it("monotonic silence beyond watchdogS fires watchdog and records silenceS", async (t) => {
+    const ctx = silentServeContext();
+    const intervals = [];
+    t.mock.method(globalThis, "setInterval", (fn, ms) => {
+      const item = { fn, ms };
+      intervals.push(item);
+      return item;
+    });
+    t.mock.method(globalThis, "clearInterval", () => {});
+
+    let mono = 5_000;
+    const now = () => mono;
+
+    try {
+      const pending = runPrompt({
+        cwd: ctx.cwd,
+        kind: "task",
+        title: "monotonic watchdog silence test",
+        promptText: "test prompt",
+        timeoutS: 60,
+        watchdogS: 10,
+        now,
+      });
+
+      let eventsPath = null;
+      for (let i = 0; i < 100; i++) {
+        const jobsDir = path.join(ctx.stateDir, "jobs");
+        if (fs.existsSync(jobsDir)) {
+          const list = fs.readdirSync(jobsDir);
+          if (list.length > 0) {
+            const ep = path.join(jobsDir, list[0], "events.ndjson");
+            if (fs.existsSync(ep) && fs.readFileSync(ep, "utf8").includes("session.status")) {
+              eventsPath = ep;
+              break;
+            }
+          }
+        }
+        await new Promise((r) => setTimeout(r, 20));
+      }
+      assert.ok(eventsPath, "initial event must be recorded in events.ndjson");
+      assert.ok(intervals.length >= 2, "watchdog interval must be registered");
+      const watchdogTick = intervals[1].fn;
+
+      // Advance monotonic clock past watchdogS (12s > 10s)
+      mono += 12_000;
+      watchdogTick();
+
+      const { job } = await pending;
+      assert.equal(job.status, "stalled");
+      assert.ok(job.error.includes("watchdog: no events for 10s"));
+      assert.equal(job.stats.events, 1);
+
+      // job.stats.lastActivity is still written as an ISO wall-clock string
+      assert.equal(typeof job.stats.lastActivity, "string");
+      assert.ok(!Number.isNaN(Date.parse(job.stats.lastActivity)));
+      assert.match(job.stats.lastActivity, /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}/);
+
+      const events = fs.readFileSync(eventsPath, "utf8").trim().split("\n").map(JSON.parse);
+      const firedEvent = events.find((e) => e.type === "companion.watchdog.fired");
+      assert.ok(firedEvent, "companion.watchdog.fired must be recorded");
+      assert.equal(firedEvent.silenceS, 12);
+    } finally {
+      ctx.killAll();
+      ctx.restore();
+      ctx.rm();
+    }
+  });
+
+  it("monotonic silence from watchdog arming fires when no events arrive", async (t) => {
+    const ctx = silentServeContext({ emitInitial: false });
+    const intervals = [];
+    t.mock.method(globalThis, "setInterval", (fn, ms) => {
+      const item = { fn, ms };
+      intervals.push(item);
+      return item;
+    });
+    t.mock.method(globalThis, "clearInterval", () => {});
+
+    let mono = 1_000;
+    const now = () => mono;
+
+    try {
+      const pending = runPrompt({
+        cwd: ctx.cwd,
+        kind: "task",
+        title: "monotonic silence from arming test",
+        promptText: "test prompt",
+        timeoutS: 60,
+        watchdogS: 10,
+        now,
+      });
+
+      let jobsDir = path.join(ctx.stateDir, "jobs");
+      let jobDirName = null;
+      for (let i = 0; i < 100; i++) {
+        if (intervals.length >= 2 && fs.existsSync(jobsDir)) {
+          const list = fs.readdirSync(jobsDir);
+          if (list.length > 0) {
+            jobDirName = list[0];
+            break;
+          }
+        }
+        await new Promise((r) => setTimeout(r, 20));
+      }
+      assert.ok(jobDirName, "job directory must be created");
+      assert.ok(intervals.length >= 2, "watchdog interval must be registered");
+      const watchdogTick = intervals[1].fn;
+
+      // No events arrived: silence starts from arming time (mono = 1000).
+      // Advance monotonic clock past watchdogS (16s > 10s)
+      mono += 16_000;
+      watchdogTick();
+
+      const { job } = await pending;
+      assert.equal(job.status, "stalled");
+      assert.ok(job.error.includes("watchdog: no events for 10s"));
+      assert.equal(job.stats.events, 0);
+      assert.equal(job.stats.lastActivity, null);
+
+      const eventsPath = path.join(jobsDir, jobDirName, "events.ndjson");
+      const events = fs.readFileSync(eventsPath, "utf8").trim().split("\n").map(JSON.parse);
+      const firedEvent = events.find((e) => e.type === "companion.watchdog.fired");
+      assert.ok(firedEvent, "companion.watchdog.fired must be recorded");
+      assert.equal(firedEvent.silenceS, 16);
+    } finally {
+      ctx.killAll();
+      ctx.restore();
+      ctx.rm();
+    }
+  });
+});
+

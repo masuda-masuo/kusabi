@@ -708,7 +708,7 @@ export function watchdogKillOrDecline({ server, stateDir, job, abortOk, healthOk
  *
  * @returns {Promise<{ job: object, resultText: string, stateDir: string }>}
  */
-export async function runPrompt({ cwd, kind, title, promptText, agent, model, session, tools, format, timeoutS, watchdogS, phase }) {
+export async function runPrompt({ cwd, kind, title, promptText, agent, model, session, tools, format, timeoutS, watchdogS, phase, now = () => performance.now() }) {
   const server = await ensureServer(cwd);
   const { stateDir } = server;
 
@@ -798,6 +798,11 @@ export async function runPrompt({ cwd, kind, title, promptText, agent, model, se
     abort.abort();
   }, 10000);
 
+  // Monotonic timestamp for silence watchdog (kusabi #724). Initialized
+  // at the moment the watchdog is armed so the first silence window starts
+  // when this process starts watching.
+  let lastActivityMono = now();
+
   if (watchdogS > 0) {
     watchdogInterval = setInterval(() => {
       if (watchdogFired) return;
@@ -806,8 +811,7 @@ export async function runPrompt({ cwd, kind, title, promptText, agent, model, se
       // nothing left to kill — claiming otherwise would put a kill that never
       // happened into the audit trail.
       if (serveDead) return;
-      const lastActivity = job.stats.lastActivity ?? job.startedAt;
-      const silenceMs = Date.now() - Date.parse(lastActivity);
+      const silenceMs = now() - lastActivityMono;
       if (silenceMs > watchdogS * 1000) {
         watchdogFired = true;
         clearInterval(watchdogInterval);
@@ -867,6 +871,7 @@ export async function runPrompt({ cwd, kind, title, promptText, agent, model, se
           if (eventSession(event) !== sessionID) continue;
           job.stats.events += 1;
           job.stats.lastActivity = new Date().toISOString();
+          lastActivityMono = now();
           const type = String(event?.type ?? "");
           appendEvent(stateDir, job.id, event);
 
