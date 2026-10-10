@@ -76,54 +76,40 @@ describe("extractKaibaMcp", () => {
     assert.throws(() => extractKaibaMcp(file), /is not valid JSON/);
   });
 
-  it("rejects a string, a number, a boolean, an array and null — each is a config error, not an absence", () => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-claude-mcp-"));
-    const file = path.join(dir, "claude.json");
-    const junk = [
-      ["string", "kaiba"],
-      ["number", 7],
-      ["boolean", true],
-      ["array", ["kaiba"]],
-      ["null", null],
-    ];
-    for (const [label, value] of junk) {
-      fs.writeFileSync(file, JSON.stringify({ mcpServers: { sunaba: { command: "npx" }, kaiba: value } }), "utf8");
-      assert.throws(
-        () => extractKaibaMcp(file),
-        (err) => {
-          // A reader must be able to tell this apart from the missing-sunaba
-          // failure: the message names the kaiba key, says the entry is not
-          // a server entry, and tells the operator that removing the key
-          // restores the previous behaviour.
-          assert.match(err.message, /mcpServers\.kaiba/, "the error must name the key");
-          assert.match(err.message, /not a server entry/, "the error must say the entry is not a server entry");
-          assert.match(
-            err.message,
-            /remove the mcpServers\.kaiba key/,
-            "the error must tell the operator that removing the key restores the previous behaviour",
-          );
-          return true;
-        },
-        `${label} entry must throw`,
-      );
-    }
-  });
-
-  it("the error says what the entry was found to be", () => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-claude-mcp-"));
-    const file = path.join(dir, "claude.json");
-    const cases = [
-      ["string", "kaiba", /is a string, not a server entry/],
-      ["number", 7, /is a number, not a server entry/],
-      ["boolean", true, /is a boolean, not a server entry/],
-      ["array", ["kaiba"], /is an array, not a server entry/],
-      ["null", null, /is null, not a server entry/],
-    ];
-    for (const [label, value, re] of cases) {
-      fs.writeFileSync(file, JSON.stringify({ mcpServers: { sunaba: { command: "npx" }, kaiba: value } }), "utf8");
-      assert.throws(() => extractKaibaMcp(file), re, `${label}: the message must say what was found`);
-    }
-  });
+  // A missing optional entry returns null; a present malformed entry is a config error.
+  const malformedKaibaEntries = [
+    ["string", "kaiba", /is a string, not a server entry/],
+    ["number", 7, /is a number, not a server entry/],
+    ["boolean", true, /is a boolean, not a server entry/],
+    ["array", ["kaiba"], /is an array, not a server entry/],
+    ["null", null, /is null, not a server entry/],
+  ];
+  for (const [label, value, typePattern] of malformedKaibaEntries) {
+    it(`rejects ${label} kaiba entry as a config error, not an absence`, () => {
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-claude-mcp-"));
+      const file = path.join(dir, "claude.json");
+      try {
+        fs.writeFileSync(file, JSON.stringify({ mcpServers: { sunaba: { command: "npx" }, kaiba: value } }), "utf8");
+        assert.throws(
+          () => extractKaibaMcp(file),
+          (err) => {
+            assert.match(err.message, /mcpServers\.kaiba/, `${label}: the error must name the key`);
+            assert.match(err.message, /not a server entry/, `${label}: the error must say the entry is not a server entry`);
+            assert.match(
+              err.message,
+              /remove the mcpServers\.kaiba key/,
+              `${label}: the error must advise removing the key`,
+            );
+            assert.match(err.message, typePattern, `${label}: the error must say what was found`);
+            return true;
+          },
+          `${label} entry must throw`,
+        );
+      } finally {
+        fs.rmSync(dir, { recursive: true, force: true });
+      }
+    });
+  }
 
   it("rejects an object with no field that could start a server — {} and junk objects are malformed, not absent", () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-claude-mcp-"));
