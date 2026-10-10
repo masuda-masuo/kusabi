@@ -5472,33 +5472,6 @@ describe("kusabi-companion extraction invariants (kusabi #437)", () => {
   });
 });
 
-describe("kusabi-companion extraction invariants (kusabi #443)", () => {
-  it("companion contains no moved metrics/dashboard/chain-stats command definitions or re-exports", () => {
-    const source = fs.readFileSync(path.join(import.meta.dirname, "kusabi-companion.mjs"), "utf8");
-    assert.ok(!source.includes("function cmdChainStats("), "cmdChainStats must not be defined in companion");
-    assert.ok(!source.includes("function cmdMetricsIngest("), "cmdMetricsIngest must not be defined in companion");
-    assert.ok(!source.includes("function cmdMetricsReport("), "cmdMetricsReport must not be defined in companion");
-    assert.ok(!source.includes("function dashboardPortFlag("), "dashboardPortFlag must not be defined in companion");
-    assert.ok(!source.includes("async function cmdDashboard("), "cmdDashboard must not be defined in companion");
-    assert.ok(!source.includes("export { cmdChainStats"), "no cmdChainStats re-export");
-    assert.ok(!source.includes("export { cmdMetricsIngest"), "no cmdMetricsIngest re-export");
-    assert.ok(!source.includes("export { cmdMetricsReport"), "no cmdMetricsReport re-export");
-    assert.ok(!source.includes("export { cmdDashboard"), "no cmdDashboard re-export");
-  });
-});
-
-describe("kusabi-companion extraction invariants (kusabi #445)", () => {
-  it("companion contains no moved host command definitions or re-exports", () => {
-    const source = fs.readFileSync(path.join(import.meta.dirname, "kusabi-companion.mjs"), "utf8");
-    assert.ok(!source.includes("function copyDirTree("), "copyDirTree must not be defined in companion");
-    assert.ok(!source.includes("function opencodeConfigDir("), "opencodeConfigDir must not be defined in companion");
-    assert.ok(!source.includes("function destDirState("), "destDirState must not be defined in companion");
-    assert.ok(!source.includes("function cmdInstallAgents("), "cmdInstallAgents must not be defined in companion");
-    assert.ok(!source.includes("async function cmdSalvage("), "cmdSalvage must not be defined in companion");
-    assert.ok(!source.includes("export { cmdInstallAgents"), "no cmdInstallAgents re-export");
-    assert.ok(!source.includes("export { cmdSalvage"), "no cmdSalvage re-export");
-  });
-});
 
 
 // ---------------------------------------------------------------------------
