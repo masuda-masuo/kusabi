@@ -38,7 +38,9 @@ import {
   readChainControl,
   writeChainControl,
 } from "./chain-control.mjs";
-import { writeJson, stateDirFor } from "./state-paths.mjs";
+import { writeJson, stateDirFor, readJson } from "./state-paths.mjs";
+import { cmdTask } from "./task-cmd.mjs";
+import { cmdChain } from "./chain-cmd.mjs";
 import {
   startSunabaStub,
   startDetachStub,
@@ -436,18 +438,246 @@ describe("resolveOrchestratorRecord (kusabi #227)", () => {
     }
   });
 
-  it("both dispatch sites resolve through it, not through the bare parser (source guard)", () => {
-    // cmdTask lives in task-cmd.mjs (kusabi #437); cmdChain lives in
-    // chain-cmd.mjs since kusabi #422 Job 2.  The wiring being pinned is the same wiring.
-    const taskCmdSource = fs.readFileSync(path.join(import.meta.dirname, "task-cmd.mjs"), "utf8");
-    const chainCmdSource = fs.readFileSync(path.join(import.meta.dirname, "chain-cmd.mjs"), "utf8");
-    const cmdTaskSource = taskCmdSource.slice(taskCmdSource.indexOf("async function cmdTask("), taskCmdSource.indexOf("async function cmdReview("));
-    const cmdChainSource = chainCmdSource.slice(chainCmdSource.indexOf("async function cmdChain("));
-    assert.ok(cmdTaskSource.includes("const orchestrator = resolveOrchestratorRecord(text);"));
-    assert.ok(cmdChainSource.includes("const orchestrator = resolveOrchestratorRecord(text);"));
-    // No dispatch site may bypass the resolution by parsing the brief itself.
-    assert.ok(!cmdTaskSource.includes("parseOrchestratorSignature("));
-    assert.ok(!cmdChainSource.includes("parseOrchestratorSignature("));
+  it("cmdTask caller resolves and persists orchestrator record for signed and unsigned inputs", async () => {
+    const taskCases = [
+      {
+        name: "signed with env",
+        text: SIGNED,
+        envSession: ENV_UUID,
+        expected: {
+          model: "claude-fable-5",
+          session: ENV_UUID,
+          date: "2026-08-12",
+          sessionSource: "env",
+        },
+      },
+      {
+        name: "signed without env",
+        text: SIGNED,
+        envSession: undefined,
+        expected: {
+          model: "claude-fable-5",
+          session: "cc-20260811-215",
+          date: "2026-08-12",
+        },
+      },
+      {
+        name: "unsigned ad-hoc with env",
+        text: UNSIGNED,
+        envSession: ENV_UUID,
+        expected: {
+          model: null,
+          session: ENV_UUID,
+          date: null,
+          sessionSource: "env",
+        },
+      },
+    ];
+
+    for (const tc of taskCases) {
+      const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-test-task-caller-"));
+      const cwd = path.join(tmp, "ws");
+      fs.mkdirSync(cwd, { recursive: true });
+      const prevEnv = process.env.KUSABI_STATE_DIR;
+      const prevOrch = process.env[ORCH_SESSION_ENV];
+      try {
+        process.env.KUSABI_STATE_DIR = path.join(tmp, "state");
+        if (tc.envSession === undefined) {
+          delete process.env[ORCH_SESSION_ENV];
+        } else {
+          process.env[ORCH_SESSION_ENV] = tc.envSession;
+        }
+
+        let dispatched = false;
+        const fakeJob = {
+          id: "job-task-" + Date.now().toString(36),
+          status: "completed",
+          modelEntry: "test-model",
+          error: null,
+        };
+        const _dispatch = async () => {
+          dispatched = true;
+          return {
+            job: fakeJob,
+            resultText: "task complete",
+          };
+        };
+
+        const res = await cmdTask(
+          cwd,
+          { flags: {}, text: tc.text, _dispatch },
+          { stateRoot: path.join(tmp, "state") },
+        );
+        assert.equal(res.exitCode, 0);
+        assert.equal(dispatched, true);
+        assert.deepEqual(fakeJob.orchestrator, tc.expected);
+
+        const stateDir = stateDirFor(cwd);
+        const persisted = readJson(path.join(stateDir, "jobs", fakeJob.id, "job.json"));
+        assert.ok(persisted, "persisted job.json must exist");
+        assert.deepEqual(persisted.orchestrator, tc.expected);
+      } finally {
+        if (prevEnv === undefined) delete process.env.KUSABI_STATE_DIR;
+        else process.env.KUSABI_STATE_DIR = prevEnv;
+        if (prevOrch === undefined) delete process.env[ORCH_SESSION_ENV];
+        else process.env[ORCH_SESSION_ENV] = prevOrch;
+        fs.rmSync(tmp, { recursive: true, force: true });
+      }
+    }
+  });
+
+  it("cmdChain caller resolves and persists orchestrator record across signature and environment inputs", async () => {
+    const chainBrief = `${SIGNED}\n\n## Deliverables\n- \`src/foo.js\`\n\n## Smoke\n- \`npm test\`\n`;
+    const APPROVE = JSON.stringify({
+      schema_version: 1,
+      verdict: "approve",
+      findings: [],
+      summary: "ok",
+      next_steps: [],
+    });
+
+    function makeFakeCallTool() {
+      return async (toolName, params) => {
+        if (toolName === "verify_in_container") return { gate_passed: true };
+        if (toolName !== "sandbox_exec") return { output: "" };
+        const cmd = params?.commands?.[0] ?? params?.argv?.join(" ") ?? "";
+        if (cmd.includes("change-scope.mjs")) {
+          return {
+            output: JSON.stringify({
+              formatVersion: 1,
+              repositoryRoot: "/workspace",
+              input: { base: "abc123", head: "HEAD" },
+              resolved: { baseSha: "abc123", headSha: "abc123", mergeBaseSha: "abc123" },
+              paths: { committed: [], staged: [], unstaged: [], untracked: [] },
+            }),
+          };
+        }
+        if (cmd.startsWith("cd /workspace &&") && cmd.includes("TMPIDX=")) {
+          return { output: "ERROR_NO_INDEX\n" };
+        }
+        if (cmd.includes("SMOKE_EXIT=")) return { output: "SMOKE_EXIT=0\n" };
+        if (cmd === "git rev-parse HEAD") return { output: "abc123\n" };
+        if (cmd === "git status --porcelain") return { output: " M src/foo.js\n" };
+        if (cmd === "git log --oneline -5") return { output: "abc123 latest change\n" };
+        if (cmd === "git diff") return { output: "diff --git a/src/foo.js b/src/foo.js\n" };
+        if (cmd === "git ls-files --others --exclude-standard") return { output: "untracked.txt\n" };
+        return { output: "" };
+      };
+    }
+
+    function makeFakeDispatch() {
+      return async (opts) => {
+        if (opts.kind === "review") {
+          return {
+            job: {
+              id: "job-rev-1",
+              status: "completed",
+              modelEntry: "opencode/fake-review",
+              modelVariant: null,
+              fallbacks: null,
+              sessionID: "ses_rev_1",
+              usage: { available: true, input: 2, output: 2, reasoning: 0, cacheRead: 0, cacheWrite: 0, cost: 0.01 },
+              error: null,
+            },
+            resultText: APPROVE,
+          };
+        }
+        if (opts.kind === "task") {
+          return {
+            job: {
+              id: "job-imp-1",
+              status: "completed",
+              modelEntry: "opencode/fake-model",
+              modelVariant: null,
+              fallbacks: null,
+              sessionID: "ses_imp_1",
+              usage: { available: true, input: 1, output: 1, reasoning: 0, cacheRead: 0, cacheWrite: 0, cost: 0.01 },
+              error: null,
+            },
+            resultText: "implemented",
+          };
+        }
+        throw new Error("unexpected dispatch kind: " + opts.kind);
+      };
+    }
+
+    function makeChainInject() {
+      return {
+        inject: {
+          callTool: makeFakeCallTool(),
+          dispatchWithFallback: makeFakeDispatch(),
+          reviewDispatchWithFallback: makeFakeDispatch(),
+          reworkDispatchWithFallback: makeFakeDispatch(),
+        },
+      };
+    }
+
+    function captureStdout() {
+      const orig = process.stdout.write;
+      process.stdout.write = () => true;
+      return {
+        restore() { process.stdout.write = orig; },
+      };
+    }
+
+    const chainCases = [
+      {
+        name: "signed with env",
+        envSession: ENV_UUID,
+        expected: {
+          model: "claude-fable-5",
+          session: ENV_UUID,
+          date: "2026-08-12",
+          sessionSource: "env",
+        },
+      },
+      {
+        name: "signed without env",
+        envSession: undefined,
+        expected: {
+          model: "claude-fable-5",
+          session: "cc-20260811-215",
+          date: "2026-08-12",
+        },
+      },
+    ];
+
+    for (const tc of chainCases) {
+      const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-test-chain-caller-"));
+      const cwd = path.join(tmp, "ws");
+      fs.mkdirSync(cwd, { recursive: true });
+      const chainId = "chain-" + crypto.randomBytes(4).toString("hex");
+      const prevEnv = process.env.KUSABI_STATE_DIR;
+      const prevOrch = process.env[ORCH_SESSION_ENV];
+
+      const cap = captureStdout();
+      try {
+        process.env.KUSABI_STATE_DIR = path.join(tmp, "state");
+        if (tc.envSession === undefined) {
+          delete process.env[ORCH_SESSION_ENV];
+        } else {
+          process.env[ORCH_SESSION_ENV] = tc.envSession;
+        }
+
+        const flags = { container: "cid-1", "chain-id": chainId, keepServe: true };
+        const res = await cmdChain(cwd, { flags, text: chainBrief }, makeChainInject());
+
+        assert.match(res, /accepted at round 1/);
+
+        const stateDir = stateDirFor(cwd);
+        const chainJson = readJson(path.join(stateDir, "chains", chainId, "chain.json"));
+        assert.ok(chainJson, "chain.json must exist");
+        assert.deepEqual(chainJson.orchestrator, tc.expected);
+        assert.equal(chainJson.records?.[0]?.probesGreen, true);
+      } finally {
+        cap.restore();
+        if (prevEnv === undefined) delete process.env.KUSABI_STATE_DIR;
+        else process.env.KUSABI_STATE_DIR = prevEnv;
+        if (prevOrch === undefined) delete process.env[ORCH_SESSION_ENV];
+        else process.env[ORCH_SESSION_ENV] = prevOrch;
+        fs.rmSync(tmp, { recursive: true, force: true });
+      }
+    }
   });
 });
 
