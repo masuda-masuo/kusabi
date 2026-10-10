@@ -720,7 +720,7 @@ describe("waitForChain --next debris exclusion (kusabi #298)", () => {
 
     const result = await waitForChain({
       chainsDir, next: true, sleep, probeProcess: ALIVE, pollIntervalMs: 1,
-      appearTimeoutMs: 60_000, now: FUTURE_CLOCK(), reportIgnored: (id) => ignored.push(id),
+      appearTimeoutMs: 60_000, now: steppingClock(5_000), wallNow: FUTURE_CLOCK(), reportIgnored: (id) => ignored.push(id),
     });
 
     assert.equal(result.chainId, "chain-real");
@@ -781,6 +781,32 @@ describe("waitForChain --next debris exclusion (kusabi #298)", () => {
     assert.match(result.digest, /^chain chain-later: status=completed/);
   });
 
+  it("switches by observation order after a backward clock step", async () => {
+    makeChainDir(chainsDir, "chain-backward-locked");
+    const createdAt = stampedCreatedAt({
+      "chain-backward-locked": 2_000_000,
+      "chain-backward-real": 1_999_881,
+    });
+
+    let sleeps = 0;
+    const sleep = async () => {
+      sleeps += 1;
+      if (sleeps === 1) {
+        const dir = makeChainDir(chainsDir, "chain-backward-real");
+        writeControl(dir, { ...runningControl("chain-backward-real"), status: "completed" });
+      }
+    };
+
+    const result = await waitForChain({
+      chainsDir, next: true, sleep, probeProcess: ALIVE, pollIntervalMs: 1,
+      appearTimeoutMs: 60_000, now: steppingClock(5_000),
+      wallNow: () => 2_000_000, createdAt,
+    });
+
+    assert.equal(result.chainId, "chain-backward-real");
+    assert.match(result.digest, /^chain chain-backward-real: status=completed/);
+  });
+
   it("still stalls on a recordless dir when no newer chain ever appears", async () => {
     // The bound must survive the rescue: a recordless dir that is the newest
     // eligible chain cannot be traded away, so the wait still fails bounded.
@@ -809,7 +835,7 @@ describe("waitForChain --next debris exclusion (kusabi #298)", () => {
       await assert.rejects(
         () => waitForChain({
           chainsDir, next: true, sleep: async () => {}, probeProcess: ALIVE,
-          pollIntervalMs: 1, appearTimeoutMs: 10_000, now: FUTURE_CLOCK(),
+          pollIntervalMs: 1, appearTimeoutMs: 10_000, now: steppingClock(5_000), wallNow: FUTURE_CLOCK(),
         }),
         (err) => err.code === "no-chain-appeared",
       );
@@ -837,7 +863,7 @@ describe("waitForChain --next debris exclusion (kusabi #298)", () => {
 
     const result = await waitForChain({
       chainsDir, next: true, since: Date.now() - 60_000, sleep, probeProcess: ALIVE,
-      pollIntervalMs: 1, appearTimeoutMs: 60_000, now: FUTURE_CLOCK(),
+      pollIntervalMs: 1, appearTimeoutMs: 60_000, now: steppingClock(5_000), wallNow: FUTURE_CLOCK(),
       reportIgnored: (id) => ignored.push(id),
     });
 
@@ -888,7 +914,7 @@ describe("waitForChain --next same-stamp re-selection (kusabi #309)", () => {
 
     const result = await waitForChain({
       chainsDir, next: true, sleep, probeProcess: ALIVE, pollIntervalMs: 1,
-      appearTimeoutMs: 60_000, now: steppingClock(5_000), createdAt,
+      appearTimeoutMs: 60_000, now: steppingClock(5_000), wallNow: () => 1_000_000, createdAt,
     });
 
     assert.equal(result.chainId, "chain-same-real");
@@ -916,7 +942,7 @@ describe("waitForChain --next same-stamp re-selection (kusabi #309)", () => {
     await assert.rejects(
       () => waitForChain({
         chainsDir, next: true, sleep, probeProcess: ALIVE, pollIntervalMs: 1,
-        appearTimeoutMs: 10_000, now: steppingClock(4_000), createdAt,
+        appearTimeoutMs: 10_000, now: steppingClock(4_000), wallNow: () => 1_000_000, createdAt,
       }),
       (err) => {
         assert.equal(err.code, "stalled");
@@ -957,7 +983,7 @@ describe("waitForChain --next same-stamp re-selection (kusabi #309)", () => {
     await assert.rejects(
       () => waitForChain({
         chainsDir, next: true, sleep, probeProcess: ALIVE, pollIntervalMs: 1,
-        appearTimeoutMs: 40_000, now: steppingClock(4_000), createdAt,
+        appearTimeoutMs: 40_000, now: steppingClock(4_000), wallNow: () => 1_000_000, createdAt,
       }),
       (err) => {
         assert.equal(err.code, "stalled");
