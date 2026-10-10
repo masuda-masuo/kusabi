@@ -3,7 +3,7 @@
 // Backend contract: a function with the SAME call/return shape as
 // `dispatchWithFallback` (prompt-execution.mjs): it receives the dispatch
 // options object (cwd, kind, title, promptText, agent, phase, session,
-// tools, timeoutS, watchdogS, tiers, round, tierIndex, explicitModel) and
+// tools, timeoutS, watchdogS, tiers, round, explicitModel) and
 // resolves to `{ job, resultText, stateDir }`.  kusabi-companion.mjs picks
 // this function instead of dispatchWithFallback when `--backend claude` is
 // given; the chain phases stay backend-blind.
@@ -761,7 +761,6 @@ export async function runClaudeProcess({
  *        the job `status: "stalled"` (kusabi #215 Job B; see runClaudeProcess).
  * @param {(string|string[])[]} [opts.tiers]
  * @param {number} [opts.round]
- * @param {number} [opts.tierIndex]
  * @param {string|null} [opts.explicitModel]
  * @returns {Promise<{ job: object, resultText: string, stateDir: string }>}
  */
@@ -795,7 +794,7 @@ export async function claudeDispatch(opts) {
   }
 
   // v1 model selection: explicit model, else the chain's first route.
-  // tiers/round/tierIndex are accepted for contract parity but the tier
+  // tiers/round are accepted for contract parity but the capacity
   // ladder is NOT walked — one model per phase.  The fallback route below
   // is only reachable with a chain that command-start validation
   // (validateClaudeChain) already accepted, so it never throws on a

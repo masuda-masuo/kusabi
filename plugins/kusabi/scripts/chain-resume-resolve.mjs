@@ -270,8 +270,7 @@ export function classifyReviewSeatReplacement(chainJson, { explicitRoute } = {})
  *     interrupted round persisted at stop time) → resume at that round's
  *     REVIEW phase, continuing the persisted partial record.
  *   - Last record is complete with disposition rework → resume at
- *     the NEXT round's IMPLEMENT phase (with the escalated
- *     tier/reworkCount).
+ *     the NEXT round's IMPLEMENT phase (with the incremented reworkCount).
  *   - Terminal dispositions (accept / accept-with-followup / escalate) mean
  *     the chain already finished — error.  ONE exception (kusabi #248): an
  *     `escalate` that classifyReviewSeatReplacement finds eligible — probes
@@ -281,17 +280,9 @@ export function classifyReviewSeatReplacement(chainJson, { explicitRoute } = {})
  *     intact and only the seat was consumed, so no round-budget slot is spent
  *     (the return sits before the budget-derived guard).
  *
- * Cross-round state (reworkCount, currentTierIndex, strategized, session,
- * baseSha) is derived from the record fields so the resumed run continues the
- * ladder exactly where the original left off.
- *
- * `currentTierIndex` addresses the chain the NEXT round dispatches on
- * (kusabi #192 axis 2): the implement chain for a round-1 resume, the REWORK
- * chain from round 2 on when a models.phases.rework chain was configured
- * (rework rounds run the tier ladder over the rework chain; the persisted
- * tierAfter/tierBefore were recorded against it).  The driver re-dispatches
- * rework rounds on the rework resolution restored from chain.json, so the
- * index is applied to the same chain it was recorded against.
+ * Cross-round state (reworkCount, strategized, session, baseSha) is derived
+ * from the record fields so the resumed run continues exactly where the
+ * original left off.
  *
  * @param {object}  opts
  * @param {object|null} opts.control    — control.json record.
@@ -305,7 +296,7 @@ export function classifyReviewSeatReplacement(chainJson, { explicitRoute } = {})
  *   - `reviewSeatReplacement` — true only for the kusabi #248 escalate
  *     exception; tells the driver to archive the failed seat on the record
  *     before dispatching the replacement review
- *   - `reworkCount`, `currentTierIndex`, `strategized`, `session`, `baseSha`
+ *   - `reworkCount`, `strategized`, `session`, `baseSha`
  */
 export function resolveChainResume({ control, chainJson, explicitRoute = null }) {
   if (!control) {
@@ -381,7 +372,6 @@ export function resolveChainResume({ control, chainJson, explicitRoute = null })
           records,
           reviewSeatReplacement: true,
           reworkCount: last.reworkCount ?? 0,
-          currentTierIndex: last.tierBefore ?? 0,
           strategized,
           session: last.sessionID ?? undefined,
           baseSha,
@@ -446,7 +436,6 @@ export function resolveChainResume({ control, chainJson, explicitRoute = null })
         records,
         // A rework consumed one rework.
         reworkCount: (last.reworkCount ?? 0) + 1,
-        currentTierIndex: last.tierAfter ?? last.tierBefore ?? 0,
         strategized,
         session: last.sessionID ?? undefined,
         baseSha,
@@ -475,7 +464,6 @@ export function resolveChainResume({ control, chainJson, explicitRoute = null })
       roundRecord: last,
       records,
       reworkCount: last.reworkCount ?? 0,
-      currentTierIndex: last.tierBefore ?? 0,
       strategized,
       session: last.sessionID ?? undefined,
       baseSha,

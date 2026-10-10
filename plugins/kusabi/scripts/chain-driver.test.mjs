@@ -89,8 +89,6 @@ function needsAttentionReview(findings = [finding()], { summary = "s", next_step
 }
 
 const REWORK = needsAttentionReview();
-const REWORK_A = needsAttentionReview([finding({ file: "src/a.js", recommendation: "r" })]);
-const REWORK_B = needsAttentionReview([finding({ file: "src/b.js", recommendation: "r" })]);
 
 function makeChainDir({ prefix = "kusabi-chain-", chainId = "chain-test", container = "cid-1" } = {}) {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
@@ -421,7 +419,7 @@ describe("runChainDriver resume", () => {
     assert.equal(chainJson.records.length, 1); // no duplicate push
   });
 
-  it("carries tier/reworkCount into the next round after a resumed review that reworks", async () => {
+  it("carries reworkCount into the next round after a resumed review that reworks", async () => {
     const partial = {
       round: 3,
       resumeMethod: { type: "continue_session" },
@@ -444,7 +442,7 @@ describe("runChainDriver resume", () => {
     };
     const { chainDir } = makeChainState({ records: [partial] });
     // Review finds problems → rework; the next round's implement hits provider
-    // exhaustion so the test can observe the carried tier/reworkCount.
+    // exhaustion so the test can observe the carried reworkCount.
     // The finding has to be NAMED: since kusabi #299 a needs-attention that
     // names nothing over green probes escalates instead of reworking, and
     // this test is about the rework ladder, not about that row.
@@ -460,10 +458,8 @@ describe("runChainDriver resume", () => {
     // Cross-round context derived at resume (position) — the ladder continues
     const round3 = readJson(path.join(chainDir, "round-3.json"));
     assert.equal(round3.disposition.disposition, "rework");
-    assert.equal(round3.tierAfter, 1); // 0 + 1 (2nd rework escalates), 2-tier chain, not clamped
 
     const round4 = readJson(path.join(chainDir, "round-4.json"));
-    assert.equal(round4.tierBefore, 1);   // carried currentTierIndex
     assert.equal(round4.reworkCount, 2);  // 1 + the consumed rework
     // round 4 is a NEW round after the resumed one — only the resumed round
     // itself carries the resumed trace
@@ -492,7 +488,7 @@ describe("runChainDriver resume", () => {
       tierBefore: 0,
       tierAfter: 1,
       reworkCount: 1,
-      pendingReworkStrategy: { tierDelta: 1, newSession: true, reason: "2nd rework: escalate tier, new session, keep artifacts" },
+      pendingReworkStrategy: { newSession: true, reason: "2nd rework: new session, keep artifacts" },
       disposition: { disposition: "rework", reason: "needs-attention" },
       findingsText: "fix the parser",
     };
@@ -511,7 +507,6 @@ describe("runChainDriver resume", () => {
     assert.match(impCall.promptText, /fix the parser/);
 
     const round3 = readJson(path.join(chainDir, "round-3.json"));
-    assert.equal(round3.tierBefore, 1);   // carried from round 2 tierAfter
     assert.equal(round3.reworkCount, 2);  // 1 + the consumed rework
     assert.equal(round3.resumed, true);
 
@@ -1534,87 +1529,6 @@ describe("runChainDriver per-round rework tiering (kusabi #192 axis 2)", () => {
     fs.rmSync(tmp, { recursive: true, force: true });
   });
 
-  it("the tier ladder climbs over the REWORK chain: first rework at its tier 0, next rework at its tier 1", async () => {
-    const { tmp, chainDir } = makeChainDir();
-    const implement = makePhaseDispatch({ kind: "task", modelEntry: "opencode-go/deepseek-v4-pro", sessionPrefix: "ses_imp_", resultText: "implemented" });
-    const rework = makePhaseDispatch({ kind: "task", modelEntry: "opencode-go/deepseek-v4-flash", sessionPrefix: "ses_rework_", resultText: "implemented" });
-    // Distinct finding files per round: same-file repeats would trigger the
-    // strategize lever instead of the plain rework this test exercises.
-    const review = makeReviewDispatch({ reviewResults: [REWORK_A, REWORK_B, APPROVE] });
-
-    const text = await runDriver({
-      cwd: tmp, chainDir,
-      model: "deepseek-v4-pro", modelChain: [["opencode-go/deepseek-v4-pro"]],
-      reworkModel: "deepseek-v4-flash",
-      reworkModelChain: [["opencode-go/deepseek-v4-flash"], ["opencode-go/deepseek-v4-pro"]],
-      reworkBackend: "opencode",
-      reviewModelChain: [["opencode-go/deepseek-v4-flash"]],
-      maxRounds: 3,
-      brief: BRIEF,
-      callTool: fakeCallTool({ gatePassedSequence: [false, false, true] }),
-      backend: "opencode", reviewBackend: "opencode",
-      dispatchWithFallback: implement.dispatch,
-      reworkDispatchWithFallback: rework.dispatch,
-      reviewDispatchWithFallback: review.dispatch,
-    });
-
-    assert.match(text, /accepted at round 3/);
-
-    // Both rework rounds went to the rework seam with the REWORK chain; the
-    // tier index climbed 0 → 1 within it.
-    const reworkCalls = rework.calls.filter((c) => c.round >= 2);
-    assert.equal(reworkCalls.length, 2);
-    assert.equal(reworkCalls[0].round, 2);
-    assert.equal(reworkCalls[0].tierIndex, 0, "first rework starts at the rework chain's tier 0");
-    assert.equal(reworkCalls[1].round, 3);
-    assert.equal(reworkCalls[1].tierIndex, 1, "second rework escalates within the rework chain");
-    for (const c of reworkCalls) {
-      assert.deepEqual(c.tiers, [["opencode-go/deepseek-v4-flash"], ["opencode-go/deepseek-v4-pro"]],
-        "rework rounds address the rework chain");
-    }
-
-    const round2 = readJson(path.join(chainDir, "round-2.json"));
-    assert.equal(round2.tierBefore, 0);
-    const round3 = readJson(path.join(chainDir, "round-3.json"));
-    assert.equal(round3.tierBefore, 1);
-    assert.equal(round3.tierAfter, 1);
-
-    fs.rmSync(tmp, { recursive: true, force: true });
-  });
-
-  it("a single-tier rework chain clamps the escalation exactly as today, over the rework chain", async () => {
-    const { tmp, chainDir } = makeChainDir();
-    const implement = makePhaseDispatch({ kind: "task", modelEntry: "opencode-go/deepseek-v4-pro", sessionPrefix: "ses_imp_", resultText: "implemented" });
-    const rework = makePhaseDispatch({ kind: "task", modelEntry: "opencode-go/deepseek-v4-flash", sessionPrefix: "ses_rework_", resultText: "implemented" });
-    const review = makeReviewDispatch({ reviewResults: [REWORK_A, REWORK_B, APPROVE] });
-
-    const text = await runDriver({
-      cwd: tmp, chainDir,
-      model: "deepseek-v4-pro", modelChain: [["opencode-go/deepseek-v4-pro"]],
-      reworkModel: "deepseek-v4-flash", reworkModelChain: [["opencode-go/deepseek-v4-flash"]],
-      reworkBackend: "opencode",
-      reviewModelChain: [["opencode-go/deepseek-v4-flash"]],
-      maxRounds: 3,
-      brief: BRIEF,
-      callTool: fakeCallTool({ gatePassedSequence: [false, false, true] }),
-      backend: "opencode", reviewBackend: "opencode",
-      dispatchWithFallback: implement.dispatch,
-      reworkDispatchWithFallback: rework.dispatch,
-      reviewDispatchWithFallback: review.dispatch,
-    });
-
-    assert.match(text, /accepted at round 3/);
-
-    const reworkCalls = rework.calls.filter((c) => c.round >= 2);
-    assert.equal(reworkCalls.length, 2);
-    assert.equal(reworkCalls[1].tierIndex, 0, "escalation clamps at the single-tier rework chain's top");
-    const round2 = readJson(path.join(chainDir, "round-2.json"));
-    assert.equal(round2.tierClamped, true);
-    assert.match(round2.tierClampReason, /single-tier chain/);
-
-    fs.rmSync(tmp, { recursive: true, force: true });
-  });
-
   it("chain-resume with the key re-dispatches the rework round on the rework backend/model; a legacy chain.json resumes on the implement resolution", async () => {
     function previousRecord({ backend, sessionID }) {
       return {
@@ -1724,103 +1638,8 @@ describe("runChainDriver per-round rework tiering (kusabi #192 axis 2)", () => {
     assert.equal(legacy.implementCalls[0].session, "ses_imp_1", "legacy rework round continues the session");
     assert.equal(legacy.round2.backend, "opencode");
   });
-
-  it("a multi-entry claude REWORK ladder never records tierAfter > 0 (backend-aware clamp, kusabi #192 follow-up)", async () => {
-    const { tmp, chainDir } = makeChainDir();
-    const implement = makePhaseDispatch({ kind: "task", modelEntry: "opus", sessionPrefix: "claude-uuid-", resultText: "implemented" });
-    const rework = makePhaseDispatch({ kind: "task", modelEntry: "sonnet", sessionPrefix: "claude-uuid-rw-", resultText: "implemented" });
-    const review = makeReviewDispatch({ reviewResults: [REWORK_A, REWORK_B, APPROVE] });
-
-    const text = await runDriver({
-      cwd: tmp, chainDir,
-      model: "opus", modelChain: [["opus"]],
-      reworkModel: "sonnet",
-      // Multi-entry claude chain — legal config (kusabi #184), but the
-      // claude backend never walks its tiers: the model is pinned to the
-      // rework command-start model on every rework round.
-      reworkModelChain: [["opus"], ["sonnet"]],
-      reworkBackend: "claude",
-      reviewModelChain: [["opencode-go/deepseek-v4-flash"]],
-      maxRounds: 3,
-      brief: BRIEF,
-      callTool: fakeCallTool({ gatePassedSequence: [false, false, true] }),
-      backend: "claude", reviewBackend: "opencode",
-      dispatchWithFallback: implement.dispatch,
-      reworkDispatchWithFallback: rework.dispatch,
-      reviewDispatchWithFallback: review.dispatch,
-    });
-
-    assert.match(text, /accepted at round 3/);
-
-    // Both rework rounds dispatch at tier 0 — the clamp pins the tier index
-    // to the claude ladder's single effective tier.
-    const reworkCalls = rework.calls.filter((c) => c.round >= 2);
-    assert.equal(reworkCalls.length, 2);
-    assert.equal(reworkCalls[0].tierIndex, 0, "first rework at the claude ladder's only tier");
-    assert.equal(reworkCalls[1].tierIndex, 0, "second rework stays clamped at tier 0");
-
-    // Records: tierAfter never exceeds 0 on a claude ladder — kusabi #153's
-    // recorded-tier-vs-actual-model contradiction must not return through
-    // the claude rework surface (the modelEntry never changes: "sonnet" on
-    // every rework round while the raw chain length would claim 0 → 1).
-    const round2 = readJson(path.join(chainDir, "round-2.json"));
-    assert.equal(round2.tierBefore, 0);
-    assert.equal(round2.tierAfter, 0, "claude ladder: tierAfter must never exceed 0");
-    assert.equal(round2.tierClamped, true);
-    assert.match(round2.tierClampReason, /single-tier chain/);
-    assert.equal(round2.modelEntry, "sonnet");
-    const round3 = readJson(path.join(chainDir, "round-3.json"));
-    assert.equal(round3.tierBefore, 0);
-    assert.equal(round3.tierAfter, 0, "claude ladder: tierAfter must never exceed 0");
-
-    fs.rmSync(tmp, { recursive: true, force: true });
-  });
-
-  it("a multi-entry claude IMPLEMENT ladder (no rework key) also clamps: tierAfter stays 0 (pre-existing base surface, kusabi #192 follow-up)", async () => {
-    const { tmp, chainDir } = makeChainDir();
-    const implement = makePhaseDispatch({ kind: "task", modelEntry: "opus", sessionPrefix: "claude-uuid-", resultText: "implemented" });
-    const review = makeReviewDispatch({ reviewResults: [REWORK_A, REWORK_B, APPROVE] });
-
-    const text = await runDriver({
-      cwd: tmp, chainDir,
-      model: "opus",
-      // Multi-entry claude IMPLEMENT chain, no models.phases.rework key:
-      // rework rounds keep the implement resolution (effectiveReworkChain is
-      // the implement chain) — the base surface the follow-up also fixes.
-      modelChain: [["opus"], ["sonnet"]],
-      reviewModelChain: [["opencode-go/deepseek-v4-flash"]],
-      maxRounds: 3,
-      brief: BRIEF,
-      callTool: fakeCallTool({ gatePassedSequence: [false, false, true] }),
-      backend: "claude", reviewBackend: "opencode",
-      dispatchWithFallback: implement.dispatch,
-      reworkDispatchWithFallback: null,
-      reviewDispatchWithFallback: review.dispatch,
-    });
-
-    assert.match(text, /accepted at round 3/);
-
-    // Rework rounds run on the implement seam (no rework key) at tier 0.
-    const implementCalls = implement.calls.filter((c) => c.round >= 2);
-    assert.equal(implementCalls.length, 2);
-    assert.equal(implementCalls[0].tierIndex, 0);
-    assert.equal(implementCalls[1].tierIndex, 0, "claude implement ladder never escalates");
-
-    const round2 = readJson(path.join(chainDir, "round-2.json"));
-    assert.equal(round2.tierBefore, 0);
-    assert.equal(round2.tierAfter, 0, "claude implement ladder: tierAfter must never exceed 0");
-    assert.equal(round2.tierClamped, true);
-    assert.match(round2.tierClampReason, /single-tier chain/);
-    const round3 = readJson(path.join(chainDir, "round-3.json"));
-    assert.equal(round3.tierAfter, 0);
-
-    fs.rmSync(tmp, { recursive: true, force: true });
-  });
 });
 
-// =========================================================================
-// chain-start banner (kusabi #192 follow-up) — backend-aware tier counts
-// -------------------------------------------------------------------------
 // The banner line (B7) had zero coverage before this block.  A claude-native
 // chain has an effective tier count of min(1, length): claudeDispatch pins
 
@@ -3266,7 +3085,7 @@ describe("CLI smoke baseline (kusabi #292)", () => {
       // what matters is that the chain got PAST the baseline — it printed its
       // start banner and created its chain state, exactly as before #292.
       assert.doesNotMatch(result.stdout, /dispatch refused/);
-      assert.match(result.stdout, /^Chain .*tiers=/m);
+      assert.match(result.stdout, /^Chain .*maxRounds=/m);
       const chained = workspaceDirs(stateRootDir).some((d) => fs.existsSync(path.join(d, "chains")));
       assert.ok(chained, `the chain must proceed to create its state: ${result.stdout}`);
     } finally {
@@ -3287,7 +3106,7 @@ describe("CLI smoke baseline (kusabi #292)", () => {
         { cwd: tmp, stateRootDir, url },
       );
 
-      assert.match(result.stdout, /^Chain .*maxRounds=2 /m);
+      assert.match(result.stdout, /^Chain .*maxRounds=2/m);
     } finally {
       server.close();
       fs.rmSync(tmp, { recursive: true, force: true });
@@ -3565,7 +3384,7 @@ describe("CLI smoke baseline (kusabi #292)", () => {
         // printed its start banner and created its chain state, exactly as
         // before #321.
         assert.doesNotMatch(result.stdout, /dispatch refused/);
-        assert.match(result.stdout, /^Chain .*tiers=/m);
+        assert.match(result.stdout, /^Chain .*maxRounds=/m);
         const chained = workspaceDirs(stateRootDir).some((d) => fs.existsSync(path.join(d, "chains")));
         assert.ok(chained, `the chain must proceed to create its state: ${result.stdout}`);
       } finally {
@@ -3588,7 +3407,7 @@ describe("CLI smoke baseline (kusabi #292)", () => {
         );
 
         assert.doesNotMatch(result.stdout, /dispatch refused/);
-        assert.match(result.stdout, /^Chain .*tiers=/m);
+        assert.match(result.stdout, /^Chain .*maxRounds=/m);
         const chained = workspaceDirs(stateRootDir).some((d) => fs.existsSync(path.join(d, "chains")));
         assert.ok(chained, `the chain must proceed to create its state: ${result.stdout}`);
       } finally {

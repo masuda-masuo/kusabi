@@ -38,10 +38,9 @@
 // classifyReviewSeatReplacement, archiveFailedReviewSeat) live in
 // chain-resume-resolve.mjs (kusabi #441).
 //
-// Rework scheduling, path-normalised stall detection, and tier escalation
+// Rework scheduling and path-normalised stall detection
 // (normalizeFilePath, hasRepeatedAreas, resolveReworkScope,
-// inScopeFindingFiles, applyTierEscalation, recordReworkEscalation)
-// live in chain-rework.mjs (kusabi #457).
+// inScopeFindingFiles) live in chain-rework.mjs (kusabi #457).
 
 
 import crypto from "node:crypto";

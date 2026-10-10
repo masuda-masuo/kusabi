@@ -526,7 +526,6 @@ describe("handleProviderExhaustion", () => {
     const result = handleProviderExhaustion({
       records,
       roundRecord,
-      currentTierIndex: 0,
       phase: "implement",
       jobError: "All routes exhausted",
       chainFollowupDraft: null,
@@ -536,7 +535,7 @@ describe("handleProviderExhaustion", () => {
     assert.equal(result.records.length, 3, "records should have 3 entries");
     const round3Entries = result.records.filter((r) => r.round === 3);
     assert.equal(round3Entries.length, 1, "round 3 must appear exactly once");
-    assert.equal(round3Entries[0].tierAfter, 0, "tierAfter must be set");
+    assert.equal(round3Entries[0].tierAfter, undefined, "tierAfter is no longer written (kusabi #683)");
     assert.ok(result.outcome.includes("implement provider exhausted"),
       "outcome names the implement phase");
   });
@@ -550,7 +549,6 @@ describe("handleProviderExhaustion", () => {
     const result = handleProviderExhaustion({
       records,
       roundRecord,
-      currentTierIndex: 1,
       phase: "review",
       jobError: "All routes exhausted",
       chainFollowupDraft: null,
@@ -560,7 +558,7 @@ describe("handleProviderExhaustion", () => {
     assert.equal(result.records.length, 3, "records should have 3 entries");
     const round3Entries = result.records.filter((r) => r.round === 3);
     assert.equal(round3Entries.length, 1, "round 3 must appear exactly once");
-    assert.equal(round3Entries[0].tierAfter, 1, "tierAfter must be set");
+    assert.equal(round3Entries[0].tierAfter, undefined, "tierAfter is no longer written (kusabi #683)");
     assert.ok(result.outcome.includes("review provider exhausted"),
       "outcome names the review phase");
   });
@@ -576,7 +574,6 @@ describe("handleProviderExhaustion", () => {
     const result = handleProviderExhaustion({
       records,
       roundRecord,
-      currentTierIndex: 0,
       phase: "strategize",
       jobError: "All routes exhausted",
       chainFollowupDraft: null,
@@ -587,7 +584,7 @@ describe("handleProviderExhaustion", () => {
     assert.equal(result.records.length, 3, "records should still have 3 entries (no duplicate)");
     const round3Entries = result.records.filter((r) => r.round === 3);
     assert.equal(round3Entries.length, 1, "round 3 must appear exactly once");
-    assert.equal(round3Entries[0].tierAfter, 0, "tierAfter must be set on the existing record");
+    assert.equal(round3Entries[0].tierAfter, undefined, "tierAfter is no longer written (kusabi #683)");
     assert.ok(result.outcome.includes("strategize provider exhausted"),
       "outcome names the strategize phase");
   });
@@ -600,7 +597,6 @@ describe("handleProviderExhaustion", () => {
 
     const result = handleProviderExhaustion({
       records, roundRecord,
-      currentTierIndex: 0,
       phase: "implement",
       jobError: "error detail",
       chainFollowupDraft: null,
@@ -609,7 +605,7 @@ describe("handleProviderExhaustion", () => {
 
     const round2InState = result.chainState.records.filter((r) => r.round === 2);
     assert.equal(round2InState.length, 1, "chainState records must contain round 2 exactly once");
-    assert.equal(round2InState[0].tierAfter, 0, "tierAfter must be reflected in chainState");
+    assert.equal(round2InState[0].tierAfter, undefined, "tierAfter is no longer written (kusabi #683)");
   });
 
   it("persisted chainState for review contains the round exactly once", () => {
@@ -618,7 +614,6 @@ describe("handleProviderExhaustion", () => {
 
     const result = handleProviderExhaustion({
       records, roundRecord,
-      currentTierIndex: 1,
       phase: "review",
       jobError: "error detail",
       chainFollowupDraft: null,
@@ -636,7 +631,6 @@ describe("handleProviderExhaustion", () => {
 
     const result = handleProviderExhaustion({
       records, roundRecord,
-      currentTierIndex: 0,
       phase: "strategize",
       jobError: "error detail",
       chainFollowupDraft: null,
@@ -659,7 +653,6 @@ describe("handleProviderExhaustion", () => {
 
     const result = handleProviderExhaustion({
       records, roundRecord,
-      currentTierIndex: 0,
       phase: "implement",
       jobError: "error detail",
       chainFollowupDraft: null,
@@ -681,7 +674,6 @@ describe("handleProviderExhaustion", () => {
 
     const result = handleProviderExhaustion({
       records, roundRecord,
-      currentTierIndex: 0,
       phase: "review",
       jobError: "error detail",
       chainFollowupDraft: null,
@@ -704,7 +696,6 @@ describe("handleProviderExhaustion", () => {
 
     const result = handleProviderExhaustion({
       records, roundRecord,
-      currentTierIndex: 0,
       phase: "implement",
       jobError: "error detail",
       chainFollowupDraft: null,
@@ -729,7 +720,6 @@ describe("handleProviderExhaustion", () => {
 
     const result = handleProviderExhaustion({
       records, roundRecord,
-      currentTierIndex: 0,
       phase: "review",
       jobError: "error detail",
       chainFollowupDraft: null,
@@ -759,7 +749,6 @@ describe("handleProviderExhaustion", () => {
 
       const result = handleProviderExhaustion({
         records, roundRecord,
-        currentTierIndex: 0,
         phase,
         jobError: "error detail",
         chainFollowupDraft: null,
@@ -778,7 +767,6 @@ describe("handleProviderExhaustion", () => {
 
       const result = handleProviderExhaustion({
         records, roundRecord,
-        currentTierIndex: 0,
         phase,
         jobError: "error detail",
         chainFollowupDraft: null,
@@ -806,7 +794,6 @@ describe("handleProviderExhaustion", () => {
 
       const result = handleProviderExhaustion({
         records, roundRecord,
-        currentTierIndex: 0,
         phase,
         jobError: "error detail",
         chainFollowupDraft: null,
@@ -829,7 +816,6 @@ describe("handleProviderExhaustion", () => {
     const result = handleProviderExhaustion({
       records,
       roundRecord,
-      currentTierIndex: 0,
       phase: "implement",
       jobError: "claude dispatch failed: You've hit your session limit · resets 1:20am (Asia/Tokyo) — " +
         "session limit exhausted: the whole claude backend is blocked; do not retry claude.",
@@ -856,7 +842,6 @@ describe("handleProviderExhaustion", () => {
     const result = handleProviderExhaustion({
       records,
       roundRecord,
-      currentTierIndex: 0,
       phase: "implement",
       jobError: "All routes exhausted",
       jobFailure: null,

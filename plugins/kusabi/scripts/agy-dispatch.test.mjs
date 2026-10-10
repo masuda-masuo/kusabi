@@ -71,7 +71,6 @@ import {
 import {
   resolveReviewDispatch,
   resolveResumeDispatches,
-  effectiveTierCount,
 } from "./chain-driver.mjs";
 import { claudeDispatch } from "./claude-dispatch.mjs";
 import { readAgentSystemPrompt } from "./agent-system-prompt.mjs";
@@ -1467,13 +1466,6 @@ describe("backend registry", () => {
     assert.equal(backendPinsModel("agy"), true);
     assert.equal(backendPinsModel("claude"), true);
     assert.equal(backendPinsModel("opencode"), false);
-  });
-
-  it("an agy chain's effective tier count is at most 1 — it walks no ladder", () => {
-    const chain = [["gemini-3.6-flash-high"], ["gemini-3.1-pro-high"], ["claude-sonnet-4-6"]];
-    assert.equal(effectiveTierCount(chain, "agy"), 1);
-    assert.equal(effectiveTierCount(chain, "opencode"), 3);
-    assert.equal(effectiveTierCount([], "agy"), 0);
   });
 
   it("a differing review backend gets ITS OWN canonical dispatch, never the implement one", () => {

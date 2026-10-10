@@ -82,129 +82,6 @@ export function collectChainRecords(stateDir) {
   return { chains, skipped, noRecord };
 }
 
-// =========================================================================
-// Tier resolution
-// =========================================================================
-
-/**
- * Strip the `:variant` suffix from a route string.
- *
- * A route string has the form `provider/model[:variant]` where the variant
- * follows the first `:` after the `/`.  If no variant is present the string
- * is returned unchanged.
- *
- * @param {*} route
- * @returns {string}
- */
-function dropVariant(route) {
-  if (typeof route !== "string") return "";
-  const slashIdx = route.indexOf("/");
-  if (slashIdx === -1) return route;
-  const colonIdx = route.indexOf(":", slashIdx + 1);
-  if (colonIdx === -1) return route;
-  return route.substring(0, colonIdx);
-}
-
-/**
- * Normalise a modelChain entry to always be an array of route strings.
- *
- * Flat entries (a single string) become a one-element array.  Tiered entries
- * (already an array) are returned as-is.  Non-strings are dropped.
- *
- * @param {string|string[]} entry
- * @returns {string[]}
- */
-function normaliseTierEntry(entry) {
-  if (typeof entry === "string") return [entry];
-  if (Array.isArray(entry)) {
-    return entry.filter((e) => typeof e === "string");
-  }
-  return [];
-}
-
-/**
- * Resolve the tier index for a round from its modelEntry and the chain's
- * modelChain.
- *
- * Resolution tries, in order:
- *
- * 1. `"recorded"` — `round.tierBefore` is a number.  Use it and stop.
- * 2. `"derived"` — the normalised modelChain contains `modelEntry` as an
- *    exact string match.  The tier index is the index of the entry
- *    containing it.
- * 3. `"derived-variant-insensitive"` — same match after dropping the
- *    `:variant` suffix from both sides.
- * 4. `"unknown"` — nothing matched, or there is no usable modelChain.
- *
- * The function **never throws**, whatever garbage is in the input.
- *
- * @param {object}   round      — round record (may carry `tierBefore`, `modelEntry`)
- * @param {*}        modelChain — chain config (array | undefined | null | anything)
- * @returns {{ tierIndex: number, tierCount: number, source: string }}
- *   `tierIndex` is the 0-based index or -1 for unknown.
- *   `tierCount` is the number of tiers in the modelChain (0 if unusable).
- *   `source` is one of `"recorded"`, `"derived"`, `"derived-variant-insensitive"`,
- *   `"unknown"`.
- */
-export function resolveRoundTier(round, modelChain) {
-  // Step 1: recorded — round.tierBefore is a finite number.
-  // `typeof NaN === "number"`, so the finiteness check is load-bearing: a NaN
-  // tierBefore would be reported as `source: "recorded"` while vanishing from
-  // tierCounts and the peak-tier scan (every NaN comparison is false), i.e. an
-  // authoritative-looking count over a round that appears nowhere.
-  if (typeof round?.tierBefore === "number" && Number.isFinite(round.tierBefore)) {
-    const tierCount = getTierCount(modelChain);
-    return { tierIndex: round.tierBefore, tierCount, source: "recorded" };
-  }
-
-  // Must have a string modelEntry to attempt derivation
-  if (!round?.modelEntry || typeof round.modelEntry !== "string") {
-    const tierCount = getTierCount(modelChain);
-    return { tierIndex: -1, tierCount, source: "unknown" };
-  }
-
-  // ModelChain must be an array
-  if (!Array.isArray(modelChain)) {
-    return { tierIndex: -1, tierCount: 0, source: "unknown" };
-  }
-
-  // Normalise: each tier entry becomes an array of strings
-  const normalised = modelChain.map(normaliseTierEntry);
-  const tierCount = normalised.length;
-
-  // Step 2: exact match
-  for (let i = 0; i < normalised.length; i++) {
-    for (const entry of normalised[i]) {
-      if (entry === round.modelEntry) {
-        return { tierIndex: i, tierCount, source: "derived" };
-      }
-    }
-  }
-
-  // Step 3: variant-insensitive match
-  const modelBase = dropVariant(round.modelEntry);
-  for (let i = 0; i < normalised.length; i++) {
-    for (const entry of normalised[i]) {
-      if (dropVariant(entry) === modelBase) {
-        return { tierIndex: i, tierCount, source: "derived-variant-insensitive" };
-      }
-    }
-  }
-
-  // Step 4: unknown
-  return { tierIndex: -1, tierCount, source: "unknown" };
-}
-
-/**
- * Get the number of tiers from a modelChain.
- *
- * @param {*} modelChain
- * @returns {number}
- */
-function getTierCount(modelChain) {
-  if (!Array.isArray(modelChain)) return 0;
-  return modelChain.length;
-}
 
 // =========================================================================
 // Pure statistics computation
@@ -624,69 +501,6 @@ export function computeStats(chains, opts = {}) {
     }
   }
 
-  // ---- tier distribution ----
-  const tierCounts = {};        // { [tierIndex]: count } — only resolved tiers (index >= 0)
-  const tierSourceBreakdown = {
-    recorded: 0,
-    derived: 0,
-    "derived-variant-insensitive": 0,
-    unknown: 0,
-  };
-
-  for (const { chainIndex, round } of allRounds) {
-    const chain = chains[chainIndex];
-    const chainMeta = chain?.meta;
-    const modelChain = chainMeta?.modelChain;
-    const resolved = resolveRoundTier(round, modelChain);
-    tierSourceBreakdown[resolved.source] = (tierSourceBreakdown[resolved.source] || 0) + 1;
-    if (resolved.tierIndex >= 0) {
-      const key = String(resolved.tierIndex);
-      tierCounts[key] = (tierCounts[key] || 0) + 1;
-    }
-  }
-
-  // ---- per-chain peak tier (only active chains) ----
-  const chainTiers = {}; // { chainIndex: { chainId, tierCount, maxTier } }
-  const chainShapeDistribution = {}; // { [tierCount]: number of chains }
-
-  for (const ci of activeChainIndices) {
-    const chain = chains[ci];
-    const chainMeta = chain?.meta;
-    const modelChain = chainMeta?.modelChain;
-    const tierCount = Array.isArray(modelChain) ? modelChain.length : 0;
-
-    // Track chain shape (only chains that have a resolvable modelChain)
-    if (tierCount > 0) {
-      const shapeKey = String(tierCount);
-      chainShapeDistribution[shapeKey] = (chainShapeDistribution[shapeKey] || 0) + 1;
-    }
-
-    // Find the peak tier among this chain's rounds in range
-    let maxTier = -1;
-    for (const { chainIndex: ci2, round } of allRounds) {
-      if (ci2 !== ci) continue;
-      const resolved = resolveRoundTier(round, modelChain);
-      if (resolved.tierIndex >= 0 && resolved.tierIndex > maxTier) {
-        maxTier = resolved.tierIndex;
-      }
-    }
-
-    chainTiers[ci] = {
-      chainId: chain.chainId,
-      tierCount,
-      peakTier: maxTier >= 0 ? maxTier : -1,
-    };
-  }
-
-  // How many chains reached their top tier
-  let chainsReachedTopTier = 0;
-  for (const ct of Object.values(chainTiers)) {
-    if (ct.tierCount > 0 && ct.peakTier >= 0 && ct.peakTier === ct.tierCount - 1) {
-      chainsReachedTopTier += 1;
-    }
-  }
-
-  const chainPeakTiers = Object.values(chainTiers);
 
   // ---- capacity fallbacks ----
   const fallbackCounts = {}; // { "from → to": count }
@@ -753,16 +567,9 @@ export function computeStats(chains, opts = {}) {
     perChainTotals,
     filteredTotals,
 
-    // Model and tier
+    // Model
     modelCounts,
     modelEntryNA,
-    tierCounts,
-    tierSourceBreakdown,
-
-    // Chain-level
-    chainPeakTiers,
-    chainsReachedTopTier,
-    chainShapeDistribution,
 
     // Fallbacks
     fallbackCounts,
@@ -954,54 +761,6 @@ export function renderChainStats(stats, opts = {}) {
     }
   } else {
     lines.push("  (no model data)");
-  }
-  lines.push("");
-
-  // Tier distribution
-  lines.push("Tier distribution:");
-  const tierEntries = Object.entries(stats.tierCounts).sort((a, b) => Number(a[0]) - Number(b[0]));
-  const tierTotal = stats.roundCount;
-  const unknownTierCount = stats.tierSourceBreakdown.unknown;
-  if (tierTotal > 0 && (tierEntries.length > 0 || unknownTierCount < tierTotal)) {
-    for (const [tierIdx, count] of tierEntries) {
-      lines.push(line(`tier ${tierIdx}`, count, tierTotal));
-    }
-    if (unknownTierCount > 0) {
-      lines.push(line("unknown", unknownTierCount, tierTotal));
-    }
-    lines.push(`  Source breakdown: recorded=${stats.tierSourceBreakdown.recorded}, derived=${stats.tierSourceBreakdown.derived}, variant-insensitive=${stats.tierSourceBreakdown["derived-variant-insensitive"]}, unknown=${stats.tierSourceBreakdown.unknown}`);
-  } else if (tierTotal > 0 && unknownTierCount >= tierTotal) {
-    lines.push("  (no round has a resolvable tier — all are \"unknown\")");
-    lines.push(`  Source breakdown: recorded=${stats.tierSourceBreakdown.recorded}, derived=${stats.tierSourceBreakdown.derived}, variant-insensitive=${stats.tierSourceBreakdown["derived-variant-insensitive"]}, unknown=${stats.tierSourceBreakdown.unknown}`);
-  } else {
-    lines.push("  (no tier data)");
-  }
-  lines.push("");
-
-  // Per-chain peak tier
-  lines.push("Peak tier per chain:");
-  if (stats.chainPeakTiers.length > 0) {
-    for (const ct of stats.chainPeakTiers) {
-      const peakStr = ct.peakTier >= 0 ? `${ct.peakTier} of ${ct.tierCount}` : "unknown";
-      lines.push(`  ${ct.chainId}: peak ${peakStr}`);
-    }
-    lines.push(line("Reached top tier", stats.chainsReachedTopTier, stats.chainPeakTiers.length));
-  } else {
-    lines.push("  (no active chains with rounds)");
-  }
-  lines.push("");
-
-  // Chain shapes
-  lines.push("Chain shape distribution:");
-  const shapeEntries = Object.entries(stats.chainShapeDistribution)
-    .sort((a, b) => Number(a[0]) - Number(b[0]));
-  if (shapeEntries.length > 0) {
-    const totalShapes = Object.values(stats.chainShapeDistribution).reduce((s, c) => s + c, 0);
-    for (const [tierCount, count] of shapeEntries) {
-      lines.push(line(`${tierCount}-tier`, count, totalShapes));
-    }
-  } else {
-    lines.push("  (no chain shape data)");
   }
   lines.push("");
 
@@ -1205,44 +964,6 @@ export function renderComparison(statsBefore, statsAfter, cutoff) {
   if (statsBefore.modelEntryNA > 0 || statsAfter.modelEntryNA > 0) {
     lines.push(col(`  n/a (no modelEntry)`, `${statsBefore.modelEntryNA}/${modelTotalB}`, `${statsAfter.modelEntryNA}/${modelTotalA}`));
   }
-
-  // Tiers
-  lines.push("  ── Tiers ──");
-  const allTiers = new Set([...Object.keys(statsBefore.tierCounts), ...Object.keys(statsAfter.tierCounts)]);
-  const tierTotalB2 = statsBefore.roundCount;
-  const tierTotalA2 = statsAfter.roundCount;
-  // A bare tier index is only comparable when both ranges ran on chains of the
-  // same shape: tier 1 of a 2-tier chain is the top tier, tier 1 of a 3-tier
-  // chain is the middle one.  Label the position with the tier count when the
-  // shape is unambiguous, and say so plainly when it is not -- this view exists
-  // to answer "did the expensive tier get used less", which a mixed-shape
-  // aggregate cannot answer.
-  const shapesB = Object.keys(statsBefore.chainShapeDistribution || {});
-  const shapesA = Object.keys(statsAfter.chainShapeDistribution || {});
-  const allShapes = new Set([...shapesB, ...shapesA]);
-  const sharedTierCount = allShapes.size === 1 ? [...allShapes][0] : null;
-
-  for (const tierIdx of [...allTiers].sort((a, b) => Number(a) - Number(b))) {
-    const cb = statsBefore.tierCounts[tierIdx] || 0;
-    const ca = statsAfter.tierCounts[tierIdx] || 0;
-    if (cb > 0 || ca > 0) {
-      const label = sharedTierCount !== null
-        ? `  tier ${tierIdx} of ${sharedTierCount}`
-        : `  tier ${tierIdx}`;
-      lines.push(col(label, `${cb}/${tierTotalB2}`, `${ca}/${tierTotalA2}`));
-    }
-  }
-  if (sharedTierCount === null && allShapes.size > 1) {
-    lines.push(`  (tier index is not comparable here: chain shapes differ (${[...allShapes].sort().join("-tier, ")}-tier) —`);
-    lines.push("   see 'peak tier per chain' in the single-range view)");
-  }
-  const unknownB = statsBefore.tierSourceBreakdown.unknown;
-  const unknownA = statsAfter.tierSourceBreakdown.unknown;
-  if (unknownB > 0 || unknownA > 0) {
-    lines.push(col(`  unknown`, `${unknownB}/${tierTotalB2}`, `${unknownA}/${tierTotalA2}`));
-  }
-
-  // In-range cost only. Whole-chain totals span a cutoff and therefore are
   // intentionally omitted from this before/after table.
   lines.push("  ── Costs (in-range rounds) ──");
   const costCell = (totals) => {

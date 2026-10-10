@@ -147,13 +147,12 @@ describe("resolveChainResume", () => {
     assert.equal(p.round, 3);
     assert.equal(p.roundRecord, partial);
     assert.equal(p.reworkCount, 2);           // carried, not incremented
-    assert.equal(p.currentTierIndex, 1);      // from tierBefore
     assert.equal(p.strategized, true);
     assert.equal(p.session, "sess-3");
     assert.equal(p.baseSha, "abc123");
   });
 
-  it("resumes at the next round's implement after a rework disposition, with escalated tier and rework count", () => {
+  it("resumes at the next round's implement after a rework disposition, with updated rework count", () => {
     const control = {
       chainId: "chain-test", container: "cid-1", pid: 0,
       status: "cancelled", round: 2, finishedAt: new Date().toISOString(),
@@ -168,7 +167,7 @@ describe("resolveChainResume", () => {
       tierBefore: 0,
       tierAfter: 1,
       reworkCount: 1,
-      pendingReworkStrategy: { tierDelta: 1, newSession: true, reason: "2nd rework: escalate tier" },
+      pendingReworkStrategy: { newSession: true, reason: "2nd rework: new session, keep artifacts" },
       disposition: { disposition: "rework", reason: "needs-attention" },
     };
     const chainJson = baseChainJson({ records: [complete] });
@@ -180,7 +179,6 @@ describe("resolveChainResume", () => {
     assert.equal(p.round, 3);
     assert.equal(p.roundRecord, null);
     assert.equal(p.reworkCount, 2);        // 1 + the consumed rework
-    assert.equal(p.currentTierIndex, 1);   // tierAfter carried
     assert.equal(p.session, "sess-2");
   });
 
@@ -467,7 +465,6 @@ describe("resolveChainResume", () => {
     assert.equal(result.position.roundRecord, record);
     assert.equal(result.position.records.length, 1);
     assert.equal(result.position.reworkCount, 0);
-    assert.equal(result.position.currentTierIndex, 0);
     assert.equal(result.position.session, "sess-1");
   });
 

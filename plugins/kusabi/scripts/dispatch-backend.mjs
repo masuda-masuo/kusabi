@@ -84,14 +84,12 @@ export function backendDispatch(backend) {
 }
 
 /**
- * True when the backend pins ONE model per phase instead of walking a tier
- * ladder — the v1 shape of both non-opencode backends.
+ * True when the backend pins ONE model per phase instead of walking the
+ * capacity ladder — the v1 shape of the non-opencode backends.
  *
- * Two things follow from it, and both read this rather than naming a
- * backend: the chain commands wrap such a dispatch in `clampModelDispatch`
- * so later rounds reuse the command-start model, and `effectiveTierCount`
- * reports a ladder of at most one tier so printed/recorded numbers describe
- * the ladder that is actually climbed.
+ * The chain commands read this rather than naming a backend: they wrap such
+ * a dispatch in `clampModelDispatch` so later rounds reuse the command-start
+ * model.
  *
  * @param {string|null|undefined} backend
  * @returns {boolean}

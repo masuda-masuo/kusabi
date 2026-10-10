@@ -312,7 +312,7 @@ describe("review-resume revalidation with an unchecked oracle (kusabi #541)", ()
     };
   }
 
-  function approvingReviewDispatch() {
+  function approvingReviewDispatch(verdict = "approve") {
     const calls = [];
     const dispatch = async (opts) => {
       calls.push(opts);
@@ -324,7 +324,7 @@ describe("review-resume revalidation with an unchecked oracle (kusabi #541)", ()
             usage: { available: true, input: 1, output: 1, reasoning: 0, cacheRead: 0, cacheWrite: 0, cost: 0.01 },
             error: null,
           },
-          resultText: JSON.stringify({ schema_version: 1, verdict: "approve", findings: [], summary: "ok", next_steps: [] }),
+          resultText: JSON.stringify({ schema_version: 1, verdict, findings: [], summary: "ok", next_steps: [] }),
         };
       }
       throw new Error("unexpected dispatch kind: " + opts.kind);
@@ -380,7 +380,7 @@ describe("review-resume revalidation with an unchecked oracle (kusabi #541)", ()
     };
   }
 
-  async function runResume({ roundRecord, probeCtx, callTool, effectiveVerifyBaseline = null }) {
+  async function runResume({ roundRecord, probeCtx, callTool, effectiveVerifyBaseline = null, verdict = "approve" }) {
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-541-reval-"));
     const chainDir = path.join(tmp, "chains", "chain-541-reval");
     fs.mkdirSync(chainDir, { recursive: true });
@@ -388,7 +388,7 @@ describe("review-resume revalidation with an unchecked oracle (kusabi #541)", ()
       chainId: "chain-541-reval", container: "cid-541", pid: process.pid,
       status: "running", round: 0, startedAt: new Date().toISOString(),
     });
-    const dispatch = approvingReviewDispatch();
+    const dispatch = approvingReviewDispatch(verdict);
     const ctx = reviewResumeCtx({ tmp, chainDir, dispatch, callTool, effectiveVerifyBaseline });
     const result = await finishRound({
       round: 1, roundRecord, previousRecord: null, probeCtx,
@@ -444,6 +444,59 @@ describe("review-resume revalidation with an unchecked oracle (kusabi #541)", ()
       assert.ok(rr.probesRevalidated, "the accept re-validation must be recorded");
       assert.equal(rr.probesRevalidated.oracleUnchecked, false,
         "the recorded flag is preserved on the revalidation note");
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  function redAnchoringProbeCtx() {
+    return {
+      probesGreen: false,
+      probesFromRecord: true,
+      oracleViolation: false,
+      oracleUnchecked: false,
+      chainChangedPaths: ["src/foo.js"],
+      chainNewlyChanged: ["src/foo.js"],
+      chainStatusObserved: true,
+      chainStatusOutput: " M src/foo.js\n",
+      chainBaseLog: "abc123 latest change\n",
+      chainDeliverables: ["src/foo.js"],
+      chainUntracked: [],
+      chainTruncation: null,
+      worktreeChanged: true,
+      changeScope: { added: [], deleted: [], modified: ["src/foo.js"] },
+    };
+  }
+
+  it("anchoring override wires approve with red probes through finishRound on 1st rework", async () => {
+    const roundRecord = resumedRoundRecord();
+    const { tmp, roundRecord: rr } = await runResume({
+      roundRecord,
+      probeCtx: redAnchoringProbeCtx(),
+      callTool: async () => ({ output: "" }),
+      verdict: "approve",
+    });
+    try {
+      assert.equal(rr.disposition.disposition, "rework");
+      assert.equal(rr.pendingReworkStrategy.newSession, true);
+      assert.match(rr.pendingReworkStrategy.reason, /worker claimed done, probes red: anchoring break/);
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("anchoring override does not trigger for needs-attention with red probes and no repeated areas", async () => {
+    const roundRecord = resumedRoundRecord();
+    const { tmp, roundRecord: rr } = await runResume({
+      roundRecord,
+      probeCtx: redAnchoringProbeCtx(),
+      callTool: async () => ({ output: "" }),
+      verdict: "needs-attention",
+    });
+    try {
+      assert.equal(rr.disposition.disposition, "rework");
+      assert.equal(rr.pendingReworkStrategy.newSession, false);
+      assert.doesNotMatch(rr.pendingReworkStrategy.reason, /anchoring break/);
     } finally {
       fs.rmSync(tmp, { recursive: true, force: true });
     }

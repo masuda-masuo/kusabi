@@ -13,8 +13,8 @@
 // cmdChainResume back from here.  No name crosses the old companion entry
 // point any more — the entry point only dispatches.
 //
-// This module also imports from chain-driver.mjs (effectiveTierCount,
-// runChainDriver, resolveResumeReviewContext, resolveResumeReworkContext,
+// This module also imports from chain-driver.mjs (runChainDriver,
+// resolveResumeReviewContext, resolveResumeReworkContext,
 // resolveResumeDispatches).  chain-driver.mjs does NOT import from this
 // module -- the import is one-directional: cmd -> driver.
 //
@@ -80,32 +80,15 @@ import {
 
 // From chain-driver.mjs (one-directional: cmd -> driver).
 import {
-  effectiveTierCount,
   runChainDriver,
   resolveResumeReviewContext,
   resolveResumeReworkContext,
   resolveResumeDispatches,
 } from "./chain-driver.mjs";
 
-// The chain-start banner line (B7).  Returns null when there is no ladder to
-// describe (no implement chain); the caller skips the write.  The
-// can-reach-top claim is computed against the chain the ladder ACTUALLY
-// climbs: the REWORK chain's effective tier count when a models.phases.rework
-// key is configured, the implement chain's otherwise (kusabi #192 axis 2).
-export function renderChainBanner({ chainId, tierCount, reworkTierCount, reworkKeyConfigured, maxRounds }) {
-  if (tierCount <= 0) return null;
-  const ladderTierCount = reworkKeyConfigured ? reworkTierCount : tierCount;
-  // The ladder can climb to tier (ladderTierCount - 1). With the default
-  // ladder, the 1st rework uses tier 0 (same), 2nd uses tier 1 (+1), 3rd
-  // uses tier 2 (+1).  The top tier is reached at round:
-  // 1 (initial) + (ladderTierCount) reworks.
-  const roundsToTopTier = 1 + ladderTierCount; // initial + one rework per tier beyond 0
-  const canReachTop = maxRounds >= roundsToTopTier;
-  return "Chain " + chainId + ": tiers=" + tierCount +
-    (reworkKeyConfigured ? ", reworkTiers=" + reworkTierCount : "") +
-    ", maxRounds=" + maxRounds +
-    (canReachTop ? " (can reach top tier)" : " (maxRounds insufficient to reach top tier)") +
-    "\n";
+// The chain-start banner line (B7).
+export function renderChainBanner({ chainId, maxRounds }) {
+  return "Chain " + chainId + ": maxRounds=" + maxRounds + "\n";
 }
 
 
@@ -404,23 +387,9 @@ export async function runChainLifecycle(cwd, { flags, text, orchestrator }, opts
   // worktree.
   const verifyBaseline = await captureVerifyBaseline(callTool, container);
 
-  // ---- chain-start output: state tiers, maxRounds, and ladder info (B7) ----
-  // The ladder claim must not lie when a rework chain is configured (kusabi
-  // #192 axis 2): the implement chain serves round 1 only — the ladder that
-  // climbs across rework rounds is the REWORK chain's.  Print both tier
-  // counts so the claim is explicit; the can-reach-top claim is computed
-  // against the chain the ladder actually climbs (rework when configured,
-  // implement otherwise).
-  // The counts are backend-aware (kusabi #192 follow-up): a claude-native
-  // chain has an effective tier count of min(1, length) — claudeDispatch
-  // pins every phase to the command-start model, so its ladder never climbs
-  // and the banner must not claim a multi-tier ladder that cannot be walked.
-  const tierCount = effectiveTierCount(implementDispatch.chain, implementDispatch.backend);
-  const reworkTierCount = reworkKeyConfigured
-    ? effectiveTierCount(reworkDispatch.chain, reworkDispatch.backend)
-    : 0;
+  // ---- chain-start output: state chainId and maxRounds (B7) ----
   const bannerLine = renderChainBanner({
-    chainId, tierCount, reworkTierCount, reworkKeyConfigured, maxRounds,
+    chainId, maxRounds,
   });
   if (bannerLine != null) process.stdout.write(bannerLine);
 

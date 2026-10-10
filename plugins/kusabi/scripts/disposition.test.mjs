@@ -381,36 +381,30 @@ describe("deriveDisposition — high/critical severity escalation gate (kusabi #
 
 describe("deriveReworkStrategy", () => {
   // B3: Default ladder
-  it("1st rework: same tier, continue session, keep artifacts", () => {
+  it("1st rework: continue session, keep artifacts", () => {
     const result = deriveReworkStrategy({
       reworkCount: 0,
     });
-    assert.equal(result.tierDelta, 0);
     assert.equal(result.newSession, false);
     assert.match(result.reason, /1st rework/);
-    assert.match(result.reason, /same tier/);
     assert.match(result.reason, /continue session/);
   });
 
-  it("2nd rework: +1 tier, new session, keep artifacts", () => {
+  it("2nd rework: new session, keep artifacts", () => {
     const result = deriveReworkStrategy({
       reworkCount: 1,
     });
-    assert.equal(result.tierDelta, 1);
     assert.equal(result.newSession, true);
     assert.match(result.reason, /2nd rework/);
-    assert.match(result.reason, /escalate tier/);
     assert.match(result.reason, /new session/);
   });
 
-  it("3rd rework: +1 tier, new session, keep artifacts", () => {
+  it("3rd rework: new session, keep artifacts", () => {
     const result = deriveReworkStrategy({
       reworkCount: 2,
     });
-    assert.equal(result.tierDelta, 1);
     assert.equal(result.newSession, true);
     assert.match(result.reason, /3th rework/);
-    assert.match(result.reason, /escalate tier/);
     assert.match(result.reason, /new session/);
   });
 
@@ -455,11 +449,11 @@ describe("deriveReworkStrategy", () => {
 
   // ---- Anchoring override (kusabi #62) ----
   // On the FIRST rework, machine-refuted success claims and cross-round
-  // repetition force a NEW session with the tier unchanged.  The lever
+  // repetition force a NEW session. The lever
   // function must not depend on the scheduling accident that repetition
   // normally implies a later rework.
 
-  it("anchoring override: approve + probes red on 1st rework forces a new session with same tier", () => {
+  it("anchoring override: approve + probes red on 1st rework forces a new session", () => {
     const result = deriveReworkStrategy({
       reworkCount: 0,
       verdict: "approve",
@@ -467,14 +461,12 @@ describe("deriveReworkStrategy", () => {
       repeatedAreas: false,
     });
     assert.equal(result.newSession, true);
-    assert.equal(result.tierDelta, 0);
     assert.match(result.reason, /worker claimed done, probes red: anchoring break/);
     assert.match(result.reason, /1st rework/);
-    assert.match(result.reason, /same tier/);
     assert.match(result.reason, /new session/);
   });
 
-  it("anchoring override: repeatedAreas on 1st rework forces a new session with same tier", () => {
+  it("anchoring override: repeatedAreas on 1st rework forces a new session", () => {
     const result = deriveReworkStrategy({
       reworkCount: 0,
       verdict: "needs-attention",
@@ -482,7 +474,6 @@ describe("deriveReworkStrategy", () => {
       repeatedAreas: true,
     });
     assert.equal(result.newSession, true);
-    assert.equal(result.tierDelta, 0);
     assert.match(result.reason, /same file area flagged across rounds: anchoring break/);
   });
 
@@ -494,7 +485,6 @@ describe("deriveReworkStrategy", () => {
       repeatedAreas: true,
     });
     assert.equal(result.newSession, true);
-    assert.equal(result.tierDelta, 0);
     assert.match(result.reason, /worker claimed done, probes red: anchoring break/);
     assert.match(result.reason, /same file area flagged across rounds: anchoring break/);
   });
@@ -507,7 +497,6 @@ describe("deriveReworkStrategy", () => {
       repeatedAreas: false,
     });
     assert.equal(result.newSession, false);
-    assert.equal(result.tierDelta, 0);
     assert.match(result.reason, /continue session/);
   });
 
@@ -519,7 +508,6 @@ describe("deriveReworkStrategy", () => {
       repeatedAreas: false,
     });
     assert.equal(result.newSession, false);
-    assert.equal(result.tierDelta, 0);
     assert.match(result.reason, /continue session/);
   });
 
@@ -530,14 +518,12 @@ describe("deriveReworkStrategy", () => {
       probesGreen: false,
       repeatedAreas: true,
     });
-    // 2nd rework row wins: +1 tier, new session, standard reason.
-    assert.equal(result.tierDelta, 1);
+    // 2nd rework row wins: new session, standard reason.
     assert.equal(result.newSession, true);
     assert.match(result.reason, /2nd rework/);
-    assert.match(result.reason, /escalate tier/);
+    assert.match(result.reason, /new session/);
   });
 });
-
 
 // deriveDisposition — the deterministic oracle marker (kusabi #197)
 // ---------------------------------------------------------------------------

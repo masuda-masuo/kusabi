@@ -293,25 +293,24 @@ This complements the authoring-side guards rather than replacing them: the deleg
 
 #### 3.5.5 Restart method and recording — three-lever separation
 
-Three independent progression mechanisms (budget, model tier, session lifecycle) are now **separate**. The round number (`1..maxRounds`) is only the budget counter. Model tier escalation and session decisions are governed by a pure function `deriveReworkStrategy` in `disposition.mjs`:
+Progression mechanisms (budget, session lifecycle) are separate. The round number (`1..maxRounds`) is the budget counter. Tier escalation was removed in kusabi #683 (all phases use a single capacity ladder; tier escalation happened 0 times in 226 chains). Session decisions are governed by a pure function `deriveReworkStrategy` in `disposition.mjs`:
 
 **Default ladder** (no countervailing evidence):
 
-| rework | tier  | session  |
-|--------|-------|----------|
-| 1st    | same  | continue |
-| 2nd    | +1    | new      |
-| 3rd+   | +1    | new      |
+| rework | session  |
+|--------|----------|
+| 1st    | continue |
+| 2nd    | new      |
+| 3rd+   | new      |
 
 **Anchoring-override rows** (kusabi #62), FIRST rework only — session
 continuity is the wrong lever when the finished round's evidence shows the
-worker is anchored to a false claim.  The tier stays (no new escalation is
-introduced by the override); only the session lever moves:
+worker is anchored to a false claim. Only the session lever moves:
 
-| rework | trigger condition                              | tier  | session  |
-|--------|------------------------------------------------|-------|----------|
-| 1st    | reviewer verdict `approve` while `probesGreen` was false (machine-refuted success claim) | same | **new** |
-| 1st    | `repeatedAreas` (same file area flagged across rounds) — defensive guard, presently unreachable: `deriveDisposition` yields `rework` only when `repeatedAreas` is false, so this row becomes live only if the disposition table changes | same | **new** |
+| rework | trigger condition                              | session  |
+|--------|------------------------------------------------|----------|
+| 1st    | reviewer verdict `approve` while `probesGreen` was false (machine-refuted success claim) | **new** |
+| 1st    | `repeatedAreas` (same file area flagged across rounds) — defensive guard, presently unreachable: `deriveDisposition` yields `rework` only when `repeatedAreas` is false, so this row becomes live only if the disposition table changes | **new** |
 
 Artifacts are always carried over — the chain never rolls the worktree back.
 `checkpoint_restore` has been removed from the chain (issue #114). A new session
@@ -376,7 +375,6 @@ Evidence inputs to `deriveReworkStrategy`:
   `inScopeFindingFiles`, and is a no-op for a full-scope round.
 
 The function returns:
-- `tierDelta` — how many tiers to advance (0 = same tier)
 - `newSession` — whether to start a fresh session
 - `reason` — human-readable explanation of the decision
 
@@ -447,13 +445,13 @@ Launched with `chain-stats [--since <ISO>] [--until <ISO>] [--compare <ISO>]`. R
 - All pure-function logic is testable without a state directory
 
 **Round record fields** (B8):
-- `tierBefore`, `tierAfter` — the tier index before and after the round
 - `reworkCount` — how many reworks had been done prior to this round
 - `reworkStrategyReason` — the reason string from `deriveReworkStrategy`
 - `pendingReworkStrategy` — the full strategy object stored on the round record and consumed by the next iteration
 - `reviewParseable` — whether the review output was parseable as JSON
+*(Note: `tierBefore` and `tierAfter` were written on historical round records; kusabi #683 stopped writing them on new records).*
 
-**Chain-start output** (B7): the chain emits a line showing `tiers=N`, `maxRounds=M`, and whether the budget can reach the top tier.
+**Chain-start output** (B7): the start banner is `Chain <chainId>: maxRounds=<N>`. (kusabi #683 dropped tiers / reworkTiers / reachability).
 
 On escalate, include remaining findings + history (each round's verdict/probes/disposition/tier/resume method) in the final output. publish is never called from the chain (not on the allow list). When the terminal round carries a structured `findings` array (kusabi #336), the escalate terminal output — both the `renderEscalateOutcome` handover and `chain-show` for the escalated chain — renders each finding's body and its recommendation as a decision for the orchestrator: severity-ordered (critical → high → medium → low → unknown, stable within a severity), budget-bounded by `ESCALATION_DECISIONS_BUDGET`, with an explicit instruction that a one-line answer per item is enough. Pre-#336 records without a structured `findings` array degrade to the one-line `findingsText` list; a round with no findings at all states that plainly.
 
@@ -928,7 +926,7 @@ Eligible iff **all four** hold for the final round record:
 
 **Records.** The round is continued in place — one record, one round row, no double-counting in metrics ingest. Before the replacement review is dispatched, `archiveFailedReviewSeat` moves every review field of the dead seat (verdict, `verdictSource`, parseable/partial flags, job id, usage, model entry, fallbacks, findings, and the escalate `disposition` it produced) into a `reviewSeatFailures[]` entry and **clears** the live fields. Clearing is load-bearing, not tidiness: `reviewPartial` and `verdictSource` are written only conditionally by `runReviewPhase`, so a surviving value would keep describing the dead seat next to the replacement's verdict — a clean `approve` still flagged partial. The dead seat's spend stays counted (`computeChainTotals` and the ingest's review columns read the archived usages), because a seat that died still burned tokens. `chain-show` and the postable review record render each failed seat next to the replacement verdict, so a replaced round can never read as a single clean review.
 
-Cross-round state (`reworkCount`, `currentTierIndex`, `session`, `baseSha`) is derived from the record fields, so the resumed run continues the tier ladder exactly where the original left off. `session` comes from the last record's `sessionID` — the session that round's
+Cross-round state (`reworkCount`, `session`, `baseSha`) is derived from the record fields, so the resumed run continues exactly where the original left off. `session` comes from the last record's `sessionID` — the session that round's
 implement dispatch actually used or created — so the resumed run continues
 the same conversation the interrupted run would have continued.  (The
 in-memory carry `runImplementPhase` reports is that same `job.sessionID` the
@@ -1044,7 +1042,7 @@ Measured motivation (2026-08-09): a strong model's round-1 skeleton was one-shot
 
 **The key.** `models.phases.rework` — when present, implement rounds AFTER round 1 (rework rounds) resolve their dispatch / model / chain from it with the exact same machinery as any other phase: `claude/` entry prefixes, the single-backend-per-phase invariant, `:variant` rejection on the claude backend, and the explicit `--backend` flag forcing it like every other phase (a conflict with a claude-native rework chain throws at startup, same rule as §3.5.12). Round 1 keeps the `implement` resolution. **Fallback precedence for the key itself**: `models.phases.rework` → the implement resolution — NOT `models.chain` directly. Key absence must mean “byte-identical to today”: rework rounds continue on the implement chain and its ladder.
 
-**Ladder semantics with the key present.** Rework rounds run the existing tier ladder OVER the rework chain: the first rework starts at the rework chain's tier 0, and `recordReworkEscalation` climbs within that chain exactly as it always climbed within the implement chain. `applyTierEscalation` / `recordReworkEscalation` decision logic is unchanged — only which chain the tier index addresses changes. `currentTierIndex` addresses the implement chain during round 1 and the rework chain from round 2 on; chain-resume restores it from `tierAfter` / `tierBefore`, which were recorded against the same chain the resumed round re-dispatches on.
+**Rework routing with the key present.** Rework rounds dispatch on the rework chain. (Note: in kusabi #683, tier escalation was removed; rework rounds dispatch on the configured rework capacity ladder without tier climbing).
 
 **Records stay truthful per round.** Each round record's `backend` / model fields reflect the backend and route that round's implement job ACTUALLY used: round 1 = implement resolution, rework rounds = rework resolution. `reviewBackend` is unchanged.
 
@@ -1052,7 +1050,7 @@ Measured motivation (2026-08-09): a strong model's round-1 skeleton was one-shot
 
 **Resume / persistence symmetry** (learned from the axis-1 findings — the persistence and exhaustion paths must not diverge). `chain.json` gains `reworkModel` / `reworkModelChain` / `reworkBackend`, persisted by `persistChainState` (`chain-persist.mjs`, kusabi #451) AND `handleProviderExhaustion` (`chain-outcomes.mjs`, kusabi #439) symmetrically. chain-resume resolves them with the key-absence-is-legacy rule (mirror of `resolveResumeReviewContext`): absent keys fall back to the implement values; persisted null stays null (no rework key at chain start). Rework rounds re-dispatch on the rework backend/model, with the rework seam always explicit — a claude rework backend resumes clamped to the recorded rework model, an opencode rework backend on the plain opencode dispatch (never the other backend's implement dispatch).
 
-**Chain-start banner.** The banner (`tiers=N, maxRounds=M …`) must not lie when a rework chain is configured: it prints both counts (`tiers=N, reworkTiers=P`) and computes the “can reach top tier” claim against the chain the ladder actually climbs (the rework chain's count when configured, the implement chain's otherwise). Tier counts are backend-aware: a chain on a model-pinning backend (claude, agy) counts as ONE tier (min(1, length)) in the banner and in the escalation records — those dispatches pin every phase to the command-start model, so their ladder never climbs and `tierAfter` can never exceed 0 on such a ladder. The rule is stated over `backendPinsModel`, not over one backend's name.
+**Chain-start banner.** The banner prints `Chain <chainId>: maxRounds=<N>`. (In kusabi #683, tier counts, reworkTiers, and reachability claims were dropped from the banner).
 
 #### 3.5.14 agy backend — implemented, resume via `--conversation` (kusabi #199 / #316)
 
