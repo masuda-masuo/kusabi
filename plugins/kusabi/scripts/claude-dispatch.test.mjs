@@ -692,9 +692,19 @@ describe("allowedToolsForAgent", () => {
     assert.ok(!csv.includes("mcp__sunaba__sandbox_issue_write"));
   });
 
-  it("rejects agents with no v1 allowlist", () => {
-    assert.throws(() => allowedToolsForAgent("unknown-agent"), /no permission allowlist/);
-    assert.throws(() => allowedToolsForAgent("custom-agent"), /no permission allowlist/);
+  it("rejects agents with no v1 allowlist (error text names offending agent, test-author, and plan)", () => {
+    for (const agent of ["unknown-agent", "custom-agent"]) {
+      assert.throws(
+        () => allowedToolsForAgent(agent),
+        (err) => {
+          assert.match(err.message, /no permission allowlist/);
+          assert.match(err.message, new RegExp(`"${agent}"`));
+          assert.match(err.message, /\btest-author\b/);
+          assert.match(err.message, /\bplan\b/);
+          return true;
+        },
+      );
+    }
   });
 
   it("grants kaiba recall, agenda and progress to supported agents — never remember or agenda_edit (kusabi #279, #391)", () => {
@@ -769,12 +779,6 @@ describe("allowedToolsForAgent", () => {
     const shioriCount = reviewTools.filter(t => t.startsWith("mcp__shiori__")).length;
     assert.equal(planTools.size, reviewTools.length - shioriCount, "plan must differ from review only by the shiori removal");
   });
-
-  it("no v1 allowlist still thrown for unknown agents (error text names test-author and plan)", () => {
-    assert.throws(() => allowedToolsForAgent("unknown-agent"), /no permission allowlist/);
-    assert.throws(() => allowedToolsForAgent("custom-agent"), /no permission allowlist/);
-  });
-
 });
 
 describe("applyToolDenies", () => {
