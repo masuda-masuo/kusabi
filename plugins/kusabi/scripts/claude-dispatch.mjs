@@ -615,7 +615,7 @@ export async function runClaudeProcess({
               // this watchdog must not report (or overwrite) a stall it did
               // not cause (kusabi #234).
               if (ctl.isKilled() || writeStalled || repeatStalled) return;
-              const idleMs = Date.now() - lastWriteAt;
+              const idleMs = ctl.now() - lastWriteAt;
               const idleS = Math.round(idleMs / 1000);
               if (!writeWarned && idleMs > writeWatchdog.warnS * 1000) {
                 // Exactly once per job: a repeating warning is noise the
@@ -643,7 +643,7 @@ export async function runClaudeProcess({
           // Only file-mutating calls reset this clock; detection fails open (kusabi #215).
           if (writeWatchdog) {
             try {
-              if (eventHasClaudeWriteTool(parsedLine)) lastWriteAt = Date.now();
+              if (eventHasClaudeWriteTool(parsedLine)) lastWriteAt = ctl.now();
             } catch { /* fail open: no reset, never a broken stream */ }
           }
           // The repeat-tool chain folds at the SAME parsed-event point the
@@ -688,7 +688,7 @@ export async function runClaudeProcess({
           // Rationale: docs/design/backend-dispatch.md#claude-quota-and-watchdogs
           if (writeWatchdog && !writeWarned && !writeStalled && !repeatStalled && !ctl.isKilled()) {
             try {
-              const idleMs = Date.now() - lastWriteAt;
+              const idleMs = ctl.now() - lastWriteAt;
               if (idleMs > writeWatchdog.warnS * 1000) {
                 writeWarned = true;
                 notifyWriteWatchdog({ kind: "warned", idleS: Math.round(idleMs / 1000) });

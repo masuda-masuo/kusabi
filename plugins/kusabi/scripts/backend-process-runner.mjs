@@ -128,6 +128,8 @@ export function killProcessGroup(child) {
  *        down the kill.
  * @param {(line: string) => object|null} opts.parseLine — returns non-null
  *        for parsed events (which reset the silence clock), null for noise.
+ * @param {() => number} [opts.now=performance.now] — monotonic clock used for
+ *        in-process duration measurements; recorded timestamps remain wall time.
  * @param {(ctl: {spawnedAt: number, now: () => number, kill: () => void, isKilled: () => boolean, addInterval: (fn: Function, ms: number) => NodeJS.Timeout, clearInterval: (timer: NodeJS.Timeout) => void}) => {onParsed?: (parsed: object) => void, onClose?: () => void}|void} [opts.extend]
  *        — optional adapter extension hook called immediately after spawn.
  * @returns {Promise<{ code: number|null, stdout: string, stderr: string,
@@ -137,10 +139,11 @@ export function killProcessGroup(child) {
 export function runBackendProcess({
   bin, args, cwd, promptText, timeoutS, watchdogS,
   env, onStart, onLine, onWatchdog, parseLine, extend,
+  now = () => performance.now(),
 }) {
   return new Promise((resolve) => {
     const hasStdin = typeof promptText === "string";
-    const spawnedAt = Date.now();
+    const spawnedAt = now();
     const child = spawn(bin, args, {
       cwd,
       // `env` overrides ride on top of the parent env (additive); the only
@@ -172,7 +175,7 @@ export function runBackendProcess({
     const extraIntervals = new Set();
     const ctl = {
       spawnedAt,
-      now: () => Date.now(),
+      now,
       kill: () => {
         siblingKilled = true;
         killProcessGroup(child);
@@ -206,7 +209,7 @@ export function runBackendProcess({
     function deliverLine(line) {
       const parsed = parseLine(line);
       if (parsed !== null) {
-        lastEventAt = Date.now();
+        lastEventAt = now();
         if (typeof hooks.onParsed === "function") {
           try {
             hooks.onParsed(parsed);
@@ -283,7 +286,7 @@ export function runBackendProcess({
           // error text).  With no adapter kill, this reads exactly as it did
           // before (kusabi #215 item 3, #234).
           if (timedOut || stalled || siblingKilled) return;
-          const silenceMs = Date.now() - lastEventAt;
+          const silenceMs = now() - lastEventAt;
           if (silenceMs > watchdogS * 1000) {
             stalled = true;
             clearInterval(watchdogTimer);
