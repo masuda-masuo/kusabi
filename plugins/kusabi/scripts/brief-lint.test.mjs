@@ -5,6 +5,101 @@ import { briefLintReport } from "./brief-lint.mjs";
 const SIGNATURE = "Orchestrator: claude-opus-5-5 | session brief-lint-test | 2026-10-07";
 const WORKPLACE = "## Workplace\ncid-test";
 
+describe("briefLintReport — basic dispatch checks (kusabi #289)", () => {
+  const SIGNATURE = "Orchestrator: claude-fable-5 | session wsl-test-1 | 2026-08-16";
+  const DELIVERABLES = "## Deliverables\n\n- `plugins/kusabi/scripts/kusabi-companion.mjs`\n";
+  const SMOKE = "## Smoke\n\n- `node --check plugins/kusabi/scripts/kusabi-companion.mjs`\n";
+  const taskBrief = (body) => `# Task\n\n${body}`;
+  const signedBrief = (body = "") => taskBrief(`${SIGNATURE}\n${body ? `\n${body}` : ""}`);
+  const NO_WORKPLACE = signedBrief(`${DELIVERABLES}\n${SMOKE}`);
+
+  it("passes an implement brief whose container comes from --container", () => {
+    assert.equal(
+      briefLintReport({ brief: NO_WORKPLACE, phase: "implement", container: "cid-1" }),
+      null,
+    );
+  });
+
+  it("passes an implement brief whose container comes from ## Workplace", () => {
+    const brief = `${NO_WORKPLACE}\n## Workplace\n\nContainer \`cid-1\` (kusabi main).\n`;
+    assert.equal(briefLintReport({ brief, phase: "implement", container: null }), null);
+  });
+
+  it("refuses an implement dispatch with neither source, naming both remedies", () => {
+    const report = briefLintReport({ brief: NO_WORKPLACE, phase: "implement", container: null });
+    assert.ok(report, "the incident brief must be refused");
+    assert.match(report, /brief rejected before dispatch/);
+    assert.match(report, /no container source/);
+    assert.match(report, /--container <cid>/);
+    assert.match(report, /## Workplace/);
+  });
+
+  it("refuses an implement dispatch whose ## Deliverables is absent, naming the section", () => {
+    const report = briefLintReport({
+      brief: signedBrief(),
+      phase: "implement",
+      container: "cid-1",
+    });
+    assert.ok(report);
+    assert.match(report, /## Deliverables/);
+  });
+
+  it("refuses a ## Deliverables heading that parses to zero entries", () => {
+    const report = briefLintReport({
+      brief: signedBrief("## Deliverables\n\nTo be decided by the worker.\n"),
+      phase: "implement",
+      container: "cid-1",
+    });
+    assert.ok(report, "a heading with no parseable entry is the same failure as no heading");
+    assert.match(report, /## Deliverables/);
+  });
+
+  it("refuses a brief with no signature line, for every phase", () => {
+    const brief = taskBrief(`${DELIVERABLES}\n## Workplace\n\nContainer \`cid-1\`.\n`);
+    for (const phase of ["implement", "review", "respond", "gofer"]) {
+      const report = briefLintReport({ brief, phase, container: "cid-1" });
+      assert.ok(report, `${phase} must be refused`);
+      assert.ok(
+        report.includes("Orchestrator: <model-id> | session <id> | <date>"),
+        `${phase}: the refusal must show the line to add, got: ${report}`,
+      );
+    }
+  });
+
+  it("adds nothing but the signature line to the non-implement phases", () => {
+    // Non-goal of #289: investigate/review/... keep the brief requirements
+    // they already had.  No Deliverables, no Workplace, no container.
+    for (const phase of ["review", "respond", "gofer"]) {
+      assert.equal(
+        briefLintReport({ brief: signedBrief("Look into it.\n"), phase, container: null }),
+        null,
+        phase,
+      );
+    }
+  });
+
+  it("leaves an ad-hoc task with no --phase alone", () => {
+    // `/kusabi:task <free text>` is not an orchestrator's brief; the lint
+    // covers phase dispatches and chains.
+    assert.equal(briefLintReport({ brief: "look at the flaky test in x.mjs" }), null);
+  });
+
+  it("requires deliverables and a signature when a chain starts, listing every miss at once", () => {
+    const report = briefLintReport({
+      brief: taskBrief(`Implement it.\n\n${SMOKE}`),
+      container: "cid-1",
+      chain: true,
+    });
+    assert.ok(report);
+    assert.match(report, /2 problems found/);
+    assert.match(report, /## Deliverables/);
+    assert.ok(report.includes("Orchestrator: <model-id>"));
+    // `chain` refuses a missing --container on its own, before this call:
+    // the container-source line must not double up on that message.
+    assert.doesNotMatch(report, /no container source/);
+  });
+});
+
 describe("briefLintReport — Rule A: Smoke section required for implement (kusabi #662)", () => {
   const briefWithoutSmoke = [
     SIGNATURE,
