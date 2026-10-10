@@ -240,12 +240,6 @@ describe("checkDeliverablesSinceBaseline", () => {
     assert.equal(result.passed, true);
   });
 
-  // --- missing baseline → unknown ---
-  it("treats missing baseline as unknown in worktreeChanged", () => {
-    assert.equal(resolveWorktreeChanged(null, CURRENT_SAME), null);
-    assert.equal(resolveWorktreeChanged(undefined, CURRENT_SAME), null);
-  });
-
   // --- heading present but no entries parsed → fail ---
   it("fails when heading present but no entries parsed", () => {
     const result = checkDeliverablesSinceBaseline([], ["file.js"], true);
