@@ -39,7 +39,8 @@ import {
   writeChainControl,
 } from "./chain-control.mjs";
 import { writeJson, stateDirFor, readJson } from "./state-paths.mjs";
-import { cmdTask } from "./task-cmd.mjs";
+import { jobDir } from "./job-store.mjs";
+import { cmdTask, cmdReview } from "./task-cmd.mjs";
 import { cmdChain } from "./chain-cmd.mjs";
 import {
   startSunabaStub,
@@ -3443,34 +3444,125 @@ describe("flushAndExit (kusabi #243)", () => {
 
 // Failure next-action names the companion CLI, not a slash command (kusabi #246)
 // ---------------------------------------------------------------------------
-// Cursor CLI has no `/kusabi:status`, and companion stdout is transferred
-// verbatim by whatever orchestrator ran it — so the line a failed task/review
-// renders must name the executable surface. cmdTask / cmdReview live in
-// task-cmd.mjs (kusabi #437); the rendered literal is pinned in their source.
+// Drive the callers with terminal jobs so the output contract is observed at
+// the same boundary that hands it to the orchestrator.
 
 describe("failed task/review next-action (kusabi #246)", () => {
-  const TASK_CMD_SCRIPT = path.join(import.meta.dirname, "task-cmd.mjs");
+  const SIGNED_AD_HOC_BRIEF =
+    "Orchestrator: claude-fable-5 | session cc-20260811-215 | 2026-08-12\n\nDo the work.";
+  const STATUS_HINT = "Run kusabi-companion status";
 
-  function commandSource(startMarker, endMarker) {
-    const source = fs.readFileSync(TASK_CMD_SCRIPT, "utf8");
-    const start = source.indexOf(startMarker);
-    assert.ok(start >= 0, `could not slice ${startMarker}`);
-    if (!endMarker) return source.slice(start);
-    const end = source.indexOf(endMarker, start + startMarker.length);
-    assert.ok(end > start, `could not slice ${startMarker} to ${endMarker}`);
-    return source.slice(start, end);
-  }
+  it("cmdTask points at kusabi-companion status, never a slash command", async () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-task-next-action-"));
+    const previousStateDir = process.env.KUSABI_STATE_DIR;
+    const callerCwd = process.cwd();
+    const stateRootDir = path.join(tmp, "state");
+    process.env.KUSABI_STATE_DIR = stateRootDir;
+    let failedDispatchRan = false;
+    let completedDispatchRan = false;
+    try {
+      const failed = await cmdTask(
+        callerCwd,
+        {
+          flags: {},
+          text: SIGNED_AD_HOC_BRIEF,
+          _dispatch: async () => {
+            failedDispatchRan = true;
+            return {
+              job: { id: "job-task-f1", status: "failed", error: "worker err" },
+              resultText: "",
+            };
+          },
+        },
+      );
+      assert.equal(failedDispatchRan, true);
+      assert.equal(failed.exitCode, 1);
+      assert.ok(failed.text.includes("Run kusabi-companion status job-task-f1 for details."), failed.text);
+      assert.ok(failed.text.includes("worker err"), failed.text);
+      assert.ok(!failed.text.includes("/kusabi:"), failed.text);
 
-  it("cmdTask points at kusabi-companion status, never a slash command", () => {
-    const cmdTaskSource = commandSource("async function cmdTask(", "async function cmdReview(");
-    assert.ok(cmdTaskSource.includes("Run kusabi-companion status ${job.id} for details."));
-    assert.ok(!cmdTaskSource.includes("/kusabi:"), "no slash command in cmdTask output");
+      const completed = await cmdTask(
+        callerCwd,
+        {
+          flags: {},
+          text: SIGNED_AD_HOC_BRIEF,
+          _dispatch: async () => {
+            completedDispatchRan = true;
+            return {
+              job: { id: "job-task-ok1", status: "completed", error: null },
+              resultText: "task complete",
+            };
+          },
+        },
+      );
+      assert.equal(completedDispatchRan, true);
+      assert.equal(completed.exitCode, 0);
+      assert.ok(completed.text.includes("task complete"), completed.text);
+      assert.ok(!completed.text.includes(STATUS_HINT), completed.text);
+    } finally {
+      if (previousStateDir === undefined) delete process.env.KUSABI_STATE_DIR;
+      else process.env.KUSABI_STATE_DIR = previousStateDir;
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
   });
 
-  it("cmdReview points at kusabi-companion status, never a slash command", () => {
-    const cmdReviewSource = commandSource("async function cmdReview(");
-    assert.ok(cmdReviewSource.includes("Run kusabi-companion status ${job.id} for details."));
-    assert.ok(!cmdReviewSource.includes("/kusabi:"), "no slash command in cmdReview output");
+  it("cmdReview points at kusabi-companion status, never a slash command", async () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-review-next-action-"));
+    const previousStateDir = process.env.KUSABI_STATE_DIR;
+    const callerCwd = process.cwd();
+    process.env.KUSABI_STATE_DIR = path.join(tmp, "state");
+    let failedPromptRan = false;
+    let completedPromptRan = false;
+    try {
+      const failed = await cmdReview(
+        callerCwd,
+        {
+          flags: {},
+          text: "Check the changed behavior.",
+          _runPrompt: async () => {
+            failedPromptRan = true;
+            return {
+              job: { id: "job-rev-f1", status: "failed", error: "rev err" },
+              resultText: "",
+            };
+          },
+        },
+      );
+      assert.equal(failedPromptRan, true);
+      assert.equal(typeof failed, "string");
+      assert.ok(failed.includes("Run kusabi-companion status job-rev-f1 for details."), failed);
+      assert.ok(failed.includes("rev err"), failed);
+      assert.ok(!failed.includes("/kusabi:"), failed);
+
+      const approvedJson = JSON.stringify({
+        schema_version: 1,
+        verdict: "approve",
+        summary: "Looks good.",
+        findings: [],
+        next_steps: [],
+      });
+      const completed = await cmdReview(
+        callerCwd,
+        {
+          flags: {},
+          text: "Check the changed behavior.",
+          _runPrompt: async () => {
+            completedPromptRan = true;
+            const job = { id: "job-rev-ok1", status: "completed", error: null };
+            fs.mkdirSync(jobDir(stateDirFor(callerCwd), job.id), { recursive: true });
+            return { job, resultText: approvedJson };
+          },
+        },
+      );
+      assert.equal(completedPromptRan, true);
+      assert.equal(typeof completed, "string");
+      assert.ok(completed.includes("**Verdict: approve**"), completed);
+      assert.ok(!completed.includes(STATUS_HINT), completed);
+    } finally {
+      if (previousStateDir === undefined) delete process.env.KUSABI_STATE_DIR;
+      else process.env.KUSABI_STATE_DIR = previousStateDir;
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
   });
 });
 
