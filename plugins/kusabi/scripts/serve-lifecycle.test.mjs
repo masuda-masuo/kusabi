@@ -1456,8 +1456,8 @@ describe("reapIdleServes (spawn-based, temp state root)", () => {
 // end-to-end path.  'refuted' records are removed with the decline;
 // 'unverifiable' records are kept so a genuine serve is never stranded.
 
-function serveStopFixture() {
-  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-servestop-id-"));
+function identityFixture(tempPrefix) {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), tempPrefix));
   const root = path.join(tmp, "state");
   const cwd = path.join(tmp, "ws");
   fs.mkdirSync(cwd, { recursive: true });
@@ -1478,6 +1478,10 @@ function serveStopFixture() {
       else process.env.KUSABI_STATE_DIR = saved;
     },
   };
+}
+
+function serveStopFixture() {
+  return identityFixture("kusabi-servestop-id-");
 }
 
 describe("cmdServeStop identity gate (spawn-based)", () => {
@@ -1600,30 +1604,13 @@ describe("cmdServeStop identity gate (spawn-based)", () => {
 // function and stays unconditional, so the stall handling is never lost.
 
 function watchdogFixture() {
-  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-watchdog-id-"));
-  const root = path.join(tmp, "state");
-  const cwd = path.join(tmp, "ws");
-  fs.mkdirSync(cwd, { recursive: true });
-  const sleeper = path.join(tmp, "sleeper.mjs");
-  fs.writeFileSync(sleeper, ORPHAN_SLEEPER_SOURCE, "utf8");
-  const saved = process.env.KUSABI_STATE_DIR;
-  process.env.KUSABI_STATE_DIR = root;
-  const stateDir = stateDirFor(cwd);
+  const fx = identityFixture("kusabi-watchdog-id-");
   const jobId = "job-wd";
-  fs.mkdirSync(path.join(stateDir, "jobs", jobId), { recursive: true });
+  fs.mkdirSync(path.join(fx.stateDir, "jobs", jobId), { recursive: true });
   return {
-    tmp,
-    root,
-    cwd,
-    sleeper,
-    stateDir,
+    ...fx,
     jobId,
-    serverFile: path.join(stateDir, "server.json"),
-    eventsFile: path.join(stateDir, "jobs", jobId, "events.ndjson"),
-    restore() {
-      if (saved === undefined) delete process.env.KUSABI_STATE_DIR;
-      else process.env.KUSABI_STATE_DIR = saved;
-    },
+    eventsFile: path.join(fx.stateDir, "jobs", jobId, "events.ndjson"),
   };
 }
 
