@@ -17,7 +17,7 @@ import {
   briefSyntaxDefectSummary,
 } from "./brief-parsing.mjs";
 import { classifyRefusalOutcome, verifyRefusalAnchors, refusalRepoPaths } from "./probe-decisions.mjs";
-import { deriveDisposition } from "./disposition.mjs";
+import { deriveDisposition, deriveReworkStrategy } from "./disposition.mjs";
 import { stateRoot, writeJson } from "./state-paths.mjs";
 import { countUnfilledReviewRecords } from "./review-record-scan.mjs";
 import { finalizeChainControl, updateChainControlRound } from "./chain-control.mjs";
@@ -27,9 +27,6 @@ import {
   persistChainState,
   writeReviewRecord,
 } from "./chain-persist.mjs";
-import {
-  recordReworkEscalation,
-} from "./chain-rework.mjs";
 import {
   quotaExhaustionReason,
 } from "./chain-quota.mjs";
@@ -322,8 +319,8 @@ async function runRevalidationProbePhase({ baseSha, container, brief, callTool, 
  *   effectiveReviewChain, effectiveReworkChain, effectiveReworkBackend,
  *   effectiveBaseSha, effectiveVerifyBaseline, reviewModel, reviewModelChain,
  *   reworkModel, reworkModelChain, reworkBackend, reviewDispatch,
- *   injectedDispatch, reworkTierCount) plus mutable cross-round state
- *   (records, reworkCount, currentTierIndex).
+ *   injectedDispatch) plus mutable cross-round state
+ *   (records, reworkCount).
  * @returns {Promise<{done: boolean, text?: string}>}
  */
 export async function finishRound(
@@ -335,12 +332,11 @@ export async function finishRound(
     flagsModel, reviewFlagsModel, effectiveReviewChain,
     effectiveBaseSha, effectiveVerifyBaseline, reviewModel, reviewModelChain,
     reworkModel, reworkModelChain, reworkBackend, reviewDispatch,
-    reworkTierCount,
     // Mission linkage (kusabi #532): threaded from runChainDriver's ctx so a
     // normally completed Luna inner chain persists it; null on plain chains.
     missionId,
     // Mutable cross-round state
-    records, reworkCount, currentTierIndex,
+    records, reworkCount,
   } = ctx;
 
   const {
@@ -519,7 +515,7 @@ export async function finishRound(
   if (reviewJobStatus === "provider-error") {
     const { chainState, outcome } = handleProviderExhaustion({
       records, roundRecord,
-      currentTierIndex, phase: "review", jobError: reviewJobError,
+      phase: "review", jobError: reviewJobError,
       jobFailure: roundRecord.reviewJobFailure || null,
       chainId, round, container, model, modelChain,
       reviewModel, reviewModelChain,
@@ -711,41 +707,21 @@ export async function finishRound(
   // ---- Compute rework strategy for the NEXT round (if rework needed) ----
   let pendingReworkStrategy = null;
   if (disposition.disposition === "rework") {
-    // Tier escalation is clamped to the modelChain range (kusabi #153):
-    // selectRoutes already keeps dispatch at the top tier, so the
-    // recorded tier must match the model actually used — never "0 → 1"
-    // on a single-tier chain.  The clamp fields (tierClamped /
-    // tierClampReason) land on the round record here.
-    // The tier ladder climbs over the chain the NEXT round dispatches on
-    // (kusabi #192 axis 2): a rework round addresses the REWORK chain, so
-    // the escalation clamps against its tier count — the implement chain's
-    // count when no rework chain is configured (unchanged behaviour).
-    // The count is backend-aware (kusabi #192 follow-up): a claude-native
-    // ladder has an effective tier count of min(1, length), so tierAfter
-    // can never exceed 0 on a claude ladder — the model never changes
-    // there, and a recorded 0 → 1 would contradict the pinned model.
-    const escalation = recordReworkEscalation({
-      roundRecord,
-      currentTierIndex,
+    const strategy = deriveReworkStrategy({
       reworkCount,
-      tierCount: reworkTierCount,
-      // Anchoring-override evidence (#62): verdict, probes and the
-      // cross-round repeated-areas signal from the finished round.
-      chainVerdict,
-      chainRepeatedAreas,
+      verdict: chainVerdict,
+      repeatedAreas: chainRepeatedAreas,
       probesGreen,
     });
 
     // Update cross-round state for the next iteration
-    pendingReworkStrategy = escalation.strategy;
+    pendingReworkStrategy = strategy;
     ctx.reworkCount += 1;
-    ctx.currentTierIndex = escalation.currentTierIndex;
   }
 
   // Record the pending rework strategy on the round record so the next
   // round can read it, and so chain-show can display what levers were pulled.
   roundRecord.pendingReworkStrategy = pendingReworkStrategy;
-  roundRecord.tierAfter = ctx.currentTierIndex;
 
   persistChainState({
     chainDir, round, roundRecord, chainId, container, model, modelChain,

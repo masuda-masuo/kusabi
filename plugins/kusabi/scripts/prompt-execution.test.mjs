@@ -420,7 +420,7 @@ describe("dispatchWithFallback", () => {
 
     const { job, resultText } = await dispatchWithFallback({
       _runPrompt: fakeRunner,
-      tiers: [["route/flash-free", "route/flash"], ["route/pro"]],
+      tiers: [["route/flash-free", "route/flash", "route/pro"]],
       round: 1,
       kind: "task",
       promptText: "test",
@@ -797,7 +797,7 @@ describe("dispatchWithFallback", () => {
 
     const { job } = await dispatchWithFallback({
       _runPrompt: fakeRunner,
-      tiers: [["route/a", "route/b"], ["route/c"]],
+      tiers: [["route/a", "route/b", "route/c"]],
       round: 1,
       kind: "task",
       promptText: "test",
@@ -933,7 +933,7 @@ describe("dispatchWithFallback", () => {
 
     const { job } = await dispatchWithFallback({
       _runPrompt: fakeRunner,
-      tiers: [["route/default"], ["route/fallback"]],
+      tiers: [["route/default", "route/fallback"]],
       round: 1,
       explicitModel: "custom/override-model",
       kind: "task",

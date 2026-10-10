@@ -188,16 +188,17 @@ You can customise this with a config file at `<state root>/config.json`
 {
   "models": {
     "chain": [
-      ["opencode/deepseek-v4-flash-free:max", "opencode-go/deepseek-v4-flash:max"],
-      ["opencode-go/deepseek-v4-pro:max"]
+      "opencode/deepseek-v4-flash-free:max",
+      "opencode-go/deepseek-v4-flash:max",
+      "opencode-go/deepseek-v4-pro:max"
     ],
     "phases": { "implement": ["opencode-go/deepseek-v4-flash"] }
   }
 }
 ```
 
-Flat all-string chains are still accepted (each string is a single-route
-tier) — but the built-in default is the tiered shape above.
+A nested one-tier array `[["route1", "route2"]]` is also accepted — both forms
+represent a single capacity ladder.
 
 A route prefixed with `claude/`, `agy/`, or `codex/` selects that backend and
 passes the remainder as its model: for example, `agy/gemini-3.6-flash-high`.

@@ -80,20 +80,7 @@ import {
 // chain
 // ---------------------------------------------------------------------------
 
-// Ladder accounting is backend-aware (kusabi #192 follow-up): a chain on a
-// model-pinning backend never walks its tiers — that backend's dispatch pins
-// every phase to the command-start model — so everywhere a tier count feeds
-// ACCOUNTING (the chain-start banner, the recordReworkEscalation clamp) such
-// a chain has an effective tier count of min(1, length).  Dispatch behaviour
-// is untouched; this only makes printed/recorded numbers match the ladder the
-// backend actually climbs.  opencode chains keep their full length.  Keyed on
-// `backendPinsModel`, so the agy backend (kusabi #199 — also one model per
-// phase) reports its real ladder without a second branch here.
-export function effectiveTierCount(chain, backend) {
-  if (!chain) return 0;
-  if (backendPinsModel(backend)) return Math.min(1, chain.length);
-  return chain.length;
-}
+
 
 
 
@@ -259,11 +246,10 @@ export function resolveResumeDispatches({ resumeBackend, resumeReviewBackend, mo
  *        object); persisted for chain-resume.
  * @param {Array} [opts.reworkModelChain] — the rework phase's route chain
  *        (kusabi #192 axis 2).  Implement rounds AFTER round 1 (rework
- *        rounds) dispatch from it, and the tier ladder climbs over it; null
- *        (no models.phases.rework key) keeps rework rounds on the implement
- *        chain and ladder — byte-identical to today.  Persisted to
- *        chain.json so chain-resume re-dispatches rework rounds on the same
- *        route.
+ *        rounds) dispatch from it; null (no models.phases.rework key) keeps
+ *        rework rounds on the implement chain — byte-identical to today.
+ *        Persisted to chain.json so chain-resume re-dispatches rework rounds
+ *        on the same route.
  * @param {string|object|null} [opts.reworkModel] — the rework phase's
  *        command-start resolved model; persisted for chain-resume.
  * @param {"opencode"|"claude"|null} [opts.reworkBackend] — the rework
@@ -359,7 +345,6 @@ export async function runChainDriver({
   let session = resume ? resume.session : initialSession;
   let provenance = session ? sessionProvenance : null;
   let reworkCount = resume ? resume.reworkCount : 0;
-  let currentTierIndex = resume ? resume.currentTierIndex : 0;
   const startRound = resume ? resume.round : 1;
 
   // ---- context object for lifted finishRound / finaliseChain / finaliseProvisionalChain
@@ -373,7 +358,6 @@ export async function runChainDriver({
     effectiveBaseSha, effectiveVerifyBaseline,
     reviewModel, reviewModelChain, reworkModel, reworkModelChain, reworkBackend,
     reviewDispatch, injectedDispatch,
-    reworkTierCount: effectiveTierCount(effectiveReworkChain, effectiveReworkBackend),
     smokeObservation: effectiveSmokeObservation,
     // Mission linkage (kusabi #532): the owning luna mission's id, threaded
     // through the ordinary round loop's finishRound persistence so
@@ -383,7 +367,6 @@ export async function runChainDriver({
     // Mutable cross-round state (owned by the loop, mutated by finishRound)
     records,
     reworkCount,
-    currentTierIndex,
   };
 
   try {
@@ -550,18 +533,12 @@ export async function runChainDriver({
       const { resumeMethod } = resolveRoundResume({ useNewSession });
 
       // ---- phase 2: round model selection ----
-      // Use currentTierIndex (never round) so tier is decoupled from the round counter.
-      // For review, the reviewer stays on tier 0 (round 1) — that's handled in
-      // runReviewPhase which passes round=1 to dispatchWithFallback.
 
       // ---- per-round implement dispatch context (kusabi #192 axis 2) ----
       // Round 1 dispatches from the implement resolution; every LATER round
       // is a rework round and dispatches from the rework resolution when
       // models.phases.rework is configured (absent key \u2192 the implement
-      // resolution \u2014 byte-identical to today).  The tier ladder climbs over
-      // the same chain the round dispatches on: currentTierIndex addresses
-      // the implement chain during round 1 and the rework chain from
-      // round 2 on (the first rework starts at the rework chain's tier 0).
+      // resolution \u2014 byte-identical to today).
       const isReworkRound = !isFirstRound;
       const roundModelChain = isReworkRound ? effectiveReworkChain : modelChain;
       const roundBackend = isReworkRound ? effectiveReworkBackend : backend;
@@ -595,7 +572,6 @@ export async function runChainDriver({
         implementRefusal,
       } = await runImplementPhase({
         cwd, chainId, round, isFirstRound, implementText, modelChain: roundModelChain,
-        tierIndex: ctx.currentTierIndex,
         useNewSession, session, sessionProvenance: provenance, previousRecord, resumeMethod, flagsModel,
         backend: roundBackend,
         _dispatchWithFallback: roundDispatch,
@@ -629,7 +605,6 @@ export async function runChainDriver({
       roundRecord.reviewBackend = reviewBackend;
 
       // Record lever info on the round record (B8)
-      roundRecord.tierBefore = ctx.currentTierIndex;
       roundRecord.reworkStrategyReason = reworkStrategyReason;
       roundRecord.reworkCount = ctx.reworkCount;
 
@@ -648,7 +623,7 @@ export async function runChainDriver({
       if (implementJobStatus === "provider-error" || implementJobFailure?.kind === "quota-exhaustion") {
         const { chainState, outcome } = handleProviderExhaustion({
           records, roundRecord,
-          currentTierIndex: ctx.currentTierIndex, phase: "implement", jobError: implementJobError,
+          phase: "implement", jobError: implementJobError,
           jobFailure: implementJobFailure,
           chainId, round, container, model, modelChain,
           reviewModel, reviewModelChain,

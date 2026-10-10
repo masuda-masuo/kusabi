@@ -274,8 +274,7 @@ export function renderProviderExhaustedOutcome({ chainId, round, phase, jobError
  *
  * @param {Object} opts
  * @param {Array}  opts.records             - Chain records so far (mutated in place).
- * @param {Object} opts.roundRecord          - Current round record (mutated: tierAfter set).
- * @param {number} opts.currentTierIndex     - Tier index to record as `tierAfter`.
+ * @param {Object} opts.roundRecord          - Current round record.
  * @param {string} opts.phase               - Phase name ("implement", "review", "strategize").
  * @param {string|null} [opts.jobError=null] - Provider error detail.
  * @param {object|null} [opts.jobFailure=null] - Structured terminal-failure
@@ -322,7 +321,6 @@ export function renderProviderExhaustedOutcome({ chainId, round, phase, jobError
 export function handleProviderExhaustion({
   records,
   roundRecord,
-  currentTierIndex,
   phase,
   jobError = null,
   jobFailure = null,
@@ -345,9 +343,6 @@ export function handleProviderExhaustion({
   missionId = null,
   verifyBaseline = null,
 }) {
-  // Record the tier after this round
-  roundRecord.tierAfter = currentTierIndex;
-
   // Whether the round was already pushed depends on where the failing phase sits
   // relative to phase 7's unconditional push: implement and review return before
   // it, strategize runs after it.  That is derived here rather than passed in by

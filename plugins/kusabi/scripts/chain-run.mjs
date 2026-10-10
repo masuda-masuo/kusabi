@@ -123,7 +123,7 @@ export function buildImplementText({ round, brief, previousRecord, container, re
  * fields (probes, review, disposition).
  */
 export async function runImplementPhase({
-  cwd, chainId, round, isFirstRound, implementText, modelChain, tierIndex,
+  cwd, chainId, round, isFirstRound, implementText, modelChain,
   useNewSession, session, sessionProvenance, previousRecord, resumeMethod, flagsModel,
   backend = "opencode",
   _dispatchWithFallback: _dispatch = dispatchWithFallback,
@@ -174,7 +174,6 @@ export async function runImplementPhase({
     timeoutS: 3600,
     watchdogS: 900,
     tiers: modelChain,
-    tierIndex, // decoupled from round counter (B1)
     round,
     explicitModel: isFirstRound ? flagsModel : null,
   });

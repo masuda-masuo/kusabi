@@ -7,7 +7,6 @@ import crypto from "node:crypto";
 import { sessionProvenanceRefusal, renderChainBanner, cmdChain, runChainLifecycle } from "./chain-cmd.mjs";
 import { resolveOrchestratorRecord } from "./companion-config.mjs";
 import { createChainDir } from "./chain-phases.mjs";
-import { effectiveTierCount } from "./chain-driver.mjs";
 
 // sessionProvenanceRefusal — the agy --session chain-start gate (kusabi #321)
 // ---------------------------------------------------------------------------
@@ -101,75 +100,15 @@ describe("sessionProvenanceRefusal (kusabi #321)", () => {
 });
 
 
-// banner must not claim tiers it cannot walk (reworkTiers=2 on a claude
-// rework chain of 2 was a false "can reach top tier" claim at maxRounds >= 3).
+// chain-start banner (kusabi #683)
 // =========================================================================
 
-describe("chain-start banner (kusabi #192 follow-up)", () => {
-  const OPENCODE_IMPLEMENT_1 = [["opencode-go/deepseek-v4-pro"]];
-  const OPENCODE_REWORK_2 = [["opencode-go/deepseek-v4-flash"], ["opencode-go/deepseek-v4-pro"]];
-  const CLAUDE_IMPLEMENT_1 = [["claude/opus"]];
-  const CLAUDE_REWORK_2 = [["claude/opus"], ["claude/sonnet-4-5"]];
-
-  it("opencode rework chain of 2: unchanged semantics — can reach top with maxRounds >= 3", () => {
-    const tierCount = effectiveTierCount(OPENCODE_IMPLEMENT_1, "opencode");
-    const reworkTierCount = effectiveTierCount(OPENCODE_REWORK_2, "opencode");
-    assert.equal(tierCount, 1);
-    assert.equal(reworkTierCount, 2, "opencode chains keep their full length");
-    // roundsToTopTier = 1 + 2 = 3: the top tier needs three rounds.
+describe("chain-start banner", () => {
+  it("renders chain banner with chainId and maxRounds", () => {
     assert.equal(
-      renderChainBanner({ chainId: "c1", tierCount, reworkTierCount, reworkKeyConfigured: true, maxRounds: 3 }),
-      "Chain c1: tiers=1, reworkTiers=2, maxRounds=3 (can reach top tier)\n");
-    assert.equal(
-      renderChainBanner({ chainId: "c1", tierCount, reworkTierCount, reworkKeyConfigured: true, maxRounds: 2 }),
-      "Chain c1: tiers=1, reworkTiers=2, maxRounds=2 (maxRounds insufficient to reach top tier)\n");
-  });
-
-  it("claude-native rework chain of 2: effective tier count is 1 — the claim never exceeds ladderTierCount 1", () => {
-    const tierCount = effectiveTierCount(CLAUDE_IMPLEMENT_1, "claude");
-    const reworkTierCount = effectiveTierCount(CLAUDE_REWORK_2, "claude");
-    assert.equal(tierCount, 1);
-    assert.equal(reworkTierCount, 1, "a claude chain counts as one tier");
-    // roundsToTopTier = 1 + 1 = 2: maxRounds 2 already reaches the (only)
-    // top tier.  The pre-fix code computed roundsToTopTier = 3 from the raw
-    // length 2 and falsely claimed the top was unreachable at maxRounds 2.
-    assert.equal(
-      renderChainBanner({ chainId: "c1", tierCount, reworkTierCount, reworkKeyConfigured: true, maxRounds: 2 }),
-      "Chain c1: tiers=1, reworkTiers=1, maxRounds=2 (can reach top tier)\n");
-    // At maxRounds 3 the pre-fix banner printed reworkTiers=2 and claimed
-    // can-reach-top from a 2-tier ladder the claude backend never walks.
-    assert.equal(
-      renderChainBanner({ chainId: "c1", tierCount, reworkTierCount, reworkKeyConfigured: true, maxRounds: 3 }),
-      "Chain c1: tiers=1, reworkTiers=1, maxRounds=3 (can reach top tier)\n");
-    assert.equal(
-      renderChainBanner({ chainId: "c1", tierCount, reworkTierCount, reworkKeyConfigured: true, maxRounds: 1 }),
-      "Chain c1: tiers=1, reworkTiers=1, maxRounds=1 (maxRounds insufficient to reach top tier)\n");
-  });
-
-  it("no rework key: today's banner byte-identical (opencode implement chain of 2)", () => {
-    const tierCount = effectiveTierCount(OPENCODE_REWORK_2, "opencode");
-    assert.equal(tierCount, 2);
-    assert.equal(
-      renderChainBanner({ chainId: "c1", tierCount, reworkTierCount: 0, reworkKeyConfigured: false, maxRounds: 3 }),
-      "Chain c1: tiers=2, maxRounds=3 (can reach top tier)\n");
-  });
-
-  it("no rework key, claude implement chain of 2: the implement surface clamps to one tier too", () => {
-    const tierCount = effectiveTierCount(CLAUDE_REWORK_2, "claude");
-    assert.equal(tierCount, 1);
-    // Pre-fix: tiers=2 with roundsToTopTier=3 — a false claim at maxRounds 2.
-    assert.equal(
-      renderChainBanner({ chainId: "c1", tierCount, reworkTierCount: 0, reworkKeyConfigured: false, maxRounds: 2 }),
-      "Chain c1: tiers=1, maxRounds=2 (can reach top tier)\n");
-    assert.equal(
-      renderChainBanner({ chainId: "c1", tierCount, reworkTierCount: 0, reworkKeyConfigured: false, maxRounds: 3 }),
-      "Chain c1: tiers=1, maxRounds=3 (can reach top tier)\n");
-  });
-
-  it("no implement chain: no banner line (the caller skips the write)", () => {
-    assert.equal(
-      renderChainBanner({ chainId: "c1", tierCount: 0, reworkTierCount: 0, reworkKeyConfigured: false, maxRounds: 4 }),
-      null);
+      renderChainBanner({ chainId: "c1", maxRounds: 3 }),
+      "Chain c1: maxRounds=3\n",
+    );
   });
 });
 

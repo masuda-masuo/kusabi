@@ -70,65 +70,47 @@ export function parseModel(value) {
 }
 
 /**
- * Built-in default chain — two tiers with :max reasoning variants.
- * Tier 1: flash-free (zen) → flash (go).  Tier 2: pro.
+ * Built-in default chain — one flat capacity ladder with :max reasoning variants.
+ * Ordered: flash-free (zen) → flash (go) → pro (go).
  * Matches DESIGN.md §4: "zen's deepseek-v4-flash-free → go's deepseek v4 Flash"
  * plus "Pro finishing".
  */
 export const BUILTIN_DEFAULT_CHAIN = [
-  ["opencode/deepseek-v4-flash-free:max", "opencode-go/deepseek-v4-flash:max"],
-  ["opencode-go/deepseek-v4-pro:max"],
+  "opencode/deepseek-v4-flash-free:max",
+  "opencode-go/deepseek-v4-flash:max",
+  "opencode-go/deepseek-v4-pro:max",
 ];
 
 /**
- * Pure function: select ordered route candidates from the tiered chain.
+ * Pure function: select ordered route candidates from the chain ladder.
  *
- * Converts each tier entry (string → single-route tier, array → multi-route
- * tier) to a uniform shape, clamps `round` (or explicit `tierIndex`) to the
- * tier count, and returns an ordered list of candidate route strings:
- * remaining routes of the current tier first, then later tiers, skipping
- * routes present in `failedRoutes`.
+ * Normalises flat (string[]) or nested-array ([string[]]) chains to a
+ * single ladder and returns candidate routes minus routes present in `failedRoutes`.
  * An `explicitModel` (e.g. `--model <entry>`) is prepended when provided
  * and not already failed.
  *
- * When `tierIndex` is provided it takes precedence over `round` — this is
- * used by the chain to decouple model tier from the round counter.
- *
- * @param {object}   opts
- * @param {(string|string[])[]} opts.tiers        — Tiered chain entries.
- * @param {number}             [opts.round]       — 1-based round number (used
- *                                                  when tierIndex is not given).
- * @param {number}             [opts.tierIndex]   — Explicit 0-based tier index.
- *                                                  Overrides round when set.
- * @param {string|null}        [opts.explicitModel] — --model flag value.
- * @param {Set<string>}        [opts.failedRoutes]  — Routes already known dead.
+ * @param {object}            opts
+ * @param {(string|string[])[]} opts.tiers        — Chain ladder entries.
+ * @param {string|null}         [opts.explicitModel] — --model flag value.
+ * @param {Set<string>}         [opts.failedRoutes]  — Routes already known dead.
  * @returns {string[]} Ordered candidate route strings.
  */
-export function selectRoutes({ tiers, round, tierIndex, explicitModel, failedRoutes }) {
+export function selectRoutes({ tiers, explicitModel, failedRoutes }) {
   const failed = failedRoutes ?? new Set();
 
   if (explicitModel) {
     return failed.has(explicitModel) ? [] : [explicitModel];
   }
 
-  // Normalise: string -> [string]; array -> its own copy.
-  const normalized = tiers.map(function (t) {
-    return typeof t === "string" ? [t] : [...t];
-  });
-  if (normalized.length === 0) return [];
-
-  // Use explicit tierIndex when given, otherwise derive from round.
-  const effectiveTierIndex = tierIndex !== undefined
-    ? Math.min(tierIndex, normalized.length - 1)
-    : Math.min(round - 1, normalized.length - 1);
+  if (!Array.isArray(tiers) || tiers.length === 0) return [];
 
   /** @type {string[]} */
   const candidates = [];
 
-  // Current tier first, then latent tiers.
-  for (let i = effectiveTierIndex; i < normalized.length; i++) {
-    for (const route of normalized[i]) {
-      if (!failed.has(route) && !candidates.includes(route)) {
+  for (const tier of tiers) {
+    const routes = Array.isArray(tier) ? tier : [tier];
+    for (const route of routes) {
+      if (typeof route === "string" && !failed.has(route) && !candidates.includes(route)) {
         candidates.push(route);
       }
     }
@@ -138,14 +120,15 @@ export function selectRoutes({ tiers, round, tierIndex, explicitModel, failedRou
 }
 
 /**
- * Validate tiered chain entries from config.
+ * Validate chain entries from config.
  *
- * Accepts both flat (all-string) and tiered (mixed string|array) chains.
- * Throws with a message that names the config path on invalid input.
+ * Accepts (a) a flat array of route strings, or (b) an array holding exactly
+ * one non-empty array of route strings. Two or more array entries, or a mix of
+ * strings and arrays, is rejected because tier escalation was removed.
  *
  * @param {(string|string[])[]} entries
  * @param {string}              configPath  — e.g. "models.chain" or "models.phases.implement"
- * @throws {Error} On empty chain, empty tier, non-string route, or wrong type.
+ * @throws {Error} On empty chain, empty tier, non-string route, multiple tiers, or wrong type.
  */
 export function validateChainEntries(entries, configPath) {
   if (!Array.isArray(entries)) {
@@ -154,16 +137,18 @@ export function validateChainEntries(entries, configPath) {
   if (entries.length === 0) {
     throw new Error(`kusabi config: "${configPath}" must not be empty (omit to use defaults)`);
   }
+  let arrayCount = 0;
+  let stringCount = 0;
   for (let i = 0; i < entries.length; i++) {
     const entry = entries[i];
     const subPath = `${configPath}[${i}]`;
     if (typeof entry === "string") {
+      stringCount++;
       if (entry === "") {
         throw new Error(`kusabi config: "${subPath}" must not be an empty string`);
       }
-      continue;
-    }
-    if (Array.isArray(entry)) {
+    } else if (Array.isArray(entry)) {
+      arrayCount++;
       if (entry.length === 0) {
         throw new Error(`kusabi config: "${subPath}" must not be an empty array`);
       }
@@ -175,9 +160,12 @@ export function validateChainEntries(entries, configPath) {
           throw new Error(`kusabi config: "${subPath}[${j}]" must not be an empty string`);
         }
       }
-      continue;
+    } else {
+      throw new Error(`kusabi config: "${subPath}" must be a string or array of strings`);
     }
-    throw new Error(`kusabi config: "${subPath}" must be a string or array of strings`);
+  }
+  if (arrayCount > 1 || (arrayCount > 0 && stringCount > 0)) {
+    throw new Error(`kusabi config: "${configPath}": tier escalation was removed; put the routes in one list`);
   }
 }
 

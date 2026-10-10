@@ -1178,8 +1178,10 @@ export async function runPrompt({ cwd, kind, title, promptText, agent, model, se
 export async function dispatchWithFallback(opts) {
   const {
     tiers,
+    // Callers still pass `round`; route selection no longer uses it (kusabi
+    // #683), but it is stripped here so it never leaks into runPrompt options.
+    // eslint-disable-next-line no-unused-vars
     round,
-    tierIndex,
     explicitModel,
     explicitRestrictions = false,
     excludedBackends = [],
@@ -1192,10 +1194,10 @@ export async function dispatchWithFallback(opts) {
     _backendDispatch,
     ...runPromptOpts
   } = opts;
-  const routeCandidates = selectRoutes({ tiers, round, tierIndex, explicitModel, failedRoutes });
+  const routeCandidates = selectRoutes({ tiers, explicitModel, failedRoutes });
   const excludedBackendSet = new Set(excludedBackends);
   const diagnosticRoutes = excludedBackends.length > 0
-    ? selectRoutes({ tiers, round, tierIndex, explicitModel, failedRoutes: new Set() })
+    ? selectRoutes({ tiers, explicitModel, failedRoutes: new Set() })
     : routeCandidates;
   const skippedExcludedRoutes = excludedBackends.length > 0
     ? diagnosticRoutes

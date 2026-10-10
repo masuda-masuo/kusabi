@@ -4,7 +4,7 @@
 // `dispatchWithFallback` (prompt-execution.mjs) and `claudeDispatch`
 // (claude-dispatch.mjs): it receives the dispatch options object (cwd, kind,
 // title, promptText, agent, phase, session, tools, timeoutS, watchdogS,
-// tiers, round, tierIndex, explicitModel) and resolves to
+// tiers, round, explicitModel) and resolves to
 // `{ job, resultText, stateDir }`.  kusabi-companion.mjs picks this function
 // per phase; the chain phases stay backend-blind.
 //
@@ -481,7 +481,6 @@ export function runAgyProcess({ bin, args, cwd, env, timeoutS, watchdogS, onStar
  *        `status: "stalled"` (kusabi #332).
  * @param {(string|string[])[]} [opts.tiers]
  * @param {number} [opts.round]
- * @param {number} [opts.tierIndex]
  * @param {string|null} [opts.explicitModel]
  * @returns {Promise<{ job: object, resultText: string, stateDir: string }>}
  */
@@ -500,7 +499,7 @@ export async function agyDispatch(opts) {
   });
 
   // v1 model selection: explicit model, else the chain's first route.
-  // tiers/round/tierIndex are accepted for contract parity but the tier
+  // tiers/round are accepted for contract parity but the capacity
   // ladder is NOT walked — one model per phase.
   const modelEntry = validateAgyModel(opts.explicitModel || firstRoute(opts.tiers || []));
   if (!modelEntry) {
