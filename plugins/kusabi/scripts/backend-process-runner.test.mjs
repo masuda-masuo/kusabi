@@ -319,6 +319,45 @@ describe("runBackendProcess", () => {
     );
   });
 
+  it("backward clock step does not shorten measured silence", async () => {
+    const originalDateNow = Date.now;
+    let wallOffsetMs = 0;
+    Date.now = () => originalDateNow() + wallOffsetMs;
+    const fired = [];
+    let steppedBackward = false;
+    try {
+      const result = await runBackendProcess({
+        bin: process.execPath,
+        args: ["-e", "setInterval(() => {}, 1000)"],
+        cwd: ctx.tmp,
+        watchdogS: 1,
+        now: () => performance.now(),
+        parseLine: parseLineNothing,
+        onWatchdog: (event) => { if (event.kind === "fired") fired.push(event); },
+        onStart: () => {
+          const start = performance.now();
+          while (performance.now() - start < 2500) {
+            if (!steppedBackward && performance.now() - start >= 1250) {
+              wallOffsetMs = -5000;
+              steppedBackward = true;
+            }
+          }
+        },
+      });
+      assert.equal(result.stalled, true);
+      assert.equal(result.timedOut, false);
+      assert.equal(result.spawnError, null);
+      assert.equal(steppedBackward, true);
+      assert.equal(fired.length, 1);
+      assert.ok(
+        fired[0].silenceS >= 3,
+        `the wall clock stepped backward by 5s during 2.5s of silence; watchdog measured ${fired[0].silenceS}s`,
+      );
+    } finally {
+      Date.now = originalDateNow;
+    }
+  });
+
   it("onLine errors do not crash the process runner (stats-fold safety)", async () => {
     const result = await runBackendProcess({
       bin: ctx.binPath,

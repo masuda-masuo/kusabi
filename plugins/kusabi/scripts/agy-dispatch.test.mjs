@@ -2185,7 +2185,9 @@ describe("agyDispatch (fake agy binary)", () => {
     let captured = null;
     const baseNow = 1_800_000_000_000;
     let elapsed = 0;
-    t.mock.method(Date, "now", () => baseNow + elapsed);
+    // The silence watchdog measures on the monotonic clock (kusabi #718), so
+    // that is the clock this test drives; recorded timestamps stay wall time.
+    t.mock.method(performance, "now", () => baseNow + elapsed);
     t.mock.method(globalThis, "setInterval", (fn, ms) => { captured = { fn, ms }; return undefined; });
     const pending = agyDispatch(ctx.dispatchOptions({ watchdogS: 30, timeoutS: 600 }));
 
