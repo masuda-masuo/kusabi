@@ -22,8 +22,8 @@
 // phase/backend/model resolution, baselines, chain id/directory/control
 // creation, signal handling, the runChainDriver dispatch and the terminal
 // cleanup) is exported as runChainLifecycle (kusabi #526).  cmdChain is the
-// CLI adapter on top: it resolves the brief file and the orchestrator
-// record and delegates, so a future mission driver can run an inner chain
+// CLI adapter on top: it resolves the brief file and orchestrator
+// record, then delegates the plain chain lifecycle.
 // through the same seam without bypassing any of it.
 
 import fs from "node:fs";
@@ -161,17 +161,14 @@ export async function cmdChain(cwd, { flags, text }, opts = {}) {
   // The whole fresh-chain lifecycle (kusabi #526) lives in the reusable seam
   // below: publish/brief checks, refusals, backend resolution, baselines,
   // chain creation, the runChainDriver dispatch and the terminal cleanup.
-  // cmdChain is only the CLI adapter that turns user-facing input into the
-  // lifecycle's inputs; the future mission driver calls runChainLifecycle
-  // directly and therefore cannot skip any check this command used to run
-  // inline.  `opts` is the same test-only injection seam the lifecycle
+  // cmdChain is the CLI adapter that turns user-facing input into the
+  // lifecycle's inputs. `opts` is the same test-only injection seam the lifecycle
   // accepts (forwarded verbatim).
   return runChainLifecycle(cwd, { flags, text, orchestrator }, opts);
 }
 
 /**
- * The reusable fresh-chain lifecycle shared by the `chain` CLI and the
- * future mission driver (kusabi #526).
+ * The reusable fresh-chain lifecycle for the `chain` CLI.
  *
  * Everything that must hold before a worker is handed a container runs
  * here, in the order `chain` always ran it: the runtime publish guard, the
@@ -182,7 +179,7 @@ export async function cmdChain(cwd, { flags, text }, opts = {}) {
  * the base SHA / worktree / verify baseline captures, `runChainDriver`, and
  * the terminal cleanup (signal-listener removal; the driver's own
  * serve-stop / control finalisation).  A caller invoking this seam directly
- * gets the same checks in the same order, so a future mission driver cannot
+ * gets the same checks in the same order, so this lifecycle cannot
  * skip any of them by calling it with the normal production options.
  *
  * Injection (`opts.inject`) is the TEST-ONLY escape hatch for the two
@@ -438,10 +435,6 @@ export async function runChainLifecycle(cwd, { flags, text, orchestrator }, opts
       signalReceived: () => signalReceived,
       keepServe: !!flags.keepServe,
       resume: null,
-      // Mission linkage (kusabi #532): the owning luna mission's id, present
-      // only when the caller (the luna driver) supplies it — a plain chain
-      // keeps chain.json byte-identical.
-      missionId: flags.missionId ?? null,
     });
   } finally {
     process.removeListener("SIGTERM", onSignal);
@@ -749,9 +742,6 @@ export async function cmdChainResume(cwd, { flags, text }) {
       signalReceived: () => signalReceived,
       keepServe: !!flags.keepServe,
       resume: position,
-      // Mission linkage (kusabi #532): carried across a resume from the
-      // stored chain.json so a resumed inner chain keeps its mission link.
-      missionId: chainJson.missionId ?? null,
     });
   } finally {
     process.removeListener("SIGTERM", onSignal);

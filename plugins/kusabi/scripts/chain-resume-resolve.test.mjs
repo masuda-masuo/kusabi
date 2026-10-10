@@ -1131,3 +1131,24 @@ describe("chain-resume-resolve source guards (kusabi #441)", () => {
     assert.ok(!chainPhasesSrc.includes("from './chain-resume-resolve.mjs'"));
   });
 });
+
+describe("resolveChainResume after Sol gate removal", () => {
+  it("refuses a legacy sol-blocked round with a clear removed-gate message", () => {
+    const result = resolveChainResume({
+      control: { status: "cancelled", pid: -1 },
+      chainJson: {
+        modelChain: [["fake/model"]],
+        brief: "Implement X.",
+        maxRounds: 2,
+        records: [{
+          round: 1,
+          implementJobId: "job-1",
+          disposition: { disposition: "sol-blocked", reason: "legacy Sol gate" },
+        }],
+      },
+    });
+    assert.equal(result.ok, false);
+    assert.match(result.error, /removed Sol gate/);
+    assert.match(result.error, /sol-blocked/);
+  });
+});

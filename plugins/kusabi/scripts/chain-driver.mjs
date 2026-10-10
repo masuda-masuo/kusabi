@@ -296,7 +296,6 @@ export async function runChainDriver({
   reworkDispatchWithFallback = null,
   initialSession, flagsModel = null, reviewFlagsModel = null, signalReceived = () => false,
   keepServe = false, resume = null, sessionProvenance = null,
-  missionId = null,
   smokeObservation = null,
 }) {
   // Per-phase dispatch (kusabi #192): the review phase dispatches through its
@@ -359,11 +358,6 @@ export async function runChainDriver({
     reviewModel, reviewModelChain, reworkModel, reworkModelChain, reworkBackend,
     reviewDispatch, injectedDispatch,
     smokeObservation: effectiveSmokeObservation,
-    // Mission linkage (kusabi #532): the owning luna mission's id, threaded
-    // through the ordinary round loop's finishRound persistence so
-    // a normally completed Luna inner chain writes it; plain chains carry
-    // null and stay byte-identical.
-    missionId,
     // Mutable cross-round state (owned by the loop, mutated by finishRound)
     records,
     reworkCount,
@@ -688,7 +682,6 @@ export async function runChainDriver({
           interrupted: true,
           verifyBaseline: effectiveVerifyBaseline,
           smokeObservation: ctx.smokeObservation ?? null,
-          ...(missionId ? { missionId } : {}),
         });
         finalizeChainControl({ chainDir, status: "cancelled", round });
         const text = `Chain ${chainId} cancelled during round ${round} (stop requested after probes, before review). Progress preserved — resume with chain-resume ${chainId}.`;

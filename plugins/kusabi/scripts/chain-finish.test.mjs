@@ -113,11 +113,9 @@ describe("chain-finish source guard", () => {
 });
 
 // =========================================================================
-// kusabi #532 — a failed Luna inner chain stays attributable to its mission.
-// handleProviderExhaustion writes the TERMINAL chain.json for both
-// provider-exhausted phases (review, strategize); the optional mission link
-// must ride on it exactly like a successful chain's, and a plain chain must
-// omit the key (byte-identical serialization).
+// kusabi #532 — removed chain mission linkage.
+// handleProviderExhaustion writes the TERMINAL chain.json for provider-exhausted phases;
+// a stale missionId input is ignored and the key is absent.
 // =========================================================================
 
 const CHAIN_BRIEF = "Implement X.\n\n## Deliverables\n- src/foo.js\n";
@@ -179,10 +177,10 @@ function reviewExhaustedDispatch() {
   return dispatch;
 }
 
-describe("provider-exhaustion mission linkage (kusabi #532)", () => {
-  it("handleProviderExhaustion carries missionId on the terminal chainState for both exhausted phases and omits it for a plain chain", () => {
+describe("provider-exhaustion chain records omit removed mission linkage", () => {
+  it("handleProviderExhaustion omits missionId for both exhausted phases", () => {
     for (const phase of ["review", "strategize"]) {
-      // Luna inner chain: the terminal chainState keeps its mission link.
+      // A stale caller option is ignored.
       const luna = handleProviderExhaustion({
         records: [],
         roundRecord: { round: 1 },
@@ -200,8 +198,7 @@ describe("provider-exhaustion mission linkage (kusabi #532)", () => {
         strategized: false,
         missionId: "mission-abc",
       });
-      assert.equal(luna.chainState.missionId, "mission-abc",
-        `${phase}: a failed Luna inner chain keeps its mission attribution`);
+      assert.equal("missionId" in luna.chainState, false);
       assert.equal(luna.chainState.chainId, "chain-x");
 
       // Plain chain: the key is absent entirely, never null/false.
@@ -226,7 +223,7 @@ describe("provider-exhaustion mission linkage (kusabi #532)", () => {
     }
   });
 
-  it("a Luna inner chain failing review provider exhaustion persists missionId on chain.json; a plain chain omits the key", async () => {
+  it("review provider exhaustion does not persist a stale missionId option", async () => {
     async function runChain({ missionId }) {
       const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-532-rev-exhaust-"));
       const chainDir = path.join(tmp, "chains", "chain-x");
@@ -254,8 +251,7 @@ describe("provider-exhaustion mission linkage (kusabi #532)", () => {
     try {
       assert.match(luna.text, /review provider exhausted/);
       const chainJson = readJson(path.join(luna.chainDir, "chain.json"));
-      assert.equal(chainJson.missionId, "mission-abc",
-        "a failed Luna inner chain keeps its mission attribution on the terminal chain.json");
+      assert.equal("missionId" in chainJson, false);
       assert.equal(chainJson.records.length, 1);
     } finally {
       fs.rmSync(luna.tmp, { recursive: true, force: true });

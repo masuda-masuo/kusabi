@@ -332,9 +332,6 @@ export async function finishRound(
     flagsModel, reviewFlagsModel, effectiveReviewChain,
     effectiveBaseSha, effectiveVerifyBaseline, reviewModel, reviewModelChain,
     reworkModel, reworkModelChain, reworkBackend, reviewDispatch,
-    // Mission linkage (kusabi #532): threaded from runChainDriver's ctx so a
-    // normally completed Luna inner chain persists it; null on plain chains.
-    missionId,
     // Mutable cross-round state
     records, reworkCount,
   } = ctx;
@@ -522,9 +519,6 @@ export async function finishRound(
       reworkModel, reworkModelChain, reworkBackend,
       maxRounds, brief, orchestrator, baseSha: effectiveBaseSha,
       strategized: false, chainFollowupDraft: null,
-      // Mission linkage (kusabi #532): a failed Luna inner chain keeps its
-      // mission attribution on the terminal chain.json write.
-      missionId,
       verifyBaseline: effectiveVerifyBaseline,
     });
     writeJson(path.join(chainDir, "round-" + round + ".json"), roundRecord);
@@ -731,9 +725,6 @@ export async function finishRound(
     chainTotals, strategized: false, chainFollowupDraft,
     verifyBaseline: effectiveVerifyBaseline,
     smokeObservation: ctx.smokeObservation ?? null,
-    // Mission linkage (kusabi #532): emitted only under Luna mode; a plain
-    // chain serialization stays byte-identical when the key is absent.
-    ...(missionId ? { missionId } : {}),
   });
 
   // Update the chain control round counter

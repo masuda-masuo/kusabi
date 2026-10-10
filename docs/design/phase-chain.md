@@ -586,7 +586,7 @@ This limitation is deliberate and documented rather than silently claimed as cov
 
 ### 3.5.7f Removed surface
 
-The Luna mission driver, coordinator/auditor roles, Sol audit gate, and evaluation command were removed in #673. Recover the historical design from tag `v0.1.0`. The chain-core mission linkage remains covered by #702, and mission metrics remain covered by #703.
+The Luna mission driver, coordinator/auditor roles, Sol audit gate, and evaluation command were removed in #673. Recover the historical design from tag `v0.1.0`. The chain-core Sol gate and mission linkage were removed in #702. Mission metrics remain covered by #703.
 
 ### 3.5.8 metrics store (ingest) — implemented
 
