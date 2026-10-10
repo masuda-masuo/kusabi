@@ -120,15 +120,6 @@ describe("shouldSkipReview", () => {
     assert.equal(result, false);
   });
 
-  it("returns false when no deliverables declared", () => {
-    const result = shouldSkipReview({
-      chainStatusObserved: true,
-      chainChangedPaths: [],
-      chainDeliverables: [],
-    });
-    assert.equal(result, false);
-  });
-
   it("returns false when empty paths but no deliverables (both arrays empty)", () => {
     const result = shouldSkipReview({
       chainStatusObserved: true,

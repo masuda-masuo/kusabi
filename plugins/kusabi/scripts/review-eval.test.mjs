@@ -21,7 +21,8 @@ const GOLD = {
 };
 
 describe("isFindingHit — range overlap", () => {
-  it("hits when finding range overlaps gold range", () => {
+  it("hits when finding range overlaps gold range (finding.kind omitted, gold.kind present)", () => {
+    // Overlapping ranges hit even when finding.kind is omitted while gold.kind is present (kind is documentation, not a gate).
     const f = { file: "bug.js", line_start: 15, line_end: 18 };
     assert.equal(isFindingHit(f, GOLD), true);
   });
@@ -95,11 +96,6 @@ describe("isFindingHit — missing data is a non-hit", () => {
 });
 
 describe("isFindingHit — kind is documentation, not a gate", () => {
-  it("hits when finding.kind is omitted and gold.kind is present", () => {
-    const f = { file: "bug.js", line_start: 15, line_end: 18 };
-    assert.equal(isFindingHit(f, GOLD), true);
-  });
-
   it("hits when finding.kind differs from gold.kind", () => {
     const f = {
       file: "bug.js",
