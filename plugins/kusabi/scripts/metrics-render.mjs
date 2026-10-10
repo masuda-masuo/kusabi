@@ -531,43 +531,6 @@ function renderBackendSplit(split) {
 }
 
 // ---------------------------------------------------------------------------
-// Missions section (kusabi #532) — render
-// ---------------------------------------------------------------------------
-
-/**
- * Render the additive Missions section.  Returns [] — no section at all —
- * when no mission rows exist, so a store without missions (including a
- * pre-#532 store whose schema lacks the tables) renders byte-identically to
- * before.
- */
-function renderMissionsSection(report) {
-  const section = report.missions;
-  if (!section || section.count === 0) return [];
-  const lines = [`Missions (${fmtCount(section.count)}):`];
-  for (const row of section.rows) {
-    const coord = [row.coordinatorProvider, row.coordinatorModel]
-      .filter((v) => typeof v === "string" && v)
-      .join("/") || "?";
-    lines.push(
-      `  ${row.missionId}  status: ${row.status ?? "unknown"}  coordinator: ${coord}  gates: ${fmtCount(row.gates)}`,
-    );
-  }
-  lines.push(
-    `  totals: coordinator errors ${fmtInt(section.coordinatorErrors)}  brief corrections ${fmtInt(section.briefCorrections)}  ` +
-      `host interventions ${fmtInt(section.hostInterventions)}  latency ${fmtNum(section.latencySeconds)}s  cost ${fmtCost(section.cost)} units`,
-  );
-  lines.push(
-    `  tokens: in ${fmtInt(section.tokens.input)}  out ${fmtInt(section.tokens.output)}  reasoning ${fmtInt(section.tokens.reasoning)}  ` +
-      `cache-read ${fmtInt(section.tokens.cacheRead)}  cache-write ${fmtInt(section.tokens.cacheWrite)}`,
-  );
-  lines.push(
-    `  consultation origins: luna-requested ${fmtCount(section.consultationOrigins.lunaRequested)}  ` +
-      `policy-mandated ${fmtCount(section.consultationOrigins.policyMandated)}  sampled ${fmtCount(section.consultationOrigins.sampled)}`,
-  );
-  return lines;
-}
-
-// ---------------------------------------------------------------------------
 // top-level render — the exported entry points
 // ---------------------------------------------------------------------------
 
@@ -589,15 +552,6 @@ export function renderReportText(report) {
   if (report.status === "empty") {
     lines.push("");
     lines.push("Store is empty (0 sessions, 0 turns, 0 chains, 0 jobs).");
-    // kusabi #532: a store that carries mission rows but nothing of the
-    // legacy tables appends the Missions section after the empty line — the
-    // pre-#532 text stays byte-identical, and the mission facts are never
-    // hidden behind an "empty" that only describes the legacy tables.
-    const missionLines = renderMissionsSection(report);
-    if (missionLines.length > 0) {
-      lines.push("");
-      lines.push(...missionLines);
-    }
     return lines.join("\n");
   }
 
@@ -632,13 +586,6 @@ export function renderReportText(report) {
   if (backendSplitLines.length > 0) {
     lines.push("");
     lines.push(...backendSplitLines);
-  }
-  // kusabi #532: the additive Missions section — emitted only when mission
-  // rows exist, appended after the legacy sections so nothing reflows.
-  const missionLines = renderMissionsSection(report);
-  if (missionLines.length > 0) {
-    lines.push("");
-    lines.push(...missionLines);
   }
   return lines.join("\n");
 }
