@@ -22,6 +22,7 @@ import { DatabaseSync } from "node:sqlite";
 import { patchEnv } from "./fixtures.mjs";
 import { loggedArgs, isAlive } from "./backend-dispatch-fixtures.mjs";
 
+import { runBackendDispatch } from "./backend-dispatch-core.mjs";
 import {
   AGY_DEFAULT_CHAIN,
   agyBin,
@@ -3678,6 +3679,61 @@ describe("the argv size guard is agy-only (criterion 5)", () => {
         source, /checkAgyArgvSize|AGY_MAX_ARG|MAX_ARG_STRLEN|E2BIG/,
         `${file} must not carry the agy argv size check`,
       );
+    }
+  });
+});
+
+describe("backend-dispatch-core monotonic stats save throttle (kusabi #723)", () => {
+  it("stats save throttle uses monotonic clock and is unaffected by Date.now backward jump", async (t) => {
+    let wall = 1_000_000_000;
+    t.mock.method(Date, "now", () => {
+      wall -= 50_000;
+      return wall;
+    });
+
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-dispatch-throttle-"));
+    const stateDir = path.join(tmp, "state");
+    fs.mkdirSync(stateDir, { recursive: true });
+
+    let mono = 0;
+    const now = () => mono;
+
+    const job = { id: "job-throttle-test", status: "running", stats: { events: 0 } };
+    const jobRecordFile = path.join(stateDir, "jobs", job.id, "job.json");
+
+    try {
+      await runBackendDispatch({
+        stateDir,
+        job,
+        promptText: "test prompt",
+        bin: "/bin/echo",
+        now,
+        stream: {
+          init: () => ({}),
+          onLine: (_state, _line, j) => {
+            j.stats.events += 1;
+          },
+        },
+        runProcess: async ({ onLine }) => {
+          onLine("line 1");
+          assert.equal(readJson(jobRecordFile)?.stats?.events, 1, "first event saved immediately");
+
+          mono = 500;
+          onLine("line 2");
+          assert.equal(readJson(jobRecordFile)?.stats?.events, 1, "second event within 1s is throttled");
+
+          mono = 2000;
+          onLine("line 3");
+          assert.equal(readJson(jobRecordFile)?.stats?.events, 3, "event after 1s on monotonic clock is saved");
+
+          return { code: 0, stdout: "", stderr: "", timedOut: false, stalled: false, spawnError: null };
+        },
+        classifyExit: () => ({ status: "completed" }),
+      });
+
+      assert.equal(job.status, "completed");
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
     }
   });
 });

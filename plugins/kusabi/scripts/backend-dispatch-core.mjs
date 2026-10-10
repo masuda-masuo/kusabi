@@ -100,6 +100,7 @@ export async function runBackendDispatch({
   finishedEvent,
   resultBackend,
   transformResultText,
+  now = () => performance.now(),
 }) {
   const bin = binOpt ?? labels?.bin;
   const spawnErrorPrefix = labels?.spawnErrorPrefix ?? "dispatch failed";
@@ -159,7 +160,10 @@ export async function runBackendDispatch({
     let spawned = false;
     let streamEvents = 0;
     let malformedLines = 0;
-    let lastStatsSaveAt = 0;
+    // Monotonic clock for throttling job saves (kusabi #723). Initialized
+    // to -Infinity so the first stream event is always saved immediately,
+    // preserving the behavior from when this used Date.now().
+    let lastStatsSaveAt = -Infinity;
 
     const onLine = (rawLine) => {
       const isBlank = typeof rawLine === "string" ? !rawLine.trim() : !rawLine;
@@ -175,9 +179,9 @@ export async function runBackendDispatch({
         return;
       }
       streamEvents += 1;
-      const now = Date.now();
-      if (now - lastStatsSaveAt >= STATS_SAVE_INTERVAL_MS) {
-        lastStatsSaveAt = now;
+      const currentNow = now();
+      if (currentNow - lastStatsSaveAt >= STATS_SAVE_INTERVAL_MS) {
+        lastStatsSaveAt = currentNow;
         saveJob(stateDir, job);
       }
     };
@@ -203,6 +207,7 @@ export async function runBackendDispatch({
       onStart,
       onLine,
       onWatchdog,
+      now,
     });
     const { code, stdout, stderr, timedOut, stalled, spawnError } = processResult;
     if (spawnError) {

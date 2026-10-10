@@ -15,6 +15,7 @@ import {
   reapOrphanedServes,
   reapIdleServes,
   isOurServe,
+  waitForPublishedHealthy,
 } from "./serve-lifecycle.mjs";
 import { readJson, stateDirFor } from "./state-paths.mjs";
 // The identity gate is shared by every kill site (kusabi #181); these two
@@ -640,6 +641,53 @@ describe("ensureServer (fake serve, spawn-based)", () => {
       ctx.killAll();
       ctx.restore();
       ctx.rm();
+    }
+  });
+
+  it("ensureServer startup deadline is unaffected when wall clock jumps backward (kusabi #723)", async (t) => {
+    const ctx = fakeServeContext("never");
+    process.env.KUSABI_SERVE_READY_TIMEOUT_MS = "400";
+    let wall = 1_000_000_000;
+    t.mock.method(Date, "now", () => {
+      wall -= 50_000;
+      return wall;
+    });
+    try {
+      await assert.rejects(ensureServer(ctx.cwd), /did not become ready/);
+      const spawned = spawnedPids(ctx.spawnLog);
+      assert.equal(spawned.length, 1, "exactly one serve process may be spawned");
+      await waitForDeath(spawned[0]);
+      assert.ok(!isAlive(spawned[0]), "the spawned serve must be dead after timeout");
+    } finally {
+      ctx.killAll();
+      ctx.restore();
+      ctx.rm();
+    }
+  });
+
+  it("waitForPublishedHealthy timeout is unaffected when wall clock jumps backward (kusabi #723)", async (t) => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-wait-healthy-"));
+    const serverFile = path.join(tmp, "server.json");
+    const lockDir = path.join(tmp, "serve.lock");
+    fs.mkdirSync(lockDir);
+
+    let wall = 1_000_000_000;
+    t.mock.method(Date, "now", () => {
+      wall -= 50_000;
+      return wall;
+    });
+
+    let mono = 0;
+    const now = () => {
+      mono += 50;
+      return mono;
+    };
+
+    try {
+      const result = await waitForPublishedHealthy(serverFile, lockDir, 100, { now });
+      assert.equal(result, null);
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
     }
   });
 

@@ -289,4 +289,34 @@ describe("dispatch backend process identity (kusabi #601)", () => {
       env.cleanup();
     }
   });
+
+  it("stopRecordedProcess timeout deadline is unaffected when wall clock jumps backward (kusabi #723)", async (t) => {
+    const env = createFakeAgyEnv();
+    try {
+      const pending = agyDispatch(env.options);
+      const running = await waitForRunningJob(env.stateDir);
+
+      const realKill = process.kill;
+
+      t.mock.method(process, "kill", (targetPid, sig) => {
+        if (sig === "SIGKILL") return true;
+        return realKill.call(process, targetPid, sig);
+      });
+
+      let wall = 2_000_000_000;
+      t.mock.method(Date, "now", () => {
+        wall -= 100_000;
+        return wall;
+      });
+
+      const stop = await stopRecordedProcess(running.process, { waitMs: 40, pollMs: 10 });
+      assert.equal(stop.outcome, "alive");
+      assert.equal(stop.signalled, true);
+
+      try { realKill.call(process, -running.process.pid, "SIGKILL"); } catch { /* ignore */ }
+      await pending;
+    } finally {
+      env.cleanup();
+    }
+  });
 });
