@@ -7,7 +7,7 @@
 // session never sees intermediate narration, tool logs, or raw events.
 
 import { parseArgs } from "./cli.mjs";
-import { formatCodexSupportedModels } from "./codex-dispatch.mjs";
+
 import { renderJobLine, renderHeader } from "./render.mjs";
 import { cmdInstallCli, diagnoseCompanionShim, formatShimSetupLine } from "./install-cli.mjs";
 // Exit path only (kusabi #243); its own module since kusabi #277 so that the
@@ -30,20 +30,6 @@ import {
 } from "./chain-ops.mjs";
 // task-cmd (kusabi #437): the `task` and `review` single-shot phase commands.
 import { cmdTask, cmdReview, cmdTaskDetach } from "./task-cmd.mjs";
-// luna-cmd (kusabi #530/#531): the opt-in luna mission surfaces (luna,
-// luna-detach, luna-wait, luna-show, luna-cancel, luna-resume).  luna-cmd.mjs
-// is NOT on a cycle with companion: it imports only leaf modules (the mission
-// driver reaches the chain lifecycle seam through a lazy import).
-import {
-  cmdLuna,
-  cmdLunaDetach,
-  cmdLunaWait,
-  cmdLunaShow,
-  cmdLunaCancel,
-  cmdLunaResume,
-  DEFAULT_COORDINATOR_SEAT,
-  DEFAULT_AUDITOR_SEAT,
-} from "./luna-cmd.mjs";
 // metrics-cmd (kusabi #443): the look-at-recorded-work command surfaces
 // (chain-stats, metrics-ingest, metrics-report). Unlike chain-cmd,
 // chain-ops, and task-cmd, metrics-cmd.mjs is NOT on a cycle with companion:
@@ -59,8 +45,6 @@ import {
 import { cmdInstallAgents } from "./host-cmd.mjs";
 // job-control-cmd (split): the cancel / serve-stop command surfaces.
 import { cmdCancel, cmdServeStop } from "./job-control-cmd.mjs";
-// eval-cmd (split): the read-only `evaluation` replay surface.
-import { cmdEvaluation } from "./eval-cmd.mjs";
 import fs from "node:fs";
 import path from "node:path";
 import process from "node:process";
@@ -256,13 +240,6 @@ function usage() {
     "  chain-stats Aggregate every chain record and print a summary (read-only, no LLM)",
     "  task-detach Launch a task in a detached background process and print a runnable task-wait command line (no LLM in launcher)",
     "  task-wait  Block until a task reaches a terminal state, print a one-line digest, exit 0 (read-only, no LLM; safe to SIGTERM at any moment). Non-zero means the WAIT itself failed — unknown job id, nothing appeared under --next, or the task stalled",
-    `  luna       Run an opt-in luna mission: the ${DEFAULT_COORDINATOR_SEAT.model} coordinator proposes bounded actions, and the deterministic driver validates and executes only the frozen enum (read_probe, run_chain, rework_chain, consult_sol, escalate_to_host, finish) against an immutable evidence envelope. The mission never accepts, publishes, merges, creates issues or creates containers — its terminal result is a host-facing recommendation`,
-    "  luna-detach Launch a luna mission in a detached background process and print a runnable luna-wait command line (no LLM in launcher)",
-    "  luna-wait  Block until a NAMED luna mission reaches a terminal state, print a one-line digest, exit 0 (read-only, no LLM, no serve; safe to SIGTERM at any moment). Non-zero means the WAIT itself failed — a mission that never appeared, a malformed mission id, or a stalled mission — never a disposition you dislike",
-    "  luna-show  Print a compact plain-text digest of a luna mission: exact seat provenance/substitution, attempts and inner chain ids, errors/consults, state and recommendation (read-only, no LLM)",
-    "  luna-cancel Record a stop request on a luna mission: no coordinator, auditor, or inner-chain seat is dispatched after it (the stop propagates to a live inner chain; a stale inner chain finalises through the existing chain stop lever)",
-    "  luna-resume Resume a luna mission from its persisted state: refuses while the mission process or a recorded Luna/Sol job is genuinely live, settles stale chains/jobs deterministically, and only a matching human audit override (--audit-override <gateId> --audit-override-reason <reason> --audit-override-by <actor>) lets a sol-blocked mission proceed",
-    "  evaluation Replay a named luna mission or plain chain from durable records alone and report the replayed audit-gate results (read-only, no LLM, no dispatch): mission-* -> mission replay, chain-* -> plain-chain replay",
     "  metrics-ingest  Ingest transcripts + Codex usage + chain records + delegated-job records into a durable SQLite store (read-only source, no LLM)",
     "  metrics-report  Query/report over the SQLite metrics store (read-only, no LLM, never ingests)",
     "  chain-cancel  Request a running chain to stop (file-based, works across processes)",
@@ -278,7 +255,7 @@ function usage() {
     "Flags:",
     "  --read-only, --resume-last",
     "  --base <ref> (review: branch diff base; task: diff base for --phase review --container, rejected elsewhere), --agent <id>, --phase <name> (implement|review|respond|gofer|test-author|plan)",
-    "  --backend opencode|claude|agy|codex (task/chain: force EVERY phase onto that backend; default opencode. Redundant when --model names a backend — a --backend that disagrees with such a --model is a contradiction and is rejected, naming both. With neither, the config chain entries decide: models.phases.<phase> (or models.chain) entries may carry a claude/, agy/, or codex/ prefix for per-phase backend mixing; one phase's chain must be single-backend. agy resumes via --conversation: --session/--resume-last are accepted when the job store proves the id an agy conversation, and --read-only/--deny are rejected on it. codex runs every invocation in a fixed read-only sandbox with reasoning effort high: --read-only is accepted, --deny is rejected, and the model must be one of the exact seat ids (" + formatCodexSupportedModels("or") + "). chain-resume accepts --backend/--model only to route a quota-exhausted review seat onto a different backend or model)",
+    "  --backend opencode|claude|agy|codex (task/chain: force EVERY phase onto that backend; default opencode. Redundant when --model names a backend — a --backend that disagrees with such a --model is a contradiction and is rejected, naming both. With neither, the config chain entries decide: models.phases.<phase> (or models.chain) entries may carry a claude/, agy/, or codex/ prefix for per-phase backend mixing; one phase's chain must be single-backend. agy resumes via --conversation: --session/--resume-last are accepted when the job store proves the id an agy conversation, and --read-only/--deny are rejected on it. codex runs every invocation in a fixed read-only sandbox with reasoning effort high: --read-only is accepted, --deny is rejected, and the model must be one of the supported exact seat ids. chain-resume accepts --backend/--model only to route a quota-exhausted review seat onto a different backend or model)",
     "  --session <id>, --timeout <s>, --watchdog <s>, --deny <tools>",
     "  --brief-file <path> (task / chain: read the brief from a file; exclusive with inline text)",
     "  --container <cid> (chain/task: container to run deterministic probes in; NOT supported by review)",
@@ -288,14 +265,6 @@ function usage() {
     "  --prior <text> (review: prior findings for anti-ratchet)",
     "  --max-rounds <N> (chain: max rounds, default 2)",
     "  --chain-id <id> (chain / chain-detach: run the chain under this id instead of minting one — caller-owned: must be unique per concurrent dispatch. The id becomes a path segment under chains/, so it must match chain-[a-z0-9]+ and its directory must not already exist \u2014 a malformed id is refused before any filesystem write. chain-detach hands the SAME id back: the emitted wait line is `chain-wait <id>`, which waits for the chain by name \u2014 no --next, no --since, and no recency race with another orchestrator working the same repo)",
-    "  --mission-file <path> (luna / luna-detach: the mission brief file; required. The mission brief is the outer brief — inner chains get their own brief from the coordinator's run_chain request)",
-    "  --mission-id <id> (luna / luna-detach: run the mission under this id instead of minting one. The id becomes a path segment under missions/, so it must match mission-[a-z0-9]+. luna-detach hands the SAME id back: the emitted wait line is `luna-wait <id>`, which waits for the mission by name — no recency selection)",
-    `  --coordinator-model <provider/model> (luna / luna-detach: the coordinator seat, default ${DEFAULT_COORDINATOR_SEAT.provider}/${DEFAULT_COORDINATOR_SEAT.model}; the luna mode never leaves the codex seats, and a non-default model is refused unless --allow-substitute authorizes it)`,
-    `  --auditor-model <provider/model> (luna / luna-detach: the auditor seat, default ${DEFAULT_AUDITOR_SEAT.provider}/${DEFAULT_AUDITOR_SEAT.model}; same substitution rule as --coordinator-model)`,
-    "  --allow-substitute (luna / luna-detach: explicitly authorize a non-default coordinator/auditor seat. Substitution is loud in mission records and show/wait output — requested and actual models are both recorded)",
-    "  --audit-override <gateId> (luna-resume: the blocking gate a human override resolves. Required together with --audit-override-reason and --audit-override-by; the original verdict is embedded byte-for-byte and only a sol-blocked mission can be overridden)",
-    "  --audit-override-reason <reason> (luna-resume: the human's reason for the override, persisted verbatim. Required; refused when empty)",
-    "  --audit-override-by <actor> (luna-resume: the human identifier authorising the override. Required; refused when empty)",
     "  --next (chain-wait: wait for a chain to APPEAR and then wait on it, instead of naming one; selects the newest chain that is new since the wait started OR was already there and has not reached a terminal state, so a chain the dispatch created in the moment before the wait started still counts and a chain that finished earlier never does; a preexisting empty directory with no control record and older than --appear-timeout is debris from a dispatch that died before it wrote anything, and is skipped with a stderr note; while the selected chain is still recordless, a newer or same-stamped chain that appears wins instead of the wait stalling on the empty dir (a dir once traded away is never revisited); a dispatch that dies before creating a chain directory exits non-zero here instead of looking finished)",
     "  --since <ISO> (chain-wait --next: only a chain created at or after this stamp counts as the one to wait for, terminal or not — the precise tool, with an explicit chain id, when several chains run in one workspace at once and the default newest-unfinished selection would be ambiguous; while the selected chain has no control record yet, a newer or same-stamped in-window chain that appears wins, same as the default selection)",
     "  --poll-interval <s> (chain-wait: state poll interval, default 2)",
@@ -314,8 +283,6 @@ function usage() {
     "  --since <ISO> (metrics-report: window start, inclusive)",
     "  --until <ISO> (metrics-report: window end, exclusive)",
     "  --json (metrics-report: emit the report as one JSON document instead of text)",
-    "  --sample-rate <0..1> (evaluation: deterministic T12 sampling rate for the replay; recorded policyInput.sampling always wins)",
-    "  --salt <string> (evaluation: sampling salt for the replay, default v1)",
     "  -h, --help",
     "",
     "Unknown flags cause an error. Use -- to treat subsequent tokens as literal text.",
@@ -330,19 +297,9 @@ function usage() {
 }
 
 // Subcommands that create a job — they reach runPrompt() or dispatchWithFallback()
-// (which itself calls runPrompt()) directly, or start a chain (which dispatches
-// rounds through the same path), or run a luna mission (which dispatches the
-// coordinator through the codex backend and runs inner chains through the
-// chain lifecycle). Enumerated from the switch in main() below; every other
-// subcommand only reads or stops existing state.
-//   task         -> dispatchWithFallback (cmdTask)
-//   review       -> runPrompt            (cmdReview)
-//   chain        -> dispatchWithFallback via runImplementPhase, per round (cmdChain)
-//   chain-resume -> same as chain, from a saved position (cmdChainResume)
-//   luna         -> runLunaMission (cmdLuna)
-//   luna-detach  -> spawns a detached luna child (cmdLunaDetach)
-//   luna-resume  -> resumes a mission's driver from saved state (cmdLunaResume)
-const JOB_CREATING_SUBCOMMANDS = new Set(["task", "review", "chain", "chain-resume", "chainResume", "chain-detach", "chainDetach", "task-detach", "taskDetach", "luna", "luna-detach", "lunaDetach", "luna-resume", "lunaResume"]);
+// directly, or start a chain that dispatches rounds through the same path.
+// Every other subcommand only reads or stops existing state.
+const JOB_CREATING_SUBCOMMANDS = new Set(["task", "review", "chain", "chain-resume", "chainResume", "chain-detach", "chainDetach", "task-detach", "taskDetach"]);
 
 async function main() {
   const [subcommand, ...argv] = process.argv.slice(2);
@@ -412,80 +369,13 @@ async function main() {
     "chain-detach", "chainDetach",
     "task-wait", "taskWait",
     "task-detach", "taskDetach",
-    "luna-wait", "lunaWait",
   ]);
   if (!waitSubcommands.has(subcommand)) {
     for (const flag of ["next", "poll-interval", "appear-timeout", "progress-timeout"]) {
       if (parsed.flags[flag] !== undefined) {
-        throw new Error(`--${flag} is only supported by chain-wait, chain-detach, task-wait, task-detach and luna-wait (got subcommand ${subcommand ?? "(none)"})`);
+        throw new Error(`--${flag} is only supported by chain-wait, chain-detach, task-wait and task-detach (got subcommand ${subcommand ?? "(none)"})`);
       }
     }
-  }
-
-  // The luna mission flags (kusabi #530) are mission-creation decisions; on
-  // any other subcommand they would be silently ignored — reject them out
-  // loud, exactly like --backend above.  The value flags are
-  // stored under their kebab keys, but the boolean --allow-substitute is
-  // stored under the camelCase key parseArgs derives, so it is checked
-  // separately.
-  const lunaCreating = new Set(["luna", "luna-detach", "lunaDetach"]);
-  for (const flag of ["mission-file", "mission-id", "coordinator-model", "auditor-model"]) {
-    if (parsed.flags[flag] !== undefined && !lunaCreating.has(subcommand)) {
-      throw new Error(`--${flag} is only supported by luna and luna-detach (got subcommand ${subcommand ?? "(none)"})`);
-    }
-  }
-  if (parsed.flags.allowSubstitute === true && !lunaCreating.has(subcommand)) {
-    throw new Error(`--allow-substitute is only supported by luna and luna-detach (got subcommand ${subcommand ?? "(none)"})`);
-  }
-  // luna-wait is a NAMED wait only: the --next/--since selectors belong to
-  // chain-wait / task-wait and would be silently ignored by the luna wait
-  // loop (its handler only reads the shared bounds).  Reject them out loud.
-  if (
-    (subcommand === "luna-wait" || subcommand === "lunaWait") &&
-    (parsed.flags.next !== undefined || parsed.flags.since !== undefined)
-  ) {
-    const flag = parsed.flags.next !== undefined ? "next" : "since";
-    throw new Error(
-      `--${flag} is only supported by chain-wait and task-wait — luna-wait waits for a ` +
-      `named mission id only (got subcommand ${subcommand ?? "(none)"})`,
-    );
-  }
-  // --container on the read-only luna surfaces would be silently ignored —
-  // wait/show never start a mission, so a container flag there is a mistake.
-  // The steering surfaces (luna-cancel / luna-resume) act on recorded state,
-  // so a container flag is equally meaningless there.  The read-only
-  // `evaluation` surface (kusabi #532) never names a container either.
-  if (
-    (subcommand === "luna-wait" || subcommand === "lunaWait" ||
-     subcommand === "luna-show" || subcommand === "lunaShow" ||
-     subcommand === "luna-cancel" || subcommand === "lunaCancel" ||
-     subcommand === "luna-resume" || subcommand === "lunaResume" ||
-     subcommand === "evaluation") &&
-    parsed.flags.container !== undefined
-  ) {
-    throw new Error(`--container is only supported by luna and luna-detach (got subcommand ${subcommand ?? "(none)"})`);
-  }
-
-  // The evaluation sampling flags (kusabi #532) are replay parameters; on any
-  // other subcommand they would be silently ignored — reject them out loud,
-  // exactly like the mission flags above.
-  if (parsed.flags["sample-rate"] !== undefined && subcommand !== "evaluation") {
-    throw new Error(`--sample-rate is only supported by evaluation (got subcommand ${subcommand ?? "(none)"})`);
-  }
-  if (parsed.flags.salt !== undefined && subcommand !== "evaluation") {
-    throw new Error(`--salt is only supported by evaluation (got subcommand ${subcommand ?? "(none)"})`);
-  }
-
-  // The luna-resume audit-override flags (kusabi #531) are human-override
-  // decisions; on any other subcommand they would be silently ignored —
-  // reject them out loud, exactly like --backend above.
-  if (
-    subcommand !== "luna-resume" && subcommand !== "lunaResume" &&
-    (parsed.flags["audit-override"] !== undefined ||
-     parsed.flags["audit-override-reason"] !== undefined ||
-     parsed.flags["audit-override-by"] !== undefined)
-  ) {
-    throw new Error(`--audit-override* is only supported by luna-resume (got subcommand ${subcommand ?? "(none)"})`);
   }
 
   if (parsed.flags["state-root"] !== undefined) {
@@ -541,25 +431,6 @@ async function main() {
     case "task-wait":
     case "taskWait":
       return cmdTaskWait(cwd, parsed);
-    case "luna":
-      return cmdLuna(cwd, parsed);
-    case "luna-detach":
-    case "lunaDetach":
-      return cmdLunaDetach(cwd, parsed);
-    case "luna-wait":
-    case "lunaWait":
-      return cmdLunaWait(cwd, parsed);
-    case "luna-show":
-    case "lunaShow":
-      return cmdLunaShow(cwd, parsed);
-    case "luna-cancel":
-    case "lunaCancel":
-      return cmdLunaCancel(cwd, parsed);
-    case "luna-resume":
-    case "lunaResume":
-      return cmdLunaResume(cwd, parsed);
-    case "evaluation":
-      return cmdEvaluation(cwd, parsed);
     case "chain-stats":
     case "chainStats":
       return cmdChainStats(cwd, parsed);
@@ -570,7 +441,7 @@ async function main() {
     case "metricsReport":
       return cmdMetricsReport(cwd, parsed);
     default:
-      throw new Error(`unknown subcommand: ${subcommand ?? "(none)"}. Use setup|task|review|chain|baseline|chain-detach|task-detach|task-wait|chain-resume|chain-show|chain-wait|chain-stats|metrics-ingest|metrics-report|chain-cancel|status|result|cancel|serve-stop|install-agents|install-cli|luna|luna-detach|luna-wait|luna-show|luna-cancel|luna-resume|evaluation`);
+      throw new Error(`unknown subcommand: ${subcommand ?? "(none)"}. Use setup|task|review|chain|baseline|chain-detach|task-detach|task-wait|chain-resume|chain-show|chain-wait|chain-stats|metrics-ingest|metrics-report|chain-cancel|status|result|cancel|serve-stop|install-agents|install-cli`);
   }
 }
 
