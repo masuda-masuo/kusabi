@@ -3089,7 +3089,7 @@ describe("CLI smoke baseline (kusabi #292)", () => {
     }
   });
 
-  it("defaults to 2 max rounds when --max-rounds is omitted (kusabi #681)", async () => {
+  it("defaults to 1 max rounds when --max-rounds is omitted", async () => {
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-default-max-rounds-"));
     const { server, url } = await startSunabaStub({ toolResult: { output: "SMOKE_EXIT=0\n" } });
     try {
@@ -3101,7 +3101,7 @@ describe("CLI smoke baseline (kusabi #292)", () => {
         { cwd: tmp, stateRootDir, url },
       );
 
-      assert.match(result.stdout, /^Chain .*maxRounds=2/m);
+      assert.match(result.stdout, /^Chain .*maxRounds=1/m);
     } finally {
       server.close();
       fs.rmSync(tmp, { recursive: true, force: true });
