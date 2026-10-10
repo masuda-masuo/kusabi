@@ -199,7 +199,7 @@ export function renderMaxRoundsOutcome({ chainId, maxRounds, records, orchestrat
  * @param {object}   opts
  * @param {string}   opts.chainId       — Chain identifier.
  * @param {number}   opts.round         — Round number where exhaustion occurred.
- * @param {string}   opts.phase         — Phase name: "implement", "review", "strategize".
+ * @param {string}   opts.phase         — Phase name: "implement", "review".
  * @param {string}   opts.jobError      — Error message from the exhausted job
  *                                        (already contains the "All routes
  *                                        exhausted:" text from the wrapper).
@@ -265,17 +265,14 @@ export function renderProviderExhaustedOutcome({ chainId, round, phase, jobError
  * and what outcome is rendered when a phase job returns
  * `status === "provider-error"`.
  *
- * Whether the round still needs pushing depends on where the failing phase
- * sits relative to phase 7's unconditional push: implement and review return
- * before it, strategize (phase 9) runs after it.  **That is detected here, not
- * passed in.**  A caller that got such a flag wrong would silently duplicate or
- * drop the round — the exact defect PR #119 fixed — and no test of this
- * function could catch a mistake made at the call site.
+ * The round is added only when it is not already present in records. This
+ * generic idempotence guard keeps provider-exhaustion handling safe regardless
+ * of which live phase called it.
  *
  * @param {Object} opts
  * @param {Array}  opts.records             - Chain records so far (mutated in place).
  * @param {Object} opts.roundRecord          - Current round record.
- * @param {string} opts.phase               - Phase name ("implement", "review", "strategize").
+ * @param {string}   opts.phase               - Phase name ("implement", "review").
  * @param {string|null} [opts.jobError=null] - Provider error detail.
  * @param {object|null} [opts.jobFailure=null] - Structured terminal-failure
  *        classification from the failed job record (kusabi #215):
@@ -305,12 +302,8 @@ export function renderProviderExhaustedOutcome({ chainId, round, phase, jobError
  * @param {string} opts.brief
  * @param {string} opts.orchestrator
  * @param {string} opts.baseSha
- * @param {boolean} opts.strategized
- * @param {string|null} [opts.chainFollowupDraft=null]
- *        (kusabi #532).  A failed Luna inner chain stays attributable to its
- *        mission just like a successful one: emitted on the terminal
- *        chain.json only when supplied, so an ordinary chain stays
- *        byte-identical.
+ * @param {string|null} [opts.chainFollowupDraft=null] - Optional follow-up
+ *        issue draft to persist in chain.json.
  * @param {object|null} [opts.verifyBaseline=null]
  * @returns {{ records: Array, chainState: Object, outcome: string }}
  *   - `records`   — the (mutated) records array with roundRecord present exactly once.
@@ -337,15 +330,11 @@ export function handleProviderExhaustion({
   brief,
   orchestrator,
   baseSha,
-  strategized,
   chainFollowupDraft = null,
   verifyBaseline = null,
 }) {
-  // Whether the round was already pushed depends on where the failing phase sits
-  // relative to phase 7's unconditional push: implement and review return before
-  // it, strategize runs after it.  That is derived here rather than passed in by
-  // the caller — a caller that got the flag wrong would silently duplicate or
-  // drop the round, which is the exact bug PR #119 fixed.
+  // The guard is generic idempotence: callers may already have recorded this
+  // round before provider exhaustion is handled.
   if (!records.includes(roundRecord)) {
     records.push(roundRecord);
   }
@@ -380,7 +369,7 @@ export function handleProviderExhaustion({
     records,
     baseSha,
     chainTotals,
-    strategized,
+    strategized: false,
     followupIssueDraft: chainFollowupDraft,
     // Chain-start verify baseline (kusabi #173) — carried on every chain.json
     // write so chain-resume reuses the recorded baseline.

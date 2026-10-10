@@ -623,7 +623,7 @@ export async function runChainDriver({
           reviewModel, reviewModelChain,
           reworkModel, reworkModelChain, reworkBackend,
           maxRounds, brief, orchestrator, baseSha: effectiveBaseSha,
-          strategized: false, chainFollowupDraft: null,
+          chainFollowupDraft: null,
           verifyBaseline: effectiveVerifyBaseline,
         });
         writeJson(path.join(chainDir, "round-" + round + ".json"), roundRecord);
@@ -678,7 +678,7 @@ export async function runChainDriver({
           reviewModel, reviewModelChain,
           reworkModel, reworkModelChain, reworkBackend,
           maxRounds, brief, orchestrator, records, baseSha: effectiveBaseSha,
-          chainTotals: partialTotals, strategized: false, chainFollowupDraft: null,
+          chainTotals: partialTotals, chainFollowupDraft: null,
           interrupted: true,
           verifyBaseline: effectiveVerifyBaseline,
           smokeObservation: ctx.smokeObservation ?? null,

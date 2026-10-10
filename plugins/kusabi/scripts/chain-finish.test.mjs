@@ -179,7 +179,7 @@ function reviewExhaustedDispatch() {
 
 describe("provider-exhaustion chain records omit removed mission linkage", () => {
   it("handleProviderExhaustion omits missionId for both exhausted phases", () => {
-    for (const phase of ["review", "strategize"]) {
+    for (const phase of ["implement", "review"]) {
       // A stale caller option is ignored.
       const luna = handleProviderExhaustion({
         records: [],
@@ -195,11 +195,11 @@ describe("provider-exhaustion chain records omit removed mission linkage", () =>
         brief: CHAIN_BRIEF,
         orchestrator: null,
         baseSha: "abc123",
-        strategized: false,
         missionId: "mission-abc",
       });
       assert.equal("missionId" in luna.chainState, false);
       assert.equal(luna.chainState.chainId, "chain-x");
+      assert.equal(luna.chainState.strategized, false);
 
       // Plain chain: the key is absent entirely, never null/false.
       const plain = handleProviderExhaustion({
@@ -216,8 +216,8 @@ describe("provider-exhaustion chain records omit removed mission linkage", () =>
         brief: CHAIN_BRIEF,
         orchestrator: null,
         baseSha: "abc123",
-        strategized: false,
       });
+      assert.equal(plain.chainState.strategized, false);
       assert.equal("missionId" in plain.chainState, false,
         `${phase}: a plain chain omits the mission key`);
     }
@@ -611,7 +611,7 @@ describe("review-resume revalidation with an unchecked oracle (kusabi #541)", ()
   it("finishRound accepts an approving review over green deterministic gates even when change-scope collection failed", async () => {
     // Downstream boundary: a normal round where change-scope collection failed,
     // but all six deterministic P1-P6 probes passed and reviewer approves.
-    // The round must accept and never become rework or strategize.
+    // The round must accept and never become rework.
     const roundRecord = {
       round: 1,
       reworkScope: "full",
@@ -659,7 +659,6 @@ describe("review-resume revalidation with an unchecked oracle (kusabi #541)", ()
       assert.equal(result.done, true);
       assert.equal(roundRecord.disposition.disposition, "accept");
       assert.notEqual(roundRecord.disposition.disposition, "rework");
-      assert.notEqual(roundRecord.disposition.disposition, "strategize");
     } finally {
       fs.rmSync(tmp, { recursive: true, force: true });
     }

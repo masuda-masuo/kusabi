@@ -280,7 +280,7 @@ export function classifyReviewSeatReplacement(chainJson, { explicitRoute } = {})
  *     intact and only the seat was consumed, so no round-budget slot is spent
  *     (the return sits before the budget-derived guard).
  *
- * Cross-round state (reworkCount, strategized, session, baseSha) is derived
+ * Cross-round state (reworkCount, session, baseSha) is derived
  * from the record fields so the resumed run continues exactly where the
  * original left off.
  *
@@ -296,7 +296,7 @@ export function classifyReviewSeatReplacement(chainJson, { explicitRoute } = {})
  *   - `reviewSeatReplacement` — true only for the kusabi #248 escalate
  *     exception; tells the driver to archive the failed seat on the record
  *     before dispatching the replacement review
- *   - `reworkCount`, `strategized`, `session`, `baseSha`
+ *   - `reworkCount`, `session`, `baseSha`
  */
 export function resolveChainResume({ control, chainJson, explicitRoute = null }) {
   if (!control) {
@@ -341,7 +341,6 @@ export function resolveChainResume({ control, chainJson, explicitRoute = null })
     : 4;
   const records = Array.isArray(chainJson.records) ? chainJson.records : [];
   const last = records.length > 0 ? records[records.length - 1] : null;
-  const strategized = !!chainJson.strategized;
   const baseSha = chainJson.baseSha ?? null;
 
   if (!last) {
@@ -378,7 +377,6 @@ export function resolveChainResume({ control, chainJson, explicitRoute = null })
           records,
           reviewSeatReplacement: true,
           reworkCount: last.reworkCount ?? 0,
-          strategized,
           session: last.sessionID ?? undefined,
           baseSha,
         },
@@ -442,7 +440,6 @@ export function resolveChainResume({ control, chainJson, explicitRoute = null })
         records,
         // A rework consumed one rework.
         reworkCount: (last.reworkCount ?? 0) + 1,
-        strategized,
         session: last.sessionID ?? undefined,
         baseSha,
       },
@@ -470,7 +467,6 @@ export function resolveChainResume({ control, chainJson, explicitRoute = null })
       roundRecord: last,
       records,
       reworkCount: last.reworkCount ?? 0,
-      strategized,
       session: last.sessionID ?? undefined,
       baseSha,
     },

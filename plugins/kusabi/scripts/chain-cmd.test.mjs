@@ -22,7 +22,6 @@ describe("sessionProvenanceRefusal (kusabi #321)", () => {
   const AGY = "agy";
   const OPENCODE = "opencode";
   const CLAUDE = "claude";
-  const CURSOR = "cursor";
   const CODEX = "codex";
   const UUID = "123e4567-e89b-12d3-a456-426614174000";
 
@@ -56,7 +55,7 @@ describe("sessionProvenanceRefusal (kusabi #321)", () => {
     }
   });
 
-  for (const b of [CLAUDE, CURSOR, CODEX]) {
+  for (const b of [CLAUDE, CODEX]) {
     it(`passes a session the store proves ${b}-owned on a ${b} chain`, () => {
       assert.equal(sessionProvenanceRefusal({ session: UUID, provenance: b, implementBackend: b }), null);
     });

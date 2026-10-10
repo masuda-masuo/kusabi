@@ -1,7 +1,7 @@
 // chain-phases.mjs — Round lifecycle phases for cmdChain.
 //
 // Every function in this module receives cross-round state (baseSha,
-// strategized, records) as explicit arguments and returns results as
+// records) as explicit arguments and returns results as
 // explicit return values — nothing is captured from an enclosing scope.
 //
 // Quota classification and recorded-failure / explicit-route helpers
