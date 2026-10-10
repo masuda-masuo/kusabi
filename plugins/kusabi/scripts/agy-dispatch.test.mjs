@@ -338,107 +338,52 @@ describe("buildAgyArgs", () => {
 });
 
 // =========================================================================
-// the two bound sites agree (kusabi #328)
+// timeout bound sites agree with the resolver and each other (kusabi #328, #330, #697)
 // =========================================================================
 //
 // resolveBoundS, buildAgyArgs (`--print-timeout`, the INNER bound) and
 // runAgyProcess (the OUTER timer) all decide with the SAME predicate
-// (isUsableTimeoutS).  The per-function tests above pin each one alone;
-// THIS test drives both sites from the SAME input and asserts the pair
-// agrees — a value that arms one bound and not the other is the #327
-// half-arm this issue exists to ban, whether it arrives through agyDispatch
-// or by calling a site directly.  It is written to FAIL when either site's
-// guard is loosened on its own: the other site still refuses the shape, so
-// the two decisions no longer match.
-
-describe("the two timeout bound sites agree — armed together or not at all", () => {
-  let ctx;
-
-  beforeEach(() => { ctx = fakeAgyContext(); });
-  afterEach(() => { ctx.restore(); });
-
-  it("for every shape kusabi's callers can pass, BOTH bounds arm or NEITHER does", async (t) => {
-    // The shapes that motivated this issue — a string, NaN, zero, negative,
-    // Infinity, null, absent — plus the positive numbers kusabi passes
-    // today (valid positives must keep arming BOTH, and keep rendering the
-    // same --print-timeout values, so the pair agreement cannot be bought
-    // by making the inner bound refuse everything).
-    const inputs = [
-      undefined, null, "3600", "1", NaN, 0, -5, -1.5, Infinity, -Infinity,
-      600, 1800, 3600, 1, 20, 0.5,
-    ];
-    for (const timeoutS of inputs) {
-      const args = buildAgyArgs({ model: "m", promptText: "p", jsonSchema: null, timeoutS });
-      const innerArmed = args.includes("--print-timeout");
-
-      // Observe the OUTER timer's arming DECISION directly: setTimeout is
-      // swapped for a recorder that never fires, so the test needs no real
-      // timer (and none may fire — the fake agy exits on its own, and the
-      // decision, not the firing, is what must agree with the inner bound).
-      let outerTimerArmed = false;
-      const mocked = t.mock.method(globalThis, "setTimeout", () => {
-        outerTimerArmed = true;
-        return undefined; // no real handle: runAgyProcess's clearTimeout is null-guarded
-      });
-      const result = await runAgyProcess({
-        bin: ctx.binPath,
-        args: ["-p", "p"],
-        cwd: ctx.cwd,
-        timeoutS,
-      });
-      mocked.mock.restore();
-
-      assert.equal(result.spawnError, null, `timeoutS=${String(timeoutS)}: the fake agy must spawn`);
-      assert.equal(result.timedOut, false, `timeoutS=${String(timeoutS)}: no timer may fire here`);
-      assert.equal(
-        outerTimerArmed,
-        innerArmed,
-        `timeoutS=${String(timeoutS)}: --print-timeout present=${innerArmed} but outer timer ` +
-        `armed=${outerTimerArmed} — one bound armed, the other not (the #327 half-arm)`,
-      );
-    }
-  });
-});
-
-// =========================================================================
-// each bound site agrees with the RESOLVER (kusabi #330)
-// =========================================================================
+// (isUsableTimeoutS).
 //
-// The pair test above drives both sites from the same input and asserts
-// they agree WITH EACH OTHER.  Nothing there pins resolveBoundS: if
-// both sites drifted identically away from it — the #328 first round,
-// where both sites carried the same hand-copied `typeof === "number" &&
-// > 0` that accepted Infinity while the resolver's Number.isFinite refused
-// it — the pair would still agree with each other and that test would
-// stay green.  THIS test pins the resolver's decision per shape (measured
-// on the #329 tree) and asserts each site's arming decision, reached from
-// the SAME RAW value a caller passes, matches that decision exactly: a
-// site that arms where the resolver says null, or refuses where the
-// resolver resolves, is the identical-drift regression.
+// Consolidated test (kusabi #697): drives both sites and the resolver from
+// the same explicit 17-row table. For every shape kusabi's callers can pass,
+// it asserts:
+// 1. resolveBoundS matches the fixed pinned decision (pins against identical drift, #330).
+// 2. The inner bound (--print-timeout) arms if and only if the resolver resolves.
+// 3. The outer timer arms if and only if the resolver resolves.
+// 4. Both bounds arm together or neither does (the #327 half-arm ban).
+// A single subprocess run per row covers both site agreement and resolver
+// agreement without duplicating process spawns (17 runs instead of 27).
 
-describe("each bound site agrees with the resolver, on the raw input (kusabi #330)", () => {
+describe("the two timeout bound sites agree with the resolver and each other (kusabi #328, #330, #697)", () => {
   let ctx;
 
   beforeEach(() => { ctx = fakeAgyContext(); });
   afterEach(() => { ctx.restore(); });
 
-  it("for every shape, resolveBoundS resolves exactly when a direct site call arms its bound", async (t) => {
-    // [raw input, resolver output] — the resolver column is pinned to the
-    // decisions measured on the #329 tree, so a resolver drift fails at
-    // the first assert and a sites' drift fails at the site asserts, even
-    // when both sites moved together.
+  it("for every shape kusabi's callers can pass, resolver and both bound sites agree", async (t) => {
+    // [rawInput, expectedResolver] — explicit 17-row table (kusabi #697).
+    // Each positive finite numeric input has fixed expected resolver output
+    // equal to that numeric value; every other row has fixed null.
+    // Pinned to decisions measured on the #329 tree (do not generate via resolver under test).
     const cases = [
       [3600, 3600],
       [1800, 1800],
+      [600, 600],
+      [20, 20],
+      [1, 1],
+      [0.5, 0.5],
+      [1.5, 1.5],
       ["3600", null],
+      ["1", null],
       [0, null],
       [-5, null],
+      [-1.5, null],
       [NaN, null],
       [null, null],
       [undefined, null],
       [Infinity, null],
       [-Infinity, null],
-      [1.5, 1.5],
     ];
     for (const [timeoutS, expected] of cases) {
       const resolved = resolveBoundS(timeoutS);
@@ -451,36 +396,53 @@ describe("each bound site agrees with the resolver, on the raw input (kusabi #33
       const shouldArm = expected !== null;
 
       // The INNER bound, reached directly with the raw value.
-      const innerArmed = buildAgyArgs({ model: "m", promptText: "p", jsonSchema: null, timeoutS })
-        .includes("--print-timeout");
-      assert.equal(innerArmed, shouldArm,
+      const args = buildAgyArgs({ model: "m", promptText: "p", jsonSchema: null, timeoutS });
+      const innerArmed = args.includes("--print-timeout");
+      assert.equal(
+        innerArmed,
+        shouldArm,
         `timeoutS=${String(timeoutS)}: --print-timeout present=${innerArmed} but the resolver ` +
         `${resolved === null ? "refuses" : "resolves"} this shape — the inner bound drifted ` +
-        `from the resolver`);
+        `from the resolver`,
+      );
 
-      // Observe the OUTER timer's arming DECISION directly, exactly like
-      // the pair test: setTimeout is swapped for a recorder that never
-      // fires, so no real timer runs (the fake agy exits on its own, and
-      // the decision, not the firing, is what must match the resolver).
-      let outerArmed = false;
+      // Observe the OUTER timer's arming DECISION directly: setTimeout is
+      // swapped for a recorder that never fires, so the test needs no real
+      // timer (and none may fire — the fake agy exits on its own, and the
+      // decision, not the firing, is what must agree with the inner bound
+      // and resolver).
+      let outerTimerArmed = false;
       const mocked = t.mock.method(globalThis, "setTimeout", () => {
-        outerArmed = true;
+        outerTimerArmed = true;
         return undefined; // no real handle: runAgyProcess's clearTimeout is null-guarded
       });
-      const result = await runAgyProcess({
-        bin: ctx.binPath,
-        args: ["-p", "p"],
-        cwd: ctx.cwd,
-        timeoutS,
-      });
-      mocked.mock.restore();
+      let result;
+      try {
+        result = await runAgyProcess({
+          bin: ctx.binPath,
+          args: ["-p", "p"],
+          cwd: ctx.cwd,
+          timeoutS,
+        });
+      } finally {
+        mocked.mock.restore();
+      }
 
       assert.equal(result.spawnError, null, `timeoutS=${String(timeoutS)}: the fake agy must spawn`);
       assert.equal(result.timedOut, false, `timeoutS=${String(timeoutS)}: no timer may fire here`);
-      assert.equal(outerArmed, shouldArm,
-        `timeoutS=${String(timeoutS)}: outer timer armed=${outerArmed} but the resolver ` +
+      assert.equal(
+        outerTimerArmed,
+        shouldArm,
+        `timeoutS=${String(timeoutS)}: outer timer armed=${outerTimerArmed} but the resolver ` +
         `${resolved === null ? "refuses" : "resolves"} this shape — the outer bound drifted ` +
-        `from the resolver`);
+        `from the resolver`,
+      );
+      assert.equal(
+        outerTimerArmed,
+        innerArmed,
+        `timeoutS=${String(timeoutS)}: --print-timeout present=${innerArmed} but outer timer ` +
+        `armed=${outerTimerArmed} — one bound armed, the other not (the #327 half-arm)`,
+      );
     }
   });
 });
