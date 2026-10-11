@@ -1,7 +1,7 @@
 # kusabi Design Document
 
 Last updated: 2026-08-29
-Status: Design finalized + field-verified up to the phase chain, auto-chain (chain subcommand + sunaba-rpc) **implemented / reflected in main**. The phase chain (§3) now lives in `docs/design/phase-chain.md`; the §3.x numbers named below are unchanged. Decision 5 (accept-with-followup, §9.2) **implemented**. Decision 4 (strategist, §9.1) **implemented**. Fail-fast retry detection, tiered chain entries, and capacity fallback (issue #50) **implemented**. chain-stats (issue #124) **implemented**. The metrics store — ingest (§3.5.8) and query/report (§3.5.9) — **implemented**. chain-resume (§3.5.10) **implemented**. The review record (§3.5.7) and the P2 verify-gate baseline (§3.5.2) **implemented**. The claude dispatch backend (§3.5.11) **implemented** (fresh dispatch, session resume, and the metrics-DB backend columns with the report by-backend split). Per-phase backend mixing via `claude/` entry prefixes (kusabi #192, §3.5.12) **implemented** (implement and review resolve their backends independently from `models.phases.<phase>`; one phase's chain must be single-backend; round records gain `reviewBackend`). Per-round rework tiering (kusabi #192 axis 2, §3.5.13) **implemented** (`models.phases.rework` sends implement rounds after round 1 onto their own chain/backend — a strong round-1 model with cheap rework; the tier ladder climbs over the rework chain; chain.json persists `reworkModel` / `reworkModelChain` / `reworkBackend` for chain-resume). Rework scheduling by finding kind (kusabi #60 step 2, §3.5.5a) **implemented** (mechanical findings cleaned up first in free rounds; design findings one per budget round; budget derived from records, never persisted). JSONL review output (kusabi #202, §3.5.3) **implemented** (the reviewer emits one record per line as each piece is decided; the single-object path is still read; a stream without a verdict line is a `partial` review that escalates). The review-quality eval suite is documented in `evals/review/README.md`. Stages C/D remain future work (§9.3).
+Status: Design finalized + field-verified up to the phase chain, auto-chain (chain subcommand + sunaba-rpc) **implemented / reflected in main**. The phase chain (§3) now lives in `docs/design/phase-chain.md`; the §3.x numbers named below are unchanged. Decision 5 (accept-with-followup, §9.2) **implemented**. Decision 4 (strategist, §9.1) was removed in #672, #682, and #693. Fail-fast retry detection, tiered chain entries, and capacity fallback (issue #50) **implemented**. chain-stats (issue #124) **implemented**. The metrics store — ingest (§3.5.8) and query/report (§3.5.9) — **implemented**. chain-resume (§3.5.10) **implemented**. The review record (§3.5.7) and the P2 verify-gate baseline (§3.5.2) **implemented**. The claude dispatch backend (§3.5.11) **implemented** (fresh dispatch, session resume, and the metrics-DB backend columns with the report by-backend split). Per-phase backend mixing via `claude/` entry prefixes (kusabi #192, §3.5.12) **implemented** (implement and review resolve their backends independently from `models.phases.<phase>`; one phase's chain must be single-backend; round records gain `reviewBackend`). Per-round rework tiering (kusabi #192 axis 2, §3.5.13) **implemented** (`models.phases.rework` sends implement rounds after round 1 onto their own chain/backend — a strong round-1 model with cheap rework; the tier ladder climbs over the rework chain; chain.json persists `reworkModel` / `reworkModelChain` / `reworkBackend` for chain-resume). Rework scheduling by finding kind (kusabi #60 step 2, §3.5.5a) **implemented** (mechanical findings cleaned up first in free rounds; design findings one per budget round; budget derived from records, never persisted). JSONL review output (kusabi #202, §3.5.3) **implemented** (the reviewer emits one record per line as each piece is decided; the single-object path is still read; a stream without a verdict line is a `partial` review that escalates). The review-quality eval suite is documented in `evals/review/README.md`. Stages C/D remain future work (§9.3).
 
 ## 1. Purpose and positioning
 
@@ -52,7 +52,7 @@ unchanged, so a reference to §3.x still names the same section.
 
 Entries in `models.chain` and `models.phases.<phase>` may be **either a string or a non-empty array of strings**. A string is a tier with one route; an array is one tier whose entries are alternate routes of equivalent quality, in preference order.
 
-Tier selection is decoupled from the round counter. `selectRoutes` in `cli.mjs` accepts an optional `tierIndex` parameter; when provided, it is used directly (clamped to the tier count). When absent, the old `min(round - 1, tierCount - 1)` fallback applies for backward compatibility. The chain passes `tierIndex` derived from `deriveReworkStrategy`'s cumulative tier delta, so the model tier is independent of the round budget counter.
+Tier selection is decoupled from the round counter. `selectRoutes` in `cli.mjs` accepts an optional `tierIndex` parameter; when provided, it is used directly (clamped to the tier count). When absent, the old `min(round - 1, tierCount - 1)` fallback applies for backward compatibility. The chain no longer derives a tier from rework; tier escalation was removed in #683.
 
 The built-in default chain is two tiers (matching DESIGN.md §4's "free → flash → pro" capacity path), with the reasoning variant pinned to `max` on every route:
 
@@ -155,18 +155,11 @@ Container management tools (`sandbox_initialize` / `sandbox_stop`, etc.) are als
 
 ## 9. Auto-chain expansion plan (implemented stages)
 
-The following content is derived from the design agreed in the "design confirmation before starting" comment (2026-07-19) on issue #36. Decisions 4 and 5 are implemented in current main; Stages C/D remain future work.
+The following content is derived from the design agreed in the "design confirmation before starting" comment (2026-07-19) on issue #36. Decision 4 was removed in #672, #682, and #693; Decision 5 is implemented. Stages C/D remain future work.
 
-### 9.1 Decision 4: strategist stage (stall countermeasure) — **implemented**
+### 9.1 Decision 4: strategist stage (stall countermeasure) — **removed**
 
-Implemented across `plugins/kusabi/scripts/`: `deriveDisposition` in `disposition.mjs`, `renderStrategistPrompt` in `render.mjs`, the strategist dispatch (`runStrategizePhase`) in `chain-strategize.mjs` (kusabi #455), orchestrated by `runChainDriver` in `chain-driver.mjs`.
-
-- `deriveDisposition` accepts an optional `strategizeEligible` boolean, combined internally with `round < maxRounds` into `strategizeAllowed` (a strategist job on the final round has no next round to consume its output — #117). When `repeatedAreas` holds on a non-shippable round and `strategizeAllowed` is true — `needs-attention`, or `approve` with probes red — returns `{ disposition: "strategize", ... }` (needs-attention reason: "same file area flagged twice; structural re-diagnosis before next rework"). On the second stagnation (strategized=true), escalates as before.
-- `renderStrategistPrompt` is an exported pure function that builds the prompt for the strategist: acceptance criteria + findings from the last two rounds + one-structural-change instruction.
-- On `strategize` disposition, the chain dispatches ONE extra job (kind: "strategist") with agent `kusabi-investigate` and `tools: reviewDenyTools()`. Records `strategistJobId`, `strategistUsage`, and `strategistRecommendation` on the round record.
-- Sets chain-level `strategized: true` persisted in `chain.json`. The next rework round includes the recommendation under `## Strategist recommendation (structural change for this rework)` and starts a FRESH session on the existing worktree (anchoring break per `docs/design/phase-chain.md` §3.4 — the conversation is discarded, the work is not).
-- The strategist does not consume its own round number; normal round accounting applies to the rework. The max-rounds hard limit still applies unchanged.
-- `chain-show` renders the strategist round data: model/usage line and the recommendation verbatim.
+Removed in #672, #682, and #693 because the strategist stage was no longer part of the chain.
 
 ### 9.2 Decision 5: accept-with-followup (economic cutoff) — **implemented**
 
@@ -194,7 +187,7 @@ Reference: issue #36 comment "Decision 5: accept-with-followup (economic cutoff 
 | Stage | Content | Prerequisite |
 |---|---|---|
 | **B** | Brief-declaration probes: `kind: refactor` format. Migration byte identity (unnumbered — P1–P6 are taken by the implemented probes) | Stage A stable operation |
-| **B** | Decision 5 (accept-with-followup) — **done**. Decision 4 (strategist stage) — **done** | Stage A |
+| **B** | Decision 5 (accept-with-followup) — **done**. Decision 4 (strategist stage) — **removed** | Stage A |
 | **C candidate** | Patch-target audit (unscheduled): mechanically classify patch/monkeypatch.setattr targets via AST. Use only for mock-target determination; exclude system-under-test tests | File an issue only after a concrete incident or measured need |
 
 The deliverables probe (P3), the smoke probe (P4), the frozen-tests probe (P5) and the collected-count probe (P6) are now implemented; see `docs/design/phase-chain.md` §3.5.2. The `baseline_collected: N` book-keeping format this stage once envisaged is superseded: the count is captured automatically at chain start (`buildVerifyBaseline`, `collected`) and compared by P6, so no brief declares it. Migration byte identity and the patch-target audit remain design candidates, not scheduled work: file an issue only after a concrete incident or measured need supplies their acceptance evidence.

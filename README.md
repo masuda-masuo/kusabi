@@ -175,10 +175,9 @@ tiers, with the `:max` reasoning variant pinned on every route:
 Tier 0's two routes are interchangeable — the same quality, tried in order
 when one is unavailable; a non-retryable provider failure (for example an
 HTTP 401 with a structured provider status) also advances the walk to the
-next route in the same tier. That is capacity fallback, not a quality step: with
-the default ladder, rounds 1 and 2 both run on tier 0 and the second tier is
-first reached at round 3 (see "Chain round escalation"). The first route of
-the current tier is used unless overridden.
+next route in the same tier. That is capacity fallback, not a quality step.
+The round number is a budget counter; it does not drive tier escalation.
+The first route of the current tier is used unless overridden.
 
 You can customise this with a config file at `<state root>/config.json`
 (typically `~/.kusabi/config.json`, or the directory pointed to by
@@ -278,7 +277,7 @@ split (or without the field) are treated as `opencode` by readers.
   -C <cwd> -s read-only --json -m <model> -c 'model_reasoning_effort="high"'
   [`-c 'mcp_servers={}'`] -`; the prompt is supplied on stdin, never argv).
   Config entries and `--model` use `codex/<model>` to select this backend,
-  and v1 accepts exactly the seat ids `gpt-5.6-luna` and `gpt-5.6-sol` — a
+  and v1 accepts exactly the seat ids listed in `CODEX_SUPPORTED_MODELS` (`codex-dispatch.mjs`) — a
   `:variant` suffix or any other id is rejected. Every invocation runs in a
   dedicated job-owned HOME/CODEX_HOME (no inherited config/rules/sessions or
   MCP files; the minimum auth symlink to the operator's own cache is the only
@@ -439,7 +438,7 @@ a failed job whose error names the actions and the `permissions.allow` file.
 
 ### Resolution precedence (highest to lowest)
 
-1. **Explicit `--model` flag** — wins for the phases it applies to: a single `task` dispatch, a chain's round-1 implement, and every chain review. A chain's rework rounds follow the tier ladder instead (see "Chain round escalation" below).
+1. **Explicit `--model` flag** — wins for the phases it applies to: a single `task` dispatch, a chain's round-1 implement, and every chain review. A chain's rework rounds follow the configured rework resolution (see "Chain tier and rework routing").
 2. **Per-phase chain** — `models.phases.<phase>` first entry (e.g. a config with `"implement": ["m1"]` resolves to `m1` for implement-phase tasks).
 3. **Global chain** — `models.chain` first entry, or the built-in default chain when no config file exists.
 4. **Built-in default** — the first route of `BUILTIN_DEFAULT_CHAIN`, `opencode/deepseek-v4-flash-free:max`, when no config file and no flag is set.
@@ -448,32 +447,17 @@ Missing config file = silently uses the built-in defaults. A malformed config fi
 
 The full resolved chain is stored on every job record (`job.modelChain`) for use by future fallback logic (issue #50).
 
-### Chain round escalation
+### Chain tier and rework routing
 
-The round number is only the budget counter — it does **not** index into the
-model chain. Model tier and session lifecycle are separate levers, decided by
-`deriveReworkStrategy` (`docs/design/phase-chain.md` §3.5.5).
+Round-based tier escalation was removed in #683. The round number is a budget counter and does not drive tier escalation.
 
 `models.chain` is a list of **tiers**. Each tier holds interchangeable routes of
 the same quality, tried in order when one is unavailable — that is capacity
 fallback, and it does not consume a round.
 
-Default ladder, absent countervailing evidence:
-
-| Rework | Tier | Session |
-|---|---|---|
-| 1st | same | continue |
-| 2nd | +1 | new |
-| 3rd+ | +1 | new |
-
-So with a two-tier chain, rounds 1 and 2 both run on tier 0 and the second tier
-is first reached at **round 3**.
-
-**`--model` does not raise the chain.** It applies to round 1's implement phase
-only — reworks return to the ladder — and to the review phase of *every* round,
-which then stays on that model instead of tier 0. Passing a top-tier model is
-therefore a decision to pay for every review in the chain, not a way to start
-the implementer higher for the whole run.
+`--model` pins the round-1 implement model and the review model; rework rounds
+follow the rule below. When `models.phases.rework` is configured, rework uses that resolution;
+otherwise it uses the implement resolution.
 
 If a chain entry carries a `:variant` suffix (e.g. `:max`), the `variant`
 field is included in the `prompt_async` request for that round and stored

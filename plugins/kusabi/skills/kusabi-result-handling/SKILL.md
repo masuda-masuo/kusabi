@@ -24,8 +24,9 @@ user-invocable: false
 
 ## Prohibition of substituting for failure
 
+The former post-mortem continuation path was removed in #670.
+
 - If the worker's job failed or was incomplete, do not substitute it with implementation on the orchestrator's side. Report it as a failure. Recovery goes through diagnosis and re-delegation, within the bounds the `delegate` skill's Inspection section sets (reproduce the evidence first; bounded repair by the same worker or a narrow same-container job) — never through the orchestrator writing the missing work
-- The same applies to salvage results: the job is to report the analysis result; the continuation is re-delegated, not implemented by the orchestrator
 - If the companion returns a setup/authentication error, guide the user to run `kusabi-companion setup`. Do not improvise another authentication path
 
 ## Verification against reports (interface with the reviewer specification)
@@ -38,7 +39,7 @@ Before discarding work or re-dispatching after an escalation, perform a terminal
 
 1. **Read the chain state.** Run `chain-show` on the escalated chain. Note the exact disposition reason it reports — this is the authoritative cause of the escalation. Inspect the underlying implement/review job status and result, including recovered or no-final results. Check for `reviewSeatFailures` entries — they indicate review seats that died and may have left useful progress behind.
 
-2. **Inspect retained work.** Check the worktree diff (`git diff` or `git status --porcelain` against the chain base) and any checkpoint or progress artifacts. An escalated chain may retain valuable implementation progress even when review failed — this is expected and the work should not be discarded without evidence it is unsalvageable.
+2. **Inspect retained work.** Check the worktree diff (`git diff` or `git status --porcelain` against the chain base) and any checkpoint or progress artifacts. An escalated chain may retain valuable implementation progress even when review failed — this is expected and the work should not be discarded without evidence it is unrecoverable.
 
 3. **For temporary container access failures** (transient network issues, provider errors), preserve the container and inspect `sandbox_list_containers` to assess its current state. Wait/retry the access operation once as appropriate. Use a non-destructive same-container restart only when the environment permits. For stopped or removed containers, inspect durable chain/job/checkpoint artifacts before declaring work lost.
 
