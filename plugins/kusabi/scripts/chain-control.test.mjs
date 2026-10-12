@@ -326,7 +326,7 @@ describe("finalizeChainControl", () => {
     assert.equal(readChainControl(tmpDir), null);
   });
 
-  it("writes inbox under stateDir when notify is enabled", () => {
+  it("writes the local inbox without mutating kaiba agenda actions", () => {
     if (prevNotify === undefined) delete process.env.KUSABI_CHAIN_NOTIFY;
     else process.env.KUSABI_CHAIN_NOTIFY = prevNotify;
 
@@ -360,6 +360,7 @@ describe("finalizeChainControl", () => {
       "CREATE TABLE actions (id INTEGER PRIMARY KEY AUTOINCREMENT, content TEXT NOT NULL, position REAL NOT NULL, author TEXT, created_at TEXT NOT NULL, done_at TEXT)"
     );
     db.close();
+    const beforeDb = fs.readFileSync(kaibaDb);
 
     const prevDb = process.env.KAIBA_DB;
     process.env.KAIBA_DB = kaibaDb;
@@ -369,6 +370,8 @@ describe("finalizeChainControl", () => {
       if (prevDb === undefined) delete process.env.KAIBA_DB;
       else process.env.KAIBA_DB = prevDb;
     }
+
+    assert.deepEqual(fs.readFileSync(kaibaDb), beforeDb, "terminal notification does not insert an agenda/action row");
 
     const inboxPath = path.join(stateDir, "inbox", "chain-notify-wire.md");
     assert.ok(fs.existsSync(inboxPath), "inbox file should exist");

@@ -14,6 +14,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import process from "node:process";
+import { randomUUID } from "node:crypto";
 import { readJson, writeJson } from "./state-paths.mjs";
 import { notifyChainTerminal, stateDirForChain } from "./chain-notify.mjs";
 import { retireJobProgress } from "./kaiba-progress-retire.mjs";
@@ -100,9 +101,19 @@ export function dispositionOf(chainJsonOrRecords) {
  * @returns {object}
  */
 export function buildNotifyArgs(chainDir, existing, status) {
+  return buildNotifyArgsWithOptions(chainDir, existing, status);
+}
+
+function buildNotifyArgsWithOptions(chainDir, existing, status, options = {}) {
+  if (existing?.terminalNotifyArgs && typeof existing.terminalNotifyArgs === "object") {
+    return { ...existing.terminalNotifyArgs };
+  }
+
   const chainJson = readJson(path.join(chainDir, "chain.json"));
   const chainId = existing.chainId || (chainJson && chainJson.chainId) || path.basename(chainDir);
-  const disposition = dispositionOf(chainJson);
+  const disposition = Object.hasOwn(options, "disposition")
+    ? options.disposition
+    : dispositionOf(chainJson);
   const container = existing.container || chainJson?.container || null;
   const cwdLabel = briefTitle(chainJson?.brief);
   return {
@@ -175,49 +186,87 @@ export function createChainControl({ chainId, container, pid }) {
  * @returns {{ chainId: string, wasRunning: boolean, wasStale: boolean }}
  */
 export function requestChainStop(chainDir, requestedBy) {
-  const existing = readChainControl(chainDir);
-  if (!existing) {
+  const observed = readChainControl(chainDir);
+  if (!observed) {
     throw new Error(`no control record found for chain in ${chainDir}`);
   }
 
-  const wasRunning = existing.status === "running";
+  const outcome = withControlWriteLock(chainDir, () => {
+    const latest = readChainControl(chainDir);
+    if (!latest) {
+      throw new Error(`no control record found for chain in ${chainDir}`);
+    }
+    if (runMarker(latest) !== runMarker(observed)) {
+      return { superseded: true, control: latest };
+    }
 
-  // Check liveness of the chain process
-  if (wasRunning && existing.pid != null) {
-    const alive = isPidAlive(existing.pid);
-    if (!alive) {
-      // The chain process is gone — finalise the status.
-      // This is the exception to the single-writer rule.
-      writeChainControl(chainDir, {
-        ...existing,
-        status: "cancelled",
+    // Another stop from this run may have completed while this caller waited.
+    // Reuse its durable result without replacing its lifecycle fields.
+    if (latest.status !== "running") {
+      if (latest.status === "cancelled" && observed.status === "running") {
+        const claim = readOrCreateTerminalOccurrenceClaim(chainDir, latest, "cancelled");
+        const control = {
+          ...latest,
+          terminalOccurrenceId: claim.terminalOccurrenceId,
+          terminalNotifyArgs: claim.terminalNotifyArgs,
+          finishedAt: claim.finishedAt,
+        };
+        notifyAndRetireTerminalRun(chainDir, control, "cancelled");
+        return { control, wasStale: true };
+      }
+      const control = {
+        ...latest,
+        stopRequestedAt: new Date().toISOString(),
+        stopRequestedBy: requestedBy,
+      };
+      writeChainControl(chainDir, control);
+      return { control, wasRunning: false, wasStale: false };
+    }
+
+    const wasRunning = latest.status === "running";
+    if (wasRunning && latest.pid != null && !isPidAlive(latest.pid)) {
+      const notifyOptions = latest.resumedAt ? { disposition: null } : {};
+      const control = persistTerminalControlLocked(chainDir, latest, "cancelled", {
         stopRequestedBy: requestedBy,
         stopRequestedAt: new Date().toISOString(),
-        finishedAt: new Date().toISOString(),
-      });
-      // Host-side terminal notification for stale-chain cancellation
-      try {
-        notifyChainTerminal(buildNotifyArgs(chainDir, existing, "cancelled"));
-      } catch {
-        // Best-effort — never fail the chain for notify errors
-      }
-      // Job-scoped kaiba progress retirement (kusabi #497): the stale-pid stop
-      // is an authoritative terminal boundary for every job the chain ever
-      // dispatched. Best-effort and idempotent - never throws, never changes
-      // the cancelled disposition.
-      sweepChainJobRetirement(chainDir);
-      return { chainId: existing.chainId, wasRunning: false, wasStale: true };
+      }, notifyOptions);
+      notifyAndRetireTerminalRun(chainDir, control, "cancelled");
+      return { control, wasStale: true };
     }
-  }
 
-  // Write the stop request (only the stop-request fields are new).
-  writeChainControl(chainDir, {
-    ...existing,
-    stopRequestedAt: new Date().toISOString(),
-    stopRequestedBy: requestedBy,
+    const control = {
+      ...latest,
+      stopRequestedAt: new Date().toISOString(),
+      stopRequestedBy: requestedBy,
+    };
+    writeChainControl(chainDir, control);
+    return { control, wasRunning, wasStale: false };
   });
 
-  return { chainId: existing.chainId, wasRunning, wasStale: false };
+  if (outcome.superseded) {
+    return {
+      chainId: outcome.control.chainId,
+      wasRunning: false,
+      wasStale: false,
+      superseded: true,
+    };
+  }
+
+  if (outcome.wasStale) {
+    const control = outcome.control;
+    return {
+      chainId: control.chainId,
+      wasRunning: false,
+      wasStale: true,
+      terminalOccurrenceId: control.terminalOccurrenceId,
+      terminalNotifyArgs: { ...control.terminalNotifyArgs },
+    };
+  }
+  return {
+    chainId: outcome.control.chainId,
+    wasRunning: outcome.wasRunning,
+    wasStale: false,
+  };
 }
 
 /**
@@ -292,11 +341,12 @@ export function shouldStopNow({ chainDir, signalReceived = false }) {
  * @param {number} opts.round
  */
 export function updateChainControlRound({ chainDir, round }) {
-  const existing = readChainControl(chainDir);
-  if (!existing) return;
-  writeChainControl(chainDir, {
-    ...existing,
-    round,
+  const observed = readChainControl(chainDir);
+  if (!observed) return;
+  withControlWriteLock(chainDir, () => {
+    const latest = readChainControl(chainDir);
+    if (!latest || runMarker(latest) !== runMarker(observed)) return;
+    writeChainControl(chainDir, { ...latest, round });
   });
 }
 
@@ -317,22 +367,35 @@ export function updateChainControlRound({ chainDir, round }) {
  * @returns {object} The new control record.
  */
 export function rearmChainControl({ chainDir, round }) {
-  const existing = readChainControl(chainDir);
-  if (!existing) {
-    throw new Error(`no control record found for chain in ${chainDir}`);
-  }
-  const next = {
-    ...existing,
-    status: "running",
-    pid: process.pid,
-    round,
-    stopRequestedAt: undefined,
-    stopRequestedBy: undefined,
-    finishedAt: undefined,
-    resumedAt: new Date().toISOString(),
-  };
-  writeChainControl(chainDir, next);
-  return next;
+  return withControlWriteLock(chainDir, () => {
+    const existing = readChainControl(chainDir);
+    if (!existing) {
+      throw new Error(`no control record found for chain in ${chainDir}`);
+    }
+    const priorClaimPath = terminalOccurrenceClaimPath(chainDir, existing);
+    const next = {
+      ...existing,
+      status: "running",
+      pid: process.pid,
+      round,
+      stopRequestedAt: undefined,
+      stopRequestedBy: undefined,
+      finishedAt: undefined,
+      terminalOccurrenceId: undefined,
+      terminalNotifyArgs: undefined,
+      terminalRunId: randomUUID(),
+      resumedAt: new Date().toISOString(),
+    };
+    writeChainControl(chainDir, next);
+    // A crash before cleanup leaves only harmless prior-run claim data: the
+    // new terminalRunId selects a different claim path for the next occurrence.
+    try {
+      fs.unlinkSync(priorClaimPath);
+    } catch {
+      // Cleanup is best-effort after the rearm has become durable.
+    }
+    return next;
+  });
 }
 
 /**
@@ -345,28 +408,211 @@ export function rearmChainControl({ chainDir, round }) {
  * @param {number} opts.round  — current round at exit time
  */
 export function finalizeChainControl({ chainDir, status, round }) {
-  const existing = readChainControl(chainDir);
-  if (!existing) return;
-  writeChainControl(chainDir, {
-    ...existing,
-    status,
-    round,
-    finishedAt: new Date().toISOString(),
-  });
-
-  // Host-side terminal notification: inbox file + best-effort kaiba agenda.
-  // Fail-soft — notify errors must never prevent the chain from finalising.
-  if (["completed", "cancelled", "failed"].includes(status)) {
-    try {
-      notifyChainTerminal(buildNotifyArgs(chainDir, existing, status));
-    } catch {
-      // Best-effort — never fail the chain for notify errors
+  const observed = readChainControl(chainDir);
+  if (!observed) return;
+  const isTerminal = ["completed", "cancelled", "failed"].includes(status);
+  const outcome = withControlWriteLock(chainDir, () => {
+    const latest = readChainControl(chainDir);
+    if (!latest || runMarker(latest) !== runMarker(observed)) return { superseded: true };
+    if (isTerminal) {
+      const control = persistTerminalControlLocked(chainDir, latest, status, { round });
+      notifyAndRetireTerminalRun(chainDir, control, status);
+      return { control };
     }
-    // Job-scoped kaiba progress retirement (kusabi #497): chain finalization
-    // is an authoritative terminal boundary for every job the chain
-    // dispatched. Best-effort and idempotent — never throws, never changes
-    // the control record or chain.json.
-    sweepChainJobRetirement(chainDir);
+    const control = { ...latest, status, round, finishedAt: new Date().toISOString() };
+    writeChainControl(chainDir, control);
+    return { control };
+  });
+  if (outcome.superseded) return;
+}
+
+function notifyAndRetireTerminalRun(chainDir, control, status) {
+  // Keep terminal side effects inside the control-write lock so rearm cannot
+  // make this run stale between its durable finalization and notification.
+  try {
+    notifyChainTerminal(buildNotifyArgs(chainDir, control, status));
+  } catch {
+    // Best-effort — never fail the chain for notify errors
+  }
+  // Job-scoped kaiba progress retirement is authoritative for this run only.
+  sweepChainJobRetirement(chainDir);
+}
+
+function persistTerminalControlLocked(chainDir, latest, status, updates = {}, notifyOptions = {}) {
+  const claim = readOrCreateTerminalOccurrenceClaim(chainDir, latest, status, notifyOptions);
+  const control = {
+    ...latest,
+    ...updates,
+    status,
+    finishedAt: claim.finishedAt,
+    terminalOccurrenceId: claim.terminalOccurrenceId,
+    terminalNotifyArgs: claim.terminalNotifyArgs,
+  };
+  writeChainControl(chainDir, control);
+  return control;
+}
+
+function runMarker(control) {
+  return control.terminalRunId || control.resumedAt || control.startedAt || "initial";
+}
+
+const CONTROL_LOCK_TIMEOUT_MS = 10_000;
+const CONTROL_LOCK_ORPHAN_GRACE_MS = 30_000;
+
+function withControlWriteLock(chainDir, fn) {
+  const lockDir = path.join(chainDir, ".control-write.lock");
+  const token = randomUUID();
+  const deadline = Date.now() + CONTROL_LOCK_TIMEOUT_MS;
+  const pause = new Int32Array(new SharedArrayBuffer(4));
+  let acquired = false;
+
+  while (!acquired) {
+    try {
+      fs.mkdirSync(lockDir);
+      fs.writeFileSync(path.join(lockDir, "owner.json"), JSON.stringify({
+        pid: process.pid,
+        token,
+      }), { flag: "wx" });
+      acquired = true;
+      break;
+    } catch (error) {
+      if (error?.code !== "EEXIST") {
+        try {
+          fs.rmSync(lockDir, { recursive: true, force: true });
+        } catch {
+          // If cleanup fails, the orphan grace period lets another caller recover it.
+        }
+        throw error;
+      }
+      reclaimDeadControlLock(lockDir);
+      if (Date.now() >= deadline) {
+        throw new Error(`timed out waiting for chain control lock in ${chainDir}`);
+      }
+      Atomics.wait(pause, 0, 0, 10);
+    }
+  }
+
+  try {
+    return fn();
+  } finally {
+    try {
+      const ownerPath = path.join(lockDir, "owner.json");
+      const owner = JSON.parse(fs.readFileSync(ownerPath, "utf8"));
+      if (owner.token === token) fs.rmSync(lockDir, { recursive: true, force: true });
+    } catch {
+      // The lock may have been reclaimed after an owner crash.
+    }
+  }
+}
+
+function reclaimDeadControlLock(lockDir) {
+  let owner;
+  try {
+    owner = JSON.parse(fs.readFileSync(path.join(lockDir, "owner.json"), "utf8"));
+  } catch {
+    try {
+      if (Date.now() - fs.statSync(lockDir).mtimeMs < CONTROL_LOCK_ORPHAN_GRACE_MS) return;
+    } catch {
+      return;
+    }
+  }
+  if (owner) {
+    try {
+      process.kill(owner.pid, 0);
+      return;
+    } catch (error) {
+      if (error?.code !== "ESRCH") return;
+    }
+  }
+  const abandonedPath = lockDir + ".abandoned-" + randomUUID();
+  try {
+    fs.renameSync(lockDir, abandonedPath);
+    fs.rmSync(abandonedPath, { recursive: true, force: true });
+  } catch {
+    // Another contender removed or replaced the stale directory.
+  }
+}
+
+/**
+ * Resolve a durable terminal claim path scoped to one chain run. The
+ * terminalRunId changes on rearm, so stale prior-run claims cannot be reused.
+ *
+ * @param {string} chainDir
+ * @param {object} control
+ * @returns {string}
+ */
+function terminalOccurrenceClaimPath(chainDir, control) {
+  const runKey = Buffer.from(runMarker(control)).toString("hex");
+  return path.join(chainDir, ".terminal-occurrence-" + runKey + ".claim");
+}
+
+/**
+ * Atomically publish one immutable event claim. The complete candidate is
+ * written to a same-directory temp file before linkSync publishes it at the
+ * unique claim path. linkSync chooses one winner; losers read that complete
+ * record. This durable record is not a lock: after a crash, another caller can
+ * reuse it and finish control persistence.
+ *
+ * @param {string} chainDir
+ * @param {object} existing
+ * @param {string} status
+ * @returns {{terminalOccurrenceId:string, terminalNotifyArgs:object, finishedAt:string}}
+ */
+function readOrCreateTerminalOccurrenceClaim(chainDir, existing, status, notifyOptions = {}) {
+  const claimPath = terminalOccurrenceClaimPath(chainDir, existing);
+  const persistedId =
+    typeof existing.terminalOccurrenceId === "string" && existing.terminalOccurrenceId.length > 0
+      ? existing.terminalOccurrenceId
+      : null;
+  const persistedArgs =
+    existing.terminalNotifyArgs &&
+    typeof existing.terminalNotifyArgs === "object" &&
+    !Array.isArray(existing.terminalNotifyArgs)
+      ? existing.terminalNotifyArgs
+      : null;
+  const candidate = {
+    terminalOccurrenceId: persistedId || randomUUID(),
+    terminalNotifyArgs: persistedId && persistedArgs
+      ? { ...persistedArgs, occurrenceId: persistedId }
+      : {
+          ...buildNotifyArgsWithOptions(chainDir, existing, status, notifyOptions),
+          occurrenceId: persistedId || undefined,
+        },
+    finishedAt: existing.finishedAt || new Date().toISOString(),
+  };
+  if (!candidate.terminalNotifyArgs.occurrenceId) {
+    candidate.terminalNotifyArgs.occurrenceId = candidate.terminalOccurrenceId;
+  }
+
+  const tmpPath = path.join(
+    chainDir,
+    ".terminal-occurrence-" + process.pid + "-" + randomUUID() + ".tmp",
+  );
+  try {
+    fs.writeFileSync(tmpPath, JSON.stringify(candidate) + "\n", { flag: "wx" });
+    try {
+      fs.linkSync(tmpPath, claimPath);
+      return candidate;
+    } catch (err) {
+      if (err?.code !== "EEXIST") throw err;
+      const winner = JSON.parse(fs.readFileSync(claimPath, "utf8"));
+      if (
+        typeof winner.terminalOccurrenceId !== "string" ||
+        !winner.terminalOccurrenceId ||
+        !winner.terminalNotifyArgs ||
+        winner.terminalNotifyArgs.occurrenceId !== winner.terminalOccurrenceId ||
+        typeof winner.finishedAt !== "string"
+      ) {
+        throw new Error("invalid terminal occurrence claim in " + chainDir);
+      }
+      return winner;
+    }
+  } finally {
+    try {
+      fs.unlinkSync(tmpPath);
+    } catch {
+      // Best-effort temp cleanup; the claim is already durable if published.
+    }
   }
 }
 

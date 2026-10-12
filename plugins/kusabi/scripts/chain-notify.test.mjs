@@ -1,9 +1,6 @@
-// chain-notify.test.mjs — tests for host-side terminal notification.
-//
-// Frozen baseline at beaaf95: 2975 collected tests, all pass.
-// New tests must raise collected count.
+// chain-notify.test.mjs — local terminal inbox behavior and MCP boundary smoke tests.
 
-import { describe, it, beforeEach, afterEach } from "node:test";
+import { describe, it, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
@@ -12,315 +9,302 @@ import { DatabaseSync } from "node:sqlite";
 
 import {
   notifyChainTerminal,
-  resolveKaibaDbPath,
   stateDirForChain,
   chainIdFromDir,
 } from "./chain-notify.mjs";
 
-/** Create a temporary directory for tests. */
+const tempDirs = new Set();
 function makeTmpDir() {
-  return fs.mkdtempSync(path.join(os.tmpdir(), "chain-notify-test-"));
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "chain-notify-test-"));
+  tempDirs.add(dir);
+  return dir;
 }
-
-/**
- * Create a kaiba-compatible actions table in a temp DB.
- * Returns the path to the DB file.
- */
-function createKaibaDb(dir) {
-  const dbPath = path.join(dir, "kaiba.db");
-  const db = new DatabaseSync(dbPath, { open: true, write: true });
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS actions (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      content TEXT NOT NULL,
-      position REAL NOT NULL,
-      author TEXT NOT NULL DEFAULT 'kusabi',
-      created_at TEXT NOT NULL,
-      done_at TEXT
-    );
-  `);
-  db.close();
-  return dbPath;
-}
-
-/**
- * Read all open rows (done_at IS NULL) from the actions table.
- */
-function readOpenActions(dbPath) {
-  const db = new DatabaseSync(dbPath, { open: true, readOnly: true });
-  const rows = db.prepare("SELECT * FROM actions WHERE done_at IS NULL").all();
-  db.close();
-  return rows;
-}
-
-// ---------------------------------------------------------------------------
-// resolveKaibaDbPath
-// ---------------------------------------------------------------------------
-describe("resolveKaibaDbPath", () => {
-  it("returns KAIBA_DB env var when set", () => {
-    const result = resolveKaibaDbPath({ KAIBA_DB: "/tmp/test.db" });
-    assert.equal(result, "/tmp/test.db");
-  });
-
-  it("returns default ~/.kaiba/kaiba.db when KAIBA_DB is not set", () => {
-    const result = resolveKaibaDbPath({});
-    assert.ok(result.endsWith(path.join(".kaiba", "kaiba.db")));
-  });
-
-  it("trims whitespace from KAIBA_DB", () => {
-    const result = resolveKaibaDbPath({ KAIBA_DB: "  /tmp/test.db  " });
-    assert.equal(result, "/tmp/test.db");
-  });
-
-  it("falls back to default when KAIBA_DB is empty string", () => {
-    const result = resolveKaibaDbPath({ KAIBA_DB: "" });
-    assert.ok(result.endsWith(path.join(".kaiba", "kaiba.db")));
-  });
+afterEach(() => {
+  for (const dir of tempDirs) fs.rmSync(dir, { recursive: true, force: true });
+  tempDirs.clear();
 });
 
-// ---------------------------------------------------------------------------
-// stateDirForChain / chainIdFromDir
-// ---------------------------------------------------------------------------
-describe("stateDirForChain", () => {
-  it("derives stateDir from chainDir", () => {
-    const chainDir = "/home/user/.kusabi/abc123/chains/chain-mywork";
-    assert.equal(stateDirForChain(chainDir), "/home/user/.kusabi/abc123");
-  });
-});
+const fixtureSource = String.raw`
+import fs from "node:fs";
+import { createInterface } from "node:readline";
+const [logPath, mode] = process.argv.slice(2);
+const send = (message) => process.stdout.write(JSON.stringify(message) + "\n");
+for await (const line of createInterface({ input: process.stdin })) {
+  const request = JSON.parse(line);
+  fs.appendFileSync(logPath, JSON.stringify(request) + "\n");
+  if (request.method === "initialize") send({ jsonrpc: "2.0", id: request.id, result: { protocolVersion: "2025-03-26", capabilities: {}, serverInfo: { name: "fixture", version: "1" } } });
+  if (request.method === "tools/list") {
+    if (mode === "missing-tool") {
+      send({ jsonrpc: "2.0", id: request.id, result: { tools: [] } });
+      continue;
+    }
+    const metadataSchema = mode === "optional-null-metadata"
+      ? { anyOf: [{ type: "object" }, { type: "null" }] }
+      : { type: "object" };
+    const required = ["event_key", "event_type", "subject", "title"];
+    if (mode === "required-unknown-field") required.push("unknown_argument");
+    send({ jsonrpc: "2.0", id: request.id, result: { tools: [{
+      name: "inbox_append",
+      inputSchema: {
+        type: "object",
+        properties: {
+          event_key: { type: "string" },
+          event_type: { type: "string" },
+          subject: { type: "string" },
+          title: { type: "string" },
+          metadata: metadataSchema
+        },
+        required
+      }
+    }] } });
+  }
+  if (request.method === "tools/call") send({ jsonrpc: "2.0", id: request.id, result: { structuredContent: { entry: { id: "entry-1" }, duplicate: false } } });
+}
+`;
 
-describe("chainIdFromDir", () => {
-  it("extracts chain id from directory name", () => {
-    assert.equal(chainIdFromDir("/some/path/chain-mywork"), "chain-mywork");
-  });
-});
+function makeMcpFixture(dir, mode = "standard") {
+  const serverPath = path.join(dir, "server.mjs");
+  const logPath = path.join(dir, "requests.jsonl");
+  const configPath = path.join(dir, "config.jsonc");
+  fs.writeFileSync(serverPath, fixtureSource);
+  fs.writeFileSync(configPath, JSON.stringify({ mcp: { kaiba: {
+    type: "local",
+    command: [process.execPath, serverPath, logPath, mode],
+    environment: {},
+    enabled: true,
+  } } }));
+  return { serverPath, logPath, configPath };
+}
 
-// ---------------------------------------------------------------------------
-// notifyChainTerminal — core behavior
-// ---------------------------------------------------------------------------
-describe("notifyChainTerminal", () => {
-  let tmpDir;
-  let stateDir;
-  let chainDir;
-  let kaibaDbPath;
-
-  beforeEach(() => {
-    tmpDir = makeTmpDir();
-    stateDir = path.join(tmpDir, "state");
-    chainDir = path.join(stateDir, "chains", "chain-test-abc");
-    fs.mkdirSync(chainDir, { recursive: true });
-    kaibaDbPath = createKaibaDb(tmpDir);
-  });
-
-  afterEach(() => {
-    fs.rmSync(tmpDir, { recursive: true, force: true });
-  });
-
-  it("creates inbox file and exactly one open agenda row", () => {
-    const result = notifyChainTerminal({
-      stateDir,
-      chainId: "chain-test-abc",
-      status: "completed",
-      disposition: "accept",
-      container: "abc123def456",
-      cwdLabel: "my-repo",
-      env: { KAIBA_DB: kaibaDbPath },
-      now: "2026-09-05T12:00:00Z",
-    });
-
-    // Inbox file created
-    assert.ok(result.inboxPath);
-    assert.ok(fs.existsSync(result.inboxPath));
-    const content = fs.readFileSync(result.inboxPath, "utf8");
-    assert.ok(content.includes("chain-test-abc"));
-    assert.ok(content.includes("completed"));
-    assert.ok(content.includes("accept"));
-    assert.ok(content.includes("abc123def456"));
-
-    // Exactly one open agenda row
-    const rows = readOpenActions(kaibaDbPath);
-    assert.equal(rows.length, 1);
-    assert.ok(rows[0].content.includes("chain-test-abc"));
-    assert.ok(rows[0].content.includes("status=completed"));
-    assert.ok(rows[0].content.includes("disposition=accept"));
-    assert.ok(rows[0].content.includes("container=abc123def456"));
-    assert.ok(rows[0].content.includes("my-repo"));
-    assert.equal(rows[0].author, "kusabi");
-    assert.equal(rows[0].position, 1.0);
-    assert.equal(rows[0].done_at, null);
-    assert.equal(result.agendaInserted, true);
+describe("chain notifier local behavior", () => {
+  it("derives stateDir from a chain directory", () => {
+    assert.equal(stateDirForChain("/home/user/.kusabi/abc/chains/chain-x"), "/home/user/.kusabi/abc");
   });
 
-  it("second notify for same chainId does not create a second open agenda row", () => {
-    notifyChainTerminal({
-      stateDir,
-      chainId: "chain-test-abc",
-      status: "completed",
-      disposition: "accept",
-      container: "abc123def456",
-      cwdLabel: "my-repo",
-      env: { KAIBA_DB: kaibaDbPath },
-      now: "2026-09-05T12:00:00Z",
-    });
-
-    // Second call — inbox is overwritten, agenda is deduped
-    const second = notifyChainTerminal({
-      stateDir,
-      chainId: "chain-test-abc",
-      status: "completed",
-      disposition: "accept",
-      container: "abc123def456",
-      cwdLabel: "my-repo",
-      env: { KAIBA_DB: kaibaDbPath },
-      now: "2026-09-05T12:01:00Z",
-    });
-    assert.equal(second.agendaInserted, false);
-    const rows = readOpenActions(kaibaDbPath);
-    assert.equal(rows.length, 1, "dedup should prevent a second agenda row");
+  it("extracts the chain ID from its directory name", () => {
+    assert.equal(chainIdFromDir("/some/path/chain-x"), "chain-x");
   });
 
-  it("absent kaiba db still writes inbox and does not throw", () => {
-    const fakeDbPath = path.join(tmpDir, "nonexistent", "kaiba.db");
+  it("writes a durable local inbox and emits a structured terminal event", () => {
+    const dir = makeTmpDir();
+    const fixture = makeMcpFixture(dir);
+    const stateDir = path.join(dir, "state");
+    const dbPath = path.join(dir, "kaiba.db");
+    const db = new DatabaseSync(dbPath);
+    db.exec("CREATE TABLE actions (id INTEGER PRIMARY KEY, content TEXT NOT NULL)");
+    db.prepare("INSERT INTO actions VALUES (1, 'human row')").run();
+    db.close();
+    const beforeDb = fs.readFileSync(dbPath);
 
     const result = notifyChainTerminal({
       stateDir,
-      chainId: "chain-test-abc",
+      chainId: "chain-test",
+      status: "completed",
+      disposition: "accept",
+      container: "container-1",
+      cwdLabel: "repo",
+      occurrenceId: "occ-1",
+      mcpConfigFile: fixture.configPath,
+      env: { KAIBA_DB: dbPath },
+    });
+
+    assert.equal(result.inboxDelivered, true);
+    assert.equal(result.duplicate, false);
+    assert.equal(result.inboxPath, path.join(stateDir, "inbox", "chain-test.md"));
+    const body = fs.readFileSync(result.inboxPath, "utf8");
+    assert.match(body, /chain-test/);
+    assert.match(body, /completed/);
+    assert.match(body, /accept/);
+    assert.ok(body.includes("Run `kusabi-companion chain-show chain-test`"));
+    assert.doesNotMatch(body, /\$\{chainId\}/);
+    assert.deepEqual(fs.readFileSync(dbPath), beforeDb, "notifier leaves kaiba actions database unchanged");
+
+    const requests = fs.readFileSync(fixture.logPath, "utf8").trim().split("\n").map(JSON.parse);
+    assert.deepEqual(requests.map((request) => request.method), [
+      "initialize", "notifications/initialized", "tools/list", "tools/call",
+    ]);
+    assert.deepEqual(requests.at(-1).params.arguments, {
+      event_key: "chain-terminal:chain-test:occ-1",
+      event_type: "chain_terminal",
+      subject: "chain-test",
+      title: "repo",
+      metadata: {
+        status: "completed",
+        disposition: "accept",
+        container: "container-1",
+        inbox_path: path.resolve(result.inboxPath),
+        cwd_label: "repo",
+      },
+    });
+  });
+
+  it("keeps the local inbox file idempotent for repeated notification of one chain", () => {
+    const dir = makeTmpDir();
+    const fixture = makeMcpFixture(dir);
+    const options = {
+      stateDir: dir,
+      chainId: "chain-idempotent",
+      status: "completed",
+      disposition: "accept",
+      container: "container-1",
+      cwdLabel: "repo",
+      occurrenceId: "occ-1",
+      mcpConfigFile: fixture.configPath,
+    };
+
+    const first = notifyChainTerminal(options);
+    const firstBody = fs.readFileSync(first.inboxPath, "utf8");
+    const second = notifyChainTerminal(options);
+
+    assert.equal(first.inboxPath, second.inboxPath);
+    assert.equal(fs.readFileSync(second.inboxPath, "utf8"), firstBody);
+    assert.equal(fs.readdirSync(path.join(dir, "inbox")).filter((name) => name.endsWith(".md")).length, 1);
+  });
+
+  it("maps omitted disposition, container, and cwd label to the established nullable metadata fields", () => {
+    const dir = makeTmpDir();
+    const fixture = makeMcpFixture(dir);
+    const result = notifyChainTerminal({
+      stateDir: dir,
+      chainId: "chain-null-metadata",
+      status: "failed",
+      occurrenceId: "occ-1",
+      mcpConfigFile: fixture.configPath,
+    });
+    const args = JSON.parse(fs.readFileSync(fixture.logPath, "utf8").trim().split("\n").at(-1)).params.arguments;
+
+    assert.equal(result.inboxDelivered, true);
+    assert.equal(args.title, "chain-null-metadata");
+    assert.deepEqual(args.metadata, {
       status: "failed",
       disposition: null,
       container: null,
-      cwdLabel: "",
-      env: { KAIBA_DB: fakeDbPath },
-      now: "2026-09-05T12:00:00Z",
+      inbox_path: path.resolve(result.inboxPath),
+      cwd_label: "",
     });
-
-    // Inbox file should still be created
-    assert.ok(result.inboxPath);
-    assert.ok(fs.existsSync(result.inboxPath));
-    const content = fs.readFileSync(result.inboxPath, "utf8");
-    assert.ok(content.includes("chain-test-abc"));
-    assert.ok(content.includes("failed"));
-    assert.equal(result.agendaInserted, false);
   });
 
-  it("KUSABI_CHAIN_NOTIFY=0 skips inbox and agenda", () => {
+  for (const [label, contents] of [
+    ["absent", null],
+    ["empty", ""],
+    ["whitespace-only", "   "],
+  ]) {
+    it(`fails soft for an ${label} operator MCP config while retaining the local inbox file`, () => {
+      const dir = makeTmpDir();
+      const fixture = makeMcpFixture(dir);
+      if (contents === null) fs.rmSync(fixture.configPath);
+      else fs.writeFileSync(fixture.configPath, contents);
+      const result = notifyChainTerminal({
+        stateDir: dir,
+        chainId: `chain-config-${label}`,
+        status: "cancelled",
+        occurrenceId: "occ-1",
+        mcpConfigFile: fixture.configPath,
+      });
+
+      assert.equal(result.inboxDelivered, false);
+      assert.equal(fs.existsSync(result.inboxPath), true);
+      assert.equal(fs.existsSync(fixture.logPath), false);
+    });
+  }
+
+  it("accepts kaiba's optional nullable metadata schema and sends a metadata object", () => {
+    const dir = makeTmpDir();
+    const fixture = makeMcpFixture(dir, "optional-null-metadata");
     const result = notifyChainTerminal({
-      stateDir,
-      chainId: "chain-test-abc",
+      stateDir: dir,
+      chainId: "chain-optional-metadata",
       status: "completed",
-      disposition: "accept",
-      container: "abc123def456",
-      cwdLabel: "my-repo",
-      env: { KAIBA_DB: kaibaDbPath, KUSABI_CHAIN_NOTIFY: "0" },
-      now: "2026-09-05T12:00:00Z",
+      occurrenceId: "occ-1",
+      mcpConfigFile: fixture.configPath,
     });
+    const call = fs.readFileSync(fixture.logPath, "utf8").trim().split("\n").map(JSON.parse)
+      .find((request) => request.method === "tools/call");
 
-    assert.deepEqual(result, { skipped: true });
-
-    // No inbox file
-    const inboxDir = path.join(stateDir, "inbox");
-    assert.ok(!fs.existsSync(inboxDir));
-
-    // No agenda row
-    const rows = readOpenActions(kaibaDbPath);
-    assert.equal(rows.length, 0);
+    assert.equal(result.inboxDelivered, true);
+    assert.equal(typeof call.params.arguments.metadata, "object");
+    assert.equal(Array.isArray(call.params.arguments.metadata), false);
   });
 
-  it("kaiba db without actions table still writes inbox and does not throw", () => {
-    // Create a DB without the actions table
-    const noActionsDbPath = path.join(tmpDir, "no-actions.db");
-    const db = new DatabaseSync(noActionsDbPath, { open: true, write: true });
-    db.exec("CREATE TABLE IF NOT EXISTS other_table (id INTEGER PRIMARY KEY)");
-    db.close();
-
+  it("rejects an inbox schema with an unknown required argument", () => {
+    const dir = makeTmpDir();
+    const fixture = makeMcpFixture(dir, "required-unknown-field");
     const result = notifyChainTerminal({
-      stateDir,
-      chainId: "chain-test-abc",
+      stateDir: dir,
+      chainId: "chain-incompatible-schema",
+      status: "completed",
+      occurrenceId: "occ-1",
+      mcpConfigFile: fixture.configPath,
+    });
+    const requests = fs.readFileSync(fixture.logPath, "utf8").trim().split("\n").map(JSON.parse);
+
+    assert.equal(result.inboxDelivered, false);
+    assert.equal(requests.some((request) => request.method === "tools/call"), false);
+  });
+
+  it("fails soft when inbox_append is missing from the configured API", () => {
+    const dir = makeTmpDir();
+    const fixture = makeMcpFixture(dir, "missing-tool");
+    const result = notifyChainTerminal({
+      stateDir: dir,
+      chainId: "chain-missing-api",
+      status: "completed",
+      occurrenceId: "occ-1",
+      mcpConfigFile: fixture.configPath,
+    });
+    const requests = fs.readFileSync(fixture.logPath, "utf8").trim().split("\n").map(JSON.parse);
+
+    assert.equal(result.inboxDelivered, false);
+    assert.equal(fs.existsSync(result.inboxPath), true);
+    assert.equal(requests.some((request) => request.method === "tools/call"), false);
+  });
+
+  it("missing occurrence IDs retain the local file without calling the API", () => {
+    const dir = makeTmpDir();
+    const fixture = makeMcpFixture(dir);
+    const result = notifyChainTerminal({
+      stateDir: dir,
+      chainId: "chain-no-occurrence",
+      status: "failed",
+      mcpConfigFile: fixture.configPath,
+    });
+    assert.equal(result.inboxDelivered, false);
+    assert.equal(fs.existsSync(result.inboxPath), true);
+    assert.equal(fs.existsSync(fixture.logPath), false);
+  });
+
+  it("fails soft when the configured inbox server is unavailable", () => {
+    const dir = makeTmpDir();
+    const configPath = path.join(dir, "config.jsonc");
+    fs.writeFileSync(configPath, JSON.stringify({ mcp: { kaiba: {
+      type: "local",
+      command: [path.join(dir, "missing-server")],
+      enabled: true,
+    } } }));
+    const result = notifyChainTerminal({
+      stateDir: dir,
+      chainId: "chain-offline",
       status: "cancelled",
-      disposition: null,
-      container: "xyz",
-      cwdLabel: "some-repo",
-      env: { KAIBA_DB: noActionsDbPath },
-      now: "2026-09-05T12:00:00Z",
+      occurrenceId: "occ-1",
+      mcpConfigFile: configPath,
     });
-
-    // Inbox file should still be created
-    assert.ok(result.inboxPath);
-    assert.ok(fs.existsSync(result.inboxPath));
-    const content = fs.readFileSync(result.inboxPath, "utf8");
-    assert.ok(content.includes("chain-test-abc"));
-    assert.ok(content.includes("cancelled"));
+    assert.equal(result.inboxDelivered, false);
+    assert.equal(fs.existsSync(result.inboxPath), true);
   });
 
-  it("uses KUSABI_AGENDA_AUTHOR env var when set", () => {
-    notifyChainTerminal({
-      stateDir,
-      chainId: "chain-test-abc",
-      status: "completed",
-      disposition: "accept",
-      container: null,
-      cwdLabel: "",
-      env: { KAIBA_DB: kaibaDbPath, KUSABI_AGENDA_AUTHOR: "custom-author" },
-      now: "2026-09-05T12:00:00Z",
-    });
-
-    const rows = readOpenActions(kaibaDbPath);
-    assert.equal(rows.length, 1);
-    assert.equal(rows[0].author, "custom-author");
-  });
-
-  it("appends at correct position when existing open rows exist", () => {
-    // Insert an existing open row
-    const db = new DatabaseSync(kaibaDbPath, { open: true, write: true });
-    db.prepare(
-      "INSERT INTO actions (content, position, author, created_at) VALUES (?, ?, ?, ?)"
-    ).run("Existing task", 5.0, "other", "2026-09-01T00:00:00Z");
-    db.close();
-
-    notifyChainTerminal({
-      stateDir,
-      chainId: "chain-test-abc",
-      status: "completed",
-      disposition: "accept",
-      container: null,
-      cwdLabel: "",
-      env: { KAIBA_DB: kaibaDbPath },
-      now: "2026-09-05T12:00:00Z",
-    });
-
-    const rows = readOpenActions(kaibaDbPath);
-    assert.equal(rows.length, 2);
-    const newRow = rows.find((r) => r.content.includes("chain-test-abc"));
-    assert.ok(newRow);
-    assert.equal(newRow.position, 6.0); // 5.0 + 1.0
-  });
-
-  it("resolves disposition from chain.json when not passed directly", () => {
-    // Write a chain.json into the chain dir
-    fs.writeFileSync(
-      path.join(chainDir, "chain.json"),
-      JSON.stringify({
-        chainId: "chain-test-abc",
-        container: "from-json",
-        disposition: { disposition: "escalate", round: 2 },
-      }),
-      "utf8"
-    );
-
+  it("opt-out skips both the local file and kaiba inbox", () => {
+    const dir = makeTmpDir();
+    const fixture = makeMcpFixture(dir);
     const result = notifyChainTerminal({
-      stateDir,
-      chainId: "chain-test-abc",
+      stateDir: dir,
+      chainId: "chain-optout",
       status: "completed",
-      // disposition intentionally omitted — notifyChainTerminal does not
-      // auto-read chain.json, but finalizeChainControl passes it through
-      disposition: "escalate",
-      container: "from-json",
-      cwdLabel: "",
-      env: { KAIBA_DB: kaibaDbPath },
-      now: "2026-09-05T12:00:00Z",
+      occurrenceId: "occ-1",
+      mcpConfigFile: fixture.configPath,
+      env: { KUSABI_CHAIN_NOTIFY: "0" },
     });
-
-    assert.ok(result.inboxPath);
-    const rows = readOpenActions(kaibaDbPath);
-    assert.equal(rows.length, 1);
-    assert.ok(rows[0].content.includes("disposition=escalate"));
+    assert.deepEqual(result, { skipped: true });
+    assert.equal(fs.existsSync(path.join(dir, "inbox")), false);
+    assert.equal(fs.existsSync(fixture.logPath), false);
   });
 });

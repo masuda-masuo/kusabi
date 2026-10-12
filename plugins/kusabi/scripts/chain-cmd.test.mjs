@@ -450,16 +450,25 @@ describe("runChainLifecycle seam (kusabi #526)", () => {
   //     chainDir-relative remainder is compared verbatim).
   const ISO_RE = /20\d\d-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d+)?Z?/g;
 
-  function normalizeJson(value) {
-    if (Array.isArray(value)) return value.map(normalizeJson);
+  function normalizeJson(value, fx) {
+    if (Array.isArray(value)) return value.map((item) => normalizeJson(item, fx));
     if (value && typeof value === "object") {
       const out = {};
       for (const key of Object.keys(value).sort()) {
-        out[key] = key === "pid" ? "<pid>" : normalizeJson(value[key]);
+        const field = value[key];
+        if (key === "pid") out[key] = "<pid>";
+        else if (key === "terminalOccurrenceId" || key === "occurrenceId") {
+          out[key] = "<terminalOccurrenceId>";
+        } else out[key] = normalizeJson(field, fx);
       }
       return out;
     }
-    if (typeof value === "string") return value.replace(ISO_RE, "<ts>");
+    if (typeof value === "string") {
+      return value
+        .replace(ISO_RE, "<ts>")
+        .replaceAll(fx.stateDir, "<stateDir>")
+        .replaceAll(fx.tmp, "<tmp>");
+    }
     return value;
   }
 
@@ -592,6 +601,12 @@ describe("runChainLifecycle seam (kusabi #526)", () => {
   // every job.json under the state dir -- normalized for the comparison.
   function readArtifacts(fx) {
     const out = {};
+    const control = JSON.parse(fs.readFileSync(path.join(fx.chainDir, "control.json"), "utf8"));
+    assert.equal(typeof control.terminalOccurrenceId, "string");
+    assert.notEqual(control.terminalOccurrenceId, "");
+    assert.equal(control.terminalNotifyArgs.occurrenceId, control.terminalOccurrenceId);
+    assert.equal(control.terminalNotifyArgs.stateDir, fx.stateDir);
+
     function walk(dir, prefix) {
       for (const name of fs.readdirSync(dir)) {
         const full = path.join(dir, name);
@@ -599,9 +614,12 @@ describe("runChainLifecycle seam (kusabi #526)", () => {
         if (fs.statSync(full).isDirectory()) {
           walk(full, rel);
         } else if (name.endsWith(".json")) {
-          out[rel] = normalizeJson(JSON.parse(fs.readFileSync(full, "utf8")));
+          out[rel] = normalizeJson(JSON.parse(fs.readFileSync(full, "utf8")), fx);
         } else if (name === "review-record.md") {
-          out[rel] = fs.readFileSync(full, "utf8").replace(ISO_RE, "<ts>");
+          out[rel] = fs.readFileSync(full, "utf8")
+            .replace(ISO_RE, "<ts>")
+            .replaceAll(fx.stateDir, "<stateDir>")
+            .replaceAll(fx.tmp, "<tmp>");
         }
       }
     }
