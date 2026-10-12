@@ -101,13 +101,19 @@ export function dispositionOf(chainJsonOrRecords) {
  * @returns {object}
  */
 export function buildNotifyArgs(chainDir, existing, status) {
+  return buildNotifyArgsWithOptions(chainDir, existing, status);
+}
+
+function buildNotifyArgsWithOptions(chainDir, existing, status, options = {}) {
   if (existing?.terminalNotifyArgs && typeof existing.terminalNotifyArgs === "object") {
     return { ...existing.terminalNotifyArgs };
   }
 
   const chainJson = readJson(path.join(chainDir, "chain.json"));
   const chainId = existing.chainId || (chainJson && chainJson.chainId) || path.basename(chainDir);
-  const disposition = dispositionOf(chainJson);
+  const disposition = Object.hasOwn(options, "disposition")
+    ? options.disposition
+    : dispositionOf(chainJson);
   const container = existing.container || chainJson?.container || null;
   const cwdLabel = briefTitle(chainJson?.brief);
   return {
@@ -219,10 +225,11 @@ export function requestChainStop(chainDir, requestedBy) {
 
     const wasRunning = latest.status === "running";
     if (wasRunning && latest.pid != null && !isPidAlive(latest.pid)) {
+      const notifyOptions = latest.resumedAt ? { disposition: null } : {};
       const control = persistTerminalControlLocked(chainDir, latest, "cancelled", {
         stopRequestedBy: requestedBy,
         stopRequestedAt: new Date().toISOString(),
-      });
+      }, notifyOptions);
       notifyAndRetireTerminalRun(chainDir, control, "cancelled");
       return { control, wasStale: true };
     }
@@ -431,8 +438,8 @@ function notifyAndRetireTerminalRun(chainDir, control, status) {
   sweepChainJobRetirement(chainDir);
 }
 
-function persistTerminalControlLocked(chainDir, latest, status, updates = {}) {
-  const claim = readOrCreateTerminalOccurrenceClaim(chainDir, latest, status);
+function persistTerminalControlLocked(chainDir, latest, status, updates = {}, notifyOptions = {}) {
+  const claim = readOrCreateTerminalOccurrenceClaim(chainDir, latest, status, notifyOptions);
   const control = {
     ...latest,
     ...updates,
@@ -551,7 +558,7 @@ function terminalOccurrenceClaimPath(chainDir, control) {
  * @param {string} status
  * @returns {{terminalOccurrenceId:string, terminalNotifyArgs:object, finishedAt:string}}
  */
-function readOrCreateTerminalOccurrenceClaim(chainDir, existing, status) {
+function readOrCreateTerminalOccurrenceClaim(chainDir, existing, status, notifyOptions = {}) {
   const claimPath = terminalOccurrenceClaimPath(chainDir, existing);
   const persistedId =
     typeof existing.terminalOccurrenceId === "string" && existing.terminalOccurrenceId.length > 0
@@ -568,7 +575,7 @@ function readOrCreateTerminalOccurrenceClaim(chainDir, existing, status) {
     terminalNotifyArgs: persistedId && persistedArgs
       ? { ...persistedArgs, occurrenceId: persistedId }
       : {
-          ...buildNotifyArgs(chainDir, existing, status),
+          ...buildNotifyArgsWithOptions(chainDir, existing, status, notifyOptions),
           occurrenceId: persistedId || undefined,
         },
     finishedAt: existing.finishedAt || new Date().toISOString(),

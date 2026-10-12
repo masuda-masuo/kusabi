@@ -115,6 +115,7 @@ async function main() {
   const input = JSON.parse(Buffer.concat(chunks).toString("utf8"));
   const deadline = Date.now() + Math.max(50, Math.min(input.timeoutMs - 200, 1800));
   const env = { ...process.env, ...input.env, KAIBA_INBOX_PRODUCER: "kusabi", KAIBA_READONLY: "1" };
+  delete env.KAIBA_HTTP_PORT;
   server = spawn(input.command, input.args, { env, stdio: ["pipe", "pipe", "ignore"], detached: process.platform !== "win32", windowsHide: true });
   stdoutLines = createInterface({ input: server.stdout });
   stdoutLines.on("line", onLine);
