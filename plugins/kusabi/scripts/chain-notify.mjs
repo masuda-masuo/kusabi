@@ -1,73 +1,34 @@
-// chain-notify.mjs — host-side, surface-agnostic terminal notification.
-//
-// On every terminal chain disposition this writes a durable inbox file under
-// the workspace state dir and best-effort appends one kaiba agenda row.
-// This fires from finalizeChainControl() so it
-// covers every terminal path (completed / cancelled / failed) regardless of
-// whether chain-wait or any session-bound watcher is armed.
+// chain-notify.mjs — host-side, fail-soft terminal inbox notification.
 
 import fs from "node:fs";
 import path from "node:path";
-import os from "node:os";
-import { DatabaseSync } from "node:sqlite";
+import { spawnSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
 
-/**
- * Resolve the kaiba database path.
- * Honours KAIBA_DB environment variable, falling back to ~/.kaiba/kaiba.db.
- * (Copied from kaiba-progress-watch.mjs — fail-soft path resolution style.)
- *
- * @param {NodeJS.ProcessEnv} [env=process.env]
- * @returns {string}
- */
-export function resolveKaibaDbPath(env = process.env) {
-  if (typeof env.KAIBA_DB === "string" && env.KAIBA_DB.trim() !== "") {
-    return env.KAIBA_DB.trim();
-  }
-  return path.join(os.homedir(), ".kaiba", "kaiba.db");
-}
+import { codexMcpServerDefinitions } from "./codex-mcp.mjs";
+
+const clientPath = fileURLToPath(new URL("./chain-inbox-client.mjs", import.meta.url));
 
 /**
  * Derive the state directory from a chain directory.
  * chainDir = stateDir / chains / chain-{id}
- *
- * @param {string} chainDir
- * @returns {string}
  */
 export function stateDirForChain(chainDir) {
   return path.resolve(chainDir, "..", "..");
 }
 
-/**
- * Derive the chain id from a chain directory path.
- *
- * @param {string} chainDir
- * @returns {string}
- */
+/** Derive the chain id from a chain directory path. */
 export function chainIdFromDir(chainDir) {
   return path.basename(chainDir);
 }
 
-/**
- * Write the inbox file for a terminal chain.
- *
- * @param {string} inboxDir — the inbox directory
- * @param {string} chainId
- * @param {object} info
- * @param {string} info.status
- * @param {string|null} info.disposition
- * @param {string|null} info.container
- * @param {string} info.inboxPath — absolute path of the written file
- * @returns {string} absolute path of the written file
- */
 function writeInboxFile(inboxDir, chainId, info) {
   fs.mkdirSync(inboxDir, { recursive: true });
   const inboxPath = path.join(inboxDir, `${chainId}.md`);
-  const disposition = info.disposition ?? "none";
-  const container = info.container ?? "none";
   const body = `# Chain ${chainId} — terminal\n\n` +
     `- **status**: ${info.status}\n` +
-    `- **disposition**: ${disposition}\n` +
-    `- **container**: ${container}\n` +
+    `- **disposition**: ${info.disposition ?? "none"}\n` +
+    `- **container**: ${info.container ?? "none"}\n` +
     `- **inbox**: ${info.inboxPath}\n\n` +
     `## Next steps\n\n` +
     `Run \`kusabi-companion chain-show ${chainId}\` then inspect the review record and adjudicate / publish / record.\n`;
@@ -76,87 +37,56 @@ function writeInboxFile(inboxDir, chainId, info) {
 }
 
 /**
- * Best-effort insert into kaiba actions table.
- * Must NOT throw on any failure.
- *
- * @param {string} dbPath
- * @param {object} info
- * @param {string} info.chainId
- * @param {string} info.status
- * @param {string|null} info.disposition
- * @param {string|null} info.container
- * @param {string} info.cwdLabel
- * @param {string} info.inboxPath
- * @param {string} info.author
- * @param {string} now — ISO timestamp
+ * Best-effort local kaiba inbox append using the operator-owned MCP definition.
+ * This function is intentionally synchronous because terminal notification is
+ * part of the chain finalization path.
  */
-function insertKaibaAgenda(dbPath, info, now) {
-  let db;
+function appendKaibaInbox(configFile, event, env, timeoutMs) {
   try {
-    db = new DatabaseSync(dbPath, { open: true, write: true });
+    const definitions = codexMcpServerDefinitions({ kaiba: ["inbox_append"] }, configFile);
+    const definition = definitions.kaiba;
+    if (!definition?.command || definition.url) return { delivered: false, duplicate: false };
+
+    const configuredEnv = definition.env ?? {};
+    if (Object.values(configuredEnv).some((value) => typeof value !== "string")) {
+      return { delivered: false, duplicate: false };
+    }
+
+    const result = spawnSync(process.execPath, [clientPath], {
+      input: JSON.stringify({ command: definition.command, args: definition.args ?? [], env: configuredEnv, event, timeoutMs }),
+      encoding: "utf8",
+      timeout: timeoutMs,
+      maxBuffer: 1024 * 1024,
+      env: { ...process.env, ...env },
+      windowsHide: true,
+      stdio: ["pipe", "pipe", "ignore"],
+    });
+    if (result.error || result.status !== 0) return { delivered: false, duplicate: false };
+    const response = JSON.parse(result.stdout);
+    if (response?.ok !== true || typeof response.duplicate !== "boolean") {
+      return { delivered: false, duplicate: false };
+    }
+    return { delivered: true, duplicate: response.duplicate };
   } catch {
-    // DB file missing or unreadable — fail-soft
-    return false;
-  }
-
-  try {
-    // Check if actions table exists
-    const tableCheck = db.prepare(
-      "SELECT name FROM sqlite_master WHERE type='table' AND name='actions'"
-    );
-    const row = tableCheck.get();
-    if (!row) return false;
-
-    // Dedup: if any open row (done_at IS NULL) already mentions this chainId, skip
-    const dedup = db.prepare(
-      "SELECT id FROM actions WHERE done_at IS NULL AND content LIKE ?"
-    );
-    const existing = dedup.get(`%${info.chainId}%`);
-    if (existing) return false;
-
-    // Find the next position: max position of open rows + 1.0, or 1.0 if none
-    const posRow = db.prepare(
-      "SELECT MAX(position) AS max_pos FROM actions WHERE done_at IS NULL"
-    ).get();
-    const position = (posRow && posRow.max_pos != null) ? posRow.max_pos + 1.0 : 1.0;
-
-    const disposition = info.disposition ?? "none";
-    const container = info.container ?? "none";
-    const cwdLabel = info.cwdLabel || "unknown";
-    const content =
-      `Inspect ${cwdLabel} ${info.chainId} (status=${info.status}, disposition=${disposition}) ` +
-      `container=${container} — chain-show then adjudicate/publish/record. inbox=${info.inboxPath}`;
-
-    const insert = db.prepare(
-      "INSERT INTO actions (content, position, author, created_at) VALUES (?, ?, ?, ?)"
-    );
-    insert.run(content, position, info.author, now);
-    return true;
-  } catch {
-    // Any SQL error — fail-soft
-    return false;
-  } finally {
-    try { db.close(); } catch { /* best-effort */ }
+    return { delivered: false, duplicate: false };
   }
 }
 
 /**
  * Notify on chain terminal disposition.
  *
- * 1. If KUSABI_CHAIN_NOTIFY=0, skip silently.
- * 2. Write inbox file at {stateDir}/inbox/{chainId}.md (idempotent overwrite).
- * 3. Best-effort kaiba agenda row (deduped, fail-soft).
- *
  * @param {object} opts
- * @param {string} opts.stateDir   — workspace state root (e.g. ~/.kusabi/<hash>)
+ * @param {string} opts.stateDir
  * @param {string} opts.chainId
- * @param {string} opts.status     — completed / cancelled / failed
- * @param {string|null} [opts.disposition] — from chain.json, or null
+ * @param {string} opts.status
+ * @param {string|null} [opts.disposition]
  * @param {string|null} [opts.container]
- * @param {string} [opts.cwdLabel] — repo/cwd basename for agenda content
+ * @param {string} [opts.cwdLabel]
  * @param {NodeJS.ProcessEnv} [opts.env=process.env]
- * @param {string} [opts.now]      — ISO timestamp, defaults to now
- * @returns {{ skipped?: boolean, inboxPath?: string, agendaInserted?: boolean }}
+ * @param {string} [opts.occurrenceId]
+ * @param {string} [opts.mcpConfigFile]
+ * @param {number} [opts.timeoutMs]
+ * @returns {{ skipped?: boolean, inboxPath?: string, inboxDelivered?: boolean, duplicate?: boolean }}
  */
 export function notifyChainTerminal(opts) {
   const {
@@ -167,42 +97,49 @@ export function notifyChainTerminal(opts) {
     container = null,
     cwdLabel = "",
     env = process.env,
-    now = new Date().toISOString(),
+    occurrenceId,
+    mcpConfigFile,
+    timeoutMs: requestedTimeout = 2000,
   } = opts;
 
-  // Opt-out
-  if (env.KUSABI_CHAIN_NOTIFY === "0") {
-    return { skipped: true };
-  }
+  if (env.KUSABI_CHAIN_NOTIFY === "0") return { skipped: true };
 
   const inboxDir = path.join(stateDir, "inbox");
-  const inboxPath = path.join(inboxDir, `${chainId}.md`);
-
-  // 1. Write inbox file — log on failure; still attempt agenda with the intended path
+  const inboxPath = path.resolve(inboxDir, `${chainId}.md`);
   try {
-    writeInboxFile(inboxDir, chainId, {
-      status,
-      disposition,
-      container,
-      inboxPath,
-    });
+    writeInboxFile(inboxDir, chainId, { status, disposition, container, inboxPath });
   } catch (err) {
     const msg = err && typeof err === "object" && "message" in err ? err.message : String(err);
     console.error(`[chain-notify] inbox write failed for ${chainId}: ${msg}`);
   }
 
-  // 2. Best-effort kaiba agenda
-  const author = env.KUSABI_AGENDA_AUTHOR || "kusabi";
-  const dbPath = resolveKaibaDbPath(env);
-  const agendaInserted = insertKaibaAgenda(dbPath, {
-    chainId,
-    status,
-    disposition,
-    container,
-    cwdLabel,
-    inboxPath,
-    author,
-  }, now) === true;
+  if (typeof occurrenceId !== "string" || occurrenceId.length === 0) {
+    return { inboxPath, inboxDelivered: false };
+  }
 
-  return { inboxPath, agendaInserted };
+  const parsedTimeout = Number.isFinite(requestedTimeout) && requestedTimeout > 0
+    ? Math.min(requestedTimeout, 2000)
+    : 2000;
+  const title = typeof cwdLabel === "string" && cwdLabel.trim()
+    ? cwdLabel
+    : chainId;
+  const event = {
+    event_key: `chain-terminal:${chainId}:${occurrenceId}`,
+    event_type: "chain_terminal",
+    subject: chainId,
+    title,
+    metadata: {
+      status,
+      disposition,
+      container,
+      inbox_path: inboxPath,
+      cwd_label: cwdLabel,
+    },
+  };
+  const result = appendKaibaInbox(mcpConfigFile, event, env, parsedTimeout);
+  return {
+    inboxPath,
+    inboxDelivered: result.delivered,
+    ...(result.delivered ? { duplicate: result.duplicate } : {}),
+  };
 }
