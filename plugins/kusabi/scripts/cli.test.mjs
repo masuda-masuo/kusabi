@@ -8,6 +8,7 @@ import {
   reviewDenyTools,
 } from "./cli.mjs";
 import { resolveBackend } from "./dispatch-backend.mjs";
+import { patchEnv } from "./fixtures.mjs";
 
 // parseArgs
 // ---------------------------------------------------------------------------
@@ -800,5 +801,72 @@ describe("Criterion 3: rejection of cursor backend and prefixes", () => {
     const res = splitRouteBackend("cursor/x");
     assert.equal(res.backend, "opencode");
     assert.equal(res.route, "cursor/x");
+  });
+});
+
+describe("Agenda2001: resolveModel with opt-in OpenCode free worker profile", () => {
+  it("configured phase chain outranks opt-in free profile defaults", () => {
+    const restoreEnv = patchEnv({ KUSABI_OPENCODE_FREE_WORKER: "1" });
+    try {
+      const config = {
+        models: {
+          phases: {
+            implement: ["opencode/custom-implement-model"],
+          },
+        },
+      };
+      const res = resolveModel({ flag: undefined, phase: "implement", config });
+      assert.equal(res.model?.providerID, "opencode");
+      assert.equal(res.model?.modelID, "custom-implement-model");
+      assert.deepEqual(res.chain, ["opencode/custom-implement-model"]);
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  it("configured global chain outranks opt-in free profile defaults", () => {
+    const restoreEnv = patchEnv({ KUSABI_OPENCODE_FREE_WORKER: "1" });
+    try {
+      const config = {
+        models: {
+          chain: ["opencode-go/custom-global-model:max"],
+        },
+      };
+      const res = resolveModel({ flag: undefined, phase: "implement", config });
+      assert.equal(res.model?.providerID, "opencode-go");
+      assert.equal(res.model?.modelID, "custom-global-model");
+      assert.deepEqual(res.chain, ["opencode-go/custom-global-model:max"]);
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  it("explicit --model flag outranks both phase config and profile defaults", () => {
+    const restoreEnv = patchEnv({ KUSABI_OPENCODE_FREE_WORKER: "1" });
+    try {
+      const config = {
+        models: {
+          phases: { implement: ["opencode/phase-model"] },
+        },
+      };
+      const res = resolveModel({ flag: "anthropic/claude-3-opus", phase: "implement", config });
+      assert.equal(res.model?.providerID, "anthropic");
+      assert.equal(res.model?.modelID, "claude-3-opus");
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  it("non-1 opt-in values ('false', '0', empty) preserve built-in default chain", () => {
+    for (const val of ["0", "false", "", undefined]) {
+      const restoreEnv = patchEnv({ KUSABI_OPENCODE_FREE_WORKER: val });
+      try {
+        const res = resolveModel({ flag: undefined, phase: undefined, config: null });
+        assert.equal(res.model?.providerID, "opencode");
+        assert.equal(res.model?.modelID, "deepseek-v4-flash-free");
+      } finally {
+        restoreEnv();
+      }
+    }
   });
 });

@@ -17,6 +17,7 @@ import process from "node:process";
 import { fileURLToPath } from "node:url";
 
 import { kusabiOpencodeConfigHome } from "./state-paths.mjs";
+import { isOpenCodeFreeWorkerEnabled, transformAgentForOptIn } from "./free-worker-profile.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const PLUGIN_ROOT = path.resolve(HERE, "..");
@@ -109,7 +110,18 @@ export function cmdInstallAgents() {
   }
   // Install current agent definitions under new kusabi-* names
   const files = fs.existsSync(src) ? fs.readdirSync(src).filter((f) => f.endsWith(".md")) : [];
-  for (const f of files) fs.copyFileSync(path.join(src, f), path.join(dest, f));
+  const optIn = isOpenCodeFreeWorkerEnabled();
+  for (const f of files) {
+    const srcFile = path.join(src, f);
+    const destFile = path.join(dest, f);
+    if (!optIn) {
+      fs.copyFileSync(srcFile, destFile);
+    } else {
+      const content = fs.readFileSync(srcFile, "utf8");
+      const transformed = transformAgentForOptIn(content);
+      fs.writeFileSync(destFile, transformed, "utf8");
+    }
+  }
 
   // Skills distribution: copy-and-overwrite ONLY — never delete anything at
   // the destination. The skills dir (OPENCODE_SKILL_DIR, default

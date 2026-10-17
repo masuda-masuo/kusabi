@@ -10,6 +10,8 @@ import { writeJson, stateRoot } from "./state-paths.mjs";
 import { durationS } from "./render.mjs";
 import { parseModel, selectRoutes, splitRouteBackend } from "./cli.mjs";
 import { agyDispatch } from "./agy-dispatch.mjs";
+import { isOpenCodeFreeWorkerEnabled, getReviewSchema } from "./free-worker-profile.mjs";
+import { validateReview } from "./review-validate.mjs";
 
 let _cachedClaudeDispatch = null;
 async function getClaudeDispatch() {
@@ -618,10 +620,137 @@ export function accumulateUsage(events) {
   return { available: false };
 }
 
+/**
+ * Recover structured review object from recorded SSE events.
+ *
+ * When OpenCode V1 executes a prompt with structured output (format: { type: "json_schema", ... }),
+ * GET /session/{sessionID}/message fails with HTTP 400 ("Expected OutputFormatJsonSchema").
+ * However, the authoritative structured review was already emitted in the session's SSE stream
+ * inside `message.updated` (properties.info.structured) before session.idle.
+ *
+ * This function inspects the job's recorded events, isolates the matching session, identifies
+ * the latest relevant assistant message in order, ensures no subsequent assistant error occurred,
+ * validates the structured payload against the canonical review schema via validateReview,
+ * and returns the validated structured review.
+ *
+ * @param {string} eventsPath Path to events.ndjson
+ * @param {string} [sessionID] Expected session ID
+ * @returns {{ ok: true, assistantId: string, structured: object } | { ok: false, reason: string, assistantId?: string, error?: any, errors?: any[], structured?: any }}
+ */
+export function recoverStructuredReviewFromEvents(eventsPath, sessionID) {
+  let raw = "";
+  try {
+    raw = fs.readFileSync(eventsPath, "utf8");
+  } catch {
+    return { ok: false, reason: "events-unreadable" };
+  }
+
+  const messageMap = new Map();
+  const assistantOrder = [];
+
+  for (const line of raw.split("\n")) {
+    if (!line.trim()) continue;
+    let event;
+    try {
+      event = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    if (!event || typeof event !== "object") continue;
+
+    // Strict session matching: drop events belonging to other sessions
+    const es = eventSession(event);
+    if (es && sessionID && es !== sessionID) {
+      continue;
+    }
+
+    if (event.type === "message.updated") {
+      const info = event.properties?.info;
+      if (info && typeof info === "object" && typeof info.id === "string") {
+        const id = info.id;
+        const prev = messageMap.get(id) || {};
+        const merged = { ...prev, ...info };
+        messageMap.set(id, merged);
+        if (merged.role === "assistant" && !assistantOrder.includes(id)) {
+          assistantOrder.push(id);
+        }
+      }
+    }
+  }
+
+  if (assistantOrder.length === 0) {
+    return { ok: false, reason: "no-assistant-messages" };
+  }
+
+  const latestId = assistantOrder[assistantOrder.length - 1];
+  const latestAssistant = messageMap.get(latestId);
+
+  // Preserve latest error: never approve if latest assistant errored
+  const hasError = Boolean(latestAssistant.error || latestAssistant.finish === "error");
+  if (hasError) {
+    return {
+      ok: false,
+      reason: "assistant-error",
+      assistantId: latestId,
+      error: latestAssistant.error ?? { message: "assistant finished with error" },
+    };
+  }
+
+  const structured = latestAssistant.structured;
+  if (structured === undefined || structured === null) {
+    return {
+      ok: false,
+      reason: "no-structured-output",
+      assistantId: latestId,
+    };
+  }
+
+  let parsedStructured = structured;
+  if (typeof structured === "string") {
+    try {
+      parsedStructured = JSON.parse(structured);
+    } catch (err) {
+      return {
+        ok: false,
+        reason: "structured-json-unparseable",
+        assistantId: latestId,
+        error: String(err?.message ?? err),
+      };
+    }
+  }
+
+  // Canonical schema validation via validateReview
+  const validation = validateReview(parsedStructured);
+  if (!validation.valid) {
+    return {
+      ok: false,
+      reason: "schema-validation-failed",
+      assistantId: latestId,
+      errors: validation.errors,
+      structured: parsedStructured,
+    };
+  }
+
+  return {
+    ok: true,
+    assistantId: latestId,
+    structured: parsedStructured,
+  };
+}
+
 async function fetchFinalMessage(server, sessionID) {
   const messages = (await api(server, "GET", `/session/${sessionID}/message`)) ?? [];
   const assistant = [...messages].reverse().find((m) => (m.info?.role ?? m.role) === "assistant");
   if (!assistant) return "";
+
+  // Prefer info.structured from last assistant message
+  if (assistant.info?.structured !== undefined && assistant.info?.structured !== null) {
+    if (typeof assistant.info.structured === "string") {
+      return assistant.info.structured;
+    }
+    return JSON.stringify(assistant.info.structured);
+  }
+
   const parts = assistant.parts ?? [];
   return parts
     .filter((p) => p.type === "text" && p.text)
@@ -1023,6 +1152,14 @@ export async function runPrompt({ cwd, kind, title, promptText, agent, model, se
     }
   })();
 
+  let effectiveFormat = format;
+  if (!effectiveFormat && isOpenCodeFreeWorkerEnabled() && (phase === "review" || kind === "review")) {
+    effectiveFormat = {
+      type: "json_schema",
+      schema: getReviewSchema(),
+    };
+  }
+
   try {
     await Promise.race([sseConnected, new Promise((r) => setTimeout(r, 5000))]);
     await api(server, "POST", `/session/${sessionID}/prompt_async`, {
@@ -1031,7 +1168,7 @@ export async function runPrompt({ cwd, kind, title, promptText, agent, model, se
       ...(model ? { model: { providerID: model.providerID, modelID: model.modelID } } : {}),
       ...(model?.variant ? { variant: model.variant } : {}),
       ...(tools ? { tools } : {}),
-      ...(format ? { format } : {}),
+      ...(effectiveFormat ? { format: effectiveFormat } : {}),
     });
     await watcher;
   } finally {
@@ -1099,52 +1236,117 @@ export async function runPrompt({ cwd, kind, title, promptText, agent, model, se
     // apart from "there was nothing to ask for" (result-recovery.mjs).
     const fetched = await fetchFinalMessageOutcome(server, sessionID);
     const dir = jobDir(stateDir, job.id);
-    const resolved = resolveCompletedResult({
-      backend: "opencode",
-      fetched,
-      coords: { eventsPath: path.join(dir, "events.ndjson") },
-    });
-    resultText = resolved.text;
-    job.result = resolved.record;
-    if (resolved.record.recovered) {
-      appendEvent(stateDir, job.id, {
-        type: "companion.result.recovered",
-        source: resolved.record.recovery.source,
-        chars: resolved.record.recovery.chars,
-        fetchFailed: resolved.record.fetchFailed,
-        fetchError: resolved.record.fetchError,
+    const eventsPath = path.join(dir, "events.ndjson");
+
+    const isReviewRun =
+      phase === "review" ||
+      kind === "review" ||
+      Boolean(
+        effectiveFormat?.type === "json_schema" ||
+        format?.type === "json_schema" ||
+        effectiveFormat?.schema ||
+        format?.schema
+      );
+
+    // Final-message success retains priority.
+    if (fetched?.ok === true && fetched?.text) {
+      resultText = fetched.text;
+      job.result = {
+        source: "final-message",
+        recovered: false,
+        fetchFailed: false,
+        fetchError: null,
+        recovery: null,
+      };
+    } else if (isReviewRun) {
+      // Review structured recovery from recorded SSE events (Agenda2001).
+      // OpenCode V1 GET /session/{id}/message fails with HTTP 400 when structured
+      // format is used, but the authoritative structured review is in message.updated.
+      const structuredRecovery = recoverStructuredReviewFromEvents(eventsPath, sessionID);
+      const fetchFailed = fetched?.ok !== true;
+      const fetchError = fetchFailed ? String(fetched?.error ?? "unknown error") : null;
+
+      if (structuredRecovery.ok) {
+        resultText = JSON.stringify(structuredRecovery.structured, null, 2);
+        job.result = {
+          source: "recovered",
+          recovered: true,
+          fetchFailed,
+          fetchError,
+          recovery: {
+            source: "opencode-structured-events",
+            backend: "opencode",
+            chars: resultText.length,
+            assistantId: structuredRecovery.assistantId,
+            schemaVersion: structuredRecovery.structured?.schema_version ?? null,
+          },
+        };
+        appendEvent(stateDir, job.id, {
+          type: "companion.result.recovered",
+          source: job.result.recovery.source,
+          chars: job.result.recovery.chars,
+          fetchFailed: job.result.fetchFailed,
+          fetchError: job.result.fetchError,
+        });
+      } else {
+        // Structured review recovery failed (errored assistant, missing, or malformed schema).
+        // Reject or preserve explicit failure through established contract rather than silently
+        // approving from reasoning text. For review structured failure, do NOT claim successful schema output.
+        resultText = "";
+        if (structuredRecovery.reason === "assistant-error" && structuredRecovery.error) {
+          job.error = job.error || structuredRecovery.error;
+        }
+        job.result = {
+          source: fetchFailed ? "unavailable" : "none",
+          recovered: false,
+          fetchFailed,
+          fetchError,
+          recovery: {
+            source: "opencode-structured-events",
+            backend: "opencode",
+            failed: true,
+            reason: structuredRecovery.reason,
+            assistantId: structuredRecovery.assistantId ?? null,
+            error: structuredRecovery.error ?? null,
+            errors: structuredRecovery.errors ?? null,
+          },
+        };
+      }
+    } else {
+      // Default / non-review recovery behavior: recover plain text parts via resolveCompletedResult.
+      const resolved = resolveCompletedResult({
+        backend: "opencode",
+        fetched,
+        coords: { eventsPath },
       });
+      resultText = resolved.text;
+      job.result = resolved.record;
+      if (resolved.record.recovered) {
+        appendEvent(stateDir, job.id, {
+          type: "companion.result.recovered",
+          source: resolved.record.recovery.source,
+          chars: resolved.record.recovery.chars,
+          fetchFailed: resolved.record.fetchFailed,
+          fetchError: resolved.record.fetchError,
+        });
+      }
     }
+
     fs.writeFileSync(path.join(dir, "result.md"), resultText, "utf8");
 
-    // kusabi #496: a provider stream that ended `finish: "unknown"` and then
-    // went idle, with NO terminal final payload -- only a recovered
-    // event/reasoning reconstruction -- carries the deterministic STREAM
-    // signal of a run cut off mid-flight (measured incident job-mtyfpjlc8452:
-    // finish unknown, recovered reasoning-only text, zero deliverable
-    // changes, failed P3/P4 -- stored and notified as completed success).
-    // The signal alone is NOT the terminal verdict: the phase contract and
-    // the deliverable/probe evidence (no declared deliverable changes +
-    // failed P3/P4) decide it, and that evidence exists only at the
-    // probe-truth layer (cmdTask / the chain's probe phase).  runPrompt
-    // therefore only records the evidence on the job -- finalizeIncomplete
-    // CompletedRun closes the record there, and a complete-but-message-less
-    // write run whose deliverables/probes are green is never falsely
-    // failed.  The recovered text stays on disk so `kusabi-companion
-    // result <id>` still returns it.
     if (finishedUnknown && phaseRequiresOutput(job.phase, job.kind)) {
-      const source = resolved.record.source;
+      const source = job.result?.source;
       if (source === "recovered" || source === "none") {
         job.noFinalEvidence = {
           finishedUnknown: true,
           source,
-          recovered: resolved.record.recovered === true,
+          recovered: job.result?.recovered === true,
           phase: job.phase,
         };
         appendEvent(stateDir, job.id, {
           type: "companion.result.no-final",
           source,
-          recovered: resolved.record.recovered === true,
+          recovered: job.result?.recovered === true,
           finishedUnknown: true,
           phase: job.phase,
         });

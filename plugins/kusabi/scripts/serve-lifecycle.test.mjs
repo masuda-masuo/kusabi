@@ -16,6 +16,7 @@ import {
   reapIdleServes,
   isOurServe,
   waitForPublishedHealthy,
+  checkServerProfileCompatibility,
 } from "./serve-lifecycle.mjs";
 import { readJson, stateDirFor } from "./state-paths.mjs";
 // The identity gate is shared by every kill site (kusabi #181); these two
@@ -1818,6 +1819,64 @@ describe("watchdog kill decision (identity gate, spawn-based)", () => {
       killPid(child.pid);
       fx.restore();
       fs.rmSync(fx.tmp, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("Agenda2001: checkServerProfileCompatibility", () => {
+  it("rejects reusing default server when opt-in free worker is enabled", () => {
+    const restoreEnv = patchEnv({ KUSABI_OPENCODE_FREE_WORKER: "1" });
+    try {
+      const defaultServer = { pid: 12345, port: 4000, profile: "default", pure: false };
+      assert.throws(
+        () => checkServerProfileCompatibility(defaultServer),
+        /Server profile mismatch.*default mode/
+      );
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  it("rejects reusing opt-in pure server when opt-in is disabled", () => {
+    const restoreEnv = patchEnv({ KUSABI_OPENCODE_FREE_WORKER: undefined });
+    try {
+      const freeServer = { pid: 12345, port: 4000, profile: "free", pure: true };
+      assert.throws(
+        () => checkServerProfileCompatibility(freeServer),
+        /Server profile mismatch.*opt-in free worker mode/
+      );
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  it("allows reusing server with matching profile metadata", () => {
+    let restoreEnv = patchEnv({ KUSABI_OPENCODE_FREE_WORKER: "1" });
+    try {
+      assert.doesNotThrow(() =>
+        checkServerProfileCompatibility({ pid: 12345, port: 4000, profile: "free", pure: true })
+      );
+    } finally {
+      restoreEnv();
+    }
+
+    restoreEnv = patchEnv({ KUSABI_OPENCODE_FREE_WORKER: "0" });
+    try {
+      assert.doesNotThrow(() =>
+        checkServerProfileCompatibility({ pid: 12345, port: 4000, profile: "default", pure: false })
+      );
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  it("preserves fixture compatibility when server record has no mode metadata", () => {
+    const restoreEnv = patchEnv({ KUSABI_OPENCODE_FREE_WORKER: "1" });
+    try {
+      const legacyFixture = { pid: 12345, port: 4000, password: "pw" };
+      assert.doesNotThrow(() => checkServerProfileCompatibility(legacyFixture));
+    } finally {
+      restoreEnv();
     }
   });
 });

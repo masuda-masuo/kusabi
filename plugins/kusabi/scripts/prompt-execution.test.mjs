@@ -17,6 +17,7 @@ import {
   phaseRequiresOutput,
   probeEvidenceIncomplete,
   providerStatusFromError,
+  recoverStructuredReviewFromEvents,
   resetFailedRoutes,
   runPrompt,
 } from "./prompt-execution.mjs";
@@ -3316,3 +3317,538 @@ describe("runPrompt monotonic silence watchdog (kusabi #724)", () => {
   });
 });
 
+// =========================================================================
+// Agenda2001: V1 final-message GET 400 structured review recovery
+// =========================================================================
+
+function v1StructuredRecoveryServeSource({
+  messageStatusCode = 400,
+  messageError = "Expected OutputFormatJsonSchema",
+  messagePayload = null,
+  streamEvents = [],
+}) {
+  return `#!/usr/bin/env node
+import http from "node:http";
+import fs from "node:fs";
+
+const argv = process.argv.slice(2);
+const port = Number(argv[argv.indexOf("--port") + 1]);
+let nextSession = 0;
+const MESSAGE_STATUS = ${JSON.stringify(messageStatusCode)};
+const MESSAGE_ERROR = ${JSON.stringify(messageError)};
+const MESSAGE_PAYLOAD = ${JSON.stringify(messagePayload)};
+const STREAM_EVENTS = ${JSON.stringify(streamEvents)};
+
+function sse(res, event) {
+  res.write("data: " + JSON.stringify(event) + "\\n\\n");
+}
+
+const server = http.createServer((req, res) => {
+  res.on("error", () => {});
+  const url = new URL(req.url, "http://127.0.0.1:" + port);
+  req.on("data", () => {});
+  req.on("end", () => {
+    if (req.method === "GET" && url.pathname === "/session") {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end("[]");
+      return;
+    }
+    if (req.method === "POST" && url.pathname === "/session") {
+      const id = "ses-" + (++nextSession);
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ id }));
+      return;
+    }
+    const segs = url.pathname.split("/");
+    const sessionId = segs[2];
+    if (req.method === "POST" && segs[3] === "prompt_async") {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end("{}");
+      return;
+    }
+    if (req.method === "POST" && segs[3] === "abort") {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end("{}");
+      return;
+    }
+    if (req.method === "GET" && segs[3] === "message") {
+      if (MESSAGE_STATUS !== 200) {
+        res.writeHead(MESSAGE_STATUS, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: MESSAGE_ERROR }));
+        return;
+      }
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify(MESSAGE_PAYLOAD ?? []));
+      return;
+    }
+    if (req.method === "GET" && url.pathname === "/event") {
+      res.writeHead(200, { "content-type": "text/event-stream" });
+      const id = "ses-" + nextSession;
+      for (const ev of STREAM_EVENTS) {
+        const templated = JSON.parse(JSON.stringify(ev).replace(/__SESSION_ID__/g, id));
+        sse(res, templated);
+      }
+      sse(res, { type: "session.idle", properties: { sessionID: id } });
+      res.end();
+      return;
+    }
+    res.writeHead(404, { "content-type": "application/json" });
+    res.end("{}");
+  });
+});
+server.listen(port, "127.0.0.1");
+setInterval(() => {}, 1000);
+`;
+}
+
+function v1StructuredRecoveryContext(opts = {}) {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-v1-recovery-test-"));
+  const binPath = path.join(tmp, "fake-serve.mjs");
+  fs.writeFileSync(binPath, v1StructuredRecoveryServeSource(opts), "utf8");
+  fs.chmodSync(binPath, 0o755);
+  const stateRoot = path.join(tmp, "state");
+  const cwd = path.join(tmp, "cwd");
+  fs.mkdirSync(cwd, { recursive: true });
+  const restoreEnv = patchEnv({
+    OPENCODE_BIN: binPath,
+    KUSABI_STATE_DIR: stateRoot,
+    KUSABI_SERVE_READY_TIMEOUT_MS: "8000",
+  });
+  const stateDir = stateDirFor(cwd);
+  return {
+    tmp,
+    cwd,
+    stateDir,
+    restore() {
+      restoreEnv();
+    },
+    killAll() {
+      try {
+        const rec = JSON.parse(fs.readFileSync(path.join(stateDir, "server.json"), "utf8"));
+        try { process.kill(rec.pid, "SIGKILL"); } catch { /* already gone */ }
+      } catch { /* no record */ }
+    },
+    rm() {
+      try { fs.rmSync(tmp, { recursive: true, force: true }); } catch { /* best effort */ }
+    },
+  };
+}
+
+describe("Agenda2001: preserve structured review on V1 final-message GET failure", () => {
+  describe("recoverStructuredReviewFromEvents unit tests", () => {
+    it("returns events-unreadable for non-existent events file", () => {
+      const res = recoverStructuredReviewFromEvents("/non/existent/events.ndjson", "ses-1");
+      assert.equal(res.ok, false);
+      assert.equal(res.reason, "events-unreadable");
+    });
+
+    it("returns no-assistant-messages when events contain no assistant messages", () => {
+      const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "unit-test-"));
+      const ep = path.join(tmp, "events.ndjson");
+      fs.writeFileSync(ep, JSON.stringify({ type: "message.updated", properties: { sessionID: "ses-1", info: { id: "m1", role: "user" } } }) + "\n");
+      try {
+        const res = recoverStructuredReviewFromEvents(ep, "ses-1");
+        assert.equal(res.ok, false);
+        assert.equal(res.reason, "no-assistant-messages");
+      } finally {
+        fs.rmSync(tmp, { recursive: true, force: true });
+      }
+    });
+
+    it("excludes events with mismatched sessionID", () => {
+      const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "unit-test-"));
+      const ep = path.join(tmp, "events.ndjson");
+      fs.writeFileSync(ep, JSON.stringify({
+        type: "message.updated",
+        properties: {
+          sessionID: "ses-other",
+          info: {
+            id: "msg-other",
+            role: "assistant",
+            structured: { schema_version: 1, verdict: "approve", summary: "ok", findings: [], next_steps: [] },
+          },
+        },
+      }) + "\n");
+      try {
+        const res = recoverStructuredReviewFromEvents(ep, "ses-current");
+        assert.equal(res.ok, false);
+        assert.equal(res.reason, "no-assistant-messages");
+      } finally {
+        fs.rmSync(tmp, { recursive: true, force: true });
+      }
+    });
+
+    it("fails when latest assistant encountered an error", () => {
+      const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "unit-test-"));
+      const ep = path.join(tmp, "events.ndjson");
+      const lines = [
+        JSON.stringify({
+          type: "message.updated",
+          properties: {
+            sessionID: "ses-1",
+            info: {
+              id: "msg-1",
+              role: "assistant",
+              structured: { schema_version: 1, verdict: "approve", summary: "early", findings: [], next_steps: [] },
+            },
+          },
+        }),
+        JSON.stringify({
+          type: "message.updated",
+          properties: {
+            sessionID: "ses-1",
+            info: {
+              id: "msg-2",
+              role: "assistant",
+              error: { message: "Context exhausted" },
+            },
+          },
+        }),
+      ];
+      fs.writeFileSync(ep, lines.join("\n") + "\n");
+      try {
+        const res = recoverStructuredReviewFromEvents(ep, "ses-1");
+        assert.equal(res.ok, false);
+        assert.equal(res.reason, "assistant-error");
+        assert.equal(res.assistantId, "msg-2");
+        assert.ok(res.error);
+      } finally {
+        fs.rmSync(tmp, { recursive: true, force: true });
+      }
+    });
+
+    it("fails when latest assistant structured output is malformed against canonical schema", () => {
+      const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "unit-test-"));
+      const ep = path.join(tmp, "events.ndjson");
+      fs.writeFileSync(ep, JSON.stringify({
+        type: "message.updated",
+        properties: {
+          sessionID: "ses-1",
+          info: {
+            id: "msg-1",
+            role: "assistant",
+            structured: { verdict: "approve" }, // missing schema_version, summary, findings, next_steps
+          },
+        },
+      }) + "\n");
+      try {
+        const res = recoverStructuredReviewFromEvents(ep, "ses-1");
+        assert.equal(res.ok, false);
+        assert.equal(res.reason, "schema-validation-failed");
+        assert.ok(Array.isArray(res.errors));
+        assert.ok(res.errors.length > 0);
+      } finally {
+        fs.rmSync(tmp, { recursive: true, force: true });
+      }
+    });
+  });
+
+  describe("runPrompt E2E targeted recovery tests", () => {
+    it("valid current assistant structured recovers as JSON on GET 400", async () => {
+      const validReview = {
+        schema_version: 1,
+        verdict: "approve",
+        summary: "Implementation looks clean and verified",
+        findings: [],
+        next_steps: ["ship to canary"],
+      };
+      const ctx = v1StructuredRecoveryContext({
+        messageStatusCode: 400,
+        messageError: "Expected OutputFormatJsonSchema",
+        streamEvents: [
+          {
+            type: "message.updated",
+            properties: {
+              sessionID: "__SESSION_ID__",
+              info: {
+                id: "msg-1",
+                role: "assistant",
+                structured: validReview,
+              },
+            },
+          },
+        ],
+      });
+      try {
+        const outcome = await runPrompt({
+          cwd: ctx.cwd,
+          kind: "review",
+          phase: "review",
+          title: "Agenda2001 test",
+          promptText: "review changes",
+          timeoutS: 10,
+        });
+
+        assert.equal(outcome.job.status, "completed");
+        assert.equal(outcome.job.result.recovered, true);
+        assert.equal(outcome.job.result.source, "recovered");
+        assert.equal(outcome.job.result.fetchFailed, true);
+        assert.match(outcome.job.result.fetchError, /400/);
+        assert.equal(outcome.job.result.recovery.source, "opencode-structured-events");
+        assert.equal(outcome.job.result.recovery.schemaVersion, 1);
+
+        const parsed = JSON.parse(outcome.resultText);
+        assert.deepEqual(parsed, validReview);
+      } finally {
+        ctx.killAll();
+        ctx.restore();
+        ctx.rm();
+      }
+    });
+
+    it("mismatched session excluded from structured recovery", async () => {
+      const foreignReview = {
+        schema_version: 1,
+        verdict: "approve",
+        summary: "Foreign session review",
+        findings: [],
+        next_steps: [],
+      };
+      const ctx = v1StructuredRecoveryContext({
+        messageStatusCode: 400,
+        messageError: "Expected OutputFormatJsonSchema",
+        streamEvents: [
+          {
+            type: "message.updated",
+            properties: {
+              sessionID: "ses-foreign-999",
+              info: {
+                id: "msg-foreign",
+                role: "assistant",
+                structured: foreignReview,
+              },
+            },
+          },
+        ],
+      });
+      try {
+        const outcome = await runPrompt({
+          cwd: ctx.cwd,
+          kind: "review",
+          phase: "review",
+          title: "Mismatched session test",
+          promptText: "review changes",
+          timeoutS: 10,
+        });
+
+        assert.equal(outcome.job.status, "completed");
+        assert.equal(outcome.job.result.recovered, false);
+        assert.equal(outcome.resultText, "");
+      } finally {
+        ctx.killAll();
+        ctx.restore();
+        ctx.rm();
+      }
+    });
+
+    it("earlier structured assistant followed by newer errored assistant cannot approve", async () => {
+      const earlyReview = {
+        schema_version: 1,
+        verdict: "approve",
+        summary: "Early review before error",
+        findings: [],
+        next_steps: [],
+      };
+      const ctx = v1StructuredRecoveryContext({
+        messageStatusCode: 400,
+        messageError: "Expected OutputFormatJsonSchema",
+        streamEvents: [
+          {
+            type: "message.updated",
+            properties: {
+              sessionID: "__SESSION_ID__",
+              info: {
+                id: "msg-1",
+                role: "assistant",
+                structured: earlyReview,
+              },
+            },
+          },
+          {
+            type: "message.updated",
+            properties: {
+              sessionID: "__SESSION_ID__",
+              info: {
+                id: "msg-2",
+                role: "assistant",
+                error: { message: "Context length exceeded on subsequent assistant turn" },
+              },
+            },
+          },
+        ],
+      });
+      try {
+        const outcome = await runPrompt({
+          cwd: ctx.cwd,
+          kind: "review",
+          phase: "review",
+          title: "Errored newer assistant test",
+          promptText: "review changes",
+          timeoutS: 10,
+        });
+
+        assert.equal(outcome.job.result.recovered, false);
+        assert.equal(outcome.job.result.recovery.reason, "assistant-error");
+        assert.equal(outcome.resultText, "");
+        assert.ok(outcome.job.error);
+      } finally {
+        ctx.killAll();
+        ctx.restore();
+        ctx.rm();
+      }
+    });
+
+    it("malformed structured schema cannot approve", async () => {
+      const malformed = {
+        verdict: "approve",
+      };
+      const ctx = v1StructuredRecoveryContext({
+        messageStatusCode: 400,
+        messageError: "Expected OutputFormatJsonSchema",
+        streamEvents: [
+          {
+            type: "message.updated",
+            properties: {
+              sessionID: "__SESSION_ID__",
+              info: {
+                id: "msg-1",
+                role: "assistant",
+                structured: malformed,
+              },
+            },
+          },
+        ],
+      });
+      try {
+        const outcome = await runPrompt({
+          cwd: ctx.cwd,
+          kind: "review",
+          phase: "review",
+          title: "Malformed schema test",
+          promptText: "review changes",
+          timeoutS: 10,
+        });
+
+        assert.equal(outcome.job.result.recovered, false);
+        assert.equal(outcome.job.result.recovery.reason, "schema-validation-failed");
+        assert.equal(outcome.resultText, "");
+      } finally {
+        ctx.killAll();
+        ctx.restore();
+        ctx.rm();
+      }
+    });
+
+    it("ordinary text recovery unaffected on GET 400 during task run", async () => {
+      const ctx = v1StructuredRecoveryContext({
+        messageStatusCode: 400,
+        messageError: "Expected OutputFormatJsonSchema",
+        streamEvents: [
+          {
+            type: "message.updated",
+            properties: {
+              sessionID: "__SESSION_ID__",
+              info: {
+                id: "msg-1",
+                role: "assistant",
+              },
+            },
+          },
+          {
+            type: "message.part.updated",
+            properties: {
+              sessionID: "__SESSION_ID__",
+              part: {
+                id: "p-1",
+                messageID: "msg-1",
+                type: "text",
+                text: "regular implement task result text",
+              },
+            },
+          },
+        ],
+      });
+      try {
+        const outcome = await runPrompt({
+          cwd: ctx.cwd,
+          kind: "task",
+          phase: "implement",
+          title: "Ordinary text task test",
+          promptText: "implement feature",
+          timeoutS: 10,
+        });
+
+        assert.equal(outcome.job.status, "completed");
+        assert.equal(outcome.job.result.recovered, true);
+        assert.equal(outcome.job.result.recovery.source, "opencode-events");
+        assert.match(outcome.resultText, /regular implement task result text/);
+      } finally {
+        ctx.killAll();
+        ctx.restore();
+        ctx.rm();
+      }
+    });
+
+    it("final-message success retains priority when GET succeeds", async () => {
+      const fromGet = {
+        schema_version: 1,
+        verdict: "approve",
+        summary: "Authoritative review from successful GET",
+        findings: [],
+        next_steps: [],
+      };
+      const fromSse = {
+        schema_version: 1,
+        verdict: "needs-attention",
+        summary: "Stale SSE payload",
+        findings: [],
+        next_steps: [],
+      };
+      const ctx = v1StructuredRecoveryContext({
+        messageStatusCode: 200,
+        messagePayload: [
+          {
+            info: { id: "msg-get", role: "assistant", structured: fromGet },
+            parts: [{ type: "text", text: "fallback text" }],
+          },
+        ],
+        streamEvents: [
+          {
+            type: "message.updated",
+            properties: {
+              sessionID: "__SESSION_ID__",
+              info: {
+                id: "msg-sse",
+                role: "assistant",
+                structured: fromSse,
+              },
+            },
+          },
+        ],
+      });
+      try {
+        const outcome = await runPrompt({
+          cwd: ctx.cwd,
+          kind: "review",
+          phase: "review",
+          title: "Final message priority test",
+          promptText: "review changes",
+          timeoutS: 10,
+        });
+
+        assert.equal(outcome.job.status, "completed");
+        assert.equal(outcome.job.result.source, "final-message");
+        assert.equal(outcome.job.result.recovered, false);
+        assert.equal(outcome.job.result.fetchFailed, false);
+
+        const parsed = JSON.parse(outcome.resultText);
+        assert.equal(parsed.summary, "Authoritative review from successful GET");
+        assert.equal(parsed.verdict, "approve");
+      } finally {
+        ctx.killAll();
+        ctx.restore();
+        ctx.rm();
+      }
+    });
+  });
+});
