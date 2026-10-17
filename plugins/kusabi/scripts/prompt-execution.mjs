@@ -664,7 +664,6 @@ export function recoverStructuredReviewFromEvents(eventsPath, sessionID) {
     }
     if (!event || typeof event !== "object") continue;
 
-    // Strict session matching: drop events belonging to other sessions
     // Strict session matching: events must carry the exact target session id
     // (including properties.info.sessionID).  A sessionless event is not
     // evidence for THIS session and must never supply an approval.
