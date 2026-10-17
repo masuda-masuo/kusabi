@@ -2,6 +2,9 @@
 // Pure functions — no I/O, no imports from kusabi-companion.mjs.
 
 import { formatCodexSupportedModels } from "./codex-dispatch.mjs";
+import { OPENCODE_FREE_WORKER_CHAIN, isOpenCodeFreeWorkerEnabled } from "./free-worker-profile.mjs";
+
+export { OPENCODE_FREE_WORKER_CHAIN, isOpenCodeFreeWorkerEnabled };
 
 export const WRITE_TOOL_NAMES = ["bash", "edit", "write", "patch", "task"];
 
@@ -452,12 +455,15 @@ export function stripBackendPrefixChain(chain) {
 export const stripClaudePrefixChain = stripBackendPrefixChain;
 
 export function resolveModel({ flag, phase, config }) {
+  const optIn = isOpenCodeFreeWorkerEnabled();
+  const defaultChain = optIn ? OPENCODE_FREE_WORKER_CHAIN : BUILTIN_DEFAULT_CHAIN;
+
   // Determine the full ordered chain (may be tiered: string|string[])
   let chain;
   if (config?.models?.chain) {
     chain = [...config.models.chain];
   } else {
-    chain = [...BUILTIN_DEFAULT_CHAIN];
+    chain = [...defaultChain];
   }
 
   // If we have an explicit --model flag, use it directly as the first model,

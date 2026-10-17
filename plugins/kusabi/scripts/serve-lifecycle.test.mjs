@@ -1,6 +1,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
+import http from "node:http";
 import process from "node:process";
 import fs from "node:fs";
 import os from "node:os";
@@ -16,6 +17,7 @@ import {
   reapIdleServes,
   isOurServe,
   waitForPublishedHealthy,
+  checkServerProfileCompatibility,
 } from "./serve-lifecycle.mjs";
 import { readJson, stateDirFor } from "./state-paths.mjs";
 // The identity gate is shared by every kill site (kusabi #181); these two
@@ -1818,6 +1820,114 @@ describe("watchdog kill decision (identity gate, spawn-based)", () => {
       killPid(child.pid);
       fx.restore();
       fs.rmSync(fx.tmp, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("Agenda2001: checkServerProfileCompatibility", () => {
+  it("rejects reusing default server when opt-in free worker is enabled", () => {
+    const restoreEnv = patchEnv({ KUSABI_OPENCODE_FREE_WORKER: "1" });
+    try {
+      const defaultServer = { pid: 12345, port: 4000, profile: "default", pure: false };
+      assert.throws(
+        () => checkServerProfileCompatibility(defaultServer),
+        /Server profile mismatch.*default mode/
+      );
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  it("rejects reusing opt-in pure server when opt-in is disabled", () => {
+    const restoreEnv = patchEnv({ KUSABI_OPENCODE_FREE_WORKER: undefined });
+    try {
+      const freeServer = { pid: 12345, port: 4000, profile: "free", pure: true };
+      assert.throws(
+        () => checkServerProfileCompatibility(freeServer),
+        /Server profile mismatch.*opt-in free worker mode/
+      );
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  it("allows reusing server with matching profile metadata", () => {
+    let restoreEnv = patchEnv({ KUSABI_OPENCODE_FREE_WORKER: "1" });
+    try {
+      assert.doesNotThrow(() =>
+        checkServerProfileCompatibility({ pid: 12345, port: 4000, profile: "free", pure: true })
+      );
+    } finally {
+      restoreEnv();
+    }
+
+    restoreEnv = patchEnv({ KUSABI_OPENCODE_FREE_WORKER: "0" });
+    try {
+      assert.doesNotThrow(() =>
+        checkServerProfileCompatibility({ pid: 12345, port: 4000, profile: "default", pure: false })
+      );
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  it("rejects opt-in reuse of an unidentified legacy server record (no profile/pure)", () => {
+    const restoreEnv = patchEnv({ KUSABI_OPENCODE_FREE_WORKER: "1" });
+    try {
+      const legacyFixture = { pid: 12345, port: 4000, password: "pw" };
+      assert.throws(
+        () => checkServerProfileCompatibility(legacyFixture),
+        /Server profile mismatch.*unidentified legacy record/
+      );
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  it("accepts a legacy default server record only in opt-out mode", () => {
+    const restoreEnv = patchEnv({ KUSABI_OPENCODE_FREE_WORKER: undefined });
+    try {
+      const legacyFixture = { pid: 12345, port: 4000, password: "pw" };
+      assert.doesNotThrow(() => checkServerProfileCompatibility(legacyFixture));
+    } finally {
+      restoreEnv();
+    }
+  });
+});
+
+describe("PR755: incompatible server is refused, never implicitly killed", () => {
+  it("throws for opt-in reuse of a healthy default server without touching it", async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-pr755-refuse-"));
+    const restoreEnv = patchEnv({
+      KUSABI_OPENCODE_FREE_WORKER: "1",
+      KUSABI_STATE_DIR: path.join(tmpDir, "state"),
+    });
+    const srv = http.createServer((req, res) => {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end("[]");
+    });
+    await new Promise((resolve) => srv.listen(0, "127.0.0.1", resolve));
+    const port = srv.address().port;
+    try {
+      const cwd = path.join(tmpDir, "cwd");
+      fs.mkdirSync(cwd, { recursive: true });
+      const stateDir = stateDirFor(cwd);
+      fs.writeFileSync(
+        path.join(stateDir, "server.json"),
+        JSON.stringify({ port, password: "pw", pid: process.pid, cwd, profile: "default", pure: false }),
+        "utf8"
+      );
+
+      await assert.rejects(ensureServer(cwd), /Server profile mismatch/);
+
+      // Refusal must not kill the incompatible server: it is still healthy.
+      assert.equal(srv.listening, true);
+      const res = await fetch(`http://127.0.0.1:${port}/session`);
+      assert.equal(res.ok, true);
+    } finally {
+      await new Promise((resolve) => srv.close(resolve));
+      restoreEnv();
+      fs.rmSync(tmpDir, { recursive: true, force: true });
     }
   });
 });

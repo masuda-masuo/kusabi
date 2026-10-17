@@ -30,6 +30,13 @@
 
 export default [
   {
+    // Vendored generated third-party artifacts are never linted: the official
+    // upstream bundle carries inline disable comments for rules this
+    // dependency-free config (deliberately) does not define.  See
+    // plugins/kusabi/vendor/PROVENANCE.md.
+    ignores: ["plugins/kusabi/vendor/**"],
+  },
+  {
     files: ["plugins/kusabi/scripts/**/*.mjs", "plugins/kusabi-codex-notify/scripts/**/*.mjs"],
     languageOptions: {
       ecmaVersion: 2024,

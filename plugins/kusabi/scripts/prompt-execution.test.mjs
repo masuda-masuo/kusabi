@@ -17,8 +17,11 @@ import {
   phaseRequiresOutput,
   probeEvidenceIncomplete,
   providerStatusFromError,
+  recoverStructuredReviewFromEvents,
   resetFailedRoutes,
   runPrompt,
+  validateFinalStructuredReview,
+  warnFreeWorkerConfiguredRoute,
 } from "./prompt-execution.mjs";
 import { stateDirFor } from "./state-paths.mjs";
 import { loadJob, saveJob } from "./job-store.mjs";
@@ -3316,3 +3319,838 @@ describe("runPrompt monotonic silence watchdog (kusabi #724)", () => {
   });
 });
 
+// =========================================================================
+// Agenda2001: V1 final-message GET 400 structured review recovery
+// =========================================================================
+
+function v1StructuredRecoveryServeSource({
+  messageStatusCode = 400,
+  messageError = "Expected OutputFormatJsonSchema",
+  messagePayload = null,
+  streamEvents = [],
+}) {
+  return `#!/usr/bin/env node
+import http from "node:http";
+import fs from "node:fs";
+
+const argv = process.argv.slice(2);
+if (argv.includes("--version")) {
+  process.stdout.write("1.19.3\\n");
+  process.exit(0);
+}
+const port = Number(argv[argv.indexOf("--port") + 1]);
+let nextSession = 0;
+const MESSAGE_STATUS = ${JSON.stringify(messageStatusCode)};
+const MESSAGE_ERROR = ${JSON.stringify(messageError)};
+const MESSAGE_PAYLOAD = ${JSON.stringify(messagePayload)};
+const STREAM_EVENTS = ${JSON.stringify(streamEvents)};
+
+function sse(res, event) {
+  res.write("data: " + JSON.stringify(event) + "\\n\\n");
+}
+
+const server = http.createServer((req, res) => {
+  res.on("error", () => {});
+  const url = new URL(req.url, "http://127.0.0.1:" + port);
+  req.on("data", () => {});
+  req.on("end", () => {
+    if (req.method === "GET" && url.pathname === "/session") {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end("[]");
+      return;
+    }
+    if (req.method === "POST" && url.pathname === "/session") {
+      const id = "ses-" + (++nextSession);
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ id }));
+      return;
+    }
+    const segs = url.pathname.split("/");
+    const sessionId = segs[2];
+    if (req.method === "POST" && segs[3] === "prompt_async") {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end("{}");
+      return;
+    }
+    if (req.method === "POST" && segs[3] === "abort") {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end("{}");
+      return;
+    }
+    if (req.method === "GET" && segs[3] === "message") {
+      if (MESSAGE_STATUS !== 200) {
+        res.writeHead(MESSAGE_STATUS, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: MESSAGE_ERROR }));
+        return;
+      }
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify(MESSAGE_PAYLOAD ?? []));
+      return;
+    }
+    if (req.method === "GET" && url.pathname === "/event") {
+      res.writeHead(200, { "content-type": "text/event-stream" });
+      const id = "ses-" + nextSession;
+      for (const ev of STREAM_EVENTS) {
+        const templated = JSON.parse(JSON.stringify(ev).replace(/__SESSION_ID__/g, id));
+        sse(res, templated);
+      }
+      sse(res, { type: "session.idle", properties: { sessionID: id } });
+      res.end();
+      return;
+    }
+    res.writeHead(404, { "content-type": "application/json" });
+    res.end("{}");
+  });
+});
+server.listen(port, "127.0.0.1");
+setInterval(() => {}, 1000);
+`;
+}
+
+function v1StructuredRecoveryContext(opts = {}, { freeWorker = true } = {}) {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-v1-recovery-test-"));
+  const binPath = path.join(tmp, "fake-serve.mjs");
+  fs.writeFileSync(binPath, v1StructuredRecoveryServeSource(opts), "utf8");
+  fs.chmodSync(binPath, 0o755);
+  const stateRoot = path.join(tmp, "state");
+  const cwd = path.join(tmp, "cwd");
+  fs.mkdirSync(cwd, { recursive: true });
+  const envPatch = {
+    OPENCODE_BIN: binPath,
+    KUSABI_STATE_DIR: stateRoot,
+    KUSABI_SERVE_READY_TIMEOUT_MS: "8000",
+  };
+  // Structured review recovery is opt-in only (finding 2): gate the whole
+  // structured flow on the free-worker profile plus a review intent.
+  if (freeWorker) envPatch.KUSABI_OPENCODE_FREE_WORKER = "1";
+  const restoreEnv = patchEnv(envPatch);
+  const stateDir = stateDirFor(cwd);
+  return {
+    tmp,
+    cwd,
+    stateDir,
+    restore() {
+      restoreEnv();
+    },
+    killAll() {
+      try {
+        const rec = JSON.parse(fs.readFileSync(path.join(stateDir, "server.json"), "utf8"));
+        try { process.kill(rec.pid, "SIGKILL"); } catch { /* already gone */ }
+      } catch { /* no record */ }
+    },
+    rm() {
+      try { fs.rmSync(tmp, { recursive: true, force: true }); } catch { /* best effort */ }
+    },
+  };
+}
+
+describe("Agenda2001: preserve structured review on V1 final-message GET failure", () => {
+  describe("recoverStructuredReviewFromEvents unit tests", () => {
+    it("returns events-unreadable for non-existent events file", () => {
+      const res = recoverStructuredReviewFromEvents("/non/existent/events.ndjson", "ses-1");
+      assert.equal(res.ok, false);
+      assert.equal(res.reason, "events-unreadable");
+    });
+
+    it("returns no-assistant-messages when events contain no assistant messages", () => {
+      const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "unit-test-"));
+      const ep = path.join(tmp, "events.ndjson");
+      fs.writeFileSync(ep, JSON.stringify({ type: "message.updated", properties: { sessionID: "ses-1", info: { id: "m1", role: "user" } } }) + "\n");
+      try {
+        const res = recoverStructuredReviewFromEvents(ep, "ses-1");
+        assert.equal(res.ok, false);
+        assert.equal(res.reason, "no-assistant-messages");
+      } finally {
+        fs.rmSync(tmp, { recursive: true, force: true });
+      }
+    });
+
+    it("excludes events with mismatched sessionID", () => {
+      const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "unit-test-"));
+      const ep = path.join(tmp, "events.ndjson");
+      fs.writeFileSync(ep, JSON.stringify({
+        type: "message.updated",
+        properties: {
+          sessionID: "ses-other",
+          info: {
+            id: "msg-other",
+            role: "assistant",
+            structured: { schema_version: 1, verdict: "approve", summary: "ok", findings: [], next_steps: [] },
+          },
+        },
+      }) + "\n");
+      try {
+        const res = recoverStructuredReviewFromEvents(ep, "ses-current");
+        assert.equal(res.ok, false);
+        assert.equal(res.reason, "no-assistant-messages");
+      } finally {
+        fs.rmSync(tmp, { recursive: true, force: true });
+      }
+    });
+
+    it("fails when latest assistant encountered an error", () => {
+      const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "unit-test-"));
+      const ep = path.join(tmp, "events.ndjson");
+      const lines = [
+        JSON.stringify({
+          type: "message.updated",
+          properties: {
+            sessionID: "ses-1",
+            info: {
+              id: "msg-1",
+              role: "assistant",
+              structured: { schema_version: 1, verdict: "approve", summary: "early", findings: [], next_steps: [] },
+            },
+          },
+        }),
+        JSON.stringify({
+          type: "message.updated",
+          properties: {
+            sessionID: "ses-1",
+            info: {
+              id: "msg-2",
+              role: "assistant",
+              error: { message: "Context exhausted" },
+            },
+          },
+        }),
+      ];
+      fs.writeFileSync(ep, lines.join("\n") + "\n");
+      try {
+        const res = recoverStructuredReviewFromEvents(ep, "ses-1");
+        assert.equal(res.ok, false);
+        assert.equal(res.reason, "assistant-error");
+        assert.equal(res.assistantId, "msg-2");
+        assert.ok(res.error);
+      } finally {
+        fs.rmSync(tmp, { recursive: true, force: true });
+      }
+    });
+
+    it("fails when latest assistant structured output is malformed against canonical schema", () => {
+      const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "unit-test-"));
+      const ep = path.join(tmp, "events.ndjson");
+      fs.writeFileSync(ep, JSON.stringify({
+        type: "message.updated",
+        properties: {
+          sessionID: "ses-1",
+          info: {
+            id: "msg-1",
+            role: "assistant",
+            structured: { verdict: "approve" }, // missing schema_version, summary, findings, next_steps
+          },
+        },
+      }) + "\n");
+      try {
+        const res = recoverStructuredReviewFromEvents(ep, "ses-1");
+        assert.equal(res.ok, false);
+        assert.equal(res.reason, "schema-validation-failed");
+        assert.ok(Array.isArray(res.errors));
+        assert.ok(res.errors.length > 0);
+      } finally {
+        fs.rmSync(tmp, { recursive: true, force: true });
+      }
+    });
+  });
+
+  describe("runPrompt E2E targeted recovery tests", () => {
+    it("valid current assistant structured recovers as JSON on GET 400", async () => {
+      const validReview = {
+        schema_version: 1,
+        verdict: "approve",
+        summary: "Implementation looks clean and verified",
+        findings: [],
+        next_steps: ["ship to canary"],
+      };
+      const ctx = v1StructuredRecoveryContext({
+        messageStatusCode: 400,
+        messageError: "Expected OutputFormatJsonSchema",
+        streamEvents: [
+          {
+            type: "message.updated",
+            properties: {
+              sessionID: "__SESSION_ID__",
+              info: {
+                id: "msg-1",
+                role: "assistant",
+                structured: validReview,
+              },
+            },
+          },
+        ],
+      });
+      try {
+        const outcome = await runPrompt({
+          cwd: ctx.cwd,
+          kind: "review",
+          phase: "review",
+          title: "Agenda2001 test",
+          promptText: "review changes",
+          timeoutS: 10,
+        });
+
+        assert.equal(outcome.job.status, "completed");
+        assert.equal(outcome.job.result.recovered, true);
+        assert.equal(outcome.job.result.source, "recovered");
+        assert.equal(outcome.job.result.fetchFailed, true);
+        assert.match(outcome.job.result.fetchError, /400/);
+        assert.equal(outcome.job.result.recovery.source, "opencode-structured-events");
+        assert.equal(outcome.job.result.recovery.schemaVersion, 1);
+
+        const parsed = JSON.parse(outcome.resultText);
+        assert.deepEqual(parsed, validReview);
+      } finally {
+        ctx.killAll();
+        ctx.restore();
+        ctx.rm();
+      }
+    });
+
+    it("mismatched session excluded from structured recovery", async () => {
+      const foreignReview = {
+        schema_version: 1,
+        verdict: "approve",
+        summary: "Foreign session review",
+        findings: [],
+        next_steps: [],
+      };
+      const ctx = v1StructuredRecoveryContext({
+        messageStatusCode: 400,
+        messageError: "Expected OutputFormatJsonSchema",
+        streamEvents: [
+          {
+            type: "message.updated",
+            properties: {
+              sessionID: "ses-foreign-999",
+              info: {
+                id: "msg-foreign",
+                role: "assistant",
+                structured: foreignReview,
+              },
+            },
+          },
+        ],
+      });
+      try {
+        const outcome = await runPrompt({
+          cwd: ctx.cwd,
+          kind: "review",
+          phase: "review",
+          title: "Mismatched session test",
+          promptText: "review changes",
+          timeoutS: 10,
+        });
+
+        assert.equal(outcome.job.status, "completed");
+        assert.equal(outcome.job.result.recovered, false);
+        assert.equal(outcome.resultText, "");
+      } finally {
+        ctx.killAll();
+        ctx.restore();
+        ctx.rm();
+      }
+    });
+
+    it("earlier structured assistant followed by newer errored assistant cannot approve", async () => {
+      const earlyReview = {
+        schema_version: 1,
+        verdict: "approve",
+        summary: "Early review before error",
+        findings: [],
+        next_steps: [],
+      };
+      const ctx = v1StructuredRecoveryContext({
+        messageStatusCode: 400,
+        messageError: "Expected OutputFormatJsonSchema",
+        streamEvents: [
+          {
+            type: "message.updated",
+            properties: {
+              sessionID: "__SESSION_ID__",
+              info: {
+                id: "msg-1",
+                role: "assistant",
+                structured: earlyReview,
+              },
+            },
+          },
+          {
+            type: "message.updated",
+            properties: {
+              sessionID: "__SESSION_ID__",
+              info: {
+                id: "msg-2",
+                role: "assistant",
+                error: { message: "Context length exceeded on subsequent assistant turn" },
+              },
+            },
+          },
+        ],
+      });
+      try {
+        const outcome = await runPrompt({
+          cwd: ctx.cwd,
+          kind: "review",
+          phase: "review",
+          title: "Errored newer assistant test",
+          promptText: "review changes",
+          timeoutS: 10,
+        });
+
+        assert.equal(outcome.job.result.recovered, false);
+        assert.equal(outcome.job.result.recovery.reason, "assistant-error");
+        assert.equal(outcome.resultText, "");
+        assert.ok(outcome.job.error);
+      } finally {
+        ctx.killAll();
+        ctx.restore();
+        ctx.rm();
+      }
+    });
+
+    it("malformed structured schema cannot approve", async () => {
+      const malformed = {
+        verdict: "approve",
+      };
+      const ctx = v1StructuredRecoveryContext({
+        messageStatusCode: 400,
+        messageError: "Expected OutputFormatJsonSchema",
+        streamEvents: [
+          {
+            type: "message.updated",
+            properties: {
+              sessionID: "__SESSION_ID__",
+              info: {
+                id: "msg-1",
+                role: "assistant",
+                structured: malformed,
+              },
+            },
+          },
+        ],
+      });
+      try {
+        const outcome = await runPrompt({
+          cwd: ctx.cwd,
+          kind: "review",
+          phase: "review",
+          title: "Malformed schema test",
+          promptText: "review changes",
+          timeoutS: 10,
+        });
+
+        assert.equal(outcome.job.result.recovered, false);
+        assert.equal(outcome.job.result.recovery.reason, "schema-validation-failed");
+        assert.equal(outcome.resultText, "");
+      } finally {
+        ctx.killAll();
+        ctx.restore();
+        ctx.rm();
+      }
+    });
+
+    it("ordinary text recovery unaffected on GET 400 during task run", async () => {
+      const ctx = v1StructuredRecoveryContext({
+        messageStatusCode: 400,
+        messageError: "Expected OutputFormatJsonSchema",
+        streamEvents: [
+          {
+            type: "message.updated",
+            properties: {
+              sessionID: "__SESSION_ID__",
+              info: {
+                id: "msg-1",
+                role: "assistant",
+              },
+            },
+          },
+          {
+            type: "message.part.updated",
+            properties: {
+              sessionID: "__SESSION_ID__",
+              part: {
+                id: "p-1",
+                messageID: "msg-1",
+                type: "text",
+                text: "regular implement task result text",
+              },
+            },
+          },
+        ],
+      });
+      try {
+        const outcome = await runPrompt({
+          cwd: ctx.cwd,
+          kind: "task",
+          phase: "implement",
+          title: "Ordinary text task test",
+          promptText: "implement feature",
+          timeoutS: 10,
+        });
+
+        assert.equal(outcome.job.status, "completed");
+        assert.equal(outcome.job.result.recovered, true);
+        assert.equal(outcome.job.result.recovery.source, "opencode-events");
+        assert.match(outcome.resultText, /regular implement task result text/);
+      } finally {
+        ctx.killAll();
+        ctx.restore();
+        ctx.rm();
+      }
+    });
+
+    it("final-message success retains priority when GET succeeds", async () => {
+      const fromGet = {
+        schema_version: 1,
+        verdict: "approve",
+        summary: "Authoritative review from successful GET",
+        findings: [],
+        next_steps: [],
+      };
+      const fromSse = {
+        schema_version: 1,
+        verdict: "needs-attention",
+        summary: "Stale SSE payload",
+        findings: [],
+        next_steps: [],
+      };
+      const ctx = v1StructuredRecoveryContext({
+        messageStatusCode: 200,
+        messagePayload: [
+          {
+            info: { id: "msg-get", role: "assistant", structured: fromGet },
+            parts: [{ type: "text", text: "fallback text" }],
+          },
+        ],
+        streamEvents: [
+          {
+            type: "message.updated",
+            properties: {
+              sessionID: "__SESSION_ID__",
+              info: {
+                id: "msg-sse",
+                role: "assistant",
+                structured: fromSse,
+              },
+            },
+          },
+        ],
+      });
+      try {
+        const outcome = await runPrompt({
+          cwd: ctx.cwd,
+          kind: "review",
+          phase: "review",
+          title: "Final message priority test",
+          promptText: "review changes",
+          timeoutS: 10,
+        });
+
+        assert.equal(outcome.job.status, "completed");
+        assert.equal(outcome.job.result.source, "final-message");
+        assert.equal(outcome.job.result.recovered, false);
+        assert.equal(outcome.job.result.fetchFailed, false);
+
+        const parsed = JSON.parse(outcome.resultText);
+        assert.equal(parsed.summary, "Authoritative review from successful GET");
+        assert.equal(parsed.verdict, "approve");
+      } finally {
+        ctx.killAll();
+        ctx.restore();
+        ctx.rm();
+      }
+    });
+  });
+});
+
+// =========================================================================
+// PR755 review findings: structured flow isolation, final validation,
+// configured-route warning, strict session matching
+// =========================================================================
+
+describe("PR755: structured review flow is opt-in + review-intent only", () => {
+  it("opt-out review ignores info.structured and keeps text-parts behavior", async () => {
+    const ctx = v1StructuredRecoveryContext(
+      {
+        messageStatusCode: 200,
+        messagePayload: [
+          {
+            info: {
+              id: "m-get",
+              role: "assistant",
+              structured: {
+                schema_version: 1,
+                verdict: "approve",
+                summary: "structured should be ignored without opt-in",
+                findings: [],
+                next_steps: [],
+              },
+            },
+            parts: [{ type: "text", text: "plain text fallback" }],
+          },
+        ],
+      },
+      { freeWorker: false }
+    );
+    try {
+      const outcome = await runPrompt({
+        cwd: ctx.cwd,
+        kind: "review",
+        phase: "review",
+        agent: "kusabi-review",
+        title: "opt-out review",
+        promptText: "review",
+        timeoutS: 10,
+      });
+      assert.equal(outcome.resultText, "plain text fallback");
+      assert.equal(outcome.job.result.recovery, null);
+      assert.notEqual(outcome.job.result.recovery?.source, "opencode-structured-events");
+    } finally {
+      ctx.killAll();
+      ctx.restore();
+      ctx.rm();
+    }
+  });
+
+  it("nonreview run with an explicit json_schema format does not use structured recovery", async () => {
+    const validReview = {
+      schema_version: 1,
+      verdict: "approve",
+      summary: "must not be used for a nonreview run",
+      findings: [],
+      next_steps: [],
+    };
+    const ctx = v1StructuredRecoveryContext({
+      messageStatusCode: 400,
+      messageError: "Expected OutputFormatJsonSchema",
+      streamEvents: [
+        {
+          type: "message.updated",
+          properties: {
+            sessionID: "__SESSION_ID__",
+            info: { id: "m1", role: "assistant", structured: validReview },
+          },
+        },
+        {
+          type: "message.part.updated",
+          properties: {
+            sessionID: "__SESSION_ID__",
+            part: { id: "p1", messageID: "m1", type: "text", text: "implement task result text" },
+          },
+        },
+      ],
+    });
+    try {
+      const outcome = await runPrompt({
+        cwd: ctx.cwd,
+        kind: "task",
+        phase: "implement",
+        title: "nonreview with format",
+        promptText: "implement",
+        format: { type: "json_schema", schema: { type: "object" } },
+        timeoutS: 10,
+      });
+      assert.equal(outcome.job.result.recovery?.source, "opencode-events");
+      assert.match(outcome.resultText, /implement task result text/);
+    } finally {
+      ctx.killAll();
+      ctx.restore();
+      ctx.rm();
+    }
+  });
+});
+
+describe("PR755: final GET review validation (no silent approval, no SSE fallback)", () => {
+  it("invalid structured final response on GET 200 fails explicitly without SSE fallback", async () => {
+    const staleSse = {
+      schema_version: 1,
+      verdict: "needs-attention",
+      summary: "stale SSE payload that must not hide the invalid final GET",
+      findings: [],
+      next_steps: [],
+    };
+    const ctx = v1StructuredRecoveryContext({
+      messageStatusCode: 200,
+      messagePayload: [
+        { info: { id: "m-get", role: "assistant", structured: { verdict: "approve" } }, parts: [] },
+      ],
+      streamEvents: [
+        {
+          type: "message.updated",
+          properties: {
+            sessionID: "__SESSION_ID__",
+            info: { id: "m-sse", role: "assistant", structured: staleSse },
+          },
+        },
+      ],
+    });
+    try {
+      const outcome = await runPrompt({
+        cwd: ctx.cwd,
+        kind: "review",
+        phase: "review",
+        agent: "kusabi-review",
+        title: "invalid final structured",
+        promptText: "review",
+        timeoutS: 10,
+      });
+      assert.equal(outcome.resultText, "");
+      assert.equal(outcome.job.result.source, "final-message");
+      assert.equal(outcome.job.result.recovery.reason, "final-review-schema-validation-failed");
+      assert.ok(Array.isArray(outcome.job.result.recovery.errors));
+      assert.ok(outcome.job.error);
+    } finally {
+      ctx.killAll();
+      ctx.restore();
+      ctx.rm();
+    }
+  });
+
+  it("plain non-JSON final review text on GET 200 fails explicitly", async () => {
+    const ctx = v1StructuredRecoveryContext({
+      messageStatusCode: 200,
+      messagePayload: [
+        { info: { id: "m-get", role: "assistant" }, parts: [{ type: "text", text: "review prose, not structured" }] },
+      ],
+    });
+    try {
+      const outcome = await runPrompt({
+        cwd: ctx.cwd,
+        kind: "review",
+        phase: "review",
+        agent: "kusabi-review",
+        title: "plain final review",
+        promptText: "review",
+        timeoutS: 10,
+      });
+      assert.equal(outcome.resultText, "");
+      assert.equal(outcome.job.result.recovery.reason, "final-review-schema-validation-failed");
+      assert.match(outcome.job.result.recovery.error, /not valid JSON/);
+    } finally {
+      ctx.killAll();
+      ctx.restore();
+      ctx.rm();
+    }
+  });
+
+  it("validateFinalStructuredReview accepts canonical JSON and rejects empty/plain/invalid", () => {
+    const valid = { schema_version: 1, verdict: "approve", summary: "ok", findings: [], next_steps: [] };
+    const okRes = validateFinalStructuredReview(JSON.stringify(valid));
+    assert.equal(okRes.ok, true);
+    assert.deepEqual(okRes.structured, valid);
+
+    assert.equal(validateFinalStructuredReview("").ok, false);
+    assert.equal(validateFinalStructuredReview("   ").ok, false);
+    assert.equal(validateFinalStructuredReview("plain text").ok, false);
+    assert.equal(validateFinalStructuredReview(JSON.stringify({ verdict: "approve" })).ok, false);
+  });
+});
+
+describe("PR755: strict SSE session matching", () => {
+  it("sessionless message.updated events cannot provide a structured approval", () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pr755-sessionless-"));
+    const ep = path.join(tmp, "events.ndjson");
+    fs.writeFileSync(
+      ep,
+      JSON.stringify({
+        type: "message.updated",
+        properties: {
+          info: {
+            id: "msg-sessionless",
+            role: "assistant",
+            structured: { schema_version: 1, verdict: "approve", summary: "no session", findings: [], next_steps: [] },
+          },
+        },
+      }) + "\n"
+    );
+    try {
+      const res = recoverStructuredReviewFromEvents(ep, "ses-1");
+      assert.equal(res.ok, false);
+      assert.equal(res.reason, "no-assistant-messages");
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("PR755: configured OpenCode route outside free candidates warns and is unchanged", () => {
+  it("does not warn without opt-in, for free candidates, or for non-opencode backends", () => {
+    const messages = [];
+    const warn = (m) => messages.push(m);
+    assert.equal(warnFreeWorkerConfiguredRoute(["opencode/deepseek-v4.1-flash-free"], { enabled: false, warn }), null);
+    assert.equal(warnFreeWorkerConfiguredRoute(["claude/opus"], { enabled: true, warn }), null);
+    assert.equal(warnFreeWorkerConfiguredRoute(["agy/gemini-3.6-flash-high"], { enabled: true, warn }), null);
+    assert.equal(messages.length, 0);
+
+    assert.equal(warnFreeWorkerConfiguredRoute(["opencode/deepseek-v4.1-flash-free"], { enabled: true, warn }), null);
+    assert.equal(warnFreeWorkerConfiguredRoute(["opencode/glm-5.3-flash-free:max"], { enabled: true, warn }), null);
+    assert.equal(messages.length, 0);
+
+    const msg = warnFreeWorkerConfiguredRoute(["opencode-go/custom:max"], { enabled: true, warn });
+    assert.ok(msg);
+    assert.match(msg, /outside the free candidate chain/);
+    assert.equal(messages.length, 1);
+  });
+
+  it("emits a warning at the dispatch boundary while dispatching the configured route unchanged", async () => {
+    const restore = patchEnv({ KUSABI_OPENCODE_FREE_WORKER: "1" });
+    const originalWarn = console.warn;
+    const warnings = [];
+    console.warn = (m) => warnings.push(m);
+    try {
+      const result = await dispatchWithFallback({
+        tiers: [["opencode-go/custom-paid-model:max"]],
+        round: 1,
+        explicitModel: null,
+        kind: "review",
+        title: "dispatch warning",
+        promptText: "review",
+        _runPrompt: async () => ({
+          job: { id: "job-warn", status: "completed", stats: {}, usage: null },
+          resultText: "ok",
+          stateDir: null,
+        }),
+      });
+      assert.equal(result.job.modelEntry, "opencode-go/custom-paid-model:max");
+      assert.equal(warnings.length, 1);
+      assert.match(warnings[0], /outside the free candidate chain/);
+    } finally {
+      console.warn = originalWarn;
+      restore();
+    }
+  });
+
+  it("warns only about the actually selected route, never a later unused paid fallback", () => {
+    const messages = [];
+    const warn = (m) => messages.push(m);
+
+    // The selected (first) route is a non-opencode backend: no warning, even
+    // though a paid OpenCode route sits later in the unused fallback chain.
+    assert.equal(
+      warnFreeWorkerConfiguredRoute(["agy/gemini-3.6-flash-high", "opencode-go/paid-model:max"], { enabled: true, warn }),
+      null,
+    );
+    assert.equal(
+      warnFreeWorkerConfiguredRoute(["claude/opus", "opencode-go/paid-model:max"], { enabled: true, warn }),
+      null,
+    );
+    // A free candidate selected first also never warns about a later paid one.
+    assert.equal(
+      warnFreeWorkerConfiguredRoute(
+        ["opencode/deepseek-v4.1-flash-free", "opencode-go/paid-model:max"],
+        { enabled: true, warn },
+      ),
+      null,
+    );
+    assert.equal(messages.length, 0, "no warning may be emitted for an unused paid fallback");
+
+    // When the selected (first) route itself is a paid OpenCode route, warn.
+    const msg = warnFreeWorkerConfiguredRoute(["opencode-go/paid-model:max", "agy/gemini-3.6-flash-high"], {
+      enabled: true,
+      warn,
+    });
+    assert.ok(msg);
+    assert.match(msg, /outside the free candidate chain/);
+    assert.equal(messages.length, 1);
+  });
+});

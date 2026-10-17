@@ -10,6 +10,14 @@ import { writeJson, stateRoot } from "./state-paths.mjs";
 import { durationS } from "./render.mjs";
 import { parseModel, selectRoutes, splitRouteBackend } from "./cli.mjs";
 import { agyDispatch } from "./agy-dispatch.mjs";
+import {
+  isOpenCodeFreeWorkerEnabled,
+  getReviewSchema,
+  isReviewIntent,
+  isOpenCodeFreeCandidateRoute,
+  freeWorkerConfiguredRouteWarning,
+} from "./free-worker-profile.mjs";
+import { validateReview } from "./review-validate.mjs";
 
 let _cachedClaudeDispatch = null;
 async function getClaudeDispatch() {
@@ -618,10 +626,142 @@ export function accumulateUsage(events) {
   return { available: false };
 }
 
-async function fetchFinalMessage(server, sessionID) {
+/**
+ * Recover structured review object from recorded SSE events.
+ *
+ * When OpenCode V1 executes a prompt with structured output (format: { type: "json_schema", ... }),
+ * GET /session/{sessionID}/message fails with HTTP 400 ("Expected OutputFormatJsonSchema").
+ * However, the authoritative structured review was already emitted in the session's SSE stream
+ * inside `message.updated` (properties.info.structured) before session.idle.
+ *
+ * This function inspects the job's recorded events, isolates the matching session, identifies
+ * the latest relevant assistant message in order, ensures no subsequent assistant error occurred,
+ * validates the structured payload against the canonical review schema via validateReview,
+ * and returns the validated structured review.
+ *
+ * @param {string} eventsPath Path to events.ndjson
+ * @param {string} [sessionID] Expected session ID
+ * @returns {{ ok: true, assistantId: string, structured: object } | { ok: false, reason: string, assistantId?: string, error?: any, errors?: any[], structured?: any }}
+ */
+export function recoverStructuredReviewFromEvents(eventsPath, sessionID) {
+  let raw = "";
+  try {
+    raw = fs.readFileSync(eventsPath, "utf8");
+  } catch {
+    return { ok: false, reason: "events-unreadable" };
+  }
+
+  const messageMap = new Map();
+  const assistantOrder = [];
+
+  for (const line of raw.split("\n")) {
+    if (!line.trim()) continue;
+    let event;
+    try {
+      event = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    if (!event || typeof event !== "object") continue;
+
+    // Strict session matching: events must carry the exact target session id
+    // (including properties.info.sessionID).  A sessionless event is not
+    // evidence for THIS session and must never supply an approval.
+    const es = eventSession(event);
+    if (!sessionID || es !== sessionID) {
+      continue;
+    }
+
+    if (event.type === "message.updated") {
+      const info = event.properties?.info;
+      if (info && typeof info === "object" && typeof info.id === "string") {
+        const id = info.id;
+        const prev = messageMap.get(id) || {};
+        const merged = { ...prev, ...info };
+        messageMap.set(id, merged);
+        if (merged.role === "assistant" && !assistantOrder.includes(id)) {
+          assistantOrder.push(id);
+        }
+      }
+    }
+  }
+
+  if (assistantOrder.length === 0) {
+    return { ok: false, reason: "no-assistant-messages" };
+  }
+
+  const latestId = assistantOrder[assistantOrder.length - 1];
+  const latestAssistant = messageMap.get(latestId);
+
+  // Preserve latest error: never approve if latest assistant errored
+  const hasError = Boolean(latestAssistant.error || latestAssistant.finish === "error");
+  if (hasError) {
+    return {
+      ok: false,
+      reason: "assistant-error",
+      assistantId: latestId,
+      error: latestAssistant.error ?? { message: "assistant finished with error" },
+    };
+  }
+
+  const structured = latestAssistant.structured;
+  if (structured === undefined || structured === null) {
+    return {
+      ok: false,
+      reason: "no-structured-output",
+      assistantId: latestId,
+    };
+  }
+
+  let parsedStructured = structured;
+  if (typeof structured === "string") {
+    try {
+      parsedStructured = JSON.parse(structured);
+    } catch (err) {
+      return {
+        ok: false,
+        reason: "structured-json-unparseable",
+        assistantId: latestId,
+        error: String(err?.message ?? err),
+      };
+    }
+  }
+
+  // Canonical schema validation via validateReview
+  const validation = validateReview(parsedStructured);
+  if (!validation.valid) {
+    return {
+      ok: false,
+      reason: "schema-validation-failed",
+      assistantId: latestId,
+      errors: validation.errors,
+      structured: parsedStructured,
+    };
+  }
+
+  return {
+    ok: true,
+    assistantId: latestId,
+    structured: parsedStructured,
+  };
+}
+
+async function fetchFinalMessage(server, sessionID, { preferStructured = false } = {}) {
   const messages = (await api(server, "GET", `/session/${sessionID}/message`)) ?? [];
   const assistant = [...messages].reverse().find((m) => (m.info?.role ?? m.role) === "assistant");
   if (!assistant) return "";
+
+  // Prefer info.structured from the last assistant message ONLY for an
+  // opt-in structured review run.  Default reviews and non-review runs keep
+  // the pre-existing text-parts behavior: a json_schema format on a
+  // non-review run does not make it a review.
+  if (preferStructured && assistant.info?.structured !== undefined && assistant.info?.structured !== null) {
+    if (typeof assistant.info.structured === "string") {
+      return assistant.info.structured;
+    }
+    return JSON.stringify(assistant.info.structured);
+  }
+
   const parts = assistant.parts ?? [];
   return parts
     .filter((p) => p.type === "text" && p.text)
@@ -641,12 +781,55 @@ async function fetchFinalMessage(server, sessionID) {
  *
  * @returns {Promise<{ok: true, text: string}|{ok: false, error: string}>}
  */
-async function fetchFinalMessageOutcome(server, sessionID) {
+async function fetchFinalMessageOutcome(server, sessionID, opts = {}) {
   try {
-    return { ok: true, text: await fetchFinalMessage(server, sessionID) };
+    return { ok: true, text: await fetchFinalMessage(server, sessionID, opts) };
   } catch (err) {
     return { ok: false, error: String(err?.message ?? err) };
   }
+}
+
+/**
+ * Validate the final-message payload of an opt-in structured review run
+ * against the canonical review contract.
+ *
+ * The same canonical validator the SSE recovery path uses runs here too, so
+ * a final GET that returns arbitrary text (or schema-invalid structured data)
+ * cannot silently complete as an approval.  A valid payload serializes to
+ * canonical JSON for the review parser path; an invalid one returns the
+ * explicit failure and schema details and the caller must NOT fall back to a
+ * stale SSE/reasoning reconstruction to hide it.
+ *
+ * @param {string} text  final assistant message text (or serialized structured)
+ * On success the ORIGINAL text is preserved (not re-serialized): the
+ * validation is what matters, and byte-preserving keeps a valid text-part
+ * fallback identical to the fetched response.
+ *
+ * @returns {{ ok: true, structured: object, text: string } | { ok: false, error: string, errors?: any[], parsed?: any }}
+ */
+export function validateFinalStructuredReview(text) {
+  if (typeof text !== "string" || text.trim() === "") {
+    return { ok: false, error: "final review response is empty" };
+  }
+  let parsed;
+  try {
+    parsed = JSON.parse(text);
+  } catch (err) {
+    return {
+      ok: false,
+      error: `final review response is not valid JSON: ${err?.message ?? err}`,
+    };
+  }
+  const validation = validateReview(parsed);
+  if (!validation.valid) {
+    return {
+      ok: false,
+      error: "final review response failed canonical schema validation",
+      errors: validation.errors,
+      parsed,
+    };
+  }
+  return { ok: true, structured: parsed, text };
 }
 
 /**
@@ -1023,6 +1206,19 @@ export async function runPrompt({ cwd, kind, title, promptText, agent, model, se
     }
   })();
 
+  // Structured review flow is opt-in AND an actual review run (phase/kind/
+  // agent).  A json_schema format alone never classifies a run as review.
+  const reviewIntent = isReviewIntent({ phase, kind, agent });
+  const structuredReviewRun = isOpenCodeFreeWorkerEnabled() && reviewIntent;
+
+  let effectiveFormat = format;
+  if (!effectiveFormat && structuredReviewRun) {
+    effectiveFormat = {
+      type: "json_schema",
+      schema: getReviewSchema(),
+    };
+  }
+
   try {
     await Promise.race([sseConnected, new Promise((r) => setTimeout(r, 5000))]);
     await api(server, "POST", `/session/${sessionID}/prompt_async`, {
@@ -1031,7 +1227,7 @@ export async function runPrompt({ cwd, kind, title, promptText, agent, model, se
       ...(model ? { model: { providerID: model.providerID, modelID: model.modelID } } : {}),
       ...(model?.variant ? { variant: model.variant } : {}),
       ...(tools ? { tools } : {}),
-      ...(format ? { format } : {}),
+      ...(effectiveFormat ? { format: effectiveFormat } : {}),
     });
     await watcher;
   } finally {
@@ -1097,24 +1293,131 @@ export async function runPrompt({ cwd, kind, title, promptText, agent, model, se
     // Recover from those (deterministically, no LLM, no extra request) rather
     // than write an empty result.md.  The record also keeps "could not ask"
     // apart from "there was nothing to ask for" (result-recovery.mjs).
-    const fetched = await fetchFinalMessageOutcome(server, sessionID);
-    const dir = jobDir(stateDir, job.id);
-    const resolved = resolveCompletedResult({
-      backend: "opencode",
-      fetched,
-      coords: { eventsPath: path.join(dir, "events.ndjson") },
+    const fetched = await fetchFinalMessageOutcome(server, sessionID, {
+      preferStructured: structuredReviewRun,
     });
-    resultText = resolved.text;
-    job.result = resolved.record;
-    if (resolved.record.recovered) {
-      appendEvent(stateDir, job.id, {
-        type: "companion.result.recovered",
-        source: resolved.record.recovery.source,
-        chars: resolved.record.recovery.chars,
-        fetchFailed: resolved.record.fetchFailed,
-        fetchError: resolved.record.fetchError,
+    const dir = jobDir(stateDir, job.id);
+    const eventsPath = path.join(dir, "events.ndjson");
+
+    // Final-message success retains priority.  For an opt-in structured review
+    // the successful final GET is validated through the SAME canonical
+    // validator the SSE recovery uses, so arbitrary fetched text cannot
+    // silently complete as an approval.  An invalid final response is an
+    // explicit failure — never hidden by falling back to stale SSE/reasoning.
+    if (fetched?.ok === true && fetched?.text) {
+      if (structuredReviewRun) {
+        const finalCheck = validateFinalStructuredReview(fetched.text);
+        if (finalCheck.ok) {
+          resultText = finalCheck.text;
+          job.result = {
+            source: "final-message",
+            recovered: false,
+            fetchFailed: false,
+            fetchError: null,
+            recovery: null,
+          };
+        } else {
+          resultText = "";
+          if (finalCheck.error) job.error = job.error || finalCheck.error;
+          job.result = {
+            source: "final-message",
+            recovered: false,
+            fetchFailed: false,
+            fetchError: null,
+            recovery: {
+              source: "opencode-final-message",
+              backend: "opencode",
+              failed: true,
+              reason: "final-review-schema-validation-failed",
+              error: finalCheck.error ?? null,
+              errors: finalCheck.errors ?? null,
+            },
+          };
+        }
+      } else {
+        resultText = fetched.text;
+        job.result = {
+          source: "final-message",
+          recovered: false,
+          fetchFailed: false,
+          fetchError: null,
+          recovery: null,
+        };
+      }
+    } else if (structuredReviewRun) {
+      // Review structured recovery from recorded SSE events (Agenda2001).
+      // OpenCode V1 GET /session/{id}/message fails with HTTP 400 when structured
+      // format is used, but the authoritative structured review is in message.updated.
+      const structuredRecovery = recoverStructuredReviewFromEvents(eventsPath, sessionID);
+      const fetchFailed = fetched?.ok !== true;
+      const fetchError = fetchFailed ? String(fetched?.error ?? "unknown error") : null;
+
+      if (structuredRecovery.ok) {
+        resultText = JSON.stringify(structuredRecovery.structured, null, 2);
+        job.result = {
+          source: "recovered",
+          recovered: true,
+          fetchFailed,
+          fetchError,
+          recovery: {
+            source: "opencode-structured-events",
+            backend: "opencode",
+            chars: resultText.length,
+            assistantId: structuredRecovery.assistantId,
+            schemaVersion: structuredRecovery.structured?.schema_version ?? null,
+          },
+        };
+        appendEvent(stateDir, job.id, {
+          type: "companion.result.recovered",
+          source: job.result.recovery.source,
+          chars: job.result.recovery.chars,
+          fetchFailed: job.result.fetchFailed,
+          fetchError: job.result.fetchError,
+        });
+      } else {
+        // Structured review recovery failed (errored assistant, missing, or malformed schema).
+        // Reject or preserve explicit failure through established contract rather than silently
+        // approving from reasoning text. For review structured failure, do NOT claim successful schema output.
+        resultText = "";
+        if (structuredRecovery.reason === "assistant-error" && structuredRecovery.error) {
+          job.error = job.error || structuredRecovery.error;
+        }
+        job.result = {
+          source: fetchFailed ? "unavailable" : "none",
+          recovered: false,
+          fetchFailed,
+          fetchError,
+          recovery: {
+            source: "opencode-structured-events",
+            backend: "opencode",
+            failed: true,
+            reason: structuredRecovery.reason,
+            assistantId: structuredRecovery.assistantId ?? null,
+            error: structuredRecovery.error ?? null,
+            errors: structuredRecovery.errors ?? null,
+          },
+        };
+      }
+    } else {
+      // Default / non-review recovery behavior: recover plain text parts via resolveCompletedResult.
+      const resolved = resolveCompletedResult({
+        backend: "opencode",
+        fetched,
+        coords: { eventsPath },
       });
+      resultText = resolved.text;
+      job.result = resolved.record;
+      if (resolved.record.recovered) {
+        appendEvent(stateDir, job.id, {
+          type: "companion.result.recovered",
+          source: resolved.record.recovery.source,
+          chars: resolved.record.recovery.chars,
+          fetchFailed: resolved.record.fetchFailed,
+          fetchError: resolved.record.fetchError,
+        });
+      }
     }
+
     fs.writeFileSync(path.join(dir, "result.md"), resultText, "utf8");
 
     // kusabi #496: a provider stream that ended `finish: "unknown"` and then
@@ -1133,18 +1436,18 @@ export async function runPrompt({ cwd, kind, title, promptText, agent, model, se
     // failed.  The recovered text stays on disk so `kusabi-companion
     // result <id>` still returns it.
     if (finishedUnknown && phaseRequiresOutput(job.phase, job.kind)) {
-      const source = resolved.record.source;
+      const source = job.result?.source;
       if (source === "recovered" || source === "none") {
         job.noFinalEvidence = {
           finishedUnknown: true,
           source,
-          recovered: resolved.record.recovered === true,
+          recovered: job.result?.recovered === true,
           phase: job.phase,
         };
         appendEvent(stateDir, job.id, {
           type: "companion.result.no-final",
           source,
-          recovered: resolved.record.recovered === true,
+          recovered: job.result?.recovered === true,
           finishedUnknown: true,
           phase: job.phase,
         });
@@ -1158,6 +1461,39 @@ export async function runPrompt({ cwd, kind, title, promptText, agent, model, se
 // =========================================================================
 // dispatchWithFallback — single wrapper above runPrompt, below callers
 // =========================================================================
+
+/**
+ * Emit the configured-routing warning once at the dispatch boundary when the
+ * opt-in free worker profile is enabled and the first OpenCode route actually
+ * selected lies outside the two free candidates.
+ *
+ * Operator precedence is preserved: the configured route is dispatched
+ * unchanged.  AGY/Claude/Codex routes never warn — only an opencode-backend
+ * selection is relevant, and only opt-in enables the warning at all.  The
+ * pure model resolver is left side-effect free; this runs only here.
+ *
+ * @param {string[]} candidates  ordered route candidates about to be dispatched
+ * @param {{ enabled?: boolean, warn?: (msg: string) => void }} [opts]
+ * @returns {string|null} the warning message when one was emitted
+ */
+export function warnFreeWorkerConfiguredRoute(
+  candidates,
+  { enabled = isOpenCodeFreeWorkerEnabled(), warn = (msg) => console.warn(msg) } = {}
+) {
+  if (!enabled) return null;
+  // Only the route actually selected matters: the first candidate in the
+  // ordered chain is the one that will be dispatched.  Scanning later, unused
+  // fallbacks warned about a paid OpenCode route even when the selected route
+  // was AGY/Claude/Codex, which is not the route being used.
+  const selected = candidates[0];
+  if (!selected) return null;
+  const { backend } = splitRouteBackend(selected);
+  if (backend !== "opencode") return null;
+  if (isOpenCodeFreeCandidateRoute(selected)) return null;
+  const message = freeWorkerConfiguredRouteWarning(selected);
+  warn(message);
+  return message;
+}
 
 /**
  * Dispatch a prompt with automatic capacity fallback over the tiered chain.
@@ -1230,6 +1566,10 @@ export async function dispatchWithFallback(opts) {
     }
     return true;
   });
+
+  // Configured-routing warning (never an override): when opt-in is active and
+  // the selected OpenCode route is outside the two free candidates, say so.
+  warnFreeWorkerConfiguredRoute(candidates);
 
   if (candidates.length === 0) {
     const errorMsg = exclusionErrorPrefix && skippedExcludedRoutes.length > 0

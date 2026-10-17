@@ -6,6 +6,15 @@ import process from "node:process";
 import { spawn } from "node:child_process";
 import crypto from "node:crypto";
 import { stateDirFor, readJson, writeJson, kusabiOpencodeConfigHome } from "./state-paths.mjs";
+import {
+  isOpenCodeFreeWorkerEnabled,
+  checkOpencodeVersion,
+  checkServerProfileCompatibility,
+  assertInstalledAgentProfile,
+  opencodeAgentDiscoveryDir,
+} from "./free-worker-profile.mjs";
+
+export { checkOpencodeVersion, checkServerProfileCompatibility, assertInstalledAgentProfile };
 
 const SERVER_READY_TIMEOUT_MS = 20_000;
 
@@ -115,12 +124,21 @@ export async function serverHealthy(server) {
  * serve ever outlives a call that did not record it in server.json.
  */
 export async function ensureServer(cwd, { now = () => performance.now() } = {}) {
+  // Installed-agent mode isolation: reject a mismatch between the profile the
+  // phase agents were installed for and the active mode BEFORE this serve can
+  // reuse or start against the shared discovery directory.  Placement-invisible
+  // modes (no installed kusabi agents) are a no-op.
+  assertInstalledAgentProfile(opencodeAgentDiscoveryDir());
+
   const stateDir = stateDirFor(cwd);
   const serverFile = path.join(stateDir, "server.json");
   const timeoutMs = serverReadyTimeoutMs();
 
   const existing = readJson(serverFile);
-  if (await serverHealthy(existing)) return { ...existing, stateDir };
+  if (await serverHealthy(existing)) {
+    checkServerProfileCompatibility(existing, stateDir);
+    return { ...existing, stateDir };
+  }
 
   const lockDir = path.join(stateDir, "serve.lock");
   for (;;) {
@@ -133,7 +151,10 @@ export async function ensureServer(cwd, { now = () => performance.now() } = {}) 
       // Another caller is starting a serve.  Wait (bounded) for its
       // server.json to appear and become healthy, then reuse it.
       const published = await waitForPublishedHealthy(serverFile, lockDir, timeoutMs, { now });
-      if (published) return { ...published, stateDir };
+      if (published) {
+        checkServerProfileCompatibility(published, stateDir);
+        return { ...published, stateDir };
+      }
       if (lockIsStale(lockDir, timeoutMs)) {
         // The holder gave up (or died) without publishing: a lock older than
         // the ready timeout is stale.  Take it over and start ourselves.
@@ -182,13 +203,23 @@ function lockIsStale(lockDir, timeoutMs) {
 // lock afterwards); on any failure the spawned child is killed before the
 // error propagates, so a live serve is never left unrecorded.
 async function startServer({ stateDir, serverFile, cwd, timeoutMs, now = () => performance.now() }) {
+  if (isOpenCodeFreeWorkerEnabled()) {
+    checkOpencodeVersion(opencodeBin());
+  }
+
   const port = await freePort();
   const password = crypto.randomBytes(16).toString("hex");
   const logFile = path.join(stateDir, "server.log");
   const logFd = fs.openSync(logFile, "a");
+  const optIn = isOpenCodeFreeWorkerEnabled();
+  const serveArgs = ["serve", "--port", String(port)];
+  if (optIn) {
+    serveArgs.push("--pure");
+  }
+
   let child;
   try {
-    child = spawn(opencodeBin(), ["serve", "--port", String(port)], {
+    child = spawn(opencodeBin(), serveArgs, {
       cwd,
       detached: true,
       stdio: ["ignore", logFd, logFd],
@@ -207,7 +238,15 @@ async function startServer({ stateDir, serverFile, cwd, timeoutMs, now = () => p
     } catch { /* best-effort */ }
   });
 
-  const server = { port, password, pid: child.pid, cwd, startedAt: new Date().toISOString() };
+  const server = {
+    port,
+    password,
+    pid: child.pid,
+    cwd,
+    startedAt: new Date().toISOString(),
+    profile: optIn ? "free" : "default",
+    pure: optIn,
+  };
   const deadline = now() + timeoutMs;
   try {
     while (now() < deadline) {
