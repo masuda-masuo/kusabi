@@ -10,7 +10,13 @@ import { writeJson, stateRoot } from "./state-paths.mjs";
 import { durationS } from "./render.mjs";
 import { parseModel, selectRoutes, splitRouteBackend } from "./cli.mjs";
 import { agyDispatch } from "./agy-dispatch.mjs";
-import { isOpenCodeFreeWorkerEnabled, getReviewSchema } from "./free-worker-profile.mjs";
+import {
+  isOpenCodeFreeWorkerEnabled,
+  getReviewSchema,
+  isReviewIntent,
+  isOpenCodeFreeCandidateRoute,
+  freeWorkerConfiguredRouteWarning,
+} from "./free-worker-profile.mjs";
 import { validateReview } from "./review-validate.mjs";
 
 let _cachedClaudeDispatch = null;
@@ -659,8 +665,11 @@ export function recoverStructuredReviewFromEvents(eventsPath, sessionID) {
     if (!event || typeof event !== "object") continue;
 
     // Strict session matching: drop events belonging to other sessions
+    // Strict session matching: events must carry the exact target session id
+    // (including properties.info.sessionID).  A sessionless event is not
+    // evidence for THIS session and must never supply an approval.
     const es = eventSession(event);
-    if (es && sessionID && es !== sessionID) {
+    if (!sessionID || es !== sessionID) {
       continue;
     }
 
@@ -738,13 +747,16 @@ export function recoverStructuredReviewFromEvents(eventsPath, sessionID) {
   };
 }
 
-async function fetchFinalMessage(server, sessionID) {
+async function fetchFinalMessage(server, sessionID, { preferStructured = false } = {}) {
   const messages = (await api(server, "GET", `/session/${sessionID}/message`)) ?? [];
   const assistant = [...messages].reverse().find((m) => (m.info?.role ?? m.role) === "assistant");
   if (!assistant) return "";
 
-  // Prefer info.structured from last assistant message
-  if (assistant.info?.structured !== undefined && assistant.info?.structured !== null) {
+  // Prefer info.structured from the last assistant message ONLY for an
+  // opt-in structured review run.  Default reviews and non-review runs keep
+  // the pre-existing text-parts behavior: a json_schema format on a
+  // non-review run does not make it a review.
+  if (preferStructured && assistant.info?.structured !== undefined && assistant.info?.structured !== null) {
     if (typeof assistant.info.structured === "string") {
       return assistant.info.structured;
     }
@@ -770,12 +782,55 @@ async function fetchFinalMessage(server, sessionID) {
  *
  * @returns {Promise<{ok: true, text: string}|{ok: false, error: string}>}
  */
-async function fetchFinalMessageOutcome(server, sessionID) {
+async function fetchFinalMessageOutcome(server, sessionID, opts = {}) {
   try {
-    return { ok: true, text: await fetchFinalMessage(server, sessionID) };
+    return { ok: true, text: await fetchFinalMessage(server, sessionID, opts) };
   } catch (err) {
     return { ok: false, error: String(err?.message ?? err) };
   }
+}
+
+/**
+ * Validate the final-message payload of an opt-in structured review run
+ * against the canonical review contract.
+ *
+ * The same canonical validator the SSE recovery path uses runs here too, so
+ * a final GET that returns arbitrary text (or schema-invalid structured data)
+ * cannot silently complete as an approval.  A valid payload serializes to
+ * canonical JSON for the review parser path; an invalid one returns the
+ * explicit failure and schema details and the caller must NOT fall back to a
+ * stale SSE/reasoning reconstruction to hide it.
+ *
+ * @param {string} text  final assistant message text (or serialized structured)
+ * On success the ORIGINAL text is preserved (not re-serialized): the
+ * validation is what matters, and byte-preserving keeps a valid text-part
+ * fallback identical to the fetched response.
+ *
+ * @returns {{ ok: true, structured: object, text: string } | { ok: false, error: string, errors?: any[], parsed?: any }}
+ */
+export function validateFinalStructuredReview(text) {
+  if (typeof text !== "string" || text.trim() === "") {
+    return { ok: false, error: "final review response is empty" };
+  }
+  let parsed;
+  try {
+    parsed = JSON.parse(text);
+  } catch (err) {
+    return {
+      ok: false,
+      error: `final review response is not valid JSON: ${err?.message ?? err}`,
+    };
+  }
+  const validation = validateReview(parsed);
+  if (!validation.valid) {
+    return {
+      ok: false,
+      error: "final review response failed canonical schema validation",
+      errors: validation.errors,
+      parsed,
+    };
+  }
+  return { ok: true, structured: parsed, text };
 }
 
 /**
@@ -1152,8 +1207,13 @@ export async function runPrompt({ cwd, kind, title, promptText, agent, model, se
     }
   })();
 
+  // Structured review flow is opt-in AND an actual review run (phase/kind/
+  // agent).  A json_schema format alone never classifies a run as review.
+  const reviewIntent = isReviewIntent({ phase, kind, agent });
+  const structuredReviewRun = isOpenCodeFreeWorkerEnabled() && reviewIntent;
+
   let effectiveFormat = format;
-  if (!effectiveFormat && isOpenCodeFreeWorkerEnabled() && (phase === "review" || kind === "review")) {
+  if (!effectiveFormat && structuredReviewRun) {
     effectiveFormat = {
       type: "json_schema",
       schema: getReviewSchema(),
@@ -1234,31 +1294,58 @@ export async function runPrompt({ cwd, kind, title, promptText, agent, model, se
     // Recover from those (deterministically, no LLM, no extra request) rather
     // than write an empty result.md.  The record also keeps "could not ask"
     // apart from "there was nothing to ask for" (result-recovery.mjs).
-    const fetched = await fetchFinalMessageOutcome(server, sessionID);
+    const fetched = await fetchFinalMessageOutcome(server, sessionID, {
+      preferStructured: structuredReviewRun,
+    });
     const dir = jobDir(stateDir, job.id);
     const eventsPath = path.join(dir, "events.ndjson");
 
-    const isReviewRun =
-      phase === "review" ||
-      kind === "review" ||
-      Boolean(
-        effectiveFormat?.type === "json_schema" ||
-        format?.type === "json_schema" ||
-        effectiveFormat?.schema ||
-        format?.schema
-      );
-
-    // Final-message success retains priority.
+    // Final-message success retains priority.  For an opt-in structured review
+    // the successful final GET is validated through the SAME canonical
+    // validator the SSE recovery uses, so arbitrary fetched text cannot
+    // silently complete as an approval.  An invalid final response is an
+    // explicit failure — never hidden by falling back to stale SSE/reasoning.
     if (fetched?.ok === true && fetched?.text) {
-      resultText = fetched.text;
-      job.result = {
-        source: "final-message",
-        recovered: false,
-        fetchFailed: false,
-        fetchError: null,
-        recovery: null,
-      };
-    } else if (isReviewRun) {
+      if (structuredReviewRun) {
+        const finalCheck = validateFinalStructuredReview(fetched.text);
+        if (finalCheck.ok) {
+          resultText = finalCheck.text;
+          job.result = {
+            source: "final-message",
+            recovered: false,
+            fetchFailed: false,
+            fetchError: null,
+            recovery: null,
+          };
+        } else {
+          resultText = "";
+          if (finalCheck.error) job.error = job.error || finalCheck.error;
+          job.result = {
+            source: "final-message",
+            recovered: false,
+            fetchFailed: false,
+            fetchError: null,
+            recovery: {
+              source: "opencode-final-message",
+              backend: "opencode",
+              failed: true,
+              reason: "final-review-schema-validation-failed",
+              error: finalCheck.error ?? null,
+              errors: finalCheck.errors ?? null,
+            },
+          };
+        }
+      } else {
+        resultText = fetched.text;
+        job.result = {
+          source: "final-message",
+          recovered: false,
+          fetchFailed: false,
+          fetchError: null,
+          recovery: null,
+        };
+      }
+    } else if (structuredReviewRun) {
       // Review structured recovery from recorded SSE events (Agenda2001).
       // OpenCode V1 GET /session/{id}/message fails with HTTP 400 when structured
       // format is used, but the authoritative structured review is in message.updated.
@@ -1334,6 +1421,21 @@ export async function runPrompt({ cwd, kind, title, promptText, agent, model, se
 
     fs.writeFileSync(path.join(dir, "result.md"), resultText, "utf8");
 
+    // kusabi #496: a provider stream that ended `finish: "unknown"` and then
+    // went idle, with NO terminal final payload -- only a recovered
+    // event/reasoning reconstruction -- carries the deterministic STREAM
+    // signal of a run cut off mid-flight (measured incident job-mtyfpjlc8452:
+    // finish unknown, recovered reasoning-only text, zero deliverable
+    // changes, failed P3/P4 -- stored and notified as completed success).
+    // The signal alone is NOT the terminal verdict: the phase contract and
+    // the deliverable/probe evidence (no declared deliverable changes +
+    // failed P3/P4) decide it, and that evidence exists only at the
+    // probe-truth layer (cmdTask / the chain's probe phase).  runPrompt
+    // therefore only records the evidence on the job -- finalizeIncomplete
+    // CompletedRun closes the record there, and a complete-but-message-less
+    // write run whose deliverables/probes are green is never falsely
+    // failed.  The recovered text stays on disk so `kusabi-companion
+    // result <id>` still returns it.
     if (finishedUnknown && phaseRequiresOutput(job.phase, job.kind)) {
       const source = job.result?.source;
       if (source === "recovered" || source === "none") {
@@ -1360,6 +1462,39 @@ export async function runPrompt({ cwd, kind, title, promptText, agent, model, se
 // =========================================================================
 // dispatchWithFallback — single wrapper above runPrompt, below callers
 // =========================================================================
+
+/**
+ * Emit the configured-routing warning once at the dispatch boundary when the
+ * opt-in free worker profile is enabled and the first OpenCode route actually
+ * selected lies outside the two free candidates.
+ *
+ * Operator precedence is preserved: the configured route is dispatched
+ * unchanged.  AGY/Claude/Codex routes never warn — only an opencode-backend
+ * selection is relevant, and only opt-in enables the warning at all.  The
+ * pure model resolver is left side-effect free; this runs only here.
+ *
+ * @param {string[]} candidates  ordered route candidates about to be dispatched
+ * @param {{ enabled?: boolean, warn?: (msg: string) => void }} [opts]
+ * @returns {string|null} the warning message when one was emitted
+ */
+export function warnFreeWorkerConfiguredRoute(
+  candidates,
+  { enabled = isOpenCodeFreeWorkerEnabled(), warn = (msg) => console.warn(msg) } = {}
+) {
+  if (!enabled) return null;
+  // Only the route actually selected matters: the first candidate in the
+  // ordered chain is the one that will be dispatched.  Scanning later, unused
+  // fallbacks warned about a paid OpenCode route even when the selected route
+  // was AGY/Claude/Codex, which is not the route being used.
+  const selected = candidates[0];
+  if (!selected) return null;
+  const { backend } = splitRouteBackend(selected);
+  if (backend !== "opencode") return null;
+  if (isOpenCodeFreeCandidateRoute(selected)) return null;
+  const message = freeWorkerConfiguredRouteWarning(selected);
+  warn(message);
+  return message;
+}
 
 /**
  * Dispatch a prompt with automatic capacity fallback over the tiered chain.
@@ -1432,6 +1567,10 @@ export async function dispatchWithFallback(opts) {
     }
     return true;
   });
+
+  // Configured-routing warning (never an override): when opt-in is active and
+  // the selected OpenCode route is outside the two free candidates, say so.
+  warnFreeWorkerConfiguredRoute(candidates);
 
   if (candidates.length === 0) {
     const errorMsg = exclusionErrorPrefix && skippedExcludedRoutes.length > 0

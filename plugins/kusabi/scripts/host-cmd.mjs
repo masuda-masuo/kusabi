@@ -17,7 +17,11 @@ import process from "node:process";
 import { fileURLToPath } from "node:url";
 
 import { kusabiOpencodeConfigHome } from "./state-paths.mjs";
-import { isOpenCodeFreeWorkerEnabled, transformAgentForOptIn } from "./free-worker-profile.mjs";
+import {
+  isOpenCodeFreeWorkerEnabled,
+  prepareAgentInstall,
+  writeInstalledAgentProfile,
+} from "./free-worker-profile.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const PLUGIN_ROOT = path.resolve(HERE, "..");
@@ -67,9 +71,13 @@ function destDirState(p) {
   return real.isDirectory() ? "directory" : "not-a-directory";
 }
 
-export function cmdInstallAgents() {
+// `sourceDir` / `skillSourceDir` are injectable seams for tests: they let a
+// test drive the real install entry path over disposable templates without
+// ever touching the checked-in ones.  Production callers pass nothing and get
+// the shipped directories.
+export function cmdInstallAgents({ sourceDir, skillSourceDir } = {}) {
   const kusabiConfigDir = path.join(kusabiOpencodeConfigHome(), "opencode");
-  const src = path.join(PLUGIN_ROOT, "opencode-agents");
+  const src = sourceDir || path.join(PLUGIN_ROOT, "opencode-agents");
   const dest = process.env.OPENCODE_AGENT_DIR || path.join(kusabiConfigDir, "agent");
 
   // Skills destination preflight — runs BEFORE any mutation, so a broken
@@ -77,7 +85,7 @@ export function cmdInstallAgents() {
   // the agent half installed and then dying on a raw mkdirSync EEXIST.
   // (OPENCODE_SKILL_DIR / OPENCODE_AGENT_DIR are placement overrides that
   // opencode 1.18.15 does not read; see the skills comment below.)
-  const skillSrc = path.join(PLUGIN_ROOT, "opencode-skills");
+  const skillSrc = skillSourceDir || path.join(PLUGIN_ROOT, "opencode-skills");
   const skillDest = process.env.OPENCODE_SKILL_DIR || path.join(kusabiConfigDir, "skills");
   const skillDestState = destDirState(skillDest);
   if (skillDestState !== "absent" && skillDestState !== "directory") {
@@ -85,6 +93,13 @@ export function cmdInstallAgents() {
       `skills destination ${skillDest} is not a usable directory (${skillDestState}); refusing to install skills`,
     );
   }
+
+  // Agent contents are computed BEFORE any mutation.  Transform failures
+  // (missing/malformed frontmatter, no wildcard deny) must fail the whole
+  // install cleanly rather than leave a half-transformed agent directory.
+  const optIn = isOpenCodeFreeWorkerEnabled();
+  const prepared = prepareAgentInstall(src, { optIn });
+  const files = prepared.map((p) => p.f);
 
   fs.mkdirSync(dest, { recursive: true });
   // Remove stale legacy agent definitions from install target
@@ -108,20 +123,18 @@ export function cmdInstallAgents() {
       removed += 1;
     }
   }
-  // Install current agent definitions under new kusabi-* names
-  const files = fs.existsSync(src) ? fs.readdirSync(src).filter((f) => f.endsWith(".md")) : [];
-  const optIn = isOpenCodeFreeWorkerEnabled();
-  for (const f of files) {
-    const srcFile = path.join(src, f);
+  // Install current agent definitions under new kusabi-* names.
+  for (const { f, srcFile, content } of prepared) {
     const destFile = path.join(dest, f);
-    if (!optIn) {
+    if (content === null) {
       fs.copyFileSync(srcFile, destFile);
     } else {
-      const content = fs.readFileSync(srcFile, "utf8");
-      const transformed = transformAgentForOptIn(content);
-      fs.writeFileSync(destFile, transformed, "utf8");
+      fs.writeFileSync(destFile, content, "utf8");
     }
   }
+  // Durable mode marker: the isolation guard (assertInstalledAgentProfile)
+  // reads it before a serve reuses/installs against this directory.
+  writeInstalledAgentProfile(dest, optIn ? "free" : "default");
 
   // Skills distribution: copy-and-overwrite ONLY — never delete anything at
   // the destination. The skills dir (OPENCODE_SKILL_DIR, default

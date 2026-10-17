@@ -2,7 +2,7 @@
 // Acceptance tests for Agenda2001 opt-in OpenCode free worker profile.
 // Pinned contract:
 // 1. Opt-in via KUSABI_OPENCODE_FREE_WORKER=1; absent/false leaves existing behavior untouched.
-// 2. Candidate configuration selects opencode/deepseek-v4.1-flash-free; GLM reserve only; operator models untouched.
+// 2. Candidate configuration selects opencode/deepseek-v4.1-flash-free (DeepSeek only, shared quota); explicit GLM supported/recognized; operator models untouched.
 // 3. Opt-in serve uses --pure and rejects detected OpenCode V2 or V1 < 1.19.3 with actionable error.
 // 4. Opt-in installed OpenCode phase agent definitions preserve sunaba/shiori permissions and add host read:ask and bash:deny; templates remain safe.
 // 5. OpenCode review requests send format: { type: 'json_schema', schema: <review-output.schema.json> } via prompt_async; no format on implement/gofer.
@@ -16,15 +16,27 @@ import path from "node:path";
 import os from "node:os";
 import http from "node:http";
 import process from "node:process";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 import { resolveModel, BUILTIN_DEFAULT_CHAIN } from "./cli.mjs";
 import { ensureServer, freePort } from "./serve-lifecycle.mjs";
 import { cmdInstallAgents } from "./host-cmd.mjs";
-import { runPrompt } from "./prompt-execution.mjs";
+import { runPrompt, warnFreeWorkerConfiguredRoute } from "./prompt-execution.mjs";
 import { parseReviewResult } from "./chain-review.mjs";
 import { stateDirFor } from "./state-paths.mjs";
 import { patchEnv, writeExecutable } from "./fixtures.mjs";
+import {
+  OPENCODE_FREE_WORKER_CHAIN,
+  OPENCODE_RECOGNIZED_FREE_MODELS,
+  assertInstalledAgentProfile,
+  detectInstalledAgentProfile,
+  classifyInstalledAgentContent,
+  isOpenCodeFreeCandidateRoute,
+  isOpenCodeFreeWorkerEnabled,
+  prepareAgentInstall,
+  transformAgentForOptIn,
+  writeInstalledAgentProfile,
+} from "./free-worker-profile.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PLUGIN_ROOT = path.resolve(__dirname, "..");
@@ -210,12 +222,18 @@ describe("Agenda2001 opt-in OpenCode free worker profile: acceptance tests", () 
       assert.equal(res.model?.modelID, "deepseek-v4.1-flash-free");
     });
 
-    it("1.3 Candidate configuration has GLM reserve only (no paid go routes in chain)", () => {
+    it("1.3 Candidate configuration contains DeepSeek only, no automatic GLM fallback (shared quota) and no paid routes", () => {
+      assert.deepEqual(OPENCODE_FREE_WORKER_CHAIN, ["opencode/deepseek-v4.1-flash-free"]);
+      assert.deepEqual(OPENCODE_RECOGNIZED_FREE_MODELS, [
+        "opencode/deepseek-v4.1-flash-free",
+        "opencode/glm-5.3-flash-free",
+      ]);
       restoreEnv = patchEnv({ KUSABI_OPENCODE_FREE_WORKER: "1" });
       const res = resolveModel({ flag: undefined, phase: undefined, config: null });
       const chainRoutes = res.chain.flat();
+      assert.deepEqual(chainRoutes, ["opencode/deepseek-v4.1-flash-free"]);
       const hasGlm = chainRoutes.some((route) => route.toLowerCase().includes("glm"));
-      assert.ok(hasGlm, `candidate chain must contain GLM reserve, got: ${JSON.stringify(chainRoutes)}`);
+      assert.equal(hasGlm, false, `candidate chain must not contain automatic GLM fallback, got: ${JSON.stringify(chainRoutes)}`);
       const hasPaidGo = chainRoutes.some((route) => route.includes("opencode-go/"));
       assert.ok(!hasPaidGo, `candidate chain must not contain paid opencode-go routes, got: ${JSON.stringify(chainRoutes)}`);
     });
@@ -225,6 +243,57 @@ describe("Agenda2001 opt-in OpenCode free worker profile: acceptance tests", () 
       const operatorRes = resolveModel({ flag: "codex/gpt-5", phase: undefined, config: null });
       assert.equal(operatorRes.model?.providerID, "codex");
       assert.equal(operatorRes.model?.modelID, "gpt-5");
+    });
+
+    it("1.5 Opt-in with no operator config yields DeepSeek only", () => {
+      restoreEnv = patchEnv({ KUSABI_OPENCODE_FREE_WORKER: "1" });
+      const res = resolveModel({ flag: undefined, phase: undefined, config: null });
+      assert.equal(res.model?.providerID, "opencode");
+      assert.equal(res.model?.modelID, "deepseek-v4.1-flash-free");
+      assert.deepEqual(res.chain, ["opencode/deepseek-v4.1-flash-free"]);
+    });
+
+    it("1.6 Explicit GLM remains honored and free recognized without warnings", () => {
+      restoreEnv = patchEnv({ KUSABI_OPENCODE_FREE_WORKER: "1" });
+      const res = resolveModel({ flag: "opencode/glm-5.3-flash-free", phase: undefined, config: null });
+      assert.equal(res.model?.providerID, "opencode");
+      assert.equal(res.model?.modelID, "glm-5.3-flash-free");
+
+      assert.equal(isOpenCodeFreeCandidateRoute("opencode/glm-5.3-flash-free"), true);
+      assert.equal(isOpenCodeFreeCandidateRoute("opencode/glm-5.3-flash-free:max"), true);
+      assert.equal(isOpenCodeFreeCandidateRoute("opencode/deepseek-v4.1-flash-free"), true);
+      assert.equal(isOpenCodeFreeCandidateRoute("opencode-go/custom"), false);
+
+      const warned = warnFreeWorkerConfiguredRoute(["opencode/glm-5.3-flash-free"], { enabled: true });
+      assert.equal(warned, null, "explicit GLM must not emit paid/non-free warnings");
+    });
+
+    it("1.7 Operator-configured routes remain untouched by opt-in defaults", () => {
+      restoreEnv = patchEnv({ KUSABI_OPENCODE_FREE_WORKER: "1" });
+      const customChain = ["codex/gpt-5", "agy/gemini-3.6-flash-high"];
+      const resChain = resolveModel({ flag: undefined, phase: undefined, config: { models: { chain: customChain } } });
+      assert.deepEqual(resChain.chain, customChain);
+      assert.equal(resChain.model?.providerID, "codex");
+      assert.equal(resChain.model?.modelID, "gpt-5");
+
+      const resPhase = resolveModel({
+        flag: undefined,
+        phase: "review",
+        config: { models: { phases: { review: ["opencode/glm-5.3-flash-free"] } } },
+      });
+      assert.equal(resPhase.model?.providerID, "opencode");
+      assert.equal(resPhase.model?.modelID, "glm-5.3-flash-free");
+    });
+
+    it("1.8 Opt-out defaults remain completely unchanged", () => {
+      for (const val of [undefined, "0", "false", ""]) {
+        restoreEnv = patchEnv({ KUSABI_OPENCODE_FREE_WORKER: val });
+        const res = resolveModel({ flag: undefined, phase: undefined, config: null });
+        assert.deepEqual(res.chain, BUILTIN_DEFAULT_CHAIN);
+        assert.equal(res.model?.providerID, "opencode");
+        assert.equal(res.model?.modelID, "deepseek-v4-flash-free");
+        assert.equal(isOpenCodeFreeWorkerEnabled(), false);
+      }
     });
   });
 
@@ -485,7 +554,7 @@ describe("Agenda2001 opt-in OpenCode free worker profile: acceptance tests", () 
       const stateDir = stateDirFor(cwd);
       fs.writeFileSync(
         path.join(stateDir, "server.json"),
-        JSON.stringify({ port, password: "test-pw", pid: process.pid, cwd, startedAt: new Date().toISOString() }),
+        JSON.stringify({ port, password: "test-pw", pid: process.pid, cwd, startedAt: new Date().toISOString(), profile: "free", pure: true }),
         "utf8"
       );
 
@@ -527,7 +596,7 @@ describe("Agenda2001 opt-in OpenCode free worker profile: acceptance tests", () 
       const stateDir = stateDirFor(cwd);
       fs.writeFileSync(
         path.join(stateDir, "server.json"),
-        JSON.stringify({ port, password: "test-pw", pid: process.pid, cwd, startedAt: new Date().toISOString() }),
+        JSON.stringify({ port, password: "test-pw", pid: process.pid, cwd, startedAt: new Date().toISOString(), profile: "free", pure: true }),
         "utf8"
       );
 
@@ -640,7 +709,7 @@ describe("Agenda2001 opt-in OpenCode free worker profile: acceptance tests", () 
       const stateDir = stateDirFor(cwd);
       fs.writeFileSync(
         path.join(stateDir, "server.json"),
-        JSON.stringify({ port, password: "test-pw", pid: process.pid, cwd, startedAt: new Date().toISOString() }),
+        JSON.stringify({ port, password: "test-pw", pid: process.pid, cwd, startedAt: new Date().toISOString(), profile: "free", pure: true }),
         "utf8"
       );
 
@@ -696,7 +765,7 @@ describe("Agenda2001 opt-in OpenCode free worker profile: acceptance tests", () 
       const stateDir = stateDirFor(cwd);
       fs.writeFileSync(
         path.join(stateDir, "server.json"),
-        JSON.stringify({ port, password: "test-pw", pid: process.pid, cwd, startedAt: new Date().toISOString() }),
+        JSON.stringify({ port, password: "test-pw", pid: process.pid, cwd, startedAt: new Date().toISOString(), profile: "free", pure: true }),
         "utf8"
       );
 
@@ -745,5 +814,578 @@ describe("Agenda2001 opt-in OpenCode free worker profile: acceptance tests", () 
       // This test pins the boundary: no broad audit subsystem module is expected or tested.
       assert.ok(true);
     });
+  });
+});
+
+// =========================================================================
+// PR755 finding 1 & 5: installed-agent mode isolation + fail-closed install
+// =========================================================================
+
+describe("PR755: installed agent profile isolation", () => {
+  let tmpDir;
+  let restoreEnv = () => {};
+
+  beforeEach(() => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-pr755-guard-"));
+  });
+
+  afterEach(() => {
+    restoreEnv();
+    try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch { /* best effort */ }
+  });
+
+  function discoveryDir() {
+    return path.join(tmpDir, "config", "opencode", "agent");
+  }
+
+  function writeAgent(name, content) {
+    const dir = discoveryDir();
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, name), content, "utf8");
+  }
+
+  const defaultTemplate = fs.readFileSync(path.join(AGENTS_DIR, "kusabi-review.md"), "utf8");
+
+  it("rejects dispatch after an opt-in install once the env is unset", async () => {
+    restoreEnv = patchEnv({
+      KUSABI_OPENCODE_FREE_WORKER: "1",
+      KUSABI_OPENCODE_CONFIG_HOME: path.join(tmpDir, "config"),
+      KUSABI_STATE_DIR: path.join(tmpDir, "state"),
+    });
+    cmdInstallAgents();
+    assert.equal(detectInstalledAgentProfile(discoveryDir()), "free");
+
+    // Flip to standard mode WITHOUT reinstalling.
+    const restoreFlip = patchEnv({ KUSABI_OPENCODE_FREE_WORKER: undefined });
+    try {
+      const cwd = path.join(tmpDir, "cwd");
+      fs.mkdirSync(cwd, { recursive: true });
+      await assert.rejects(
+        ensureServer(cwd),
+        /reinstall|Installed phase agents/i,
+        "opt-out dispatch must reject a free-installed agent directory"
+      );
+      assert.throws(
+        () => assertInstalledAgentProfile(discoveryDir(), false),
+        /reinstall/i
+      );
+    } finally {
+      restoreFlip();
+    }
+  });
+
+  it("inverse: rejects dispatch after a default install once opt-in is enabled", async () => {
+    restoreEnv = patchEnv({
+      KUSABI_OPENCODE_FREE_WORKER: undefined,
+      KUSABI_OPENCODE_CONFIG_HOME: path.join(tmpDir, "config"),
+      KUSABI_STATE_DIR: path.join(tmpDir, "state"),
+    });
+    cmdInstallAgents();
+    assert.equal(detectInstalledAgentProfile(discoveryDir()), "default");
+
+    const restoreFlip = patchEnv({ KUSABI_OPENCODE_FREE_WORKER: "1" });
+    try {
+      assert.throws(
+        () => assertInstalledAgentProfile(discoveryDir(), true),
+        /reinstall/i
+      );
+    } finally {
+      restoreFlip();
+    }
+  });
+
+  it("never silently trusts free-installed files that lack metadata", () => {
+    writeAgent("kusabi-review.md", transformAgentForOptIn(defaultTemplate));
+    assert.equal(detectInstalledAgentProfile(discoveryDir()), "free");
+    assert.throws(
+      () => assertInstalledAgentProfile(discoveryDir(), false),
+      /reinstall/i
+    );
+  });
+
+  it("accepts a structurally default legacy install in opt-out and rejects it in opt-in", () => {
+    writeAgent("kusabi-review.md", defaultTemplate);
+    assert.equal(detectInstalledAgentProfile(discoveryDir()), "default");
+    assert.doesNotThrow(() => assertInstalledAgentProfile(discoveryDir(), false));
+    assert.throws(() => assertInstalledAgentProfile(discoveryDir(), true), /reinstall/i);
+  });
+
+  it("treats a directory with no kusabi agents as absent (no-op)", () => {
+    assert.equal(detectInstalledAgentProfile(discoveryDir()), "absent");
+    assert.equal(assertInstalledAgentProfile(discoveryDir(), true), "absent");
+  });
+
+  it("classifies installed agent content structurally", () => {
+    assert.equal(classifyInstalledAgentContent(defaultTemplate), "default");
+    assert.equal(classifyInstalledAgentContent(transformAgentForOptIn(defaultTemplate)), "free");
+    assert.equal(classifyInstalledAgentContent("no frontmatter here"), "unknown");
+    assert.equal(classifyInstalledAgentContent("---\nname: x\npermission:\n  read: allow\n---\nbody"), "unknown");
+  });
+});
+
+describe("PR755: agent transform fails closed before any install", () => {
+  let tmpDir;
+
+  beforeEach(() => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-pr755-transform-"));
+  });
+
+  afterEach(() => {
+    try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch { /* best effort */ }
+  });
+
+  it("throws descriptive errors for missing frontmatter, missing permission block, and missing wildcard", () => {
+    assert.throws(() => transformAgentForOptIn("body only\n"), /frontmatter/i);
+    assert.throws(
+      () => transformAgentForOptIn("---\nname: kusabi-review\n---\nbody\n"),
+      /permission/i
+    );
+    assert.throws(
+      () => transformAgentForOptIn("---\nname: kusabi-review\npermission:\n  read: allow\n---\nbody\n"),
+      /wildcard/i
+    );
+  });
+
+  it("aborts the whole preflight when one template is malformed (no partial install)", () => {
+    const src = path.join(tmpDir, "agents");
+    fs.mkdirSync(src, { recursive: true });
+    fs.writeFileSync(path.join(src, "a-ok.md"), "---\nname: kusabi-implement\npermission:\n  \"*\": deny\n  sunaba_read_file_range: allow\n---\nbody ok\n", "utf8");
+    fs.writeFileSync(path.join(src, "b-malformed.md"), "---\nname: kusabi-review\npermission:\n  read: allow\n---\nbody\n", "utf8");
+    assert.throws(() => prepareAgentInstall(src, { optIn: true }), /wildcard/i);
+  });
+});
+
+// =========================================================================
+// PR755 follow-up: fail-closed constrained permission transform regressions
+// =========================================================================
+
+describe("PR755 follow-up: constrained permission rules are fail-closed", () => {
+  const VALID_NON_REVIEW =
+    "---\nname: kusabi-implement\npermission:\n  \"*\": deny\n  sunaba_sandbox_exec: allow\n---\nbody\n";
+
+  it("rejects a template that already broadens read or bash instead of normalizing it", () => {
+    assert.throws(
+      () =>
+        transformAgentForOptIn(
+          "---\nname: kusabi-implement\npermission:\n  \"*\": deny\n  read: allow\n  bash: allow\n---\nbody\n"
+        ),
+      /read.*must be "ask"/i
+    );
+    assert.throws(
+      () =>
+        transformAgentForOptIn(
+          "---\nname: kusabi-implement\npermission:\n  \"*\": deny\n  read: ask\n  bash: allow\n---\nbody\n"
+        ),
+      /bash.*must be "deny"/i
+    );
+  });
+
+  it("rejects a conflicting review StructuredOutput rule", () => {
+    assert.throws(
+      () =>
+        transformAgentForOptIn(
+          "---\nname: kusabi-review\npermission:\n  \"*\": deny\n  StructuredOutput: deny\n---\nbody\n"
+        ),
+      /StructuredOutput.*must be "allow"/i
+    );
+  });
+
+  it("rejects duplicate constrained rules, a later wildcard rule, and object mappings", () => {
+    assert.throws(
+      () =>
+        transformAgentForOptIn(
+          "---\nname: kusabi-implement\npermission:\n  \"*\": deny\n  read: ask\n  read: ask\n---\nbody\n"
+        ),
+      /duplicate permission rule "read"/i
+    );
+    assert.throws(
+      () =>
+        transformAgentForOptIn(
+          "---\nname: kusabi-implement\npermission:\n  \"*\": deny\n  \"*\": allow\n---\nbody\n"
+        ),
+      /duplicate permission rule "\*"|wildcard/i
+    );
+    assert.throws(
+      () =>
+        transformAgentForOptIn(
+          "---\nname: kusabi-implement\npermission:\n  \"*\": deny\n  read:\n    \"*\": allow\n---\nbody\n"
+        ),
+      /"read" must be a scalar/i
+    );
+  });
+
+  it("cannot be bypassed by quoting or comments on a conflicting value", () => {
+    assert.throws(
+      () =>
+        transformAgentForOptIn(
+          "---\nname: kusabi-implement\npermission:\n  \"*\": deny\n  read: \"allow\"\n---\nbody\n"
+        ),
+      /read.*must be "ask"/i
+    );
+    assert.throws(
+      () =>
+        transformAgentForOptIn(
+          "---\nname: kusabi-implement\npermission:\n  \"*\": deny\n  read: allow # explicitly broad\n---\nbody\n"
+        ),
+      /read.*must be "ask"/i
+    );
+  });
+
+  it("accepts exact scalar constrained rules idempotently", () => {
+    const exact =
+      "---\nname: kusabi-implement\npermission:\n  \"*\": deny\n  read: ask\n  bash: deny\n  sunaba_sandbox_exec: allow\n---\nbody\n";
+    const once = transformAgentForOptIn(exact);
+    assert.equal(once, exact, "an already-exact block must transform to itself");
+    assert.equal(transformAgentForOptIn(once), once, "transform must stay idempotent");
+  });
+
+  it("reads permission rules only from frontmatter, never from the body", () => {
+    const input =
+      "---\nname: kusabi-implement\npermission:\n  \"*\": deny\n---\nread: allow\nbash: allow\n";
+    const out = transformAgentForOptIn(input);
+    assert.match(out, /read: ask/);
+    assert.match(out, /bash: deny/);
+    assert.match(out, /read: allow\nbash: allow/, "body text must be preserved verbatim");
+  });
+
+  // Real install entry-path regression (PR755 round 2).  The old version of
+  // this test only exercised prepareAgentInstall and asserted a destination
+  // that was never passed to anything did not exist, which proved nothing
+  // about install atomicity.  This drives cmdInstallAgents itself with a
+  // disposable injected source and asserts the real destination and marker
+  // are never written when one template is invalid.
+  it("real cmdInstallAgents preflight writes no agent or marker when one template is invalid", () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-pr755-nopartial-"));
+    const dest = path.join(tmpDir, "dest");
+    const restoreEnv = patchEnv({
+      KUSABI_OPENCODE_FREE_WORKER: "1",
+      OPENCODE_AGENT_DIR: dest,
+      KUSABI_OPENCODE_CONFIG_HOME: path.join(tmpDir, "cfg"),
+    });
+    try {
+      const src = path.join(tmpDir, "agents");
+      fs.mkdirSync(src, { recursive: true });
+      fs.writeFileSync(path.join(src, "a-ok.md"), VALID_NON_REVIEW, "utf8");
+      fs.writeFileSync(
+        path.join(src, "b-broaden.md"),
+        "---\nname: kusabi-implement\npermission:\n  \"*\": deny\n  read: allow\n  bash: allow\n---\nbody\n",
+        "utf8"
+      );
+      assert.throws(
+        () => cmdInstallAgents({ sourceDir: src }),
+        /read.*must be "ask"/i,
+        "the real install entry path must reject the invalid template"
+      );
+      assert.equal(fs.existsSync(dest), false, "a failed install must not create the destination directory");
+      assert.equal(
+        fs.existsSync(path.join(dest, ".kusabi-install-profile.json")),
+        false,
+        "a failed install must not leave an installed-profile marker"
+      );
+    } finally {
+      restoreEnv();
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+});
+
+// =========================================================================
+// PR755 round 2: shared permission-block extraction and explicit allowlist
+// =========================================================================
+
+describe("PR755 round 2: one permission-block path for transform and classification", () => {
+  const BASE = (tail) => `---\nname: kusabi-implement\npermission:\n  "*": deny\n${tail}\n---\nbody\n`;
+
+  it("does not let column-0 or indented comments/blank lines truncate the permission block", () => {
+    // The orchestrator's reproduction: a column-0 comment before broadened
+    // grants used to end the block early, so the transform accepted and the
+    // broad grant survived with last-match precedence.
+    assert.throws(
+      () => transformAgentForOptIn(BASE("# column-0 comment\n  read: allow\n  bash: allow")),
+      /read.*must be "ask"/i
+    );
+    assert.throws(
+      () => transformAgentForOptIn(BASE("  # indented comment\n  read: allow")),
+      /read.*must be "ask"/i
+    );
+    assert.throws(() => transformAgentForOptIn(BASE("\n\n  bash: allow")), /bash.*must be "deny"/i);
+  });
+
+  it("rejects unknown exact host keys and general globs that could shadow a host tool", () => {
+    const cases = [
+      ["  write: allow", /unsupported permission key "write"/i],
+      ["  edit: allow", /unsupported permission key "edit"/i],
+      ["  patch: allow", /unsupported permission key "patch"/i],
+      ["  terminal: allow", /unsupported permission key "terminal"/i],
+      ['  "read*": allow', /unsupported permission key "read\*"/i],
+      ['  "write*": allow', /unsupported permission key "write\*"/i],
+      ['  "**": allow', /unsupported permission key "\*\*"/i],
+      ['  "sunaba_*": allow', /unsupported permission key "sunaba_\*"/i],
+      ['  "read": allow', /read.*must be "ask"/i],
+    ];
+    for (const [tail, re] of cases) {
+      assert.throws(() => transformAgentForOptIn(BASE(tail)), re, `must reject: ${tail.trim()}`);
+    }
+  });
+
+  it("rejects a duplicate wildcard rule", () => {
+    assert.throws(() => transformAgentForOptIn(BASE('  "*": allow')), /duplicate permission rule "\*"/i);
+    assert.throws(() => transformAgentForOptIn(BASE('  "*": deny')), /duplicate permission rule "\*"/i);
+  });
+
+  it("accepts a supported nested skill map and anchored tool families idempotently", () => {
+    const supported =
+      '---\nname: kusabi-implement\npermission:\n  "*": deny\n  kaiba_recall: allow\n  skill:\n    "kusabi-*": allow\n  shiori*: allow\n  sunaba_read_file_range: allow\n---\nbody\n';
+    const once = transformAgentForOptIn(supported);
+    assert.equal(transformAgentForOptIn(once), once, "supported template transform must be idempotent");
+    assert.match(once, /"kusabi-\*": allow/, "nested skill grant must be preserved verbatim");
+    assert.match(once, /read: ask/);
+    assert.match(once, /bash: deny/);
+  });
+
+  it("rejects an unsupported nested skill child", () => {
+    assert.throws(
+      () =>
+        transformAgentForOptIn(
+          '---\nname: kusabi-implement\npermission:\n  "*": deny\n  skill:\n    "evil-*": allow\n---\nbody\n'
+        ),
+      /nested skill rule/i
+    );
+  });
+
+  it("classifies every repository template default-first and transform results free", () => {
+    const templates = fs.readdirSync(AGENTS_DIR).filter((f) => f.endsWith(".md"));
+    assert.ok(templates.length > 0, "must find templates");
+    for (const file of templates) {
+      const content = fs.readFileSync(path.join(AGENTS_DIR, file), "utf8");
+      assert.equal(classifyInstalledAgentContent(content), "default", `${file} on disk must classify default`);
+      const transformed = transformAgentForOptIn(content);
+      assert.equal(
+        classifyInstalledAgentContent(transformed),
+        "free",
+        `${file} transformed must classify free`
+      );
+      assert.equal(transformAgentForOptIn(transformed), transformed, `${file} transform must be idempotent`);
+    }
+  });
+});
+
+describe("PR755 round 2: installed classification cannot be fooled or concealed", () => {
+  it("classifies a comment-truncated broadened free agent unknown, never default", () => {
+    const hiddenWrite =
+      '---\nname: kusabi-review\npermission:\n  "*": deny\n  read: ask\n  bash: deny\n# comment\n  write: allow\n---\nbody\n';
+    assert.equal(classifyInstalledAgentContent(hiddenWrite), "unknown");
+    assert.throws(() => transformAgentForOptIn(hiddenWrite), /unsupported permission key "write"/i);
+
+    const freeWithComment =
+      '---\nname: kusabi-review\npermission:\n  "*": deny\n# comment\n  read: ask\n  bash: deny\n---\nbody\n';
+    assert.equal(classifyInstalledAgentContent(freeWithComment), "free");
+    assert.notEqual(classifyInstalledAgentContent(freeWithComment), "default");
+  });
+
+  it("refuses an opt-out dispatch whose durable marker conceals tampered content", () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-pr755-conceal-"));
+    const dir = path.join(tmpDir, "agent");
+    try {
+      fs.mkdirSync(dir, { recursive: true });
+      writeInstalledAgentProfile(dir, "default");
+      fs.writeFileSync(
+        path.join(dir, "kusabi-review.md"),
+        '---\nname: kusabi-review\npermission:\n  "*": deny\n  read: ask\n  bash: deny\n  write: allow\n---\nbody\n',
+        "utf8"
+      );
+      assert.equal(detectInstalledAgentProfile(dir), "unknown");
+      assert.throws(() => assertInstalledAgentProfile(dir, false), /unknown|conflicting/i);
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses a marker that disagrees with the on-disk content", () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-pr755-conflict-"));
+    const dir = path.join(tmpDir, "agent");
+    try {
+      fs.mkdirSync(dir, { recursive: true });
+      const defaultTemplateInner = fs.readFileSync(path.join(AGENTS_DIR, "kusabi-review.md"), "utf8");
+      fs.writeFileSync(path.join(dir, "kusabi-review.md"), defaultTemplateInner, "utf8");
+      writeInstalledAgentProfile(dir, "free"); // marker says free, files are default
+      assert.equal(detectInstalledAgentProfile(dir), "unknown");
+      assert.throws(() => assertInstalledAgentProfile(dir, false), /unknown|conflicting/i);
+      assert.throws(() => assertInstalledAgentProfile(dir, true), /unknown|conflicting/i);
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it("classifies mixed free/default trees unknown and rejects dispatch in both modes across marker cases and entry orders", () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-pr755-mixed-"));
+    try {
+      const defaultContent = fs.readFileSync(path.join(AGENTS_DIR, "kusabi-review.md"), "utf8");
+      const freeContent = transformAgentForOptIn(defaultContent);
+
+      const orders = [
+        ["free-first", [["kusabi-a.md", freeContent], ["kusabi-b.md", defaultContent]]],
+        ["default-first", [["kusabi-a.md", defaultContent], ["kusabi-b.md", freeContent]]],
+      ];
+      const markers = [null, "free", "default"];
+
+      for (const [orderLabel, files] of orders) {
+        for (const marker of markers) {
+          const subDir = path.join(tmpDir, `${orderLabel}-${marker ?? "nomarker"}`);
+          fs.mkdirSync(subDir, { recursive: true });
+          if (marker) writeInstalledAgentProfile(subDir, marker);
+          for (const [fname, content] of files) {
+            fs.writeFileSync(path.join(subDir, fname), content, "utf8");
+          }
+
+          assert.equal(
+            detectInstalledAgentProfile(subDir),
+            "unknown",
+            `mixed tree (${orderLabel}, marker=${marker}) must detect as unknown`
+          );
+          assert.throws(
+            () => assertInstalledAgentProfile(subDir, true),
+            /unknown|conflicting/i,
+            `opt-in dispatch must reject mixed tree (${orderLabel}, marker=${marker})`
+          );
+          assert.throws(
+            () => assertInstalledAgentProfile(subDir, false),
+            /unknown|conflicting/i,
+            `opt-out dispatch must reject mixed tree (${orderLabel}, marker=${marker})`
+          );
+        }
+      }
+
+      // Homogeneous trees remain compatible with their matching marker or absent marker
+      const homogeneousDefaultDir = path.join(tmpDir, "homo-default");
+      fs.mkdirSync(homogeneousDefaultDir, { recursive: true });
+      fs.writeFileSync(path.join(homogeneousDefaultDir, "kusabi-a.md"), defaultContent, "utf8");
+      fs.writeFileSync(path.join(homogeneousDefaultDir, "kusabi-b.md"), defaultContent, "utf8");
+      assert.equal(detectInstalledAgentProfile(homogeneousDefaultDir), "default");
+      assert.equal(assertInstalledAgentProfile(homogeneousDefaultDir, false), "default");
+
+      const homogeneousFreeDir = path.join(tmpDir, "homo-free");
+      fs.mkdirSync(homogeneousFreeDir, { recursive: true });
+      writeInstalledAgentProfile(homogeneousFreeDir, "free");
+      fs.writeFileSync(path.join(homogeneousFreeDir, "kusabi-a.md"), freeContent, "utf8");
+      fs.writeFileSync(path.join(homogeneousFreeDir, "kusabi-b.md"), freeContent, "utf8");
+      assert.equal(detectInstalledAgentProfile(homogeneousFreeDir), "free");
+      assert.equal(assertInstalledAgentProfile(homogeneousFreeDir, true), "free");
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+});
+
+// =========================================================================
+// PR755: strict YAML parser — canonical parse + dependency boot
+// =========================================================================
+
+describe("PR755: strict YAML parsing and vendored-parser boot", () => {
+  it("parses a valid commented/nested source into ordered policy rules", async () => {
+    const { analyzeAgentFrontmatter } = await import("./free-worker-yaml.mjs");
+    const source = `---
+name: kusabi-implement
+# leading comment
+permission:
+  "*": deny   # wildcard
+  kaiba_recall: allow
+  skill:
+    "kusabi-*": allow
+  shiori*: allow
+  sunaba_read_file_range: allow
+---
+body
+`;
+    const parsed = analyzeAgentFrontmatter(source);
+    assert.equal(parsed.ok, true, parsed.ok ? "" : parsed.error);
+    assert.deepEqual(
+      parsed.rules.map((r) => [r.key, r.value]),
+      [
+        ["*", "deny"],
+        ["kaiba_recall", "allow"],
+        ["skill", undefined],
+        ["shiori*", "allow"],
+        ["sunaba_read_file_range", "allow"],
+      ],
+      "comments and quoted/nested keys must parse to the ordered rule list",
+    );
+  });
+
+  it("boots the vendored parser from a clean runtime copy with no ambient node_modules", async () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-pr755-clean-"));
+    try {
+      const pluginRoot = path.join(tmp, "plugins", "kusabi");
+      fs.mkdirSync(pluginRoot, { recursive: true });
+      // Copy only the authored modules the profile needs plus the vendored
+      // parser artifact; no package manifests, no node_modules.
+      fs.cpSync(path.join(PLUGIN_ROOT, "vendor"), path.join(pluginRoot, "vendor"), { recursive: true });
+      const scriptsDest = path.join(pluginRoot, "scripts");
+      fs.mkdirSync(scriptsDest, { recursive: true });
+      for (const f of ["free-worker-yaml.mjs", "free-worker-profile.mjs", "state-paths.mjs"]) {
+        fs.copyFileSync(path.join(PLUGIN_ROOT, "scripts", f), path.join(scriptsDest, f));
+      }
+      fs.cpSync(path.join(PLUGIN_ROOT, "schemas"), path.join(pluginRoot, "schemas"), { recursive: true });
+
+      // Prove there is no ambient dependency tree to fall back on.
+      assert.equal(fs.existsSync(path.join(pluginRoot, "node_modules")), false);
+      assert.equal(fs.existsSync(path.join(tmp, "node_modules")), false);
+
+      const mod = await import(pathToFileURL(path.join(scriptsDest, "free-worker-profile.mjs")).href);
+      const src = fs.readFileSync(path.join(AGENTS_DIR, "kusabi-review.md"), "utf8");
+      const out = mod.transformAgentForOptIn(src);
+      assert.match(out, /read:\s*ask/);
+      assert.match(out, /bash:\s*deny/);
+      assert.match(out, /StructuredOutput:\s*allow/);
+      assert.equal(mod.transformAgentForOptIn(out), out, "clean-copy transform must be idempotent");
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("surfaces actionable source line for invalid permission Pair nodes", async () => {
+    const { analyzeAgentFrontmatter } = await import("./free-worker-yaml.mjs");
+    // Invalid permission value on line 4 (Pair node in AST lacks node.range)
+    const invalidPair = [
+      "---",
+      "name: kusabi-implement",
+      "permission:",
+      '  "*": deny',
+      "  read: allow",
+      "---",
+      "body",
+    ].join("\n");
+    const res = analyzeAgentFrontmatter(invalidPair);
+    assert.equal(res.ok, false);
+    assert.equal(res.code, "invalid-permission");
+    assert.match(
+      res.error,
+      /\(frontmatter line 4\)/,
+      "semantic error must pinpoint line 4 for the invalid permission Pair",
+    );
+
+    assert.throws(
+      () => transformAgentForOptIn(invalidPair),
+      /\(frontmatter line 4\)/,
+      "transform exception must preserve actionable source line for the invalid Pair",
+    );
+
+    // Unsupported permission key Pair on line 4
+    const unsupportedKey = [
+      "---",
+      "name: kusabi-implement",
+      "permission:",
+      '  "*": deny',
+      "  write: allow",
+      "---",
+      "body",
+    ].join("\n");
+    const resUnsupported = analyzeAgentFrontmatter(unsupportedKey);
+    assert.equal(resUnsupported.ok, false);
+    assert.match(
+      resUnsupported.error,
+      /\(frontmatter line 4\)/,
+      "unsupported permission key Pair error must pinpoint line 4",
+    );
   });
 });

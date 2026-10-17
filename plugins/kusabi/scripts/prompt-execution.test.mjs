@@ -20,6 +20,8 @@ import {
   recoverStructuredReviewFromEvents,
   resetFailedRoutes,
   runPrompt,
+  validateFinalStructuredReview,
+  warnFreeWorkerConfiguredRoute,
 } from "./prompt-execution.mjs";
 import { stateDirFor } from "./state-paths.mjs";
 import { loadJob, saveJob } from "./job-store.mjs";
@@ -3332,6 +3334,10 @@ import http from "node:http";
 import fs from "node:fs";
 
 const argv = process.argv.slice(2);
+if (argv.includes("--version")) {
+  process.stdout.write("1.19.3\\n");
+  process.exit(0);
+}
 const port = Number(argv[argv.indexOf("--port") + 1]);
 let nextSession = 0;
 const MESSAGE_STATUS = ${JSON.stringify(messageStatusCode)};
@@ -3401,7 +3407,7 @@ setInterval(() => {}, 1000);
 `;
 }
 
-function v1StructuredRecoveryContext(opts = {}) {
+function v1StructuredRecoveryContext(opts = {}, { freeWorker = true } = {}) {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-v1-recovery-test-"));
   const binPath = path.join(tmp, "fake-serve.mjs");
   fs.writeFileSync(binPath, v1StructuredRecoveryServeSource(opts), "utf8");
@@ -3409,11 +3415,15 @@ function v1StructuredRecoveryContext(opts = {}) {
   const stateRoot = path.join(tmp, "state");
   const cwd = path.join(tmp, "cwd");
   fs.mkdirSync(cwd, { recursive: true });
-  const restoreEnv = patchEnv({
+  const envPatch = {
     OPENCODE_BIN: binPath,
     KUSABI_STATE_DIR: stateRoot,
     KUSABI_SERVE_READY_TIMEOUT_MS: "8000",
-  });
+  };
+  // Structured review recovery is opt-in only (finding 2): gate the whole
+  // structured flow on the free-worker profile plus a review intent.
+  if (freeWorker) envPatch.KUSABI_OPENCODE_FREE_WORKER = "1";
+  const restoreEnv = patchEnv(envPatch);
   const stateDir = stateDirFor(cwd);
   return {
     tmp,
@@ -3850,5 +3860,297 @@ describe("Agenda2001: preserve structured review on V1 final-message GET failure
         ctx.rm();
       }
     });
+  });
+});
+
+// =========================================================================
+// PR755 review findings: structured flow isolation, final validation,
+// configured-route warning, strict session matching
+// =========================================================================
+
+describe("PR755: structured review flow is opt-in + review-intent only", () => {
+  it("opt-out review ignores info.structured and keeps text-parts behavior", async () => {
+    const ctx = v1StructuredRecoveryContext(
+      {
+        messageStatusCode: 200,
+        messagePayload: [
+          {
+            info: {
+              id: "m-get",
+              role: "assistant",
+              structured: {
+                schema_version: 1,
+                verdict: "approve",
+                summary: "structured should be ignored without opt-in",
+                findings: [],
+                next_steps: [],
+              },
+            },
+            parts: [{ type: "text", text: "plain text fallback" }],
+          },
+        ],
+      },
+      { freeWorker: false }
+    );
+    try {
+      const outcome = await runPrompt({
+        cwd: ctx.cwd,
+        kind: "review",
+        phase: "review",
+        agent: "kusabi-review",
+        title: "opt-out review",
+        promptText: "review",
+        timeoutS: 10,
+      });
+      assert.equal(outcome.resultText, "plain text fallback");
+      assert.equal(outcome.job.result.recovery, null);
+      assert.notEqual(outcome.job.result.recovery?.source, "opencode-structured-events");
+    } finally {
+      ctx.killAll();
+      ctx.restore();
+      ctx.rm();
+    }
+  });
+
+  it("nonreview run with an explicit json_schema format does not use structured recovery", async () => {
+    const validReview = {
+      schema_version: 1,
+      verdict: "approve",
+      summary: "must not be used for a nonreview run",
+      findings: [],
+      next_steps: [],
+    };
+    const ctx = v1StructuredRecoveryContext({
+      messageStatusCode: 400,
+      messageError: "Expected OutputFormatJsonSchema",
+      streamEvents: [
+        {
+          type: "message.updated",
+          properties: {
+            sessionID: "__SESSION_ID__",
+            info: { id: "m1", role: "assistant", structured: validReview },
+          },
+        },
+        {
+          type: "message.part.updated",
+          properties: {
+            sessionID: "__SESSION_ID__",
+            part: { id: "p1", messageID: "m1", type: "text", text: "implement task result text" },
+          },
+        },
+      ],
+    });
+    try {
+      const outcome = await runPrompt({
+        cwd: ctx.cwd,
+        kind: "task",
+        phase: "implement",
+        title: "nonreview with format",
+        promptText: "implement",
+        format: { type: "json_schema", schema: { type: "object" } },
+        timeoutS: 10,
+      });
+      assert.equal(outcome.job.result.recovery?.source, "opencode-events");
+      assert.match(outcome.resultText, /implement task result text/);
+    } finally {
+      ctx.killAll();
+      ctx.restore();
+      ctx.rm();
+    }
+  });
+});
+
+describe("PR755: final GET review validation (no silent approval, no SSE fallback)", () => {
+  it("invalid structured final response on GET 200 fails explicitly without SSE fallback", async () => {
+    const staleSse = {
+      schema_version: 1,
+      verdict: "needs-attention",
+      summary: "stale SSE payload that must not hide the invalid final GET",
+      findings: [],
+      next_steps: [],
+    };
+    const ctx = v1StructuredRecoveryContext({
+      messageStatusCode: 200,
+      messagePayload: [
+        { info: { id: "m-get", role: "assistant", structured: { verdict: "approve" } }, parts: [] },
+      ],
+      streamEvents: [
+        {
+          type: "message.updated",
+          properties: {
+            sessionID: "__SESSION_ID__",
+            info: { id: "m-sse", role: "assistant", structured: staleSse },
+          },
+        },
+      ],
+    });
+    try {
+      const outcome = await runPrompt({
+        cwd: ctx.cwd,
+        kind: "review",
+        phase: "review",
+        agent: "kusabi-review",
+        title: "invalid final structured",
+        promptText: "review",
+        timeoutS: 10,
+      });
+      assert.equal(outcome.resultText, "");
+      assert.equal(outcome.job.result.source, "final-message");
+      assert.equal(outcome.job.result.recovery.reason, "final-review-schema-validation-failed");
+      assert.ok(Array.isArray(outcome.job.result.recovery.errors));
+      assert.ok(outcome.job.error);
+    } finally {
+      ctx.killAll();
+      ctx.restore();
+      ctx.rm();
+    }
+  });
+
+  it("plain non-JSON final review text on GET 200 fails explicitly", async () => {
+    const ctx = v1StructuredRecoveryContext({
+      messageStatusCode: 200,
+      messagePayload: [
+        { info: { id: "m-get", role: "assistant" }, parts: [{ type: "text", text: "review prose, not structured" }] },
+      ],
+    });
+    try {
+      const outcome = await runPrompt({
+        cwd: ctx.cwd,
+        kind: "review",
+        phase: "review",
+        agent: "kusabi-review",
+        title: "plain final review",
+        promptText: "review",
+        timeoutS: 10,
+      });
+      assert.equal(outcome.resultText, "");
+      assert.equal(outcome.job.result.recovery.reason, "final-review-schema-validation-failed");
+      assert.match(outcome.job.result.recovery.error, /not valid JSON/);
+    } finally {
+      ctx.killAll();
+      ctx.restore();
+      ctx.rm();
+    }
+  });
+
+  it("validateFinalStructuredReview accepts canonical JSON and rejects empty/plain/invalid", () => {
+    const valid = { schema_version: 1, verdict: "approve", summary: "ok", findings: [], next_steps: [] };
+    const okRes = validateFinalStructuredReview(JSON.stringify(valid));
+    assert.equal(okRes.ok, true);
+    assert.deepEqual(okRes.structured, valid);
+
+    assert.equal(validateFinalStructuredReview("").ok, false);
+    assert.equal(validateFinalStructuredReview("   ").ok, false);
+    assert.equal(validateFinalStructuredReview("plain text").ok, false);
+    assert.equal(validateFinalStructuredReview(JSON.stringify({ verdict: "approve" })).ok, false);
+  });
+});
+
+describe("PR755: strict SSE session matching", () => {
+  it("sessionless message.updated events cannot provide a structured approval", () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pr755-sessionless-"));
+    const ep = path.join(tmp, "events.ndjson");
+    fs.writeFileSync(
+      ep,
+      JSON.stringify({
+        type: "message.updated",
+        properties: {
+          info: {
+            id: "msg-sessionless",
+            role: "assistant",
+            structured: { schema_version: 1, verdict: "approve", summary: "no session", findings: [], next_steps: [] },
+          },
+        },
+      }) + "\n"
+    );
+    try {
+      const res = recoverStructuredReviewFromEvents(ep, "ses-1");
+      assert.equal(res.ok, false);
+      assert.equal(res.reason, "no-assistant-messages");
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("PR755: configured OpenCode route outside free candidates warns and is unchanged", () => {
+  it("does not warn without opt-in, for free candidates, or for non-opencode backends", () => {
+    const messages = [];
+    const warn = (m) => messages.push(m);
+    assert.equal(warnFreeWorkerConfiguredRoute(["opencode/deepseek-v4.1-flash-free"], { enabled: false, warn }), null);
+    assert.equal(warnFreeWorkerConfiguredRoute(["claude/opus"], { enabled: true, warn }), null);
+    assert.equal(warnFreeWorkerConfiguredRoute(["agy/gemini-3.6-flash-high"], { enabled: true, warn }), null);
+    assert.equal(messages.length, 0);
+
+    assert.equal(warnFreeWorkerConfiguredRoute(["opencode/deepseek-v4.1-flash-free"], { enabled: true, warn }), null);
+    assert.equal(warnFreeWorkerConfiguredRoute(["opencode/glm-5.3-flash-free:max"], { enabled: true, warn }), null);
+    assert.equal(messages.length, 0);
+
+    const msg = warnFreeWorkerConfiguredRoute(["opencode-go/custom:max"], { enabled: true, warn });
+    assert.ok(msg);
+    assert.match(msg, /outside the free candidate chain/);
+    assert.equal(messages.length, 1);
+  });
+
+  it("emits a warning at the dispatch boundary while dispatching the configured route unchanged", async () => {
+    const restore = patchEnv({ KUSABI_OPENCODE_FREE_WORKER: "1" });
+    const originalWarn = console.warn;
+    const warnings = [];
+    console.warn = (m) => warnings.push(m);
+    try {
+      const result = await dispatchWithFallback({
+        tiers: [["opencode-go/custom-paid-model:max"]],
+        round: 1,
+        explicitModel: null,
+        kind: "review",
+        title: "dispatch warning",
+        promptText: "review",
+        _runPrompt: async () => ({
+          job: { id: "job-warn", status: "completed", stats: {}, usage: null },
+          resultText: "ok",
+          stateDir: null,
+        }),
+      });
+      assert.equal(result.job.modelEntry, "opencode-go/custom-paid-model:max");
+      assert.equal(warnings.length, 1);
+      assert.match(warnings[0], /outside the free candidate chain/);
+    } finally {
+      console.warn = originalWarn;
+      restore();
+    }
+  });
+
+  it("warns only about the actually selected route, never a later unused paid fallback", () => {
+    const messages = [];
+    const warn = (m) => messages.push(m);
+
+    // The selected (first) route is a non-opencode backend: no warning, even
+    // though a paid OpenCode route sits later in the unused fallback chain.
+    assert.equal(
+      warnFreeWorkerConfiguredRoute(["agy/gemini-3.6-flash-high", "opencode-go/paid-model:max"], { enabled: true, warn }),
+      null,
+    );
+    assert.equal(
+      warnFreeWorkerConfiguredRoute(["claude/opus", "opencode-go/paid-model:max"], { enabled: true, warn }),
+      null,
+    );
+    // A free candidate selected first also never warns about a later paid one.
+    assert.equal(
+      warnFreeWorkerConfiguredRoute(
+        ["opencode/deepseek-v4.1-flash-free", "opencode-go/paid-model:max"],
+        { enabled: true, warn },
+      ),
+      null,
+    );
+    assert.equal(messages.length, 0, "no warning may be emitted for an unused paid fallback");
+
+    // When the selected (first) route itself is a paid OpenCode route, warn.
+    const msg = warnFreeWorkerConfiguredRoute(["opencode-go/paid-model:max", "agy/gemini-3.6-flash-high"], {
+      enabled: true,
+      warn,
+    });
+    assert.ok(msg);
+    assert.match(msg, /outside the free candidate chain/);
+    assert.equal(messages.length, 1);
   });
 });

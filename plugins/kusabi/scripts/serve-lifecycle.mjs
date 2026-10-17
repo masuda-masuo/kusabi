@@ -6,9 +6,15 @@ import process from "node:process";
 import { spawn } from "node:child_process";
 import crypto from "node:crypto";
 import { stateDirFor, readJson, writeJson, kusabiOpencodeConfigHome } from "./state-paths.mjs";
-import { isOpenCodeFreeWorkerEnabled, checkOpencodeVersion, checkServerProfileCompatibility } from "./free-worker-profile.mjs";
+import {
+  isOpenCodeFreeWorkerEnabled,
+  checkOpencodeVersion,
+  checkServerProfileCompatibility,
+  assertInstalledAgentProfile,
+  opencodeAgentDiscoveryDir,
+} from "./free-worker-profile.mjs";
 
-export { checkOpencodeVersion, checkServerProfileCompatibility };
+export { checkOpencodeVersion, checkServerProfileCompatibility, assertInstalledAgentProfile };
 
 const SERVER_READY_TIMEOUT_MS = 20_000;
 
@@ -118,6 +124,12 @@ export async function serverHealthy(server) {
  * serve ever outlives a call that did not record it in server.json.
  */
 export async function ensureServer(cwd, { now = () => performance.now() } = {}) {
+  // Installed-agent mode isolation: reject a mismatch between the profile the
+  // phase agents were installed for and the active mode BEFORE this serve can
+  // reuse or start against the shared discovery directory.  Placement-invisible
+  // modes (no installed kusabi agents) are a no-op.
+  assertInstalledAgentProfile(opencodeAgentDiscoveryDir());
+
   const stateDir = stateDirFor(cwd);
   const serverFile = path.join(stateDir, "server.json");
   const timeoutMs = serverReadyTimeoutMs();

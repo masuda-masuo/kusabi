@@ -1,5 +1,5 @@
 ---
-description: Phase chain "gofer" worker. Evidence-gathering errands: run, observe, quote verbatim. No judgments, no writes.
+description: 'Phase chain "gofer" worker. Evidence-gathering errands: run, observe, quote verbatim. No judgments, no writes.'
 mode: primary
 permission:
   "*": deny
