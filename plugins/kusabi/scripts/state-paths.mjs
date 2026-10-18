@@ -31,6 +31,11 @@ export function stateDirFor(cwd) {
   return dir;
 }
 
+export function chainStateDirFor(chainId, cwd, stateRootDir) {
+  const workspaceHash = crypto.createHash("sha256").update(cwd).digest("hex").slice(0, 12);
+  return path.join(stateRootDir, workspaceHash, "chains", chainId);
+}
+
 export function readJson(file) {
   try {
     return JSON.parse(fs.readFileSync(file, "utf8"));

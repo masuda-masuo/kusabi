@@ -58,6 +58,7 @@ import { opencodeBin, ensureServer, reapIdleServes, reapOrphanedServes } from ".
 import { renderJobProgress } from "./kaiba-progress-watch.mjs";
 import { cmdReviewRecordClose } from "./review-record-close.mjs";
 import { cmdReviewRecordAdjudicate } from "./review-record-adjudicate.mjs";
+import { cmdReviewRecordArchive } from "./review-record-archive.mjs";
 
 // Re-export so external consumers (tests) that import these functions
 // from kusabi-companion.mjs continue to resolve correctly.
@@ -242,6 +243,7 @@ function usage() {
     "  chain-stats Aggregate every chain record and print a summary (read-only, no LLM)",
     "  review-record-close Mark old unfilled review records as historical (dry-run unless --apply)",
     "  review-record-adjudicate <chainId> --row <n> --verdict accept|reject|open-unverified --reason <text> [--evidence <text>] [--force] [--state-root <dir>] OR --precedent <text> [--force] [--state-root <dir>]",
+    "  review-record-archive <chainId> --kairanban <path> [--force] [--state-root <dir>]",
     "  task-detach Launch a task in a detached background process and print a runnable task-wait command line (no LLM in launcher)",
     "  task-wait  Block until a task reaches a terminal state, print a one-line digest, exit 0 (read-only, no LLM; safe to SIGTERM at any moment). Non-zero means the WAIT itself failed — unknown job id, nothing appeared under --next, or the task stalled",
     "  metrics-ingest  Ingest transcripts + Codex usage + chain records + delegated-job records into a durable SQLite store (read-only source, no LLM)",
@@ -361,6 +363,9 @@ async function main() {
   }
   if (subcommand === "review-record-adjudicate") {
     return cmdReviewRecordAdjudicate(flat, { cwd });
+  }
+  if (subcommand === "review-record-archive") {
+    return cmdReviewRecordArchive(flat, { cwd });
   }
 
   const parsed = parseArgs(flat);

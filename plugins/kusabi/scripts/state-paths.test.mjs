@@ -3,7 +3,9 @@ import assert from "node:assert/strict";
 import os from "node:os";
 import path from "node:path";
 import fs from "node:fs";
+import crypto from "node:crypto";
 import {
+  chainStateDirFor,
   stateRoot,
   readJson,
   writeJson,
@@ -178,5 +180,21 @@ describe("writeJson atomic replace", () => {
     assert.match(thrown.message, /simulated rename failure/);
     assert.deepEqual(readJson(file), oldValue, "target keeps the old content");
     assert.deepEqual(fs.readdirSync(tmpDir), ["job.json"], "temp file removed on failure");
+  });
+});
+
+describe("chainStateDirFor", () => {
+  it("matches the sha256 workspace layout without creating directories", () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-chain-state-path-"));
+    const cwd = path.join(root, "workspace");
+    const stateRootDir = path.join(root, "state");
+    const hash = crypto.createHash("sha256").update(cwd).digest("hex").slice(0, 12);
+    try {
+      const result = chainStateDirFor("chain-test", cwd, stateRootDir);
+      assert.equal(result, path.join(stateRootDir, hash, "chains", "chain-test"));
+      assert.equal(fs.existsSync(stateRootDir), false);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
   });
 });
