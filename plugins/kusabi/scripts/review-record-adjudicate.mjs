@@ -1,10 +1,9 @@
 // review-record-adjudicate.mjs — fill one findings verdict or the reusable precedent.
 // Cell input escapes pipes as \| and refuses newlines for reasons and evidence.
-import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
-import { stateRoot } from "./state-paths.mjs";
+import { chainStateDirFor, stateRoot } from "./state-paths.mjs";
 
 export const USAGE = "Usage: review-record-adjudicate <chainId> --row <n> --verdict accept|reject|open-unverified --reason \"<text>\" [--evidence \"<text>\"] [--force] [--state-root <dir>] OR review-record-adjudicate <chainId> --precedent \"<text>\" [--force] [--state-root <dir>]";
 
@@ -57,12 +56,6 @@ function parseArgs(argv) {
     if (/^\s*#/m.test(options.precedent)) throw new Error("--precedent cannot contain a line starting with #");
   }
   return { chainId, ...options };
-}
-
-function recordPathFor({ chainId, stateRootDir, cwd }) {
-  // stateDirFor(cwd) is the closest existing helper; it hashes cwd but is tied to stateRoot() and creates jobs/.
-  const workspaceHash = crypto.createHash("sha256").update(cwd).digest("hex").slice(0, 12);
-  return path.join(stateRootDir, workspaceHash, "chains", chainId, "review-record.md");
 }
 
 function sectionBounds(content, heading) {
@@ -119,7 +112,7 @@ function writeAtomically(filePath, content) {
 
 export function adjudicateReviewRecord({ chainId, argv, stateRootDir = stateRoot(), cwd = process.cwd() }) {
   const options = parseArgs([chainId, ...argv]);
-  const recordPath = recordPathFor({ chainId: options.chainId, stateRootDir, cwd });
+  const recordPath = path.join(chainStateDirFor(options.chainId, cwd, stateRootDir), "review-record.md");
   if (!fs.existsSync(recordPath)) throw new Error(`review record not found for chain ${chainId}`);
   const original = fs.readFileSync(recordPath, "utf8");
   const { lines, start, end } = sectionBounds(original, FINDINGS_HEADING);
