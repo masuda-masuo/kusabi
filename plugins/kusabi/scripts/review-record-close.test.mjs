@@ -7,6 +7,7 @@ import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { closeReviewRecords, cmdReviewRecordClose, HISTORICAL_MARK_PREFIX } from "./review-record-close.mjs";
 import { countUnfilledReviewRecords } from "./review-record-scan.mjs";
+import { scanReviewRecords } from "./review-record-close.mjs";
 
 const BEFORE = "2022-01-01T00:00:00.000Z";
 const COMPANION = fileURLToPath(new URL("./kusabi-companion.mjs", import.meta.url));
@@ -52,6 +53,27 @@ describe("review-record-close", () => {
       const before = fs.readFileSync(recordPath);
       const output = cmdReviewRecordClose(["--historical", "--before", BEFORE, "--state-root", root]);
       assert.equal(output, `Targets: 1\ntarget: ${recordPath}\nSkipped: 0`);
+      assert.deepEqual(fs.readFileSync(recordPath), before);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("skips an unadjudicated record without the exact adjudication heading before apply", () => {
+    const root = createStateRoot();
+    try {
+      const recordPath = writeRecord(root, "alternate-heading");
+      const original = fs.readFileSync(recordPath, "utf8").replace(
+        "## Findings adjudication (fill at inspection)",
+        "## Findings adjudication",
+      );
+      fs.writeFileSync(recordPath, original);
+      const before = fs.readFileSync(recordPath);
+      const result = scanReviewRecords({ before: BEFORE, stateRootDir: root });
+      assert.deepEqual(result.targets, []);
+      assert.deepEqual(result.skipped, [{ path: recordPath, reason: "no adjudication heading" }]);
+      const output = cmdReviewRecordClose(["--historical", "--before", BEFORE, "--apply", "--state-root", root]);
+      assert.ok(output.includes("skipped: no adjudication heading:"));
       assert.deepEqual(fs.readFileSync(recordPath), before);
     } finally {
       fs.rmSync(root, { recursive: true, force: true });

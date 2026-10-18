@@ -6,6 +6,7 @@ import { stateRoot } from "./state-paths.mjs";
 import { isUnadjudicatedRecord } from "./review-record-scan.mjs";
 
 export const FINDINGS_HEADER = "## Findings adjudication (fill at inspection)";
+const FINDINGS_HEADER_PATTERN = /^[ \t]*## Findings adjudication \(fill at inspection\)[ \t]*(\r?\n|$)/m;
 export const HISTORICAL_MARK_PREFIX = "<!-- historical: not adjudicated; closed by review-record-close before ";
 export const USAGE = "Usage: kusabi-companion review-record-close --historical --before <ISO> [--apply] [--state-root <dir>]";
 
@@ -80,6 +81,10 @@ export function scanReviewRecords({ before, stateRootDir = stateRoot() }) {
       continue;
     }
     if (!isUnadjudicatedRecord(content) || hasHistoricalMark(content)) continue;
+    if (!FINDINGS_HEADER_PATTERN.test(content)) {
+      skipped.push({ path: recordPath, reason: "no adjudication heading" });
+      continue;
+    }
     const finished = finishedTimestamp(content);
     if (finished === null) {
       skipped.push({ path: recordPath, reason: "no finished time" });
