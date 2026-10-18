@@ -57,6 +57,7 @@ import { jobDir, loadJob, listJobs, latestJob } from "./job-store.mjs";
 import { opencodeBin, ensureServer, reapIdleServes, reapOrphanedServes } from "./serve-lifecycle.mjs";
 import { renderJobProgress } from "./kaiba-progress-watch.mjs";
 import { cmdReviewRecordClose } from "./review-record-close.mjs";
+import { cmdReviewRecordAdjudicate } from "./review-record-adjudicate.mjs";
 
 // Re-export so external consumers (tests) that import these functions
 // from kusabi-companion.mjs continue to resolve correctly.
@@ -240,6 +241,7 @@ function usage() {
     "  chain-wait Block until a chain reaches a terminal state, print a one-line digest, exit 0 (read-only, no LLM, no serve; safe to SIGTERM at any moment). Non-zero means the WAIT itself failed — a chain that never appeared (or a malformed id), nothing appeared under --next, or the chain stalled — never a disposition you dislike",
     "  chain-stats Aggregate every chain record and print a summary (read-only, no LLM)",
     "  review-record-close Mark old unfilled review records as historical (dry-run unless --apply)",
+    "  review-record-adjudicate <chainId> --row <n> --verdict accept|reject|open-unverified --reason <text> [--evidence <text>] [--force] [--state-root <dir>] OR --precedent <text> [--force] [--state-root <dir>]",
     "  task-detach Launch a task in a detached background process and print a runnable task-wait command line (no LLM in launcher)",
     "  task-wait  Block until a task reaches a terminal state, print a one-line digest, exit 0 (read-only, no LLM; safe to SIGTERM at any moment). Non-zero means the WAIT itself failed — unknown job id, nothing appeared under --next, or the task stalled",
     "  metrics-ingest  Ingest transcripts + Codex usage + chain records + delegated-job records into a durable SQLite store (read-only source, no LLM)",
@@ -356,6 +358,9 @@ async function main() {
 
   if (subcommand === "review-record-close") {
     return cmdReviewRecordClose(flat);
+  }
+  if (subcommand === "review-record-adjudicate") {
+    return cmdReviewRecordAdjudicate(flat, { cwd });
   }
 
   const parsed = parseArgs(flat);
