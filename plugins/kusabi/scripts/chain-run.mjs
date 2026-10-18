@@ -66,7 +66,7 @@ import {
  */
 export function withContainerWorkspace(text, container) {
   if (!container) return text;
-  return "The workspace lives inside container `" + container + "`. Pass this exact ID as `container_id` to every sunaba tool call. Do not guess container names or call sandbox_attach.\n\n" + text;
+  return "The workspace lives inside container `" + container + "`. Pass this exact ID as `container_id` to every sunaba tool call. Do not guess container names or call sandbox_attach. Do not call sandbox_list_containers either; this container is the only one.\n\n" + text;
 }
 
 /**
