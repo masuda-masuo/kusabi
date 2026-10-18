@@ -296,7 +296,7 @@ export async function runChainDriver({
   reworkDispatchWithFallback = null,
   initialSession, flagsModel = null, reviewFlagsModel = null, signalReceived = () => false,
   keepServe = false, resume = null, sessionProvenance = null,
-  smokeObservation = null,
+  smokeObservation = null, repo = null, repoReason = null,
 }) {
   // Per-phase dispatch (kusabi #192): the review phase dispatches through its
   // own backend-specific dispatch unless the caller threads a single one
@@ -352,6 +352,7 @@ export async function runChainDriver({
   const ctx = {
     // Immutable config (copied once, never reassigned)
     chainDir, chainId, container, cwd, model, modelChain, maxRounds, brief, orchestrator,
+    repo, repoReason,
     callTool, flagsModel, reviewFlagsModel,
     effectiveReviewChain, effectiveReworkChain, effectiveReworkBackend,
     effectiveBaseSha, effectiveVerifyBaseline,
@@ -626,6 +627,9 @@ export async function runChainDriver({
           chainFollowupDraft: null,
           verifyBaseline: effectiveVerifyBaseline,
         });
+        chainState.repo = repo;
+        if (repo == null) chainState.repoReason = repoReason || "Repository identity unavailable";
+        else delete chainState.repoReason;
         writeJson(path.join(chainDir, "round-" + round + ".json"), roundRecord);
         writeJson(path.join(chainDir, "chain.json"), chainState);
         finalizeChainControl({ chainDir, status: "failed", round });
@@ -682,6 +686,7 @@ export async function runChainDriver({
           interrupted: true,
           verifyBaseline: effectiveVerifyBaseline,
           smokeObservation: ctx.smokeObservation ?? null,
+          repo, repoReason,
         });
         finalizeChainControl({ chainDir, status: "cancelled", round });
         const text = `Chain ${chainId} cancelled during round ${round} (stop requested after probes, before review). Progress preserved — resume with chain-resume ${chainId}.`;

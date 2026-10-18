@@ -1929,6 +1929,17 @@ describe("renderReviewRecord", () => {
     assert.doesNotMatch(text, /\| 2 \|/);
   });
 
+  it("renders a review record header with a repository identity", () => {
+    const text = renderReviewRecord({
+      chainId: "chain-abc",
+      label: "kusabi",
+      repo: "owner/repo",
+      brief: "Implement X.",
+      records: [],
+    });
+    assert.match(text, /^# \[review-record\] owner\/repo chain-abc — Implement X\./m);
+  });
+
   it("renders a representative two-round chain record end to end", () => {
     const record = {
       chainId: "chain-abc",
@@ -1973,7 +1984,7 @@ describe("renderReviewRecord", () => {
     const text = renderReviewRecord(record);
 
     // Header: label, chain id, truncated brief first line.
-    assert.match(text, /# \[review-record\] kusabi chain-abc — Implement X\./);
+    assert.equal(text.split("\n")[0], "# [review-record] kusabi (dir) chain-abc — Implement X.");
     assert.match(text, /Orchestrator: claude-fable-5 \| session abc123 \| 2026-08-08 \| finished: 2026-08-08T12:00:00\.000Z/);
     assert.match(text, /Model chain: flash\/quick \(configured: flash\/quick → pro\/deep\) \| container: cid-123/);
     assert.match(text, /Final disposition: escalated at round 2 of 4/);

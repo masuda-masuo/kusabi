@@ -54,6 +54,20 @@ describe("chain-finish source guard", () => {
     }
   });
 
+  it("looks up repo identity only on fresh chains and restores it from chain.json on resume", () => {
+    const cmdSource = fs.readFileSync(path.join(__dirname, "chain-cmd.mjs"), "utf8");
+    const lifecycleStart = cmdSource.indexOf("export async function runChainLifecycle(");
+    const resumeStart = cmdSource.indexOf("export async function cmdChainResume(");
+    assert.ok(lifecycleStart !== -1 && resumeStart > lifecycleStart);
+    const lifecycleSource = cmdSource.slice(lifecycleStart, resumeStart);
+    assert.equal(lifecycleSource.split("readOriginRepo(").length - 1, 1);
+    assert.match(lifecycleSource, /repo, repoReason,/);
+    const resumeSource = cmdSource.slice(resumeStart);
+    assert.ok(resumeSource.includes("repo: chainJson.repo ?? null"));
+    assert.ok(resumeSource.includes("repoReason: chainJson.repo == null"));
+    assert.equal(resumeSource.includes("readOriginRepo("), false);
+  });
+
   it("chain-finish.mjs exports finishRound, finaliseChain, finaliseProvisionalChain", () => {
     const finishSource = fs.readFileSync(
       path.join(__dirname, "chain-finish.mjs"),
@@ -224,7 +238,7 @@ describe("provider-exhaustion chain records omit removed mission linkage", () =>
   });
 
   it("review provider exhaustion does not persist a stale missionId option", async () => {
-    async function runChain({ missionId }) {
+    async function runChain({ missionId, repo = null, repoReason = null }) {
       const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-532-rev-exhaust-"));
       const chainDir = path.join(tmp, "chains", "chain-x");
       fs.mkdirSync(chainDir, { recursive: true });
@@ -241,6 +255,7 @@ describe("provider-exhaustion chain records omit removed mission linkage", () =>
         keepServe: true,
         signalReceived: () => false,
         resume: null,
+        repo, repoReason,
         // The luna driver threads the owning mission id; a plain chain omits it.
         ...(missionId ? { missionId } : {}),
       });
@@ -252,6 +267,8 @@ describe("provider-exhaustion chain records omit removed mission linkage", () =>
       assert.match(luna.text, /review provider exhausted/);
       const chainJson = readJson(path.join(luna.chainDir, "chain.json"));
       assert.equal("missionId" in chainJson, false);
+      assert.equal(chainJson.repo, null);
+      assert.equal(chainJson.repoReason, "Repository identity unavailable");
       assert.equal(chainJson.records.length, 1);
     } finally {
       fs.rmSync(luna.tmp, { recursive: true, force: true });
@@ -263,8 +280,19 @@ describe("provider-exhaustion chain records omit removed mission linkage", () =>
       const chainJson = readJson(path.join(plain.chainDir, "chain.json"));
       assert.equal("missionId" in chainJson, false,
         "a plain chain's terminal chain.json must not carry a missionId key");
+      assert.equal(chainJson.repo, null);
+      assert.equal(chainJson.repoReason, "Repository identity unavailable");
     } finally {
       fs.rmSync(plain.tmp, { recursive: true, force: true });
+    }
+
+    const identified = await runChain({ missionId: null, repo: "owner/repo" });
+    try {
+      const chainJson = readJson(path.join(identified.chainDir, "chain.json"));
+      assert.equal(chainJson.repo, "owner/repo");
+      assert.equal("repoReason" in chainJson, false);
+    } finally {
+      fs.rmSync(identified.tmp, { recursive: true, force: true });
     }
   });
 

@@ -44,6 +44,7 @@ import {
   explicitRouteDiffersFromRecord,
 } from "./chain-quota.mjs";
 import { resolveChainResume } from "./chain-resume-resolve.mjs";
+import { readOriginRepo } from "./repo-identity.mjs";
 import { captureWorktreeState } from "./worktree-baseline.mjs";
 import {
   readChainControl,
@@ -350,6 +351,7 @@ export async function runChainLifecycle(cwd, { flags, text, orchestrator }, opts
     : null;
 
   const { chainId, chainDir } = createChainDir(stateDir, chainIdFlag ?? null);
+  const { repo, repoReason } = readOriginRepo(cwd, { run: inject.runOriginRepo });
   const maxRounds = Number(flags["max-rounds"] ?? 1); // default 1 = implement only, a rejected round escalates to the orchestrator (was 2; kusabi #681 was 4)
   const brief = text;
 
@@ -396,6 +398,7 @@ export async function runChainLifecycle(cwd, { flags, text, orchestrator }, opts
       modelChain: implementDispatch.chain, reviewModel: reviewDispatch.model,
       reviewModelChain: reviewDispatch.chain, maxRounds,
       brief, orchestrator, baseSha, worktreeBaseline, verifyBaseline, callTool,
+      repo, repoReason,
       smokeObservation,
       backend: implementDispatch.backend,
       reviewBackend: reviewDispatch.backend,
@@ -719,6 +722,10 @@ export async function cmdChainResume(cwd, { flags, text }) {
       reworkBackend: reworkBackendForResume,
       maxRounds: chainJson.maxRounds ?? 4,
       brief: chainJson.brief ?? "",
+      repo: chainJson.repo ?? null,
+      repoReason: chainJson.repo == null
+        ? (chainJson.repoReason ?? "Repository identity was not recorded")
+        : null,
       orchestrator: chainJson.orchestrator ?? null,
       baseSha: chainJson.baseSha ?? null,
       worktreeBaseline: null,
