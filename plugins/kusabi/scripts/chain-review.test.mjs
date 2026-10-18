@@ -1971,3 +1971,76 @@ describe("chain-review source guards (kusabi #435)", () => {
     assert.ok(!chainPhasesSrc.includes("from './chain-review.mjs'"));
   });
 });
+
+describe("runReviewPhase review tree hash", () => {
+  it("records the captured worktree tree hash before a dispatched review", async () => {
+    const roundRecord = { round: 1 };
+    const treeHash = "0123456789abcdef0123456789abcdef01234567";
+    let captureCalls = 0;
+    let dispatchCalls = 0;
+
+    await runReview({
+      roundRecord,
+      callTool: async (tool, params) => {
+        captureCalls += 1;
+        assert.equal(tool, "sandbox_exec");
+        assert.equal(params.container_id, "test");
+        return { output: "TREE_HASH=" + treeHash + "\nCOUNT=0\n" };
+      },
+      _dispatchWithFallback: async () => {
+        dispatchCalls += 1;
+        return fakeJob("job-tree-hash", JSON.stringify({ schema_version: 1, verdict: "approve", summary: "s", findings: [], next_steps: [] }));
+      },
+    });
+
+    assert.equal(captureCalls, 1);
+    assert.equal(dispatchCalls, 1);
+    assert.equal(roundRecord.reviewTreeHash, treeHash);
+    assert.equal(Object.hasOwn(roundRecord, "reviewTreeHashReason"), false);
+  });
+
+  it("does not record a worktree tree hash when review is skipped", async () => {
+    const roundRecord = { round: 1 };
+    let captureCalls = 0;
+    let dispatchCalls = 0;
+
+    await runReview({
+      roundRecord,
+      chainStatusObserved: true,
+      chainChangedPaths: [],
+      chainDeliverables: ["src/foo.js"],
+      callTool: async () => {
+        captureCalls += 1;
+        return { output: "TREE_HASH=unexpected\nCOUNT=0\n" };
+      },
+      _dispatchWithFallback: async () => {
+        dispatchCalls += 1;
+        return fakeJob("unexpected-review", JSON.stringify({ schema_version: 1, verdict: "approve", summary: "s", findings: [], next_steps: [] }));
+      },
+    });
+
+    assert.equal(captureCalls, 0);
+    assert.equal(dispatchCalls, 0);
+    assert.equal(Object.hasOwn(roundRecord, "reviewTreeHash"), false);
+    assert.equal(Object.hasOwn(roundRecord, "reviewTreeHashReason"), false);
+  });
+
+  it("continues review and records a reason when worktree capture fails", async () => {
+    const roundRecord = { round: 1 };
+    let dispatchCalls = 0;
+
+    await runReview({
+      roundRecord,
+      callTool: async () => ({ output: "" }),
+      _dispatchWithFallback: async () => {
+        dispatchCalls += 1;
+        return fakeJob("job-capture-failed", JSON.stringify({ schema_version: 1, verdict: "approve", summary: "s", findings: [], next_steps: [] }));
+      },
+    });
+
+    assert.equal(dispatchCalls, 1);
+    assert.equal(Object.hasOwn(roundRecord, "reviewTreeHash"), false);
+    assert.equal(roundRecord.reviewTreeHashReason, "worktree state capture returned no state");
+    assert.equal(roundRecord.verdict, "approve");
+  });
+});
