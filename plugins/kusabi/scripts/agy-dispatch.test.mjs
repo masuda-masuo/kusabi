@@ -240,14 +240,25 @@ describe("resolveBoundS \u2014 the ONE timeout decision (kusabi #328)", () => {
 });
 
 describe("buildAgyArgs", () => {
+  it("omits -p and promptText while retaining --model m (MARKER_ARGV_CHECK_7)", () => {
+    const args = buildAgyArgs({ model: "m", promptText: "MARKER_ARGV_CHECK_7", jsonSchema: null });
+    assert.equal(args.includes("-p"), false);
+    assert.equal(args.includes("MARKER_ARGV_CHECK_7"), false);
+    const modelIdx = args.indexOf("--model");
+    assert.ok(modelIdx !== -1, "must contain --model");
+    assert.equal(args[modelIdx + 1], "m");
+  });
+
   it("builds the base invocation with NO --print-timeout when no timeout is resolved", () => {
     // Without a positive timeoutS there is no outer bound to keep
     // authoritative, so no inner bound is invented either — agy's own
     // default (5m0s) is then its business, not kusabi's.  This mirrors
     // runAgyProcess, which arms no timer for such a dispatch.
+    const baseArgs = buildAgyArgs({ model: "gemini-3.6-flash-high", promptText: "Do the thing.", jsonSchema: null });
+    assert.equal(baseArgs.includes("-p"), false);
     assert.deepEqual(
-      buildAgyArgs({ model: "gemini-3.6-flash-high", promptText: "Do the thing.", jsonSchema: null }),
-      ["-p", "Do the thing.", "--output-format", "stream-json", "--model", "gemini-3.6-flash-high"],
+      baseArgs,
+      ["--output-format", "stream-json", "--model", "gemini-3.6-flash-high"],
     );
     for (const timeoutS of [undefined, null, 0, -5]) {
       assert.equal(
@@ -265,11 +276,11 @@ describe("buildAgyArgs", () => {
     // way agy's own help prints durations (default 5m0s).
     assert.deepEqual(
       buildAgyArgs({ model: "m", promptText: "p", jsonSchema: null, timeoutS: 3600 }),
-      ["-p", "p", "--output-format", "stream-json", "--model", "m", "--print-timeout", "1h5m0s"],
+      ["--output-format", "stream-json", "--model", "m", "--print-timeout", "1h5m0s"],
     );
     assert.deepEqual(
       buildAgyArgs({ model: "m", promptText: "p", jsonSchema: null, timeoutS: 1800 }),
-      ["-p", "p", "--output-format", "stream-json", "--model", "m", "--print-timeout", "35m0s"],
+      ["--output-format", "stream-json", "--model", "m", "--print-timeout", "35m0s"],
     );
   });
 
@@ -293,9 +304,10 @@ describe("buildAgyArgs", () => {
 
   it("appends --json-schema only when a schema is given", () => {
     const args = buildAgyArgs({ model: "m", promptText: "p", jsonSchema: '{"type":"object"}' });
+    assert.equal(args.includes("-p"), false);
     assert.deepEqual(
       args,
-      ["-p", "p", "--output-format", "stream-json", "--model", "m", "--json-schema", '{"type":"object"}'],
+      ["--output-format", "stream-json", "--model", "m", "--json-schema", '{"type":"object"}'],
     );
   });
 
@@ -304,29 +316,33 @@ describe("buildAgyArgs", () => {
       model: "m", promptText: "p", jsonSchema: null, timeoutS: 1800,
       conversationId: "6f5f0f1e-0000-4a1b-9c2d-1122334455aa",
     });
+    assert.equal(args.includes("-p"), false);
     assert.deepEqual(
       args,
-      ["-p", "p", "--output-format", "stream-json", "--model", "m",
+      ["--output-format", "stream-json", "--model", "m",
        "--print-timeout", "35m0s", "--conversation", "6f5f0f1e-0000-4a1b-9c2d-1122334455aa"],
     );
     // Absent / empty / null ids leave a fresh-dispatch argv byte-identical.
     for (const conversationId of [undefined, null, ""]) {
+      const freshArgs = buildAgyArgs({ model: "m", promptText: "p", jsonSchema: null, conversationId });
+      assert.equal(freshArgs.includes("-p"), false);
       assert.deepEqual(
-        buildAgyArgs({ model: "m", promptText: "p", jsonSchema: null, conversationId }),
-        ["-p", "p", "--output-format", "stream-json", "--model", "m"],
+        freshArgs,
+        ["--output-format", "stream-json", "--model", "m"],
       );
     }
   });
 
   it("never passes --dangerously-skip-permissions, and invents no flag", () => {
     const KNOWN = new Set([
-      "-p", "--output-format", "json", "--model", "--print-timeout", "--json-schema", "--conversation",
+      "--output-format", "json", "--model", "--print-timeout", "--json-schema", "--conversation",
     ]);
     for (const jsonSchema of [null, '{"type":"object"}']) {
       const args = buildAgyArgs({
         model: "m", promptText: "p", jsonSchema, timeoutS: 600,
         conversationId: jsonSchema ? undefined : "conv-1",
       });
+      assert.equal(args.includes("-p"), false);
       assert.equal(args.includes("--dangerously-skip-permissions"), false);
       for (const arg of args) {
         if (arg.startsWith("-")) {
@@ -420,7 +436,7 @@ describe("the two timeout bound sites agree with the resolver and each other (ku
       try {
         result = await runAgyProcess({
           bin: ctx.binPath,
-          args: ["-p", "p"],
+          args: ["--output-format", "stream-json", "--model", "m"],
           cwd: ctx.cwd,
           timeoutS,
         });
@@ -1644,6 +1660,10 @@ const NL = String.fromCharCode(10);
 const argv = process.argv.slice(2);
 fs.appendFileSync(process.env.FAKE_AGY_ARGS_LOG, JSON.stringify(argv) + NL);
 fs.appendFileSync(process.env.FAKE_AGY_PIDS, String(process.pid) + NL);
+const promptText = fs.readFileSync(0, "utf8");
+if (process.env.FAKE_AGY_STDIN_LOG) {
+  fs.appendFileSync(process.env.FAKE_AGY_STDIN_LOG, promptText);
+}
 // The HOME the spawn actually ran under (kusabi #542): the fake logs it only
 // when the test asks (FAKE_AGY_HOME_LOG set), so the existing tests' logs
 // stay byte-identical to before.
@@ -1830,6 +1850,9 @@ function fakeAgyContext(mode = "ok") {
   fs.writeFileSync(pidsLog, "", "utf8");
   fs.writeFileSync(homeLog, "", "utf8");
 
+  const stdinLog = path.join(tmp, "stdin.txt");
+  fs.writeFileSync(stdinLog, "", "utf8");
+
   const stateRoot = path.join(tmp, "state");
   const cwd = path.join(tmp, "cwd");
   fs.mkdirSync(cwd, { recursive: true });
@@ -1841,6 +1864,7 @@ function fakeAgyContext(mode = "ok") {
     FAKE_AGY_ARGS_LOG: argsLog,
     FAKE_AGY_PIDS: pidsLog,
     FAKE_AGY_HOME_LOG: homeLog,
+    FAKE_AGY_STDIN_LOG: stdinLog,
   });
 
   const stateDir = stateDirFor(cwd);
@@ -1854,6 +1878,7 @@ function fakeAgyContext(mode = "ok") {
     argsLog,
     pidsLog,
     homeLog,
+    stdinLog,
     setMode(next) { process.env.FAKE_AGY_MODE = next; },
     dispatchOptions(overrides = {}) {
       return {
@@ -1940,14 +1965,15 @@ describe("agyDispatch (fake agy binary)", () => {
     await agyDispatch(ctx.dispatchOptions());
     const calls = loggedArgs(ctx.argsLog);
     assert.equal(calls.length, 1);
+    assert.equal(calls[0].includes("-p"), false);
     // dispatchOptions resolves timeoutS: 20, so the inner bound is
     // 20 + AGY_PRINT_TIMEOUT_MARGIN_S = 320s, as a Go duration (kusabi #326).
     assert.deepEqual(calls[0], [
-      "-p", "Do the thing.",
       "--output-format", "stream-json",
       "--model", "gemini-3.6-flash-high",
       "--print-timeout", "5m20s",
     ]);
+    assert.equal(fs.readFileSync(ctx.stdinLog, "utf8"), "Do the thing.");
   });
 
   it("a review dispatch adds --json-schema built from the existing verdict contract", async () => {
@@ -1961,9 +1987,10 @@ describe("agyDispatch (fake agy binary)", () => {
       schema,
       JSON.parse(fs.readFileSync(path.join(PLUGIN_ROOT, "schemas", "review-output.schema.json"), "utf8")),
     );
-    // The role body is carried in the prompt, since agy has no
+    // The role body is carried in the prompt on stdin, since agy has no
     // --append-system-prompt.
-    assert.match(args[1], /^<role>\n/);
+    assert.equal(args.includes("-p"), false);
+    assert.match(fs.readFileSync(ctx.stdinLog, "utf8"), /^<role>\n/);
   });
 
   it("the review verdict flows through the EXISTING extraction path unchanged", async () => {
@@ -2298,8 +2325,10 @@ describe("agyDispatch (fake agy binary)", () => {
     assert.equal(args[convIdx + 1], "6f5f0f1e-0000-4a1b-9c2d-1122334455aa");
     // The rest of the invocation is unchanged: the resume flag is added,
     // nothing else moves or is invented.
-    assert.equal(args[0], "-p");
+    assert.equal(args.includes("-p"), false);
+    assert.equal(args[0], "--output-format");
     assert.equal(args.includes("--dangerously-skip-permissions"), false);
+    assert.equal(fs.readFileSync(ctx.stdinLog, "utf8"), "Do the thing.");
     // sessionID still IS the CLI's conversation_id for the continued run.
     assert.equal(job.sessionID, "6f5f0f1e-0000-4a1b-9c2d-1122334455aa");
   });
@@ -3173,7 +3202,8 @@ describe("CLI agy wiring (subprocess)", () => {
     fs.chmodSync(binPath, 0o755);
     const argsLog = path.join(tmp, "args.ndjson");
     const pidsLog = path.join(tmp, "pids");
-    for (const f of [argsLog, pidsLog]) fs.writeFileSync(f, "", "utf8");
+    const stdinLog = path.join(tmp, "stdin.txt");
+    for (const f of [argsLog, pidsLog, stdinLog]) fs.writeFileSync(f, "", "utf8");
 
     const env = { ...process.env };
     delete env.KUSABI_WORKER_CONTEXT;
@@ -3182,7 +3212,8 @@ describe("CLI agy wiring (subprocess)", () => {
     env.FAKE_AGY_MODE = "ok";
     env.FAKE_AGY_ARGS_LOG = argsLog;
     env.FAKE_AGY_PIDS = pidsLog;
-    return { env, argsLog };
+    env.FAKE_AGY_STDIN_LOG = stdinLog;
+    return { env, argsLog, stdinLog };
   }
 
   function run(args, cwd, env) {
@@ -3380,7 +3411,7 @@ describe("CLI agy wiring (subprocess)", () => {
 // argv size guard — the E2BIG residual left open by kusabi #221
 // =========================================================================
 //
-// agy has no stdin prompt transport, so a brief past MAX_ARG_STRLEN used to
+// The prompt travels via stdin, but an oversized schema past MAX_ARG_STRLEN would
 // die as a raw E2BIG with nothing naming the cause.  These tests pin the
 // refusal: which element, how big, what the limit is, and what to do next.
 
@@ -3414,34 +3445,26 @@ describe("checkAgyArgvSize — the per-argument byte rule", () => {
   });
 
   it("passes at exactly the limit and refuses at limit+1", () => {
-    assert.equal(checkAgyArgvSize(["-p", "x".repeat(AGY_MAX_ARG_BYTES)]).ok, true);
-    const over = checkAgyArgvSize(["-p", "x".repeat(AGY_MAX_ARG_BYTES + 1)]);
+    assert.equal(checkAgyArgvSize(["--json-schema", "x".repeat(AGY_MAX_ARG_BYTES)]).ok, true);
+    const over = checkAgyArgvSize(["--json-schema", "x".repeat(AGY_MAX_ARG_BYTES + 1)]);
     assert.equal(over.ok, false);
     assert.equal(over.oversized[0].bytes, AGY_MAX_ARG_BYTES + 1);
   });
 
-  it("names the prompt element, its size, the limit and the way out", () => {
-    const result = checkAgyArgvSize(["-p", "x".repeat(200)], 100);
+  it("names the schema element, its size, the limit and the way out", () => {
+    const result = checkAgyArgvSize(["--json-schema", "x".repeat(200)], 100);
     assert.equal(result.ok, false);
     assert.deepEqual(result.oversized, [
-      { index: 1, element: "prompt", flag: "-p", bytes: 200 },
+      { index: 1, element: "schema", flag: "--json-schema", bytes: 200 },
     ]);
-    assert.match(result.message, /the prompt \(-p\) is 200 bytes/);
+    assert.match(result.message, /the schema \(--json-schema\) is 200 bytes/);
     assert.match(result.message, /100-byte per-argument limit/);
     assert.match(result.message, /MAX_ARG_STRLEN is 131072/);
-    assert.match(result.message, /shrink the brief/);
-    assert.match(result.message, /--model claude/);
-    assert.match(result.message, /opencode model/);
+    assert.match(result.message, /shrink the schema/);
+    assert.match(result.message, /backend that accepts a larger schema/);
   });
 
   it("names the SCHEMA when the schema is oversized and the prompt is small (criterion 2)", () => {
-    // Exactly the composition agyDispatch performs — buildAgyArgs, then the
-    // guard over its output — with the sizes reversed from the usual case.
-    // A small prompt does not make an oversized schema safe: they are
-    // SEPARATE argv strings, each measured against the same cap.  (The real
-    // review schema is ~2KB, so an end-to-end oversized-schema dispatch
-    // would require editing a repo artifact; this exercises the same code
-    // path the dispatch runs.)
     const args = buildAgyArgs({
       model: "gemini-3.6-flash-high",
       promptText: "tiny",
@@ -3453,22 +3476,21 @@ describe("checkAgyArgvSize — the per-argument byte rule", () => {
     assert.equal(result.oversized[0].element, "schema");
     assert.equal(result.oversized[0].flag, "--json-schema");
     assert.match(result.message, /the schema \(--json-schema\) is \d+ bytes/);
-    // Only the schema is NAMED as oversized (the standing advice text
-    // mentions the prompt, which is why this checks the named form).
-    assert.doesNotMatch(result.message, /the prompt \(-p\) is/);
+    assert.match(result.message, /shrink the schema/);
+    assert.match(result.message, /backend that accepts a larger schema/);
   });
 
-  it("reports EVERY oversized element, not just the first", () => {
+  it("does not measure prompt on argv (prompt rides stdin)", () => {
     const args = buildAgyArgs({
       model: "gemini-3.6-flash-high",
       promptText: "x".repeat(200),
       jsonSchema: "y".repeat(300),
     });
     const result = checkAgyArgvSize(args, 100);
-    assert.deepEqual(result.oversized.map((o) => o.element), ["prompt", "schema"]);
+    assert.deepEqual(result.oversized.map((o) => o.element), ["schema"]);
     assert.match(
       result.message,
-      /the prompt \(-p\) is 200 bytes, and the schema \(--json-schema\) is 300 bytes/,
+      /the schema \(--json-schema\) is 300 bytes/,
     );
   });
 
@@ -3476,7 +3498,7 @@ describe("checkAgyArgvSize — the per-argument byte rule", () => {
     const jp = "実装".repeat(30); // 60 characters, 180 UTF-8 bytes
     assert.equal(jp.length, 60);
     assert.ok(jp.length < 100, "the .length reading must be UNDER the limit");
-    const result = checkAgyArgvSize(["-p", jp], 100);
+    const result = checkAgyArgvSize(["--json-schema", jp], 100);
     assert.equal(result.ok, false);
     assert.equal(result.oversized[0].bytes, 180);
   });
@@ -3494,85 +3516,48 @@ describe("agyDispatch — an oversized argv is refused before the spawn", () => 
   beforeEach(() => { ctx = fakeAgyContext(); });
   afterEach(() => { ctx.restore(); });
 
-  it("refuses, never spawns, and finalises the record with why (criterion 1)", async () => {
+  it("refuses an oversized schema at argv composition and names why (criterion 1)", () => {
     const oversized = "x".repeat(AGY_MAX_ARG_BYTES + 1);
-    const { job, resultText, stateDir } = await agyDispatch(
-      ctx.dispatchOptions({ promptText: oversized }),
-    );
-
-    // NOTHING was started: the fake binary logged no argv and no pid.
-    assert.deepEqual(loggedArgs(ctx.argsLog), []);
-    assert.equal(fs.readFileSync(ctx.pidsLog, "utf8"), "");
-    assert.equal(job.process, null);
-
-    // A caller error, not a provider outage — the same brief would fail
-    // identically on the next agy dispatch, so a retry walk must not be
-    // invited by a provider-error classification.
-    assert.equal(job.status, "error");
-    assert.equal(job.failure, null);
-    assert.notEqual(job.status, "provider-error");
-    assert.ok(job.finishedAt, "a refused dispatch is finished, not left running");
-
-    assert.match(job.error, /the prompt \(-p\) is 130049 bytes/);
-    assert.match(job.error, /130048-byte per-argument limit/);
-    assert.match(job.error, /MAX_ARG_STRLEN is 131072/);
-    assert.match(job.error, /shrink the brief/);
-    assert.match(job.error, /--model claude/);
-    assert.match(job.error, /opencode model/);
-    assert.equal(resultText, "");
-
-    // Persisted the same way every other failure on this backend is.
-    assert.equal(loadJob(stateDir, job.id).status, "error");
-    // kusabi #388: the closed terminal reason is stamped on the argv-too-large
-    // refusal (caller error -> "unknown").
-    assert.equal(job.stopReason, "unknown");
-    assert.equal(loadJob(stateDir, job.id).stopReason, "unknown");
-
-    const jdir = jobDir(stateDir, job.id);
-    // prompt.md is written even though nothing ran: the operator of a
-    // refused dispatch is the one who most needs to see what was too big.
-    assert.equal(fs.readFileSync(path.join(jdir, "prompt.md"), "utf8"), oversized);
-    assert.ok(!fs.existsSync(path.join(jdir, "result.md")));
-
-    const events = fs.readFileSync(path.join(jdir, "events.ndjson"), "utf8")
-      .trim().split("\n").map(JSON.parse);
-    assert.equal(events.length, 3);
-    assert.equal(events[0].type, "companion.agy.dispatch");
-    assert.equal(events[1].type, "companion.agy.argv-too-large");
-    assert.equal(events[1].backend, "agy");
-    assert.equal(events[1].model, "gemini-3.6-flash-high");
-    assert.equal(events[1].limit, AGY_MAX_ARG_BYTES);
-    // The MEASURED sizes, so the refusal can be checked rather than trusted.
-    assert.deepEqual(events[1].oversized, [
-      { index: 1, element: "prompt", flag: "-p", bytes: AGY_MAX_ARG_BYTES + 1 },
-    ]);
-    assert.equal(events[2].type, "companion.agy.finished");
-    assert.equal(events[2].spawned, false);
-    assert.equal(events[2].exitCode, null);
+    const args = buildAgyArgs({
+      model: "gemini-3.6-flash-high",
+      promptText: "Do the thing.",
+      jsonSchema: oversized,
+      timeoutS: 300,
+    });
+    const result = checkAgyArgvSize(args);
+    assert.equal(result.ok, false);
+    assert.equal(result.oversized.length, 1);
+    assert.equal(result.oversized[0].element, "schema");
+    assert.equal(result.oversized[0].flag, "--json-schema");
+    assert.equal(result.oversized[0].bytes, AGY_MAX_ARG_BYTES + 1);
+    assert.match(result.message, /the schema \(--json-schema\) is 130049 bytes/);
+    assert.match(result.message, /130048-byte per-argument limit/);
+    assert.match(result.message, /MAX_ARG_STRLEN is 131072/);
+    assert.match(result.message, /shrink the schema/);
+    assert.match(result.message, /backend that accepts a larger schema/);
   });
 
-  it("a refused (argv too large) dispatch records dispatch, argv-too-large, finished with spawned false, and no process", async () => {
+  it("flags an oversized schema in composed args with element schema", () => {
     const oversized = "x".repeat(AGY_MAX_ARG_BYTES + 1);
-    const { job, stateDir } = await agyDispatch(
-      ctx.dispatchOptions({ promptText: oversized }),
-    );
-    const events = fs.readFileSync(path.join(jobDir(stateDir, job.id), "events.ndjson"), "utf8")
-      .trim().split("\n").map(JSON.parse);
-    assert.deepEqual(events.map((e) => e.type), [
-      "companion.agy.dispatch",
-      "companion.agy.argv-too-large",
-      "companion.agy.finished",
+    const args = buildAgyArgs({
+      model: "gemini-3.6-flash-high",
+      promptText: "Do the thing.",
+      jsonSchema: oversized,
+      timeoutS: 300,
+    });
+    const result = checkAgyArgvSize(args);
+    assert.equal(result.ok, false);
+    assert.equal(result.oversized.length, 1);
+    assert.equal(result.oversized[0].element, "schema");
+    assert.equal(result.oversized[0].flag, "--json-schema");
+    assert.deepEqual(result.oversized, [
+      { index: 7, element: "schema", flag: "--json-schema", bytes: AGY_MAX_ARG_BYTES + 1 },
     ]);
-    assert.equal(events[2].spawned, false);
-    assert.equal(events[2].exitCode, null);
-    assert.equal(job.process, null);
-    assert.equal(fs.readFileSync(ctx.pidsLog, "utf8").trim(), "");
+    assert.match(result.message, /the schema \(--json-schema\) is 130049 bytes/);
   });
 
-  it("a prompt exactly AT the limit dispatches exactly as today (criterion 3)", async () => {
-    // Also a live check that the margin is not over-tight: this 130048-byte
-    // argument really does survive a real spawn on a real kernel.
-    const atLimit = "x".repeat(AGY_MAX_ARG_BYTES);
+  it("a prompt larger than AGY_MAX_ARG_BYTES no longer triggers the refusal (only an oversized schema does)", async () => {
+    const atLimit = "x".repeat(AGY_MAX_ARG_BYTES + 100);
     const { job, resultText, stateDir } = await agyDispatch(
       ctx.dispatchOptions({ promptText: atLimit }),
     );
@@ -3581,12 +3566,13 @@ describe("agyDispatch — an oversized argv is refused before the spawn", () => 
     assert.equal(resultText, "implemented the thing per the brief");
     const calls = loggedArgs(ctx.argsLog);
     assert.equal(calls.length, 1);
+    assert.equal(calls[0].includes("-p"), false);
     assert.deepEqual(calls[0], [
-      "-p", atLimit,
       "--output-format", "stream-json",
       "--model", "gemini-3.6-flash-high",
       "--print-timeout", "5m20s",
     ]);
+    assert.equal(fs.readFileSync(ctx.stdinLog, "utf8"), atLimit);
 
     const events = fs.readFileSync(path.join(jobDir(stateDir, job.id), "events.ndjson"), "utf8")
       .trim().split("\n").map(JSON.parse);
@@ -3595,33 +3581,62 @@ describe("agyDispatch — an oversized argv is refused before the spawn", () => 
     assert.deepEqual(events.filter((e) => e.type === "companion.agy.argv-too-large"), []);
   });
 
-  it("refuses a brief that is under the limit by .length but over it in bytes (criterion 4)", async () => {
+  it("refuses a schema that is under the limit by .length but over it in bytes (criterion 4)", () => {
     const jp = "実装してください。".repeat(6000); // 54000 chars, 162000 bytes
     assert.ok(jp.length < AGY_MAX_ARG_BYTES, "the .length reading must be UNDER the limit");
 
-    const { job } = await agyDispatch(ctx.dispatchOptions({ promptText: jp }));
-
-    assert.deepEqual(loggedArgs(ctx.argsLog), []);
-    assert.equal(job.status, "error");
-    assert.match(job.error, /the prompt \(-p\) is 162000 bytes/);
+    const args = buildAgyArgs({
+      model: "gemini-3.6-flash-high",
+      promptText: "Do the thing.",
+      jsonSchema: jp,
+      timeoutS: 300,
+    });
+    const result = checkAgyArgvSize(args);
+    assert.equal(result.ok, false);
+    assert.equal(result.oversized.length, 1);
+    assert.equal(result.oversized[0].element, "schema");
+    assert.equal(result.oversized[0].bytes, 162000);
+    assert.match(result.message, /the schema \(--json-schema\) is 162000 bytes/);
   });
 
-  it("counts the ROLE BLOCK too — the composed prompt is what rides argv", async () => {
-    // buildAgyPrompt prepends the agent's role body; the guard runs on the
-    // composed prompt, not the caller's, so a brief that only goes over
-    // AFTER composition is still refused.
+  it("counts the ROLE BLOCK too — composed prompt rides stdin without triggering argv refusal", async () => {
     const roleBody = readAgentSystemPrompt("kusabi-review");
     assert.ok(roleBody && roleBody.length > 0, "the review role body must be non-empty");
     const justUnder = "x".repeat(AGY_MAX_ARG_BYTES - 100);
     const composed = buildAgyPrompt({ systemPrompt: roleBody, promptText: justUnder });
     assert.ok(Buffer.byteLength(composed, "utf8") > AGY_MAX_ARG_BYTES);
 
+    ctx.setMode("review-json");
     const { job } = await agyDispatch(
       ctx.dispatchOptions({ promptText: justUnder, agent: "kusabi-review", phase: "review" }),
     );
-    assert.deepEqual(loggedArgs(ctx.argsLog), []);
-    assert.equal(job.status, "error");
-    assert.match(job.error, /the prompt \(-p\) is \d+ bytes/);
+    assert.equal(job.status, "completed");
+    const calls = loggedArgs(ctx.argsLog);
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].includes("-p"), false);
+    assert.equal(fs.readFileSync(ctx.stdinLog, "utf8"), composed);
+  });
+
+  it("dispatches prompt with distinctive marker over stdin and not argv", async () => {
+    const marker = "DISTINCTIVE_PROMPT_MARKER_TEST_2B";
+    const { job } = await agyDispatch(
+      ctx.dispatchOptions({ promptText: marker }),
+    );
+    assert.equal(job.status, "completed");
+    assert.equal(fs.readFileSync(ctx.stdinLog, "utf8"), marker);
+    const calls = loggedArgs(ctx.argsLog);
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].includes(marker), false);
+    assert.ok(!calls[0].some((arg) => arg.includes(marker)));
+  });
+
+  it("a prompt of exactly AGY_MAX_ARG_BYTES + 1 bytes is not refused", async () => {
+    const prompt = "x".repeat(AGY_MAX_ARG_BYTES + 1);
+    const { job } = await agyDispatch(
+      ctx.dispatchOptions({ promptText: prompt }),
+    );
+    assert.doesNotMatch(job.error ?? "", /over the .* limit/);
+    assert.equal(fs.readFileSync(ctx.stdinLog, "utf8").length, prompt.length);
   });
 });
 

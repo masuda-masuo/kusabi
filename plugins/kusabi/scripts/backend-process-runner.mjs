@@ -89,7 +89,7 @@ export function killProcessGroup(child) {
  * `parseLine`) and what happens to the job record (via `onLine`, `onWatchdog`).
  *
  * Adapters share this lifecycle:
- *   - agy: prompt on argv, no stdin; `parseLine` = `parseAgyStreamLine`.
+ *   - agy: prompt on stdin; `parseLine` = `parseAgyStreamLine`.
  *   - codex: prompt on stdin, no argv payload.
  *
  * The `parseLine` function determines which lines are "parsed events" that

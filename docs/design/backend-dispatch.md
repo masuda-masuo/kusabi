@@ -111,8 +111,10 @@ contract.
 
 ### Agy transport and payloads
 
-  agy -p <prompt> --output-format stream-json --model <id> --print-timeout <duration>
+  agy --output-format stream-json --model <id> --print-timeout <duration>
         [--json-schema <schema>] [--conversation <id>]
+
+(with the prompt delivered via stdin)
 
 and an NDJSON event stream on stdout, one object per line, discriminated
 by the `event` key (NOT `type` — that is the claude vocabulary; agy uses
@@ -157,12 +159,11 @@ metadata (`job.agyStatus`) only.  A missing/empty payload is a failed job
 regardless of what `status` claims.  Reading it the other way round would
 throw away completed, paid-for work on a mid-run tool typo.
 
-The prompt is on argv because that is the documented transport (unlike the
-claude backend, which was field-verified to accept stdin).  The tradeoff
-is real and accepted for v1: the prompt is visible in `ps` output on the
-host for the life of the child.  Briefs are not secrets; credentials never
-appear in one.  A stdin transport would need field verification against
-the real CLI before it could replace this.
+The prompt travels over stdin (omitting `-p`), so the full brief is not
+visible in `ps` output on the host while the child runs. Field verification
+confirmed that agy reads the prompt from stdin when `-p` is omitted, and that
+`--model`, `--json-schema` (structured_output is returned), `--print-timeout`,
+and `--conversation` all take effect in that mode.
 
 `resolveCompletedResult` selects a recovery source by backend and has
 none for agy (its transcripts are the CLI's own, in a location kusabi
@@ -228,12 +229,10 @@ With the 4096-byte pages this project runs on that is 131072 bytes
 ARG_MAX bounds the argv+env TOTAL, and a single oversized brief hits the
 per-string cap first by an order of magnitude.
 
-It matters HERE and nowhere else.  agy has no stdin prompt transport (field
-verification, kusabi #199): the composed prompt rides `-p <promptText>` and
-the schema rides `--json-schema <json>`, so both are single argv strings
-subject to this cap.  The claude backend feeds its prompt over stdin and
-opencode goes over HTTP — neither can reach this failure, and neither gets
-a size check.
+It matters HERE and nowhere else.  The prompt rides stdin, but the schema rides
+`--json-schema <json>` on argv, so it is a single argv string subject to this
+cap.  The claude backend feeds its prompt over stdin and opencode goes over HTTP
+— neither can reach this failure, and neither gets a size check.
 
 MAX_ARG_STRLEN less a 1024-byte margin, for two reasons worth stating:
   - The kernel measures the string WITH its NUL terminator (`copy_strings`
