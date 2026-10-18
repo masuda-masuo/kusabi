@@ -826,8 +826,10 @@ Measured motivation (2026-08-09): a strong model's round-1 skeleton was one-shot
 **Dispatch.** `plugins/kusabi/scripts/agy-dispatch.mjs` exports `agyDispatch` with the same call/return contract as `dispatchWithFallback` / `claudeDispatch` (`{ job, resultText, stateDir }`), selected per phase by `resolveDispatchBackend` exactly like the other two. It spawns the Antigravity CLI headlessly with the field-verified invocation and **nothing else**:
 
 ```
-agy -p <prompt> --output-format stream-json --model <id> --print-timeout <duration> [--json-schema <schema>] [--conversation <id>]
+agy --output-format stream-json --model <id> --print-timeout <duration> [--json-schema <schema>] [--conversation <id>]
 ```
+
+(with the prompt on stdin)
 
 `--conversation <id>` is the resume path: the CLI continues the conversation
 whose id is given (kusabi #316). It is appended by `buildAgyArgs` only when a

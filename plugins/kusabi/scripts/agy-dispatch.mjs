@@ -242,12 +242,12 @@ export function formatGoDuration(totalSeconds) {
 }
 
 /**
- * Build the argv for an `agy -p` dispatch.
+ * Build the argv for an `agy` dispatch (prompt on stdin).
  *
  * Contract (field-verified, kusabi #199; resume flag #316; timeout #326;
  * stream format #332):
- * `agy -p <prompt> --output-format stream-json --model <id> --print-timeout <duration>
- * [--json-schema <schema>] [--conversation <id>]`
+ * `agy --output-format stream-json --model <id> --print-timeout <duration>
+ * [--json-schema <schema>] [--conversation <id>]` with the prompt on stdin
  * — and NOTHING else.  Every flag here appears in that contract; no flag is
  * invented, and `--dangerously-skip-permissions` is never passed (not
  * needed, and blocked by the orchestrator-side classifier).

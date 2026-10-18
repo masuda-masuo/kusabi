@@ -7,7 +7,7 @@ Use kusabi from inside Claude Code to delegate tasks or run adversarial code rev
 ```
 orchestrator ——> kusabi-companion <subcommand> —┬—HTTP——> opencode serve (127.0.0.1, on-demand)
                                                 ├—spawn——> claude -p       (headless, no server)
-                                                ├—spawn——> agy -p          (headless, no server)
+                                                ├—spawn——> agy             (headless, no server)
                                                 └—spawn——> codex exec      (headless, no server)
                                                 │
                                                 ├─ SSE /event: progress tracking + automatic permission replies
@@ -252,8 +252,8 @@ split (or without the field) are treated as `opencode` by readers.
   (default `claude`). A **pre-dispatch session-quota guard** can refuse a
   dispatch before it starts — see below.
 - **agy** — dispatch through the Antigravity CLI in headless mode
-  (`agy -p <prompt> --output-format stream-json --model <id>
-  --print-timeout <duration>`, plus `--json-schema` for reviews and
+  (`agy --output-format stream-json --model <id> --print-timeout <duration>`,
+  with the prompt sent on stdin, plus `--json-schema` for reviews and
   `--conversation <id>` when resuming). It buys a separate quota pool
   (Gemini, metered apart from the other backends) and another model family
   for cross-family review; any phase may route to it. Config entries and
