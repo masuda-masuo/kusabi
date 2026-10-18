@@ -254,3 +254,27 @@ _fill: reusable precedent, if any_
     }
   });
 });
+
+
+describe("historical review record marks", () => {
+  it("does not count a marked unadjudicated record", () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-scan-historical-"));
+    try {
+      const recordPath = path.join(tmpDir, "hash123", "chains", "chain-historical", "review-record.md");
+      fs.mkdirSync(path.dirname(recordPath), { recursive: true });
+      const recordText = `# [review-record] repo chain-historical
+## Findings adjudication (fill at inspection)
+<!-- historical: not adjudicated; closed by review-record-close before 2020-01-01T00:00:00.000Z -->
+| # | severity | finding | 採否 | 理由 |
+|---|---|---|---|---|
+| 1 | low | old finding | _fill_ | _fill_ |
+`;
+      fs.writeFileSync(recordPath, recordText);
+
+      assert.equal(isUnadjudicatedRecord(recordText), false);
+      assert.equal(countUnfilledReviewRecords(tmpDir), 0);
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+});
