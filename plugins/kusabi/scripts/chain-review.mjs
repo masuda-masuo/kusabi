@@ -34,6 +34,7 @@ import {
 import {
   classifyDispatchQuotaExhaustion,
 } from "./chain-quota.mjs";
+import { captureWorktreeState } from "./worktree-baseline.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const PLUGIN_ROOT = path.resolve(HERE, "..");
@@ -342,7 +343,7 @@ export function renderProbeReport(probeResults) {
  * caller's provider-exhaustion branch.
  */
 export async function runReviewPhase({
-  container, brief, modelChain, chainId, cwd, previousRecord, baseSha,
+  container, brief, modelChain, chainId, cwd, previousRecord, baseSha, callTool,
   chainStatusOutput, chainBaseLog, chainUntracked, chainTruncation, roundRecord,
   chainChangedPaths, chainNewlyChanged, chainStatusObserved, chainDeliverables, flagsModel,
   reworkScope, changeScope,
@@ -460,6 +461,18 @@ export async function runReviewPhase({
 
     let reviewJob;
     let reviewResultText;
+    delete roundRecord.reviewTreeHash;
+    delete roundRecord.reviewTreeHashReason;
+    try {
+      const reviewTreeState = await captureWorktreeState(callTool, container);
+      if (typeof reviewTreeState?.treeHash === "string" && reviewTreeState.treeHash) {
+        roundRecord.reviewTreeHash = reviewTreeState.treeHash;
+      } else {
+        roundRecord.reviewTreeHashReason = "worktree state capture returned no state";
+      }
+    } catch (error) {
+      roundRecord.reviewTreeHashReason = "worktree state capture failed: " + String(error?.message || error).slice(0, 100);
+    }
     ({ job: reviewJob, resultText: reviewResultText } = await _dispatch(reviewDispatchOptions));
 
     // ---- parse review result ----

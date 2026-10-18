@@ -356,7 +356,7 @@ export async function finishRound(
     chainParsedReview, chainRepeatedAreas, skipReview,
     reviewJobStatus, reviewJobError,
   } = await runReviewPhase({
-    container, brief, modelChain: effectiveReviewChain, chainId, cwd, previousRecord, baseSha: effectiveBaseSha,
+    container, brief, modelChain: effectiveReviewChain, chainId, cwd, previousRecord, baseSha: effectiveBaseSha, callTool,
     chainStatusOutput, chainBaseLog, chainUntracked, chainTruncation, roundRecord,
     chainChangedPaths, chainNewlyChanged, chainStatusObserved, chainDeliverables,
     flagsModel: reviewFlagsModel ?? flagsModel, _dispatchWithFallback: reviewDispatch,
