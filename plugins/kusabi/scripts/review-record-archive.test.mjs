@@ -96,6 +96,22 @@ describe("review-record-archive", () => {
     }
   });
 
+  it("accepts a finished row whose finding contains _fill_", () => {
+    const f = fixture({ record: [
+      "# record",
+      "## Findings adjudication (fill at inspection)",
+      "| # | severity | finding | verdict | reason |",
+      "|---|---|---|---|---|",
+      "| 1 | medium | archive does not refuse rows still marked _fill_ | 採用 | 修正済み |",
+      "## Usage",
+    ].join("\n") });
+    try {
+      assert.match(archive(f), /staged/);
+    } finally {
+      fs.rmSync(f.root, { recursive: true, force: true });
+    }
+  });
+
   it("refuses unfilled rows and includes all row numbers", () => {
     const f = fixture({ record: [
       "# record",

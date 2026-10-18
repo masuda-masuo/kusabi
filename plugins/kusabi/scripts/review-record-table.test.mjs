@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { formatAdjudicationRow, parseAdjudicationRow } from "./review-record-table.mjs";
+import { formatAdjudicationRow, parseAdjudicationRow, unfilledAdjudicationLines } from "./review-record-table.mjs";
 
 describe("review-record-table", () => {
   it("parses the five cells of a regular adjudication row", () => {
@@ -30,6 +30,27 @@ describe("review-record-table", () => {
     assert.deepEqual(parseAdjudicationRow(row), {
       cells: ["5", "medium", "finding", "採用", "left | right"],
     });
+  });
+
+  it("checks _fill_ only in verdict and reason for complete table rows", () => {
+    const result = (row) => unfilledAdjudicationLines([
+      "## Findings adjudication",
+      row,
+    ].join("\n")).unfilled;
+
+    assert.deepEqual(result("| 1 | medium | archive does not refuse rows still marked _fill_ | 採用 | 修正済み |"), []);
+    assert.deepEqual(result("| 2 | medium | finding | _fill_ | complete |"), [{ line: 2, row: "2" }]);
+    assert.deepEqual(result("| 2 | medium | finding | _fill_ (todo) | complete |"), [{ line: 2, row: "2" }]);
+    assert.deepEqual(result("| 3 | medium | finding | complete | _fill_ |"), [{ line: 2, row: "3" }]);
+    assert.deepEqual(result("| 3 | medium | finding | complete | note _fill_ |"), [{ line: 2, row: "3" }]);
+    assert.deepEqual(result("3 | medium | finding _fill_ | complete | reason"), [{ line: 2, row: "3" }]);
+  });
+
+  it("round-trips a trailing backslash and a literal backslash-pipe in findings", () => {
+    for (const finding of ["ends\\", "literal \\| pipe"]) {
+      const row = formatAdjudicationRow(["8", "medium", finding, "採用", "reason"]);
+      assert.equal(parseAdjudicationRow(row).cells[2], finding);
+    }
   });
 
   it("returns null for lines that are not table rows", () => {

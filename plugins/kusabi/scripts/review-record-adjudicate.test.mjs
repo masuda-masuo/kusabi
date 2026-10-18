@@ -6,7 +6,7 @@ import path from "node:path";
 import { describe, it } from "node:test";
 import { cmdReviewRecordAdjudicate } from "./review-record-adjudicate.mjs";
 import { countUnfilledReviewRecords } from "./review-record-scan.mjs";
-import { parseAdjudicationRow } from "./review-record-table.mjs";
+import { formatAdjudicationRow, parseAdjudicationRow } from "./review-record-table.mjs";
 
 const FINDINGS = "## Findings adjudication (fill at inspection)";
 const PRECEDENT = "## 判例として (fill at inspection)";
@@ -254,6 +254,26 @@ describe("review-record-adjudicate", () => {
         assert.ok(row.includes(findingBytes));
         assert.equal(parseAdjudicationRow(row).cells[2], "finding | title");
       }
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("adjudicates a finding containing a literal backslash-pipe", () => {
+    const { root, recordPath } = fixture();
+    try {
+      const original = fs.readFileSync(recordPath, "utf8");
+      const row = formatAdjudicationRow(["1", "low", "finding \\| title", "_fill_", "_fill_"]);
+      fs.writeFileSync(recordPath, original.replace(
+        "| 1 | low | finding one | _fill_ | _fill_ |",
+        row,
+      ));
+
+      run(root, "--row", "1", "--verdict", "accept", "--reason", "handled");
+      const parsed = parseAdjudicationRow(rows(fs.readFileSync(recordPath, "utf8"))[0]);
+      assert.equal(parsed.cells[2], "finding \\| title");
+      assert.equal(parsed.cells[3], "採用");
+      assert.equal(parsed.cells[4], "handled");
     } finally {
       fs.rmSync(root, { recursive: true, force: true });
     }

@@ -1944,6 +1944,20 @@ describe("renderReviewRecord", () => {
     assert.deepEqual(parseAdjudicationRow(tableLine).cells.slice(0, 3), ["1", "low", "left | right"]);
   });
 
+  it("escapes pipes and trailing backslashes in adjudication findings", () => {
+    const finding = "left|right and trailing\\";
+    const text = renderReviewRecord({
+      chainId: "chain-pipe-backslash",
+      records: [{
+        round: 1,
+        findings: [{ severity: "low", title: finding }],
+      }],
+    });
+    const tableLine = text.split("\n").find((line) => line.startsWith("| 1 | low |"));
+    assert.ok(tableLine.includes("left\\|right and trailing\\\\"));
+    assert.equal(parseAdjudicationRow(tableLine).cells[2], finding);
+  });
+
   it("renders a review record header with a repository identity", () => {
     const text = renderReviewRecord({
       chainId: "chain-abc",

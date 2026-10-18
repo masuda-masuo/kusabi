@@ -4,18 +4,27 @@ export function parseAdjudicationRow(line) {
   const trimmed = line.trim();
   if (!trimmed.startsWith("|") || !trimmed.endsWith("|")) return null;
 
-  const rawFields = trimmed.slice(1, -1).split(/(?<!\\)\|/);
+  const inner = trimmed.slice(1, -1);
+  const separators = pipePositions(inner);
+  const rawFields = [];
+  let start = 0;
+  for (const position of separators) {
+    rawFields.push(inner.slice(start, position));
+    start = position + 1;
+  }
+  rawFields.push(inner.slice(start));
   const fields = rawFields.map((cell) => cell.trim());
   if (fields.length < 5) return { cells: fields };
 
-  const finding = rawFields.slice(2, -2).join("|").trim().replace(/\\\|/g, "|");
-  const reason = fields.at(-1).replace(/\\\|/g, "|");
+  const decodeCell = (value) => value.replace(/\\\|/g, "|").replace(/\\\\/g, "\\");
+  const finding = decodeCell(rawFields.slice(2, -2).join("|").trim());
+  const reason = decodeCell(fields.at(-1));
   return {
     cells: [fields[0], fields[1], finding, fields.at(-2), reason],
   };
 }
 
-function escapedCell(value) {
+export function escapedCell(value) {
   return String(value).replace(/\\/g, "\\\\").replace(/\|/g, "\\|");
 }
 
@@ -87,7 +96,13 @@ export function unfilledAdjudicationLines(content) {
       historical = true;
       continue;
     }
-    if (historical || !line.includes("_fill_")) continue;
+    if (historical) continue;
+    const parsedRow = parseAdjudicationRow(line);
+    const isCompleteTableRow = parsedRow?.cells?.length >= 5;
+    const hasUnfilledCell = isCompleteTableRow
+      ? parsedRow.cells.slice(-2).some((cell) => cell.includes("_fill_"))
+      : line.includes("_fill_");
+    if (!hasUnfilledCell) continue;
 
     const numberedRow = line.match(/^\s*\|?\s*(\d+)\b/);
     unfilled.push({
