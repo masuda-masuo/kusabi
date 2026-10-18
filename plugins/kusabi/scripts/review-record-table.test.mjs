@@ -38,11 +38,11 @@ describe("review-record-table", () => {
       row,
     ].join("\n")).unfilled;
 
-    assert.deepEqual(result("| 1 | medium | archive does not refuse rows still marked _fill_ | 採用 | 修正済み |"), []);
+    assert.deepEqual(result("| 1 | medium | archive gate | 採用 | archive が _fill_ 行を拒否するよう修正済み |"), []);
     assert.deepEqual(result("| 2 | medium | finding | _fill_ | complete |"), [{ line: 2, row: "2" }]);
     assert.deepEqual(result("| 2 | medium | finding | _fill_ (todo) | complete |"), [{ line: 2, row: "2" }]);
     assert.deepEqual(result("| 3 | medium | finding | complete | _fill_ |"), [{ line: 2, row: "3" }]);
-    assert.deepEqual(result("| 3 | medium | finding | complete | note _fill_ |"), [{ line: 2, row: "3" }]);
+    assert.deepEqual(result("| 3 | medium | finding | complete | note _fill_ |"), []);
     assert.deepEqual(result("3 | medium | finding _fill_ | complete | reason"), [{ line: 2, row: "3" }]);
   });
 

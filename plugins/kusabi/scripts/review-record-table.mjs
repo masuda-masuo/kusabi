@@ -100,7 +100,10 @@ export function unfilledAdjudicationLines(content) {
     const parsedRow = parseAdjudicationRow(line);
     const isCompleteTableRow = parsedRow?.cells?.length >= 5;
     const hasUnfilledCell = isCompleteTableRow
-      ? parsedRow.cells.slice(-2).some((cell) => cell.includes("_fill_"))
+      ? parsedRow.cells.slice(-2).some((cell) => {
+        const trimmedCell = cell.trim();
+        return trimmedCell === "_fill_" || trimmedCell.startsWith("_fill_");
+      })
       : line.includes("_fill_");
     if (!hasUnfilledCell) continue;
 
