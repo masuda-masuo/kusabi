@@ -96,7 +96,7 @@ function adjudicationRows(lines, start, end) {
 }
 
 function escapeCell(value) {
-  return value.replace(/\|/g, "\\|");
+  return value.replace(/\\/g, "\\\\").replace(/\|/g, "\\|");
 }
 
 function replaceRowCells(line, verdict, reason) {
