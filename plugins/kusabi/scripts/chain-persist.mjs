@@ -76,7 +76,7 @@ export function persistChainState({
   reworkModel = null, reworkModelChain = null, reworkBackend = null,
   maxRounds, brief, orchestrator, records, baseSha, chainTotals,
   chainFollowupDraft, interrupted = false, verifyBaseline = null,
-  smokeObservation = null,
+  smokeObservation = null, repo = null, repoReason = null,
 }) {
   if (interrupted) {
     roundRecord.interrupted = true;
@@ -97,6 +97,8 @@ export function persistChainState({
   writeJson(path.join(chainDir, "round-" + round + ".json"), roundRecord);
   writeJson(path.join(chainDir, "chain.json"), {
     chainId,
+    repo: repo ?? null,
+    ...(repo == null ? { repoReason: repoReason || "Repository identity unavailable" } : {}),
     container,
     model,
     modelChain,
@@ -156,6 +158,7 @@ export function persistChainState({
  *                                       from records only when not given.
  * @param {{disposition: string, round: number, reason?: string|null}} opts.disposition
  *                                       — the FINAL disposition.
+ * @param {string|null} [opts.repo]       — owner/repo identity for the header.
  * @param {string} [opts.label]         — repo/cwd label for the header.
  * @param {string} [opts.finishedAt]    — ISO timestamp; defaults to now.
  * @param {boolean} [opts.provisional]  — true when chain ended at a non-completed exit.
@@ -163,13 +166,14 @@ export function persistChainState({
  */
 export function writeReviewRecord({
   chainDir, chainId, container, modelChain, maxRounds, brief, orchestrator,
-  records, chainTotals, disposition, round, label, finishedAt, provisional,
+  records, chainTotals, disposition, round, label, repo, finishedAt, provisional,
 }) {
   const safeRecords = Array.isArray(records) ? records : [];
   const markdown = renderReviewRecord({
     chainId,
     container,
     label,
+    repo,
     brief,
     orchestrator,
     modelChain,

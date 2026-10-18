@@ -230,7 +230,10 @@ export function renderReviewRecord(record) {
   const lines = [];
 
   // ---- header ----
-  lines.push(`# [review-record] ${rec.label || "(unknown)"} ${chainId} — ${reviewRecordBriefFirstLine(rec.brief)}`);
+  const headerLabel = typeof rec.repo === "string"
+    ? rec.repo
+    : `${rec.label || "(unknown)"} (dir)`;
+  lines.push(`# [review-record] ${headerLabel} ${chainId} — ${reviewRecordBriefFirstLine(rec.brief)}`);
   lines.push("");
   lines.push(`Orchestrator: ${reviewRecordOrchestratorLine(rec)} | finished: ${reviewRecordFinishedAt(rec)}`);
   lines.push(`Model chain: ${reviewRecordModelChain(rec)} | container: ${rec.container || "(unknown)"}`);

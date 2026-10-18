@@ -58,7 +58,7 @@ import {
  * @returns {string} The outcome text with the record path appended.
  */
 export function finaliseChain(text, disposition, round, ctx) {
-  const { chainDir, chainId, container, modelChain, maxRounds, brief, orchestrator, records, cwd } = ctx;
+  const { chainDir, chainId, container, modelChain, maxRounds, brief, orchestrator, records, cwd, repo } = ctx;
   let recordPath = null;
   let writeError = null;
   try {
@@ -67,6 +67,7 @@ export function finaliseChain(text, disposition, round, ctx) {
       records, chainTotals: computeChainTotals(records),
       disposition, round,
       label: path.basename(cwd) || null,
+      repo,
     });
   } catch (err) {
     // Best-effort — the outcome text stays intact, but the failure must be
@@ -101,7 +102,7 @@ export function finaliseChain(text, disposition, round, ctx) {
  * @returns {string} The outcome text with the record path appended.
  */
 export function finaliseProvisionalChain(text, disposition, round, ctx) {
-  const { chainDir, chainId, container, modelChain, maxRounds, brief, orchestrator, records, cwd } = ctx;
+  const { chainDir, chainId, container, modelChain, maxRounds, brief, orchestrator, records, cwd, repo } = ctx;
   const last = records.length >= 1 ? records[records.length - 1] : null;
   const predicateHolds = Boolean(
     records.length >= 1 &&
@@ -123,6 +124,7 @@ export function finaliseProvisionalChain(text, disposition, round, ctx) {
       records, chainTotals: computeChainTotals(records),
       disposition: dispObj, round: recRound,
       label: path.basename(cwd) || null,
+      repo,
       provisional: true,
     });
   } catch (err) {
@@ -521,6 +523,12 @@ export async function finishRound(
       chainFollowupDraft: null,
       verifyBaseline: effectiveVerifyBaseline,
     });
+    chainState.repo = ctx.repo ?? null;
+    if (chainState.repo == null) {
+      chainState.repoReason = ctx.repoReason || "Repository identity unavailable";
+    } else {
+      delete chainState.repoReason;
+    }
     writeJson(path.join(chainDir, "round-" + round + ".json"), roundRecord);
     writeJson(path.join(chainDir, "chain.json"), chainState);
     finalizeChainControl({ chainDir, status: "failed", round });
@@ -725,6 +733,7 @@ export async function finishRound(
     chainTotals, chainFollowupDraft,
     verifyBaseline: effectiveVerifyBaseline,
     smokeObservation: ctx.smokeObservation ?? null,
+    repo: ctx.repo ?? null, repoReason: ctx.repoReason ?? null,
   });
 
   // Update the chain control round counter

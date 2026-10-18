@@ -186,6 +186,8 @@ describe("persistChainState interrupted round", () => {
     assert.equal(chainJson.records[0].round, 3);
     assert.equal(chainJson.records[0].implementJobId, "job-3");
     assert.equal(chainJson.records[0].interrupted, true);
+    assert.equal(chainJson.repo, null);
+    assert.equal(chainJson.repoReason, "Repository identity unavailable");
   });
 
   it("does not mark the record when interrupted is not requested", () => {
@@ -214,6 +216,35 @@ describe("persistChainState interrupted round", () => {
     });
     const chainJson = readJson(path.join(chainDir, "chain.json"));
     assert.equal(chainJson.records.length, 1);
+  });
+
+  it("persists repo identity and adds a reason only when repo is null", () => {
+    const chainDir = makeChainDir();
+    fs.mkdirSync(chainDir, { recursive: true });
+    const roundRecord = { round: 1 };
+    persistChainState({
+      chainDir, round: 1, roundRecord, records: [roundRecord],
+      chainTotals: computeChainTotals([roundRecord]),
+      ...chainCtx,
+      repo: null,
+      repoReason: "origin missing",
+    });
+    const missingRepo = readJson(path.join(chainDir, "chain.json"));
+    assert.equal(missingRepo.repo, null);
+    assert.equal(missingRepo.repoReason, "origin missing");
+
+    const repoChainDir = path.join(makeChainDir(), "repo");
+    fs.mkdirSync(repoChainDir, { recursive: true });
+    persistChainState({
+      chainDir: repoChainDir, round: 1, roundRecord: { round: 1 }, records: [],
+      chainTotals: computeChainTotals([]),
+      ...chainCtx,
+      repo: "owner/repo",
+      repoReason: null,
+    });
+    const knownRepo = readJson(path.join(repoChainDir, "chain.json"));
+    assert.equal(knownRepo.repo, "owner/repo");
+    assert.equal("repoReason" in knownRepo, false);
   });
 
   it("persists the chain-start verify baseline into chain.json (kusabi #173)", () => {
@@ -360,7 +391,7 @@ describe("writeReviewRecord", () => {
     assert.ok(fs.existsSync(recordPath));
 
     const text = fs.readFileSync(recordPath, "utf8");
-    assert.match(text, /# \[review-record\] repo chain-1 — Implement X\./);
+    assert.equal(text.split("\n")[0], "# [review-record] repo (dir) chain-1 — Implement X.");
     assert.match(text, /Final disposition: accepted at round 1 of 4/);
     assert.match(text, /Round 1 — model: flash\/quick, verdict: approve \(parsed\), disposition: accept, changed: yes/);
     assert.match(text, /- \[high\] Null pointer \(src\/x\.js:42\)/);
@@ -369,6 +400,24 @@ describe("writeReviewRecord", () => {
     // Usage comes from the chain's existing chainTotals: null means that no
     // usage field was measured.
     assert.match(text, /input=n\/a output=n\/a reasoning=n\/a cacheRead=n\/a cacheWrite=n\/a cost=n\/a/);
+  });
+
+  it("renders the owner/repo header label when repo is present", () => {
+    const chainDir = makeChainDir();
+    writeReviewRecord({
+      chainDir,
+      chainId: "chain-x",
+      container: "cid-1",
+      label: "repo",
+      repo: "owner/repo",
+      brief: "Implement X.",
+      records,
+      disposition: { disposition: "accepted", round: 1 },
+      round: 1,
+      finishedAt: "2026-08-08T00:00:00.000Z",
+    });
+    const text = fs.readFileSync(path.join(chainDir, "review-record.md"), "utf8");
+    assert.equal(text.split("\n")[0], "# [review-record] owner/repo chain-x — Implement X.");
   });
 
   it("uses the given chainTotals verbatim instead of recomputing from rounds", () => {
