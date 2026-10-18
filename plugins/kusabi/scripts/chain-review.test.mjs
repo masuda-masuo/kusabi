@@ -2069,7 +2069,7 @@ function quoteReviewText(findings) {
   });
 }
 
-async function runQuoteReview({ findings, execOutput, execError = null, initialRecord = { round: 1 } }) {
+async function runQuoteReview({ findings, execOutput, execError = null, execResultFlags = {}, initialRecord = { round: 1 } }) {
   const calls = [];
   const roundRecord = { ...initialRecord };
   await runReview({
@@ -2078,7 +2078,7 @@ async function runQuoteReview({ findings, execOutput, execError = null, initialR
       calls.push({ tool, params });
       if (calls.length === 1) return { output: "TREE_HASH=0123456789abcdef0123456789abcdef01234567\nCOUNT=0\n" };
       if (execError) throw execError;
-      return { output: execOutput };
+      return { output: execOutput, ...execResultFlags };
     },
     _dispatchWithFallback: async () => fakeJob(
       "job-quote-check",
@@ -2145,6 +2145,30 @@ describe("runReviewPhase quote accuracy check", () => {
     });
 
     assert.equal(roundRecord.quoteCheck.mismatched, 0);
+  });
+
+  it("omits quoteCheck and preserves the verdict when exec output is truncated", async () => {
+    const { roundRecord } = await runQuoteReview({
+      findings: [quoteReviewFinding()],
+      execOutput: "0\\tok\\t" + Buffer.from("const answer = 42;").toString("base64") + "\\n",
+      execResultFlags: { truncated: true },
+    });
+
+    assert.equal(Object.hasOwn(roundRecord, "quoteCheck"), false);
+    assert.equal(roundRecord.quoteCheckReason, "quote check output truncated");
+    assert.equal(roundRecord.verdict, "approve");
+  });
+
+  it("omits quoteCheck and preserves the verdict when exec output has more data", async () => {
+    const { roundRecord } = await runQuoteReview({
+      findings: [quoteReviewFinding()],
+      execOutput: "0\\tok\\t" + Buffer.from("const answer = 42;").toString("base64") + "\\n",
+      execResultFlags: { has_more: true },
+    });
+
+    assert.equal(Object.hasOwn(roundRecord, "quoteCheck"), false);
+    assert.equal(roundRecord.quoteCheckReason, "quote check output truncated");
+    assert.equal(roundRecord.verdict, "approve");
   });
 
   it("keeps the review verdict and omits quoteCheck when exec fails", async () => {
