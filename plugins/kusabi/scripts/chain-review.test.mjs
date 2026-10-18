@@ -2044,3 +2044,191 @@ describe("runReviewPhase review tree hash", () => {
     assert.equal(roundRecord.verdict, "approve");
   });
 });
+
+
+function quoteReviewFinding({ file = "src/example.js", line = 1, body = "Quote: `const answer = 42;`" } = {}) {
+  return {
+    severity: "medium",
+    title: "Quote check",
+    body,
+    file,
+    line_start: line,
+    line_end: line,
+    confidence: 0.9,
+    recommendation: "Check the quoted line.",
+  };
+}
+
+function quoteReviewText(findings) {
+  return JSON.stringify({
+    schema_version: 1,
+    verdict: "approve",
+    summary: "Review summary",
+    findings,
+    next_steps: [],
+  });
+}
+
+async function runQuoteReview({ findings, execOutput, execError = null, execResultFlags = {}, initialRecord = { round: 1 } }) {
+  const calls = [];
+  const roundRecord = { ...initialRecord };
+  await runReview({
+    roundRecord,
+    callTool: async (tool, params) => {
+      calls.push({ tool, params });
+      if (calls.length === 1) return { output: "TREE_HASH=0123456789abcdef0123456789abcdef01234567\nCOUNT=0\n" };
+      if (execError) throw execError;
+      return { output: execOutput, ...execResultFlags };
+    },
+    _dispatchWithFallback: async () => fakeJob(
+      "job-quote-check",
+      quoteReviewText(findings),
+    ),
+  });
+  return { roundRecord, calls };
+}
+
+describe("runReviewPhase quote accuracy check", () => {
+  it("records a matching Quote finding", async () => {
+    const { roundRecord } = await runQuoteReview({
+      findings: [quoteReviewFinding()],
+      execOutput: "0\tok\t" + Buffer.from("const answer = 42;").toString("base64") + "\n",
+    });
+
+    assert.deepEqual(roundRecord.quoteCheck, {
+      findings: 1,
+      quoted: 1,
+      mismatched: 0,
+      examples: [],
+    }, roundRecord.quoteCheckReason);
+  });
+
+  it("records a mismatched quoted line with its exact example fields", async () => {
+    const { roundRecord } = await runQuoteReview({
+      findings: [quoteReviewFinding()],
+      execOutput: "0\tok\t" + Buffer.from("const answer = 0;").toString("base64") + "\n",
+    });
+
+    assert.equal(roundRecord.quoteCheck.mismatched, 1);
+    assert.deepEqual(roundRecord.quoteCheck.examples[0], {
+      file: "src/example.js",
+      line: 1,
+      quote: "const answer = 42;",
+      actual: "const answer = 0;",
+    });
+  });
+
+  it("does not count a backtick outside a Quote line", async () => {
+    const { roundRecord, calls } = await runQuoteReview({
+      findings: [quoteReviewFinding({ body: "This has `ticks`, but no quote label." })],
+    });
+
+    assert.equal(roundRecord.quoteCheck.quoted, 0);
+    assert.equal(roundRecord.quoteCheck.mismatched, 0);
+    assert.equal(calls.length, 1);
+  });
+
+  it("does not count a Quote line with fewer than two backticks", async () => {
+    const { roundRecord, calls } = await runQuoteReview({
+      findings: [quoteReviewFinding({ body: "Quote: `one tick" })],
+    });
+
+    assert.equal(roundRecord.quoteCheck.quoted, 0);
+    assert.equal(roundRecord.quoteCheck.mismatched, 0);
+    assert.equal(calls.length, 1);
+  });
+
+  it("trims leading and trailing spaces before comparing", async () => {
+    const { roundRecord } = await runQuoteReview({
+      findings: [quoteReviewFinding({ body: "Quote: `  const answer = 42;  `" })],
+      execOutput: "0\tok\t" + Buffer.from("const answer = 42;").toString("base64") + "\n",
+    });
+
+    assert.equal(roundRecord.quoteCheck.mismatched, 0);
+  });
+
+  it("omits quoteCheck and preserves the verdict when exec output is truncated", async () => {
+    const { roundRecord } = await runQuoteReview({
+      findings: [quoteReviewFinding()],
+      execOutput: "0\\tok\\t" + Buffer.from("const answer = 42;").toString("base64") + "\\n",
+      execResultFlags: { truncated: true },
+    });
+
+    assert.equal(Object.hasOwn(roundRecord, "quoteCheck"), false);
+    assert.equal(roundRecord.quoteCheckReason, "quote check output truncated");
+    assert.equal(roundRecord.verdict, "approve");
+  });
+
+  it("omits quoteCheck and preserves the verdict when exec output has more data", async () => {
+    const { roundRecord } = await runQuoteReview({
+      findings: [quoteReviewFinding()],
+      execOutput: "0\\tok\\t" + Buffer.from("const answer = 42;").toString("base64") + "\\n",
+      execResultFlags: { has_more: true },
+    });
+
+    assert.equal(Object.hasOwn(roundRecord, "quoteCheck"), false);
+    assert.equal(roundRecord.quoteCheckReason, "quote check output truncated");
+    assert.equal(roundRecord.verdict, "approve");
+  });
+
+  it("keeps the review verdict and omits quoteCheck when exec fails", async () => {
+    const { roundRecord } = await runQuoteReview({
+      findings: [quoteReviewFinding()],
+      execError: new Error("exec unavailable"),
+    });
+
+    assert.equal(roundRecord.verdict, "approve");
+    assert.equal(Object.hasOwn(roundRecord, "quoteCheck"), false);
+    assert.equal(typeof roundRecord.quoteCheckReason, "string");
+    assert.ok(roundRecord.quoteCheckReason.length <= 100);
+  });
+
+  it("marks a quote beyond EOF as line out of range", async () => {
+    const { roundRecord } = await runQuoteReview({
+      findings: [quoteReviewFinding({ line: 9 })],
+      execOutput: "0\teof\t\n",
+    });
+
+    assert.equal(roundRecord.quoteCheck.mismatched, 1);
+    assert.deepEqual(roundRecord.quoteCheck.examples[0], {
+      file: "src/example.js",
+      line: 9,
+      quote: "const answer = 42;",
+      actual: "",
+      reason: "line out of range",
+    });
+  });
+
+  it("rejects unsafe paths before the exec command", async () => {
+    const paths = ["$(touch /tmp/x)", "a;b", "../etc/passwd"];
+    const findings = paths.map(function (file) {
+      return quoteReviewFinding({ file });
+    });
+    findings.push(quoteReviewFinding({ file: "src/safe.js" }));
+    const { roundRecord, calls } = await runQuoteReview({
+      findings,
+      execOutput: "3\tok\t" + Buffer.from("const answer = 42;").toString("base64") + "\n",
+    });
+    const quoteExecCalls = calls.filter(function (call) {
+      if (!Array.isArray(call.params.commands)) return false;
+      const commands = call.params.commands.join(" ");
+      return commands.includes("base64") || commands.includes("alphabet=");
+    });
+    assert.equal(quoteExecCalls.length, 1);
+    const quoteExecCall = quoteExecCalls[0];
+    const quoteExecCommands = quoteExecCall.params.commands.join(" ");
+
+    assert.ok(
+      quoteExecCommands.includes("base64") || quoteExecCommands.includes("alphabet="),
+    );
+    for (const file of paths) {
+      assert.equal(quoteExecCommands.includes(file), false);
+    }
+    assert.equal(roundRecord.quoteCheck.mismatched, 3);
+    assert.deepEqual(roundRecord.quoteCheck.examples.map(function (example) {
+      return { file: example.file, reason: example.reason };
+    }), paths.map(function (file) {
+      return { file, reason: "invalid path" };
+    }));
+  });
+});
