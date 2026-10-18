@@ -149,6 +149,21 @@ export function computeStats(chains, opts = {}) {
   // ---- round-level stats ----
   const roundCount = allRounds.length;
 
+  // ---- quote checks ----
+  const quoteCheck = { rounds: 0, findings: 0, quoted: 0, mismatched: 0, failed: 0, excluded: 0 };
+  for (const { round } of allRounds) {
+    if (round.quoteCheck && typeof round.quoteCheck === "object" && !Array.isArray(round.quoteCheck)) {
+      quoteCheck.rounds += 1;
+      quoteCheck.findings += round.quoteCheck.findings || 0;
+      quoteCheck.quoted += round.quoteCheck.quoted || 0;
+      quoteCheck.mismatched += round.quoteCheck.mismatched || 0;
+    } else if (round.quoteCheckReason) {
+      quoteCheck.failed += 1;
+    } else {
+      quoteCheck.excluded += 1;
+    }
+  }
+
   // Rounds per chain (only chains that have rounds in this range)
   const roundsPerChain = {};
   for (const { chainIndex } of allRounds) {
@@ -528,6 +543,7 @@ export function computeStats(chains, opts = {}) {
     // Overview
     chainCount,
     roundCount,
+    quoteCheck,
     roundsPerChainCounts: rpcValues,
 
     // Dispositions (final per chain)
@@ -696,6 +712,21 @@ export function renderChainStats(stats, opts = {}) {
     lines.push(line("n/a (not available)", stats.verdictNA, totalVerdicts));
   }
   lines.push("");
+
+  // Quote check
+  if (stats.quoteCheck.rounds > 0 || stats.quoteCheck.failed > 0) {
+    const qc = stats.quoteCheck;
+    const quotedRate = qc.findings > 0 ? `${(qc.quoted / qc.findings * 100).toFixed(1)}%` : "n/a";
+    const mismatchRate = qc.quoted > 0 ? `${(qc.mismatched / qc.quoted * 100).toFixed(1)}%` : "n/a";
+    lines.push("Quote check:");
+    lines.push(`  Rounds                       ${qc.rounds}`);
+    lines.push(`  Findings                     ${qc.findings}`);
+    lines.push(`  Quoted                       ${qc.quoted} (${quotedRate})`);
+    lines.push(`  Mismatched                   ${qc.mismatched} (${mismatchRate})`);
+    lines.push(`  Failed                       ${qc.failed}`);
+    lines.push(`  Excluded                     ${qc.excluded}`);
+    lines.push("");
+  }
 
   // Deterministic probes
   lines.push("Deterministic probes:");
@@ -878,6 +909,19 @@ export function renderComparison(statsBefore, statsAfter, cutoff) {
   // Overview
   lines.push(col("Chains", statsBefore.chainCount, statsAfter.chainCount));
   lines.push(col("Rounds", statsBefore.roundCount, statsAfter.roundCount));
+
+  // Quote checks
+  const quoteRow = (stats, rateKind) => {
+    const qc = stats.quoteCheck;
+    if (qc.rounds === 0) return "n/a";
+    if (rateKind === "quoted") {
+      const rate = qc.findings > 0 ? `${(qc.quoted / qc.findings * 100).toFixed(1)}%` : "n/a";
+      return `${qc.quoted}/${qc.findings} (${rate})`;
+    }
+    return qc.quoted > 0 ? `${(qc.mismatched / qc.quoted * 100).toFixed(1)}%` : "n/a";
+  };
+  lines.push(col("Quote: quoted/findings", quoteRow(statsBefore, "quoted"), quoteRow(statsAfter, "quoted")));
+  lines.push(col("Quote: mismatch rate", quoteRow(statsBefore, "mismatch"), quoteRow(statsAfter, "mismatch")));
 
   // Final dispositions
   lines.push("  ── Dispositions ──");
