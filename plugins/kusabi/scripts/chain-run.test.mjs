@@ -78,7 +78,7 @@ describe("buildImplementText", () => {
   it("round 1 with container starts with the exact-ID header, then the brief verbatim", () => {
     const result = buildImplementText({ round: 1, brief, previousRecord: null, container: "abc123def456" });
     assert.ok(result.startsWith(
-      "The workspace lives inside container `abc123def456`. Pass this exact ID as `container_id` to every sunaba tool call. Do not guess container names or call sandbox_attach.\n\n"
+      "The workspace lives inside container `abc123def456`. Pass this exact ID as `container_id` to every sunaba tool call. Do not guess container names or call sandbox_attach. Do not call sandbox_list_containers either; this container is the only one.\n\n"
     ));
     assert.ok(result.endsWith(brief));
   });
@@ -87,7 +87,7 @@ describe("buildImplementText", () => {
     const prev = { findingsText: "file: src/foo.js:42 — missing null check" };
     const result = buildImplementText({ round: 2, brief, previousRecord: prev, container: "abc123def456" });
     assert.ok(result.startsWith(
-      "The workspace lives inside container `abc123def456`. Pass this exact ID as `container_id` to every sunaba tool call. Do not guess container names or call sandbox_attach.\n\n"
+      "The workspace lives inside container `abc123def456`. Pass this exact ID as `container_id` to every sunaba tool call. Do not guess container names or call sandbox_attach. Do not call sandbox_list_containers either; this container is the only one.\n\n"
     ));
     assert.ok(result.includes("## Prior findings"));
     assert.ok(result.includes("file: src/foo.js:42"));
