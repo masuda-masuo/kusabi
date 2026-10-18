@@ -310,7 +310,7 @@ export function renderReviewRecord(record) {
     lines.push("| # | severity | finding | 採否 | 理由 |");
     lines.push("|---|---|---|---|---|");
     allFindings.forEach(function (f, i) {
-      lines.push(`| ${i + 1} | ${f.severity} | ${f.text} | _fill_ | _fill_ |`);
+      lines.push(`| ${i + 1} | ${f.severity} | ${f.text.replace(/\|/g, "\\|")} | _fill_ | _fill_ |`);
     });
   }
   lines.push("");

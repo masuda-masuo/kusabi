@@ -6,6 +6,7 @@ import os from "node:os";
 import path from "node:path";
 import { describe, it, mock } from "node:test";
 import { archiveReviewRecord, cmdReviewRecordArchive } from "./review-record-archive.mjs";
+import { countUnfilledReviewRecords } from "./review-record-scan.mjs";
 
 const CWD = path.join(os.tmpdir(), "kusabi-review-record-archive-workspace");
 const HASH = crypto.createHash("sha256").update(CWD).digest("hex").slice(0, 12);
@@ -107,6 +108,118 @@ describe("review-record-archive", () => {
     ].join("\n") });
     try {
       assert.throws(() => archive(f), /unfilled rows: 2, 7/);
+    } finally {
+      fs.rmSync(f.root, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses an unfilled numbered row without outer pipes and includes its row number", () => {
+    const f = fixture({ record: [
+      "# record",
+      "## Findings adjudication (fill at inspection)",
+      "1 | low | x | _fill_ | _fill_",
+      "## Usage",
+    ].join("\n") });
+    try {
+      assert.throws(() => archive(f), /unfilled rows: 1/);
+    } finally {
+      fs.rmSync(f.root, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses a numbered row with only a trailing pipe and an unfilled verdict", () => {
+    const f = fixture({ record: [
+      "# record",
+      "## Findings adjudication (fill at inspection)",
+      "1 | low | x | _fill_ | ok |",
+      "## Usage",
+    ].join("\n") });
+    try {
+      assert.throws(() => archive(f), /unfilled rows: 1/);
+    } finally {
+      fs.rmSync(f.root, { recursive: true, force: true });
+    }
+  });
+
+  it("ignores non-table lines without an unfilled marker", () => {
+    const f = fixture({ record: [
+      "# record",
+      "## Findings adjudication (fill at inspection)",
+      "notes about row 1 are complete",
+      "## Usage",
+    ].join("\n") });
+    try {
+      assert.match(archive(f), /staged/);
+    } finally {
+      fs.rmSync(f.root, { recursive: true, force: true });
+    }
+  });
+
+  it("detects an unfilled row with a pipe in its finding and includes its row number", () => {
+    const f = fixture({ record: [
+      "# record",
+      "## Findings adjudication (fill at inspection)",
+      "| # | severity | finding | verdict | reason |",
+      "|---|---|---|---|---|",
+      "| 4 | low | left | middle | _fill_ | right |",
+      "## Usage",
+    ].join("\n") });
+    try {
+      assert.throws(() => archive(f), /unfilled rows: 4/);
+    } finally {
+      fs.rmSync(f.root, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses a short numbered row with an unfilled verdict or reason", () => {
+    const f = fixture({ record: [
+      "# record",
+      "## Findings adjudication (fill at inspection)",
+      "| 9 | medium | finding | _fill_ |",
+      "## Usage",
+    ].join("\n") });
+    try {
+      assert.throws(() => archive(f), /unfilled rows: 9/);
+    } finally {
+      fs.rmSync(f.root, { recursive: true, force: true });
+    }
+  });
+
+  it("agrees with scan on an unfilled row in a later adjudication section", () => {
+    const record = [
+      "# record",
+      "## Findings adjudication (fill at inspection)",
+      "| # | severity | finding | verdict | reason |",
+      "|---|---|---|---|---|",
+      "| 1 | low | complete | accept | resolved |",
+      "## Usage",
+      "notes",
+      "## Findings adjudication (fill at inspection)",
+      "| # | severity | finding | verdict | reason |",
+      "|---|---|---|---|---|",
+      "| 4 | low | left | middle | _fill_ | right |",
+    ].join("\n");
+    const f = fixture({ record });
+    try {
+      assert.equal(countUnfilledReviewRecords(f.root), 1);
+      assert.throws(() => archive(f), /unfilled rows: 4/);
+    } finally {
+      fs.rmSync(f.root, { recursive: true, force: true });
+    }
+  });
+
+  it("does not treat a historical mark with trailing text as a full-line mark", () => {
+    const f = fixture({ record: [
+      "# record",
+      "## Findings adjudication (fill at inspection)",
+      "<!-- historical: not adjudicated; closed by review-record-close before 2026-10-18 --> trailing",
+      "| # | severity | finding | verdict | reason |",
+      "|---|---|---|---|---|",
+      "| 1 | low | old finding | _fill_ | _fill_ |",
+    ].join("\n") });
+    try {
+      assert.equal(countUnfilledReviewRecords(f.root), 1);
+      assert.throws(() => archive(f), /unfilled rows: 1/);
     } finally {
       fs.rmSync(f.root, { recursive: true, force: true });
     }

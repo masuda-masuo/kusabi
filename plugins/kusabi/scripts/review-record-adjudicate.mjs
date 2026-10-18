@@ -4,6 +4,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { chainStateDirFor, stateRoot } from "./state-paths.mjs";
+import { parseAdjudicationRow, replaceAdjudicationRow } from "./review-record-table.mjs";
 
 export const USAGE = "Usage: review-record-adjudicate <chainId> --row <n> --verdict accept|reject|open-unverified --reason \"<text>\" [--evidence \"<text>\"] [--force] [--state-root <dir>] OR review-record-adjudicate <chainId> --precedent \"<text>\" [--force] [--state-root <dir>]";
 
@@ -72,32 +73,17 @@ function sectionBounds(content, heading) {
   return { lines, start, end };
 }
 
-function cellsOf(line) {
-  return line.trim().slice(1, -1).split(/(?<!\\)\|/).map((cell) => cell.trim());
-}
-
 function adjudicationRows(lines, start, end) {
   const rows = [];
   for (let index = start + 1; index < end; index += 1) {
-    const line = lines[index].trim();
-    if (!line.startsWith("|") || !line.endsWith("|")) continue;
-    const cells = cellsOf(line);
-    if (!/^\d+$/.test(cells[0])) continue;
-    rows.push({ lineIndex: index, cells });
+    const parsed = parseAdjudicationRow(lines[index]);
+    if (!parsed || !/^\d+$/.test(parsed.cells[0])) continue;
+    rows.push({ lineIndex: index, cells: parsed.cells });
   }
   return rows;
 }
 
-function escapeCell(value) {
-  return value.replace(/\\/g, "\\\\").replace(/\|/g, "\\|");
-}
 
-function replaceRowCells(line, verdict, reason) {
-  const cells = cellsOf(line);
-  cells[3] = verdict;
-  cells[4] = reason;
-  return `| ${cells.join(" | ")} |`;
-}
 
 function writeAtomically(filePath, content) {
   const temporaryPath = path.join(path.dirname(filePath), `.${path.basename(filePath)}.${process.pid}.${randomUUID()}.tmp`);
@@ -123,14 +109,14 @@ export function adjudicateReviewRecord({ chainId, argv, stateRootDir = stateRoot
     if (row > rows.length) throw new Error(`row ${row} is outside the adjudication table (1-${rows.length})`);
     const target = rows[row - 1];
     if (target.cells[0] !== String(row)) throw new Error(`row ${row} is not present in the adjudication table`);
-    if (target.cells.length !== 5) {
-      throw new Error(`row ${row} has ${target.cells.length} cells; the finding text probably contains an unescaped |, so it cannot be adjudicated`);
+    if (target.cells.length < 5) {
+      throw new Error(`row ${row} has fewer than 5 cells; it cannot be adjudicated`);
     }
     if (target.cells[3] !== "_fill_" && !options.force) throw new Error(`row ${row} already has a verdict; pass --force to overwrite`);
-    let reason = escapeCell(options.reason);
-    if (options.evidence !== undefined) reason += `（根拠: ${escapeCell(options.evidence)}）`;
+    let reason = options.reason;
+    if (options.evidence !== undefined) reason += `（根拠: ${options.evidence}）`;
     const beforeLine = lines[target.lineIndex];
-    const afterLine = replaceRowCells(beforeLine, VERDICTS.get(options.verdict), reason);
+    const afterLine = replaceAdjudicationRow(beforeLine, VERDICTS.get(options.verdict), reason);
     lines[target.lineIndex] = afterLine;
     writeAtomically(recordPath, lines.join(original.includes("\r\n") ? "\r\n" : "\n"));
     return ["- " + beforeLine, "+ " + afterLine].join(String.fromCharCode(10));
