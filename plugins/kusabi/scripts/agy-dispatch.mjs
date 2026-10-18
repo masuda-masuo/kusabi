@@ -11,7 +11,7 @@
 // One model per phase, no tier ladder or retry; the CLI validates model ids.
 // Resume requires caller-proven agy provenance; ambiguous UUIDs fail closed.
 // Success depends on payload presence; CLI status and exit code are advisory.
-// The prompt and optional schema use argv; oversized elements refuse before spawn.
+// The prompt travels via stdin, optional schema uses argv; oversized schema refuses before spawn.
 // Timeout is the outer bound; the silence watchdog is floored for CLI startup.
 // Per-dispatch denies are recorded as unenforced. Configured role homes fail closed.
 // MCP configuration belongs to the operator; this adapter never writes or overrides it.
@@ -197,7 +197,7 @@ export function agyJsonSchemaFor(agent) {
 }
 
 /**
- * Compose the prompt text handed to `agy -p`.
+ * Compose the prompt text handed to agy.
  *
  * agy has no `--append-system-prompt` equivalent, so the agent's role body
  * (the same `plugins/kusabi/opencode-agents/<agent>.md` body the claude
@@ -242,12 +242,12 @@ export function formatGoDuration(totalSeconds) {
 }
 
 /**
- * Build the argv for an `agy -p` dispatch.
+ * Build the argv for an `agy` dispatch (prompt on stdin).
  *
  * Contract (field-verified, kusabi #199; resume flag #316; timeout #326;
  * stream format #332):
- * `agy -p <prompt> --output-format stream-json --model <id> --print-timeout <duration>
- * [--json-schema <schema>] [--conversation <id>]`
+ * `agy --output-format stream-json --model <id> --print-timeout <duration>
+ * [--json-schema <schema>] [--conversation <id>]` with the prompt on stdin
  * — and NOTHING else.  Every flag here appears in that contract; no flag is
  * invented, and `--dangerously-skip-permissions` is never passed (not
  * needed, and blocked by the orchestrator-side classifier).
@@ -282,9 +282,8 @@ export function formatGoDuration(totalSeconds) {
  *        AGY_PRINT_TIMEOUT_MARGIN_S>` as a Go duration string.
  * @returns {string[]}
  */
-export function buildAgyArgs({ model, promptText, jsonSchema, conversationId, timeoutS }) {
+export function buildAgyArgs({ model, jsonSchema, conversationId, timeoutS }) {
   const args = [
-    "-p", promptText ?? "",
     "--output-format", "stream-json",
     "--model", model,
   ];
@@ -324,7 +323,6 @@ export const AGY_MAX_ARG_BYTES = AGY_MAX_ARG_STRLEN - 1024;
 // flag that PRECEDES the value, because that is what identifies it — the
 // values themselves are just strings.
 const AGY_ARG_ELEMENT_NAMES = {
-  "-p": "prompt",
   "--json-schema": "schema",
   "--model": "model",
   "--output-format": "output-format",
@@ -382,9 +380,8 @@ export function checkAgyArgvSize(args, limit = AGY_MAX_ARG_BYTES) {
       `agy dispatch refused before spawn: ${named}, over the ${limit}-byte per-argument ` +
       `limit (Linux MAX_ARG_STRLEN is ${AGY_MAX_ARG_STRLEN} bytes for a single argv string; ` +
       "kusabi refuses just under it so this says what happened instead of E2BIG). " +
-      "The agy CLI has no stdin transport — the prompt and the JSON schema both ride argv — " +
-      "so this job cannot be dispatched on agy as written: shrink the brief, or run it on a " +
-      "backend that passes the prompt over stdin (--model claude/… or an opencode model).",
+      "The JSON schema rides argv, so this job cannot be dispatched on agy as written: " +
+      "shrink the schema, or run it on a backend that accepts a larger schema.",
   };
 }
 
@@ -398,7 +395,7 @@ export function checkAgyArgvSize(args, limit = AGY_MAX_ARG_BYTES) {
  * Delegates the mechanical lifecycle (spawn, line framing, timeout, silence
  * watchdog, process-group kill, close handling) to the shared
  * `runBackendProcess` module (kusabi #462).  agy-specific concerns — the
- * parse function for the silence clock, no stdin transport — are wired here.
+ * parse function for the silence clock, prompt on stdin — are wired here.
  *
  * @param {object} opts
  * @param {string} opts.bin
@@ -421,9 +418,9 @@ export function checkAgyArgvSize(args, limit = AGY_MAX_ARG_BYTES) {
  *                     timedOut: boolean, stalled: boolean,
  *                     spawnError: Error|null }>}
  */
-export function runAgyProcess({ bin, args, cwd, env, timeoutS, watchdogS, onStart, onLine, onWatchdog }) {
+export function runAgyProcess({ bin, args, cwd, env, promptText, timeoutS, watchdogS, onStart, onLine, onWatchdog }) {
   return runBackendProcess({
-    bin, args, cwd, env, timeoutS, watchdogS, onStart, onLine, onWatchdog,
+    bin, args, cwd, env, promptText, timeoutS, watchdogS, onStart, onLine, onWatchdog,
     parseLine: parseAgyStreamLine,
   });
 }
@@ -434,7 +431,7 @@ export function runAgyProcess({ bin, args, cwd, env, timeoutS, watchdogS, onStar
 
 /**
  * Dispatch one prompt through the Antigravity CLI in headless mode
- * (`agy -p`).  Same call/return contract as `dispatchWithFallback` and
+ * (`agy`).  Same call/return contract as `dispatchWithFallback` and
  * `claudeDispatch`, so kusabi-companion.mjs can substitute it per phase
  * without touching the chain phases.
  *
@@ -554,7 +551,6 @@ export async function agyDispatch(opts) {
   // runAgyProcess) is the one that fires.
   const args = buildAgyArgs({
     model: modelEntry,
-    promptText,
     jsonSchema,
     conversationId: opts.session,
     timeoutS,
@@ -748,6 +744,7 @@ export async function agyDispatch(opts) {
         // so the child inherits the parent env byte-for-byte).  runBackendProcess
         // merges this on top of `process.env`, so the override is additive.
         env: agyHome !== null ? { HOME: agyHome } : undefined,
+        promptText,
         // The already-resolved values (the TWO decisions above) — the same
         // values buildAgyArgs and the stall text consumed, so every bound was
         // decided together.

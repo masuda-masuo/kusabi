@@ -51,7 +51,7 @@ export function parseAgyResult(stdout) {
 // NDJSON stream parsing — pure (kusabi #332)
 // =========================================================================
 //
-// `agy -p --output-format stream-json` prints one JSON event object per
+// `agy --output-format stream-json` prints one JSON event object per
 // stdout line, discriminated by the `event` key (NOT `type` — the claude
 // vocabulary; the two backends are deliberately not unified).  These three
 // functions are the whole parse/fold contract, kept pure and separate from
