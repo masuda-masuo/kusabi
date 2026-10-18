@@ -3,7 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { chainStateDirFor, stateRoot } from "./state-paths.mjs";
-import { HISTORICAL_MARK_PREFIX } from "./review-record-close.mjs";
+import { unfilledAdjudicationLines } from "./review-record-table.mjs";
 
 export const USAGE = "Usage: review-record-archive <chainId> --kairanban <path> [--force] [--state-root <dir>]";
 
@@ -54,29 +54,9 @@ function validatePathSegment(value, label) {
 }
 
 function unfilledRows(content) {
-  const lines = content.split(/\r?\n/);
-  const start = lines.findIndex((line) => line.trim() === "## Findings adjudication (fill at inspection)");
-  if (start < 0) throw new Error("review record is missing the findings adjudication heading");
-  let end = lines.length;
-  for (let index = start + 1; index < lines.length; index += 1) {
-    if (/^\s*#+\s+/.test(lines[index])) {
-      end = index;
-      break;
-    }
-  }
-  let historical = false;
-  const rows = [];
-  for (let index = start + 1; index < end; index += 1) {
-    const line = lines[index].trim();
-    if (line.startsWith(HISTORICAL_MARK_PREFIX)) {
-      historical = true;
-      continue;
-    }
-    if (historical || !line.startsWith("|") || !line.endsWith("|")) continue;
-    const cells = line.slice(1, -1).split(/(?<!\\)\|/).map((cell) => cell.trim());
-    if (/^\d+$/.test(cells[0]) && cells[3] === "_fill_" && cells[4] === "_fill_") rows.push(cells[0]);
-  }
-  return rows;
+  const result = unfilledAdjudicationLines(content);
+  if (!result.sectionFound) throw new Error("review record is missing the findings adjudication heading");
+  return result.unfilled.map(({ row }) => row);
 }
 
 function writeArchiveFiles(targets) {

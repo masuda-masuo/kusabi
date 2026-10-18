@@ -21,6 +21,7 @@ import {
   probeVerdictLabel,
 } from "./render.mjs";
 import { sampleParsed } from "./fixtures.mjs";
+import { parseAdjudicationRow } from "./review-record-table.mjs";
 
 // extractJson
 // ---------------------------------------------------------------------------
@@ -1927,6 +1928,34 @@ describe("renderReviewRecord", () => {
     assert.match(text, /\| 1 \| low \| Real one \(src\/a\.js\) \| _fill_ \| _fill_ \|/);
     // Only the one real finding survives — no row for the malformed elements.
     assert.doesNotMatch(text, /\| 2 \|/);
+  });
+
+  it("escapes pipes in adjudication findings and the parser reads them back", () => {
+    const text = renderReviewRecord({
+      chainId: "chain-pipe",
+      records: [{
+        round: 1,
+        findings: [{ severity: "low", title: "left | right" }],
+      }],
+    });
+    assert.ok(text.includes("- [low] left | right"));
+    const tableLine = text.split("\n").find((line) => line.startsWith("| 1 | low |"));
+    assert.ok(tableLine.includes("left \\| right"));
+    assert.deepEqual(parseAdjudicationRow(tableLine).cells.slice(0, 3), ["1", "low", "left | right"]);
+  });
+
+  it("escapes pipes and trailing backslashes in adjudication findings", () => {
+    const finding = "left|right and trailing\\";
+    const text = renderReviewRecord({
+      chainId: "chain-pipe-backslash",
+      records: [{
+        round: 1,
+        findings: [{ severity: "low", title: finding }],
+      }],
+    });
+    const tableLine = text.split("\n").find((line) => line.startsWith("| 1 | low |"));
+    assert.ok(tableLine.includes("left\\|right and trailing\\\\"));
+    assert.equal(parseAdjudicationRow(tableLine).cells[2], finding);
   });
 
   it("renders a review record header with a repository identity", () => {

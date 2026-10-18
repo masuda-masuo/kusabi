@@ -6,6 +6,7 @@ import path from "node:path";
 import { describe, it } from "node:test";
 import { cmdReviewRecordAdjudicate } from "./review-record-adjudicate.mjs";
 import { countUnfilledReviewRecords } from "./review-record-scan.mjs";
+import { formatAdjudicationRow, parseAdjudicationRow } from "./review-record-table.mjs";
 
 const FINDINGS = "## Findings adjudication (fill at inspection)";
 const PRECEDENT = "## 判例として (fill at inspection)";
@@ -112,6 +113,7 @@ describe("review-record-adjudicate", () => {
       const firstRow = rows(content)[0];
       assert.equal(cells(firstRow)[4], "left\\|right");
       assert.equal(cells(firstRow).length, 5);
+      assert.equal(parseAdjudicationRow(firstRow).cells[4], "left|right");
       const before = fs.readFileSync(recordPath);
       assert.throws(() => run(root, "--row", "2", "--verdict", "accept", "--reason", "two\nlines"), /cannot contain newlines/);
       assert.deepEqual(fs.readFileSync(recordPath), before);
@@ -205,23 +207,73 @@ describe("review-record-adjudicate", () => {
     }
   });
 
-  it("i. refuses malformed cell counts without writing while other rows remain adjudicable", () => {
+  it("i. adjudicates findings with pipes, refuses short rows without writing, and keeps other rows adjudicable", () => {
     const { root, recordPath } = fixture();
     try {
-      const malformed = fs.readFileSync(recordPath, "utf8").replace(
+      const withPipe = fs.readFileSync(recordPath, "utf8").replace(
         "| 1 | low | finding one | _fill_ | _fill_ |",
         "| 1 | low | finding | title | _fill_ | _fill_ |",
       );
-      fs.writeFileSync(recordPath, malformed);
+      fs.writeFileSync(recordPath, withPipe);
+      run(root, "--row", "1", "--verdict", "accept", "--reason", "reason");
+      let content = fs.readFileSync(recordPath, "utf8");
+      let first = parseAdjudicationRow(rows(content)[0]);
+      assert.equal(first.cells[2], "finding | title");
+      assert.equal(first.cells[3], "採用");
+      assert.equal(first.cells[4], "reason");
+
+      content = content.replace("| 3 | high | finding three | _fill_ | _fill_ |", "| 3 | high | short row | _fill_ |");
+      fs.writeFileSync(recordPath, content);
       const before = fs.readFileSync(recordPath);
       assert.throws(
-        () => run(root, "--row", "1", "--verdict", "accept", "--reason", "reason"),
-        (error) => /row 1 has 6 cells/.test(error.message) && /unescaped \|/.test(error.message),
+        () => run(root, "--row", "3", "--verdict", "accept", "--reason", "reason"),
+        /row 3 has fewer than 5 cells/,
       );
       assert.deepEqual(fs.readFileSync(recordPath), before);
       run(root, "--row", "2", "--verdict", "accept", "--reason", "valid row");
-      assert.equal(cells(rows(fs.readFileSync(recordPath, "utf8"))[1])[3], "採用");
-      assert.equal(cells(rows(fs.readFileSync(recordPath, "utf8"))[0]).length, 6);
+      assert.equal(parseAdjudicationRow(rows(fs.readFileSync(recordPath, "utf8"))[1]).cells[3], "採用");
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("preserves finding bytes through repeated --force runs on a pipe row", () => {
+    const { root, recordPath } = fixture();
+    try {
+      const original = fs.readFileSync(recordPath, "utf8").replace(
+        "| 1 | low | finding one | _fill_ | _fill_ |",
+        "| 1 | low | finding | title | _fill_ | _fill_ |",
+      );
+      fs.writeFileSync(recordPath, original);
+      const findingBytes = "| finding | title |";
+
+      for (const [verdict, reason] of [["accept", "first"], ["reject", "second"]]) {
+        run(root, "--row", "1", "--verdict", verdict, "--reason", reason, "--force");
+        const content = fs.readFileSync(recordPath, "utf8");
+        const row = rows(content)[0];
+        assert.ok(row.includes(findingBytes));
+        assert.equal(parseAdjudicationRow(row).cells[2], "finding | title");
+      }
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("adjudicates a finding containing a literal backslash-pipe", () => {
+    const { root, recordPath } = fixture();
+    try {
+      const original = fs.readFileSync(recordPath, "utf8");
+      const row = formatAdjudicationRow(["1", "low", "finding \\| title", "_fill_", "_fill_"]);
+      fs.writeFileSync(recordPath, original.replace(
+        "| 1 | low | finding one | _fill_ | _fill_ |",
+        row,
+      ));
+
+      run(root, "--row", "1", "--verdict", "accept", "--reason", "handled");
+      const parsed = parseAdjudicationRow(rows(fs.readFileSync(recordPath, "utf8"))[0]);
+      assert.equal(parsed.cells[2], "finding \\| title");
+      assert.equal(parsed.cells[3], "採用");
+      assert.equal(parsed.cells[4], "handled");
     } finally {
       fs.rmSync(root, { recursive: true, force: true });
     }

@@ -2,10 +2,9 @@
 import fs from "node:fs";
 import path from "node:path";
 import { stateRoot } from "./state-paths.mjs";
+import { unfilledAdjudicationLines } from "./review-record-table.mjs";
 
-const UNADJUDICATED_ROW_PATTERN = /\|\s*_fill_\s*\|\s*_fill_\s*\|/;
-const FINDINGS_SECTION_HEADER_PATTERN = /^\s*##\s+Findings adjudication\b/i;
-const ANY_HEADER_PATTERN = /^\s*#+\s+/;
+
 
 /**
  * Check if a review record's content has an unadjudicated table row
@@ -16,49 +15,12 @@ const ANY_HEADER_PATTERN = /^\s*#+\s+/;
  */
 export function isUnadjudicatedRecord(content) {
   if (!content || typeof content !== "string") return false;
-
-  const lines = content.split(/\r?\n/);
-  let inFindingsSection = false;
-  for (const line of lines) {
-    if (ANY_HEADER_PATTERN.test(line)) {
-      if (FINDINGS_SECTION_HEADER_PATTERN.test(line)) {
-        inFindingsSection = true;
-        continue;
-      }
-      if (inFindingsSection) inFindingsSection = false;
-    }
-    if (inFindingsSection && /^\s*<!-- historical: not adjudicated; closed by review-record-close before .+ -->\s*$/.test(line)) {
-      return false;
-    }
-  }
-
-  inFindingsSection = false;
-  for (const line of lines) {
-    if (ANY_HEADER_PATTERN.test(line)) {
-      if (FINDINGS_SECTION_HEADER_PATTERN.test(line)) {
-        inFindingsSection = true;
-        continue;
-      } else if (inFindingsSection) {
-        inFindingsSection = false;
-      }
-    }
-
-    if (inFindingsSection) {
-      const trimmed = line.trim();
-      if (trimmed.startsWith("|") && trimmed.endsWith("|")) {
-        if (UNADJUDICATED_ROW_PATTERN.test(trimmed)) {
-          return true;
-        }
-      }
-    }
-  }
-
-  return false;
+  return unfilledAdjudicationLines(content).unfilled.length > 0;
 }
 
 /**
  * Scan review records under the state root and count those that had findings
- * and still carry the unadjudicated placeholder (`| _fill_ | _fill_ |`).
+ * and still contain an unfilled marker (`_fill_`) in that section.
  *
  * Records whose chain produced no findings are not counted.
  * Records that cannot be read are not counted.

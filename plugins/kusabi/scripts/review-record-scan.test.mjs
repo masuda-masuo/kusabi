@@ -3,6 +3,8 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
+import crypto from "node:crypto";
+import { archiveReviewRecord } from "./review-record-archive.mjs";
 import { countUnfilledReviewRecords, isUnadjudicatedRecord } from "./review-record-scan.mjs";
 
 describe("countUnfilledReviewRecords", () => {
@@ -140,6 +142,21 @@ _fill: reusable precedent, if any_
     }
   });
 
+  it("counts a numbered unfilled row without a trailing pipe", () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-scan-no-trailing-pipe-"));
+    try {
+      const recordPath = path.join(tmpDir, "hash123", "chains", "chain-1", "review-record.md");
+      fs.mkdirSync(path.dirname(recordPath), { recursive: true });
+      const recordText = `## Findings adjudication (fill at inspection)\n1 | low | test finding | _fill_ | _fill_\n## Usage\n`;
+      fs.writeFileSync(recordPath, recordText);
+
+      assert.equal(isUnadjudicatedRecord(recordText), true);
+      assert.equal(countUnfilledReviewRecords(tmpDir), 1);
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
   it("counts Shape 2: partially filled table with at least one row unadjudicated (criterion 2)", () => {
     const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-scan-shape2-"));
     try {
@@ -255,6 +272,45 @@ _fill: reusable precedent, if any_
   });
 });
 
+
+describe("archive and scan section agreement", () => {
+  it("counts and refuses the same unfilled row in a later adjudication section", () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-scan-archive-agreement-"));
+    const cwd = path.join(os.tmpdir(), "kusabi-review-record-archive-workspace");
+    const hash = crypto.createHash("sha256").update(cwd).digest("hex").slice(0, 12);
+    const chainDir = path.join(root, hash, "chains", "chain-test");
+    const clone = path.join(root, "kairanban");
+    const recordText = [
+      "# record",
+      "## Findings adjudication (fill at inspection)",
+      "| # | severity | finding | verdict | reason |",
+      "|---|---|---|---|---|",
+      "| 1 | low | complete | accept | resolved |",
+      "## Usage",
+      "notes",
+      "## Findings adjudication (fill at inspection)",
+      "| # | severity | finding | verdict | reason |",
+      "|---|---|---|---|---|",
+      "| 4 | low | left | middle | _fill_ | right |",
+    ].join("\n");
+    fs.mkdirSync(chainDir, { recursive: true });
+    fs.mkdirSync(path.join(clone, ".git"), { recursive: true });
+    fs.writeFileSync(path.join(chainDir, "review-record.md"), recordText);
+    fs.writeFileSync(path.join(chainDir, "chain.json"), JSON.stringify({ repo: "owner/repo", brief: "brief" }));
+
+    try {
+      assert.equal(countUnfilledReviewRecords(root), 1);
+      assert.throws(() => archiveReviewRecord({
+        chainId: "chain-test",
+        kairanbanDir: clone,
+        stateRootDir: root,
+        cwd,
+      }), /unfilled rows: 4/);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
 
 describe("historical review record marks", () => {
   it("does not count a marked unadjudicated record", () => {
