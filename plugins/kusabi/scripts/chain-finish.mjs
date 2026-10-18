@@ -733,6 +733,7 @@ export async function finishRound(
     chainTotals, chainFollowupDraft,
     verifyBaseline: effectiveVerifyBaseline,
     smokeObservation: ctx.smokeObservation ?? null,
+    repo: ctx.repo ?? null, repoReason: ctx.repoReason ?? null,
   });
 
   // Update the chain control round counter

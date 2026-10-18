@@ -320,7 +320,7 @@ describe("review-resume revalidation with an unchecked oracle (kusabi #541)", ()
   // carries RECORDED truth (probesFromRecord=true) and the review re-runs
   // inside finishRound.  Records start empty because the resumed round is the
   // first record of this run.
-  function reviewResumeCtx({ tmp, chainDir, dispatch, callTool, effectiveVerifyBaseline = null }) {
+  function reviewResumeCtx({ tmp, chainDir, dispatch, callTool, effectiveVerifyBaseline = null, repo = null }) {
     return {
       chainDir, chainId: "chain-541-reval", container: "cid-541", cwd: tmp,
       model: "fake/model", modelChain: [["fake/model"]], maxRounds: 4,
@@ -328,6 +328,7 @@ describe("review-resume revalidation with an unchecked oracle (kusabi #541)", ()
       flagsModel: null, reviewFlagsModel: null,
       effectiveReviewChain: [["fake/review"]], effectiveBaseSha: "abc123",
       effectiveVerifyBaseline,
+      repo, repoReason: null,
       reviewModel: "fake/review", reviewModelChain: [["fake/review"]],
       reworkModel: null, reworkModelChain: null, reworkBackend: null,
       reviewDispatch: dispatch, injectedDispatch: dispatch,
@@ -404,7 +405,7 @@ describe("review-resume revalidation with an unchecked oracle (kusabi #541)", ()
     };
   }
 
-  async function runResume({ roundRecord, probeCtx, callTool, effectiveVerifyBaseline = null, verdict = "approve" }) {
+  async function runResume({ roundRecord, probeCtx, callTool, effectiveVerifyBaseline = null, verdict = "approve", repo = null }) {
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-541-reval-"));
     const chainDir = path.join(tmp, "chains", "chain-541-reval");
     fs.mkdirSync(chainDir, { recursive: true });
@@ -413,13 +414,29 @@ describe("review-resume revalidation with an unchecked oracle (kusabi #541)", ()
       status: "running", round: 0, startedAt: new Date().toISOString(),
     });
     const dispatch = approvingReviewDispatch(verdict);
-    const ctx = reviewResumeCtx({ tmp, chainDir, dispatch, callTool, effectiveVerifyBaseline });
+    const ctx = reviewResumeCtx({ tmp, chainDir, dispatch, callTool, effectiveVerifyBaseline, repo });
     const result = await finishRound({
       round: 1, roundRecord, previousRecord: null, probeCtx,
       implementRefusal: null, reworkScope: "full",
     }, ctx);
     return { tmp, chainDir, result, roundRecord };
   }
+
+  it("persists repo identity after a normal finishRound", async () => {
+    const { tmp, chainDir } = await runResume({
+      roundRecord: resumedRoundRecord(),
+      probeCtx: redAnchoringProbeCtx(),
+      callTool: async () => ({ output: "" }),
+      repo: "owner/repo",
+    });
+    try {
+      const chainJson = readJson(path.join(chainDir, "chain.json"));
+      assert.equal(chainJson.repo, "owner/repo");
+      assert.equal("repoReason" in chainJson, false);
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
 
   it("a review-resumed accept whose re-validation dies before P5/P6 escalates as unchecked and persists the flag", async () => {
     // Recorded truth: green probes, oracle executed and clean — the exact
