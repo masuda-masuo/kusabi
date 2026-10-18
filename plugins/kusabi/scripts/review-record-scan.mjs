@@ -19,7 +19,20 @@ export function isUnadjudicatedRecord(content) {
 
   const lines = content.split(/\r?\n/);
   let inFindingsSection = false;
+  for (const line of lines) {
+    if (ANY_HEADER_PATTERN.test(line)) {
+      if (FINDINGS_SECTION_HEADER_PATTERN.test(line)) {
+        inFindingsSection = true;
+        continue;
+      }
+      if (inFindingsSection) inFindingsSection = false;
+    }
+    if (inFindingsSection && /^\s*<!-- historical: not adjudicated; closed by review-record-close before .+ -->\s*$/.test(line)) {
+      return false;
+    }
+  }
 
+  inFindingsSection = false;
   for (const line of lines) {
     if (ANY_HEADER_PATTERN.test(line)) {
       if (FINDINGS_SECTION_HEADER_PATTERN.test(line)) {
