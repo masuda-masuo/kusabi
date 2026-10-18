@@ -350,6 +350,8 @@ export async function runReviewPhase({
   _dispatchWithFallback: _dispatch = dispatchWithFallback,
 } = {}) {
   const skipReview = shouldSkipReview({ chainStatusObserved, chainChangedPaths, chainNewlyChanged, chainDeliverables });
+  delete roundRecord.quoteCheck;
+  delete roundRecord.quoteCheckReason;
 
   // ---- P3 empty-change: set probe-sourced discard verdict before review ----
   if (skipReview) {
@@ -578,6 +580,102 @@ export async function runReviewPhase({
           type: "companion.review.schema_invalid",
           errors: _schemaErrors,
         });
+      }
+    }
+
+    // Verify quoted finding text against the reviewed worktree while the container is alive.
+    if (_parseable) {
+      const findings = Array.isArray(_parsed?.findings) ? _parsed.findings : [];
+      const checks = [];
+      const mismatches = [];
+      for (let idx = 0; idx < findings.length; idx += 1) {
+        const finding = findings[idx];
+        const bodyLines = typeof finding?.body === "string" ? finding.body.split("\n") : [];
+        const quoteLine = bodyLines.find(function (line) {
+          return line.startsWith("Quote: ") && (line.match(/`/g) || []).length >= 2;
+        });
+        if (!quoteLine) continue;
+        const firstTick = quoteLine.indexOf("`");
+        const lastTick = quoteLine.lastIndexOf("`");
+        const quote = quoteLine.slice(firstTick + 1, lastTick);
+        const check = { idx, file: finding.file, line_start: finding.line_start, quote };
+        const file = check.file;
+        if (typeof file !== "string" || file.startsWith("/") || file.includes("..") || !/^[A-Za-z0-9._/-]+$/.test(file)) {
+          mismatches.push({ check, actual: "", reason: "invalid path" });
+          continue;
+        }
+        const line = Number(check.line_start);
+        if (!Number.isInteger(line) || line < 1) {
+          mismatches.push({ check, actual: "", reason: "invalid line" });
+          continue;
+        }
+        checks.push({ ...check, line_start: line });
+      }
+
+      if (checks.length > 0) {
+        const command = checks.map(function (check) {
+          const quotedPath = "'" + check.file + "'";
+          const encoder = `LC_ALL=C od -An -tu1 | awk 'BEGIN { alphabet="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/" } { for (i=1; i<=NF; i++) bytes[++n]=$i } END { for (i=1; i<=n; i+=3) { a=bytes[i]; b=(i+1<=n ? bytes[i+1] : 0); c=(i+2<=n ? bytes[i+2] : 0); printf "%s%s%s%s", substr(alphabet, int(a/4)+1, 1), substr(alphabet, (a%4)*16+int(b/16)+1, 1), (i+1<=n ? substr(alphabet, (b%16)*4+int(c/64)+1, 1) : "="), (i+2<=n ? substr(alphabet, c%64+1, 1) : "=") } }'`;
+          return "if [ ! -f " + quotedPath + " ]; then printf '" + check.idx + "\\tnofile\\t\\n'; else line=$(awk 'NR==" + check.line_start + " { print; found=1 } END { if (!found) exit 1 }' " + quotedPath + "); status=$?; if [ \"$status\" -ne 0 ]; then printf '" + check.idx + "\\teof\\t\\n'; else encoded=$(printf '%s' \"$line\" | " + encoder + "); printf '" + check.idx + "\\tok\\t%s\\n' \"$encoded\"; fi; fi";
+        }).join("; ");
+        try {
+          const execResult = await callTool("sandbox_exec", {
+            container_id: container,
+            commands: [command],
+            verbose: "full",
+            limit: 1000,
+          });
+          const output = execResult?.output;
+          if (execResult?.isError === true || (typeof execResult?.exit_code === "number" && execResult.exit_code !== 0) || typeof output !== "string") {
+            throw new Error("quote check exec failed");
+          }
+          const rows = output.replace(/\n$/, "").split("\n");
+          if (rows.length !== checks.length) throw new Error("quote check output count mismatch");
+          const byIdx = new Map();
+          for (const row of rows) {
+            const match = /^(\d+)\t(ok|eof|nofile)\t([A-Za-z0-9+/=]*)$/.exec(row);
+            if (!match || byIdx.has(Number(match[1]))) throw new Error("quote check output malformed");
+            byIdx.set(Number(match[1]), { status: match[2], encoded: match[3] });
+          }
+          for (const check of checks) {
+            const result = byIdx.get(check.idx);
+            if (!result) throw new Error("quote check output missing row");
+            if (result.status === "eof") {
+              mismatches.push({ check, actual: "", reason: "line out of range" });
+            } else if (result.status === "nofile") {
+              mismatches.push({ check, actual: "", reason: "file not found" });
+            } else {
+              const actual = Buffer.from(result.encoded, "base64").toString("utf8");
+              if (actual.trim() !== check.quote.trim()) mismatches.push({ check, actual });
+            }
+          }
+        } catch (error) {
+          roundRecord.quoteCheckReason = String(error?.message || error).slice(0, 100);
+        }
+      }
+
+      if (!Object.hasOwn(roundRecord, "quoteCheckReason")) {
+        const examples = mismatches.slice(0, 3).map(function (entry) {
+          const example = {
+            file: String(entry.check.file ?? "").slice(0, 200),
+            line: entry.check.line_start,
+            quote: String(entry.check.quote ?? "").slice(0, 200),
+            actual: String(entry.actual ?? "").slice(0, 200),
+          };
+          if (entry.reason) example.reason = entry.reason;
+          return example;
+        });
+        roundRecord.quoteCheck = {
+          findings: findings.length,
+          quoted: findings.reduce(function (count, finding) {
+            const bodyLines = typeof finding?.body === "string" ? finding.body.split("\n") : [];
+            return count + (bodyLines.some(function (line) {
+              return line.startsWith("Quote: ") && (line.match(/`/g) || []).length >= 2;
+            }) ? 1 : 0);
+          }, 0),
+          mismatched: mismatches.length,
+          examples,
+        };
       }
     }
 
