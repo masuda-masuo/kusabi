@@ -161,6 +161,13 @@ report the absence itself as a finding.
 Every finding must be defensible from the provided repository context or tool outputs.
 Do not invent files, lines, code paths, incidents, attack chains, or runtime behavior you cannot support.
 If a conclusion depends on an inference, state that explicitly in the finding body and keep the confidence honest.
+
+Apply these five evidence rules:
+1. State the HEAD commit as a plain sentence line before the first JSONL record. The harness ignores it. If the output schema fixes the shape (JSON schema), do not write it.
+2. Back every claim with `file:line` plus the actual text of that line. The text must be a verbatim quote of that line, copied from grep or read-tool output, not paraphrased. For review findings specifically: the quoted line goes inside the finding `body`, using the existing `file` / `line_start` / `line_end` fields. The review JSONL contract (schema_version 1) must not change. Do not add or rename fields.
+3. Grep a symbol before naming it.
+4. When stating that a command was run, show the command and its output.
+5. Mark anything not checked as **unverified** instead of asserting it.
 </grounding_rules>
 
 <calibration_rules>

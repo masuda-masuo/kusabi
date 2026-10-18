@@ -79,6 +79,16 @@ Place machine-read sections (`Deliverables`, `Smoke`, `Frozen Tests`) first.
 - **Grep tests before freezing "all existing tests pass".** Verify existing tests do not pin behavior contradictory to the spec. When contradictions exist, fix the brief, not the test.
 - **Writing "PUBLISH" in a brief does not publish.** Worker toolset has no publish exit; the orchestrator publishes only after acceptance. Briefs demanding publication stop at worker capability limits.
 
+## Evidence rules
+
+Briefs must tell workers to follow these five evidence rules:
+
+1. State the HEAD commit at the top of the output.
+2. Back every claim with `file:line` plus the actual text of that line. The text must be a verbatim quote of that line, copied from grep or read-tool output, not paraphrased.
+3. Grep a symbol before naming it.
+4. When stating that a command was run, show the command and its output.
+5. Mark anything not checked as **unverified** instead of asserting it.
+
 ## Pre-dispatch completeness gate
 
 Run before dispatch, reading the brief as the worker will. Headings and generic prose do not satisfy the gate: every applicable category must be concrete, and inapplicable categories are omitted or explained — never padded.
