@@ -40,7 +40,8 @@ describe("review-record-table", () => {
 
     assert.deepEqual(result("| 1 | medium | archive gate | 採用 | archive が _fill_ 行を拒否するよう修正済み |"), []);
     assert.deepEqual(result("| 2 | medium | finding | _fill_ | complete |"), [{ line: 2, row: "2" }]);
-    assert.deepEqual(result("| 2 | medium | finding | _fill_ (todo) | complete |"), [{ line: 2, row: "2" }]);
+    assert.deepEqual(result("| 2 | medium | finding | _fill_ (todo) | complete |"), []);
+    assert.deepEqual(result("| 2 | medium | finding | _fill_ 行を拒否する | complete |"), []);
     assert.deepEqual(result("| 3 | medium | finding | complete | _fill_ |"), [{ line: 2, row: "3" }]);
     assert.deepEqual(result("| 3 | medium | finding | complete | note _fill_ |"), []);
     assert.deepEqual(result("3 | medium | finding _fill_ | complete | reason"), [{ line: 2, row: "3" }]);

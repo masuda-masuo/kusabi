@@ -102,7 +102,7 @@ export function unfilledAdjudicationLines(content) {
     const hasUnfilledCell = isCompleteTableRow
       ? parsedRow.cells.slice(-2).some((cell) => {
         const trimmedCell = cell.trim();
-        return trimmedCell === "_fill_" || trimmedCell.startsWith("_fill_");
+        return trimmedCell === "_fill_";
       })
       : line.includes("_fill_");
     if (!hasUnfilledCell) continue;
