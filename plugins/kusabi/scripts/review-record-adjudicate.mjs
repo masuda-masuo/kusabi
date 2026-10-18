@@ -48,7 +48,7 @@ function parseArgs(argv) {
     if (typeof options.reason !== "string" || options.reason.length === 0) throw new Error("--reason is required");
     if (options.precedent !== undefined) throw new Error("--row and --precedent cannot be used together");
     for (const [name, value] of [["reason", options.reason], ["evidence", options.evidence]]) {
-      if (typeof value === "string" && /[\r\n]/.test(value)) throw new Error(`--${name} cannot contain newlines`);
+      if (typeof value === "string" && /[\r\n\\]/.test(value)) throw new Error(`--${name} cannot contain newlines or backslashes`);
     }
   } else if (options.verdict !== undefined || options.reason !== undefined || options.evidence !== undefined || options.row !== undefined) {
     throw new Error("--precedent cannot be combined with row verdict options");

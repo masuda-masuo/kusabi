@@ -121,6 +121,48 @@ describe("review-record-adjudicate", () => {
     }
   });
 
+  it("l. refuses a trailing backslash in reason without changing the file", () => {
+    const { root, recordPath } = fixture();
+    try {
+      const before = fs.readFileSync(recordPath);
+      assert.throws(
+        () => run(root, "--row", "1", "--verdict", "accept", "--reason", "ends\\"),
+        /cannot contain newlines or backslashes/,
+      );
+      assert.deepEqual(fs.readFileSync(recordPath), before);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("m. refuses a middle backslash in reason without changing the file", () => {
+    const { root, recordPath } = fixture();
+    try {
+      const before = fs.readFileSync(recordPath);
+      assert.throws(
+        () => run(root, "--row", "1", "--verdict", "accept", "--reason", "a\\b"),
+        /cannot contain newlines or backslashes/,
+      );
+      assert.deepEqual(fs.readFileSync(recordPath), before);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("n. refuses a backslash in evidence without changing the file", () => {
+    const { root, recordPath } = fixture();
+    try {
+      const before = fs.readFileSync(recordPath);
+      assert.throws(
+        () => run(root, "--row", "1", "--verdict", "accept", "--reason", "valid", "--evidence", "a\\b"),
+        /cannot contain newlines or backslashes/,
+      );
+      assert.deepEqual(fs.readFileSync(recordPath), before);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it("f. writes precedent under its heading, refuses a second write, and preserves verdict cells", () => {
     const { root, recordPath } = fixture();
     try {
