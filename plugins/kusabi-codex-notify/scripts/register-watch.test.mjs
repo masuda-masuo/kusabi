@@ -1411,9 +1411,25 @@ fs.writeFileSync = function injectedWriteFileSync(filePath, ...rest) {
       assert.notEqual(stderrDispatch.code, 0);
       assert.equal(
         stderrDispatch.stderr,
-        "register-watch: launch failed: dispatch error\nregister-watch: launch detail: failure kind dispatch; exit code 3\ndispatch diagnostic\n"
+        "register-watch: launch failed: dispatch error (see below)\nregister-watch: launch detail: failure kind dispatch; exit code 3\ndispatch diagnostic\n"
       );
       assert.equal((stderrDispatch.stderr.match(/dispatch diagnostic/g) || []).length, 1);
+
+      const stdoutDispatch = await runLaunch(
+        kind,
+        mockBin(`${kind}-stdout-fail`, "console.log('stdout reason'); process.exit(3);")
+      );
+      assert.notEqual(stdoutDispatch.code, 0);
+      assert.equal(stdoutDispatch.stdout, "stdout reason\n");
+      assert.equal(
+        stdoutDispatch.stderr,
+        "register-watch: launch failed: stdout reason\nregister-watch: launch detail: failure kind dispatch; exit code 3\n"
+      );
+
+      const missingCompanion = await runLaunch(kind, path.join(tmpRoot, "missing-companion"));
+      assert.notEqual(missingCompanion.code, 0);
+      assert.match(missingCompanion.stderr, /^register-watch: launch failed: spawn error \(see below\)\nregister-watch: launch detail: failure kind spawn\n/);
+      assert.doesNotMatch(missingCompanion.stderr, /exit code/);
 
       const messageMentionsUnresolvedId = await runLaunch(
         kind,

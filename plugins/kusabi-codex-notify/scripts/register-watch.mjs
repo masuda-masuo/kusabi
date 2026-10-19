@@ -1384,9 +1384,9 @@ export function emitLaunchOutput(res) {
     const rawErrorMessage = res.error?.message ?? (
       res.exitCode === null ? `signal ${signal}` : `exit code ${res.exitCode}`
     );
-    const printedOutput = [res.stdout, res.stderr].map((s) => String(s || "").trim()).filter(Boolean);
-    const errorMessage = printedOutput.includes(rawErrorMessage.trim())
-      ? "dispatch error"
+    const stderrMessage = String(res.stderr || "").trim();
+    const errorMessage = stderrMessage && rawErrorMessage.trim() === stderrMessage
+      ? `${res.failureKind} error (see below)`
       : rawErrorMessage;
     const details = [`failure kind ${res.failureKind}`];
     if (res.failureKind !== "spawn" && !signal && res.exitCode !== undefined && res.exitCode !== null) {
