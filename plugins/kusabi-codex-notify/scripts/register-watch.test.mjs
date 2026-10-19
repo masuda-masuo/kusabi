@@ -1404,6 +1404,17 @@ fs.writeFileSync = function injectedWriteFileSync(filePath, ...rest) {
       );
       assert.equal((dispatchFailure.stderr.match(/code 7/g) || []).length, 2);
 
+      const stderrDispatch = await runLaunch(
+        kind,
+        mockBin(`${kind}-stderr-fail`, "console.error('dispatch diagnostic'); process.exit(3);")
+      );
+      assert.notEqual(stderrDispatch.code, 0);
+      assert.equal(
+        stderrDispatch.stderr,
+        "register-watch: launch failed: dispatch error\nregister-watch: launch detail: failure kind dispatch; exit code 3\ndispatch diagnostic\n"
+      );
+      assert.equal((stderrDispatch.stderr.match(/dispatch diagnostic/g) || []).length, 1);
+
       const messageMentionsUnresolvedId = await runLaunch(
         kind,
         mockBin(`${kind}-message-mentions-id`, "console.error('No job ID in this unrelated dispatch error'); process.exit(7);")
@@ -1417,9 +1428,14 @@ fs.writeFileSync = function injectedWriteFileSync(filePath, ...rest) {
       assert.notEqual(unresolved.code, 0);
       assert.match(
         unresolved.stderr,
-        /^register-watch: launch failed: No (?:job|chain) ID could be resolved[^\n]*\nregister-watch: launch detail: failure kind id-unresolved; ID 解決失敗: dispatch may have succeeded and a job or chain may still exist\n$/
+        /^register-watch: launch failed: No (?:job|chain) ID could be resolved[^\n]*\nregister-watch: launch detail: failure kind id-unresolved; dispatch may have succeeded and a job or chain may still exist\n$/
       );
     }
+
+    const missingCompanion = await runLaunch("chain", path.join(tmpRoot, "does-not-exist"));
+    assert.notEqual(missingCompanion.code, 0);
+    assert.match(missingCompanion.stderr, /failure kind spawn/);
+    assert.doesNotMatch(missingCompanion.stderr, /exit code/i);
   });
 
   it("signal-killed launch output reports termination by signal", async () => {

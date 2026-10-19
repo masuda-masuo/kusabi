@@ -877,7 +877,7 @@ export async function launchAndWatch({
   if (isRefusal) {
     return {
       success: false,
-      failureKind: "dispatch",
+      failureKind: dispatchResult.error ? "spawn" : "dispatch",
       exitCode: dispatchResult.exitCode,
       stdout,
       stderr,
@@ -1019,7 +1019,7 @@ export async function launchTaskAndWatch({
   if (isRefusal) {
     return {
       success: false,
-      failureKind: "dispatch",
+      failureKind: dispatchResult.error ? "spawn" : "dispatch",
       exitCode: dispatchResult.exitCode,
       stdout,
       stderr,
@@ -1381,20 +1381,27 @@ export function emitLaunchOutput(res) {
   if (res.stdout) process.stdout.write(res.stdout);
   if (res.success === false) {
     const signal = res.signal || res.error?.signal;
-    const errorMessage = res.error?.message ?? (
+    const rawErrorMessage = res.error?.message ?? (
       res.exitCode === null ? `signal ${signal}` : `exit code ${res.exitCode}`
     );
+    const printedOutput = [res.stdout, res.stderr].map((s) => String(s || "").trim()).filter(Boolean);
+    const errorMessage = printedOutput.includes(rawErrorMessage.trim())
+      ? "dispatch error"
+      : rawErrorMessage;
     const details = [`failure kind ${res.failureKind}`];
-    if (!signal && res.exitCode !== undefined && res.exitCode !== null) {
+    if (res.failureKind !== "spawn" && !signal && res.exitCode !== undefined && res.exitCode !== null) {
       details.push(`exit code ${res.exitCode}`);
     }
     if (signal) details.push(`signal ${signal}`);
     if (res.failureKind === "id-unresolved") {
-      details.push("ID 解決失敗: dispatch may have succeeded and a job or chain may still exist");
+      details.push("dispatch may have succeeded and a job or chain may still exist");
     }
     process.stderr.write(`register-watch: launch failed: ${errorMessage}\n`);
     process.stderr.write(`register-watch: launch detail: ${details.join("; ")}\n`);
-    if (res.stderr) process.stderr.write(res.stderr);
+    if (res.stderr) {
+      const stderr = String(res.stderr);
+      process.stderr.write(stderr.endsWith("\n") ? stderr : `${stderr}\n`);
+    }
     return;
   }
   if (res.stderr) process.stderr.write(res.stderr);
