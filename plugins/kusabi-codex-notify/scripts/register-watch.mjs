@@ -877,12 +877,20 @@ export async function launchAndWatch({
   if (isRefusal) {
     return {
       success: false,
-      exitCode: dispatchResult.exitCode || 1,
+      failureKind: "dispatch",
+      exitCode: dispatchResult.exitCode,
       stdout,
       stderr,
+      signal: dispatchResult.signal,
       chainId: null,
       registration: null,
-      error: dispatchResult.error || new Error(stderr.trim() || stdout.trim() || `chain-detach exited with code ${dispatchResult.exitCode}`),
+      error: dispatchResult.error || new Error(stderr.trim() || stdout.trim() || (
+        dispatchResult.signal
+          ? `chain-detach terminated by signal ${dispatchResult.signal}`
+          : typeof dispatchResult.exitCode === "number"
+            ? `chain-detach exited with code ${dispatchResult.exitCode}`
+            : "chain-detach failed"
+      )),
     };
   }
 
@@ -933,9 +941,11 @@ export async function launchAndWatch({
   if (!chainId) {
     return {
       success: false,
-      exitCode: 1,
+      failureKind: "id-unresolved",
+      exitCode: null,
       stdout,
       stderr,
+      signal: dispatchResult.signal,
       chainId: null,
       registration: null,
       error: new Error("No chain ID could be resolved from chain-detach output"),
@@ -1009,12 +1019,20 @@ export async function launchTaskAndWatch({
   if (isRefusal) {
     return {
       success: false,
-      exitCode: dispatchResult.exitCode || 1,
+      failureKind: "dispatch",
+      exitCode: dispatchResult.exitCode,
       stdout,
       stderr,
+      signal: dispatchResult.signal,
       jobId: null,
       registration: null,
-      error: dispatchResult.error || new Error(stderr.trim() || stdout.trim() || `task-detach exited with code ${dispatchResult.exitCode}`),
+      error: dispatchResult.error || new Error(stderr.trim() || stdout.trim() || (
+        dispatchResult.signal
+          ? `task-detach terminated by signal ${dispatchResult.signal}`
+          : typeof dispatchResult.exitCode === "number"
+            ? `task-detach exited with code ${dispatchResult.exitCode}`
+            : "task-detach failed"
+      )),
     };
   }
 
@@ -1066,9 +1084,11 @@ export async function launchTaskAndWatch({
   if (!jobId) {
     return {
       success: false,
-      exitCode: 1,
+      failureKind: "id-unresolved",
+      exitCode: null,
       stdout,
       stderr,
+      signal: dispatchResult.signal,
       jobId: null,
       registration: null,
       error: new Error("No job ID could be resolved from task-detach selector output"),
@@ -1342,7 +1362,7 @@ async function readStdinAll() {
  * for a subject that can never appear.  The refusal diagnostic and the
  * explicit "no watch was registered" statement replace it.
  */
-function emitLaunchOutput(res) {
+export function emitLaunchOutput(res) {
   if (res.refusal) {
     if (res.stdout) {
       const withoutAdvice = String(res.stdout).replace(
@@ -1359,6 +1379,24 @@ function emitLaunchOutput(res) {
     return;
   }
   if (res.stdout) process.stdout.write(res.stdout);
+  if (res.success === false) {
+    const signal = res.signal || res.error?.signal;
+    const errorMessage = res.error?.message ?? (
+      res.exitCode === null ? `signal ${signal}` : `exit code ${res.exitCode}`
+    );
+    const details = [`failure kind ${res.failureKind}`];
+    if (!signal && res.exitCode !== undefined && res.exitCode !== null) {
+      details.push(`exit code ${res.exitCode}`);
+    }
+    if (signal) details.push(`signal ${signal}`);
+    if (res.failureKind === "id-unresolved") {
+      details.push("ID 解決失敗: dispatch may have succeeded and a job or chain may still exist");
+    }
+    process.stderr.write(`register-watch: launch failed: ${errorMessage}\n`);
+    process.stderr.write(`register-watch: launch detail: ${details.join("; ")}\n`);
+    if (res.stderr) process.stderr.write(res.stderr);
+    return;
+  }
   if (res.stderr) process.stderr.write(res.stderr);
 }
 

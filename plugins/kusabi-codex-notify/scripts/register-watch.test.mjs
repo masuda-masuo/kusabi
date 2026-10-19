@@ -45,6 +45,7 @@ import {
   launchAndWatch,
   launchTaskAndWatch,
   describeRecordForList,
+  emitLaunchOutput,
   isRetryableQueueFailure,
 } from "./register-watch.mjs";
 
@@ -1346,5 +1347,112 @@ fs.writeFileSync = function injectedWriteFileSync(filePath, ...rest) {
     assert.match(stdout, /Resumed 1 pending watches\./);
     assert.match(stderr, /^register-watch: resume error: injected EACCES: injected resume write failure\n$/m);
     assert.equal(code, 1);
+  });
+
+  it("launch failure without an error object reports the exit code", () => {
+    let stderr = "";
+    const originalWrite = process.stderr.write;
+    process.stderr.write = function capture(chunk) {
+      stderr += String(chunk);
+      return true;
+    };
+    try {
+      emitLaunchOutput({ success: false, failureKind: "dispatch", exitCode: 23 });
+    } finally {
+      process.stderr.write = originalWrite;
+    }
+
+    assert.equal(
+      stderr,
+      "register-watch: launch failed: exit code 23\nregister-watch: launch detail: failure kind dispatch; exit code 23\n"
+    );
+    assert.equal((stderr.match(/23/g) || []).length, 2);
+  });
+
+  it("launch failed diagnostics distinguish dispatch and unresolved-ID", async () => {
+    const mockBin = (name, code) => {
+      const file = path.join(tmpRoot, name);
+      fs.writeFileSync(file, `#!/usr/bin/env node\n${code}\n`, { mode: 0o755 });
+      return file;
+    };
+    const runLaunch = (kind, companion) => {
+      const args = [
+        REGISTER_WATCH_SCRIPT,
+        kind === "task" ? "--launch-task" : "--launch",
+        "--companion-bin", companion,
+        "--state-dir", stateDir,
+        "--cwd", workspaceDir,
+      ];
+      const child = spawn(process.execPath, args, {
+        env: { ...process.env, KUSABI_STATE_DIR: kusabiStateDir },
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      let stdout = "";
+      let stderr = "";
+      child.stdout.on("data", (chunk) => { stdout += chunk.toString(); });
+      child.stderr.on("data", (chunk) => { stderr += chunk.toString(); });
+      return new Promise((resolve) => child.on("close", (code) => resolve({ code, stdout, stderr })));
+    };
+
+    for (const kind of ["task", "chain"]) {
+      const dispatchFailure = await runLaunch(kind, mockBin(`${kind}-dispatch-fail`, "process.exit(7);"));
+      assert.equal(dispatchFailure.stdout, "");
+      assert.notEqual(dispatchFailure.code, 0);
+      assert.match(
+        dispatchFailure.stderr,
+        /^register-watch: launch failed: (?:task|chain)-detach exited with code 7\nregister-watch: launch detail: failure kind dispatch; exit code 7\n$/
+      );
+      assert.equal((dispatchFailure.stderr.match(/code 7/g) || []).length, 2);
+
+      const messageMentionsUnresolvedId = await runLaunch(
+        kind,
+        mockBin(`${kind}-message-mentions-id`, "console.error('No job ID in this unrelated dispatch error'); process.exit(7);")
+      );
+      assert.match(
+        messageMentionsUnresolvedId.stderr,
+        /register-watch: launch detail: failure kind dispatch; exit code 7/
+      );
+
+      const unresolved = await runLaunch(kind, mockBin(`${kind}-unresolved`, "process.exit(0);"));
+      assert.notEqual(unresolved.code, 0);
+      assert.match(
+        unresolved.stderr,
+        /^register-watch: launch failed: No (?:job|chain) ID could be resolved[^\n]*\nregister-watch: launch detail: failure kind id-unresolved; ID 解決失敗: dispatch may have succeeded and a job or chain may still exist\n$/
+      );
+    }
+  });
+
+  it("signal-killed launch output reports termination by signal", async () => {
+    const companion = path.join(tmpRoot, "signal-killed-dispatch");
+    fs.writeFileSync(
+      companion,
+      '#!/usr/bin/env node\nprocess.kill(process.pid, "SIGTERM");\n',
+      { mode: 0o755 }
+    );
+    const child = spawn(process.execPath, [
+      REGISTER_WATCH_SCRIPT,
+      "--launch",
+      "--companion-bin",
+      companion,
+      "--state-dir",
+      stateDir,
+      "--cwd",
+      workspaceDir,
+    ], {
+      env: { ...process.env, KUSABI_STATE_DIR: kusabiStateDir },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (chunk) => { stdout += chunk.toString(); });
+    child.stderr.on("data", (chunk) => { stderr += chunk.toString(); });
+    const result = await new Promise((resolve) => {
+      child.on("close", (code, signal) => resolve({ code, signal }));
+    });
+
+    assert.equal(stdout, "");
+    assert.notEqual(result.code, 0);
+    assert.match(stderr, /^register-watch: launch failed: chain-detach terminated by signal SIGTERM\nregister-watch: launch detail: failure kind dispatch; signal SIGTERM\n$/);
+    assert.doesNotMatch(stderr, /exited with code 128/);
   });
 });
