@@ -1622,6 +1622,7 @@ export async function main() {
 if (process.argv[1] && fileURLToPath(import.meta.url) === path.resolve(process.argv[1])) {
   main().catch((err) => {
     console.error(`register-watch error: ${err.message}`);
-    process.exit(0);
+    // Use 1 because Codex treats PostToolUse exit 2 as a block (codex-rs/hooks/src/events/post_tool_use.rs, parse_completed).
+    process.exit(1);
   });
 }

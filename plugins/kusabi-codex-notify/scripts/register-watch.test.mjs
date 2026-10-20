@@ -1488,3 +1488,83 @@ fs.writeFileSync = function injectedWriteFileSync(filePath, ...rest) {
     assert.doesNotMatch(stderr, /exited with code 128/);
   });
 });
+
+describe("kusabi-codex-notify main() failure exit status (kusabi #774)", () => {
+  let tmpRoot;
+  let kusabiStateDir;
+  let workspaceDir;
+
+  beforeEach(() => {
+    tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "kcn-774-"));
+    kusabiStateDir = path.join(tmpRoot, "kusabi-state");
+    workspaceDir = path.join(tmpRoot, "workspace");
+    fs.mkdirSync(kusabiStateDir, { recursive: true });
+    fs.mkdirSync(workspaceDir, { recursive: true });
+  });
+
+  afterEach(() => {
+    try {
+      fs.rmSync(tmpRoot, { recursive: true, force: true });
+    } catch { /* best-effort */ }
+  });
+
+  it("CLI main failure exits with status 1 and reports the error", async () => {
+    const mockBin = (name, code) => {
+      const file = path.join(tmpRoot, name);
+      fs.writeFileSync(file, `#!/usr/bin/env node\n${code}\n`, { mode: 0o755 });
+      return file;
+    };
+    const companion = mockBin(
+      "main-failure-companion",
+      'console.log("kusabi-companion chain-wait main-failure");'
+    );
+    const invalidStateDir = path.join(tmpRoot, "state-dir-is-file");
+    fs.writeFileSync(invalidStateDir, "not a directory");
+    const child = spawn(process.execPath, [
+      REGISTER_WATCH_SCRIPT,
+      "--launch",
+      "--companion-bin", companion,
+      "--state-dir", invalidStateDir,
+      "--cwd", workspaceDir,
+    ], {
+      env: { ...process.env, KUSABI_STATE_DIR: kusabiStateDir },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let stderr = "";
+    child.stderr.on("data", (chunk) => { stderr += chunk.toString(); });
+    const code = await new Promise((resolve) => child.on("close", resolve));
+
+    assert.equal(code, 1);
+    assert.match(stderr, /register-watch error:/);
+  });
+
+  it("PostToolUse hook main failure exits with status 1 and reports the error", async () => {
+    const companion = path.join(tmpRoot, "hook-main-failure-companion");
+    fs.writeFileSync(companion, "#!/usr/bin/env node\nprocess.exit(0);\n", { mode: 0o755 });
+    const invalidStateDir = path.join(tmpRoot, "hook-state-dir-is-file");
+    fs.writeFileSync(invalidStateDir, "not a directory");
+    const child = spawn(process.execPath, [REGISTER_WATCH_SCRIPT], {
+      env: {
+        ...process.env,
+        KUSABI_STATE_DIR: kusabiStateDir,
+        KUSABI_CODEX_NOTIFY_STATE_DIR: invalidStateDir,
+        KUSABI_COMPANION_BIN: companion,
+      },
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    let stderr = "";
+    child.stderr.on("data", (chunk) => { stderr += chunk.toString(); });
+    const codePromise = new Promise((resolve) => child.on("close", resolve));
+    child.stdin.end(JSON.stringify({
+      command: "kusabi-companion chain-detach",
+      response: "Detached chain launched (pid 999).\nTo wait for completion, run:\n  kusabi-companion chain-wait hook-main-failure",
+      thread_id: "thread-hook-main-failure",
+      cwd: workspaceDir,
+    }));
+    const code = await codePromise;
+
+    assert.equal(code, 1);
+    assert.match(stderr, /register-watch error:/);
+  });
+
+});
