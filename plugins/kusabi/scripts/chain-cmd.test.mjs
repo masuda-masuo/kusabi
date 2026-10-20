@@ -4,7 +4,7 @@ import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import crypto from "node:crypto";
-import { sessionProvenanceRefusal, renderChainBanner, cmdChain, runChainLifecycle } from "./chain-cmd.mjs";
+import { sessionProvenanceRefusal, renderChainBanner, cmdChain, cmdChainResume, runChainLifecycle } from "./chain-cmd.mjs";
 import { resolveOrchestratorRecord } from "./companion-config.mjs";
 import { createChainDir } from "./chain-phases.mjs";
 
@@ -844,6 +844,10 @@ describe("chain profile guard (installed agent profile)", () => {
     const calls = [];
     let checks = 0;
     try {
+      fs.mkdirSync(process.env.KUSABI_STATE_DIR, { recursive: true });
+      fs.writeFileSync(path.join(process.env.KUSABI_STATE_DIR, "config.json"), JSON.stringify({
+        models: { chain: ["codex/gpt-6.1-sol"] },
+      }));
       const cap = process.stdout.write;
       process.stdout.write = () => true;
       try {
@@ -867,6 +871,44 @@ describe("chain profile guard (installed agent profile)", () => {
       f.cleanup();
     }
   });
+
+  for (const { name, backend, route } of [
+    { name: "claude", backend: "claude", route: "claude/sonnet" },
+    { name: "agy", backend: "agy", route: "agy/gemini-3.8-flash-high" },
+  ]) {
+    it(`does not evaluate the guard for a ${name}-only chain with a bare alias`, async () => {
+      const f = fx();
+      const calls = [];
+      let checks = 0;
+      try {
+        fs.mkdirSync(process.env.KUSABI_STATE_DIR, { recursive: true });
+        fs.writeFileSync(path.join(process.env.KUSABI_STATE_DIR, "config.json"), JSON.stringify({
+          models: { chain: [route] },
+        }));
+        const cap = process.stdout.write;
+        process.stdout.write = () => true;
+        try {
+          await runChainLifecycle(f.cwd, {
+            flags: { container: "cid-1", "chain-id": `chain-profile${name}`, "keepServe": true, backend },
+            text: BRIEF,
+            orchestrator: resolveOrchestratorRecord(BRIEF),
+          }, {
+            inject: {
+              callTool: tools(),
+              dispatchWithFallback: dispatchCounter(calls),
+              reviewDispatchWithFallback: dispatchCounter(calls),
+              assertInstalledAgentProfile() { checks += 1; throw new Error(PROFILE_ERROR); },
+              opencodeAgentDiscoveryDir: () => "/fake/agent",
+            },
+          });
+        } finally { process.stdout.write = cap; }
+        assert.equal(checks, 0);
+        assert.ok(calls.some((call) => call.kind === "task"));
+      } finally {
+        f.cleanup();
+      }
+    });
+  }
 
   it("lets matching and absent profiles proceed", async () => {
     for (const profile of ["default", "absent"]) {
@@ -894,6 +936,83 @@ describe("chain profile guard (installed agent profile)", () => {
       } finally {
         f.cleanup();
       }
+    }
+  });
+
+  it("checks the full implement candidate chain before a new chain dispatch", async () => {
+    const f = fx();
+    const calls = [];
+    const reason = PROFILE_ERROR;
+    try {
+      fs.mkdirSync(process.env.KUSABI_STATE_DIR, { recursive: true });
+      fs.writeFileSync(path.join(process.env.KUSABI_STATE_DIR, "config.json"), JSON.stringify({
+        models: { chain: ["codex/gpt-6.1-sol", "opencode/test-model"] },
+      }));
+      let error;
+      try {
+        await runChainLifecycle(f.cwd, {
+          flags: { container: "cid-1", "chain-id": "chain-profile", "keepServe": true },
+          text: BRIEF,
+          orchestrator: resolveOrchestratorRecord(BRIEF),
+        }, {
+          inject: {
+            callTool: tools(),
+            dispatchWithFallback: dispatchCounter(calls),
+            reviewDispatchWithFallback: dispatchCounter(calls),
+            assertInstalledAgentProfile() { throw Object.assign(new Error(reason), { code: "KUSABI_AGENT_PROFILE_MISMATCH" }); },
+            opencodeAgentDiscoveryDir: () => "/fake/agent",
+          },
+        });
+      } catch (err) { error = err; }
+      assert.equal(error?.code, "KUSABI_AGENT_PROFILE_MISMATCH");
+      assert.equal(calls.length, 0, "no phase may dispatch after the profile mismatch");
+      const control = JSON.parse(fs.readFileSync(path.join(f.chainDir, "control.json"), "utf8"));
+      assert.equal(control.status, "failed");
+      assert.equal(control.round, 0);
+      assert.equal(control.errorReason, reason);
+    } finally {
+      f.cleanup();
+    }
+  });
+
+  it("checks the full implement candidate chain before resuming", async () => {
+    const f = fx();
+    const calls = [];
+    const chainDir = path.join(f.tmp, "state", crypto.createHash("sha256").update(f.cwd).digest("hex").slice(0, 12), "chains", "chain-profile");
+    const reason = PROFILE_ERROR;
+    try {
+      fs.mkdirSync(chainDir, { recursive: true });
+      fs.writeFileSync(path.join(chainDir, "control.json"), JSON.stringify({
+        version: 1, chainId: "chain-profile", status: "cancelled", round: 0,
+        container: "cid-1", pid: 0, createdAt: new Date().toISOString(),
+      }));
+      fs.writeFileSync(path.join(chainDir, "chain.json"), JSON.stringify({
+        container: "cid-1",
+        model: "gpt-6.1-sol",
+        modelChain: [["codex/gpt-6.1-sol", "opencode/test-model"]],
+        maxRounds: 2,
+        brief: BRIEF,
+        records: [{ round: 1, backend: "codex", implementJobId: "job-1", implementSession: null }],
+      }));
+      let error;
+      try {
+        await cmdChainResume(f.cwd, { flags: { keepServe: true }, text: "chain-profile" }, {
+          inject: {
+            callTool: async () => ({ output: "" }),
+            dispatchWithFallback: dispatchCounter(calls),
+            reviewDispatchWithFallback: dispatchCounter(calls),
+            assertInstalledAgentProfile() { throw Object.assign(new Error(reason), { code: "KUSABI_AGENT_PROFILE_MISMATCH" }); },
+            opencodeAgentDiscoveryDir: () => "/fake/agent",
+          },
+        });
+      } catch (err) { error = err; }
+      assert.equal(error?.code, "KUSABI_AGENT_PROFILE_MISMATCH");
+      const control = JSON.parse(fs.readFileSync(path.join(chainDir, "control.json"), "utf8"));
+      assert.equal(control.status, "failed");
+      assert.equal(control.round, 1);
+      assert.equal(control.errorReason, reason);
+    } finally {
+      f.cleanup();
     }
   });
 });

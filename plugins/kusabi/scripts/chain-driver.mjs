@@ -735,7 +735,7 @@ export async function runChainDriver({
     );
   } catch (err) {
     // Exception thrown mid-round — record failure and rethrow
-    const profileGuardFailure = /^Installed phase agents /.test(err?.message ?? "");
+    const profileGuardFailure = err?.code === "KUSABI_AGENT_PROFILE_MISMATCH";
     finalizeChainControl({
       chainDir,
       status: "failed",

@@ -54,7 +54,7 @@ import {
   rearmChainControl,
   chainIdForJob,
 } from "./chain-control.mjs";
-import { resolveModelBackend, BUILTIN_DEFAULT_CHAIN } from "./cli.mjs";
+import { resolveModelBackend, chainNamesBackend, BUILTIN_DEFAULT_CHAIN } from "./cli.mjs";
 import { CLAUDE_DEFAULT_CHAIN } from "./claude-dispatch.mjs";
 import { assertInstalledAgentProfile, opencodeAgentDiscoveryDir } from "./free-worker-profile.mjs";
 import { AGY_DEFAULT_CHAIN } from "./agy-dispatch.mjs";
@@ -153,8 +153,17 @@ export function sessionProvenanceRefusal({ session, provenance, implementBackend
   );
 }
 
-function hasOpenCodeCandidate(phases) {
-  return phases.some(({ backend, chain }) => backend === "opencode" && Array.isArray(chain) && chain.length > 0);
+function hasOpenCodeCandidate(dispatch) {
+  const chain = dispatch?.chain;
+  if (!chain) return false;
+  // An opencode dispatch runs every bare id on opencode.
+  if (dispatch.backend === "opencode") return chain.length > 0;
+  // Other dispatches strip their own prefix, so a bare id is that backend's
+  // seat (claude alias, agy model, codex seat id), never an opencode route.
+  // Only an explicit provider route (contains a slash) can name opencode.
+  const entries = chain.flatMap((tier) => Array.isArray(tier) ? tier : [tier]);
+  return entries.some((route) => typeof route === "string" && route.includes("/")
+    && chainNamesBackend([[route]], "opencode"));
 }
 
 function profileGuardFor(inject = {}) {
@@ -375,9 +384,9 @@ export async function runChainLifecycle(cwd, { flags, text, orchestrator }, opts
   }));
 
   const startProfileGuard = profileGuardFor(inject);
-  const hasImplementOpenCode = hasOpenCodeCandidate([implementDispatch]);
-  const hasReviewOpenCode = hasOpenCodeCandidate([reviewDispatch]);
-  const hasReworkOpenCode = hasOpenCodeCandidate([reworkDispatch]);
+  const hasImplementOpenCode = hasOpenCodeCandidate(implementDispatch);
+  const hasReviewOpenCode = hasOpenCodeCandidate(reviewDispatch);
+  const hasReworkOpenCode = hasOpenCodeCandidate(reworkDispatch);
   const hasOpenCode = hasImplementOpenCode || hasReviewOpenCode || hasReworkOpenCode;
   if (hasOpenCode) {
     try {
@@ -644,7 +653,7 @@ export async function cmdChainResume(cwd, { flags, text }, opts = {}) {
   // an error-shaped result ({ status: "error", error: "Container … not
   // found" }) when the container is missing — treat both as unreachable so
   // the driver never starts against a container that does not exist.
-  const { callTool } = await import("./sunaba-rpc.mjs");
+  const callTool = opts.inject?.callTool ?? (await import("./sunaba-rpc.mjs")).callTool;
   let probe;
   try {
     probe = await callTool("sandbox_exec", {
@@ -740,9 +749,9 @@ export async function cmdChainResume(cwd, { flags, text }, opts = {}) {
   // rule the fresh-chain driver applies.
   const reworkBackendForResume = resumeReworkBackend ?? resumeBackend;
   const prepareOpenCode = profileGuardFor(opts.inject ?? {});
-  const resumeImplementOpenCode = hasOpenCodeCandidate([{ backend: resumeBackend, chain: chainJson.modelChain }]);
-  const resumeReviewOpenCode = hasOpenCodeCandidate([{ backend: resumeReviewBackend, chain: resumeReviewModelChain }]);
-  const resumeReworkOpenCode = hasOpenCodeCandidate([{ backend: reworkBackendForResume, chain: resumeReworkModelChain }]);
+  const resumeImplementOpenCode = hasOpenCodeCandidate({ backend: resumeBackend, chain: chainJson.modelChain });
+  const resumeReviewOpenCode = hasOpenCodeCandidate({ backend: resumeReviewBackend, chain: resumeReviewModelChain });
+  const resumeReworkOpenCode = hasOpenCodeCandidate({ backend: reworkBackendForResume, chain: resumeReworkModelChain });
   const hasOpenCode = resumeImplementOpenCode || resumeReviewOpenCode || resumeReworkOpenCode;
   if (hasOpenCode) {
     try {
