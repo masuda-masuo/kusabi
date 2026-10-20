@@ -123,6 +123,9 @@ function buildNotifyArgsWithOptions(chainDir, existing, status, options = {}) {
     disposition,
     container,
     cwdLabel,
+    ...(existing.errorReason !== undefined ? { errorReason: existing.errorReason } : {}),
+    ...(existing.artifactsSurvive !== undefined ? { artifactsSurvive: existing.artifactsSurvive } : {}),
+    ...(existing.artifactReference !== undefined ? { artifactReference: existing.artifactReference } : {}),
   };
 }
 
@@ -406,8 +409,11 @@ export function rearmChainControl({ chainDir, round }) {
  * @param {string} opts.chainDir
  * @param {string} opts.status — "completed", "cancelled", "failed"
  * @param {number} opts.round  — current round at exit time
+ * @param {string} [opts.errorReason] — terminal guard reason
+ * @param {boolean} [opts.artifactsSurvive] — whether implement artifacts remain
+ * @param {string|null} [opts.artifactReference] — surviving implement job reference
  */
-export function finalizeChainControl({ chainDir, status, round }) {
+export function finalizeChainControl({ chainDir, status, round, errorReason, artifactsSurvive, artifactReference }) {
   const observed = readChainControl(chainDir);
   if (!observed) return;
   const isTerminal = ["completed", "cancelled", "failed"].includes(status);
@@ -415,7 +421,13 @@ export function finalizeChainControl({ chainDir, status, round }) {
     const latest = readChainControl(chainDir);
     if (!latest || runMarker(latest) !== runMarker(observed)) return { superseded: true };
     if (isTerminal) {
-      const control = persistTerminalControlLocked(chainDir, latest, status, { round });
+      const updates = {
+        round,
+        ...(errorReason !== undefined ? { errorReason } : {}),
+        ...(artifactsSurvive !== undefined ? { artifactsSurvive } : {}),
+        ...(artifactReference !== undefined ? { artifactReference } : {}),
+      };
+      const control = persistTerminalControlLocked(chainDir, latest, status, updates);
       notifyAndRetireTerminalRun(chainDir, control, status);
       return { control };
     }
@@ -439,7 +451,7 @@ function notifyAndRetireTerminalRun(chainDir, control, status) {
 }
 
 function persistTerminalControlLocked(chainDir, latest, status, updates = {}, notifyOptions = {}) {
-  const claim = readOrCreateTerminalOccurrenceClaim(chainDir, latest, status, notifyOptions);
+  const claim = readOrCreateTerminalOccurrenceClaim(chainDir, { ...latest, ...updates }, status, notifyOptions);
   const control = {
     ...latest,
     ...updates,

@@ -296,7 +296,7 @@ export async function runChainDriver({
   reworkDispatchWithFallback = null,
   initialSession, flagsModel = null, reviewFlagsModel = null, signalReceived = () => false,
   keepServe = false, resume = null, sessionProvenance = null,
-  smokeObservation = null, repo = null, repoReason = null,
+  smokeObservation = null, repo = null, repoReason = null, prepareOpenCode = null,
 }) {
   // Per-phase dispatch (kusabi #192): the review phase dispatches through its
   // own backend-specific dispatch unless the caller threads a single one
@@ -306,12 +306,18 @@ export async function runChainDriver({
   // dispatch of ITS backend, never the other backend's dispatch (kusabi #192
   // finding — chain-resume used to route review through the claude implement
   // dispatch while recording reviewBackend=opencode).
-  const reviewDispatch = resolveReviewDispatch({
+  const resolvedReviewDispatch = resolveReviewDispatch({
     injectedReviewDispatch,
     injectedDispatch,
     backend,
     reviewBackend,
   });
+  const reviewProfileGuard = typeof prepareOpenCode === "function" ? prepareOpenCode : prepareOpenCode?.review;
+  const reworkProfileGuard = typeof prepareOpenCode === "function" ? prepareOpenCode : prepareOpenCode?.rework;
+  const reviewDispatch = async (opts) => {
+    if (reviewProfileGuard) reviewProfileGuard();
+    return resolvedReviewDispatch(opts);
+  };
   // The review phase's route chain: its own when per-phase config resolved
   // one, else the implement chain (pre-#192 behaviour).
   const effectiveReviewChain = reviewModelChain ?? modelChain;
@@ -321,7 +327,11 @@ export async function runChainDriver({
   // chains without the key (and every pre-axis-2 caller) are byte-identical.
   const effectiveReworkChain = reworkModelChain ?? modelChain;
   const effectiveReworkBackend = reworkBackend ?? backend;
-  const effectiveReworkDispatch = reworkDispatchWithFallback ?? injectedDispatch;
+  const rawReworkDispatch = reworkDispatchWithFallback ?? injectedDispatch;
+  const effectiveReworkDispatch = async (opts) => {
+    if (reworkProfileGuard) reworkProfileGuard();
+    return rawReworkDispatch(opts);
+  };
   // baseSha: a resume keeps the ORIGINAL chain base — the resumed round's diff
   // is measured against it (P1 auto-resets HEAD to it); a fresh chain captures
   // it from the container.
@@ -364,6 +374,7 @@ export async function runChainDriver({
     reworkCount,
   };
 
+  let survivingImplementArtifact = null;
   try {
     // Round loop (kusabi #60 step 2).  The for-condition is the HARD CAP:
     // total rounds never exceed 2 × maxRounds (every mechanical round is
@@ -572,6 +583,7 @@ export async function runChainDriver({
         _dispatchWithFallback: roundDispatch,
       });
       session = resolvedSession;
+      survivingImplementArtifact = roundRecord.implementJobId ?? null;
       // The provenance follows the session: the next round's dispatch needs
       // it when (and only when) it cannot re-derive it from the round record
       // (runImplementPhase falls back to this for a session that is not the
@@ -723,7 +735,17 @@ export async function runChainDriver({
     );
   } catch (err) {
     // Exception thrown mid-round — record failure and rethrow
-    finalizeChainControl({ chainDir, status: "failed", round: records.length });
+    const profileGuardFailure = err?.code === "KUSABI_AGENT_PROFILE_MISMATCH";
+    finalizeChainControl({
+      chainDir,
+      status: "failed",
+      round: records.length,
+      ...(profileGuardFailure ? {
+        errorReason: err.message,
+        artifactsSurvive: survivingImplementArtifact !== null,
+        artifactReference: survivingImplementArtifact,
+      } : {}),
+    });
     finaliseProvisionalChain("", "failed", records.length, ctx);
     throw err;
   } finally {

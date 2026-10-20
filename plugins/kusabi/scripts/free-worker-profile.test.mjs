@@ -910,6 +910,33 @@ describe("PR755: installed agent profile isolation", () => {
     assert.throws(() => assertInstalledAgentProfile(discoveryDir(), true), /reinstall/i);
   });
 
+  it("tags each profile-mismatch throw with KUSABI_AGENT_PROFILE_MISMATCH and leaves detect-origin errors untagged", () => {
+    const agentFile = path.join(discoveryDir(), "kusabi-review.md");
+    const expectTagged = (fn) => assert.throws(fn, (err) => err instanceof Error && err.code === "KUSABI_AGENT_PROFILE_MISMATCH");
+
+    // unknown: a kusabi agent with no frontmatter cannot be trusted in either mode
+    writeAgent("kusabi-review.md", "no frontmatter here\n");
+    expectTagged(() => assertInstalledAgentProfile(discoveryDir(), false));
+    expectTagged(() => assertInstalledAgentProfile(discoveryDir(), true));
+
+    // opt-in over a default install
+    fs.rmSync(agentFile);
+    writeAgent("kusabi-review.md", defaultTemplate);
+    expectTagged(() => assertInstalledAgentProfile(discoveryDir(), true));
+
+    // opt-out over a free install
+    fs.rmSync(agentFile);
+    writeAgent("kusabi-review.md", transformAgentForOptIn(defaultTemplate));
+    expectTagged(() => assertInstalledAgentProfile(discoveryDir(), false));
+
+    // detect-origin error: path.join rejects an undefined agent dir before the
+    // function's own try blocks, so the error must propagate without the code
+    assert.throws(
+      () => assertInstalledAgentProfile(undefined, false),
+      (err) => err instanceof TypeError && err.code !== "KUSABI_AGENT_PROFILE_MISMATCH"
+    );
+  });
+
   it("treats a directory with no kusabi agents as absent (no-op)", () => {
     assert.equal(detectInstalledAgentProfile(discoveryDir()), "absent");
     assert.equal(assertInstalledAgentProfile(discoveryDir(), true), "absent");

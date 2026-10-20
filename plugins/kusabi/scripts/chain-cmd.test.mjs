@@ -4,7 +4,7 @@ import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import crypto from "node:crypto";
-import { sessionProvenanceRefusal, renderChainBanner, cmdChain, runChainLifecycle } from "./chain-cmd.mjs";
+import { sessionProvenanceRefusal, renderChainBanner, cmdChain, cmdChainResume, runChainLifecycle } from "./chain-cmd.mjs";
 import { resolveOrchestratorRecord } from "./companion-config.mjs";
 import { createChainDir } from "./chain-phases.mjs";
 
@@ -737,6 +737,282 @@ describe("runChainLifecycle seam (kusabi #526)", () => {
     } finally {
       fx3.cleanup();
       fx4.cleanup();
+    }
+  });
+});
+
+
+describe("chain profile guard (installed agent profile)", () => {
+  const PROFILE_ERROR = 'Installed phase agents at /fake/agent are in "default" mode, but opt-in free worker mode (KUSABI_OPENCODE_FREE_WORKER=1) is active.';
+  const BRIEF =
+    "# Profile guard\n\nOrchestrator: test-model | session s-1 | 2026-08-23\n\n" +
+    "## Deliverables\n\n- `src/foo.js`\n\n## Smoke\n\n- `npm test`\n";
+
+  function fx() {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-profile-chain-"));
+    const cwd = path.join(tmp, "ws");
+    fs.mkdirSync(cwd, { recursive: true });
+    const old = process.env.KUSABI_STATE_DIR;
+    process.env.KUSABI_STATE_DIR = path.join(tmp, "state");
+    const stateDir = process.env.KUSABI_STATE_DIR;
+    const chainDir = path.join(stateDir, crypto.createHash("sha256").update(cwd).digest("hex").slice(0, 12), "chains", "chain-profile");
+    return {
+      tmp, cwd, chainDir,
+      cleanup() {
+        if (old === undefined) delete process.env.KUSABI_STATE_DIR;
+        else process.env.KUSABI_STATE_DIR = old;
+        fs.rmSync(tmp, { recursive: true, force: true });
+      },
+    };
+  }
+
+  function tools() {
+    return async (name, params) => {
+      if (name === "verify_in_container") return { gate_passed: true };
+      if (name !== "sandbox_exec") return { output: "" };
+      const cmd = params?.commands?.[0] ?? params?.argv?.join(" ") ?? "";
+      if (cmd.includes("SMOKE_EXIT=")) return { output: "SMOKE_EXIT=0\n" };
+      if (cmd.includes("change-scope.mjs")) return { output: "" };
+      if (cmd.startsWith("cd /workspace &&") && cmd.includes("TMPIDX=")) return { output: "ERROR_NO_INDEX\n" };
+      if (cmd === "git rev-parse HEAD") return { output: "abc123\n" };
+      if (cmd === "git status --porcelain") return { output: " M src/foo.js\n" };
+      if (cmd === "git log --oneline -5") return { output: "abc123 latest\n" };
+      if (cmd === "git diff") return { output: "diff --git a/src/foo.js b/src/foo.js\n" };
+      if (cmd === "git ls-files --others --exclude-standard") return { output: "src/foo.js\n" };
+      return { output: "" };
+    };
+  }
+
+  function dispatchCounter(calls) {
+    return async (opts) => {
+      calls.push(opts);
+      const review = opts.kind === "review";
+      return {
+        job: {
+          id: review ? "job-review" : "job-implement",
+          status: "completed",
+          modelEntry: "fake/model",
+          modelVariant: null,
+          fallbacks: null,
+          sessionID: review ? "ses-review" : "ses-implement",
+          usage: null,
+          error: null,
+        },
+        resultText: review
+          ? JSON.stringify({ schema_version: 1, verdict: "approve", findings: [], summary: "ok", next_steps: [] })
+          : "implemented",
+      };
+    };
+  }
+
+  it("records a start mismatch before any implement dispatch", async () => {
+    const f = fx();
+    const calls = [];
+    const reason = PROFILE_ERROR;
+    try {
+      let error;
+      try {
+        await runChainLifecycle(f.cwd, {
+          flags: { container: "cid-1", "chain-id": "chain-profile", "keepServe": true },
+          text: BRIEF,
+          orchestrator: resolveOrchestratorRecord(BRIEF),
+        }, {
+          inject: {
+            callTool: tools(),
+            dispatchWithFallback: dispatchCounter(calls),
+            reviewDispatchWithFallback: dispatchCounter(calls),
+            assertInstalledAgentProfile() { throw new Error(reason); },
+            opencodeAgentDiscoveryDir: () => "/fake/agent",
+          },
+        });
+      } catch (err) { error = err; }
+      assert.match(error?.message ?? "", /Installed phase agents/);
+      assert.equal(calls.length, 0);
+      const control = JSON.parse(fs.readFileSync(path.join(f.chainDir, "control.json"), "utf8"));
+      assert.equal(control.status, "failed");
+      assert.equal(control.round, 0);
+      assert.equal(control.errorReason, reason);
+      const inbox = fs.readFileSync(path.join(path.dirname(path.dirname(f.chainDir)), "inbox", "chain-profile.md"), "utf8");
+      assert.match(inbox, /Installed phase agents/);
+    } finally {
+      f.cleanup();
+    }
+  });
+
+  it("does not evaluate the guard for codex-only resolved candidates", async () => {
+    const f = fx();
+    const calls = [];
+    let checks = 0;
+    try {
+      fs.mkdirSync(process.env.KUSABI_STATE_DIR, { recursive: true });
+      fs.writeFileSync(path.join(process.env.KUSABI_STATE_DIR, "config.json"), JSON.stringify({
+        models: { chain: ["codex/gpt-6.1-sol"] },
+      }));
+      const cap = process.stdout.write;
+      process.stdout.write = () => true;
+      try {
+        await runChainLifecycle(f.cwd, {
+          flags: { container: "cid-1", "chain-id": "chain-profile", "keepServe": true, backend: "codex" },
+          text: BRIEF,
+          orchestrator: resolveOrchestratorRecord(BRIEF),
+        }, {
+          inject: {
+            callTool: tools(),
+            dispatchWithFallback: dispatchCounter(calls),
+            reviewDispatchWithFallback: dispatchCounter(calls),
+            assertInstalledAgentProfile() { checks += 1; throw new Error(PROFILE_ERROR); },
+            opencodeAgentDiscoveryDir: () => "/fake/agent",
+          },
+        });
+      } finally { process.stdout.write = cap; }
+      assert.equal(checks, 0);
+      assert.ok(calls.some((call) => call.kind === "task"));
+    } finally {
+      f.cleanup();
+    }
+  });
+
+  for (const { name, backend, route } of [
+    { name: "claude", backend: "claude", route: "claude/sonnet" },
+    { name: "agy", backend: "agy", route: "agy/gemini-3.8-flash-high" },
+  ]) {
+    it(`does not evaluate the guard for a ${name}-only chain with a bare alias`, async () => {
+      const f = fx();
+      const calls = [];
+      let checks = 0;
+      try {
+        fs.mkdirSync(process.env.KUSABI_STATE_DIR, { recursive: true });
+        fs.writeFileSync(path.join(process.env.KUSABI_STATE_DIR, "config.json"), JSON.stringify({
+          models: { chain: [route] },
+        }));
+        const cap = process.stdout.write;
+        process.stdout.write = () => true;
+        try {
+          await runChainLifecycle(f.cwd, {
+            flags: { container: "cid-1", "chain-id": `chain-profile${name}`, "keepServe": true, backend },
+            text: BRIEF,
+            orchestrator: resolveOrchestratorRecord(BRIEF),
+          }, {
+            inject: {
+              callTool: tools(),
+              dispatchWithFallback: dispatchCounter(calls),
+              reviewDispatchWithFallback: dispatchCounter(calls),
+              assertInstalledAgentProfile() { checks += 1; throw new Error(PROFILE_ERROR); },
+              opencodeAgentDiscoveryDir: () => "/fake/agent",
+            },
+          });
+        } finally { process.stdout.write = cap; }
+        assert.equal(checks, 0);
+        assert.ok(calls.some((call) => call.kind === "task"));
+      } finally {
+        f.cleanup();
+      }
+    });
+  }
+
+  it("lets matching and absent profiles proceed", async () => {
+    for (const profile of ["default", "absent"]) {
+      const f = fx();
+      const calls = [];
+      try {
+        const cap = process.stdout.write;
+        process.stdout.write = () => true;
+        try {
+          await runChainLifecycle(f.cwd, {
+            flags: { container: "cid-1", "chain-id": "chain-profile", "keepServe": true },
+            text: BRIEF,
+            orchestrator: resolveOrchestratorRecord(BRIEF),
+          }, {
+            inject: {
+              callTool: tools(),
+              dispatchWithFallback: dispatchCounter(calls),
+              reviewDispatchWithFallback: dispatchCounter(calls),
+              assertInstalledAgentProfile() { return profile; },
+              opencodeAgentDiscoveryDir: () => "/fake/agent",
+            },
+          });
+        } finally { process.stdout.write = cap; }
+        assert.ok(calls.some((call) => call.kind === "task"));
+      } finally {
+        f.cleanup();
+      }
+    }
+  });
+
+  it("checks the full implement candidate chain before a new chain dispatch", async () => {
+    const f = fx();
+    const calls = [];
+    const reason = PROFILE_ERROR;
+    try {
+      fs.mkdirSync(process.env.KUSABI_STATE_DIR, { recursive: true });
+      fs.writeFileSync(path.join(process.env.KUSABI_STATE_DIR, "config.json"), JSON.stringify({
+        models: { chain: ["codex/gpt-6.1-sol", "opencode/test-model"] },
+      }));
+      let error;
+      try {
+        await runChainLifecycle(f.cwd, {
+          flags: { container: "cid-1", "chain-id": "chain-profile", "keepServe": true },
+          text: BRIEF,
+          orchestrator: resolveOrchestratorRecord(BRIEF),
+        }, {
+          inject: {
+            callTool: tools(),
+            dispatchWithFallback: dispatchCounter(calls),
+            reviewDispatchWithFallback: dispatchCounter(calls),
+            assertInstalledAgentProfile() { throw Object.assign(new Error(reason), { code: "KUSABI_AGENT_PROFILE_MISMATCH" }); },
+            opencodeAgentDiscoveryDir: () => "/fake/agent",
+          },
+        });
+      } catch (err) { error = err; }
+      assert.equal(error?.code, "KUSABI_AGENT_PROFILE_MISMATCH");
+      assert.equal(calls.length, 0, "no phase may dispatch after the profile mismatch");
+      const control = JSON.parse(fs.readFileSync(path.join(f.chainDir, "control.json"), "utf8"));
+      assert.equal(control.status, "failed");
+      assert.equal(control.round, 0);
+      assert.equal(control.errorReason, reason);
+    } finally {
+      f.cleanup();
+    }
+  });
+
+  it("checks the full implement candidate chain before resuming", async () => {
+    const f = fx();
+    const calls = [];
+    const chainDir = path.join(f.tmp, "state", crypto.createHash("sha256").update(f.cwd).digest("hex").slice(0, 12), "chains", "chain-profile");
+    const reason = PROFILE_ERROR;
+    try {
+      fs.mkdirSync(chainDir, { recursive: true });
+      fs.writeFileSync(path.join(chainDir, "control.json"), JSON.stringify({
+        version: 1, chainId: "chain-profile", status: "cancelled", round: 0,
+        container: "cid-1", pid: 0, createdAt: new Date().toISOString(),
+      }));
+      fs.writeFileSync(path.join(chainDir, "chain.json"), JSON.stringify({
+        container: "cid-1",
+        model: "gpt-6.1-sol",
+        modelChain: [["codex/gpt-6.1-sol", "opencode/test-model"]],
+        maxRounds: 2,
+        brief: BRIEF,
+        records: [{ round: 1, backend: "codex", implementJobId: "job-1", implementSession: null }],
+      }));
+      let error;
+      try {
+        await cmdChainResume(f.cwd, { flags: { keepServe: true }, text: "chain-profile" }, {
+          inject: {
+            callTool: async () => ({ output: "" }),
+            dispatchWithFallback: dispatchCounter(calls),
+            reviewDispatchWithFallback: dispatchCounter(calls),
+            assertInstalledAgentProfile() { throw Object.assign(new Error(reason), { code: "KUSABI_AGENT_PROFILE_MISMATCH" }); },
+            opencodeAgentDiscoveryDir: () => "/fake/agent",
+          },
+        });
+      } catch (err) { error = err; }
+      assert.equal(error?.code, "KUSABI_AGENT_PROFILE_MISMATCH");
+      const control = JSON.parse(fs.readFileSync(path.join(chainDir, "control.json"), "utf8"));
+      assert.equal(control.status, "failed");
+      assert.equal(control.round, 1);
+      assert.equal(control.errorReason, reason);
+    } finally {
+      f.cleanup();
     }
   });
 });

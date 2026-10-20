@@ -4783,3 +4783,63 @@ describe("runChainDriver probe-gate survival on collectChangeScope failure (kusa
   });
 });
 
+
+describe("runChainDriver profile mismatch after implement", () => {
+  it("fails during review preparation and records the surviving implement artifact", async () => {
+    const { tmp, chainDir } = makeChainDir({ prefix: "kusabi-profile-after-implement-" });
+    const dispatch = makePhaseDispatch({
+      kind: "task", modelEntry: "opencode/fake-model", sessionPrefix: "ses-",
+      jobIdPrefix: "job-implement-",
+    });
+    const reason = 'Installed phase agents at /fake/agent are in "default" mode, but opt-in free worker mode (KUSABI_OPENCODE_FREE_WORKER=1) is active.';
+    const codedReason = Object.assign(new Error(reason), { code: "KUSABI_AGENT_PROFILE_MISMATCH" });
+    try {
+      await assert.rejects(runDriver({
+        cwd: tmp, chainDir, chainId: "chain-test",
+        model: "fake/model", modelChain: [["fake/model"]], maxRounds: 1,
+        brief: "Implement X.\n\n## Deliverables\n- src/foo.js\n",
+        callTool: fakeCallTool(),
+        dispatchWithFallback: dispatch.dispatch,
+        reviewDispatchWithFallback: makeReviewDispatch().dispatch,
+        prepareOpenCode() { throw codedReason; },
+      }), /Installed phase agents/);
+      const control = readChainControl(chainDir);
+      assert.equal(control.status, "failed");
+      assert.equal(control.round, 0);
+      assert.equal(control.errorReason, reason);
+      assert.equal(control.artifactsSurvive, true);
+      assert.equal(control.artifactReference, "job-implement-1");
+      assert.equal(dispatch.calls.length, 1, "implement ran and review dispatch did not");
+      const inboxPath = path.join(tmp, "inbox", "chain-test.md");
+      const inbox = fs.readFileSync(inboxPath, "utf8");
+      assert.match(inbox, /Installed phase agents/);
+      assert.match(inbox, /implement artifacts survive/);
+      assert.match(inbox, /job-implement-1/);
+
+      const uncoded = makeChainDir({ prefix: "kusabi-profile-without-code-" });
+      const uncodedDispatch = makePhaseDispatch({
+        kind: "task", modelEntry: "opencode/fake-model", sessionPrefix: "ses-",
+        jobIdPrefix: "job-implement-",
+      });
+      try {
+        await assert.rejects(runDriver({
+          cwd: uncoded.tmp, chainDir: uncoded.chainDir, chainId: "chain-uncoded",
+          model: "fake/model", modelChain: [["fake/model"]], maxRounds: 1,
+          brief: "Implement X.\\n\\n## Deliverables\\n- src/foo.js\\n",
+          callTool: fakeCallTool(),
+          dispatchWithFallback: uncodedDispatch.dispatch,
+          reviewDispatchWithFallback: makeReviewDispatch().dispatch,
+          prepareOpenCode() { throw new Error("unrelated profile-check failure"); },
+        }), /unrelated profile-check failure/);
+        const uncodedControl = readChainControl(uncoded.chainDir);
+        assert.equal(uncodedControl.status, "failed");
+        assert.equal(uncodedControl.errorReason, undefined, "an uncoded error must not be recorded as a profile guard stop");
+        assert.equal(uncodedControl.artifactsSurvive, undefined);
+      } finally {
+        fs.rmSync(uncoded.tmp, { recursive: true, force: true });
+      }
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+});

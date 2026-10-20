@@ -273,22 +273,22 @@ export function assertInstalledAgentProfile(agentDir, optIn = isOpenCodeFreeWork
   const detected = detectInstalledAgentProfile(agentDir);
   if (detected === "absent") return detected;
   if (detected === "unknown") {
-    throw new Error(
+    throw Object.assign(new Error(
       `Installed phase agents at ${agentDir} have unknown or conflicting permission content and cannot be trusted. ` +
-      `Actionable: reinstall with ${optIn ? "KUSABI_OPENCODE_FREE_WORKER=1 " : ""}(kusabi install-agents) before dispatching.`
-    );
+      `Actionable: reinstall with ${optIn ? "KUSABI_OPENCODE_FREE_WORKER=1 " : ""}(kusabi install-agents) before dispatching.`,
+    ), { code: "KUSABI_AGENT_PROFILE_MISMATCH" });
   }
   if (optIn && detected !== "free") {
-    throw new Error(
+    throw Object.assign(new Error(
       `Installed phase agents at ${agentDir} are in "${detected}" mode, but opt-in free worker mode (KUSABI_OPENCODE_FREE_WORKER=1) is active. ` +
-      `Actionable: reinstall with KUSABI_OPENCODE_FREE_WORKER=1 (kusabi install-agents) before dispatching.`
-    );
+      `Actionable: reinstall with KUSABI_OPENCODE_FREE_WORKER=1 (kusabi install-agents) before dispatching.`,
+    ), { code: "KUSABI_AGENT_PROFILE_MISMATCH" });
   }
   if (!optIn && detected === "free") {
-    throw new Error(
+    throw Object.assign(new Error(
       `Installed phase agents at ${agentDir} were installed for opt-in free worker mode, but standard worker mode is active. ` +
-      `Actionable: reinstall without KUSABI_OPENCODE_FREE_WORKER (kusabi install-agents) before dispatching.`
-    );
+      `Actionable: reinstall without KUSABI_OPENCODE_FREE_WORKER (kusabi install-agents) before dispatching.`,
+    ), { code: "KUSABI_AGENT_PROFILE_MISMATCH" });
   }
   return detected;
 }
