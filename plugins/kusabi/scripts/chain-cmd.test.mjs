@@ -740,3 +740,160 @@ describe("runChainLifecycle seam (kusabi #526)", () => {
     }
   });
 });
+
+
+describe("chain profile guard (installed agent profile)", () => {
+  const PROFILE_ERROR = 'Installed phase agents at /fake/agent are in "default" mode, but opt-in free worker mode (KUSABI_OPENCODE_FREE_WORKER=1) is active.';
+  const BRIEF =
+    "# Profile guard\n\nOrchestrator: test-model | session s-1 | 2026-08-23\n\n" +
+    "## Deliverables\n\n- `src/foo.js`\n\n## Smoke\n\n- `npm test`\n";
+
+  function fx() {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-profile-chain-"));
+    const cwd = path.join(tmp, "ws");
+    fs.mkdirSync(cwd, { recursive: true });
+    const old = process.env.KUSABI_STATE_DIR;
+    process.env.KUSABI_STATE_DIR = path.join(tmp, "state");
+    const stateDir = process.env.KUSABI_STATE_DIR;
+    const chainDir = path.join(stateDir, crypto.createHash("sha256").update(cwd).digest("hex").slice(0, 12), "chains", "chain-profile");
+    return {
+      tmp, cwd, chainDir,
+      cleanup() {
+        if (old === undefined) delete process.env.KUSABI_STATE_DIR;
+        else process.env.KUSABI_STATE_DIR = old;
+        fs.rmSync(tmp, { recursive: true, force: true });
+      },
+    };
+  }
+
+  function tools() {
+    return async (name, params) => {
+      if (name === "verify_in_container") return { gate_passed: true };
+      if (name !== "sandbox_exec") return { output: "" };
+      const cmd = params?.commands?.[0] ?? params?.argv?.join(" ") ?? "";
+      if (cmd.includes("SMOKE_EXIT=")) return { output: "SMOKE_EXIT=0\n" };
+      if (cmd.includes("change-scope.mjs")) return { output: "" };
+      if (cmd.startsWith("cd /workspace &&") && cmd.includes("TMPIDX=")) return { output: "ERROR_NO_INDEX\n" };
+      if (cmd === "git rev-parse HEAD") return { output: "abc123\n" };
+      if (cmd === "git status --porcelain") return { output: " M src/foo.js\n" };
+      if (cmd === "git log --oneline -5") return { output: "abc123 latest\n" };
+      if (cmd === "git diff") return { output: "diff --git a/src/foo.js b/src/foo.js\n" };
+      if (cmd === "git ls-files --others --exclude-standard") return { output: "src/foo.js\n" };
+      return { output: "" };
+    };
+  }
+
+  function dispatchCounter(calls) {
+    return async (opts) => {
+      calls.push(opts);
+      const review = opts.kind === "review";
+      return {
+        job: {
+          id: review ? "job-review" : "job-implement",
+          status: "completed",
+          modelEntry: "fake/model",
+          modelVariant: null,
+          fallbacks: null,
+          sessionID: review ? "ses-review" : "ses-implement",
+          usage: null,
+          error: null,
+        },
+        resultText: review
+          ? JSON.stringify({ schema_version: 1, verdict: "approve", findings: [], summary: "ok", next_steps: [] })
+          : "implemented",
+      };
+    };
+  }
+
+  it("records a start mismatch before any implement dispatch", async () => {
+    const f = fx();
+    const calls = [];
+    const reason = PROFILE_ERROR;
+    try {
+      let error;
+      try {
+        await runChainLifecycle(f.cwd, {
+          flags: { container: "cid-1", "chain-id": "chain-profile", "keepServe": true },
+          text: BRIEF,
+          orchestrator: resolveOrchestratorRecord(BRIEF),
+        }, {
+          inject: {
+            callTool: tools(),
+            dispatchWithFallback: dispatchCounter(calls),
+            reviewDispatchWithFallback: dispatchCounter(calls),
+            assertInstalledAgentProfile() { throw new Error(reason); },
+            opencodeAgentDiscoveryDir: () => "/fake/agent",
+          },
+        });
+      } catch (err) { error = err; }
+      assert.match(error?.message ?? "", /Installed phase agents/);
+      assert.equal(calls.length, 0);
+      const control = JSON.parse(fs.readFileSync(path.join(f.chainDir, "control.json"), "utf8"));
+      assert.equal(control.status, "failed");
+      assert.equal(control.round, 0);
+      assert.equal(control.errorReason, reason);
+      const inbox = fs.readFileSync(path.join(path.dirname(path.dirname(f.chainDir)), "inbox", "chain-profile.md"), "utf8");
+      assert.match(inbox, /Installed phase agents/);
+    } finally {
+      f.cleanup();
+    }
+  });
+
+  it("does not evaluate the guard for codex-only resolved candidates", async () => {
+    const f = fx();
+    const calls = [];
+    let checks = 0;
+    try {
+      const cap = process.stdout.write;
+      process.stdout.write = () => true;
+      try {
+        await runChainLifecycle(f.cwd, {
+          flags: { container: "cid-1", "chain-id": "chain-profile", "keepServe": true, backend: "codex" },
+          text: BRIEF,
+          orchestrator: resolveOrchestratorRecord(BRIEF),
+        }, {
+          inject: {
+            callTool: tools(),
+            dispatchWithFallback: dispatchCounter(calls),
+            reviewDispatchWithFallback: dispatchCounter(calls),
+            assertInstalledAgentProfile() { checks += 1; throw new Error(PROFILE_ERROR); },
+            opencodeAgentDiscoveryDir: () => "/fake/agent",
+          },
+        });
+      } finally { process.stdout.write = cap; }
+      assert.equal(checks, 0);
+      assert.ok(calls.some((call) => call.kind === "task"));
+    } finally {
+      f.cleanup();
+    }
+  });
+
+  it("lets matching and absent profiles proceed", async () => {
+    for (const profile of ["default", "absent"]) {
+      const f = fx();
+      const calls = [];
+      try {
+        const cap = process.stdout.write;
+        process.stdout.write = () => true;
+        try {
+          await runChainLifecycle(f.cwd, {
+            flags: { container: "cid-1", "chain-id": "chain-profile", "keepServe": true },
+            text: BRIEF,
+            orchestrator: resolveOrchestratorRecord(BRIEF),
+          }, {
+            inject: {
+              callTool: tools(),
+              dispatchWithFallback: dispatchCounter(calls),
+              reviewDispatchWithFallback: dispatchCounter(calls),
+              assertInstalledAgentProfile() { return profile; },
+              opencodeAgentDiscoveryDir: () => "/fake/agent",
+            },
+          });
+        } finally { process.stdout.write = cap; }
+        assert.ok(calls.some((call) => call.kind === "task"));
+      } finally {
+        f.cleanup();
+      }
+    }
+  });
+});

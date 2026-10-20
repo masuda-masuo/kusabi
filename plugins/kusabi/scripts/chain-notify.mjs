@@ -29,6 +29,8 @@ function writeInboxFile(inboxDir, chainId, info) {
     `- **status**: ${info.status}\n` +
     `- **disposition**: ${info.disposition ?? "none"}\n` +
     `- **container**: ${info.container ?? "none"}\n` +
+    (info.errorReason ? `- **reason**: ${info.errorReason}\n` : "") +
+    (info.artifactsSurvive ? `- **implement artifacts survive**: yes${info.artifactReference ? ` (job ${info.artifactReference})` : ""}\n` : "") +
     `- **inbox**: ${info.inboxPath}\n\n` +
     `## Next steps\n\n` +
     `Run \`kusabi-companion chain-show ${chainId}\` then inspect the review record and adjudicate / publish / record.\n`;
@@ -96,6 +98,9 @@ export function notifyChainTerminal(opts) {
     disposition = null,
     container = null,
     cwdLabel = "",
+    errorReason,
+    artifactsSurvive,
+    artifactReference,
     env = process.env,
     occurrenceId,
     mcpConfigFile,
@@ -107,7 +112,9 @@ export function notifyChainTerminal(opts) {
   const inboxDir = path.join(stateDir, "inbox");
   const inboxPath = path.resolve(inboxDir, `${chainId}.md`);
   try {
-    writeInboxFile(inboxDir, chainId, { status, disposition, container, inboxPath });
+    writeInboxFile(inboxDir, chainId, {
+      status, disposition, container, inboxPath, errorReason, artifactsSurvive, artifactReference,
+    });
   } catch (err) {
     const msg = err && typeof err === "object" && "message" in err ? err.message : String(err);
     console.error(`[chain-notify] inbox write failed for ${chainId}: ${msg}`);
@@ -134,6 +141,9 @@ export function notifyChainTerminal(opts) {
       container,
       inbox_path: inboxPath,
       cwd_label: cwdLabel,
+      ...(errorReason !== undefined ? { error_reason: errorReason } : {}),
+      ...(artifactsSurvive !== undefined ? { artifacts_survive: artifactsSurvive } : {}),
+      ...(artifactReference !== undefined ? { artifact_reference: artifactReference } : {}),
     },
   };
   const result = appendKaibaInbox(mcpConfigFile, event, env, parsedTimeout);

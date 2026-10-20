@@ -49,12 +49,14 @@ import { captureWorktreeState } from "./worktree-baseline.mjs";
 import {
   readChainControl,
   writeChainControl,
+  finalizeChainControl,
   createChainControl,
   rearmChainControl,
   chainIdForJob,
 } from "./chain-control.mjs";
 import { resolveModelBackend, BUILTIN_DEFAULT_CHAIN } from "./cli.mjs";
 import { CLAUDE_DEFAULT_CHAIN } from "./claude-dispatch.mjs";
+import { assertInstalledAgentProfile, opencodeAgentDiscoveryDir } from "./free-worker-profile.mjs";
 import { AGY_DEFAULT_CHAIN } from "./agy-dispatch.mjs";
 import { CODEX_DEFAULT_CHAIN } from "./codex-dispatch.mjs";
 
@@ -149,6 +151,16 @@ export function sessionProvenanceRefusal({ session, provenance, implementBackend
     implementBackend + " dispatch would resume it only on positive provenance. Nothing was started: no chain state, no job " +
     "and no round state exist. Run the chain on the " + provenance + " backend, or drop --session."
   );
+}
+
+function hasOpenCodeCandidate(phases) {
+  return phases.some(({ backend, chain }) => backend === "opencode" && Array.isArray(chain) && chain.length > 0);
+}
+
+function profileGuardFor(inject = {}) {
+  const check = inject.assertInstalledAgentProfile ?? assertInstalledAgentProfile;
+  const getAgentDir = inject.opencodeAgentDiscoveryDir ?? opencodeAgentDiscoveryDir;
+  return () => check(getAgentDir());
 }
 
 export async function cmdChain(cwd, { flags, text }, opts = {}) {
@@ -362,6 +374,20 @@ export async function runChainLifecycle(cwd, { flags, text, orchestrator }, opts
     pid: process.pid,
   }));
 
+  const startProfileGuard = profileGuardFor(inject);
+  const hasImplementOpenCode = hasOpenCodeCandidate([implementDispatch]);
+  const hasReviewOpenCode = hasOpenCodeCandidate([reviewDispatch]);
+  const hasReworkOpenCode = hasOpenCodeCandidate([reworkDispatch]);
+  const hasOpenCode = hasImplementOpenCode || hasReviewOpenCode || hasReworkOpenCode;
+  if (hasOpenCode) {
+    try {
+      startProfileGuard();
+    } catch (err) {
+      finalizeChainControl({ chainDir, status: "failed", round: 0, errorReason: err?.message ?? String(err) });
+      throw err;
+    }
+  }
+
 
   // ---- SIGTERM/SIGINT handler feeds the same predicate as the file-based stop ----
   let signalReceived = false;
@@ -438,6 +464,10 @@ export async function runChainLifecycle(cwd, { flags, text, orchestrator }, opts
       signalReceived: () => signalReceived,
       keepServe: !!flags.keepServe,
       resume: null,
+      prepareOpenCode: {
+        review: hasReviewOpenCode ? startProfileGuard : null,
+        rework: hasReworkOpenCode ? startProfileGuard : null,
+      },
     });
   } finally {
     process.removeListener("SIGTERM", onSignal);
@@ -497,7 +527,7 @@ function resolveQuotaReviewReroute(record, explicitRoute) {
   return { backend, model, chain, flagsModel };
 }
 
-export async function cmdChainResume(cwd, { flags, text }) {
+export async function cmdChainResume(cwd, { flags, text }, opts = {}) {
   // Resumption context comes entirely from the saved chain state (chain.json
   // brief, records, ladder; control.json container).  Accepting another flag
   // and ignoring it would answer a different question than the one asked.
@@ -709,6 +739,24 @@ export async function cmdChainResume(cwd, { flags, text }) {
   // means rework rounds keep the implement backend — the same `?? backend`
   // rule the fresh-chain driver applies.
   const reworkBackendForResume = resumeReworkBackend ?? resumeBackend;
+  const prepareOpenCode = profileGuardFor(opts.inject ?? {});
+  const resumeImplementOpenCode = hasOpenCodeCandidate([{ backend: resumeBackend, chain: chainJson.modelChain }]);
+  const resumeReviewOpenCode = hasOpenCodeCandidate([{ backend: resumeReviewBackend, chain: resumeReviewModelChain }]);
+  const resumeReworkOpenCode = hasOpenCodeCandidate([{ backend: reworkBackendForResume, chain: resumeReworkModelChain }]);
+  const hasOpenCode = resumeImplementOpenCode || resumeReviewOpenCode || resumeReworkOpenCode;
+  if (hasOpenCode) {
+    try {
+      prepareOpenCode();
+    } catch (err) {
+      finalizeChainControl({
+        chainDir,
+        status: "failed",
+        round: position.phase === "review" ? position.round : position.round - 1,
+        errorReason: err?.message ?? String(err),
+      });
+      throw err;
+    }
+  }
 
   try {
     return await runChainDriver({
@@ -749,6 +797,10 @@ export async function cmdChainResume(cwd, { flags, text }) {
       signalReceived: () => signalReceived,
       keepServe: !!flags.keepServe,
       resume: position,
+      prepareOpenCode: {
+        review: resumeReviewOpenCode ? prepareOpenCode : null,
+        rework: resumeReworkOpenCode ? prepareOpenCode : null,
+      },
     });
   } finally {
     process.removeListener("SIGTERM", onSignal);
