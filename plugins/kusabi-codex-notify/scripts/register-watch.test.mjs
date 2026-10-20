@@ -1454,6 +1454,60 @@ fs.writeFileSync = function injectedWriteFileSync(filePath, ...rest) {
     assert.doesNotMatch(missingCompanion.stderr, /exit code/i);
   });
 
+  it("signal-killed launch output reports termination by signal", async () => {
+    const companion = path.join(tmpRoot, "signal-killed-dispatch");
+    fs.writeFileSync(
+      companion,
+      '#!/usr/bin/env node\nprocess.kill(process.pid, "SIGTERM");\n',
+      { mode: 0o755 }
+    );
+    const child = spawn(process.execPath, [
+      REGISTER_WATCH_SCRIPT,
+      "--launch",
+      "--companion-bin",
+      companion,
+      "--state-dir",
+      stateDir,
+      "--cwd",
+      workspaceDir,
+    ], {
+      env: { ...process.env, KUSABI_STATE_DIR: kusabiStateDir },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (chunk) => { stdout += chunk.toString(); });
+    child.stderr.on("data", (chunk) => { stderr += chunk.toString(); });
+    const result = await new Promise((resolve) => {
+      child.on("close", (code, signal) => resolve({ code, signal }));
+    });
+
+    assert.equal(stdout, "");
+    assert.notEqual(result.code, 0);
+    assert.match(stderr, /^register-watch: launch failed: chain-detach terminated by signal SIGTERM\nregister-watch: launch detail: failure kind dispatch; signal SIGTERM\n$/);
+    assert.doesNotMatch(stderr, /exited with code 128/);
+  });
+});
+
+describe("kusabi-codex-notify main() failure exit status (kusabi #774)", () => {
+  let tmpRoot;
+  let kusabiStateDir;
+  let workspaceDir;
+
+  beforeEach(() => {
+    tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "kcn-774-"));
+    kusabiStateDir = path.join(tmpRoot, "kusabi-state");
+    workspaceDir = path.join(tmpRoot, "workspace");
+    fs.mkdirSync(kusabiStateDir, { recursive: true });
+    fs.mkdirSync(workspaceDir, { recursive: true });
+  });
+
+  afterEach(() => {
+    try {
+      fs.rmSync(tmpRoot, { recursive: true, force: true });
+    } catch { /* best-effort */ }
+  });
+
   it("CLI main failure exits with status 1 and reports the error", async () => {
     const mockBin = (name, code) => {
       const file = path.join(tmpRoot, name);
@@ -1513,37 +1567,4 @@ fs.writeFileSync = function injectedWriteFileSync(filePath, ...rest) {
     assert.match(stderr, /register-watch error:/);
   });
 
-  it("signal-killed launch output reports termination by signal", async () => {
-    const companion = path.join(tmpRoot, "signal-killed-dispatch");
-    fs.writeFileSync(
-      companion,
-      '#!/usr/bin/env node\nprocess.kill(process.pid, "SIGTERM");\n',
-      { mode: 0o755 }
-    );
-    const child = spawn(process.execPath, [
-      REGISTER_WATCH_SCRIPT,
-      "--launch",
-      "--companion-bin",
-      companion,
-      "--state-dir",
-      stateDir,
-      "--cwd",
-      workspaceDir,
-    ], {
-      env: { ...process.env, KUSABI_STATE_DIR: kusabiStateDir },
-      stdio: ["ignore", "pipe", "pipe"],
-    });
-    let stdout = "";
-    let stderr = "";
-    child.stdout.on("data", (chunk) => { stdout += chunk.toString(); });
-    child.stderr.on("data", (chunk) => { stderr += chunk.toString(); });
-    const result = await new Promise((resolve) => {
-      child.on("close", (code, signal) => resolve({ code, signal }));
-    });
-
-    assert.equal(stdout, "");
-    assert.notEqual(result.code, 0);
-    assert.match(stderr, /^register-watch: launch failed: chain-detach terminated by signal SIGTERM\nregister-watch: launch detail: failure kind dispatch; signal SIGTERM\n$/);
-    assert.doesNotMatch(stderr, /exited with code 128/);
-  });
 });
