@@ -3012,7 +3012,9 @@ describe("CLI smoke baseline (kusabi #292)", () => {
       delete env.KUSABI_WORKER_CONTEXT;
       env.KUSABI_STATE_DIR = stateRootDir;
       env.KUSABI_SUNABA_URL = url;
-      env.OPENCODE_BIN = path.join(cwd, "no-such-opencode-bin");
+      env.OPENCODE_BIN = path.join(cwd, "fake-opencode-v1");
+      fs.writeFileSync(env.OPENCODE_BIN, ["#!/bin/sh", "echo 'opencode 1.19.0'"].join(String.fromCharCode(10)), "utf8");
+      fs.chmodSync(env.OPENCODE_BIN, 0o755);
       const child = spawn(process.execPath, [COMPANION_SCRIPT, ...args], { cwd, env });
       let stdout = "";
       let stderr = "";

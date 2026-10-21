@@ -9,7 +9,7 @@
 // 6. Prefer info.structured from last assistant message; preserve text fallback; reject invalid structured output.
 // 7. Read audit is E2E evidence extraction, not a new audit product.
 
-import { describe, it, beforeEach, afterEach } from "node:test";
+import { describe, it, beforeEach, afterEach, after } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
@@ -25,10 +25,11 @@ import { runPrompt, warnFreeWorkerConfiguredRoute } from "./prompt-execution.mjs
 import { parseReviewResult } from "./chain-review.mjs";
 import { stateDirFor } from "./state-paths.mjs";
 import { patchEnv, writeExecutable } from "./fixtures.mjs";
-import {
+import { checkOpencodeVersion,
   OPENCODE_FREE_WORKER_CHAIN,
   OPENCODE_RECOGNIZED_FREE_MODELS,
   assertInstalledAgentProfile,
+  checkDefaultOpencodeVersion,
   detectInstalledAgentProfile,
   classifyInstalledAgentContent,
   isOpenCodeFreeCandidateRoute,
@@ -1486,5 +1487,65 @@ body
       /\(frontmatter line 4\)/,
       "unsupported permission key Pair error must pinpoint line 4",
     );
+  });
+});
+
+
+describe("default OpenCode version guard (kusabi #780)", () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-opencode-version-"));
+  const makeBinary = (name, script) => {
+    const bin = path.join(tmp, name);
+    fs.writeFileSync(bin, `#!/bin/sh\n${script}\n`, "utf8");
+    fs.chmodSync(bin, 0o755);
+    return bin;
+  };
+
+  it("refuses V2 with the guard code and binary path", () => {
+    const bin = makeBinary("v2", 'echo "opencode 2.0.32"');
+    assert.throws(() => checkDefaultOpencodeVersion(bin), (error) => {
+      assert.equal(error.code, "KUSABI_OPENCODE_UNSUPPORTED_VERSION");
+      assert.ok(error.message.includes(bin));
+      assert.match(error.message, /OPENCODE_BIN/);
+      assert.doesNotMatch(error.message, />= 1\.19/);
+      return true;
+    });
+  });
+
+  it("checkOpencodeVersion errors carry KUSABI_OPENCODE_UNSUPPORTED_VERSION in free mode", () => {
+    const bin = makeBinary("v2-free", 'echo "opencode 2.0.32"');
+    assert.throws(
+      () => checkOpencodeVersion(bin),
+      (err) => err.code === "KUSABI_OPENCODE_UNSUPPORTED_VERSION" && /V2/.test(err.message)
+    );
+  });
+
+  it("accepts 1.19.0 without imposing a higher V1 minimum", () => {
+    const bin = makeBinary("v1", 'echo "opencode 1.19.0"');
+    assert.deepEqual(checkDefaultOpencodeVersion(bin), { version: "1.19.0", major: 1 });
+  });
+
+  for (const [name, script] of [
+    ["nonzero", 'echo "opencode 1.19.0"; exit 4'],
+    ["unparseable", 'echo "development build"'],
+  ]) {
+    it(`fails closed for ${name} output with the same code and path`, () => {
+      const bin = makeBinary(name, script);
+      assert.throws(() => checkDefaultOpencodeVersion(bin), (error) => {
+        assert.equal(error.code, "KUSABI_OPENCODE_UNSUPPORTED_VERSION");
+        assert.ok(error.message.includes(bin));
+        return true;
+      });
+    });
+  }
+
+  after(() => fs.rmSync(tmp, { recursive: true, force: true }));
+
+  it("fails closed for a missing binary with the same code and path", () => {
+    const bin = path.join(tmp, "missing-opencode");
+    assert.throws(() => checkDefaultOpencodeVersion(bin), (error) => {
+      assert.equal(error.code, "KUSABI_OPENCODE_UNSUPPORTED_VERSION");
+      assert.ok(error.message.includes(bin));
+      return true;
+    });
   });
 });

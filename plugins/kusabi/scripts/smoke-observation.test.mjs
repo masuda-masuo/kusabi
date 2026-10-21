@@ -247,6 +247,7 @@ describe("C. Chain dispatch warning and record persistence", () => {
           dispatchWithFallback: h.fakeDispatch,
           reviewDispatchWithFallback: h.fakeDispatch,
           reworkDispatchWithFallback: h.fakeDispatch,
+          checkDefaultOpencodeVersion() {}
         },
       });
 
@@ -281,6 +282,7 @@ describe("C. Chain dispatch warning and record persistence", () => {
           dispatchWithFallback: h.fakeDispatch,
           reviewDispatchWithFallback: h.fakeDispatch,
           reworkDispatchWithFallback: h.fakeDispatch,
+          checkDefaultOpencodeVersion() {}
         },
       });
 

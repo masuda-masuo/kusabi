@@ -7,6 +7,7 @@ import crypto from "node:crypto";
 import { sessionProvenanceRefusal, renderChainBanner, cmdChain, cmdChainResume, runChainLifecycle } from "./chain-cmd.mjs";
 import { resolveOrchestratorRecord } from "./companion-config.mjs";
 import { createChainDir } from "./chain-phases.mjs";
+import { patchEnv } from "./fixtures.mjs";
 
 // sessionProvenanceRefusal — the agy --session chain-start gate (kusabi #321)
 // ---------------------------------------------------------------------------
@@ -592,6 +593,7 @@ describe("runChainLifecycle seam (kusabi #526)", () => {
         dispatchWithFallback: makeFakeDispatch(),
         reviewDispatchWithFallback: makeFakeDispatch(),
         reworkDispatchWithFallback: makeFakeDispatch(),
+        checkDefaultOpencodeVersion() {},
       },
     };
   }
@@ -861,6 +863,7 @@ describe("chain profile guard (installed agent profile)", () => {
             dispatchWithFallback: dispatchCounter(calls),
             reviewDispatchWithFallback: dispatchCounter(calls),
             assertInstalledAgentProfile() { checks += 1; throw new Error(PROFILE_ERROR); },
+            checkDefaultOpencodeVersion() { checks += 1; throw new Error("version check should not run"); },
             opencodeAgentDiscoveryDir: () => "/fake/agent",
           },
         });
@@ -928,6 +931,7 @@ describe("chain profile guard (installed agent profile)", () => {
               dispatchWithFallback: dispatchCounter(calls),
               reviewDispatchWithFallback: dispatchCounter(calls),
               assertInstalledAgentProfile() { return profile; },
+              checkDefaultOpencodeVersion() {},
               opencodeAgentDiscoveryDir: () => "/fake/agent",
             },
           });
@@ -975,6 +979,49 @@ describe("chain profile guard (installed agent profile)", () => {
     }
   });
 
+  it("free mode refuses a V2 binary at chain start when review uses opencode (kusabi #780)", async () => {
+    const f = fx();
+    const calls = [];
+    const stubDir = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-v2-stub-"));
+    const stub = path.join(stubDir, "opencode");
+    fs.writeFileSync(stub, "#!/bin/sh\necho 'opencode 2.0.32'\n", { mode: 0o755 });
+    let restore = null;
+    try {
+      fs.mkdirSync(process.env.KUSABI_STATE_DIR, { recursive: true });
+      fs.writeFileSync(path.join(process.env.KUSABI_STATE_DIR, "config.json"), JSON.stringify({
+        models: { chain: ["codex/gpt-6.1-sol", "opencode/test-model"] },
+      }));
+      restore = patchEnv({ KUSABI_OPENCODE_FREE_WORKER: "1", OPENCODE_BIN: stub });
+      let error;
+      try {
+        await runChainLifecycle(f.cwd, {
+          flags: { container: "cid-1", "chain-id": "chain-profile", "keepServe": true },
+          text: BRIEF,
+          orchestrator: resolveOrchestratorRecord(BRIEF),
+        }, {
+          inject: {
+            callTool: tools(),
+            dispatchWithFallback: dispatchCounter(calls),
+            reviewDispatchWithFallback: dispatchCounter(calls),
+            assertInstalledAgentProfile() {},
+            opencodeAgentDiscoveryDir: () => "/fake/agent",
+          },
+        });
+      } catch (err) { error = err; }
+      assert.equal(error?.code, "KUSABI_OPENCODE_UNSUPPORTED_VERSION");
+      assert.equal(calls.length, 0, "no phase may dispatch when the binary is V2");
+      const control = JSON.parse(fs.readFileSync(path.join(f.chainDir, "control.json"), "utf8"));
+      assert.equal(control.status, "failed");
+      assert.match(control.errorReason, /V2|2\.0\.32/);
+      const inbox = fs.readFileSync(path.join(f.chainDir, "..", "..", "inbox", "chain-profile.md"), "utf8");
+      assert.match(inbox, /reason/i);
+    } finally {
+      if (restore) restore();
+      f.cleanup();
+      fs.rmSync(stubDir, { recursive: true, force: true });
+    }
+  });
+
   it("checks the full implement candidate chain before resuming", async () => {
     const f = fx();
     const calls = [];
@@ -1012,6 +1059,93 @@ describe("chain profile guard (installed agent profile)", () => {
       assert.equal(control.round, 1);
       assert.equal(control.errorReason, reason);
     } finally {
+      f.cleanup();
+    }
+  });
+
+  it("stops a codex-implement / opencode-review chain on V2 before implement", async () => {
+    const f = fx();
+    const calls = [];
+    const oldBin = process.env.OPENCODE_BIN;
+    const versionBin = path.join(f.tmp, "opencode-v2");
+    fs.writeFileSync(versionBin, "#!/bin/sh\necho 'opencode 2.0.32'\n", "utf8");
+    fs.chmodSync(versionBin, 0o755);
+    process.env.OPENCODE_BIN = versionBin;
+    try {
+      fs.mkdirSync(process.env.KUSABI_STATE_DIR, { recursive: true });
+      fs.writeFileSync(path.join(process.env.KUSABI_STATE_DIR, "config.json"), JSON.stringify({
+        models: { phases: {
+          implement: ["codex/gpt-6.1-sol"],
+          review: ["opencode/review-model"],
+        } },
+      }));
+      let error;
+      try {
+        await runChainLifecycle(f.cwd, {
+          flags: { container: "cid-1", "chain-id": "chain-profile", keepServe: true },
+          text: BRIEF,
+          orchestrator: resolveOrchestratorRecord(BRIEF),
+        }, {
+          inject: {
+            callTool: tools(),
+            dispatchWithFallback: dispatchCounter(calls),
+            reviewDispatchWithFallback: dispatchCounter(calls),
+            assertInstalledAgentProfile() {},
+            opencodeAgentDiscoveryDir: () => "/fake/agent",
+          },
+        });
+      } catch (caught) { error = caught; }
+      assert.equal(error?.code, "KUSABI_OPENCODE_UNSUPPORTED_VERSION");
+      assert.equal(calls.length, 0);
+      const control = JSON.parse(fs.readFileSync(path.join(f.chainDir, "control.json"), "utf8"));
+      assert.equal(control.status, "failed");
+      assert.match(control.errorReason, /opencode-v2/);
+      const inbox = fs.readFileSync(path.join(path.dirname(path.dirname(f.chainDir)), "inbox", "chain-profile.md"), "utf8");
+      assert.match(inbox, /opencode-v2/);
+    } finally {
+      if (oldBin === undefined) delete process.env.OPENCODE_BIN;
+      else process.env.OPENCODE_BIN = oldBin;
+      f.cleanup();
+    }
+  });
+
+  it("stops chain-resume on V2 before a resumed OpenCode phase dispatch", async () => {
+    const f = fx();
+    const calls = [];
+    const chainDir = f.chainDir;
+    const oldBin = process.env.OPENCODE_BIN;
+    const versionBin = path.join(f.tmp, "opencode-resume-v2");
+    fs.writeFileSync(versionBin, "#!/bin/sh\necho 'opencode 2.0.32'\n", "utf8");
+    fs.chmodSync(versionBin, 0o755);
+    process.env.OPENCODE_BIN = versionBin;
+    try {
+      fs.mkdirSync(chainDir, { recursive: true });
+      fs.writeFileSync(path.join(chainDir, "control.json"), JSON.stringify({
+        version: 1, chainId: "chain-profile", status: "cancelled", round: 0,
+        container: "cid-1", pid: 0, createdAt: new Date().toISOString(),
+      }));
+      fs.writeFileSync(path.join(chainDir, "chain.json"), JSON.stringify({
+        container: "cid-1",
+        model: "gpt-6.1-sol",
+        modelChain: [["codex/gpt-6.1-sol", "opencode/test-model"]],
+        maxRounds: 2,
+        brief: BRIEF,
+        records: [{ round: 1, backend: "codex", implementJobId: "job-1", implementSession: null }],
+      }));
+      let error;
+      try {
+        await cmdChainResume(f.cwd, { flags: { keepServe: true }, text: "chain-profile" }, {
+          inject: { callTool: async () => ({ output: "" }), dispatchWithFallback: dispatchCounter(calls) },
+        });
+      } catch (caught) { error = caught; }
+      assert.equal(error?.code, "KUSABI_OPENCODE_UNSUPPORTED_VERSION");
+      assert.equal(calls.length, 0);
+      const control = JSON.parse(fs.readFileSync(path.join(chainDir, "control.json"), "utf8"));
+      assert.equal(control.status, "failed");
+      assert.match(control.errorReason, /opencode-resume-v2/);
+    } finally {
+      if (oldBin === undefined) delete process.env.OPENCODE_BIN;
+      else process.env.OPENCODE_BIN = oldBin;
       f.cleanup();
     }
   });
