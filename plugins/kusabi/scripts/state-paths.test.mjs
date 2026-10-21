@@ -12,6 +12,7 @@ import {
   writeJson,
 } from "./state-paths.mjs";
 import { patchEnv } from "./fixtures.mjs";
+import { isOpenCodeFreeWorkerEnabled } from "./free-worker-profile.mjs";
 
 // OpenCode mode directory
 // ---------------------------------------------------------------------------
@@ -215,4 +216,18 @@ describe("chainStateDirFor", () => {
       fs.rmSync(root, { recursive: true, force: true });
     }
   });
+});
+
+describe("opencodeModeDir agrees with the free-worker opt-in predicate (kusabi #777)", () => {
+  for (const value of ["1", undefined, "true"]) {
+    it(`KUSABI_OPENCODE_FREE_WORKER=${value === undefined ? "<unset>" : JSON.stringify(value)} selects the same mode`, () => {
+      const restore = patchEnv({ KUSABI_STATE_DIR: "/tmp/kusabi-mode-agree", KUSABI_OPENCODE_FREE_WORKER: value });
+      try {
+        const expected = isOpenCodeFreeWorkerEnabled() ? "free" : "default";
+        assert.equal(path.basename(opencodeModeDir()), expected);
+      } finally {
+        restore();
+      }
+    });
+  }
 });
