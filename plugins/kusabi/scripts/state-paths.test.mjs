@@ -7,10 +7,28 @@ import crypto from "node:crypto";
 import {
   chainStateDirFor,
   stateRoot,
+  opencodeModeDir,
   readJson,
   writeJson,
 } from "./state-paths.mjs";
 import { patchEnv } from "./fixtures.mjs";
+
+// OpenCode mode directory
+// ---------------------------------------------------------------------------
+
+describe("opencodeModeDir", () => {
+  it("resolves explicit and environment-selected mode directories below state root", () => {
+    const restore = patchEnv({ KUSABI_STATE_DIR: "/tmp/kusabi-mode-paths", KUSABI_OPENCODE_FREE_WORKER: undefined });
+    try {
+      assert.equal(opencodeModeDir("default"), "/tmp/kusabi-mode-paths/opencode-mode/default");
+      assert.equal(opencodeModeDir(), "/tmp/kusabi-mode-paths/opencode-mode/default");
+      process.env.KUSABI_OPENCODE_FREE_WORKER = "1";
+      assert.equal(opencodeModeDir(), "/tmp/kusabi-mode-paths/opencode-mode/free");
+    } finally {
+      restore();
+    }
+  });
+});
 
 // stateRoot — state directory resolution with migration
 // ---------------------------------------------------------------------------

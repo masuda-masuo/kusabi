@@ -5,7 +5,7 @@ import fs from "node:fs";
 import process from "node:process";
 import { spawn } from "node:child_process";
 import crypto from "node:crypto";
-import { stateDirFor, readJson, writeJson, kusabiOpencodeConfigHome } from "./state-paths.mjs";
+import { stateDirFor, readJson, writeJson, kusabiOpencodeConfigHome, opencodeModeDir } from "./state-paths.mjs";
 import {
   isOpenCodeFreeWorkerEnabled,
   checkOpencodeVersion,
@@ -61,6 +61,7 @@ export function buildServeEnv(baseEnv, password, stateDir) {
     OPENCODE_SERVER_PASSWORD: password,
     KUSABI_WORKER_CONTEXT: "1",
     XDG_CONFIG_HOME: kusabiOpencodeConfigHome(),
+    OPENCODE_CONFIG_DIR: opencodeModeDir(),
   };
   // The serve's own state dir is stamped as well, so a live process can be
   // attributed back to the state dir that should name it in server.json —

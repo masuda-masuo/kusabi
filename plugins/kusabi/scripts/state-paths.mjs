@@ -24,6 +24,13 @@ export function kusabiOpencodeConfigHome() {
   return path.join(stateRoot(), "opencode-config");
 }
 
+export function opencodeModeDir(mode = (process.env.KUSABI_OPENCODE_FREE_WORKER === "1" ? "free" : "default")) {
+  if (mode !== "free" && mode !== "default") {
+    throw new Error(`Unknown OpenCode mode: ${mode}`);
+  }
+  return path.join(stateRoot(), "opencode-mode", mode);
+}
+
 export function stateDirFor(cwd) {
   const hash = crypto.createHash("sha256").update(cwd).digest("hex").slice(0, 12);
   const dir = path.join(stateRoot(), hash);

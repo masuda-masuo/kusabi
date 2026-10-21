@@ -118,6 +118,7 @@ describe("cmdInstallAgents", () => {
       OPENCODE_AGENT_DIR: process.env.OPENCODE_AGENT_DIR,
       OPENCODE_SKILL_DIR: process.env.OPENCODE_SKILL_DIR,
       XDG_CONFIG_HOME: process.env.XDG_CONFIG_HOME,
+      KUSABI_OPENCODE_FREE_WORKER: process.env.KUSABI_OPENCODE_FREE_WORKER,
     };
     process.env.HOME = tmpHome;
     process.env.KUSABI_STATE_DIR = tmpStateDir;
@@ -125,6 +126,7 @@ describe("cmdInstallAgents", () => {
     delete process.env.OPENCODE_AGENT_DIR;
     delete process.env.OPENCODE_SKILL_DIR;
     delete process.env.XDG_CONFIG_HOME;
+    delete process.env.KUSABI_OPENCODE_FREE_WORKER;
   });
 
   afterEach(() => {
@@ -138,11 +140,33 @@ describe("cmdInstallAgents", () => {
   it("installs agents and skills under kusabi dir and seeds opencode.jsonc", () => {
     const msg = cmdInstallAgents();
     const kusabiConfigDir = path.join(tmpStateDir, "opencode-config", "opencode");
-    assert.ok(fs.existsSync(path.join(kusabiConfigDir, "agent", "kusabi-implement.md")), "agent installed in kusabi dir");
+    const modeAgentDir = path.join(tmpStateDir, "opencode-mode", "default", "agent");
+    assert.ok(fs.existsSync(path.join(modeAgentDir, "kusabi-implement.md")), "agent installed in default mode dir");
+    assert.ok(fs.existsSync(path.join(modeAgentDir, ".kusabi-install-profile.json")), "profile marker installed beside mode agents");
     assert.ok(fs.existsSync(path.join(kusabiConfigDir, "skills", "kusabi-rust-cross-target-checks", "SKILL.md")), "skill installed in kusabi dir");
     assert.ok(fs.existsSync(path.join(kusabiConfigDir, "opencode.jsonc")), "opencode.jsonc seeded in kusabi dir");
     assert.match(msg, /seeded .*opencode\.jsonc from template/);
     assert.ok(!fs.existsSync(path.join(tmpHome, ".config", "opencode", "agent", "kusabi-implement.md")), "nothing installed in personal dir");
+  });
+
+  it("installs default and free agents and markers into independent mode directories", () => {
+    const sharedConfigDir = path.join(tmpStateDir, "opencode-config", "opencode");
+    cmdInstallAgents();
+    const defaultDir = path.join(tmpStateDir, "opencode-mode", "default", "agent");
+    const defaultAgent = fs.readFileSync(path.join(defaultDir, "kusabi-implement.md"), "utf8");
+    const defaultMarker = fs.readFileSync(path.join(defaultDir, ".kusabi-install-profile.json"), "utf8");
+
+    process.env.KUSABI_OPENCODE_FREE_WORKER = "1";
+    cmdInstallAgents();
+    const freeDir = path.join(tmpStateDir, "opencode-mode", "free", "agent");
+    assert.ok(fs.existsSync(path.join(freeDir, "kusabi-implement.md")));
+    assert.ok(fs.existsSync(path.join(freeDir, ".kusabi-install-profile.json")));
+    assert.equal(fs.readFileSync(path.join(defaultDir, "kusabi-implement.md"), "utf8"), defaultAgent);
+    assert.equal(fs.readFileSync(path.join(defaultDir, ".kusabi-install-profile.json"), "utf8"), defaultMarker);
+    assert.equal(JSON.parse(defaultMarker).profile, "default");
+    assert.equal(JSON.parse(fs.readFileSync(path.join(freeDir, ".kusabi-install-profile.json"), "utf8")).profile, "free");
+    assert.ok(fs.existsSync(path.join(sharedConfigDir, "opencode.jsonc")), "config stays in shared XDG home");
+    assert.ok(!fs.existsSync(path.join(tmpStateDir, "opencode-mode", "free", "opencode.jsonc")), "no opencode config copied into mode dir");
   });
 
   it("keeps an edited opencode.jsonc on a second run without overwriting", () => {
@@ -179,7 +203,7 @@ describe("cmdInstallAgents", () => {
   });
 
   it("removes stale kusabi-draft.md, kusabi-salvage.md and kusabi-investigate.md from install target", () => {
-    const kusabiAgentDir = path.join(tmpStateDir, "opencode-config", "opencode", "agent");
+    const kusabiAgentDir = path.join(tmpStateDir, "opencode-mode", "default", "agent");
     fs.mkdirSync(kusabiAgentDir, { recursive: true });
     fs.writeFileSync(path.join(kusabiAgentDir, "kusabi-draft.md"), "stale draft");
     fs.writeFileSync(path.join(kusabiAgentDir, "kusabi-salvage.md"), "stale salvage");
