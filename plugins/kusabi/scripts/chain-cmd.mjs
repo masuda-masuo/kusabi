@@ -59,6 +59,7 @@ import { CLAUDE_DEFAULT_CHAIN } from "./claude-dispatch.mjs";
 import {
   assertInstalledAgentProfile,
   checkDefaultOpencodeVersion,
+  checkOpencodeVersion,
   isOpenCodeFreeWorkerEnabled,
   opencodeAgentDiscoveryDir,
 } from "./free-worker-profile.mjs";
@@ -178,7 +179,8 @@ function profileGuardFor(inject = {}) {
   const getAgentDir = inject.opencodeAgentDiscoveryDir ?? opencodeAgentDiscoveryDir;
   return () => {
     check(getAgentDir());
-    if (!isOpenCodeFreeWorkerEnabled()) versionCheck(opencodeBin());
+    if (isOpenCodeFreeWorkerEnabled()) checkOpencodeVersion(opencodeBin());
+    else versionCheck(opencodeBin());
   };
 }
 

@@ -25,7 +25,7 @@ import { runPrompt, warnFreeWorkerConfiguredRoute } from "./prompt-execution.mjs
 import { parseReviewResult } from "./chain-review.mjs";
 import { stateDirFor } from "./state-paths.mjs";
 import { patchEnv, writeExecutable } from "./fixtures.mjs";
-import {
+import { checkOpencodeVersion,
   OPENCODE_FREE_WORKER_CHAIN,
   OPENCODE_RECOGNIZED_FREE_MODELS,
   assertInstalledAgentProfile,
@@ -1506,9 +1506,17 @@ describe("default OpenCode version guard (kusabi #780)", () => {
       assert.equal(error.code, "KUSABI_OPENCODE_UNSUPPORTED_VERSION");
       assert.ok(error.message.includes(bin));
       assert.match(error.message, /OPENCODE_BIN/);
-      assert.match(error.message, />= 1\.19\.0/);
+      assert.doesNotMatch(error.message, />= 1\.19/);
       return true;
     });
+  });
+
+  it("checkOpencodeVersion errors carry KUSABI_OPENCODE_UNSUPPORTED_VERSION in free mode", () => {
+    const bin = makeBinary("v2-free", 'echo "opencode 2.0.32"');
+    assert.throws(
+      () => checkOpencodeVersion(bin),
+      (err) => err.code === "KUSABI_OPENCODE_UNSUPPORTED_VERSION" && /V2/.test(err.message)
+    );
   });
 
   it("accepts 1.19.0 without imposing a higher V1 minimum", () => {

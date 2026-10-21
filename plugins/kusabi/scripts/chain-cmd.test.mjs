@@ -7,6 +7,7 @@ import crypto from "node:crypto";
 import { sessionProvenanceRefusal, renderChainBanner, cmdChain, cmdChainResume, runChainLifecycle } from "./chain-cmd.mjs";
 import { resolveOrchestratorRecord } from "./companion-config.mjs";
 import { createChainDir } from "./chain-phases.mjs";
+import { patchEnv } from "./fixtures.mjs";
 
 // sessionProvenanceRefusal — the agy --session chain-start gate (kusabi #321)
 // ---------------------------------------------------------------------------
@@ -975,6 +976,49 @@ describe("chain profile guard (installed agent profile)", () => {
       assert.equal(control.errorReason, reason);
     } finally {
       f.cleanup();
+    }
+  });
+
+  it("free mode refuses a V2 binary at chain start when review uses opencode (kusabi #780)", async () => {
+    const f = fx();
+    const calls = [];
+    const stubDir = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-v2-stub-"));
+    const stub = path.join(stubDir, "opencode");
+    fs.writeFileSync(stub, "#!/bin/sh\necho 'opencode 2.0.32'\n", { mode: 0o755 });
+    let restore = null;
+    try {
+      fs.mkdirSync(process.env.KUSABI_STATE_DIR, { recursive: true });
+      fs.writeFileSync(path.join(process.env.KUSABI_STATE_DIR, "config.json"), JSON.stringify({
+        models: { chain: ["codex/gpt-6.1-sol", "opencode/test-model"] },
+      }));
+      restore = patchEnv({ KUSABI_OPENCODE_FREE_WORKER: "1", OPENCODE_BIN: stub });
+      let error;
+      try {
+        await runChainLifecycle(f.cwd, {
+          flags: { container: "cid-1", "chain-id": "chain-profile", "keepServe": true },
+          text: BRIEF,
+          orchestrator: resolveOrchestratorRecord(BRIEF),
+        }, {
+          inject: {
+            callTool: tools(),
+            dispatchWithFallback: dispatchCounter(calls),
+            reviewDispatchWithFallback: dispatchCounter(calls),
+            assertInstalledAgentProfile() {},
+            opencodeAgentDiscoveryDir: () => "/fake/agent",
+          },
+        });
+      } catch (err) { error = err; }
+      assert.equal(error?.code, "KUSABI_OPENCODE_UNSUPPORTED_VERSION");
+      assert.equal(calls.length, 0, "no phase may dispatch when the binary is V2");
+      const control = JSON.parse(fs.readFileSync(path.join(f.chainDir, "control.json"), "utf8"));
+      assert.equal(control.status, "failed");
+      assert.match(control.errorReason, /V2|2\.0\.32/);
+      const inbox = fs.readFileSync(path.join(f.chainDir, "..", "..", "inbox", "chain-profile.md"), "utf8");
+      assert.match(inbox, /reason/i);
+    } finally {
+      if (restore) restore();
+      f.cleanup();
+      fs.rmSync(stubDir, { recursive: true, force: true });
     }
   });
 

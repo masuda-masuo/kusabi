@@ -69,13 +69,15 @@ export function getReviewSchema() {
   return _cachedReviewSchema;
 }
 
+function unsupportedOpenCodeVersionError(message) {
+  return Object.assign(new Error(message), { code: "KUSABI_OPENCODE_UNSUPPORTED_VERSION" });
+}
+
 export function checkDefaultOpencodeVersion(bin = "opencode", timeoutMs = 5000) {
   const fail = (detail) => {
-    const error = new Error(
-      `OpenCode default mode requires a V1 binary (>= 1.19.0); "${bin}" ${detail}. Set OPENCODE_BIN to a V1 binary (>= 1.19.0).`
+    throw unsupportedOpenCodeVersionError(
+      `OpenCode default mode requires a V1 binary; "${bin}" ${detail}. Set OPENCODE_BIN to a V1 binary.`
     );
-    error.code = "KUSABI_OPENCODE_UNSUPPORTED_VERSION";
-    throw error;
   };
 
   let result;
@@ -106,19 +108,19 @@ export function checkOpencodeVersion(bin = "opencode", timeoutMs = 5000) {
       stdio: ["ignore", "pipe", "pipe"],
     });
   } catch (err) {
-    throw new Error(
+    throw unsupportedOpenCodeVersionError(
       `Failed to execute "${bin} --version": ${err.message}. OpenCode free worker profile requires OpenCode V1 (>= 1.19.3). Please verify your OpenCode installation.`
     );
   }
 
   if (result.error) {
-    throw new Error(
+    throw unsupportedOpenCodeVersionError(
       `Failed to execute "${bin} --version": ${result.error.message}. OpenCode free worker profile requires OpenCode V1 (>= 1.19.3). Please verify your OpenCode installation.`
     );
   }
 
   if (result.status !== 0) {
-    throw new Error(
+    throw unsupportedOpenCodeVersionError(
       `"${bin} --version" exited with code ${result.status}. OpenCode free worker profile requires OpenCode V1 (>= 1.19.3). Please verify your OpenCode installation.`
     );
   }
@@ -126,7 +128,7 @@ export function checkOpencodeVersion(bin = "opencode", timeoutMs = 5000) {
   const output = (result.stdout || "").trim();
   const match = output.match(/\b(\d+)\.(\d+)\.(\d+)\b/);
   if (!match) {
-    throw new Error(
+    throw unsupportedOpenCodeVersionError(
       `Unparseable OpenCode version output "${output}". OpenCode free worker profile requires OpenCode V1 (>= 1.19.3). Please verify your OpenCode installation.`
     );
   }
@@ -136,17 +138,17 @@ export function checkOpencodeVersion(bin = "opencode", timeoutMs = 5000) {
   const patch = Number(match[3]);
 
   if (major >= 2) {
-    throw new Error(
+    throw unsupportedOpenCodeVersionError(
       `OpenCode V2 (detected version ${output}) is not supported. OpenCode free worker profile requires stable OpenCode V1 (>= 1.19.3). Actionable: please switch to a supported OpenCode V1 release.`
     );
   }
   if (major < 1) {
-    throw new Error(
+    throw unsupportedOpenCodeVersionError(
       `OpenCode version ${output} is not supported. OpenCode free worker profile requires stable OpenCode V1 (>= 1.19.3).`
     );
   }
   if (minor < 19 || (minor === 19 && patch < 3)) {
-    throw new Error(
+    throw unsupportedOpenCodeVersionError(
       `Detected OpenCode version ${output}. Unsupported version: OpenCode free worker profile requires OpenCode V1 >= 1.19.3. Please upgrade OpenCode.`
     );
   }
