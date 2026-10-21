@@ -736,11 +736,12 @@ export async function runChainDriver({
   } catch (err) {
     // Exception thrown mid-round — record failure and rethrow
     const profileGuardFailure = err?.code === "KUSABI_AGENT_PROFILE_MISMATCH";
+    const unsupportedOpenCodeVersion = err?.code === "KUSABI_OPENCODE_UNSUPPORTED_VERSION";
     finalizeChainControl({
       chainDir,
       status: "failed",
       round: records.length,
-      ...(profileGuardFailure ? {
+      ...(profileGuardFailure || unsupportedOpenCodeVersion ? {
         errorReason: err.message,
         artifactsSurvive: survivingImplementArtifact !== null,
         artifactReference: survivingImplementArtifact,

@@ -522,6 +522,10 @@ import http from "node:http";
 import fs from "node:fs";
 
 const argv = process.argv.slice(2);
+if (argv[0] === "--version") {
+  process.stdout.write(process.env.FAKE_VERSION || "1.19.3\\n");
+  process.exit(Number(process.env.FAKE_VERSION_EXIT || 0));
+}
 const portIdx = argv.indexOf("--port");
 const port = Number(argv[portIdx + 1]);
 if (!port || Number.isNaN(port)) {
@@ -562,7 +566,7 @@ function spawnedPids(spawnLog) {
   return text.trim() ? text.trim().split("\n").map(Number) : [];
 }
 
-function fakeServeContext(mode) {
+function fakeServeContext(mode, version = "1.19.3") {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-serve-test-"));
   const binPath = path.join(tmp, "fake-serve.mjs");
   const spawnLog = path.join(tmp, "spawned.pids");
@@ -579,6 +583,7 @@ function fakeServeContext(mode) {
     KUSABI_STATE_DIR: stateRoot,
     KUSABI_SERVE_READY_TIMEOUT_MS: process.env.KUSABI_SERVE_READY_TIMEOUT_MS,
     FAKE_MODE: mode,
+    FAKE_VERSION: version,
     FAKE_SPAWN_PIDS: spawnLog,
   });
   const stateDir = stateDirFor(cwd); // hashes cwd under KUSABI_STATE_DIR
@@ -614,6 +619,36 @@ describe("ensureServer (fake serve, spawn-based)", () => {
     } finally {
       if (prev === undefined) delete process.env.KUSABI_SERVE_READY_TIMEOUT_MS;
       else process.env.KUSABI_SERVE_READY_TIMEOUT_MS = prev;
+    }
+  });
+
+  it("refuses a V2 binary before spawning the default serve", async () => {
+    const ctx = fakeServeContext("ready", "2.0.32");
+    try {
+      await assert.rejects(ensureServer(ctx.cwd), (error) => {
+        assert.equal(error.code, "KUSABI_OPENCODE_UNSUPPORTED_VERSION");
+        assert.ok(error.message.includes(path.join(ctx.tmp, "fake-serve.mjs")));
+        return true;
+      });
+      assert.deepEqual(spawnedPids(ctx.spawnLog), []);
+      assert.equal(fs.existsSync(ctx.serverFile), false);
+    } finally {
+      ctx.killAll();
+      ctx.restore();
+      ctx.rm();
+    }
+  });
+
+  it("accepts the default-mode 1.19.0 minimum", async () => {
+    const ctx = fakeServeContext("ready", "1.19.0");
+    try {
+      const server = await ensureServer(ctx.cwd);
+      assert.equal(server.profile, "default");
+      assert.equal(spawnedPids(ctx.spawnLog).length, 1);
+    } finally {
+      ctx.killAll();
+      ctx.restore();
+      ctx.rm();
     }
   });
 

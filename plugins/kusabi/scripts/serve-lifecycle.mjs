@@ -9,6 +9,7 @@ import { stateDirFor, readJson, writeJson, kusabiOpencodeConfigHome, opencodeMod
 import {
   isOpenCodeFreeWorkerEnabled,
   checkOpencodeVersion,
+  checkDefaultOpencodeVersion,
   checkServerProfileCompatibility,
   assertInstalledAgentProfile,
   opencodeAgentDiscoveryDir,
@@ -204,8 +205,11 @@ function lockIsStale(lockDir, timeoutMs) {
 // lock afterwards); on any failure the spawned child is killed before the
 // error propagates, so a live serve is never left unrecorded.
 async function startServer({ stateDir, serverFile, cwd, timeoutMs, now = () => performance.now() }) {
+  // Default-profile refusals carry KUSABI_OPENCODE_UNSUPPORTED_VERSION.
   if (isOpenCodeFreeWorkerEnabled()) {
     checkOpencodeVersion(opencodeBin());
+  } else {
+    checkDefaultOpencodeVersion(opencodeBin());
   }
 
   const port = await freePort();

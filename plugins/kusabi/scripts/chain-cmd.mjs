@@ -56,7 +56,13 @@ import {
 } from "./chain-control.mjs";
 import { resolveModelBackend, chainNamesBackend, BUILTIN_DEFAULT_CHAIN } from "./cli.mjs";
 import { CLAUDE_DEFAULT_CHAIN } from "./claude-dispatch.mjs";
-import { assertInstalledAgentProfile, opencodeAgentDiscoveryDir } from "./free-worker-profile.mjs";
+import {
+  assertInstalledAgentProfile,
+  checkDefaultOpencodeVersion,
+  isOpenCodeFreeWorkerEnabled,
+  opencodeAgentDiscoveryDir,
+} from "./free-worker-profile.mjs";
+import { opencodeBin } from "./serve-lifecycle.mjs";
 import { AGY_DEFAULT_CHAIN } from "./agy-dispatch.mjs";
 import { CODEX_DEFAULT_CHAIN } from "./codex-dispatch.mjs";
 
@@ -168,8 +174,12 @@ function hasOpenCodeCandidate(dispatch) {
 
 function profileGuardFor(inject = {}) {
   const check = inject.assertInstalledAgentProfile ?? assertInstalledAgentProfile;
+  const versionCheck = inject.checkDefaultOpencodeVersion ?? checkDefaultOpencodeVersion;
   const getAgentDir = inject.opencodeAgentDiscoveryDir ?? opencodeAgentDiscoveryDir;
-  return () => check(getAgentDir());
+  return () => {
+    check(getAgentDir());
+    if (!isOpenCodeFreeWorkerEnabled()) versionCheck(opencodeBin());
+  };
 }
 
 export async function cmdChain(cwd, { flags, text }, opts = {}) {

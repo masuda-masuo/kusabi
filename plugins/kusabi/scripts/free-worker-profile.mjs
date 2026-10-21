@@ -69,6 +69,34 @@ export function getReviewSchema() {
   return _cachedReviewSchema;
 }
 
+export function checkDefaultOpencodeVersion(bin = "opencode", timeoutMs = 5000) {
+  const fail = (detail) => {
+    const error = new Error(
+      `OpenCode default mode requires a V1 binary (>= 1.19.0); "${bin}" ${detail}. Set OPENCODE_BIN to a V1 binary (>= 1.19.0).`
+    );
+    error.code = "KUSABI_OPENCODE_UNSUPPORTED_VERSION";
+    throw error;
+  };
+
+  let result;
+  try {
+    result = spawnSync(bin, ["--version"], { encoding: "utf8", timeout: timeoutMs, stdio: ["ignore", "pipe", "pipe"] });
+  } catch (err) {
+    fail(`could not be executed: ${err.message}`);
+  }
+
+  if (result.error) fail(`could not be executed: ${result.error.message}`);
+  if (result.status !== 0) fail(`exited with code ${result.status}`);
+
+  const output = (result.stdout || "").trim();
+  const match = output.match(/\b(\d+)\.(\d+)\.(\d+)\b/);
+  if (!match) fail(`printed no parseable version (output: "${output}")`);
+
+  const major = Number(match[1]);
+  if (major >= 2) fail(`reported unsupported version ${match[0]}`);
+  return { version: match[0], major };
+}
+
 export function checkOpencodeVersion(bin = "opencode", timeoutMs = 5000) {
   let result;
   try {

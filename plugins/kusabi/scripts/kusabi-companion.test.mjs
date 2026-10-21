@@ -609,6 +609,7 @@ describe("resolveOrchestratorRecord (kusabi #227)", () => {
           dispatchWithFallback: makeFakeDispatch(),
           reviewDispatchWithFallback: makeFakeDispatch(),
           reworkDispatchWithFallback: makeFakeDispatch(),
+          checkDefaultOpencodeVersion() {},
         },
       };
     }
@@ -1149,7 +1150,9 @@ describe("chain publish-demand warning", () => {
       const env = { ...process.env };
       delete env.KUSABI_WORKER_CONTEXT;
       env.KUSABI_STATE_DIR = path.join(tmpDir, "state");
-      env.OPENCODE_BIN = path.join(tmpDir, "no-such-opencode-bin");
+      env.OPENCODE_BIN = path.join(tmpDir, "fake-opencode-v1");
+      fs.writeFileSync(env.OPENCODE_BIN, ["#!/bin/sh", "echo 'opencode 1.19.0'"].join(String.fromCharCode(10)), "utf8");
+      fs.chmodSync(env.OPENCODE_BIN, 0o755);
       const result = spawnSync(
         process.execPath,
         [COMPANION_SCRIPT, "chain", "--container", "fake-cid", "## PUBLISH (mandatory)\n\nImplement it."],
@@ -1171,7 +1174,9 @@ describe("chain publish-demand warning", () => {
       const env = { ...process.env };
       delete env.KUSABI_WORKER_CONTEXT;
       env.KUSABI_STATE_DIR = path.join(tmpDir, "state");
-      env.OPENCODE_BIN = path.join(tmpDir, "no-such-opencode-bin");
+      env.OPENCODE_BIN = path.join(tmpDir, "fake-opencode-v1");
+      fs.writeFileSync(env.OPENCODE_BIN, ["#!/bin/sh", "echo 'opencode 1.19.0'"].join(String.fromCharCode(10)), "utf8");
+      fs.chmodSync(env.OPENCODE_BIN, 0o755);
       const result = spawnSync(
         process.execPath,
         [COMPANION_SCRIPT, "chain", "--container", "fake-cid", "Implement it and verify."],
@@ -1558,6 +1563,11 @@ describe("chain-resume CLI", () => {
     delete env.KUSABI_WORKER_CONTEXT;
     env.KUSABI_STATE_DIR = stateDir;
     env.KUSABI_SUNABA_URL = extraEnv?.KUSABI_SUNABA_URL ?? "http://127.0.0.1:9/mcp";
+    const versionBin = path.join(stateDir, "fake-opencode-v1");
+    fs.mkdirSync(stateDir, { recursive: true });
+    fs.writeFileSync(versionBin, ["#!/bin/sh", "echo 'opencode 1.19.0'"].join(String.fromCharCode(10)), "utf8");
+    fs.chmodSync(versionBin, 0o755);
+    env.OPENCODE_BIN = versionBin;
     return env;
   }
 
@@ -4610,7 +4620,9 @@ describe("brief lint and container delivery (kusabi #289)", () => {
       delete env.KUSABI_WORKER_CONTEXT;
       env.KUSABI_STATE_DIR = path.join(tmp, "state");
       env.KUSABI_SUNABA_URL = "http://127.0.0.1:9/mcp";
-      env.OPENCODE_BIN = path.join(tmp, "no-such-opencode-bin");
+      env.OPENCODE_BIN = path.join(tmp, "fake-opencode-v1");
+      fs.writeFileSync(env.OPENCODE_BIN, ["#!/bin/sh", "echo 'opencode 1.19.0'"].join(String.fromCharCode(10)), "utf8");
+      fs.chmodSync(env.OPENCODE_BIN, 0o755);
       return spawnSync(process.execPath, [COMPANION_SCRIPT, ...args], {
         encoding: "utf8", cwd: tmp, env, timeout: 20_000,
       });

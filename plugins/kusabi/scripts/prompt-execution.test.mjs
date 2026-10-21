@@ -1512,6 +1512,7 @@ import http from "node:http";
 import fs from "node:fs";
 
 const argv = process.argv.slice(2);
+if (argv[0] === "--version") { process.stdout.write("1.19.3"); process.exit(0); }
 const port = Number(argv[argv.indexOf("--port") + 1]);
 const sessions = [];
 let nextSession = 0;
@@ -2054,6 +2055,7 @@ import http from "node:http";
 import fs from "node:fs";
 
 const argv = process.argv.slice(2);
+if (argv[0] === "--version") { process.stdout.write("1.19.3"); process.exit(0); }
 const port = Number(argv[argv.indexOf("--port") + 1]);
 let nextSession = 0;
 const log = process.env.KUSABI_TEST_LOG;
@@ -2529,6 +2531,7 @@ import http from "node:http";
 import fs from "node:fs";
 
 const argv = process.argv.slice(2);
+if (argv[0] === "--version") { process.stdout.write("1.19.3"); process.exit(0); }
 const port = Number(argv[argv.indexOf("--port") + 1]);
 let nextSession = 0;
 const log = process.env.KUSABI_TEST_LOG;
@@ -3011,6 +3014,7 @@ import http from "node:http";
 import fs from "node:fs";
 
 const argv = process.argv.slice(2);
+if (argv[0] === "--version") { process.stdout.write("1.19.3"); process.exit(0); }
 const port = Number(argv[argv.indexOf("--port") + 1]);
 let nextSession = 0;
 const EMIT_INITIAL = ${JSON.stringify(emitInitial)};
@@ -3334,6 +3338,7 @@ import http from "node:http";
 import fs from "node:fs";
 
 const argv = process.argv.slice(2);
+if (argv[0] === "--version") { process.stdout.write("1.19.3"); process.exit(0); }
 if (argv.includes("--version")) {
   process.stdout.write("1.19.3\\n");
   process.exit(0);
