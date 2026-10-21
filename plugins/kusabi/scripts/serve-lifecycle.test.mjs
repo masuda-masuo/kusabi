@@ -76,11 +76,33 @@ describe("buildServeEnv", () => {
     try {
       const env = buildServeEnv({}, "pw");
       assert.equal(env.XDG_CONFIG_HOME, "/tmp/test-ks-state/opencode-config");
+      assert.equal(env.OPENCODE_CONFIG_DIR, "/tmp/test-ks-state/opencode-mode/default");
     } finally {
       if (origStateDir !== undefined) process.env.KUSABI_STATE_DIR = origStateDir;
       else delete process.env.KUSABI_STATE_DIR;
       if (origConfigHome !== undefined) process.env.KUSABI_OPENCODE_CONFIG_HOME = origConfigHome;
       else delete process.env.KUSABI_OPENCODE_CONFIG_HOME;
+    }
+  });
+
+  it("sets OPENCODE_CONFIG_DIR for the active free serve while retaining shared XDG_CONFIG_HOME", () => {
+    const origStateDir = process.env.KUSABI_STATE_DIR;
+    const origConfigHome = process.env.KUSABI_OPENCODE_CONFIG_HOME;
+    const origFree = process.env.KUSABI_OPENCODE_FREE_WORKER;
+    process.env.KUSABI_STATE_DIR = "/tmp/test-ks-state";
+    process.env.KUSABI_OPENCODE_CONFIG_HOME = "/tmp/shared-config";
+    process.env.KUSABI_OPENCODE_FREE_WORKER = "1";
+    try {
+      const env = buildServeEnv({}, "pw");
+      assert.equal(env.OPENCODE_CONFIG_DIR, "/tmp/test-ks-state/opencode-mode/free");
+      assert.equal(env.XDG_CONFIG_HOME, "/tmp/shared-config");
+    } finally {
+      if (origStateDir !== undefined) process.env.KUSABI_STATE_DIR = origStateDir;
+      else delete process.env.KUSABI_STATE_DIR;
+      if (origConfigHome !== undefined) process.env.KUSABI_OPENCODE_CONFIG_HOME = origConfigHome;
+      else delete process.env.KUSABI_OPENCODE_CONFIG_HOME;
+      if (origFree !== undefined) process.env.KUSABI_OPENCODE_FREE_WORKER = origFree;
+      else delete process.env.KUSABI_OPENCODE_FREE_WORKER;
     }
   });
 

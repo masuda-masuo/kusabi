@@ -2841,9 +2841,10 @@ describe("install-agents skills distribution", () => {
       });
       assert.equal(result.status, 0, result.stderr);
       const kusabiOpencodeDir = path.join(tmpState, "opencode-config", "opencode");
+      const defaultAgentDir = path.join(tmpState, "opencode-mode", "default", "agent");
       assert.ok(
-        fs.existsSync(path.join(kusabiOpencodeDir, "agent", "kusabi-implement.md")),
-        "agents land under <state root>/opencode-config/opencode/agent",
+        fs.existsSync(path.join(defaultAgentDir, "kusabi-implement.md")),
+        "agents land under <state root>/opencode-mode/default/agent",
       );
       for (const d of fs.readdirSync(SKILLS_SRC, { withFileTypes: true }).filter((e) => e.isDirectory())) {
         assert.ok(

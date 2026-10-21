@@ -834,8 +834,8 @@ describe("PR755: installed agent profile isolation", () => {
     try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch { /* best effort */ }
   });
 
-  function discoveryDir() {
-    return path.join(tmpDir, "config", "opencode", "agent");
+  function discoveryDir(mode = process.env.KUSABI_OPENCODE_FREE_WORKER === "1" ? "free" : "default") {
+    return path.join(tmpDir, "state", "opencode-mode", mode, "agent");
   }
 
   function writeAgent(name, content) {
@@ -855,20 +855,15 @@ describe("PR755: installed agent profile isolation", () => {
     cmdInstallAgents();
     assert.equal(detectInstalledAgentProfile(discoveryDir()), "free");
 
-    // Flip to standard mode WITHOUT reinstalling.
+    // The free directory still fails its original mismatch check when judged as default.
+    assert.throws(
+      () => assertInstalledAgentProfile(discoveryDir("free"), false),
+      /reinstall/i
+    );
+    // The default serve checks its own directory and is not affected by free agents.
     const restoreFlip = patchEnv({ KUSABI_OPENCODE_FREE_WORKER: undefined });
     try {
-      const cwd = path.join(tmpDir, "cwd");
-      fs.mkdirSync(cwd, { recursive: true });
-      await assert.rejects(
-        ensureServer(cwd),
-        /reinstall|Installed phase agents/i,
-        "opt-out dispatch must reject a free-installed agent directory"
-      );
-      assert.throws(
-        () => assertInstalledAgentProfile(discoveryDir(), false),
-        /reinstall/i
-      );
+      assert.doesNotThrow(() => assertInstalledAgentProfile(discoveryDir(), false));
     } finally {
       restoreFlip();
     }
@@ -886,12 +881,43 @@ describe("PR755: installed agent profile isolation", () => {
     const restoreFlip = patchEnv({ KUSABI_OPENCODE_FREE_WORKER: "1" });
     try {
       assert.throws(
-        () => assertInstalledAgentProfile(discoveryDir(), true),
+        () => assertInstalledAgentProfile(discoveryDir("default"), true),
         /reinstall/i
       );
     } finally {
       restoreFlip();
     }
+  });
+
+  it("serve refuses to start while kusabi agents remain in the shared directory", async () => {
+    restoreEnv = patchEnv({
+      KUSABI_OPENCODE_FREE_WORKER: undefined,
+      KUSABI_OPENCODE_CONFIG_HOME: path.join(tmpDir, "config"),
+      KUSABI_STATE_DIR: path.join(tmpDir, "state"),
+    });
+    const shared = path.join(tmpDir, "config", "opencode", "agent");
+    fs.mkdirSync(shared, { recursive: true });
+    fs.writeFileSync(path.join(shared, "kusabi-review.md"), defaultTemplate, "utf8");
+    const cwd = path.join(tmpDir, "cwd");
+    fs.mkdirSync(cwd, { recursive: true });
+    await assert.rejects(
+      ensureServer(cwd),
+      (err) => err.code === "KUSABI_AGENT_PROFILE_MISMATCH" && /shared agent directory/.test(err.message)
+    );
+  });
+
+  it("a dangling kusabi-*.md symlink in the shared directory still counts as residue", () => {
+    const shared = path.join(tmpDir, "config", "opencode", "agent");
+    fs.mkdirSync(shared, { recursive: true });
+    fs.symlinkSync(path.join(tmpDir, "missing-target"), path.join(shared, "kusabi-old.md"));
+    restoreEnv = patchEnv({
+      KUSABI_OPENCODE_CONFIG_HOME: path.join(tmpDir, "config"),
+      KUSABI_STATE_DIR: path.join(tmpDir, "state"),
+    });
+    assert.throws(
+      () => assertInstalledAgentProfile(path.join(tmpDir, "config", "opencode", "agent-mode-missing"), false),
+      (err) => err.code === "KUSABI_AGENT_PROFILE_MISMATCH"
+    );
   });
 
   it("never silently trusts free-installed files that lack metadata", () => {
@@ -940,6 +966,52 @@ describe("PR755: installed agent profile isolation", () => {
   it("treats a directory with no kusabi agents as absent (no-op)", () => {
     assert.equal(detectInstalledAgentProfile(discoveryDir()), "absent");
     assert.equal(assertInstalledAgentProfile(discoveryDir(), true), "absent");
+  });
+
+  it("refuses shared kusabi residue but permits user-named agents", () => {
+    restoreEnv = patchEnv({
+      KUSABI_STATE_DIR: path.join(tmpDir, "state"),
+      KUSABI_OPENCODE_CONFIG_HOME: path.join(tmpDir, "shared-config"),
+      KUSABI_OPENCODE_FREE_WORKER: undefined,
+    });
+    const sharedAgentDir = path.join(tmpDir, "shared-config", "opencode", "agent");
+    fs.mkdirSync(sharedAgentDir, { recursive: true });
+    fs.writeFileSync(path.join(sharedAgentDir, "kusabi-old.md"), "legacy residue\n");
+    assert.throws(
+      () => assertInstalledAgentProfile(discoveryDir(), false),
+      (err) => err instanceof Error
+        && err.code === "KUSABI_AGENT_PROFILE_MISMATCH"
+        && /shared agent directory .* still holds kusabi agents/i.test(err.message)
+        && /migration steps.*plugins\/kusabi\/README\.md/i.test(err.message),
+    );
+    fs.rmSync(path.join(sharedAgentDir, "kusabi-old.md"));
+    fs.writeFileSync(path.join(sharedAgentDir, "operator-review.md"), "user agent\n");
+    assert.doesNotThrow(() => assertInstalledAgentProfile(discoveryDir(), false));
+  });
+
+  it("reproduces #777: each mode accepts its own install after the other mode is installed", () => {
+    restoreEnv = patchEnv({
+      KUSABI_STATE_DIR: path.join(tmpDir, "state"),
+      KUSABI_OPENCODE_CONFIG_HOME: path.join(tmpDir, "shared-config"),
+      KUSABI_OPENCODE_FREE_WORKER: "1",
+    });
+    cmdInstallAgents();
+    assert.equal(detectInstalledAgentProfile(discoveryDir("free")), "free");
+    assert.doesNotThrow(() => assertInstalledAgentProfile(discoveryDir("default"), false));
+
+    const flipToDefault = patchEnv({ KUSABI_OPENCODE_FREE_WORKER: undefined });
+    try {
+      cmdInstallAgents();
+      assert.equal(detectInstalledAgentProfile(discoveryDir("default")), "default");
+      const flipToFree = patchEnv({ KUSABI_OPENCODE_FREE_WORKER: "1" });
+      try {
+        assert.doesNotThrow(() => assertInstalledAgentProfile(discoveryDir("free"), true));
+      } finally {
+        flipToFree();
+      }
+    } finally {
+      flipToDefault();
+    }
   });
 
   it("classifies installed agent content structurally", () => {

@@ -16,7 +16,7 @@ import path from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
 
-import { kusabiOpencodeConfigHome } from "./state-paths.mjs";
+import { kusabiOpencodeConfigHome, opencodeModeDir } from "./state-paths.mjs";
 import {
   isOpenCodeFreeWorkerEnabled,
   prepareAgentInstall,
@@ -78,7 +78,7 @@ function destDirState(p) {
 export function cmdInstallAgents({ sourceDir, skillSourceDir } = {}) {
   const kusabiConfigDir = path.join(kusabiOpencodeConfigHome(), "opencode");
   const src = sourceDir || path.join(PLUGIN_ROOT, "opencode-agents");
-  const dest = process.env.OPENCODE_AGENT_DIR || path.join(kusabiConfigDir, "agent");
+  const dest = process.env.OPENCODE_AGENT_DIR || path.join(opencodeModeDir(), "agent");
 
   // Skills destination preflight — runs BEFORE any mutation, so a broken
   // skills destination fails the whole command cleanly instead of leaving
@@ -144,13 +144,10 @@ export function cmdInstallAgents({ sourceDir, skillSourceDir } = {}) {
   // explicit list of legacy oc-* names — no such list exists for skills.)
   // Do not "clean this up" into a prune step.
   //
-  // Note on OPENCODE_SKILL_DIR (and OPENCODE_AGENT_DIR, same status): these
-  // are PLACEMENT overrides honoured by install-agents; opencode 1.18.15 does
-  // not read either env var — it discovers skills/agents under its own config
-  // dir. The default destination therefore has to be that dir, which is why it
-  // is derived from kusabiOpencodeConfigHome() rather than hardcoding ~/.config.
-  // Setting OPENCODE_SKILL_DIR to anything else lands outside opencode's scan
-  // and must not be reported as discovered.
+  // Skills stay under the shared XDG config home. OPENCODE_SKILL_DIR remains a
+  // placement override, while agent files use the mode config directory that
+  // buildServeEnv exposes as OPENCODE_CONFIG_DIR. OPENCODE_AGENT_DIR remains
+  // an explicit placement override for callers that need a custom destination.
   fs.mkdirSync(skillDest, { recursive: true });
 
   const skillDirs = fs.existsSync(skillSrc)

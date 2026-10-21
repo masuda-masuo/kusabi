@@ -5,7 +5,7 @@ import path from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
 
-import { kusabiOpencodeConfigHome } from "./state-paths.mjs";
+import { kusabiOpencodeConfigHome, opencodeModeDir } from "./state-paths.mjs";
 import { analyzeAgentFrontmatter } from "./free-worker-yaml.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -52,14 +52,13 @@ export function isReviewIntent({ phase, kind, agent } = {}) {
 }
 
 /**
- * The directory OpenCode itself discovers agents from for a serve spawned by
- * kusabi: `$XDG_CONFIG_HOME/opencode/agent`, with XDG_CONFIG_HOME pinned to
- * kusabiOpencodeConfigHome() by buildServeEnv().  OPENCODE_AGENT_DIR is a
- * PLACEMENT override honoured by install-agents only — OpenCode does not
+ * The directory OpenCode discovers agents from for the matching kusabi serve:
+ * it is the OPENCODE_CONFIG_DIR of that serve. OPENCODE_AGENT_DIR is a
+ * placement override honoured by install-agents only — OpenCode does not
  * read it — so it must never be mistaken for the discovery root here.
  */
-export function opencodeAgentDiscoveryDir() {
-  return path.join(kusabiOpencodeConfigHome(), "opencode", "agent");
+export function opencodeAgentDiscoveryDir(mode) {
+  return path.join(opencodeModeDir(mode), "agent");
 }
 
 let _cachedReviewSchema = null;
@@ -270,6 +269,26 @@ export function detectInstalledAgentProfile(agentDir) {
  *  - only an "absent" tree is a no-op in both modes.
  */
 export function assertInstalledAgentProfile(agentDir, optIn = isOpenCodeFreeWorkerEnabled()) {
+  const sharedAgentDir = path.join(kusabiOpencodeConfigHome(), "opencode", "agent");
+  let sharedEntries = [];
+  try {
+    sharedEntries = fs.readdirSync(sharedAgentDir);
+  } catch (err) {
+    // A missing shared directory holds no residue; any other read failure
+    // must not be taken as "no residue" (fail closed).
+    if (err?.code !== "ENOENT") {
+      throw Object.assign(new Error(
+        `Cannot read the shared agent directory ${sharedAgentDir} (${err.code || err.message}); its kusabi agents cannot be ruled out.`,
+      ), { code: "KUSABI_AGENT_PROFILE_MISMATCH" });
+    }
+  }
+  // Name-based on purpose: a dangling symlink named kusabi-*.md still counts.
+  const sharedKusabiAgents = sharedEntries.filter((name) => name.startsWith("kusabi-") && name.endsWith(".md"));
+  if (sharedKusabiAgents.length > 0) {
+    throw Object.assign(new Error(
+      `The shared agent directory ${sharedAgentDir} still holds kusabi agents. Follow the migration steps under install-agents in plugins/kusabi/README.md before dispatching.`,
+    ), { code: "KUSABI_AGENT_PROFILE_MISMATCH" });
+  }
   const detected = detectInstalledAgentProfile(agentDir);
   if (detected === "absent") return detected;
   if (detected === "unknown") {
