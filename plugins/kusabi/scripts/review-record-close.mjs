@@ -11,7 +11,7 @@ const FINDINGS_HEADER_PATTERN = /^[ \t]*## Findings adjudication \(fill at inspe
 export const HISTORICAL_MARK_PREFIX = "<!-- historical: not adjudicated; closed by review-record-close before ";
 export const USAGE = "Usage: kusabi-companion review-record-close --historical --before <ISO> [--apply] [--state-root <dir>]";
 
-function finishedTimestamp(content) {
+export function finishedTimestamp(content) {
   for (const line of content.split(/\r?\n/)) {
     const match = line.match(/\bfinished:\s*(\S+)/i);
     if (!match) continue;
@@ -23,7 +23,7 @@ function finishedTimestamp(content) {
   return null;
 }
 
-function hasHistoricalMark(content) {
+export function hasHistoricalMark(content) {
   let inFindings = false;
   for (const line of content.split(/\r?\n/)) {
     if (/^\s*#+\s+/.test(line)) {
@@ -38,7 +38,7 @@ function hasHistoricalMark(content) {
   return false;
 }
 
-function listRecords(root) {
+export function listRecords(root) {
   const records = [];
   let workspaces;
   try {
@@ -68,7 +68,7 @@ function listRecords(root) {
   return records.sort();
 }
 
-function validateBefore(before) {
+export function validateBefore(before) {
   if (typeof before !== "string" || !Number.isFinite(Date.parse(before))) {
     throw new Error(`--before must be a parseable date: ${before}`);
   }
