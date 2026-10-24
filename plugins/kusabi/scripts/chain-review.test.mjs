@@ -2173,9 +2173,13 @@ describe("runReviewPhase quote accuracy check", () => {
   });
 
   it("surfaces awk stderr when awk execution fails", async () => {
-    const filename = "test-unreadable-file.txt";
-    fs.writeFileSync(filename, "line 1\n");
-    fs.chmodSync(filename, 0o000);
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-awk-"));
+    const fakeBinDir = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-awk-bin-"));
+    const filename = "test-target.txt";
+    fs.writeFileSync(path.join(dir, filename), "line 1\n");
+    const fakeAwk = path.join(fakeBinDir, "awk");
+    fs.writeFileSync(fakeAwk, "#!/bin/sh\necho \"fake awk: cannot open input\" >&2\nexit 1\n", { mode: 0o755 });
+    fs.chmodSync(fakeAwk, 0o755);
     const roundRecord = { round: 1 };
 
     try {
@@ -2185,7 +2189,11 @@ describe("runReviewPhase quote accuracy check", () => {
           if (tool === "sandbox_exec") {
             const cmd = params?.commands?.[0];
             if (cmd && cmd.includes("od -An -tu1")) {
-              const res = child_process.spawnSync("sh", ["-c", cmd], { encoding: "utf8" });
+              const res = child_process.spawnSync("sh", ["-c", cmd], {
+                cwd: dir,
+                encoding: "utf8",
+                env: { ...process.env, PATH: fakeBinDir + ":" + process.env.PATH },
+              });
               return {
                 output: res.stdout,
                 stderr: res.stderr,
@@ -2203,11 +2211,11 @@ describe("runReviewPhase quote accuracy check", () => {
       });
 
       assert.equal(Object.hasOwn(roundRecord, "quoteCheck"), false);
-      assert.ok(typeof roundRecord.quoteCheckReason === "string");
-      assert.match(roundRecord.quoteCheckReason, /Permission denied|cannot open/i);
+      assert.match(roundRecord.quoteCheckReason, /fake awk: cannot open input/);
+      assert.equal(roundRecord.verdict, "approve");
     } finally {
-      fs.chmodSync(filename, 0o644);
-      fs.unlinkSync(filename);
+      fs.rmSync(dir, { recursive: true, force: true });
+      fs.rmSync(fakeBinDir, { recursive: true, force: true });
     }
   });
 
