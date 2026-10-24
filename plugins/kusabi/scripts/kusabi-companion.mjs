@@ -56,6 +56,7 @@ import { chainIdForJob, collectChainStatuses } from "./chain-control.mjs";
 import { jobDir, loadJob, listJobs, latestJob } from "./job-store.mjs";
 import { opencodeBin, ensureServer, reapIdleServes, reapOrphanedServes } from "./serve-lifecycle.mjs";
 import { renderJobProgress } from "./kaiba-progress-watch.mjs";
+import { cmdReviewRecordList } from "./review-record-list.mjs";
 import { cmdReviewRecordClose } from "./review-record-close.mjs";
 import { cmdReviewRecordAdjudicate } from "./review-record-adjudicate.mjs";
 import { cmdReviewRecordArchive } from "./review-record-archive.mjs";
@@ -241,6 +242,7 @@ function usage() {
     "  chain-show Print a compact plain-text digest of a chain (read-only, no LLM)",
     "  chain-wait Block until a chain reaches a terminal state, print a one-line digest, exit 0 (read-only, no LLM, no serve; safe to SIGTERM at any moment). Non-zero means the WAIT itself failed — a chain that never appeared (or a malformed id), nothing appeared under --next, or the chain stalled — never a disposition you dislike",
     "  chain-stats Aggregate every chain record and print a summary (read-only, no LLM)",
+    "  review-record-list List review records (unadjudicated by default, --all for every record; read-only)",
     "  review-record-close Mark old unfilled review records as historical (dry-run unless --apply)",
     "  review-record-adjudicate <chainId> --row <n> --verdict accept|reject|open-unverified --reason <text> [--evidence <text>] [--force] [--state-root <dir>] OR --precedent <text> [--force] [--state-root <dir>]",
     "  review-record-archive <chainId> --kairanban <path> [--force] [--state-root <dir>]",
@@ -358,6 +360,9 @@ async function main() {
     return usage();
   }
 
+  if (subcommand === "review-record-list") {
+    return cmdReviewRecordList(flat);
+  }
   if (subcommand === "review-record-close") {
     return cmdReviewRecordClose(flat);
   }
