@@ -20,7 +20,7 @@
 //     errors/warnings of any kind;
 //   * `permission:` must be an ordered mapping whose FIRST rule is
 //     `"*": deny` and which contains only the constrained rules
-//     (`read: ask`, `bash: deny`, `StructuredOutput: allow` for review),
+//     (`read: allow`, `bash: deny`, `StructuredOutput: allow` for review),
 //     vetted anchored `sunaba_*`/`kaiba_*`/`shiori_*` tool grants, the
 //     `shiori*` family glob, and the nested `skill:` map of `kusabi-*`
 //     grants.  Anything else (host builtin, broad glob, extra wildcard,
@@ -66,9 +66,14 @@ export function extractFrontmatter(content) {
 }
 
 export const OPT_IN_CONSTRAINED_RULES = Object.freeze({
-  read: "ask",
+  read: "allow",
   bash: "deny",
   StructuredOutput: "allow",
+});
+
+// Legacy accepted values for installed agents (deprecated, tolerated during migration)
+export const OPT_IN_LEGACY_CONSTRAINED_RULES = Object.freeze({
+  read: "ask",
 });
 
 // Anchored, unambiguous vetted tool-namespace families for this opt-in
@@ -217,11 +222,13 @@ export function validatePermissionMapping(permissionMap, yamlText = "") {
         };
       }
       const expected = OPT_IN_CONSTRAINED_RULES[key];
-      if (pair.value.value !== expected) {
+      const val = pair.value.value;
+      const isLegacy = hasOwn(OPT_IN_LEGACY_CONSTRAINED_RULES, key) && val === OPT_IN_LEGACY_CONSTRAINED_RULES[key];
+      if (val !== expected && !isLegacy) {
         return {
           ok: false,
           error:
-            `permission rule "${key}" must be "${expected}", found "${pair.value.value}" — ` +
+            `permission rule "${key}" must be "${expected}", found "${val}" — ` +
             `refusing to silently normalize a broader privilege${atPosition(yamlText, pair)}`,
           rules,
         };

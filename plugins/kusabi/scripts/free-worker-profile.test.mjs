@@ -37,6 +37,7 @@ import { checkOpencodeVersion,
   prepareAgentInstall,
   transformAgentForOptIn,
   writeInstalledAgentProfile,
+  _resetLegacyAskWarnedForTesting,
 } from "./free-worker-profile.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -488,8 +489,8 @@ describe("Agenda2001 opt-in OpenCode free worker profile: acceptance tests", () 
         assert.equal(entries[0][0], "*", `${file} must have '*' as first entry`);
         assert.equal(entries[0][1], "deny", `${file} must have '*: deny' as first entry`);
 
-        // 2. read: ask added (after *:deny)
-        assert.equal(parsed.permission["read"], "ask", `${file} must have read: ask`);
+        // 2. read: allow added (after *:deny)
+        assert.equal(parsed.permission["read"], "allow", `${file} must have read: allow`);
 
         // 3. bash: deny added
         assert.equal(parsed.permission["bash"], "deny", `${file} must have bash: deny`);
@@ -1067,14 +1068,14 @@ describe("PR755 follow-up: constrained permission rules are fail-closed", () => 
     assert.throws(
       () =>
         transformAgentForOptIn(
-          "---\nname: kusabi-implement\npermission:\n  \"*\": deny\n  read: allow\n  bash: allow\n---\nbody\n"
+          "---\nname: kusabi-implement\npermission:\n  \"*\": deny\n  read: deny\n  bash: allow\n---\nbody\n"
         ),
-      /read.*must be "ask"/i
+      /read.*must be "allow"/i
     );
     assert.throws(
       () =>
         transformAgentForOptIn(
-          "---\nname: kusabi-implement\npermission:\n  \"*\": deny\n  read: ask\n  bash: allow\n---\nbody\n"
+          "---\nname: kusabi-implement\npermission:\n  \"*\": deny\n  read: allow\n  bash: allow\n---\nbody\n"
         ),
       /bash.*must be "deny"/i
     );
@@ -1118,22 +1119,22 @@ describe("PR755 follow-up: constrained permission rules are fail-closed", () => 
     assert.throws(
       () =>
         transformAgentForOptIn(
-          "---\nname: kusabi-implement\npermission:\n  \"*\": deny\n  read: \"allow\"\n---\nbody\n"
+          "---\nname: kusabi-implement\npermission:\n  \"*\": deny\n  read: \"deny\"\n---\nbody\n"
         ),
-      /read.*must be "ask"/i
+      /read.*must be "allow"/i
     );
     assert.throws(
       () =>
         transformAgentForOptIn(
-          "---\nname: kusabi-implement\npermission:\n  \"*\": deny\n  read: allow # explicitly broad\n---\nbody\n"
+          "---\nname: kusabi-implement\npermission:\n  \"*\": deny\n  read: deny # explicitly forbidden\n---\nbody\n"
         ),
-      /read.*must be "ask"/i
+      /read.*must be "allow"/i
     );
   });
 
   it("accepts exact scalar constrained rules idempotently", () => {
     const exact =
-      "---\nname: kusabi-implement\npermission:\n  \"*\": deny\n  read: ask\n  bash: deny\n  sunaba_sandbox_exec: allow\n---\nbody\n";
+      "---\nname: kusabi-implement\npermission:\n  \"*\": deny\n  read: allow\n  bash: deny\n  sunaba_sandbox_exec: allow\n---\nbody\n";
     const once = transformAgentForOptIn(exact);
     assert.equal(once, exact, "an already-exact block must transform to itself");
     assert.equal(transformAgentForOptIn(once), once, "transform must stay idempotent");
@@ -1143,7 +1144,7 @@ describe("PR755 follow-up: constrained permission rules are fail-closed", () => 
     const input =
       "---\nname: kusabi-implement\npermission:\n  \"*\": deny\n---\nread: allow\nbash: allow\n";
     const out = transformAgentForOptIn(input);
-    assert.match(out, /read: ask/);
+    assert.match(out, /read: allow/);
     assert.match(out, /bash: deny/);
     assert.match(out, /read: allow\nbash: allow/, "body text must be preserved verbatim");
   });
@@ -1168,12 +1169,12 @@ describe("PR755 follow-up: constrained permission rules are fail-closed", () => 
       fs.writeFileSync(path.join(src, "a-ok.md"), VALID_NON_REVIEW, "utf8");
       fs.writeFileSync(
         path.join(src, "b-broaden.md"),
-        "---\nname: kusabi-implement\npermission:\n  \"*\": deny\n  read: allow\n  bash: allow\n---\nbody\n",
+        "---\nname: kusabi-implement\npermission:\n  \"*\": deny\n  read: deny\n  bash: allow\n---\nbody\n",
         "utf8"
       );
       assert.throws(
         () => cmdInstallAgents({ sourceDir: src }),
-        /read.*must be "ask"/i,
+        /read.*must be "allow"/i,
         "the real install entry path must reject the invalid template"
       );
       assert.equal(fs.existsSync(dest), false, "a failed install must not create the destination directory");
@@ -1201,12 +1202,12 @@ describe("PR755 round 2: one permission-block path for transform and classificat
     // grants used to end the block early, so the transform accepted and the
     // broad grant survived with last-match precedence.
     assert.throws(
-      () => transformAgentForOptIn(BASE("# column-0 comment\n  read: allow\n  bash: allow")),
-      /read.*must be "ask"/i
+      () => transformAgentForOptIn(BASE("# column-0 comment\n  read: deny\n  bash: allow")),
+      /read.*must be "allow"/i
     );
     assert.throws(
-      () => transformAgentForOptIn(BASE("  # indented comment\n  read: allow")),
-      /read.*must be "ask"/i
+      () => transformAgentForOptIn(BASE("  # indented comment\n  read: deny")),
+      /read.*must be "allow"/i
     );
     assert.throws(() => transformAgentForOptIn(BASE("\n\n  bash: allow")), /bash.*must be "deny"/i);
   });
@@ -1221,7 +1222,7 @@ describe("PR755 round 2: one permission-block path for transform and classificat
       ['  "write*": allow', /unsupported permission key "write\*"/i],
       ['  "**": allow', /unsupported permission key "\*\*"/i],
       ['  "sunaba_*": allow', /unsupported permission key "sunaba_\*"/i],
-      ['  "read": allow', /read.*must be "ask"/i],
+      ['  "read": deny', /read.*must be "allow"/i],
     ];
     for (const [tail, re] of cases) {
       assert.throws(() => transformAgentForOptIn(BASE(tail)), re, `must reject: ${tail.trim()}`);
@@ -1239,7 +1240,7 @@ describe("PR755 round 2: one permission-block path for transform and classificat
     const once = transformAgentForOptIn(supported);
     assert.equal(transformAgentForOptIn(once), once, "supported template transform must be idempotent");
     assert.match(once, /"kusabi-\*": allow/, "nested skill grant must be preserved verbatim");
-    assert.match(once, /read: ask/);
+    assert.match(once, /read: allow/);
     assert.match(once, /bash: deny/);
   });
 
@@ -1434,7 +1435,7 @@ body
       const mod = await import(pathToFileURL(path.join(scriptsDest, "free-worker-profile.mjs")).href);
       const src = fs.readFileSync(path.join(AGENTS_DIR, "kusabi-review.md"), "utf8");
       const out = mod.transformAgentForOptIn(src);
-      assert.match(out, /read:\s*ask/);
+      assert.match(out, /read:\s*allow/);
       assert.match(out, /bash:\s*deny/);
       assert.match(out, /StructuredOutput:\s*allow/);
       assert.equal(mod.transformAgentForOptIn(out), out, "clean-copy transform must be idempotent");
@@ -1451,7 +1452,7 @@ body
       "name: kusabi-implement",
       "permission:",
       '  "*": deny',
-      "  read: allow",
+      "  read: deny",
       "---",
       "body",
     ].join("\n");
@@ -1547,5 +1548,132 @@ describe("default OpenCode version guard (kusabi #780)", () => {
       assert.ok(error.message.includes(bin));
       return true;
     });
+  });
+});
+
+// =========================================================================
+// Recurrence guard & Spec 3: read is allow, not ineffective ask (Closes #783)
+// =========================================================================
+
+describe("Recurrence guard & Spec 3: read is allow, not ineffective ask (Closes #783)", () => {
+  it("generates every kusabi agent in both modes with no ask permission remaining", () => {
+    const templateFiles = fs.readdirSync(AGENTS_DIR).filter((f) => f.endsWith(".md"));
+    assert.ok(templateFiles.length > 0, "must find kusabi agent templates");
+
+    for (const file of templateFiles) {
+      const raw = fs.readFileSync(path.join(AGENTS_DIR, file), "utf8");
+
+      // Mode 1: Default mode (exact template content as install-agents installs)
+      const defaultParsed = parseFrontmatter(raw);
+      assert.equal(defaultParsed.permission["read"], undefined, `${file} in default mode must not have read permission`);
+
+      // Recursively scan permission keys in default mode
+      for (const [key, val] of Object.entries(defaultParsed.permission)) {
+        if (typeof val === "object" && val !== null) {
+          for (const [nestedKey, nestedVal] of Object.entries(val)) {
+            assert.notEqual(
+              nestedVal,
+              "ask",
+              `${file}: permission key "${key}.${nestedKey}" must not have value "ask" (decidePermission approves every ask, so ask is ineffective; use allow)`
+            );
+          }
+        } else {
+          assert.notEqual(
+            val,
+            "ask",
+            `${file}: permission key "${key}" must not have value "ask" (decidePermission approves every ask, so ask is ineffective; use allow)`
+          );
+        }
+      }
+
+      // Mode 2: Free mode (apply free insertion rules as install-agents does)
+      const freeContent = transformAgentForOptIn(raw);
+      const freeParsed = parseFrontmatter(freeContent);
+
+      // Assert no permission key with value "ask" remains anywhere
+      for (const [key, val] of Object.entries(freeParsed.permission)) {
+        if (typeof val === "object" && val !== null) {
+          for (const [nestedKey, nestedVal] of Object.entries(val)) {
+            assert.notEqual(
+              nestedVal,
+              "ask",
+              `${file}: permission key "${key}.${nestedKey}" must not have value "ask" (decidePermission approves every ask, so ask is ineffective; use allow)`
+            );
+          }
+        } else {
+          assert.notEqual(
+            val,
+            "ask",
+            `${file}: permission key "${key}" must not have value "ask" (decidePermission approves every ask, so ask is ineffective; use allow)`
+          );
+        }
+      }
+
+      // Check order: "*": deny appears before read: allow
+      const permLines = freeContent.slice(freeContent.indexOf("permission:"), freeContent.indexOf("\n---\n", 4)).split("\n");
+      const wildcardIdx = permLines.findIndex((l) => /^\s*["']?\*["']?:\s*deny/.test(l));
+      const readIdx = permLines.findIndex((l) => /^\s*read:\s*allow/.test(l));
+      assert.ok(wildcardIdx >= 0, `${file} must contain *: deny`);
+      assert.ok(readIdx >= 0, `${file} must contain read: allow`);
+      assert.ok(wildcardIdx < readIdx, `${file} must have *: deny before read: allow`);
+
+      // Assert read: allow and bash: deny
+      assert.equal(freeParsed.permission["read"], "allow", `${file} free mode must have read: allow`);
+      assert.equal(freeParsed.permission["bash"], "deny", `${file} free mode must have bash: deny`);
+    }
+  });
+
+  it("classifies an agent with read: allow as free", () => {
+    const freeDoc =
+      '---\nname: kusabi-implement\npermission:\n  "*": deny\n  read: allow\n  bash: deny\n---\nbody\n';
+    assert.equal(classifyInstalledAgentContent(freeDoc), "free");
+  });
+
+  it("detects installed agent profile with read: allow as free", () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-detect-allow-"));
+    try {
+      const dir = path.join(tmp, "agent");
+      fs.mkdirSync(dir, { recursive: true });
+      fs.writeFileSync(
+        path.join(dir, "kusabi-implement.md"),
+        '---\nname: kusabi-implement\npermission:\n  "*": deny\n  read: allow\n  bash: deny\n---\nbody\n',
+        "utf8"
+      );
+      assert.equal(detectInstalledAgentProfile(dir), "free");
+      assert.equal(classifyInstalledAgentContent(fs.readFileSync(path.join(dir, "kusabi-implement.md"), "utf8")), "free");
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("classifies an old free install with read: ask as free and warns once that install should be refreshed", () => {
+    _resetLegacyAskWarnedForTesting();
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-detect-legacy-ask-"));
+    const warnings = [];
+    const customWarn = (msg) => warnings.push(msg);
+    try {
+      const dir = path.join(tmp, "agent");
+      fs.mkdirSync(dir, { recursive: true });
+      fs.writeFileSync(
+        path.join(dir, "kusabi-implement.md"),
+        '---\nname: kusabi-implement\npermission:\n  "*": deny\n  read: ask\n  bash: deny\n---\nbody\n',
+        "utf8"
+      );
+      // classifyInstalledAgentContent recognizes it as free
+      assert.equal(classifyInstalledAgentContent(fs.readFileSync(path.join(dir, "kusabi-implement.md"), "utf8")), "free");
+
+      // detectInstalledAgentProfile recognizes it as free
+      assert.equal(detectInstalledAgentProfile(dir, { warn: customWarn }), "free");
+      assert.equal(warnings.length, 1);
+      assert.match(warnings[0], /legacy "read: ask"/);
+      assert.match(warnings[0], /install-agents/);
+
+      // Warns at most once
+      assert.equal(detectInstalledAgentProfile(dir, { warn: customWarn }), "free");
+      assert.equal(warnings.length, 1);
+    } finally {
+      _resetLegacyAskWarnedForTesting();
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
   });
 });
