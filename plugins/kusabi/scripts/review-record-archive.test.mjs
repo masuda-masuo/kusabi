@@ -106,7 +106,7 @@ describe("review-record-archive", () => {
       "## Usage",
     ].join("\n") });
     try {
-      assert.match(archive(f), /staged/);
+      assert.match(archive(f), /wrote/); assert.doesNotMatch(archive(f), /\bstaged\b/);
     } finally {
       fs.rmSync(f.root, { recursive: true, force: true });
     }
@@ -165,7 +165,7 @@ describe("review-record-archive", () => {
       "## Usage",
     ].join("\n") });
     try {
-      assert.match(archive(f), /staged/);
+      assert.match(archive(f), /wrote/); assert.doesNotMatch(archive(f), /\bstaged\b/);
     } finally {
       fs.rmSync(f.root, { recursive: true, force: true });
     }
@@ -250,7 +250,7 @@ describe("review-record-archive", () => {
       "## Usage",
     ].join("\n") });
     try {
-      assert.match(archive(f), /staged/);
+      assert.match(archive(f), /wrote/); assert.doesNotMatch(archive(f), /\bstaged\b/);
     } finally {
       fs.rmSync(f.root, { recursive: true, force: true });
     }
@@ -328,7 +328,7 @@ describe("review-record-archive", () => {
     const f = fixture();
     try {
       const output = cmdReviewRecordArchive(["chain-test", "--kairanban", f.clone, "--state-root", f.root], { cwd: CWD });
-      assert.match(output, /staged/);
+      assert.match(output, /wrote/); assert.doesNotMatch(output, /\bstaged\b/);
       assert.throws(() => cmdReviewRecordArchive(["chain-test", "--force"], { cwd: CWD }), /--kairanban is required/);
     } finally {
       fs.rmSync(f.root, { recursive: true, force: true });

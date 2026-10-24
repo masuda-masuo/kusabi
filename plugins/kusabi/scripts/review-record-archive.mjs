@@ -159,7 +159,7 @@ export function archiveReviewRecord({ chainId, kairanbanDir, force = false, stat
   const commands = `git -C ${shellQuote(path.resolve(kairanbanDir))} add ${targetRelative} && git -C ${shellQuote(path.resolve(kairanbanDir))} commit -m "Archive review record for ${repoName} ${chainId}" && git -C ${shellQuote(path.resolve(kairanbanDir))} push`;
   return [
     ...(fallbackMessage ? [fallbackMessage] : []),
-    unchanged ? "unchanged" : `staged ${path.join(targetRelative, "review-record.md")} and ${path.join(targetRelative, "brief.md")}`,
+    unchanged ? "unchanged" : `wrote ${path.join(targetRelative, "review-record.md")} and ${path.join(targetRelative, "brief.md")}`,
     commands,
   ].join("\n");
 }

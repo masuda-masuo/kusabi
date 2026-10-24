@@ -6,7 +6,9 @@ import path from "node:path";
 import { describe, it } from "node:test";
 import { cmdReviewRecordAdjudicate } from "./review-record-adjudicate.mjs";
 import { countUnfilledReviewRecords } from "./review-record-scan.mjs";
+import { spawn } from "node:child_process";
 import { formatAdjudicationRow, parseAdjudicationRow } from "./review-record-table.mjs";
+import { archiveReviewRecord } from "./review-record-archive.mjs";
 
 const FINDINGS = "## Findings adjudication (fill at inspection)";
 const PRECEDENT = "## 判例として (fill at inspection)";
@@ -301,5 +303,102 @@ describe("review-record-adjudicate", () => {
     } finally {
       fs.rmSync(root, { recursive: true, force: true });
     }
+  });
+
+  it("concurrent adjudicate calls against the same record both leave their writes in the file", async () => {
+    const { root, recordPath } = fixture();
+    const flagPath = path.join(root, "reader_paused.flag");
+    const moduleUrl = new URL("./review-record-adjudicate.mjs", import.meta.url).href;
+
+    const workerScript = `
+      import fs from "node:fs";
+      import { cmdReviewRecordAdjudicate } from ${JSON.stringify(moduleUrl)};
+      const orig = fs.readFileSync;
+      fs.readFileSync = function(...args) {
+        const res = orig.apply(this, args);
+        if (typeof args[0] === "string" && args[0].endsWith("review-record.md")) {
+          fs.writeFileSync(${JSON.stringify(flagPath)}, "1");
+          const pause = new Int32Array(new SharedArrayBuffer(4));
+          Atomics.wait(pause, 0, 0, 150);
+        }
+        return res;
+      };
+      cmdReviewRecordAdjudicate(["chain-test", "--row", "1", "--verdict", "accept", "--reason", "one", "--state-root", ${JSON.stringify(root)}], { cwd: ${JSON.stringify(CWD)} });
+    `;
+
+    const child = spawn(process.execPath, ["--input-type=module", "-e", workerScript], {
+      stdio: "inherit",
+    });
+
+    try {
+      const deadline = Date.now() + 5000;
+      while (!fs.existsSync(flagPath) && Date.now() < deadline) {
+        const pause = new Int32Array(new SharedArrayBuffer(4));
+        Atomics.wait(pause, 0, 0, 5);
+      }
+      assert.ok(fs.existsSync(flagPath), "worker 1 should have signaled read");
+
+      run(root, "--row", "2", "--verdict", "reject", "--reason", "two");
+
+      const exitCode = await new Promise((resolve) => {
+        child.on("close", resolve);
+      });
+      assert.equal(exitCode, 0);
+
+      const updated = fs.readFileSync(recordPath, "utf8");
+      const r = rows(updated);
+      assert.equal(cells(r[0])[3], "採用");
+      assert.equal(cells(r[0])[4], "one");
+      assert.equal(cells(r[1])[3], "棄却");
+      assert.equal(cells(r[1])[4], "two");
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("repairs a 4-cell short row with --repair-row, allowing adjudication and archive to succeed", () => {
+    const { root, recordPath } = fixture();
+    const clone = path.join(root, "kairanban");
+    fs.mkdirSync(path.join(clone, ".git"), { recursive: true });
+    const chainDir = path.dirname(recordPath);
+    fs.writeFileSync(path.join(chainDir, "chain.json"), JSON.stringify({ repo: "owner/repo", brief: "test brief" }));
+
+    const contentWithShortRow = fs.readFileSync(recordPath, "utf8").replace(
+      "| 2 | medium | finding two | _fill_ | _fill_ |",
+      "| 2 | medium | short finding | _fill_ |",
+    );
+    fs.writeFileSync(recordPath, contentWithShortRow);
+
+    const parsedBefore = parseAdjudicationRow(rows(fs.readFileSync(recordPath, "utf8"))[1]);
+    assert.equal(parsedBefore.cells.length, 4);
+
+    assert.throws(
+      () => run(root, "--row", "2", "--verdict", "accept", "--reason", "should fail"),
+      /row 2 has fewer than 5 cells/,
+    );
+
+    const diff = run(root, "--repair-row", "2");
+    assert.match(diff, /\+ \| 2 \| medium \| short finding \| _fill_ \| repaired: padded to 5 cells \|/);
+
+    const repairedRow = parseAdjudicationRow(rows(fs.readFileSync(recordPath, "utf8"))[1]);
+    assert.equal(repairedRow.cells.length, 5);
+    assert.equal(repairedRow.cells[0], "2");
+    assert.equal(repairedRow.cells[1], "medium");
+    assert.equal(repairedRow.cells[2], "short finding");
+    assert.equal(repairedRow.cells[3], "_fill_");
+    assert.match(repairedRow.cells[4], /repaired/);
+
+    run(root, "--row", "1", "--verdict", "accept", "--reason", "one");
+    run(root, "--row", "2", "--verdict", "reject", "--reason", "inspected and rejected");
+    run(root, "--row", "3", "--verdict", "open-unverified", "--reason", "three");
+
+    const archiveOutput = archiveReviewRecord({
+      chainId: "chain-test",
+      kairanbanDir: clone,
+      stateRootDir: root,
+      cwd: CWD,
+    });
+    assert.match(archiveOutput, /wrote/);
+    assert.doesNotMatch(archiveOutput, /\bstaged\b/);
   });
 });
