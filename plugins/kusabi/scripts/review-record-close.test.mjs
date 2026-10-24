@@ -1,4 +1,4 @@
-import { describe, it } from "node:test";
+import { describe, it, mock } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
@@ -174,6 +174,101 @@ describe("review-record-close", () => {
       });
       assert.notEqual(result.status, 0);
       assert.match(result.stdout, /Usage: kusabi-companion review-record-close/);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("mid-failure on second of three targets leaves none of the targets modified", () => {
+    const root = createStateRoot();
+    try {
+      const record1 = writeRecord(root, "chain-1");
+      const record2 = writeRecord(root, "chain-2");
+      const record3 = writeRecord(root, "chain-3");
+
+      const before1 = fs.readFileSync(record1, "utf8");
+      const before2 = fs.readFileSync(record2, "utf8");
+      const before3 = fs.readFileSync(record3, "utf8");
+
+      let tempWriteCount = 0;
+      const originalWriteFileSync = fs.writeFileSync;
+      const writeSpy = mock.method(fs, "writeFileSync", (file, data, options) => {
+        if (typeof file === "string" && file.includes(".tmp")) {
+          tempWriteCount += 1;
+          if (tempWriteCount === 2) {
+            throw new Error("simulated failure on second target");
+          }
+        }
+        return originalWriteFileSync(file, data, options);
+      });
+
+      try {
+        assert.throws(
+          () => closeReviewRecords({ before: BEFORE, stateRootDir: root, apply: true }),
+          /simulated failure on second target/,
+        );
+      } finally {
+        writeSpy.mock.restore();
+      }
+
+      assert.equal(fs.readFileSync(record1, "utf8"), before1);
+      assert.equal(fs.readFileSync(record2, "utf8"), before2);
+      assert.equal(fs.readFileSync(record3, "utf8"), before3);
+
+      for (const chain of ["chain-1", "chain-2", "chain-3"]) {
+        const chainDir = path.join(root, "workspace-hash", "chains", chain);
+        const files = fs.readdirSync(chainDir);
+        assert.deepEqual(files.filter((f) => f.includes(".tmp")), []);
+      }
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("preserves symlinks and file mode after close apply", () => {
+    const root = createStateRoot();
+    const realDir = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-real-record-"));
+    try {
+      const realRecordPath = path.join(realDir, "real-review-record.md");
+      const content = `# [review-record] repo chain-symlink\nOrchestrator: test | finished: 2021-01-01T00:00:00.000Z\n## Findings adjudication (fill at inspection)\n| # | severity | finding | 採否 | 理由 |\n|---|---|---|---|---|\n| 1 | low | old finding | _fill_ | _fill_ |\n## 判例として (fill at inspection)\n_fill: reusable precedent, if any_\n`;
+      fs.writeFileSync(realRecordPath, content);
+      fs.chmodSync(realRecordPath, 0o640);
+
+      const chainDir = path.join(root, "workspace-hash", "chains", "chain-symlink");
+      fs.mkdirSync(chainDir, { recursive: true });
+      const recordLink = path.join(chainDir, "review-record.md");
+      fs.symlinkSync(realRecordPath, recordLink);
+
+      assert.ok(fs.lstatSync(recordLink).isSymbolicLink());
+
+      const result = closeReviewRecords({ before: BEFORE, stateRootDir: root, apply: true });
+      assert.deepEqual(result.targets, [recordLink]);
+      assert.equal(result.written, 1);
+
+      assert.ok(fs.lstatSync(recordLink).isSymbolicLink(), "recordPath must remain a symlink");
+      assert.equal(fs.realpathSync(recordLink), fs.realpathSync(realRecordPath));
+
+      const mode = fs.statSync(recordLink).mode & 0o777;
+      assert.equal(mode.toString(8), (0o640).toString(8));
+
+      const updated = fs.readFileSync(recordLink, "utf8");
+      assert.ok(updated.includes(HISTORICAL_MARK_PREFIX));
+    } finally {
+      fs.rmSync(realDir, { recursive: true, force: true });
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects unsafe --before values containing HTML comment markers or newlines", () => {
+    const root = createStateRoot();
+    try {
+      writeRecord(root, "unsafe-test");
+      for (const bad of ["2022-01-01 --> injection", "2022-01-01 -- comment", "2022-01-01\n<script>", "2022-01-01>"]) {
+        assert.throws(
+          () => closeReviewRecords({ before: bad, stateRootDir: root, apply: true }),
+          /invalid characters|--before must be a parseable date/,
+        );
+      }
     } finally {
       fs.rmSync(root, { recursive: true, force: true });
     }

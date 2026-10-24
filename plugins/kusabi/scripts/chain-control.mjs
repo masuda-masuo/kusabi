@@ -471,7 +471,7 @@ function runMarker(control) {
 const CONTROL_LOCK_TIMEOUT_MS = 10_000;
 const CONTROL_LOCK_ORPHAN_GRACE_MS = 30_000;
 
-function withControlWriteLock(chainDir, fn) {
+export function withControlWriteLock(chainDir, fn) {
   const lockDir = path.join(chainDir, ".control-write.lock");
   const token = randomUUID();
   const deadline = Date.now() + CONTROL_LOCK_TIMEOUT_MS;
