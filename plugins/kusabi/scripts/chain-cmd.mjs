@@ -549,6 +549,7 @@ function resolveQuotaReviewReroute(record, explicitRoute) {
 }
 
 export async function cmdChainResume(cwd, { flags, text }, opts = {}) {
+  const inject = opts?.inject ?? {};
   // Resumption context comes entirely from the saved chain state (chain.json
   // brief, records, ladder; control.json container).  Accepting another flag
   // and ignoring it would answer a different question than the one asked.
@@ -665,7 +666,7 @@ export async function cmdChainResume(cwd, { flags, text }, opts = {}) {
   // an error-shaped result ({ status: "error", error: "Container … not
   // found" }) when the container is missing — treat both as unreachable so
   // the driver never starts against a container that does not exist.
-  const callTool = opts.inject?.callTool ?? (await import("./sunaba-rpc.mjs")).callTool;
+  const callTool = inject.callTool ?? (await import("./sunaba-rpc.mjs")).callTool;
   let probe;
   try {
     probe = await callTool("sandbox_exec", {
@@ -760,7 +761,7 @@ export async function cmdChainResume(cwd, { flags, text }, opts = {}) {
   // means rework rounds keep the implement backend — the same `?? backend`
   // rule the fresh-chain driver applies.
   const reworkBackendForResume = resumeReworkBackend ?? resumeBackend;
-  const prepareOpenCode = profileGuardFor(opts.inject ?? {});
+  const prepareOpenCode = profileGuardFor(inject);
   const resumeImplementOpenCode = hasOpenCodeCandidate({ backend: resumeBackend, chain: chainJson.modelChain });
   const resumeReviewOpenCode = hasOpenCodeCandidate({ backend: resumeReviewBackend, chain: resumeReviewModelChain });
   const resumeReworkOpenCode = hasOpenCodeCandidate({ backend: reworkBackendForResume, chain: resumeReworkModelChain });
@@ -805,9 +806,9 @@ export async function cmdChainResume(cwd, { flags, text }, opts = {}) {
       callTool,
       backend: resumeBackend,
       reviewBackend: resumeReviewBackend,
-      dispatchWithFallback: resumeDispatches.dispatchWithFallback,
-      reviewDispatchWithFallback: resumeDispatches.reviewDispatchWithFallback,
-      reworkDispatchWithFallback: phaseDispatchFor(
+      dispatchWithFallback: inject.dispatchWithFallback ?? resumeDispatches.dispatchWithFallback,
+      reviewDispatchWithFallback: inject.reviewDispatchWithFallback ?? resumeDispatches.reviewDispatchWithFallback,
+      reworkDispatchWithFallback: inject.reworkDispatchWithFallback ?? phaseDispatchFor(
         reworkBackendForResume, backendDispatch(reworkBackendForResume), resumeReworkModel),
       initialSession: position.session,
       // The provenance of the resumed session (null when no session or no

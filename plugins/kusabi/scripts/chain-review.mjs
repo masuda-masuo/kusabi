@@ -616,7 +616,7 @@ export async function runReviewPhase({
         const command = checks.map(function (check) {
           const quotedPath = "'" + check.file + "'";
           const encoder = `LC_ALL=C od -An -tu1 | awk 'BEGIN { alphabet="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/" } { for (i=1; i<=NF; i++) bytes[++n]=$i } END { for (i=1; i<=n; i+=3) { a=bytes[i]; b=(i+1<=n ? bytes[i+1] : 0); c=(i+2<=n ? bytes[i+2] : 0); printf "%s%s%s%s", substr(alphabet, int(a/4)+1, 1), substr(alphabet, (a%4)*16+int(b/16)+1, 1), (i+1<=n ? substr(alphabet, (b%16)*4+int(c/64)+1, 1) : "="), (i+2<=n ? substr(alphabet, c%64+1, 1) : "=") } }'`;
-          return "if [ ! -f " + quotedPath + " ]; then printf '" + check.idx + "\\tnofile\\t\\n'; else line=$(awk 'NR==" + check.line_start + " { print; found=1 } END { if (!found) exit 1 }' 2>/dev/null " + quotedPath + "); status=$?; if [ \"$status\" -ne 0 ]; then printf '" + check.idx + "\\teof\\t\\n'; else encoded=$(printf '%s' \"$line\" | " + encoder + "); printf '" + check.idx + "\\tok\\t%s\\n' \"$encoded\"; fi; fi";
+          return "if [ ! -f " + quotedPath + " ]; then printf '" + check.idx + "\\tnofile\\t\\n'; else line=$(awk 'NR==" + check.line_start + " { print; found=1 } END { if (!found) exit 1 }' " + quotedPath + "); status=$?; if [ \"$status\" -ne 0 ]; then printf '" + check.idx + "\\teof\\t\\n'; else encoded=$(printf '%s' \"$line\" | " + encoder + "); printf '" + check.idx + "\\tok\\t%s\\n' \"$encoded\"; fi; fi";
         }).join("; ");
         try {
           const execResult = await callTool("sandbox_exec", {
@@ -629,8 +629,9 @@ export async function runReviewPhase({
             throw new Error("quote check output truncated");
           }
           const output = execResult?.output;
-          if (execResult?.isError === true || (typeof execResult?.exit_code === "number" && execResult.exit_code !== 0) || typeof output !== "string") {
-            throw new Error("quote check exec failed");
+          const stderr = typeof execResult?.stderr === "string" ? execResult.stderr.trim() : "";
+          if (execResult?.isError === true || (typeof execResult?.exit_code === "number" && execResult.exit_code !== 0) || typeof output !== "string" || stderr.length > 0) {
+            throw new Error(stderr ? `quote check exec failed: ${stderr}` : "quote check exec failed");
           }
           const rows = output.replace(/\n$/, "").split("\n");
           if (rows.length !== checks.length) throw new Error("quote check output count mismatch");

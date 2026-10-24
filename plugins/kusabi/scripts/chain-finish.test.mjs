@@ -11,9 +11,11 @@ import { finishRound } from "./chain-finish.mjs";
 import { handleProviderExhaustion } from "./chain-outcomes.mjs";
 import { readJson } from "./state-paths.mjs";
 import { ORACLE_UNCHECKED } from "./chain-probes.mjs";
+import crypto from "node:crypto";
+import { runChainLifecycle, cmdChainResume } from "./chain-cmd.mjs";
+import { renderReviewPriorFindings } from "./chain-review.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-
 /**
  * Source guard: runChainDriver's function body must not contain nested
  * function definitions for finishRound / finaliseChain / finaliseProvisionalChain
@@ -54,18 +56,191 @@ describe("chain-finish source guard", () => {
     }
   });
 
-  it("looks up repo identity only on fresh chains and restores it from chain.json on resume", () => {
-    const cmdSource = fs.readFileSync(path.join(__dirname, "chain-cmd.mjs"), "utf8");
-    const lifecycleStart = cmdSource.indexOf("export async function runChainLifecycle(");
-    const resumeStart = cmdSource.indexOf("export async function cmdChainResume(");
-    assert.ok(lifecycleStart !== -1 && resumeStart > lifecycleStart);
-    const lifecycleSource = cmdSource.slice(lifecycleStart, resumeStart);
-    assert.equal(lifecycleSource.split("readOriginRepo(").length - 1, 1);
-    assert.match(lifecycleSource, /repo, repoReason,/);
-    const resumeSource = cmdSource.slice(resumeStart);
-    assert.ok(resumeSource.includes("repo: chainJson.repo ?? null"));
-    assert.ok(resumeSource.includes("repoReason: chainJson.repo == null"));
-    assert.equal(resumeSource.includes("readOriginRepo("), false);
+  it("looks up repo identity once on fresh chains and sets repo in chain.json", async () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-fresh-repo-"));
+    const cwd = path.join(tmp, "ws");
+    fs.mkdirSync(cwd, { recursive: true });
+    const prevStateEnv = process.env.KUSABI_STATE_DIR;
+    process.env.KUSABI_STATE_DIR = path.join(tmp, "state");
+    let runOriginRepoCalls = 0;
+    const runOriginRepo = () => {
+      runOriginRepoCalls += 1;
+      return "git@github.com:owner/repo.git\n";
+    };
+
+    try {
+      const origWrite = process.stdout.write;
+      process.stdout.write = () => true;
+      try {
+        await runChainLifecycle(cwd, {
+          flags: { container: "cid-1", "chain-id": "chain-fresh", keepServe: true },
+          text: CHAIN_BRIEF,
+          orchestrator: null,
+        }, {
+          inject: {
+            runOriginRepo,
+            callTool: fakeCallTool(),
+            dispatchWithFallback: reviewExhaustedDispatch(),
+            reviewDispatchWithFallback: reviewExhaustedDispatch(),
+            reworkDispatchWithFallback: reviewExhaustedDispatch(),
+            checkDefaultOpencodeVersion() {},
+          },
+        });
+      } finally {
+        process.stdout.write = origWrite;
+      }
+
+      assert.equal(runOriginRepoCalls, 1, "runOriginRepo must be called exactly once on fresh chain");
+      const hash = crypto.createHash("sha256").update(cwd).digest("hex").slice(0, 12);
+      const chainJson = readJson(path.join(tmp, "state", hash, "chains", "chain-fresh", "chain.json"));
+      assert.equal(chainJson.repo, "owner/repo");
+      assert.equal("repoReason" in chainJson, false);
+    } finally {
+      if (prevStateEnv === undefined) delete process.env.KUSABI_STATE_DIR;
+      else process.env.KUSABI_STATE_DIR = prevStateEnv;
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("restores repo identity on resume without calling runOriginRepo", async () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-resume-repo-"));
+    const cwd = path.join(tmp, "ws");
+    fs.mkdirSync(cwd, { recursive: true });
+    const prevStateEnv = process.env.KUSABI_STATE_DIR;
+    process.env.KUSABI_STATE_DIR = path.join(tmp, "state");
+    const hash = crypto.createHash("sha256").update(cwd).digest("hex").slice(0, 12);
+    const chainDir = path.join(tmp, "state", hash, "chains", "chain-resume");
+    fs.mkdirSync(chainDir, { recursive: true });
+
+    writeChainControl(chainDir, {
+      chainId: "chain-resume",
+      container: "cid-1",
+      pid: 0,
+      status: "cancelled",
+      round: 1,
+      startedAt: new Date().toISOString(),
+      stoppedAt: new Date().toISOString(),
+    });
+
+    const chainJsonData = {
+      chainId: "chain-resume",
+      container: "cid-1",
+      model: "fake/model",
+      modelChain: [["fake/model"]],
+      maxRounds: 4,
+      brief: CHAIN_BRIEF,
+      repo: "owner/repo",
+      orchestrator: null,
+      baseSha: "abc123",
+      chainTotals: { input: 0, output: 0, reasoning: 0, cacheRead: 0, cacheWrite: 0, cost: 0 },
+      records: [{
+        round: 1,
+        backend: "opencode",
+        implementJobId: "job-1",
+        implementSession: null,
+        verdict: "reject",
+        disposition: { disposition: "rework" },
+      }],
+    };
+    fs.writeFileSync(path.join(chainDir, "chain.json"), JSON.stringify(chainJsonData, null, 2));
+
+    let runOriginRepoCalls = 0;
+    const runOriginRepo = () => {
+      runOriginRepoCalls += 1;
+      return "git@github.com:wrong/wrong.git\n";
+    };
+
+    try {
+      await cmdChainResume(cwd, { flags: { keepServe: true }, text: "chain-resume" }, {
+        inject: {
+          runOriginRepo,
+          callTool: fakeCallTool(),
+          dispatchWithFallback: reviewExhaustedDispatch(),
+          reviewDispatchWithFallback: reviewExhaustedDispatch(),
+          reworkDispatchWithFallback: reviewExhaustedDispatch(),
+          checkDefaultOpencodeVersion() {},
+        },
+      });
+
+      assert.equal(runOriginRepoCalls, 0, "runOriginRepo must NOT be called on resume");
+      const persisted = readJson(path.join(chainDir, "chain.json"));
+      assert.equal(persisted.repo, "owner/repo");
+      assert.equal("repoReason" in persisted, false);
+    } finally {
+      if (prevStateEnv === undefined) delete process.env.KUSABI_STATE_DIR;
+      else process.env.KUSABI_STATE_DIR = prevStateEnv;
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("preserves absent repo identity on resume without calling runOriginRepo", async () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-resume-norepo-"));
+    const cwd = path.join(tmp, "ws");
+    fs.mkdirSync(cwd, { recursive: true });
+    const prevStateEnv = process.env.KUSABI_STATE_DIR;
+    process.env.KUSABI_STATE_DIR = path.join(tmp, "state");
+    const hash = crypto.createHash("sha256").update(cwd).digest("hex").slice(0, 12);
+    const chainDir = path.join(tmp, "state", hash, "chains", "chain-norepo");
+    fs.mkdirSync(chainDir, { recursive: true });
+
+    writeChainControl(chainDir, {
+      chainId: "chain-norepo",
+      container: "cid-1",
+      pid: 0,
+      status: "cancelled",
+      round: 1,
+      startedAt: new Date().toISOString(),
+      stoppedAt: new Date().toISOString(),
+    });
+
+    const chainJsonData = {
+      chainId: "chain-norepo",
+      container: "cid-1",
+      model: "fake/model",
+      modelChain: [["fake/model"]],
+      maxRounds: 4,
+      brief: CHAIN_BRIEF,
+      orchestrator: null,
+      baseSha: "abc123",
+      chainTotals: { input: 0, output: 0, reasoning: 0, cacheRead: 0, cacheWrite: 0, cost: 0 },
+      records: [{
+        round: 1,
+        backend: "opencode",
+        implementJobId: "job-1",
+        implementSession: null,
+        verdict: "reject",
+        disposition: { disposition: "rework" },
+      }],
+    };
+    fs.writeFileSync(path.join(chainDir, "chain.json"), JSON.stringify(chainJsonData, null, 2));
+
+    let runOriginRepoCalls = 0;
+    const runOriginRepo = () => {
+      runOriginRepoCalls += 1;
+      return "git@github.com:wrong/wrong.git\n";
+    };
+
+    try {
+      await cmdChainResume(cwd, { flags: { keepServe: true }, text: "chain-norepo" }, {
+        inject: {
+          runOriginRepo,
+          callTool: fakeCallTool(),
+          dispatchWithFallback: reviewExhaustedDispatch(),
+          reviewDispatchWithFallback: reviewExhaustedDispatch(),
+          reworkDispatchWithFallback: reviewExhaustedDispatch(),
+          checkDefaultOpencodeVersion() {},
+        },
+      });
+
+      assert.equal(runOriginRepoCalls, 0, "runOriginRepo must NOT be called on resume");
+      const persisted = readJson(path.join(chainDir, "chain.json"));
+      assert.equal(persisted.repo, null);
+      assert.equal(typeof persisted.repoReason, "string");
+    } finally {
+      if (prevStateEnv === undefined) delete process.env.KUSABI_STATE_DIR;
+      else process.env.KUSABI_STATE_DIR = prevStateEnv;
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
   });
 
   it("chain-finish.mjs exports finishRound, finaliseChain, finaliseProvisionalChain", () => {
@@ -132,7 +307,10 @@ describe("chain-finish source guard", () => {
 // a stale missionId input is ignored and the key is absent.
 // =========================================================================
 
-const CHAIN_BRIEF = "Implement X.\n\n## Deliverables\n- src/foo.js\n";
+const CHAIN_BRIEF =
+  "# Task\n\nOrchestrator: test-model | session s-1 | 2026-08-23\n\n" +
+  "## Deliverables\n\n- `src/foo.js`\n\n" +
+  "## Smoke\n\n- `npm test`\n";
 
 /** The probe-phase callTool fake: git/verify/change-scope canned answers. */
 function fakeCallTool() {
@@ -153,6 +331,7 @@ function fakeCallTool() {
     if (cmd.startsWith("cd /workspace &&") && cmd.includes("TMPIDX=")) {
       return { output: "ERROR_NO_INDEX\n" };
     }
+    if (cmd.includes("SMOKE_EXIT=")) return { output: "SMOKE_EXIT=0\n" };
     if (cmd === "git rev-parse HEAD") return { output: "abc123\n" };
     if (cmd === "git status --porcelain") return { output: " M src/foo.js\n" };
     if (cmd === "git log --oneline -5") return { output: "abc123 latest change\n" };
@@ -189,6 +368,30 @@ function reviewExhaustedDispatch() {
   };
   dispatch.calls = calls;
   return dispatch;
+}
+
+async function runChain({ missionId, repo = null, repoReason = null }) {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-532-rev-exhaust-"));
+  const chainDir = path.join(tmp, "chains", "chain-x");
+  fs.mkdirSync(chainDir, { recursive: true });
+  writeChainControl(chainDir, {
+    chainId: "chain-x", container: "cid-1", pid: process.pid,
+    status: "running", round: 0, startedAt: new Date().toISOString(),
+  });
+  const text = await runChainDriver({
+    cwd: tmp, stateDir: tmp, chainDir, chainId: "chain-x", container: "cid-1",
+    model: "fake/model", modelChain: [["fake/model"]], maxRounds: 4,
+    brief: CHAIN_BRIEF, orchestrator: null, baseSha: "abc123", worktreeBaseline: null,
+    callTool: fakeCallTool(),
+    dispatchWithFallback: reviewExhaustedDispatch(),
+    keepServe: true,
+    signalReceived: () => false,
+    resume: null,
+    repo, repoReason,
+    // The luna driver threads the owning mission id; a plain chain omits it.
+    ...(missionId ? { missionId } : {}),
+  });
+  return { tmp, chainDir, text };
 }
 
 describe("provider-exhaustion chain records omit removed mission linkage", () => {
@@ -237,30 +440,9 @@ describe("provider-exhaustion chain records omit removed mission linkage", () =>
     }
   });
 
+
+
   it("review provider exhaustion does not persist a stale missionId option", async () => {
-    async function runChain({ missionId, repo = null, repoReason = null }) {
-      const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-532-rev-exhaust-"));
-      const chainDir = path.join(tmp, "chains", "chain-x");
-      fs.mkdirSync(chainDir, { recursive: true });
-      writeChainControl(chainDir, {
-        chainId: "chain-x", container: "cid-1", pid: process.pid,
-        status: "running", round: 0, startedAt: new Date().toISOString(),
-      });
-      const text = await runChainDriver({
-        cwd: tmp, stateDir: tmp, chainDir, chainId: "chain-x", container: "cid-1",
-        model: "fake/model", modelChain: [["fake/model"]], maxRounds: 4,
-        brief: CHAIN_BRIEF, orchestrator: null, baseSha: "abc123", worktreeBaseline: null,
-        callTool: fakeCallTool(),
-        dispatchWithFallback: reviewExhaustedDispatch(),
-        keepServe: true,
-        signalReceived: () => false,
-        resume: null,
-        repo, repoReason,
-        // The luna driver threads the owning mission id; a plain chain omits it.
-        ...(missionId ? { missionId } : {}),
-      });
-      return { tmp, chainDir, text };
-    }
 
     const luna = await runChain({ missionId: "mission-abc" });
     try {
@@ -423,10 +605,7 @@ describe("review-resume revalidation with an unchecked oracle (kusabi #541)", ()
   }
 
   it("persists repo identity after a normal finishRound", async () => {
-    const { tmp, chainDir } = await runResume({
-      roundRecord: resumedRoundRecord(),
-      probeCtx: redAnchoringProbeCtx(),
-      callTool: async () => ({ output: "" }),
+    const { tmp, chainDir } = await runChain({
       repo: "owner/repo",
     });
     try {
@@ -704,6 +883,235 @@ describe("review-resume revalidation with an unchecked oracle (kusabi #541)", ()
       assert.equal(result.done, true);
       assert.equal(roundRecord.disposition.disposition, "accept");
       assert.notEqual(roundRecord.disposition.disposition, "rework");
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("drives finishRound with real runReviewPhase wiring and records review results", async () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-finish-real-review-"));
+    const chainDir = path.join(tmp, "chains", "chain-real-rev");
+    fs.mkdirSync(chainDir, { recursive: true });
+    writeChainControl(chainDir, {
+      chainId: "chain-real-rev", container: "cid-real", pid: process.pid,
+      status: "running", round: 0, startedAt: new Date().toISOString(),
+    });
+
+    const testReworkScope = {
+      scope: "mechanical",
+      findings: [
+        {
+          kind: "mechanical",
+          severity: "low",
+          title: "Fix whitespace in bar.js",
+          body: "Line 10 has trailing spaces.",
+          file: "src/bar.js",
+          line_start: 10,
+          line_end: 10,
+          recommendation: "Remove trailing whitespace.",
+        },
+      ],
+    };
+
+    const testChangeScope = {
+      formatVersion: 1,
+      repositoryRoot: "/workspace",
+      paths: {
+        modified: ["src/foo.js"],
+      },
+    };
+
+    const roundRecord = {
+      round: 1,
+      reworkScope: "mechanical",
+    };
+
+    const probeCtx = {
+      probesGreen: true,
+      probesFromRecord: false,
+      oracleViolation: false,
+      oracleUnchecked: false,
+      changeScope: testChangeScope,
+      probeResults: [
+        { probe: "P1: HEAD clean", passed: true },
+        { probe: "P2: verify gate", passed: true },
+        { probe: "P3: deliverables", passed: true },
+        { probe: "P4: smoke", passed: true },
+        { probe: "P5: frozen", passed: true },
+        { probe: "P6: collected", passed: true },
+      ],
+      chainChangedPaths: ["src/foo.js"],
+      chainNewlyChanged: ["src/foo.js"],
+      chainStatusObserved: true,
+      chainStatusOutput: " M src/foo.js\n",
+      chainBaseLog: "abc123 latest change\n",
+      chainDeliverables: ["src/foo.js"],
+      chainUntracked: "",
+      chainTruncation: null,
+      worktreeChanged: true,
+    };
+
+    const reviewFindings = [
+      {
+        severity: "medium",
+        title: "Test quote check",
+        body: "Quote: `const x = 42;`",
+        file: "src/foo.js",
+        line_start: 1,
+        line_end: 1,
+        confidence: 0.9,
+        recommendation: "Inspect value",
+      },
+    ];
+
+    let capturedDispatchOpts = null;
+    const reviewDispatch = async (opts) => {
+      capturedDispatchOpts = opts;
+      return {
+        job: {
+          id: "job-rev-real-1",
+          status: "completed",
+          modelEntry: "fake/review-model",
+          modelVariant: null,
+          fallbacks: null,
+          sessionID: "sess-rev-real-1",
+          usage: { available: true, input: 10, output: 20, reasoning: 0, cacheRead: 0, cacheWrite: 0, cost: 0.05 },
+          error: null,
+        },
+        resultText: JSON.stringify({
+          schema_version: 1,
+          verdict: "approve",
+          summary: "All good",
+          findings: reviewFindings,
+          next_steps: [],
+        }),
+      };
+    };
+
+    const callTool = async (toolName, params) => {
+      if (toolName === "verify_in_container") {
+        return {
+          gate_passed: true,
+          lint: [],
+          types: [],
+          tests: { full: { status: "ok", passed: 1, total: 1 } },
+          collected: 1,
+        };
+      }
+      if (toolName !== "sandbox_exec") return { output: "" };
+      const cmd = params?.commands?.[0] ?? params?.argv?.join(" ") ?? "";
+      if (cmd.includes("od -An -tu1")) {
+        const encoded = Buffer.from("const x = 42;").toString("base64");
+        return { output: `0\tok\t${encoded}\n` };
+      }
+      if (cmd.startsWith("cd /workspace &&") && cmd.includes("TMPIDX=")) {
+        return { output: "TREE_HASH=0123456789abcdef0123456789abcdef01234567\nCOUNT=0\n" };
+      }
+      if (cmd === "git rev-parse HEAD") return { output: "abc123\n" };
+      if (cmd === "git status --porcelain") return { output: " M src/foo.js\n" };
+      if (cmd === "git diff") return { output: "diff --git a/src/foo.js b/src/foo.js\n" };
+      return { output: "TREE_HASH=0123456789abcdef0123456789abcdef01234567\nCOUNT=0\n" };
+    };
+
+    const ctx = {
+      chainDir,
+      chainId: "chain-real-rev",
+      container: "cid-real",
+      cwd: tmp,
+      model: "fake/model",
+      modelChain: [["fake/model"]],
+      maxRounds: 4,
+      brief: CHAIN_BRIEF,
+      orchestrator: null,
+      callTool,
+      flagsModel: null,
+      reviewFlagsModel: "custom/review-model",
+      effectiveReviewChain: [["custom/review-model"]],
+      effectiveBaseSha: "abc123",
+      effectiveVerifyBaseline: null,
+      reviewModel: "custom/review-model",
+      reviewModelChain: [["custom/review-model"]],
+      reworkModel: null,
+      reworkModelChain: null,
+      reworkBackend: null,
+      reviewDispatch,
+      injectedDispatch: reviewDispatch,
+      reworkTierCount: 1,
+      records: [],
+      strategized: false,
+      reworkCount: 0,
+      currentTierIndex: 0,
+      repo: "owner/repo",
+      repoReason: null,
+    };
+
+    try {
+      const result = await finishRound({
+        round: 1,
+        roundRecord,
+        previousRecord: null,
+        probeCtx,
+        implementRefusal: null,
+        reworkScope: testReworkScope,
+      }, ctx);
+
+      assert.ok(capturedDispatchOpts, "reviewDispatch must have been called");
+      assert.equal(capturedDispatchOpts.kind, "review");
+      assert.equal(capturedDispatchOpts.phase, "review");
+      assert.equal(capturedDispatchOpts.explicitModel, "custom/review-model");
+      assert.deepEqual(capturedDispatchOpts.tiers, [["custom/review-model"]]);
+      assert.ok(capturedDispatchOpts.promptText.includes("# Task"), "prompt includes brief");
+
+      const expectedPriorFindings = renderReviewPriorFindings(null, testReworkScope);
+      assert.ok(
+        capturedDispatchOpts.promptText.includes(expectedPriorFindings),
+        "review prompt must contain exact rendered reworkScope prior findings",
+      );
+      assert.ok(
+        capturedDispatchOpts.promptText.includes("This round was scoped to mechanical findings."),
+        "review prompt must contain mechanical scope marker",
+      );
+      assert.ok(
+        capturedDispatchOpts.promptText.includes("### [low] Fix whitespace in bar.js (src/bar.js:10)"),
+        "review prompt must contain exact scoped finding",
+      );
+
+      assert.ok(
+        capturedDispatchOpts.promptText.includes(JSON.stringify(testChangeScope, null, 2)),
+        "review prompt must contain exact changeScope JSON",
+      );
+      assert.ok(
+        capturedDispatchOpts.promptText.includes("Authoritative change set (`change-scope`):"),
+        "review prompt must contain authoritative change-scope heading",
+      );
+
+      assert.equal(roundRecord.verdict, "approve");
+      assert.equal(roundRecord.reviewParseable, true);
+      assert.equal(roundRecord.reviewModelEntry, "fake/review-model");
+      assert.equal(roundRecord.reviewTreeHash, "0123456789abcdef0123456789abcdef01234567");
+      assert.deepEqual(roundRecord.quoteCheck, {
+        findings: 1,
+        quoted: 1,
+        mismatched: 0,
+        examples: [],
+      });
+
+      assert.equal(result.done, true);
+      assert.equal(roundRecord.disposition.disposition, "accept");
+      assert.match(result.text, /accepted at round 1/);
+
+      const chainJson = readJson(path.join(chainDir, "chain.json"));
+      assert.equal(chainJson.records.length, 1);
+      assert.equal(chainJson.records[0].verdict, "approve");
+      assert.deepEqual(chainJson.records[0].quoteCheck, {
+        findings: 1,
+        quoted: 1,
+        mismatched: 0,
+        examples: [],
+      });
+      assert.equal(chainJson.records[0].reviewTreeHash, "0123456789abcdef0123456789abcdef01234567");
+      const controlJson = readJson(path.join(chainDir, "control.json"));
+      assert.equal(controlJson.status, "completed");
     } finally {
       fs.rmSync(tmp, { recursive: true, force: true });
     }
