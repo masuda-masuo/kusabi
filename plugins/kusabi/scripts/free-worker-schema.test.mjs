@@ -1,7 +1,7 @@
 // plugins/kusabi/scripts/free-worker-schema.test.mjs
 // Focused regression tests for Agenda2001 StructuredOutput repair:
 // 1. Opt-in review agent permissions evaluation leaves StructuredOutput visible after *: deny
-// 2. Existing host tools remain denied except read: ask
+// 2. Existing host tools remain denied except read: allow
 // 3. Non-review agent profiles remain unaffected (StructuredOutput disabled)
 // 4. Default repository templates remain unchanged
 // 5. Opt-in review body contains no conflicting JSONL mandates and instructs single StructuredOutput
@@ -130,8 +130,8 @@ describe("Agenda2001 StructuredOutput Repair Regressions", () => {
   });
 
   describe("2. Host tool restrictions in opt-in review agent", () => {
-    it("allows host read: ask while strictly denying bash and all other host tools", () => {
-      assert.equal(parsedTransformedReview.permission["read"], "ask");
+    it("allows host read: allow while strictly denying bash and all other host tools", () => {
+      assert.equal(parsedTransformedReview.permission["read"], "allow");
       assert.equal(parsedTransformedReview.permission["bash"], "deny");
 
       // Evaluation for bash
@@ -204,8 +204,8 @@ describe("Agenda2001 StructuredOutput Repair Regressions", () => {
           `${file} must disable StructuredOutput`
         );
 
-        // Host read: ask and bash: deny are present
-        assert.equal(parsed.permission["read"], "ask", `${file} must have read: ask`);
+        // Host read: allow and bash: deny are present
+        assert.equal(parsed.permission["read"], "allow", `${file} must have read: allow`);
         assert.equal(parsed.permission["bash"], "deny", `${file} must have bash: deny`);
 
         // Body must remain unchanged (only frontmatter permissions modified)
@@ -224,7 +224,7 @@ describe("Agenda2001 StructuredOutput Repair Regressions", () => {
         const parsed = parseFrontmatter(content);
 
         assert.equal(parsed.permission["StructuredOutput"], undefined, `${file} template must not grant StructuredOutput`);
-        assert.equal(parsed.permission["read"], undefined, `${file} template must not have read: ask`);
+        assert.equal(parsed.permission["read"], undefined, `${file} template must not have read: allow`);
         assert.equal(parsed.permission["bash"], undefined, `${file} template must not have bash: deny`);
         assert.equal(parsed.permission["*"], "deny", `${file} template must enforce *: deny`);
       }
@@ -321,7 +321,7 @@ Some body text that must not be changed.
 `;
       const transformed = transformAgentForOptIn(customAgent);
       assert.doesNotMatch(transformed, /StructuredOutput/);
-      assert.match(transformed, /read: ask/);
+      assert.match(transformed, /read: allow/);
       assert.match(transformed, /bash: deny/);
       assert.match(transformed, /Some body text that must not be changed\./);
     });

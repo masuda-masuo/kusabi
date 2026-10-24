@@ -198,7 +198,7 @@ export function checkServerProfileCompatibility(existing, stateDir = "") {
 //
 // `install-agents` is a host-level mutation of the shared OpenCode discovery
 // directory.  Opt-in and default installs produce DIFFERENT agent files
-// (opt-in adds `read: ask` / `bash: deny`, and for the review agent a
+// (opt-in adds `read: allow` / `bash: deny`, and for the review agent a
 // synthetic `StructuredOutput: allow`).  Without a durable marker, flipping
 // the env var leaves the previous mode's files in place and the next serve
 // silently runs them.  The marker below records the installed mode; when it
@@ -208,7 +208,7 @@ export function checkServerProfileCompatibility(existing, stateDir = "") {
 /**
  * Structural classification of one installed agent file:
  *   "free"    — a valid allowed permission block carrying opt-in additions
- *               (`read: ask`/`bash: deny`/`StructuredOutput: allow`)
+ *               (`read: allow`/`bash: deny`/`StructuredOutput: allow`)
  *   "default" — a valid allowed wildcard-deny block with none of those additions
  *   "unknown" — unparseable/ambiguous frontmatter, or a permission block that is
  *               malformed, broadened/duplicated, or carries an unsupported key
@@ -251,13 +251,20 @@ export function readInstalledAgentProfile(agentDir) {
  *   - any unclassifiable/malformed/broadened file, or a marker/content
  *     disagreement, makes the tree "unknown" (fail closed).
  */
-export function detectInstalledAgentProfile(agentDir) {
+let warnedLegacyFreeInstall = false;
+
+export function _resetLegacyAskWarnedForTesting() {
+  warnedLegacyFreeInstall = false;
+}
+
+export function detectInstalledAgentProfile(agentDir, { warn = (msg) => console.warn(msg) } = {}) {
   const meta = readInstalledAgentProfile(agentDir);
 
   let sawFile = false;
   let anyFree = false;
   let anyUnknown = false;
   let sawDefault = false;
+  let sawLegacyAsk = false;
   let entries = [];
   try {
     entries = fs.readdirSync(agentDir);
@@ -276,13 +283,25 @@ export function detectInstalledAgentProfile(agentDir) {
     }
     sawFile = true;
     const cls = classifyInstalledAgentContent(content);
-    if (cls === "free") anyFree = true;
+    if (cls === "free") {
+      anyFree = true;
+      const analysis = analyzeAgentFrontmatter(content);
+      if (analysis.ok && analysis.rules.some((r) => r.key === "read" && r.value === "ask")) {
+        sawLegacyAsk = true;
+      }
+    }
     else if (cls === "default") sawDefault = true;
     else anyUnknown = true;
   }
   if (!sawFile) return meta ? meta.profile : "absent";
   if (anyUnknown || (anyFree && sawDefault)) return "unknown";
   const structural = anyFree ? "free" : sawDefault ? "default" : "unknown";
+  if (structural === "free" && sawLegacyAsk && !warnedLegacyFreeInstall) {
+    warnedLegacyFreeInstall = true;
+    warn(
+      `kusabi: installed agent at ${agentDir} uses legacy "read: ask" permission; refresh with KUSABI_OPENCODE_FREE_WORKER=1 kusabi install-agents`
+    );
+  }
   if (meta) return meta.profile === structural ? meta.profile : "unknown";
   return structural;
 }
@@ -415,7 +434,7 @@ const TARGET_REVIEW_BODY = `- Do not write code. The deliverable is the review i
 // Agent transform (fail-closed, strict YAML)
 // ---------------------------------------------------------------------------
 //
-// The transform is only allowed to ADD the constrained rules `read: ask`,
+// The transform is only allowed to ADD the constrained rules `read: allow`,
 // `bash: deny`, and (for the review agent) `StructuredOutput: allow` to a
 // template whose parsed `permission:` mapping already passes the canonical
 // allowlist validator in free-worker-yaml.mjs.  A template that carries any
@@ -472,7 +491,7 @@ export function transformAgentForOptIn(content, agentName = undefined) {
   const baseIndent = (lines[wildcardLineIdx].match(/^[ \t]*/) || [""])[0];
 
   const inserts = [];
-  if (!present.has("read")) inserts.push(`${baseIndent}read: ask`);
+  if (!present.has("read")) inserts.push(`${baseIndent}read: allow`);
   if (!present.has("bash")) inserts.push(`${baseIndent}bash: deny`);
   if (isReview && !present.has("StructuredOutput")) inserts.push(`${baseIndent}StructuredOutput: allow`);
 
