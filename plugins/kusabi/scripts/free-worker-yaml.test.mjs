@@ -16,7 +16,7 @@
 //    a durable marker, and the real cmdInstallAgents entry path writes no
 //    partial agent or marker for a duplicate-key template.
 // 4. Shipped templates remain default-safe and transform idempotently to
-//    read:ask / bash:deny (review also StructuredOutput:allow), preserving
+//    read:allow / bash:deny (review also StructuredOutput:allow), preserving
 //    vetted MCP/skill rules and bodies without expanding host keys/globs.
 //
 // Behaviour is asserted only through the public helpers the task names; no
@@ -58,7 +58,7 @@ function mkTmp(prefix) {
 describe("PR755 strict YAML: duplicate mapping keys in security-relevant frontmatter", () => {
   const VALID_PERMISSION = `permission:
   "*": deny
-  read: ask
+  read: allow
   bash: deny`;
 
   // Duplicate top-level `permission`.  A last-wins reader keeps the broadened
@@ -94,15 +94,15 @@ describe("PR755 strict YAML: duplicate mapping keys in security-relevant frontma
   const DUP_RULE = [
     [
       "duplicate constrained read",
-      `name: kusabi-implement\npermission:\n  "*": deny\n  read: ask\n  read: ask`,
+      `name: kusabi-implement\npermission:\n  "*": deny\n  read: allow\n  read: allow`,
     ],
     [
       "duplicate constrained bash",
-      `name: kusabi-implement\npermission:\n  "*": deny\n  read: ask\n  bash: deny\n  bash: deny`,
+      `name: kusabi-implement\npermission:\n  "*": deny\n  read: allow\n  bash: deny\n  bash: deny`,
     ],
     [
       "duplicate nested skill pattern",
-      `name: kusabi-implement\npermission:\n  "*": deny\n  read: ask\n  bash: deny\n  skill:\n    "kusabi-*": allow\n    "kusabi-*": allow`,
+      `name: kusabi-implement\npermission:\n  "*": deny\n  read: allow\n  bash: deny\n  skill:\n    "kusabi-*": allow\n    "kusabi-*": allow`,
     ],
   ];
 
@@ -129,7 +129,7 @@ describe("PR755 strict YAML: duplicate mapping keys in security-relevant frontma
 
 describe("PR755 strict YAML: malformed or ambiguous frontmatter fails closed", () => {
   const MALFORMED = [
-    ["tab-indented permission mapping", `name: kusabi-implement\npermission:\n\t"*": deny\n\tread: ask`],
+    ["tab-indented permission mapping", `name: kusabi-implement\npermission:\n\t"*": deny\n\tread: allow`],
     ["non-mapping scalar permission", "name: kusabi-implement\npermission: allow"],
     ["non-mapping sequence permission", "name: kusabi-implement\npermission:\n  - read"],
     ["undefined alias as permission", "name: kusabi-implement\npermission: *undefined_defaults"],
@@ -195,7 +195,7 @@ describe("PR755 strict YAML: installed malformed content cannot be marker-upgrad
       fs.writeFileSync(
         path.join(dir, "kusabi-implement.md"),
         agentDoc(
-          `name: kusabi-implement\npermission:\n  "*": deny\n  read: ask\n  bash: deny\npermission:\n  "*": deny\n  read: allow`,
+          `name: kusabi-implement\npermission:\n  "*": deny\n  read: allow\n  bash: deny\npermission:\n  "*": deny\n  read: allow`,
         ),
         "utf8",
       );
@@ -245,7 +245,7 @@ describe("PR755 strict YAML: installed malformed content cannot be marker-upgrad
       fs.writeFileSync(
         path.join(src, "b-duplicate.md"),
         agentDoc(
-          `name: kusabi-implement\npermission:\n  "*": deny\n  read: ask\n  bash: deny\npermission:\n  "*": deny\n  read: allow`,
+          `name: kusabi-implement\npermission:\n  "*": deny\n  read: allow\n  bash: deny\npermission:\n  "*": deny\n  read: allow`,
         ),
         "utf8",
       );
@@ -282,7 +282,7 @@ describe("PR755 strict YAML: shipped templates still transform safely", () => {
       const once = transformAgentForOptIn(src);
       assert.equal(classifyInstalledAgentContent(once), "free", `${file} transformed must be free`);
       assert.equal(transformAgentForOptIn(once), once, `${file} must transform idempotently`);
-      assert.match(once, /read:\s*ask/, `${file} must grant read: ask`);
+      assert.match(once, /read:\s*allow/, `${file} must grant read: allow`);
       assert.match(once, /bash:\s*deny/, `${file} must deny bash`);
       assert.doesNotMatch(
         once,
@@ -313,5 +313,16 @@ describe("PR755 strict YAML: shipped templates still transform safely", () => {
       transformAgentForOptIn(gofer).endsWith(body),
       "non-review agent body must be preserved verbatim",
     );
+  });
+
+  it("accepts both read: allow and legacy read: ask as free", () => {
+    const freeAllow = agentDoc(`name: kusabi-implement\npermission:\n  "*": deny\n  read: allow\n  bash: deny`);
+    assert.equal(classifyInstalledAgentContent(freeAllow), "free");
+
+    const freeLegacyAsk = agentDoc(`name: kusabi-implement\npermission:\n  "*": deny\n  read: ask\n  bash: deny`);
+    assert.equal(classifyInstalledAgentContent(freeLegacyAsk), "free");
+
+    const invalidDeny = agentDoc(`name: kusabi-implement\npermission:\n  "*": deny\n  read: deny\n  bash: deny`);
+    assert.equal(classifyInstalledAgentContent(invalidDeny), "unknown");
   });
 });
