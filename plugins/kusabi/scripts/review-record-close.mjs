@@ -4,6 +4,7 @@ import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { stateRoot } from "./state-paths.mjs";
 import { isUnadjudicatedRecord } from "./review-record-scan.mjs";
+import { withControlWriteLock } from "./chain-control.mjs";
 
 export const FINDINGS_HEADER = "## Findings adjudication (fill at inspection)";
 const FINDINGS_HEADER_PATTERN = /^[ \t]*## Findings adjudication \(fill at inspection\)[ \t]*(\r?\n|$)/m;
@@ -116,58 +117,99 @@ function insertHistoricalMark(content, before) {
   return content.slice(0, insertionIndex) + prefix + content.slice(insertionIndex);
 }
 
+function withAllControlWriteLocks(dirs, fn) {
+  function acquire(index) {
+    if (index >= dirs.length) {
+      return fn();
+    }
+    return withControlWriteLock(dirs[index], () => acquire(index + 1));
+  }
+  return acquire(0);
+}
+
 export function closeReviewRecords({ before, stateRootDir = stateRoot(), apply = false }) {
   validateBefore(before);
   const { targets, skipped } = scanReviewRecords({ before, stateRootDir });
   if (apply && targets.length > 0) {
-    const planned = targets.map((target) => {
-      const realPath = fs.realpathSync(target.path);
-      const stat = fs.statSync(realPath);
-      const newContent = insertHistoricalMark(target.content, before);
-      const temporaryPath = path.join(
-        path.dirname(realPath),
-        `.${path.basename(realPath)}.${process.pid}.${randomUUID()}.tmp`,
-      );
+    const sortedTargets = [...targets].sort((a, b) => a.path.localeCompare(b.path));
+    const dirs = [...new Set(sortedTargets.map((target) => path.dirname(target.path)))].sort();
+
+    return withAllControlWriteLocks(dirs, () => {
+      const planned = [];
+      for (const target of sortedTargets) {
+        let currentContent;
+        try {
+          currentContent = fs.readFileSync(target.path, "utf8");
+        } catch {
+          skipped.push({ path: target.path, reason: "changed since scan" });
+          continue;
+        }
+        if (!isUnadjudicatedRecord(currentContent) || hasHistoricalMark(currentContent)) {
+          skipped.push({ path: target.path, reason: "changed since scan" });
+          continue;
+        }
+        let realPath;
+        let stat;
+        let newContent;
+        try {
+          realPath = fs.realpathSync(target.path);
+          stat = fs.statSync(realPath);
+          newContent = insertHistoricalMark(currentContent, before);
+        } catch {
+          skipped.push({ path: target.path, reason: "changed since scan" });
+          continue;
+        }
+        const temporaryPath = path.join(
+          path.dirname(realPath),
+          `.${path.basename(realPath)}.${process.pid}.${randomUUID()}.tmp`,
+        );
+        planned.push({
+          targetPath: target.path,
+          realPath,
+          mode: stat.mode,
+          originalContent: currentContent,
+          newContent,
+          temporaryPath,
+          writtenTemp: false,
+          renamed: false,
+        });
+      }
+
+      try {
+        for (const item of planned) {
+          fs.writeFileSync(item.temporaryPath, item.newContent, { flag: "wx", mode: item.mode });
+          fs.chmodSync(item.temporaryPath, item.mode);
+          item.writtenTemp = true;
+        }
+        for (const item of planned) {
+          fs.renameSync(item.temporaryPath, item.realPath);
+          item.renamed = true;
+        }
+      } catch (error) {
+        for (const item of planned) {
+          if (item.writtenTemp && !item.renamed) {
+            try { fs.unlinkSync(item.temporaryPath); } catch { /* best-effort cleanup */ }
+          }
+        }
+        for (const item of planned) {
+          if (item.renamed) {
+            try {
+              fs.writeFileSync(item.realPath, item.originalContent, { mode: item.mode });
+              fs.chmodSync(item.realPath, item.mode);
+            } catch { /* best-effort restore */ }
+          }
+        }
+        throw error;
+      }
+
       return {
-        targetPath: target.path,
-        realPath,
-        mode: stat.mode,
-        originalContent: target.content,
-        newContent,
-        temporaryPath,
-        writtenTemp: false,
-        renamed: false,
+        targets: planned.map(({ targetPath }) => targetPath),
+        skipped,
+        written: planned.length,
       };
     });
-
-    try {
-      for (const item of planned) {
-        fs.writeFileSync(item.temporaryPath, item.newContent, { flag: "wx", mode: item.mode });
-        fs.chmodSync(item.temporaryPath, item.mode);
-        item.writtenTemp = true;
-      }
-      for (const item of planned) {
-        fs.renameSync(item.temporaryPath, item.realPath);
-        item.renamed = true;
-      }
-    } catch (error) {
-      for (const item of planned) {
-        if (item.writtenTemp && !item.renamed) {
-          try { fs.unlinkSync(item.temporaryPath); } catch { /* best-effort cleanup */ }
-        }
-      }
-      for (const item of planned) {
-        if (item.renamed) {
-          try {
-            fs.writeFileSync(item.realPath, item.originalContent, { mode: item.mode });
-            fs.chmodSync(item.realPath, item.mode);
-          } catch { /* best-effort restore */ }
-        }
-      }
-      throw error;
-    }
   }
-  return { targets: targets.map(({ path: recordPath }) => recordPath), skipped, written: apply ? targets.length : 0 };
+  return { targets: targets.map(({ path: recordPath }) => recordPath), skipped, written: 0 };
 }
 
 function parseArgs(argv) {
