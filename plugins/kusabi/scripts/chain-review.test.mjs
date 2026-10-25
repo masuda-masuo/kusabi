@@ -4,6 +4,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import child_process from "node:child_process";
 
 import {
   shouldSkipReview,
@@ -2150,7 +2151,7 @@ describe("runReviewPhase quote accuracy check", () => {
   it("omits quoteCheck and preserves the verdict when exec output is truncated", async () => {
     const { roundRecord } = await runQuoteReview({
       findings: [quoteReviewFinding()],
-      execOutput: "0\\tok\\t" + Buffer.from("const answer = 42;").toString("base64") + "\\n",
+      execOutput: "0\tok\t" + Buffer.from("const answer = 42;").toString("base64") + "\n",
       execResultFlags: { truncated: true },
     });
 
@@ -2162,13 +2163,60 @@ describe("runReviewPhase quote accuracy check", () => {
   it("omits quoteCheck and preserves the verdict when exec output has more data", async () => {
     const { roundRecord } = await runQuoteReview({
       findings: [quoteReviewFinding()],
-      execOutput: "0\\tok\\t" + Buffer.from("const answer = 42;").toString("base64") + "\\n",
+      execOutput: "0\tok\t" + Buffer.from("const answer = 42;").toString("base64") + "\n",
       execResultFlags: { has_more: true },
     });
 
     assert.equal(Object.hasOwn(roundRecord, "quoteCheck"), false);
     assert.equal(roundRecord.quoteCheckReason, "quote check output truncated");
     assert.equal(roundRecord.verdict, "approve");
+  });
+
+  it("surfaces awk stderr when awk execution fails", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-awk-"));
+    const fakeBinDir = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-awk-bin-"));
+    const filename = "test-target.txt";
+    fs.writeFileSync(path.join(dir, filename), "line 1\n");
+    const fakeAwk = path.join(fakeBinDir, "awk");
+    fs.writeFileSync(fakeAwk, "#!/bin/sh\necho \"fake awk: cannot open input\" >&2\nexit 1\n", { mode: 0o755 });
+    fs.chmodSync(fakeAwk, 0o755);
+    const roundRecord = { round: 1 };
+
+    try {
+      await runReview({
+        roundRecord,
+        callTool: async (tool, params) => {
+          if (tool === "sandbox_exec") {
+            const cmd = params?.commands?.[0];
+            if (cmd && cmd.includes("od -An -tu1")) {
+              const res = child_process.spawnSync("sh", ["-c", cmd], {
+                cwd: dir,
+                encoding: "utf8",
+                env: { ...process.env, PATH: fakeBinDir + ":" + process.env.PATH },
+              });
+              return {
+                output: res.stdout,
+                stderr: res.stderr,
+                exit_code: res.status,
+              };
+            }
+            return { output: "TREE_HASH=0123456789abcdef0123456789abcdef01234567\nCOUNT=0\n" };
+          }
+          return { output: "" };
+        },
+        _dispatchWithFallback: async () => fakeJob(
+          "job-quote-check",
+          quoteReviewText([quoteReviewFinding({ file: filename, line: 1 })]),
+        ),
+      });
+
+      assert.equal(Object.hasOwn(roundRecord, "quoteCheck"), false);
+      assert.match(roundRecord.quoteCheckReason, /fake awk: cannot open input/);
+      assert.equal(roundRecord.verdict, "approve");
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+      fs.rmSync(fakeBinDir, { recursive: true, force: true });
+    }
   });
 
   it("keeps the review verdict and omits quoteCheck when exec fails", async () => {
