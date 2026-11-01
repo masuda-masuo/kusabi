@@ -150,13 +150,32 @@ export function computeStats(chains, opts = {}) {
   const roundCount = allRounds.length;
 
   // ---- quote checks ----
-  const quoteCheck = { rounds: 0, findings: 0, quoted: 0, mismatched: 0, failed: 0, excluded: 0 };
+  // `v2Rounds` and `v2Quoted` are ordinary enumerable fields so the mismatch
+  // denominator survives JSON serialisation; a non-enumerable field is lost
+  // by JSON.stringify and the rendered rate degenerates to "n/a".
+  const quoteCheck = {
+    rounds: 0,
+    findings: 0,
+    quoted: 0,
+    mismatched: 0,
+    displaced: 0,
+    v2Rounds: 0,
+    v2Quoted: 0,
+    failed: 0,
+    excluded: 0,
+  };
+
   for (const { round } of allRounds) {
     if (round.quoteCheck && typeof round.quoteCheck === "object" && !Array.isArray(round.quoteCheck)) {
       quoteCheck.rounds += 1;
       quoteCheck.findings += round.quoteCheck.findings || 0;
       quoteCheck.quoted += round.quoteCheck.quoted || 0;
-      quoteCheck.mismatched += round.quoteCheck.mismatched || 0;
+      if (round.quoteCheck.matchVersion >= 2) {
+        quoteCheck.v2Rounds += 1;
+        quoteCheck.v2Quoted += round.quoteCheck.quoted || 0;
+        quoteCheck.mismatched += round.quoteCheck.mismatched || 0;
+        quoteCheck.displaced += round.quoteCheck.displaced || 0;
+      }
     } else if (round.quoteCheckReason) {
       quoteCheck.failed += 1;
     } else {
@@ -717,12 +736,17 @@ export function renderChainStats(stats, opts = {}) {
   if (stats.quoteCheck.rounds > 0 || stats.quoteCheck.failed > 0) {
     const qc = stats.quoteCheck;
     const quotedRate = qc.findings > 0 ? `${(qc.quoted / qc.findings * 100).toFixed(1)}%` : "n/a";
-    const mismatchRate = qc.quoted > 0 ? `${(qc.mismatched / qc.quoted * 100).toFixed(1)}%` : "n/a";
+    const mismatchRate = (qc.v2Rounds > 0 && qc.v2Quoted > 0) ? `${(qc.mismatched / qc.v2Quoted * 100).toFixed(1)}%` : "n/a";
+    const displacedRate = (qc.v2Rounds > 0 && qc.v2Quoted > 0) ? `${(qc.displaced / qc.v2Quoted * 100).toFixed(1)}%` : "n/a";
     lines.push("Quote check:");
     lines.push(`  Rounds                       ${qc.rounds}`);
     lines.push(`  Findings                     ${qc.findings}`);
     lines.push(`  Quoted                       ${qc.quoted} (${quotedRate})`);
-    lines.push(`  Mismatched                   ${qc.mismatched} (${mismatchRate})`);
+    // Mismatched and Displaced are measured over v2 rounds only, so both lines
+    // carry the same denominator (v2Quoted) instead of hiding it.
+    lines.push(`  Mismatched                   ${qc.mismatched}/${qc.v2Quoted} (${mismatchRate})`);
+    lines.push(`  Displaced                    ${qc.displaced}/${qc.v2Quoted} (${displacedRate})`);
+    lines.push(`  (Mismatched and Displaced cover v2 rounds only: ${qc.v2Rounds})`);
     lines.push(`  Failed                       ${qc.failed}`);
     lines.push(`  Excluded                     ${qc.excluded}`);
     lines.push("");
@@ -918,7 +942,7 @@ export function renderComparison(statsBefore, statsAfter, cutoff) {
       const rate = qc.findings > 0 ? `${(qc.quoted / qc.findings * 100).toFixed(1)}%` : "n/a";
       return `${qc.quoted}/${qc.findings} (${rate})`;
     }
-    return qc.quoted > 0 ? `${(qc.mismatched / qc.quoted * 100).toFixed(1)}%` : "n/a";
+    return (qc.v2Rounds > 0 && qc.v2Quoted > 0) ? `${(qc.mismatched / qc.v2Quoted * 100).toFixed(1)}%` : "n/a";
   };
   lines.push(col("Quote: quoted/findings", quoteRow(statsBefore, "quoted"), quoteRow(statsAfter, "quoted")));
   lines.push(col("Quote: mismatch rate", quoteRow(statsBefore, "mismatch"), quoteRow(statsAfter, "mismatch")));

@@ -35,6 +35,7 @@ import {
   classifyDispatchQuotaExhaustion,
 } from "./chain-quota.mjs";
 import { captureWorktreeState } from "./worktree-baseline.mjs";
+import { quoteCandidates, classifyQuote } from "./quote-check.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const PLUGIN_ROOT = path.resolve(HERE, "..");
@@ -588,6 +589,7 @@ export async function runReviewPhase({
       const findings = Array.isArray(_parsed?.findings) ? _parsed.findings : [];
       const checks = [];
       const mismatches = [];
+      const displacedList = [];
       for (let idx = 0; idx < findings.length; idx += 1) {
         const finding = findings[idx];
         const bodyLines = typeof finding?.body === "string" ? finding.body.split("\n") : [];
@@ -595,10 +597,9 @@ export async function runReviewPhase({
           return line.startsWith("Quote: ") && (line.match(/`/g) || []).length >= 2;
         });
         if (!quoteLine) continue;
-        const firstTick = quoteLine.indexOf("`");
-        const lastTick = quoteLine.lastIndexOf("`");
-        const quote = quoteLine.slice(firstTick + 1, lastTick);
-        const check = { idx, file: finding.file, line_start: finding.line_start, quote };
+        const candidates = quoteCandidates(quoteLine);
+        const quote = candidates[0] ?? "";
+        const check = { idx, file: finding.file, line_start: finding.line_start, candidates, quote };
         const file = check.file;
         if (typeof file !== "string" || file.startsWith("/") || file.includes("..") || !/^[A-Za-z0-9._/-]+$/.test(file)) {
           mismatches.push({ check, actual: "", reason: "invalid path" });
@@ -613,10 +614,21 @@ export async function runReviewPhase({
       }
 
       if (checks.length > 0) {
-        const command = checks.map(function (check) {
-          const quotedPath = "'" + check.file + "'";
-          const encoder = `LC_ALL=C od -An -tu1 | awk 'BEGIN { alphabet="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/" } { for (i=1; i<=NF; i++) bytes[++n]=$i } END { for (i=1; i<=n; i+=3) { a=bytes[i]; b=(i+1<=n ? bytes[i+1] : 0); c=(i+2<=n ? bytes[i+2] : 0); printf "%s%s%s%s", substr(alphabet, int(a/4)+1, 1), substr(alphabet, (a%4)*16+int(b/16)+1, 1), (i+1<=n ? substr(alphabet, (b%16)*4+int(c/64)+1, 1) : "="), (i+2<=n ? substr(alphabet, c%64+1, 1) : "=") } }'`;
-          return "if [ ! -f " + quotedPath + " ]; then printf '" + check.idx + "\\tnofile\\t\\n'; else line=$(awk 'NR==" + check.line_start + " { print; found=1 } END { if (!found) exit 1 }' " + quotedPath + "); status=$?; if [ \"$status\" -ne 0 ]; then printf '" + check.idx + "\\teof\\t\\n'; else encoded=$(printf '%s' \"$line\" | " + encoder + "); printf '" + check.idx + "\\tok\\t%s\\n' \"$encoded\"; fi; fi";
+        const fileEntries = [];
+        const fileEntryMap = new Map();
+        for (const check of checks) {
+          if (!fileEntryMap.has(check.file)) {
+            const entry = { id: check.idx, file: check.file, checks: [] };
+            fileEntryMap.set(check.file, entry);
+            fileEntries.push(entry);
+          }
+          fileEntryMap.get(check.file).checks.push(check);
+        }
+
+        const encoder = `awk 'BEGIN { alphabet="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/" } { for (i=1; i<=NF; i++) bytes[++n]=$i } END { for (i=1; i<=n; i+=3) { a=bytes[i]; b=(i+1<=n ? bytes[i+1] : 0); c=(i+2<=n ? bytes[i+2] : 0); printf "%s%s%s%s", substr(alphabet, int(a/4)+1, 1), substr(alphabet, (a%4)*16+int(b/16)+1, 1), (i+1<=n ? substr(alphabet, (b%16)*4+int(c/64)+1, 1) : "="), (i+2<=n ? substr(alphabet, c%64+1, 1) : "=") } }'`;
+        const command = fileEntries.map(function (entry) {
+          const quotedPath = "'" + entry.file + "'";
+          return "if [ ! -f " + quotedPath + " ]; then printf '" + entry.id + "\\tnofile\\t\\n'; else encoded=$(LC_ALL=C od -An -tu1 -v " + quotedPath + " | " + encoder + "); status=$?; if [ \"$status\" -ne 0 ]; then exit \"$status\"; fi; printf '" + entry.id + "\\tok\\t%s\\n' \"$encoded\"; fi";
         }).join("; ");
         try {
           const execResult = await callTool("sandbox_exec", {
@@ -634,23 +646,43 @@ export async function runReviewPhase({
             throw new Error(stderr ? `quote check exec failed: ${stderr}` : "quote check exec failed");
           }
           const rows = output.replace(/\n$/, "").split("\n");
-          if (rows.length !== checks.length) throw new Error("quote check output count mismatch");
-          const byIdx = new Map();
+          if (rows.length !== fileEntries.length) throw new Error("quote check output count mismatch");
+          const byId = new Map();
           for (const row of rows) {
-            const match = /^(\d+)\t(ok|eof|nofile)\t([A-Za-z0-9+/=]*)$/.exec(row);
-            if (!match || byIdx.has(Number(match[1]))) throw new Error("quote check output malformed");
-            byIdx.set(Number(match[1]), { status: match[2], encoded: match[3] });
+            const match = /^(\d+)\t(ok|nofile)\t([A-Za-z0-9+/=]*)$/.exec(row);
+            if (!match || byId.has(Number(match[1]))) throw new Error("quote check output malformed");
+            byId.set(Number(match[1]), { status: match[2], encoded: match[3] });
           }
-          for (const check of checks) {
-            const result = byIdx.get(check.idx);
+          for (const entry of fileEntries) {
+            const result = byId.get(entry.id);
             if (!result) throw new Error("quote check output missing row");
-            if (result.status === "eof") {
-              mismatches.push({ check, actual: "", reason: "line out of range" });
-            } else if (result.status === "nofile") {
-              mismatches.push({ check, actual: "", reason: "file not found" });
+            if (result.status === "nofile") {
+              for (const check of entry.checks) {
+                mismatches.push({ check, actual: "", reason: "file not found" });
+              }
             } else {
-              const actual = Buffer.from(result.encoded, "base64").toString("utf8");
-              if (actual.trim() !== check.quote.trim()) mismatches.push({ check, actual });
+              const content = Buffer.from(result.encoded, "base64").toString("utf8");
+              const fileLines = content.length === 0
+                ? []
+                : (content.endsWith("\n") ? content.slice(0, -1).split("\n") : content.split("\n"));
+
+              for (const check of entry.checks) {
+                const classification = classifyQuote(check.candidates, fileLines, check.line_start);
+                if (classification.status === "matched") {
+                  // matched
+                } else if (classification.status === "displaced") {
+                  const foundAt = classification.foundAt;
+                  const foundQuote = (fileLines[foundAt - 1] ?? "").trim();
+                  displacedList.push({
+                    check,
+                    foundAt,
+                    distance: classification.distance,
+                    quote: foundQuote || check.quote,
+                  });
+                } else {
+                  mismatches.push({ check, actual: "", reason: "not in file" });
+                }
+              }
             }
           }
         } catch (error) {
@@ -669,6 +701,15 @@ export async function runReviewPhase({
           if (entry.reason) example.reason = entry.reason;
           return example;
         });
+        const displacedExamples = displacedList.slice(0, 3).map(function (entry) {
+          return {
+            file: String(entry.check.file ?? "").slice(0, 200),
+            line: entry.check.line_start,
+            foundAt: entry.foundAt,
+            distance: entry.distance,
+            quote: String(entry.quote ?? entry.check.quote ?? "").slice(0, 200),
+          };
+        });
         roundRecord.quoteCheck = {
           findings: findings.length,
           quoted: findings.reduce(function (count, finding) {
@@ -678,7 +719,15 @@ export async function runReviewPhase({
             }) ? 1 : 0);
           }, 0),
           mismatched: mismatches.length,
+          displaced: displacedList.length,
+          // Full distance list (never capped like displacedExamples) so the
+          // recorded data shows how far every displaced quote actually moved.
+          displacedDistances: displacedList.map(function (entry) {
+            return entry.distance;
+          }),
           examples,
+          displacedExamples,
+          matchVersion: 2,
         };
       }
     }

@@ -2100,7 +2100,11 @@ describe("runReviewPhase quote accuracy check", () => {
       findings: 1,
       quoted: 1,
       mismatched: 0,
+      displaced: 0,
+      displacedDistances: [],
       examples: [],
+      displacedExamples: [],
+      matchVersion: 2,
     }, roundRecord.quoteCheckReason);
   });
 
@@ -2115,7 +2119,8 @@ describe("runReviewPhase quote accuracy check", () => {
       file: "src/example.js",
       line: 1,
       quote: "const answer = 42;",
-      actual: "const answer = 0;",
+      actual: "",
+      reason: "not in file",
     });
   });
 
@@ -2231,10 +2236,10 @@ describe("runReviewPhase quote accuracy check", () => {
     assert.ok(roundRecord.quoteCheckReason.length <= 100);
   });
 
-  it("marks a quote beyond EOF as line out of range", async () => {
+  it("marks a quote beyond EOF as not in file when absent", async () => {
     const { roundRecord } = await runQuoteReview({
       findings: [quoteReviewFinding({ line: 9 })],
-      execOutput: "0\teof\t\n",
+      execOutput: "0\tok\t" + Buffer.from("line 1\nline 2\n").toString("base64") + "\n",
     });
 
     assert.equal(roundRecord.quoteCheck.mismatched, 1);
@@ -2243,7 +2248,7 @@ describe("runReviewPhase quote accuracy check", () => {
       line: 9,
       quote: "const answer = 42;",
       actual: "",
-      reason: "line out of range",
+      reason: "not in file",
     });
   });
 
@@ -2278,5 +2283,169 @@ describe("runReviewPhase quote accuracy check", () => {
     }), paths.map(function (file) {
       return { file, reason: "invalid path" };
     }));
+  });
+
+  it("criterion 1: matches over-captured quote when candidate equals line at line_start", async () => {
+    const fileContent = "import a;\n\nfoo()\nreturn;\n";
+    const { roundRecord } = await runQuoteReview({
+      findings: [quoteReviewFinding({
+        file: "a.js",
+        line: 3,
+        body: "Quote: `foo()` (a.js:3). When x, `bar` fails",
+      })],
+      execOutput: "0\tok\t" + Buffer.from(fileContent).toString("base64") + "\n",
+    });
+
+    assert.equal(roundRecord.quoteCheck.quoted, 1);
+    assert.equal(roundRecord.quoteCheck.mismatched, 0);
+    assert.equal(roundRecord.quoteCheck.displaced, 0);
+  });
+
+  it("criterion 2: quote found 21 lines from line_start is displaced with foundAt; closest wins on multiple", async () => {
+    const lines = [];
+    for (let i = 1; i <= 30; i++) {
+      if (i === 22) lines.push("targetFunction();");
+      else lines.push(`// line ${i}`);
+    }
+    const fileContent = lines.join("\n") + "\n";
+    const { roundRecord } = await runQuoteReview({
+      findings: [quoteReviewFinding({
+        line: 1,
+        body: "Quote: `targetFunction();`",
+      })],
+      execOutput: "0\tok\t" + Buffer.from(fileContent).toString("base64") + "\n",
+    });
+
+    assert.equal(roundRecord.quoteCheck.mismatched, 0);
+    assert.equal(roundRecord.quoteCheck.displaced, 1);
+    assert.deepEqual(roundRecord.quoteCheck.displacedExamples[0], {
+      file: "src/example.js",
+      line: 1,
+      foundAt: 22,
+      distance: 21,
+      quote: "targetFunction();",
+    });
+  });
+
+  it("criterion 4: records a full displacedDistances list while capping displacedExamples at three", async () => {
+    const specs = [
+      { file: "src/a.js", quote: "const alphaValue = 1;", foundAt: 3 },
+      { file: "src/b.js", quote: "const betaValue = 2;", foundAt: 5 },
+      { file: "src/c.js", quote: "const gammaValue = 3;", foundAt: 7 },
+      { file: "src/d.js", quote: "const deltaValue = 4;", foundAt: 9 },
+    ];
+    const findings = specs.map(function (spec) {
+      return quoteReviewFinding({
+        file: spec.file,
+        line: 1,
+        body: "Quote: `" + spec.quote + "`",
+      });
+    });
+    const execOutput = specs.map(function (spec, index) {
+      const lines = [];
+      for (let line = 1; line < spec.foundAt; line += 1) lines.push("const filler = " + line + ";");
+      lines.push(spec.quote);
+      return index + "\tok\t" + Buffer.from(lines.join("\n") + "\n").toString("base64") + "\n";
+    }).join("");
+
+    const { roundRecord } = await runQuoteReview({
+      findings,
+      execOutput,
+    });
+
+    assert.equal(roundRecord.quoteCheck.displaced, 4);
+    assert.equal(roundRecord.quoteCheck.displacedExamples.length, 3);
+    assert.deepEqual(roundRecord.quoteCheck.displacedDistances, [2, 4, 6, 8]);
+    assert.deepEqual(
+      roundRecord.quoteCheck.displacedExamples.map(function (example) { return example.distance; }),
+      [2, 4, 6],
+    );
+  });
+
+  it("criterion 3: line_start past EOF with quote present is displaced", async () => {
+    const fileContent = "present();\n";
+    const { roundRecord } = await runQuoteReview({
+      findings: [quoteReviewFinding({
+        line: 10,
+        body: "Quote: `present();`",
+      })],
+      execOutput: "0\tok\t" + Buffer.from(fileContent).toString("base64") + "\n",
+    });
+
+    assert.equal(roundRecord.quoteCheck.mismatched, 0);
+    assert.equal(roundRecord.quoteCheck.displaced, 1);
+    assert.deepEqual(roundRecord.quoteCheck.displacedExamples[0], {
+      file: "src/example.js",
+      line: 10,
+      foundAt: 1,
+      distance: 9,
+      quote: "present();",
+    });
+  });
+
+  it("criterion 4: blank file line never matches and empty backticks yields mismatched", async () => {
+    const fileContent = "\n   \n\t\n";
+    const { roundRecord } = await runQuoteReview({
+      findings: [quoteReviewFinding({
+        line: 1,
+        body: "Quote: ``",
+      })],
+      execOutput: "0\tok\t" + Buffer.from(fileContent).toString("base64") + "\n",
+    });
+
+    assert.equal(roundRecord.quoteCheck.quoted, 1);
+    assert.equal(roundRecord.quoteCheck.mismatched, 1);
+    assert.deepEqual(roundRecord.quoteCheck.examples[0], {
+      file: "src/example.js",
+      line: 1,
+      quote: "",
+      actual: "",
+      reason: "not in file",
+    });
+  });
+
+  it("criterion 5: reviewer text never reaches the shell command", async () => {
+    const maliciousQuote = "Quote: `$(touch /tmp/x)` and 'malicious' quote";
+    const { calls } = await runQuoteReview({
+      findings: [quoteReviewFinding({
+        body: maliciousQuote,
+      })],
+      execOutput: "0\tok\t" + Buffer.from("safe file content\n").toString("base64") + "\n",
+    });
+
+    const quoteExecCalls = calls.filter(function (call) {
+      if (!Array.isArray(call.params?.commands)) return false;
+      const commands = call.params.commands.join(" ");
+      return commands.includes("alphabet=") || commands.includes("od -An -tu1");
+    });
+    assert.equal(quoteExecCalls.length, 1);
+    const execCmd = quoteExecCalls[0].params.commands.join(" ");
+    assert.equal(execCmd.includes("touch /tmp/x"), false);
+    assert.equal(execCmd.includes("malicious"), false);
+  });
+
+  it("fetches content of distinct finding files once", async () => {
+    const findings = [
+      quoteReviewFinding({ file: "src/same.js", line: 1 }),
+      quoteReviewFinding({ file: "src/same.js", line: 2 }),
+    ];
+    const { roundRecord, calls } = await runQuoteReview({
+      findings,
+      execOutput: "0\tok\t" + Buffer.from("const answer = 42;\nconst answer = 42;\n").toString("base64") + "\n",
+    });
+
+    const quoteExecCalls = calls.filter(function (call) {
+      if (!Array.isArray(call.params?.commands)) return false;
+      const commands = call.params.commands.join(" ");
+      return commands.includes("alphabet=");
+    });
+    assert.equal(quoteExecCalls.length, 1);
+    const execCmd = quoteExecCalls[0].params.commands.join(" ");
+    // Should only have one printf for index 0 (not for index 1)
+    const fileBranches = execCmd.split("; ").filter(c => c.startsWith("if [ ! -f"));
+    assert.equal(fileBranches.length, 1);
+    assert.equal(roundRecord.quoteCheck.findings, 2);
+    assert.equal(roundRecord.quoteCheck.quoted, 2);
+    assert.equal(roundRecord.quoteCheck.mismatched, 0);
   });
 });

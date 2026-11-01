@@ -1093,7 +1093,11 @@ describe("review-resume revalidation with an unchecked oracle (kusabi #541)", ()
         findings: 1,
         quoted: 1,
         mismatched: 0,
+        displaced: 0,
+        displacedDistances: [],
         examples: [],
+        displacedExamples: [],
+        matchVersion: 2,
       });
 
       assert.equal(result.done, true);
@@ -1107,7 +1111,11 @@ describe("review-resume revalidation with an unchecked oracle (kusabi #541)", ()
         findings: 1,
         quoted: 1,
         mismatched: 0,
+        displaced: 0,
+        displacedDistances: [],
         examples: [],
+        displacedExamples: [],
+        matchVersion: 2,
       });
       assert.equal(chainJson.records[0].reviewTreeHash, "0123456789abcdef0123456789abcdef01234567");
       const controlJson = readJson(path.join(chainDir, "control.json"));
