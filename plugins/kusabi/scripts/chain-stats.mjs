@@ -150,17 +150,20 @@ export function computeStats(chains, opts = {}) {
   const roundCount = allRounds.length;
 
   // ---- quote checks ----
+  // `v2Rounds` and `v2Quoted` are ordinary enumerable fields so the mismatch
+  // denominator survives JSON serialisation; a non-enumerable field is lost
+  // by JSON.stringify and the rendered rate degenerates to "n/a".
   const quoteCheck = {
     rounds: 0,
     findings: 0,
     quoted: 0,
     mismatched: 0,
     displaced: 0,
+    v2Rounds: 0,
+    v2Quoted: 0,
     failed: 0,
     excluded: 0,
   };
-  Object.defineProperty(quoteCheck, "v2Rounds", { value: 0, writable: true, enumerable: false, configurable: true });
-  Object.defineProperty(quoteCheck, "v2Quoted", { value: 0, writable: true, enumerable: false, configurable: true });
 
   for (const { round } of allRounds) {
     if (round.quoteCheck && typeof round.quoteCheck === "object" && !Array.isArray(round.quoteCheck)) {
@@ -734,12 +737,16 @@ export function renderChainStats(stats, opts = {}) {
     const qc = stats.quoteCheck;
     const quotedRate = qc.findings > 0 ? `${(qc.quoted / qc.findings * 100).toFixed(1)}%` : "n/a";
     const mismatchRate = (qc.v2Rounds > 0 && qc.v2Quoted > 0) ? `${(qc.mismatched / qc.v2Quoted * 100).toFixed(1)}%` : "n/a";
+    const displacedRate = (qc.v2Rounds > 0 && qc.v2Quoted > 0) ? `${(qc.displaced / qc.v2Quoted * 100).toFixed(1)}%` : "n/a";
     lines.push("Quote check:");
     lines.push(`  Rounds                       ${qc.rounds}`);
     lines.push(`  Findings                     ${qc.findings}`);
     lines.push(`  Quoted                       ${qc.quoted} (${quotedRate})`);
-    lines.push(`  Mismatched                   ${qc.mismatched} (${mismatchRate})`);
-    lines.push(`  Displaced                    ${qc.displaced}`);
+    // Mismatched and Displaced are measured over v2 rounds only, so both lines
+    // carry the same denominator (v2Quoted) instead of hiding it.
+    lines.push(`  Mismatched                   ${qc.mismatched}/${qc.v2Quoted} (${mismatchRate})`);
+    lines.push(`  Displaced                    ${qc.displaced}/${qc.v2Quoted} (${displacedRate})`);
+    lines.push(`  (Mismatched and Displaced cover v2 rounds only: ${qc.v2Rounds})`);
     lines.push(`  Failed                       ${qc.failed}`);
     lines.push(`  Excluded                     ${qc.excluded}`);
     lines.push("");

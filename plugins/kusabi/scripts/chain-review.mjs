@@ -676,6 +676,7 @@ export async function runReviewPhase({
                   displacedList.push({
                     check,
                     foundAt,
+                    distance: classification.distance,
                     quote: foundQuote || check.quote,
                   });
                 } else {
@@ -705,6 +706,7 @@ export async function runReviewPhase({
             file: String(entry.check.file ?? "").slice(0, 200),
             line: entry.check.line_start,
             foundAt: entry.foundAt,
+            distance: entry.distance,
             quote: String(entry.quote ?? entry.check.quote ?? "").slice(0, 200),
           };
         });
@@ -718,6 +720,11 @@ export async function runReviewPhase({
           }, 0),
           mismatched: mismatches.length,
           displaced: displacedList.length,
+          // Full distance list (never capped like displacedExamples) so the
+          // recorded data shows how far every displaced quote actually moved.
+          displacedDistances: displacedList.map(function (entry) {
+            return entry.distance;
+          }),
           examples,
           displacedExamples,
           matchVersion: 2,

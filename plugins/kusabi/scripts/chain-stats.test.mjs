@@ -235,14 +235,30 @@ describe("computeStats", () => {
       ] }),
     ]);
     assert.deepEqual(stats.quoteCheck, {
-      rounds: 2, findings: 6, quoted: 5, mismatched: 1, displaced: 0, failed: 0, excluded: 0,
+      rounds: 2, findings: 6, quoted: 5, mismatched: 1, displaced: 0,
+      v2Rounds: 2, v2Quoted: 5, failed: 0, excluded: 0,
     });
     assert.equal(stats.quoteCheck.quoted / stats.quoteCheck.findings, 5 / 6);
     assert.equal(stats.quoteCheck.mismatched / stats.quoteCheck.quoted, 1 / 5);
     const output = renderChainStats(stats);
     assert.match(output, /Quoted\s+5 \(83\.3%\)/);
-    assert.match(output, /Mismatched\s+1 \(20\.0%\)/);
-    assert.match(output, /Displaced\s+0/);
+    assert.match(output, /Mismatched\s+1\/5 \(20\.0%\)/);
+    assert.match(output, /Displaced\s+0\/5 \(0\.0%\)/);
+  });
+
+  it("criterion 5: keeps the mismatch rate through a JSON round-trip", () => {
+    const stats = computeStats([
+      chain({ rounds: [
+        round({ quoteCheck: { findings: 4, quoted: 3, mismatched: 1, matchVersion: 2 } }),
+        round({ round: 2, quoteCheck: { findings: 2, quoted: 2, mismatched: 0, matchVersion: 2 } }),
+      ] }),
+    ]);
+    const roundTripped = JSON.parse(JSON.stringify(stats));
+
+    assert.deepEqual(roundTripped.quoteCheck, stats.quoteCheck);
+    assert.equal(roundTripped.quoteCheck.v2Rounds, 2);
+    assert.equal(roundTripped.quoteCheck.v2Quoted, 5);
+    assert.match(renderChainStats(roundTripped), /Mismatched\s+1\/5 \(20\.0%\)/);
   });
 
   it("counts quote-check failures without incrementing measured rounds", () => {
@@ -250,14 +266,16 @@ describe("computeStats", () => {
       chain({ rounds: [round({ quoteCheckReason: "checker failed" })] }),
     ]);
     assert.deepEqual(stats.quoteCheck, {
-      rounds: 0, findings: 0, quoted: 0, mismatched: 0, displaced: 0, failed: 1, excluded: 0,
+      rounds: 0, findings: 0, quoted: 0, mismatched: 0, displaced: 0,
+      v2Rounds: 0, v2Quoted: 0, failed: 1, excluded: 0,
     });
   });
 
   it("excludes old rounds without quote-check data from sums", () => {
     const stats = computeStats([chain({ rounds: [round({})] })]);
     assert.deepEqual(stats.quoteCheck, {
-      rounds: 0, findings: 0, quoted: 0, mismatched: 0, displaced: 0, failed: 0, excluded: 1,
+      rounds: 0, findings: 0, quoted: 0, mismatched: 0, displaced: 0,
+      v2Rounds: 0, v2Quoted: 0, failed: 0, excluded: 1,
     });
   });
 
@@ -266,7 +284,7 @@ describe("computeStats", () => {
       chain({ rounds: [round({ quoteCheck: { findings: 2, quoted: 0, mismatched: 0, matchVersion: 2 } })] }),
     ]);
     assert.equal(stats.quoteCheck.quoted, 0);
-    assert.match(renderChainStats(stats), /Mismatched\s+0 \(n\/a\)/);
+    assert.match(renderChainStats(stats), /Mismatched\s+0\/0 \(n\/a\)/);
   });
 
   it("compares quote rates using only rounds on each side of the cutoff", () => {
@@ -295,15 +313,19 @@ describe("computeStats", () => {
       ] }),
     ]);
     assert.deepEqual(stats.quoteCheck, {
-      rounds: 2, findings: 6, quoted: 5, mismatched: 1, displaced: 0, failed: 0, excluded: 0,
+      rounds: 2, findings: 6, quoted: 5, mismatched: 1, displaced: 0,
+      v2Rounds: 1, v2Quoted: 2, failed: 0, excluded: 0,
     });
     assert.equal(stats.quoteCheck.findings, 6);
     assert.equal(stats.quoteCheck.quoted, 5);
     assert.equal(stats.quoteCheck.mismatched, 1);
+    assert.equal(stats.quoteCheck.v2Rounds, 1);
+    assert.equal(stats.quoteCheck.v2Quoted, 2);
     const output = renderChainStats(stats);
     assert.match(output, /Quoted\s+5 \(83\.3%\)/);
-    assert.match(output, /Mismatched\s+1 \(50\.0%\)/);
-    assert.match(output, /Displaced\s+0/);
+    assert.match(output, /Mismatched\s+1\/2 \(50\.0%\)/);
+    assert.match(output, /Displaced\s+0\/2 \(0\.0%\)/);
+    assert.match(output, /Mismatched and Displaced cover v2 rounds only: 1/);
   });
 
   it("renders n/a for mismatch rate when only legacy rounds exist without matchVersion", () => {
@@ -314,10 +336,12 @@ describe("computeStats", () => {
     assert.equal(stats.quoteCheck.displaced, 0);
     assert.equal(stats.quoteCheck.quoted, 3);
     assert.equal(stats.quoteCheck.findings, 4);
+    assert.equal(stats.quoteCheck.v2Rounds, 0);
+    assert.equal(stats.quoteCheck.v2Quoted, 0);
     const output = renderChainStats(stats);
     assert.match(output, /Quoted\s+3 \(75\.0%\)/);
-    assert.match(output, /Mismatched\s+0 \(n\/a\)/);
-    assert.match(output, /Displaced\s+0/);
+    assert.match(output, /Mismatched\s+0\/0 \(n\/a\)/);
+    assert.match(output, /Displaced\s+0\/0 \(n\/a\)/);
   });
 
   it("produces the expected disposition and verdict distributions", () => {

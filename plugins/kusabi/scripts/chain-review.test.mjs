@@ -2101,6 +2101,7 @@ describe("runReviewPhase quote accuracy check", () => {
       quoted: 1,
       mismatched: 0,
       displaced: 0,
+      displacedDistances: [],
       examples: [],
       displacedExamples: [],
       matchVersion: 2,
@@ -2321,8 +2322,44 @@ describe("runReviewPhase quote accuracy check", () => {
       file: "src/example.js",
       line: 1,
       foundAt: 22,
+      distance: 21,
       quote: "targetFunction();",
     });
+  });
+
+  it("criterion 4: records a full displacedDistances list while capping displacedExamples at three", async () => {
+    const specs = [
+      { file: "src/a.js", quote: "const alphaValue = 1;", foundAt: 3 },
+      { file: "src/b.js", quote: "const betaValue = 2;", foundAt: 5 },
+      { file: "src/c.js", quote: "const gammaValue = 3;", foundAt: 7 },
+      { file: "src/d.js", quote: "const deltaValue = 4;", foundAt: 9 },
+    ];
+    const findings = specs.map(function (spec) {
+      return quoteReviewFinding({
+        file: spec.file,
+        line: 1,
+        body: "Quote: `" + spec.quote + "`",
+      });
+    });
+    const execOutput = specs.map(function (spec, index) {
+      const lines = [];
+      for (let line = 1; line < spec.foundAt; line += 1) lines.push("const filler = " + line + ";");
+      lines.push(spec.quote);
+      return index + "\tok\t" + Buffer.from(lines.join("\n") + "\n").toString("base64") + "\n";
+    }).join("");
+
+    const { roundRecord } = await runQuoteReview({
+      findings,
+      execOutput,
+    });
+
+    assert.equal(roundRecord.quoteCheck.displaced, 4);
+    assert.equal(roundRecord.quoteCheck.displacedExamples.length, 3);
+    assert.deepEqual(roundRecord.quoteCheck.displacedDistances, [2, 4, 6, 8]);
+    assert.deepEqual(
+      roundRecord.quoteCheck.displacedExamples.map(function (example) { return example.distance; }),
+      [2, 4, 6],
+    );
   });
 
   it("criterion 3: line_start past EOF with quote present is displaced", async () => {
@@ -2341,6 +2378,7 @@ describe("runReviewPhase quote accuracy check", () => {
       file: "src/example.js",
       line: 10,
       foundAt: 1,
+      distance: 9,
       quote: "present();",
     });
   });

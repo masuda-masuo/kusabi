@@ -64,7 +64,7 @@ describe("classifyQuote", () => {
     }
     // lineStart = 1, found at line 22 -> distance is 21
     const result = classifyQuote(candidates, fileLines, 1);
-    assert.deepEqual(result, { status: "displaced", foundAt: 22 });
+    assert.deepEqual(result, { status: "displaced", foundAt: 22, distance: 21 });
   });
 
   it("criterion 2: closest line wins when quote occurs twice", () => {
@@ -83,11 +83,11 @@ describe("classifyQuote", () => {
     ];
     // Tie at distance 3 between line 2 and line 8: lower line (line 2) wins
     const resultTie = classifyQuote(candidates, fileLines, 5);
-    assert.deepEqual(resultTie, { status: "displaced", foundAt: 2 });
+    assert.deepEqual(resultTie, { status: "displaced", foundAt: 2, distance: 3 });
 
     // When lineStart is 7, distance to line 8 is 1, distance to line 2 is 5 -> line 8 wins
     const resultClosest = classifyQuote(candidates, fileLines, 7);
-    assert.deepEqual(resultClosest, { status: "displaced", foundAt: 8 });
+    assert.deepEqual(resultClosest, { status: "displaced", foundAt: 8, distance: 1 });
   });
 
   it("criterion 3: quote absent from file classifies as mismatched", () => {
@@ -108,7 +108,7 @@ describe("classifyQuote", () => {
     ];
     // line_start = 10 is past EOF (file has 2 lines)
     const result = classifyQuote(candidates, fileLines, 10);
-    assert.deepEqual(result, { status: "displaced", foundAt: 1 });
+    assert.deepEqual(result, { status: "displaced", foundAt: 1, distance: 9 });
   });
 
   it("criterion 4: a blank file line never matches", () => {
@@ -146,5 +146,43 @@ describe("classifyQuote", () => {
     const candidates = ["foo()"];
     const fileLines = ["   foo()   "];
     assert.deepEqual(classifyQuote(candidates, fileLines, 1), { status: "matched" });
+  });
+
+  it("criterion 1: a low-information quote elsewhere is never displaced", () => {
+    assert.deepEqual(classifyQuote(["}"], ["a", "}", "b"], 1), { status: "mismatched" });
+    assert.deepEqual(classifyQuote(["});"], ["a", "b", "});"], 1), { status: "mismatched" });
+    assert.deepEqual(classifyQuote([");"], ["a", "b", ");"], 1), { status: "mismatched" });
+    assert.deepEqual(classifyQuote(["end"], ["a", "b", "end"], 1), { status: "mismatched" });
+  });
+
+  it("criterion 1: the scan continues past a nearby generic line to a farther informative match", () => {
+    const candidates = ["}", "return value;"];
+    const fileLines = [
+      "const a = 1;", // line 1 (line_start)
+      "}",            // line 2: low-information, close but proves nothing
+      "const b = 2;",
+      "const c = 3;",
+      "return value;", // line 5: informative displacement
+    ];
+    assert.deepEqual(classifyQuote(candidates, fileLines, 1), {
+      status: "displaced",
+      foundAt: 5,
+      distance: 4,
+    });
+  });
+
+  it("criterion 2: a displaced result carries its distance", () => {
+    const result = classifyQuote(["const value = 1;"], ["a", "b", "const value = 1;"], 1);
+    assert.deepEqual(result, { status: "displaced", foundAt: 3, distance: 2 });
+  });
+
+  it("criterion 3: a low-information quote at lineStart remains matched", () => {
+    const fileLines = ["const a = 1;", "}", "const b = 2;"];
+    assert.deepEqual(classifyQuote(["}"], fileLines, 2), { status: "matched" });
+  });
+
+  it("criterion 3: a partial-line quote remains mismatched", () => {
+    const fileLines = ["if (value) {", "  return value;", "}"];
+    assert.deepEqual(classifyQuote(["return value"], fileLines, 1), { status: "mismatched" });
   });
 });
