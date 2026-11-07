@@ -46,7 +46,7 @@ import {
   getProcessStartTime,
   checkWatcherProcess,
   isWatcherProcessAlive,
-  runProcess,
+  runResolvedProcess,
   watchChain,
   watchTask,
 } from "./watch-chain.mjs";
@@ -862,7 +862,7 @@ export async function launchAndWatch({
   // Build argv: ensure "chain-detach" is subcommand
   const dispatchArgs = args[0] === "chain-detach" ? args : ["chain-detach", ...args];
 
-  const dispatchResult = await runProcess(companionCmd, dispatchArgs, { cwd, env });
+  const dispatchResult = await runResolvedProcess(companionCmd, dispatchArgs, { cwd, env });
 
   const stdout = dispatchResult.stdout;
   const stderr = dispatchResult.stderr;
@@ -1004,7 +1004,7 @@ export async function launchTaskAndWatch({
   // Build argv: ensure "task-detach" is subcommand
   const dispatchArgs = args[0] === "task-detach" ? args : ["task-detach", ...args];
 
-  const dispatchResult = await runProcess(companionCmd, dispatchArgs, { cwd, env });
+  const dispatchResult = await runResolvedProcess(companionCmd, dispatchArgs, { cwd, env });
 
   const stdout = dispatchResult.stdout;
   const stderr = dispatchResult.stderr;
