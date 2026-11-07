@@ -29,6 +29,7 @@ import {
   watchChain,
   watchTask,
 } from "../scripts/watch-chain.mjs";
+import { launchAndWatch, launchTaskAndWatch } from "../scripts/register-watch.mjs";
 
 function writeScript(file, body) {
   fs.writeFileSync(file, body, { mode: 0o755 });
@@ -36,22 +37,41 @@ function writeScript(file, body) {
 }
 
 describe("parseEnvNodeShebang", () => {
-  it("recognizes env-node forms", () => {
-    assert.deepEqual(parseEnvNodeShebang("#!/usr/bin/env node"), { envNode: true, extraArgs: [] });
-    assert.deepEqual(parseEnvNodeShebang("#! /usr/bin/env nodejs"), { envNode: true, extraArgs: [] });
+  it("recognizes the modeled env-node forms and returns the exact program name", () => {
+    assert.deepEqual(parseEnvNodeShebang("#!/usr/bin/env node"), { envNode: true, program: "node", assignments: {}, extraArgs: [] });
+    assert.deepEqual(parseEnvNodeShebang("#! /usr/bin/env nodejs"), { envNode: true, program: "nodejs", assignments: {}, extraArgs: [] });
     assert.deepEqual(
       parseEnvNodeShebang("#!/usr/bin/env -S node --no-warnings"),
-      { envNode: true, extraArgs: ["--no-warnings"] },
+      { envNode: true, program: "node", assignments: {}, extraArgs: ["--no-warnings"] },
     );
     assert.deepEqual(
-      parseEnvNodeShebang("#!/usr/bin/env -S NODE_OPTIONS=x node"),
-      { envNode: true, extraArgs: [] },
+      parseEnvNodeShebang("#!/usr/bin/env -S A=1 B=two nodejs --x"),
+      { envNode: true, program: "nodejs", assignments: { A: "1", B: "two" }, extraArgs: ["--x"] },
     );
   });
 
-  it("rejects everything else", () => {
+  it("rejects non-env-node lines", () => {
     for (const line of ["#!/bin/sh", "#!/usr/bin/node", "#!/usr/bin/env python3", "#!/usr/bin/env", "\u007fELF", "", null]) {
       assert.equal(parseEnvNodeShebang(line).envNode, false, String(line));
+    }
+  });
+
+  it("leaves env forms it does not model to the normal launch", () => {
+    for (const line of [
+      "#!/usr/bin/env -i node",
+      "#!/usr/bin/env -u HOME node",
+      "#!/usr/bin/env -C /tmp node",
+      "#!/usr/bin/env -S -i node",
+      "#!/usr/bin/env -S -u HOME node",
+      "#!/usr/bin/env -S -C /tmp node",
+      "#!/usr/bin/env -- node",
+      "#!/usr/bin/env node --flag", // without -S the kernel passes one argument
+      "#!/usr/bin/env A=1 node", // without -S: same
+      "#!/usr/bin/env -S A='x y' node",
+      "#!/usr/bin/env -S A=${HOME} node",
+      "#!/usr/bin/env -S /opt/node/bin/node", // a path: env does not search PATH
+    ]) {
+      assert.equal(parseEnvNodeShebang(line).envNode, false, line);
     }
   });
 });
@@ -114,6 +134,70 @@ fs.writeFileSync(${JSON.stringify(marker)}, JSON.stringify({ argv: process.argv.
     const launch = resolveNodeLaunch(s, ["a"], { cwd: tmpRoot, env: { PATH: noNodeBin } });
     assert.equal(launch.viaNode, true);
     assert.deepEqual(launch.args, ["--no-warnings", s, "a"]);
+  });
+
+  for (const [wanted, provided] of [["node", "nodejs"], ["nodejs", "node"]]) {
+    it(`checks the exact name env asks for: \`env ${wanted}\` with only \`${provided}\` on PATH`, async () => {
+      const onlyOther = path.join(tmpRoot, `only-${provided}`);
+      fs.mkdirSync(onlyOther);
+      fs.symlinkSync(process.execPath, path.join(onlyOther, provided));
+      const s = writeScript(
+        path.join(tmpRoot, `wants-${wanted}`),
+        `#!/usr/bin/env ${wanted}\nrequire("node:fs").writeFileSync(${JSON.stringify(marker)}, "ran");\n`,
+      );
+      const env = { PATH: onlyOther };
+
+      // Control: the plain launch really fails for this PATH.
+      const plain = await runProcess(s, [], { cwd: tmpRoot, env });
+      assert.equal(plain.exitCode, 127, plain.stderr);
+      assert.match(plain.stderr, new RegExp(`'${wanted}'`));
+
+      const launch = resolveNodeLaunch(s, [], { cwd: tmpRoot, env });
+      assert.equal(launch.viaNode, true);
+      const res = await runResolvedProcess(s, [], { cwd: tmpRoot, env });
+      assert.equal(res.exitCode, 0, res.stderr);
+      assert.equal(fs.readFileSync(marker, "utf8"), "ran");
+    });
+  }
+
+  it("keeps -S assignments in the fallback launch, matching a normal launch", async () => {
+    const nodeBin = path.join(tmpRoot, "node-bin-assign");
+    fs.mkdirSync(nodeBin);
+    fs.symlinkSync(process.execPath, path.join(nodeBin, "node"));
+    const s = writeScript(
+      path.join(tmpRoot, "assigns"),
+      `#!/usr/bin/env -S KCN_TEST_VAR=set node\nprocess.stdout.write(String(process.env.KCN_TEST_VAR));\n`,
+    );
+
+    const normal = await runProcess(s, [], { cwd: tmpRoot, env: { PATH: nodeBin } });
+    assert.equal(normal.exitCode, 0, normal.stderr);
+    assert.equal(normal.stdout, "set");
+
+    const fallback = await runResolvedProcess(s, [], { cwd: tmpRoot, env: { PATH: noNodeBin } });
+    assert.equal(fallback.exitCode, 0, fallback.stderr);
+    assert.equal(fallback.stdout, "set");
+  });
+
+  it("searches the PATH assigned by -S, as env does", () => {
+    const nodeBin = path.join(tmpRoot, "node-bin-assigned-path");
+    fs.mkdirSync(nodeBin);
+    fs.symlinkSync(process.execPath, path.join(nodeBin, "node"));
+    const s1 = writeScript(path.join(tmpRoot, "assigned-ok"), `#!/usr/bin/env -S PATH=${nodeBin} node\n`);
+    assert.equal(resolveNodeLaunch(s1, [], { cwd: tmpRoot, env: { PATH: noNodeBin } }).viaNode, false);
+
+    const s2 = writeScript(path.join(tmpRoot, "assigned-missing"), `#!/usr/bin/env -S PATH=${noNodeBin} node\n`);
+    const launch = resolveNodeLaunch(s2, [], { cwd: tmpRoot, env: { PATH: nodeBin } });
+    assert.equal(launch.viaNode, true);
+    assert.equal(launch.env.PATH, `${noNodeBin}${path.delimiter}${path.dirname(process.execPath)}`);
+  });
+
+  it("leaves unmodeled env options unchanged even with node off PATH", () => {
+    for (const line of ["#!/usr/bin/env -S -i node", "#!/usr/bin/env -S -u HOME node", "#!/usr/bin/env -S -C /tmp node"]) {
+      const s = writeScript(path.join(tmpRoot, `opt-${Math.random().toString(36).slice(2)}`), `${line}\n`);
+      const launch = resolveNodeLaunch(s, ["a"], { cwd: tmpRoot, env: { PATH: noNodeBin } });
+      assert.equal(launch.viaNode, false, line);
+      assert.equal(launch.command, s);
+    }
   });
 
   it("leaves the launch unchanged when PATH already resolves node", () => {
@@ -268,4 +352,55 @@ if (process.env.TEST_CODEX_FAIL === "generic") { process.stderr.write("Error: co
     assert.equal(res.record.queueLaunch.viaNode, true);
     assert.equal(queueCount(), 1);
   });
+});
+
+describe("register-watch launch dispatch with node off PATH (#790)", () => {
+  let tmpRoot, noNodeBin, workspaceDir, stateDir, marker, companion;
+
+  beforeEach(() => {
+    tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "kcn-790l-"));
+    noNodeBin = path.join(tmpRoot, "empty-bin");
+    workspaceDir = path.join(tmpRoot, "workspace");
+    stateDir = path.join(tmpRoot, "notify-state");
+    for (const d of [noNodeBin, workspaceDir, stateDir]) fs.mkdirSync(d, { recursive: true });
+    marker = path.join(tmpRoot, "dispatch.json");
+    // The stand-in records that it actually ran, then refuses the dispatch so
+    // the wrapper stops before registering anything.
+    companion = writeScript(
+      path.join(tmpRoot, "mock-companion.mjs"),
+      `#!/usr/bin/env node
+import fs from "node:fs";
+fs.writeFileSync(${JSON.stringify(marker)}, JSON.stringify(process.argv.slice(2)));
+process.stderr.write("dispatch refused: test stand-in\\n");
+process.exitCode = 1;
+`,
+    );
+  });
+
+  afterEach(() => {
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  });
+
+  for (const [name, fn, sub] of [
+    ["--launch (chain-detach)", () => launchAndWatch, "chain-detach"],
+    ["--launch-task (task-detach)", () => launchTaskAndWatch, "task-detach"],
+  ]) {
+    it(`${name} reaches the companion instead of exiting 127`, async () => {
+      const res = await fn()({
+        companionBin: companion,
+        codexBin: path.join(tmpRoot, "unused-codex"),
+        args: ["--container", "c790"],
+        threadId: "thread-790l",
+        cwd: workspaceDir,
+        stateDir,
+        env: { PATH: noNodeBin, HOME: tmpRoot },
+        timeoutMs: 100,
+      });
+      assert.equal(res.success, false);
+      assert.equal(res.failureKind, "dispatch");
+      assert.equal(res.exitCode, 1, res.stderr);
+      assert.match(res.stderr, /dispatch refused/);
+      assert.deepEqual(JSON.parse(fs.readFileSync(marker, "utf8")), [sub, "--container", "c790"]);
+    });
+  }
 });

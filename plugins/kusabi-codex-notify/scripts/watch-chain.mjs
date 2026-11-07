@@ -592,19 +592,50 @@ export function resolveCommandPath(command, { cwd = process.cwd(), env = process
   return null;
 }
 
-/** Parse a `#!` line.  Returns `{ envNode: true, extraArgs }` when the
- *  interpreter is `env` running `node`/`nodejs` (with or without `-S`),
- *  otherwise `{ envNode: false }`. */
+/** Parse a `#!` line for the env-node forms this resolver models exactly.
+ *
+ *  Supported (anything else returns `{ envNode: false }` and is launched
+ *  unchanged — the boundary is explicit rather than approximated):
+ *    - `#!/usr/bin/env node` / `#!/usr/bin/env nodejs` — exactly one operand;
+ *      without `-S` the kernel passes the rest of the line as ONE argument,
+ *      so extra words would not work under a normal launch either.
+ *    - `#!/usr/bin/env -S [NAME=value ...] node|nodejs [arg ...]` — plain
+ *      words only.  Assignments are returned so the fallback launch applies
+ *      them exactly as env would.
+ *  Not modeled (→ envNode false): other env options (`-i`, `-u`, `-C`,
+ *  `-P`, `--`, ...), quoting/escapes/`${VAR}` inside `-S`, and an interpreter
+ *  given as a path (env does not search PATH for it).
+ *
+ *  Returns `{ envNode: true, program, assignments, extraArgs }`, where
+ *  `program` is the exact name env will search on PATH. */
+const ENV_ASSIGNMENT = /^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/;
+const ENV_NODE_PROGRAMS = new Set(["node", "nodejs"]);
+
 export function parseEnvNodeShebang(firstLine) {
-  if (typeof firstLine !== "string" || !firstLine.startsWith("#!")) return { envNode: false };
-  const tokens = firstLine.slice(2).trim().split(/\s+/).filter(Boolean);
-  if (tokens.length === 0 || path.basename(tokens[0]) !== "env") return { envNode: false };
-  let i = 1;
-  // Skip env options (`-S`, `-i`, `--`, ...) and NAME=value assignments.
-  while (i < tokens.length && (tokens[i].startsWith("-") || /^[A-Za-z_][A-Za-z0-9_]*=/.test(tokens[i]))) i++;
-  const program = tokens[i];
-  if (!program || !["node", "nodejs"].includes(path.basename(program))) return { envNode: false };
-  return { envNode: true, extraArgs: tokens.slice(i + 1) };
+  const no = { envNode: false };
+  if (typeof firstLine !== "string" || !firstLine.startsWith("#!")) return no;
+  const tokens = firstLine.slice(2).trim().split(/[ \t]+/).filter(Boolean);
+  if (tokens.length < 2 || path.basename(tokens[0]) !== "env") return no;
+
+  if (tokens[1] !== "-S") {
+    if (tokens.length !== 2 || !ENV_NODE_PROGRAMS.has(tokens[1])) return no;
+    return { envNode: true, program: tokens[1], assignments: {}, extraArgs: [] };
+  }
+
+  const rest = tokens.slice(2);
+  // -S splitting also interprets quotes, backslash escapes and ${VAR}; those
+  // are not modeled, so such lines are left to the normal launch.
+  if (rest.some((t) => /["'\\$]/.test(t))) return no;
+  const assignments = {};
+  let i = 0;
+  for (; i < rest.length; i++) {
+    const m = ENV_ASSIGNMENT.exec(rest[i]);
+    if (!m) break;
+    assignments[m[1]] = m[2];
+  }
+  const program = rest[i];
+  if (!program || !ENV_NODE_PROGRAMS.has(program)) return no;
+  return { envNode: true, program, assignments, extraArgs: rest.slice(i + 1) };
 }
 
 function readFirstLine(filePath) {
@@ -637,17 +668,20 @@ export function resolveNodeLaunch(command, args = [], { cwd = process.cwd(), env
   if (!resolvedPath) return unchanged;
   const shebang = parseEnvNodeShebang(readFirstLine(resolvedPath));
   if (!shebang.envNode) return { ...unchanged, resolvedPath };
-  if (resolveCommandPath("node", { cwd, env }) || resolveCommandPath("nodejs", { cwd, env })) {
-    // PATH already provides node — keep the original launch untouched.
+  // env applies `-S` assignments first, then searches PATH (possibly the
+  // assigned one) for exactly the requested program name.
+  const effectiveEnv = { ...env, ...shebang.assignments };
+  if (resolveCommandPath(shebang.program, { cwd, env: effectiveEnv })) {
+    // The interpreter env asks for is reachable — keep the original launch.
     return { ...unchanged, resolvedPath };
   }
   const nodeDir = path.dirname(nodePath);
-  const basePath = typeof env?.PATH === "string" ? env.PATH : "";
+  const basePath = typeof effectiveEnv.PATH === "string" ? effectiveEnv.PATH : "";
   const childPath = basePath ? `${basePath}${path.delimiter}${nodeDir}` : nodeDir;
   return {
     command: nodePath,
     args: [...shebang.extraArgs, resolvedPath, ...args],
-    env: { ...env, PATH: childPath },
+    env: { ...effectiveEnv, PATH: childPath },
     viaNode: true,
     resolvedPath,
   };
