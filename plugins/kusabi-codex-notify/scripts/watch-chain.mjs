@@ -539,6 +539,170 @@ export function updateClaim(claimPath, updates) {
 /**
  * Runs a process with process-group isolation, signal forwarding, and bounded escalation to SIGKILL.
  */
+// ---------------------------------------------------------------------------
+// Node-shebang launch resolution (kusabi #790)
+// ---------------------------------------------------------------------------
+//
+// npm/nvm installs of the Codex CLI (and `kusabi-companion` itself) are JS
+// entry points whose first line is `#!/usr/bin/env node`.  An absolute path
+// to such a file does NOT pin the interpreter: the kernel runs
+// `/usr/bin/env node`, which searches the CHILD's PATH.  Under systemd user
+// services, cron, or other non-login shells PATH is minimal
+// (`/usr/bin:/bin`), node is absent, and the spawn dies with exit 127
+// (`/usr/bin/env: 'node': No such file or directory`) — the terminal
+// notification is lost although the command itself was never reached.
+//
+// The watcher always runs under a working Node (it is spawned through
+// `process.execPath`), so when the target is an env-node script AND the
+// child PATH cannot resolve `node`, the script is run through
+// `process.execPath` directly, and that Node's bin directory is appended to
+// the child's PATH so the script's own `node` sub-spawns work too.  Native
+// binaries, scripts with an absolute interpreter (`#!/usr/bin/node`), and
+// env-node scripts whose PATH already resolves `node` are launched exactly
+// as before.
+
+const SHEBANG_READ_BYTES = 512;
+
+function isExecutableFile(candidate) {
+  try {
+    const st = fs.statSync(candidate);
+    if (!st.isFile()) return false;
+    fs.accessSync(candidate, fs.constants.X_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Resolve `command` the way spawn/execvp would: a path containing a slash
+ *  is taken relative to `cwd`; a bare name is searched on `env.PATH`.
+ *  Returns null when nothing executable is found. */
+export function resolveCommandPath(command, { cwd = process.cwd(), env = process.env } = {}) {
+  if (typeof command !== "string" || command === "") return null;
+  if (command.includes("/")) {
+    const abs = path.resolve(cwd || process.cwd(), command);
+    return isExecutableFile(abs) ? abs : null;
+  }
+  const pathValue = typeof env?.PATH === "string" ? env.PATH : "";
+  for (const dir of pathValue.split(path.delimiter)) {
+    if (!dir) continue;
+    const candidate = path.join(path.resolve(cwd || process.cwd(), dir), command);
+    if (isExecutableFile(candidate)) return candidate;
+  }
+  return null;
+}
+
+/** Parse a `#!` line for the env-node forms this resolver models exactly.
+ *
+ *  Supported (anything else returns `{ envNode: false }` and is launched
+ *  unchanged — the boundary is explicit rather than approximated):
+ *    - `#!/usr/bin/env node` / `#!/usr/bin/env nodejs` — exactly one operand;
+ *      without `-S` the kernel passes the rest of the line as ONE argument,
+ *      so extra words would not work under a normal launch either.
+ *    - `#!/usr/bin/env -S [NAME=value ...] node|nodejs [arg ...]` — plain
+ *      words only.  Assignments are returned so the fallback launch applies
+ *      them exactly as env would.
+ *  Not modeled (→ envNode false): other env options (`-i`, `-u`, `-C`,
+ *  `-P`, `--`, ...), quoting/escapes/`${VAR}` inside `-S`, and an interpreter
+ *  given as a path (env does not search PATH for it).
+ *
+ *  Returns `{ envNode: true, program, assignments, extraArgs }`, where
+ *  `program` is the exact name env will search on PATH. */
+const ENV_ASSIGNMENT = /^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/;
+const ENV_NODE_PROGRAMS = new Set(["node", "nodejs"]);
+
+export function parseEnvNodeShebang(firstLine) {
+  const no = { envNode: false };
+  if (typeof firstLine !== "string" || !firstLine.startsWith("#!")) return no;
+  const tokens = firstLine.slice(2).trim().split(/[ \t]+/).filter(Boolean);
+  if (tokens.length < 2 || path.basename(tokens[0]) !== "env") return no;
+
+  if (tokens[1] !== "-S") {
+    if (tokens.length !== 2 || !ENV_NODE_PROGRAMS.has(tokens[1])) return no;
+    return { envNode: true, program: tokens[1], assignments: {}, extraArgs: [] };
+  }
+
+  const rest = tokens.slice(2);
+  // -S splitting also interprets quotes, backslash escapes and ${VAR}; those
+  // are not modeled, so such lines are left to the normal launch.
+  if (rest.some((t) => /["'\\$]/.test(t))) return no;
+  const assignments = {};
+  let i = 0;
+  for (; i < rest.length; i++) {
+    const m = ENV_ASSIGNMENT.exec(rest[i]);
+    if (!m) break;
+    assignments[m[1]] = m[2];
+  }
+  const program = rest[i];
+  if (!program || !ENV_NODE_PROGRAMS.has(program)) return no;
+  return { envNode: true, program, assignments, extraArgs: rest.slice(i + 1) };
+}
+
+function readFirstLine(filePath) {
+  let fd = null;
+  try {
+    fd = fs.openSync(filePath, "r");
+    const buf = Buffer.alloc(SHEBANG_READ_BYTES);
+    const n = fs.readSync(fd, buf, 0, SHEBANG_READ_BYTES, 0);
+    const text = buf.subarray(0, n).toString("latin1");
+    const nl = text.indexOf("\n");
+    return (nl >= 0 ? text.slice(0, nl) : text).replace(/\r$/, "");
+  } catch {
+    return null;
+  } finally {
+    if (fd !== null) {
+      try { fs.closeSync(fd); } catch { /* best-effort */ }
+    }
+  }
+}
+
+/**
+ * Decide how to spawn `command args` so an env-node script still starts when
+ * the child PATH lacks `node`.  Pure apart from filesystem reads; never
+ * spawns.  Returns `{ command, args, env, viaNode, resolvedPath }`; when
+ * `viaNode` is false the inputs are returned unchanged.
+ */
+export function resolveNodeLaunch(command, args = [], { cwd = process.cwd(), env = process.env, nodePath = process.execPath } = {}) {
+  const unchanged = { command, args, env, viaNode: false, resolvedPath: null };
+  const resolvedPath = resolveCommandPath(command, { cwd, env });
+  if (!resolvedPath) return unchanged;
+  const shebang = parseEnvNodeShebang(readFirstLine(resolvedPath));
+  if (!shebang.envNode) return { ...unchanged, resolvedPath };
+  // env applies `-S` assignments first, then searches PATH (possibly the
+  // assigned one) for exactly the requested program name.
+  const effectiveEnv = { ...env, ...shebang.assignments };
+  if (resolveCommandPath(shebang.program, { cwd, env: effectiveEnv })) {
+    // The interpreter env asks for is reachable — keep the original launch.
+    return { ...unchanged, resolvedPath };
+  }
+  const nodeDir = path.dirname(nodePath);
+  const basePath = typeof effectiveEnv.PATH === "string" ? effectiveEnv.PATH : "";
+  const childPath = basePath ? `${basePath}${path.delimiter}${nodeDir}` : nodeDir;
+  return {
+    command: nodePath,
+    args: [...shebang.extraArgs, resolvedPath, ...args],
+    env: { ...effectiveEnv, PATH: childPath },
+    viaNode: true,
+    resolvedPath,
+  };
+}
+
+/** Durable, compact description of a launch decision for records. */
+export function describeLaunch(requested, launch) {
+  return {
+    requested,
+    resolvedPath: launch.resolvedPath,
+    viaNode: launch.viaNode,
+    command: launch.command,
+  };
+}
+
+/** runProcess with node-shebang resolution applied. */
+export function runResolvedProcess(command, args, options = {}) {
+  const launch = resolveNodeLaunch(command, args, { cwd: options.cwd, env: options.env ?? process.env });
+  return runProcess(launch.command, launch.args, { ...options, env: launch.env });
+}
+
 export function runProcess(command, args, { cwd, env = process.env, timeout = 0, onSpawn = null, isolateProcessGroup = true } = {}) {
   return new Promise((resolve) => {
     let stdout = "";
@@ -1077,7 +1241,7 @@ export async function watchChain({
   // 1. Run chain-wait
   const companionCmd = companionBin || env.KUSABI_COMPANION_BIN || "kusabi-companion";
   const companionArgs = ["chain-wait", chainId];
-  const waitResult = await runProcess(companionCmd, companionArgs, { cwd, env });
+  const waitResult = await runResolvedProcess(companionCmd, companionArgs, { cwd, env });
 
   if (waitResult.exitCode !== 0) {
     if (isSignalInterruption(waitResult)) {
@@ -1228,20 +1392,29 @@ export async function watchChain({
   // 5. Mark queue-in-flight immediately before spawn (fail-closed boundary).
   //    Persist the attempt timestamp on the record too, so a kill mid-queue
   //    leaves the "delivery attempted" diagnostic durable on disk.
+  //    The launch decision (kusabi #790: env-node shebang under a PATH
+  //    without node) is resolved first so it is recorded with the attempt.
+  const codexCmd = codexBin || env.CODEX_BIN || "codex";
+  const codexArgs = ["queue"];
+  if (remote) codexArgs.push("--remote", remote);
+  codexArgs.push("--thread", threadId, "--message", summaryMessage);
+  const queueLaunch = resolveNodeLaunch(codexCmd, codexArgs, { cwd, env });
+
   const attemptedAt = new Date().toISOString();
   updateClaim(claimPath, {
     phase: "queue_inflight",
     inflightAt: attemptedAt,
   });
-  currentRecord = { ...currentRecord, attemptedAt, updatedAt: attemptedAt };
+  currentRecord = {
+    ...currentRecord,
+    attemptedAt,
+    updatedAt: attemptedAt,
+    queueLaunch: describeLaunch(codexCmd, queueLaunch),
+  };
   writeRecordAtomic(recordPath, currentRecord);
 
   // 6. Call codex queue
-  const codexCmd = codexBin || env.CODEX_BIN || "codex";
-  const codexArgs = ["queue"];
-  if (remote) codexArgs.push("--remote", remote);
-  codexArgs.push("--thread", threadId, "--message", summaryMessage);
-  const queueResult = await runProcess(codexCmd, codexArgs, { cwd, env });
+  const queueResult = await runProcess(queueLaunch.command, queueLaunch.args, { cwd, env: queueLaunch.env });
 
   const evalResult = evaluateQueueResult(queueResult);
 
@@ -1495,7 +1668,7 @@ export async function watchTask({
 
   // 1. Run task-wait — the watcher owns this single blocking process
   const companionCmd = companionBin || env.KUSABI_COMPANION_BIN || "kusabi-companion";
-  const waitResult = await runProcess(companionCmd, ["task-wait", jobId], { cwd, env });
+  const waitResult = await runResolvedProcess(companionCmd, ["task-wait", jobId], { cwd, env });
 
   const taskWait = {
     exitCode: waitResult.exitCode,
@@ -1643,20 +1816,29 @@ export async function watchTask({
   // 5. Mark queue-in-flight immediately before spawn (fail-closed boundary).
   //    Persist the attempt timestamp on the record too, so a kill mid-queue
   //    leaves the "delivery attempted" diagnostic durable on disk.
+  //    The launch decision (kusabi #790: env-node shebang under a PATH
+  //    without node) is resolved first so it is recorded with the attempt.
+  const codexCmd = codexBin || env.CODEX_BIN || "codex";
+  const codexArgs = ["queue"];
+  if (remote) codexArgs.push("--remote", remote);
+  codexArgs.push("--thread", threadId, "--message", summaryMessage);
+  const queueLaunch = resolveNodeLaunch(codexCmd, codexArgs, { cwd, env });
+
   const attemptedAt = new Date().toISOString();
   updateClaim(claimPath, {
     phase: "queue_inflight",
     inflightAt: attemptedAt,
   });
-  currentRecord = { ...currentRecord, attemptedAt, updatedAt: attemptedAt };
+  currentRecord = {
+    ...currentRecord,
+    attemptedAt,
+    updatedAt: attemptedAt,
+    queueLaunch: describeLaunch(codexCmd, queueLaunch),
+  };
   writeRecordAtomic(recordPath, currentRecord);
 
   // 6. Call codex queue
-  const codexCmd = codexBin || env.CODEX_BIN || "codex";
-  const codexArgs = ["queue"];
-  if (remote) codexArgs.push("--remote", remote);
-  codexArgs.push("--thread", threadId, "--message", summaryMessage);
-  const queueResult = await runProcess(codexCmd, codexArgs, { cwd, env });
+  const queueResult = await runProcess(queueLaunch.command, queueLaunch.args, { cwd, env: queueLaunch.env });
 
   const evalResult = evaluateQueueResult(queueResult);
 
