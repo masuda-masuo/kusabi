@@ -101,6 +101,14 @@ node /path/to/kusabi/plugins/kusabi-codex-notify/scripts/watch-chain.mjs \
 
 `--remote <endpoint>` makes the watcher invoke `codex queue` with separate argv elements (`--remote`, `<endpoint>`, `--thread`, `<threadId>`, `--message`, `<summary>`); without it the default argv form is kept. Immediate live-TUI delivery requires all three (Codex app-server, origin TUI, wrapper registration) to share the same endpoint.
 
+### Running from systemd, cron, or other non-login environments
+
+npm / nvm installs of the Codex CLI (and `kusabi-companion`) are JS entry points whose first line is `#!/usr/bin/env node`. An absolute `--codex-bin` / `CODEX_BIN` path does **not** pin the interpreter: `env` searches the child's `PATH`, and under a systemd user service or cron that `PATH` is minimal (`/usr/bin:/bin`), so the spawn exits 127 (`/usr/bin/env: 'node': No such file or directory`) and the notification is lost.
+
+The watcher handles this itself (kusabi #790). Before spawning `codex queue`, `chain-wait` / `task-wait`, or the `--launch` / `--launch-task` dispatch, it resolves the command on the child `PATH`, reads its shebang, and — only when the target is an env-node script **and** that `PATH` cannot resolve `node` — runs the script through the watcher's own Node (`process.execPath`), appending that Node's bin directory to the child `PATH`. Native binaries, scripts with an absolute interpreter, and launches whose `PATH` already provides `node` are spawned exactly as before. The decision for the queue attempt is persisted on the record as `queueLaunch` (`requested`, `resolvedPath`, `viaNode`, `command`), so a failed or recovered delivery shows which launch was used. At-most-once delivery is unchanged: the launch is resolved before the `queue_inflight` boundary, and a 127 from a missing interpreter is still a definitive (retryable) queue failure, never `delivered`.
+
+Recommended entry point for long host jobs (e.g. a `systemd-run --user` verification): start the job's completion notification through `register-watch.mjs` / `watch-chain.mjs` invoked with an absolute Node (`/path/to/node .../register-watch.mjs ...`), and pass `--codex-bin` as an absolute path. Avoid calling `codex queue` directly from an ad-hoc script at the end of the job: it bypasses both this launch resolution and the durable claim/record, so a failure there leaves no recoverable state.
+
 ## Outcome status: `delivered`
 
 The durable outcome/status name remains `delivered` for backward compatibility. It means **`codex queue` exited 0** (the command was accepted). It is **not** proof of immediate live TUI display, and this plugin does not claim a live-delivery acknowledgment that Codex does not expose.
