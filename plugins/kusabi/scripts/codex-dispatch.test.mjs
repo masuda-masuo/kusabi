@@ -63,7 +63,7 @@ import {
 import { splitRouteBackend, resolveModelBackend, backendSupportsResume, WRITE_TOOL_NAMES, implementDenyTools, reviewDenyTools } from "./cli.mjs";
 import { renderHeader } from "./render.mjs";
 import { stateDirFor } from "./state-paths.mjs";
-import { loadJob, jobDir, listJobs } from "./job-store.mjs";
+import { loadJob, saveJob, jobDir, listJobs } from "./job-store.mjs";
 import { stopRecordedProcess } from "./process-identity.mjs";
 
 const THREAD_ID = "thread-527-9f3c2a1b";
@@ -121,7 +121,7 @@ function writeRollout(actualModel, effort) {
     { timestamp: new Date().toISOString(), type: "turn_context", payload: { turn_id: "turn-1", model: actualModel } },
   ];
   const body = recs.map(function (r) { return JSON.stringify(r); }).join(NL) + NL;
-  fs.writeFileSync(path.join(dir, "rollout-1.jsonl"), body);
+  fs.writeFileSync(path.join(dir, "rollout-1-" + thread + ".jsonl"), body);
 }
 
 function writeResumeRollout(originalModel, resumedModel, resumedEffort) {
@@ -139,7 +139,45 @@ function writeResumeRollout(originalModel, resumedModel, resumedEffort) {
     { timestamp: new Date().toISOString(), type: "turn_context", payload: { turn_id: "turn-2", model: resumedModel, model_reasoning_effort: resumedEffort } },
   ];
   const body = recs.map(function (r) { return JSON.stringify(r); }).join(NL) + NL;
-  fs.writeFileSync(path.join(dir, "rollout-1.jsonl"), body);
+  fs.writeFileSync(path.join(dir, "rollout-1-" + thread + ".jsonl"), body);
+}
+
+// Kusabi #793: the REAL CLI fails a resume when the thread's rollout does not
+// exist under its CODEX_HOME ("no rollout found for thread id ...").  Mirror
+// that fail-closed behaviour so a resume running under the wrong home cannot
+// pass silently.  The rollout file name carries the thread id, like the real
+// CLI's rollout-<ts>-<thread>.jsonl.
+function collectFiles(dir) {
+  const files = [];
+  const stack = [dir];
+  while (stack.length > 0) {
+    const current = stack.pop();
+    let children = [];
+    try {
+      children = fs.readdirSync(current, { withFileTypes: true });
+    } catch (e) {
+      continue;
+    }
+    for (const child of children) {
+      const full = path.join(current, child.name);
+      if (child.isDirectory()) stack.push(full);
+      else if (child.isFile()) files.push(full);
+    }
+  }
+  return files;
+}
+
+const resumeIndex = argv[0] === "exec" ? argv.indexOf("resume") : -1;
+if (resumeIndex >= 0) {
+  const resumedThread = argv[resumeIndex + 1];
+  const sessionsRoot = path.join(process.env.CODEX_HOME, "sessions");
+  const rolloutFound = collectFiles(sessionsRoot).some(function (file) {
+    return path.basename(file).indexOf(resumedThread) >= 0;
+  });
+  if (!rolloutFound) {
+    process.stderr.write("no rollout found for thread id " + resumedThread + NL);
+    process.exit(1);
+  }
 }
 
 const usage = { input_tokens: 10543, cached_input_tokens: 5376, cache_write_input_tokens: 0, output_tokens: 34 };
@@ -329,6 +367,61 @@ function loggedEnv(envLog) {
 
 function jobCodexHome(ctx, job) {
   return path.join(jobDir(ctx.stateDir, job.id), "codex-home");
+}
+
+// Kusabi #793: a resume dispatch must run under the CODEX_HOME of the codex
+// job that recorded the thread.  Seed such an originating job — and the
+// thread's rollout under its home — so the resume path has a home to reuse.
+// The rollout is written where the fake writes it, so a resumed invocation
+// overwrites it exactly like the real CLI appends to the same thread rollout.
+let seedJobCounter = 0;
+function seedOriginatingCodexJob(ctx, {
+  thread = THREAD_ID,
+  backend = CODEX_BACKEND,
+  codexHome,
+  status = "completed",
+  startedAt = new Date(Date.now() - 60000).toISOString(),
+  withRollout = true,
+} = {}) {
+  seedJobCounter += 1;
+  const id = `job-origin-${process.pid}-${seedJobCounter}`;
+  const home = codexHome === undefined ? path.join(jobDir(ctx.stateDir, id), "codex-home") : codexHome;
+  const job = {
+    id,
+    kind: "task",
+    title: "originating codex job",
+    status,
+    backend,
+    sessionID: thread,
+    cwd: ctx.cwd,
+    startedAt,
+    finishedAt: new Date(Date.now() - 59000).toISOString(),
+  };
+  if (home !== null) job.codexHome = home;
+  saveJob(ctx.stateDir, job);
+  // A job whose own per-job home EXISTS but never received the thread's
+  // rollout (`withRollout: false`) is exactly the stale record #793-stale
+  // must skip.
+  if (codexHome === undefined) fs.mkdirSync(home, { recursive: true });
+  if (withRollout && typeof home === "string" && home !== "" && fs.existsSync(home)) {
+    const dir = path.join(home, "sessions", thread);
+    fs.mkdirSync(dir, { recursive: true });
+    const recs = [
+      { timestamp: new Date().toISOString(), type: "session_meta", payload: { id: thread, cwd: ctx.cwd, model: MODEL, model_reasoning_effort: "high", approval_policy: "never", sandbox_policy: "read-only", network_policy: "restricted" } },
+      { timestamp: new Date().toISOString(), type: "turn_context", payload: { turn_id: "turn-1", model: MODEL } },
+    ];
+    fs.writeFileSync(
+      path.join(dir, `rollout-1-${thread}.jsonl`),
+      recs.map((r) => JSON.stringify(r)).join("\n") + "\n",
+      "utf8",
+    );
+  }
+  return job;
+}
+
+function jobCount(stateDir) {
+  const root = path.join(stateDir, "jobs");
+  return fs.existsSync(root) ? fs.readdirSync(root).length : 0;
 }
 
 describe("codexBin", () => {
@@ -1130,6 +1223,7 @@ describe("codexDispatch (fake codex)", () => {
   });
 
   it("resume: session with codex provenance produces the resume argv and preserves the thread id", async () => {
+    seedOriginatingCodexJob(ctx);
     const { job, resultText } = await codexDispatch(ctx.dispatchOptions({
       session: THREAD_ID,
       sessionProvenance: "codex",
@@ -1149,6 +1243,7 @@ describe("codexDispatch (fake codex)", () => {
   });
 
   it("resume: records the KNOWN thread id even when the resume stream omits thread.started", async () => {
+    seedOriginatingCodexJob(ctx);
     ctx.setMode("resume-no-thread");
     const { job, resultText, stateDir } = await codexDispatch(ctx.dispatchOptions({
       session: THREAD_ID,
@@ -1168,6 +1263,7 @@ describe("codexDispatch (fake codex)", () => {
   });
 
   it("--resume-last after a resumed job selects the SAME thread and resumes it, never fresh", async () => {
+    seedOriginatingCodexJob(ctx);
     ctx.setMode("resume-no-thread");
     await codexDispatch(ctx.dispatchOptions({ session: THREAD_ID, sessionProvenance: "codex" }));
     // --resume-last selection: the newest same-backend task job's sessionID.
@@ -1189,6 +1285,7 @@ describe("codexDispatch (fake codex)", () => {
   });
 
   it("resume provenance mismatch (model) fails closed even though the original session matched", async () => {
+    seedOriginatingCodexJob(ctx);
     ctx.setMode("resume-mismatch-model");
     const { job, resultText } = await codexDispatch(ctx.dispatchOptions({
       session: THREAD_ID,
@@ -1204,6 +1301,7 @@ describe("codexDispatch (fake codex)", () => {
   });
 
   it("resume provenance mismatch (effort) on the resumed turn fails closed", async () => {
+    seedOriginatingCodexJob(ctx);
     ctx.setMode("resume-mismatch-effort");
     const { job } = await codexDispatch(ctx.dispatchOptions({
       session: THREAD_ID,
@@ -1485,6 +1583,183 @@ describe("codexDispatch (fake codex)", () => {
     assert.ok(running, "the running codex job must be recorded with a sessionID");
     assert.equal(running.sessionID, THREAD_ID);
     await pending;
+  });
+});
+
+describe("codexDispatch resume CODEX_HOME (kusabi #793)", () => {
+  let ctx;
+  beforeEach(() => { ctx = fakeCodexContext(); });
+  afterEach(() => { ctx.restore(); });
+
+  it("#793 resume reuses the originating job's codex home, and a third resume stays there", async () => {
+    // A fresh job records the thread under its own per-job home.
+    const first = await codexDispatch(ctx.dispatchOptions());
+    assert.equal(first.job.status, "completed");
+    assert.equal(first.job.sessionID, THREAD_ID);
+    const originHome = codexHomeForJob(ctx.stateDir, first.job.id);
+    assert.equal(first.job.codexHome, originHome);
+    const originRollout = path.join(originHome, "sessions", THREAD_ID, `rollout-1-${THREAD_ID}.jsonl`);
+    assert.equal(fs.existsSync(originRollout), true);
+
+    // The rework is a NEW job.  Without the #793 fix it would get a fresh,
+    // empty per-job home and the fake (like the real CLI) would exit 1 with
+    // "no rollout found for thread id <id>".
+    fs.writeFileSync(ctx.argsLog, "", "utf8");
+    const second = await codexDispatch(ctx.dispatchOptions({
+      session: THREAD_ID,
+      sessionProvenance: "codex",
+    }));
+    assert.equal(second.job.status, "completed", second.job.error ?? "");
+    assert.equal(second.job.sessionID, THREAD_ID);
+    const secondEnv = loggedEnv(ctx.envLog);
+    assert.equal(secondEnv.CODEX_HOME, originHome, "the resumed spawn must run under job 1's codex home");
+    assert.equal(secondEnv.HOME, originHome);
+    assert.equal(fs.existsSync(originRollout), true, "the originating rollout is still where it was recorded");
+    assert.equal(second.job.codexHome, originHome);
+    assert.equal(loadJob(ctx.stateDir, second.job.id).codexHome, originHome);
+    // The new job's own directory is still its own (the schema lives there);
+    // only HOME/CODEX_HOME point at the originating home.
+    assert.notEqual(jobDir(ctx.stateDir, second.job.id), jobDir(ctx.stateDir, first.job.id));
+
+    // A THIRD resume of job 2's recorded sessionID resolves transitively to
+    // the same home, because job 2 persisted the originating home.
+    fs.writeFileSync(ctx.argsLog, "", "utf8");
+    const third = await codexDispatch(ctx.dispatchOptions({
+      session: second.job.sessionID,
+      sessionProvenance: "codex",
+    }));
+    assert.equal(third.job.status, "completed", third.job.error ?? "");
+    assert.equal(loggedEnv(ctx.envLog).CODEX_HOME, originHome);
+    assert.equal(third.job.codexHome, originHome);
+    assert.equal(loadJob(ctx.stateDir, third.job.id).codexHome, originHome);
+  });
+
+  it("#793 resume with no originating job rejects before spawning or creating a job", async () => {
+    const before = jobCount(ctx.stateDir);
+    await assert.rejects(
+      () => codexDispatch(ctx.dispatchOptions({ session: THREAD_ID, sessionProvenance: "codex" })),
+      (err) => {
+        assert.ok(err.message.includes(THREAD_ID), "message names the thread id");
+        assert.match(err.message, /no codex job/);
+        return true;
+      },
+    );
+    assert.deepEqual(loggedArgs(ctx.argsLog), [], "the fake was never spawned");
+    assert.equal(jobCount(ctx.stateDir), before, "no job directory was created");
+  });
+
+  it("#793 resume rejects when the originating record lacks codexHome", async () => {
+    const origin = seedOriginatingCodexJob(ctx, { codexHome: null });
+    const before = jobCount(ctx.stateDir);
+    await assert.rejects(
+      () => codexDispatch(ctx.dispatchOptions({ session: THREAD_ID, sessionProvenance: "codex" })),
+      (err) => {
+        assert.ok(err.message.includes(THREAD_ID), "message names the thread id");
+        assert.ok(err.message.includes(origin.id), "message names the offending job");
+        assert.match(err.message, /has no recorded codexHome/);
+        return true;
+      },
+    );
+    assert.deepEqual(loggedArgs(ctx.argsLog), [], "the fake was never spawned");
+    assert.equal(jobCount(ctx.stateDir), before, "no job directory was created");
+  });
+
+  it("#793 resume rejects when the recorded codex home directory is missing", async () => {
+    const missingHome = path.join(ctx.tmp, "missing-codex-home");
+    const origin = seedOriginatingCodexJob(ctx, { codexHome: missingHome });
+    const before = jobCount(ctx.stateDir);
+    await assert.rejects(
+      () => codexDispatch(ctx.dispatchOptions({ session: THREAD_ID, sessionProvenance: "codex" })),
+      (err) => {
+        assert.ok(err.message.includes(THREAD_ID), "message names the thread id");
+        assert.ok(err.message.includes(missingHome), "message names the missing home");
+        assert.ok(err.message.includes(origin.id), "message names the offending job");
+        assert.match(err.message, /does not exist/);
+        return true;
+      },
+    );
+    assert.deepEqual(loggedArgs(ctx.argsLog), [], "the fake was never spawned");
+    assert.equal(jobCount(ctx.stateDir), before, "no job directory was created");
+  });
+
+  it("#793-stale resume skips a newer empty-home job and uses the origin home that holds the rollout", async () => {
+    // The true origin: an OLDER job whose home holds the thread's rollout.
+    const origin = seedOriginatingCodexJob(ctx);
+    const originHome = origin.codexHome;
+    assert.equal(
+      fs.existsSync(path.join(originHome, "sessions", THREAD_ID, `rollout-1-${THREAD_ID}.jsonl`)),
+      true,
+      "the origin home holds the thread's rollout",
+    );
+
+    // The stale record a pre-fix failed rework left behind: the SAME thread
+    // and a NEWER job, status "error", whose own per-job home EXISTS but is
+    // empty.  Newest-first alone would accept this home and fail again.
+    const stale = seedOriginatingCodexJob(ctx, {
+      status: "error",
+      startedAt: new Date().toISOString(),
+      withRollout: false,
+    });
+    assert.notEqual(stale.codexHome, originHome);
+    assert.equal(fs.existsSync(stale.codexHome), true, "the stale home exists");
+    assert.equal(
+      fs.existsSync(path.join(stale.codexHome, "sessions")),
+      false,
+      "the stale home holds no rollout for the thread",
+    );
+
+    fs.writeFileSync(ctx.argsLog, "", "utf8");
+    const resumed = await codexDispatch(ctx.dispatchOptions({
+      session: THREAD_ID,
+      sessionProvenance: "codex",
+    }));
+    assert.equal(resumed.job.status, "completed", resumed.job.error ?? "");
+    const resumedEnv = loggedEnv(ctx.envLog);
+    assert.equal(resumedEnv.CODEX_HOME, originHome, "the resume must run under the home that holds the rollout");
+    assert.equal(resumedEnv.HOME, originHome);
+    assert.equal(resumed.job.codexHome, originHome);
+    assert.equal(loadJob(ctx.stateDir, resumed.job.id).codexHome, originHome);
+  });
+
+  it("#793-stale resume with only an existing-but-empty home rejects before spawning or creating a job", async () => {
+    const stale = seedOriginatingCodexJob(ctx, { status: "error", withRollout: false });
+    assert.equal(fs.existsSync(stale.codexHome), true, "the recorded home exists");
+    const before = jobCount(ctx.stateDir);
+    await assert.rejects(
+      () => codexDispatch(ctx.dispatchOptions({ session: THREAD_ID, sessionProvenance: "codex" })),
+      (err) => {
+        assert.ok(err.message.includes(THREAD_ID), "message names the thread id");
+        assert.ok(err.message.includes(stale.id), "message names the newest offending job");
+        assert.ok(err.message.includes("holds no rollout for thread"), "message names the empty-home cause");
+        return true;
+      },
+    );
+    assert.deepEqual(loggedArgs(ctx.argsLog), [], "the fake was never spawned");
+    assert.equal(jobCount(ctx.stateDir), before, "no job directory was created");
+  });
+
+  it("#793 a non-resume dispatch after a resumed one still gets its own fresh job home", async () => {
+    const first = await codexDispatch(ctx.dispatchOptions());
+    const second = await codexDispatch(ctx.dispatchOptions({ session: THREAD_ID, sessionProvenance: "codex" }));
+    assert.equal(second.job.codexHome, first.job.codexHome);
+
+    const third = await codexDispatch(ctx.dispatchOptions());
+    const ownHome = codexHomeForJob(ctx.stateDir, third.job.id);
+    assert.equal(third.job.codexHome, ownHome);
+    assert.notEqual(ownHome, first.job.codexHome, "a fresh job never reuses the originating home");
+    assert.equal(loggedEnv(ctx.envLog).CODEX_HOME, ownHome);
+    assert.equal(loadJob(ctx.stateDir, third.job.id).codexHome, ownHome);
+  });
+
+  it("#793 linking auth on an already-bridged home still succeeds as symlinked, never copied", () => {
+    fs.writeFileSync(path.join(ctx.operatorCodexHome, "auth.json"), "SECRET-TOKEN-MATERIAL", "utf8");
+    const home = path.join(ctx.tmp, "already-bridged-codex-home");
+    assert.deepEqual(linkOperatorAuth(home), { bridge: "symlinked" });
+    // EEXIST on the second bridge is success, not a failure or a copy.
+    assert.deepEqual(linkOperatorAuth(home), { bridge: "symlinked" });
+    const authPath = path.join(home, "auth.json");
+    assert.equal(fs.lstatSync(authPath).isSymbolicLink(), true, "the bridge stays a symlink");
+    assert.equal(fs.readlinkSync(authPath), path.join(ctx.operatorCodexHome, "auth.json"));
   });
 });
 
