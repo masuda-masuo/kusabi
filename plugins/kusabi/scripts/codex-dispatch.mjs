@@ -52,16 +52,24 @@
 //     --json [-]
 //
 // Resume under the same CODEX_HOME preserves the thread id (measured); the
-// thread id is passed explicitly AND the job-owned CODEX_HOME is reused, so
-// the continuation cannot attach to a different thread.  `-a` is never passed
-// to `codex exec` (measured: the resume subcommand has no approval flag and
-// passing one is an error).
+// thread id is passed explicitly AND the CODEX_HOME of the job that RECORDED
+// that thread is reused, so the continuation cannot attach to a different
+// thread.  A resume is a new job, so its own fresh home would be empty and
+// `codex exec resume` would fail with "no rollout found for thread id"; the
+// resume therefore runs under the ORIGINATING job's home, resolved from the
+// job store before anything is spawned, and fails closed when that home
+// cannot be found (kusabi #793).  `-a` is never passed to `codex exec`
+// (measured: the resume subcommand has no approval flag and passing one is an
+// error).
 //
-// Dedicated state: EVERY invocation sets both HOME and CODEX_HOME to a
-// job-owned directory under the job record, so the child never inherits the
-// orchestrator's config/rules/sessions/MCP servers.  The one exception is the
-// minimum auth bridge: for a ChatGPT-subscription login, `auth.json` in the
-// job-owned CODEX_HOME is a symlink to the operator's own auth cache.  This
+// Dedicated state: every invocation sets both HOME and CODEX_HOME to a
+// job-owned directory, so the child never inherits the orchestrator's
+// config/rules/sessions/MCP servers.  A fresh dispatch gets a per-job home
+// under its own record; a resume reuses the originating job's home (and
+// persists it on the new record, so the rendered continuation command points
+// at the home that was actually used).  The one exception to that isolation
+// is the minimum auth bridge: for a ChatGPT-subscription login, `auth.json` in
+// the job-owned CODEX_HOME is a symlink to the operator's own auth cache.  This
 // is deliberate under the accepted same-user trusted-seat model — credential
 // non-readability is NOT claimed.  Auth contents are never copied into result
 // text, events, usage, or publishable files.
@@ -96,7 +104,7 @@ import process from "node:process";
 import { firstRoute, WRITE_TOOL_NAMES } from "./cli.mjs";
 import { readAgentSystemPrompt } from "./agent-system-prompt.mjs";
 import { toolDeniesEnforced, normalizeDenyName } from "./tool-permissions.mjs";
-import { newJobId, jobDir } from "./job-store.mjs";
+import { newJobId, jobDir, listJobs } from "./job-store.mjs";
 import { stateDirFor } from "./state-paths.mjs";
 import { resolveBoundS, runBackendProcess } from "./backend-process-runner.mjs";
 import { runBackendDispatch } from "./backend-dispatch-core.mjs";
@@ -119,6 +127,7 @@ import {
 } from "./codex-stream.mjs";
 import {
   CODEX_REASONING_EFFORT,
+  findRolloutFiles,
   readRolloutProvenance,
 } from "./codex-rollout.mjs";
 
@@ -421,6 +430,99 @@ export function codexHomeForJob(stateDir, jobId) {
 }
 
 /**
+ * Does `codexHome` hold a rollout for `threadId`?  A home can exist and still
+ * be EMPTY for the thread: a job recorded the thread's sessionID plus a fresh
+ * per-job home that never received the rollout (the #793 failure mode this
+ * resolver exists to break out of).  The CLI names rollouts
+ * `rollout-<ts>-<thread-id>.jsonl`, so a basename match is the evidence that
+ * the home is the one a resume can actually continue from.
+ *
+ * @param {string} codexHome
+ * @param {string} threadId
+ * @returns {boolean}
+ */
+function codexHomeHoldsRolloutForThread(codexHome, threadId) {
+  return findRolloutFiles(codexHome).some(
+    (file) => path.basename(file).includes(threadId),
+  );
+}
+
+/**
+ * Resolve the Codex home a RESUME must run under: the home of the newest codex
+ * job in `stateDir` that recorded `threadId` as its sessionID AND actually
+ * holds that thread's rollout (kusabi #793).
+ *
+ * The CLI persists each thread's rollout under the CODEX_HOME it ran with, so
+ * `codex exec resume <thread>` only works when it is started under that SAME
+ * home.  A resume is a new job with a fresh per-job home of its own, which is
+ * necessarily empty — hence the originating job's home is reused instead of
+ * the new job's.  Because every resumed job persists the originating home on
+ * its own record, a later resume of the resumed job resolves transitively to
+ * the same home.
+ *
+ * "Newest job that recorded the thread" is NOT sufficient on its own: a failed
+ * rework job (and any job dispatched before this fix) can persist the same
+ * sessionID alongside its own fresh, EMPTY per-job home.  That home exists but
+ * holds no rollout, so accepting it would fail again with "no rollout found"
+ * and persist the same empty home forever.  The resolver therefore skips such
+ * candidates (newest first) and accepts the first home that is non-empty,
+ * exists, and contains a rollout file whose basename names `threadId`.
+ *
+ * Fail-closed BEFORE a job record exists: a thread with no codex job, or no
+ * candidate whose home holds the thread's rollout, is a config-level error,
+ * never a fresh-looking run that would attach to nothing.
+ *
+ * @param {string} stateDir
+ * @param {string} threadId
+ * @returns {string} the usable job-owned codex home (an existing directory
+ *          holding a rollout for `threadId`).
+ * @throws {Error} naming the thread id and the newest failing candidate's job
+ *          id and cause: no recorded `codexHome`, a home that does not exist,
+ *          or a home that `holds no rollout for thread`.
+ */
+export function resolveResumeCodexHome(stateDir, threadId) {
+  const candidates = listJobs(stateDir).filter(
+    (job) => job?.backend === CODEX_BACKEND && job?.sessionID === threadId,
+  );
+  if (candidates.length === 0) {
+    throw new Error(
+      `codex resume: no codex job under ${stateDir} recorded thread ${threadId} — ` +
+      "cannot resolve the job-owned CODEX_HOME that holds its rollout",
+    );
+  }
+  // Newest first (listJobs sorts by startedAt descending).  The FIRST qualifier
+  // wins; when none qualifies, the newest candidate's cause is the message.
+  const failures = [];
+  for (const job of candidates) {
+    const home = typeof job.codexHome === "string" ? job.codexHome : "";
+    if (home === "") {
+      failures.push(
+        `codex resume: the codex job ${job.id} for thread ${threadId} ` +
+        "has no recorded codexHome — cannot resolve the job-owned CODEX_HOME that holds its rollout",
+      );
+      continue;
+    }
+    if (!fs.existsSync(home)) {
+      failures.push(
+        `codex resume: the codex home ${home} recorded by codex job ${job.id} ` +
+        `for thread ${threadId} does not exist — refusing to resume without its rollout state`,
+      );
+      continue;
+    }
+    if (!codexHomeHoldsRolloutForThread(home, threadId)) {
+      failures.push(
+        `codex resume: the codex home ${home} recorded by codex job ${job.id} ` +
+        `for thread ${threadId} holds no rollout for thread ${threadId} — ` +
+        "refusing to resume without its rollout state",
+      );
+      continue;
+    }
+    return home;
+  }
+  throw new Error(failures[0]);
+}
+
+/**
  * The operator's own Codex home, resolved from the PARENT environment (the
  * child's env is overridden to the job-owned home, so this must be read
  * before the spawn).  Defaults to `~/.codex`, the CLI's own default.
@@ -574,6 +676,15 @@ export async function codexDispatch(opts) {
   }
   const stateDir = stateDirFor(opts.cwd);
 
+  // A resume must run under the CODEX_HOME of the job that recorded the
+  // thread: the thread's rollout lives there, and the new job's own fresh home
+  // is empty, so `codex exec resume` would fail with "no rollout found".
+  // Resolved here — before the job record exists and before any spawn — and
+  // fail-closed when it cannot be resolved (kusabi #793).
+  const resumeCodexHome = resumedSessionId === null
+    ? null
+    : resolveResumeCodexHome(stateDir, resumedSessionId);
+
   // ---- pre-flight (still before the job record exists) ----
   const systemPrompt = readAgentSystemPrompt(opts.agent);
   const promptText = buildCodexPrompt({ systemPrompt, promptText: opts.promptText });
@@ -698,26 +809,32 @@ export async function codexDispatch(opts) {
     retry: null,
     fallbacks: null,
   };
-  // The job-owned Codex home, persisted on the record so rendering can print
-  // an EXECUTABLE continuation command pointing HOME/CODEX_HOME at it
-  // (kusabi #527 finding 1).  The path lives under the job's own directory
-  // and carries no auth material (the auth bridge is a symlink, never a copy
-  // of the operator's cache).
-  const codexHome = codexHomeForJob(stateDir, job.id);
+  // The Codex home this dispatch runs under, persisted on the record so
+  // rendering can print an EXECUTABLE continuation command pointing
+  // HOME/CODEX_HOME at it (kusabi #527 finding 1).  A fresh dispatch gets its
+  // own per-job directory; a RESUME reuses the originating job's home, because
+  // that is the only place the thread's rollout lives (kusabi #793).  Either
+  // way the persisted path carries no auth material (the auth bridge is a
+  // symlink, never a copy of the operator's cache).
+  const codexHome = resumeCodexHome ?? codexHomeForJob(stateDir, job.id);
   job.codexHome = codexHome;
   // ---- dedicated state ----
-  // HOME and CODEX_HOME both point at the job-owned directory.  The child
-  // never inherits the orchestrator's config/rules/sessions/MCP files; the
-  // only bridge is the minimum auth symlink (same-user trusted-seat model).
-  // The dedicated home always exists (it is the child's state dir), even
-  // when there is no operator auth file to bridge.
+  // HOME and CODEX_HOME both point at `codexHome`.  The child never inherits
+  // the orchestrator's config/rules/sessions/MCP files; the only bridge is the
+  // minimum auth symlink (same-user trusted-seat model).  The dedicated home
+  // always exists (it is the child's state dir, or the already-existing
+  // originating home on resume), even when there is no operator auth file to
+  // bridge.  The new job's OWN directory is separate from that home on resume,
+  // so ensure it exists before the projected schema is written into it.
   fs.mkdirSync(codexHome, { recursive: true });
+  const jobRoot = jobDir(stateDir, job.id);
+  fs.mkdirSync(jobRoot, { recursive: true });
   // The CLI consumes a path here, not schema text.  Keep the projected
-  // schema beside this job's codex-home so it cannot be confused with a
-  // shared or checked-in generated schema.
+  // schema under THIS job's own directory so it cannot be confused with a
+  // shared or checked-in generated schema (or with the originating home).
   const codexSchemaPath = jsonSchema === null
     ? null
-    : path.join(jobDir(stateDir, job.id), "codex-output-schema.json");
+    : path.join(jobRoot, "codex-output-schema.json");
   if (codexSchemaPath !== null) {
     fs.writeFileSync(codexSchemaPath, jsonSchema, "utf8");
   }
