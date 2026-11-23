@@ -5,7 +5,7 @@ import fs from "node:fs";
 import process from "node:process";
 import { spawn } from "node:child_process";
 import crypto from "node:crypto";
-import { stateDirFor, readJson, writeJson, kusabiOpencodeConfigHome, opencodeModeDir } from "./state-paths.mjs";
+import { stateDirFor, readJson, writeJson, kusabiOpencodeConfigHome, kusabiOpencodeDb, opencodeModeDir } from "./state-paths.mjs";
 import {
   isOpenCodeFreeWorkerEnabled,
   checkOpencodeVersion,
@@ -63,12 +63,25 @@ export function buildServeEnv(baseEnv, password, stateDir) {
     KUSABI_WORKER_CONTEXT: "1",
     XDG_CONFIG_HOME: kusabiOpencodeConfigHome(),
     OPENCODE_CONFIG_DIR: opencodeModeDir(),
+    // kusabi #798: the serve gets its own database under the kusabi state
+    // root instead of the host-wide ~/.local/share/opencode/opencode.db that
+    // OpenCode V2 also writes (and migrates).  Overrides any OPENCODE_DB in
+    // baseEnv, the same way XDG_CONFIG_HOME is overridden above.
+    OPENCODE_DB: kusabiOpencodeDb(),
   };
   // The serve's own state dir is stamped as well, so a live process can be
   // attributed back to the state dir that should name it in server.json —
   // reapOrphanedServes() reads this marker to find serves no record names.
   if (stateDir) env.KUSABI_SERVE_STATE_DIR = stateDir;
   return env;
+}
+
+// Create the parent directory of the serve's OPENCODE_DB (kusabi #798).
+// Exported as its own seam so the spawn-time wiring is testable without a
+// real opencode binary; startServer() calls it just before spawn().
+export function ensureServeDbDir(dbPath = kusabiOpencodeDb()) {
+  fs.mkdirSync(path.dirname(dbPath), { recursive: true });
+  return dbPath;
 }
 
 // A `running` job record is written when its driver starts and only
@@ -211,6 +224,11 @@ async function startServer({ stateDir, serverFile, cwd, timeoutMs, now = () => p
   } else {
     checkDefaultOpencodeVersion(opencodeBin());
   }
+
+  // OpenCode cannot open a database in a directory that does not exist, so
+  // create the DB's parent before spawning (kusabi #798).  This is a
+  // filesystem write at spawn time on purpose: buildServeEnv stays pure.
+  ensureServeDbDir();
 
   const port = await freePort();
   const password = crypto.randomBytes(16).toString("hex");

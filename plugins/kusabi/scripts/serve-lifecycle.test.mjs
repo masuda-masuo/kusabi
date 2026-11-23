@@ -137,6 +137,52 @@ describe("buildServeEnv", () => {
       else delete process.env.KUSABI_OPENCODE_CONFIG_HOME;
     }
   });
+
+  // kusabi #798: the worker serve opens a kusabi-owned database instead of
+  // the host-wide ~/.local/share/opencode/opencode.db shared with OpenCode V2.
+  it("defaults OPENCODE_DB under the state root in both modes (#798)", () => {
+    const origStateDir = process.env.KUSABI_STATE_DIR;
+    const origDb = process.env.KUSABI_OPENCODE_DB;
+    const origFree = process.env.KUSABI_OPENCODE_FREE_WORKER;
+    delete process.env.KUSABI_OPENCODE_DB;
+    delete process.env.KUSABI_OPENCODE_FREE_WORKER;
+    process.env.KUSABI_STATE_DIR = "/tmp/x";
+    try {
+      const withoutOverride = buildServeEnv({}, "pw");
+      assert.equal(withoutOverride.OPENCODE_DB, "/tmp/x/opencode-data/opencode.db");
+      process.env.KUSABI_OPENCODE_FREE_WORKER = "1";
+      const freeEnv = buildServeEnv({}, "pw");
+      assert.equal(freeEnv.OPENCODE_DB, "/tmp/x/opencode-data/opencode.db");
+      assert.equal(freeEnv.OPENCODE_CONFIG_DIR, "/tmp/x/opencode-mode/free");
+    } finally {
+      if (origStateDir !== undefined) process.env.KUSABI_STATE_DIR = origStateDir;
+      else delete process.env.KUSABI_STATE_DIR;
+      if (origDb !== undefined) process.env.KUSABI_OPENCODE_DB = origDb;
+      else delete process.env.KUSABI_OPENCODE_DB;
+      if (origFree !== undefined) process.env.KUSABI_OPENCODE_FREE_WORKER = origFree;
+      else delete process.env.KUSABI_OPENCODE_FREE_WORKER;
+    }
+  });
+
+  it("prefers KUSABI_OPENCODE_DB and overrides an inherited OPENCODE_DB (#798)", () => {
+    const origStateDir = process.env.KUSABI_STATE_DIR;
+    const origDb = process.env.KUSABI_OPENCODE_DB;
+    process.env.KUSABI_STATE_DIR = "/tmp/x";
+    process.env.KUSABI_OPENCODE_DB = "/tmp/custom.db";
+    try {
+      const base = { PATH: "/usr/bin", OPENCODE_DB: "/elsewhere.db" };
+      const env = buildServeEnv(base, "pw");
+      assert.equal(env.OPENCODE_DB, "/tmp/custom.db");
+      // The base env must be left exactly as it was passed in.
+      assert.equal(base.OPENCODE_DB, "/elsewhere.db");
+      assert.equal(base.KUSABI_WORKER_CONTEXT, undefined);
+    } finally {
+      if (origStateDir !== undefined) process.env.KUSABI_STATE_DIR = origStateDir;
+      else delete process.env.KUSABI_STATE_DIR;
+      if (origDb !== undefined) process.env.KUSABI_OPENCODE_DB = origDb;
+      else delete process.env.KUSABI_OPENCODE_DB;
+    }
+  });
 });
 
 // runningRecordIsStale — fossil judgement for `running` job records
@@ -801,6 +847,41 @@ describe("ensureServer (fake serve, spawn-based)", () => {
       ctx.killAll();
       ctx.restore();
       ctx.rm();
+    }
+  });
+
+  // kusabi #798: OpenCode refuses to open a DB in a missing directory, so the
+  // spawn path must create the parent of the serve's OPENCODE_DB first.
+  it("creates the OPENCODE_DB parent directory before spawning the serve (#798)", async () => {
+    const origDb = process.env.KUSABI_OPENCODE_DB;
+    const ctx = fakeServeContext("ready");
+    const dbPath = path.join(ctx.tmp, "nested", "deeper", "custom.db");
+    process.env.KUSABI_OPENCODE_DB = dbPath;
+    process.env.KUSABI_SERVE_READY_TIMEOUT_MS = "5000";
+    try {
+      assert.equal(fs.existsSync(path.dirname(dbPath)), false, "test premise: the DB parent must not exist yet");
+      const server = await ensureServer(ctx.cwd);
+      assert.ok(fs.existsSync(path.dirname(dbPath)), "the OPENCODE_DB parent must exist after the spawn");
+      // ...and the spawned serve must actually be pointed at that database.
+      const deadline = Date.now() + 5000;
+      let opencodeDb;
+      while (Date.now() < deadline) {
+        try {
+          for (const entry of fs.readFileSync(`/proc/${server.pid}/environ`, "utf8").split("\0").filter(Boolean)) {
+            const eq = entry.indexOf("=");
+            if (eq > 0 && entry.slice(0, eq) === "OPENCODE_DB") opencodeDb = entry.slice(eq + 1);
+          }
+        } catch { /* process not readable yet */ }
+        if (opencodeDb !== undefined) break;
+        await new Promise((r) => setTimeout(r, 25));
+      }
+      assert.equal(opencodeDb, dbPath);
+    } finally {
+      ctx.killAll();
+      ctx.restore();
+      ctx.rm();
+      if (origDb !== undefined) process.env.KUSABI_OPENCODE_DB = origDb;
+      else delete process.env.KUSABI_OPENCODE_DB;
     }
   });
 });

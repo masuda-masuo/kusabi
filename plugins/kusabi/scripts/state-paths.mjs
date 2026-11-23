@@ -24,6 +24,17 @@ export function kusabiOpencodeConfigHome() {
   return path.join(stateRoot(), "opencode-config");
 }
 
+// The OpenCode database the worker serve opens (kusabi #798).  It lives under
+// the kusabi state root so V2 activity on the host — which shares
+// ~/.local/share/opencode/opencode.db with V1 — cannot migrate the file out
+// from under a running serve.  KUSABI_OPENCODE_DB is the explicit override.
+// Both modes (default and free) share this file; only their config differs.
+export function kusabiOpencodeDb() {
+  const env = process.env.KUSABI_OPENCODE_DB;
+  if (env && env.length > 0) return env;
+  return path.join(stateRoot(), "opencode-data", "opencode.db");
+}
+
 export function opencodeModeDir(mode = (process.env.KUSABI_OPENCODE_FREE_WORKER === "1" ? "free" : "default")) {
   if (mode !== "free" && mode !== "default") {
     throw new Error(`Unknown OpenCode mode: ${mode}`);
