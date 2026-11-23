@@ -23,7 +23,7 @@ import { ensureServer, freePort } from "./serve-lifecycle.mjs";
 import { cmdInstallAgents } from "./host-cmd.mjs";
 import { runPrompt, warnFreeWorkerConfiguredRoute } from "./prompt-execution.mjs";
 import { parseReviewResult } from "./chain-review.mjs";
-import { stateDirFor } from "./state-paths.mjs";
+import { stateDirFor, kusabiOpencodeDb } from "./state-paths.mjs";
 import { patchEnv, writeExecutable } from "./fixtures.mjs";
 import { checkOpencodeVersion,
   OPENCODE_FREE_WORKER_CHAIN,
@@ -556,7 +556,7 @@ describe("Agenda2001 opt-in OpenCode free worker profile: acceptance tests", () 
       const stateDir = stateDirFor(cwd);
       fs.writeFileSync(
         path.join(stateDir, "server.json"),
-        JSON.stringify({ port, password: "test-pw", pid: process.pid, cwd, startedAt: new Date().toISOString(), profile: "free", pure: true }),
+        JSON.stringify({ port, password: "test-pw", pid: process.pid, cwd, startedAt: new Date().toISOString(), profile: "free", pure: true, opencodeDb: kusabiOpencodeDb() }),
         "utf8"
       );
 
@@ -598,7 +598,7 @@ describe("Agenda2001 opt-in OpenCode free worker profile: acceptance tests", () 
       const stateDir = stateDirFor(cwd);
       fs.writeFileSync(
         path.join(stateDir, "server.json"),
-        JSON.stringify({ port, password: "test-pw", pid: process.pid, cwd, startedAt: new Date().toISOString(), profile: "free", pure: true }),
+        JSON.stringify({ port, password: "test-pw", pid: process.pid, cwd, startedAt: new Date().toISOString(), profile: "free", pure: true, opencodeDb: kusabiOpencodeDb() }),
         "utf8"
       );
 
@@ -638,7 +638,7 @@ describe("Agenda2001 opt-in OpenCode free worker profile: acceptance tests", () 
       const stateDir = stateDirFor(cwd);
       fs.writeFileSync(
         path.join(stateDir, "server.json"),
-        JSON.stringify({ port, password: "test-pw", pid: process.pid, cwd, startedAt: new Date().toISOString() }),
+        JSON.stringify({ port, password: "test-pw", pid: process.pid, cwd, startedAt: new Date().toISOString(), opencodeDb: kusabiOpencodeDb() }),
         "utf8"
       );
 
@@ -711,7 +711,7 @@ describe("Agenda2001 opt-in OpenCode free worker profile: acceptance tests", () 
       const stateDir = stateDirFor(cwd);
       fs.writeFileSync(
         path.join(stateDir, "server.json"),
-        JSON.stringify({ port, password: "test-pw", pid: process.pid, cwd, startedAt: new Date().toISOString(), profile: "free", pure: true }),
+        JSON.stringify({ port, password: "test-pw", pid: process.pid, cwd, startedAt: new Date().toISOString(), profile: "free", pure: true, opencodeDb: kusabiOpencodeDb() }),
         "utf8"
       );
 
@@ -767,7 +767,7 @@ describe("Agenda2001 opt-in OpenCode free worker profile: acceptance tests", () 
       const stateDir = stateDirFor(cwd);
       fs.writeFileSync(
         path.join(stateDir, "server.json"),
-        JSON.stringify({ port, password: "test-pw", pid: process.pid, cwd, startedAt: new Date().toISOString(), profile: "free", pure: true }),
+        JSON.stringify({ port, password: "test-pw", pid: process.pid, cwd, startedAt: new Date().toISOString(), profile: "free", pure: true, opencodeDb: kusabiOpencodeDb() }),
         "utf8"
       );
 

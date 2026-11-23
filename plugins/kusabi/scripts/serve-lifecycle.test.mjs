@@ -18,8 +18,9 @@ import {
   isOurServe,
   waitForPublishedHealthy,
   checkServerProfileCompatibility,
+  serverHealthy,
 } from "./serve-lifecycle.mjs";
-import { readJson, stateDirFor } from "./state-paths.mjs";
+import { readJson, writeJson, stateDirFor, kusabiOpencodeDb } from "./state-paths.mjs";
 // The identity gate is shared by every kill site (kusabi #181); these two
 // call sites are tested here, against real spawned processes, together with
 // reapIdleServes.  (kusabi-companion.mjs and prompt-execution.mjs guard
@@ -2062,6 +2063,139 @@ describe("PR755: incompatible server is refused, never implicitly killed", () =>
       assert.equal(srv.listening, true);
       const res = await fetch(`http://127.0.0.1:${port}/session`);
       assert.equal(res.ok, true);
+    } finally {
+      await new Promise((resolve) => srv.close(resolve));
+      restoreEnv();
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("ensureServer opencodeDb compatibility (#798 / PR #799)", () => {
+  it("records opencodeDb equal to kusabiOpencodeDb() in server.json on startServer", async () => {
+    const ctx = fakeServeContext("ready");
+    const restoreDb = patchEnv({ KUSABI_SERVE_READY_TIMEOUT_MS: "5000" });
+    try {
+      const server = await ensureServer(ctx.cwd);
+      const expectedDb = kusabiOpencodeDb();
+      assert.equal(server.opencodeDb, expectedDb);
+      const recorded = readJson(ctx.serverFile);
+      assert.equal(recorded.opencodeDb, expectedDb);
+    } finally {
+      ctx.killAll();
+      restoreDb();
+      ctx.restore();
+      ctx.rm();
+    }
+  });
+
+  it("refuses to reuse a healthy recorded serve whose opencodeDb differs without killing it", async () => {
+    const ctx = fakeServeContext("ready");
+    const dbA = path.join(ctx.tmp, "db-a", "opencode.db");
+    const dbB = path.join(ctx.tmp, "db-b", "opencode.db");
+    const restoreDb = patchEnv({
+      KUSABI_SERVE_READY_TIMEOUT_MS: "5000",
+      KUSABI_OPENCODE_DB: dbA,
+    });
+    try {
+      const first = await ensureServer(ctx.cwd);
+      assert.equal(readJson(ctx.serverFile).opencodeDb, dbA);
+
+      process.env.KUSABI_OPENCODE_DB = dbB;
+      await assert.rejects(ensureServer(ctx.cwd), (err) => {
+        assert.ok(err.message.includes("kusabi serve-stop"), err.message);
+        assert.ok(err.message.includes(String(first.pid)), err.message);
+        assert.ok(err.message.includes(String(first.port)), err.message);
+        assert.ok(err.message.includes(ctx.stateDir), err.message);
+        assert.ok(err.message.includes(dbA), err.message);
+        assert.ok(err.message.includes(dbB), err.message);
+        return true;
+      });
+
+      assert.ok(isAlive(first.pid), "mismatched serve must remain alive (not killed)");
+      assert.equal(await serverHealthy(first), true, "mismatched serve must still answer health probe");
+      assert.equal(spawnedPids(ctx.spawnLog).length, 1, "must not spawn a second serve");
+    } finally {
+      ctx.killAll();
+      restoreDb();
+      ctx.restore();
+      ctx.rm();
+    }
+  });
+
+  it("refuses a healthy recorded serve with no opencodeDb and reuses one with matching opencodeDb", async () => {
+    const ctx = fakeServeContext("ready");
+    const restoreDb = patchEnv({ KUSABI_SERVE_READY_TIMEOUT_MS: "5000" });
+    try {
+      const first = await ensureServer(ctx.cwd);
+      const second = await ensureServer(ctx.cwd);
+      assert.equal(second.pid, first.pid, "matching opencodeDb must reuse existing serve");
+      assert.equal(spawnedPids(ctx.spawnLog).length, 1, "reuse must not spawn a new serve");
+
+      const legacyRecord = readJson(ctx.serverFile);
+      delete legacyRecord.opencodeDb;
+      writeJson(ctx.serverFile, legacyRecord);
+
+      const expectedDb = kusabiOpencodeDb();
+      await assert.rejects(ensureServer(ctx.cwd), (err) => {
+        assert.ok(err.message.includes("kusabi serve-stop"), err.message);
+        assert.ok(err.message.includes("no opencodeDb recorded"), err.message);
+        assert.ok(err.message.includes(expectedDb), err.message);
+        assert.ok(err.message.includes(String(first.pid)), err.message);
+        assert.ok(err.message.includes(String(first.port)), err.message);
+        assert.ok(err.message.includes(ctx.stateDir), err.message);
+        return true;
+      });
+
+      assert.ok(isAlive(first.pid), "legacy serve must remain alive (not killed)");
+      assert.equal(await serverHealthy(first), true, "legacy serve must still answer health probe");
+      assert.equal(spawnedPids(ctx.spawnLog).length, 1, "legacy refusal must not spawn a new serve");
+    } finally {
+      ctx.killAll();
+      restoreDb();
+      ctx.restore();
+      ctx.rm();
+    }
+  });
+
+  it("refuses a concurrently published serve whose opencodeDb differs", async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "kusabi-pub-db-"));
+    const restoreEnv = patchEnv({
+      KUSABI_OPENCODE_FREE_WORKER: undefined,
+      KUSABI_STATE_DIR: path.join(tmpDir, "state"),
+      KUSABI_SERVE_READY_TIMEOUT_MS: "2000",
+    });
+    const srv = http.createServer((req, res) => {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end("[]");
+    });
+    await new Promise((resolve) => srv.listen(0, "127.0.0.1", resolve));
+    const port = srv.address().port;
+    try {
+      const cwd = path.join(tmpDir, "cwd");
+      fs.mkdirSync(cwd, { recursive: true });
+      const stateDir = stateDirFor(cwd);
+      const otherDb = path.join(tmpDir, "other", "opencode.db");
+      fs.mkdirSync(path.join(stateDir, "serve.lock"));
+      writeJson(path.join(stateDir, "server.json"), {
+        port,
+        password: "pw",
+        pid: process.pid,
+        cwd,
+        profile: "default",
+        pure: false,
+        opencodeDb: otherDb,
+      });
+
+      const expectedDb = kusabiOpencodeDb();
+      await assert.rejects(ensureServer(cwd), (err) => {
+        assert.ok(err.message.includes("kusabi serve-stop"), err.message);
+        assert.ok(err.message.includes(otherDb), err.message);
+        assert.ok(err.message.includes(expectedDb), err.message);
+        assert.ok(err.message.includes(stateDir), err.message);
+        return true;
+      });
+      assert.equal(srv.listening, true);
     } finally {
       await new Promise((resolve) => srv.close(resolve));
       restoreEnv();

@@ -127,6 +127,30 @@ export async function serverHealthy(server) {
 }
 
 /**
+ * Reject reusing a healthy recorded serve whose recorded `opencodeDb` differs
+ * from the current `kusabiOpencodeDb()`, or is missing (a legacy record from
+ * before kusabi #798).  Incompatible servers are refused with restart
+ * instructions — never killed implicitly.
+ */
+export function checkServerOpencodeDbCompatibility(existing, stateDir = "") {
+  if (!existing) return;
+  const expected = kusabiOpencodeDb();
+  const recorded = typeof existing.opencodeDb === "string" && existing.opencodeDb.length > 0
+    ? existing.opencodeDb
+    : null;
+  if (recorded === expected) return;
+
+  const loc = stateDir ? ` in ${stateDir}` : "";
+  const detail = recorded
+    ? `uses opencodeDb ${recorded}`
+    : "has no opencodeDb recorded";
+  throw new Error(
+    `Server opencodeDb mismatch: existing server (PID ${existing.pid}, port ${existing.port}${loc}) ${detail}, but expected ${expected}. ` +
+    `Actionable: stop the existing server using 'kusabi serve-stop' or terminate PID ${existing.pid}, then retry.`
+  );
+}
+
+/**
  * Make sure a healthy `opencode serve` exists for *cwd* and return its
  * record.  Reuses the recorded serve from server.json when it answers a
  * health probe; otherwise starts one.
@@ -152,6 +176,7 @@ export async function ensureServer(cwd, { now = () => performance.now() } = {}) 
   const existing = readJson(serverFile);
   if (await serverHealthy(existing)) {
     checkServerProfileCompatibility(existing, stateDir);
+    checkServerOpencodeDbCompatibility(existing, stateDir);
     return { ...existing, stateDir };
   }
 
@@ -168,6 +193,7 @@ export async function ensureServer(cwd, { now = () => performance.now() } = {}) 
       const published = await waitForPublishedHealthy(serverFile, lockDir, timeoutMs, { now });
       if (published) {
         checkServerProfileCompatibility(published, stateDir);
+        checkServerOpencodeDbCompatibility(published, stateDir);
         return { ...published, stateDir };
       }
       if (lockIsStale(lockDir, timeoutMs)) {
@@ -269,6 +295,7 @@ async function startServer({ stateDir, serverFile, cwd, timeoutMs, now = () => p
     startedAt: new Date().toISOString(),
     profile: optIn ? "free" : "default",
     pure: optIn,
+    opencodeDb: kusabiOpencodeDb(),
   };
   const deadline = now() + timeoutMs;
   try {
