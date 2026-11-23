@@ -562,6 +562,27 @@ export function updateClaim(claimPath, updates) {
 // as before.
 
 const SHEBANG_READ_BYTES = 512;
+const DEFAULT_COMPANION_COMMAND = "kusabi-companion";
+
+// The sibling companion in THIS checkout (plugins/kusabi/scripts/...), derived
+// from the watcher's own location rather than cwd or PATH (kusabi #792).  A
+// symlinked plugin install resolves through realpath, so this still points at
+// the checkout the watcher belongs to.
+const WATCHER_SELF_PATH = fileURLToPath(import.meta.url);
+const DEFAULT_COMPANION_SIBLING_PATH = path.resolve(
+  path.dirname(WATCHER_SELF_PATH), "..", "..", "kusabi", "scripts", "kusabi-companion.mjs",
+);
+
+// JS entry points a non-executable checkout copy can still be started with
+// the running Node (kusabi #792).
+const JS_SCRIPT_EXTENSIONS = new Set([".mjs", ".cjs", ".js"]);
+
+// Exactly the two-line shim `kusabi-companion install-cli` writes:
+//   #!/bin/sh
+//   exec node "<abs target>" "$@"
+// Anything else is a /bin/sh script we do not own and must not rewrite.
+const COMPANION_SHIM_PATTERN =
+  /^#!\/bin\/sh\r?\n[ \t]*exec[ \t]+node[ \t]+"([^"\r\n]+)"[ \t]+"\$@"[ \t]*\r?\n?$/;
 
 function isExecutableFile(candidate) {
   try {
@@ -656,34 +677,146 @@ function readFirstLine(filePath) {
   }
 }
 
-/**
- * Decide how to spawn `command args` so an env-node script still starts when
- * the child PATH lacks `node`.  Pure apart from filesystem reads; never
- * spawns.  Returns `{ command, args, env, viaNode, resolvedPath }`; when
- * `viaNode` is false the inputs are returned unchanged.
- */
-export function resolveNodeLaunch(command, args = [], { cwd = process.cwd(), env = process.env, nodePath = process.execPath } = {}) {
-  const unchanged = { command, args, env, viaNode: false, resolvedPath: null };
-  const resolvedPath = resolveCommandPath(command, { cwd, env });
-  if (!resolvedPath) return unchanged;
-  const shebang = parseEnvNodeShebang(readFirstLine(resolvedPath));
-  if (!shebang.envNode) return { ...unchanged, resolvedPath };
-  // env applies `-S` assignments first, then searches PATH (possibly the
-  // assigned one) for exactly the requested program name.
-  const effectiveEnv = { ...env, ...shebang.assignments };
-  if (resolveCommandPath(shebang.program, { cwd, env: effectiveEnv })) {
-    // The interpreter env asks for is reachable — keep the original launch.
-    return { ...unchanged, resolvedPath };
+/** Recognize exactly the two-line shim `kusabi-companion install-cli` writes
+ *  (`#!/bin/sh` then `exec node "<target>" "$@"`).  Returns the target path,
+ *  or null for any other content: a /bin/sh script we do not own. */
+export function parseCompanionShim(content) {
+  if (typeof content !== "string") return null;
+  const m = COMPANION_SHIM_PATTERN.exec(content);
+  return m ? m[1] : null;
+}
+
+function isRegularFile(candidate) {
+  try {
+    return fs.statSync(candidate).isFile();
+  } catch {
+    return false;
   }
+}
+
+function readFileText(filePath) {
+  try {
+    return fs.readFileSync(filePath, "utf8");
+  } catch {
+    return null;
+  }
+}
+
+/** Resolve a JS entry point given by path (relative to cwd, or as given when
+ *  it contains `/`) that is NOT executable: a git checkout keeps `.mjs`
+ *  files at mode 100644, so spawn fails with EACCES even though the running
+ *  Node can start them.  Returns null when the command does not name one. */
+function resolveNonExecutableScript(command, { cwd = process.cwd() } = {}) {
+  if (typeof command !== "string" || command === "") return null;
+  const candidate = path.resolve(cwd || process.cwd(), command);
+  if (!JS_SCRIPT_EXTENSIONS.has(path.extname(candidate))) return null;
+  if (!isRegularFile(candidate)) return null;
+  if (isExecutableFile(candidate)) return null;
+  return candidate;
+}
+
+/** Build a `process.execPath <script> ...args` launch, appending that Node's
+ *  bin directory to the child PATH exactly as the env-node fallback does. */
+function nodeLaunch(scriptPath, args, { env, nodePath, resolvedPath }) {
   const nodeDir = path.dirname(nodePath);
-  const basePath = typeof effectiveEnv.PATH === "string" ? effectiveEnv.PATH : "";
+  const basePath = typeof env?.PATH === "string" ? env.PATH : "";
   const childPath = basePath ? `${basePath}${path.delimiter}${nodeDir}` : nodeDir;
   return {
     command: nodePath,
-    args: [...shebang.extraArgs, resolvedPath, ...args],
-    env: { ...effectiveEnv, PATH: childPath },
+    args: [scriptPath, ...args],
+    env: { ...env, PATH: childPath },
     viaNode: true,
     resolvedPath,
+  };
+}
+
+/**
+ * Decide how to spawn `command args` so a JS companion/queue entry point
+ * still starts when the child PATH lacks `node`.  Pure apart from filesystem
+ * reads; never spawns.  Returns `{ command, args, env, viaNode, resolvedPath }`;
+ * when `viaNode` is false the inputs are returned unchanged.
+ *
+ * Two families are modeled:
+ *  - (kusabi #790) a `#!/usr/bin/env node` script: run it through the running
+ *    Node when the child PATH cannot resolve the interpreter the shebang asks
+ *    for;
+ *  - (kusabi #792) when the child PATH cannot resolve `node` at all: a
+ *    non-executable `.mjs`/`.cjs`/`.js` given by path (A), the exact
+ *    install-cli `/bin/sh` shim (B), or the default `kusabi-companion` when
+ *    nothing on PATH provides it (C, falling back to this checkout's sibling
+ *    `plugins/kusabi/scripts/kusabi-companion.mjs`).
+ *
+ * `defaultCompanion` is true only when neither `--companion-bin` nor
+ * `KUSABI_COMPANION_BIN` was supplied: an explicit command is never replaced
+ * by the sibling.  With `node` reachable on the child PATH every launch is
+ * left exactly as before.
+ */
+export function resolveNodeLaunch(command, args = [], {
+  cwd = process.cwd(),
+  env = process.env,
+  nodePath = process.execPath,
+  defaultCompanion = false,
+} = {}) {
+  const unchanged = { command, args, env, viaNode: false, resolvedPath: null };
+  const resolvedPath = resolveCommandPath(command, { cwd, env });
+  const firstLine = readFirstLine(resolvedPath);
+  const shebang = parseEnvNodeShebang(firstLine);
+  if (shebang.envNode) {
+    // env applies `-S` assignments first, then searches PATH (possibly the
+    // assigned one) for exactly the requested program name.
+    const effectiveEnv = { ...env, ...shebang.assignments };
+    if (resolveCommandPath(shebang.program, { cwd, env: effectiveEnv })) {
+      // The interpreter env asks for is reachable — keep the original launch.
+      return { ...unchanged, resolvedPath };
+    }
+    const nodeDir = path.dirname(nodePath);
+    const basePath = typeof effectiveEnv.PATH === "string" ? effectiveEnv.PATH : "";
+    const childPath = basePath ? `${basePath}${path.delimiter}${nodeDir}` : nodeDir;
+    return {
+      command: nodePath,
+      args: [...shebang.extraArgs, resolvedPath, ...args],
+      env: { ...effectiveEnv, PATH: childPath },
+      viaNode: true,
+      resolvedPath,
+    };
+  }
+
+  // The #792 fallbacks apply ONLY when the child PATH cannot resolve `node`.
+  if (resolveCommandPath("node", { cwd, env })) return { ...unchanged, resolvedPath };
+
+  // (C) Default companion: nothing on PATH provides `kusabi-companion`, so
+  // use the sibling of this checkout.  An explicit command is never replaced.
+  if (defaultCompanion && command === DEFAULT_COMPANION_COMMAND && !resolvedPath) {
+    if (isRegularFile(DEFAULT_COMPANION_SIBLING_PATH)) {
+      return nodeLaunch(DEFAULT_COMPANION_SIBLING_PATH, args, { env, nodePath, resolvedPath: DEFAULT_COMPANION_SIBLING_PATH });
+    }
+    return { ...unchanged, resolvedPath };
+  }
+
+  // (B) install-cli shim: `exec node "<target>" "$@"` cannot work without
+  // node on PATH, so start the target with the running Node instead.
+  if (resolvedPath && firstLine === "#!/bin/sh") {
+    const target = parseCompanionShim(readFileText(resolvedPath));
+    if (target) return nodeLaunch(target, args, { env, nodePath, resolvedPath });
+  }
+
+  // (A) A JS entry point given by path that is not executable.
+  if (!resolvedPath) {
+    const script = resolveNonExecutableScript(command, { cwd });
+    if (script) return nodeLaunch(script, args, { env, nodePath, resolvedPath: script });
+  }
+
+  return { ...unchanged, resolvedPath };
+}
+
+/** Resolve the companion command and whether it is the implicit default
+ *  (so callers only fall back to the checkout's sibling when neither
+ *  `--companion-bin` nor `KUSABI_COMPANION_BIN` was supplied). */
+export function resolveCompanionCommand(companionBin, env = process.env) {
+  const explicit = companionBin || env?.KUSABI_COMPANION_BIN || null;
+  return {
+    command: explicit || DEFAULT_COMPANION_COMMAND,
+    defaultCompanion: !explicit,
   };
 }
 
@@ -697,9 +830,15 @@ export function describeLaunch(requested, launch) {
   };
 }
 
-/** runProcess with node-shebang resolution applied. */
+/** runProcess with node-shebang resolution applied.  `defaultCompanion` marks
+ *  the implicit `kusabi-companion` command so it may fall back to this
+ *  checkout's sibling (kusabi #792). */
 export function runResolvedProcess(command, args, options = {}) {
-  const launch = resolveNodeLaunch(command, args, { cwd: options.cwd, env: options.env ?? process.env });
+  const launch = resolveNodeLaunch(command, args, {
+    cwd: options.cwd,
+    env: options.env ?? process.env,
+    defaultCompanion: options.defaultCompanion === true,
+  });
   return runProcess(launch.command, launch.args, { ...options, env: launch.env });
 }
 
@@ -1239,9 +1378,9 @@ export async function watchChain({
   writeRecordAtomic(recordPath, currentRecord);
 
   // 1. Run chain-wait
-  const companionCmd = companionBin || env.KUSABI_COMPANION_BIN || "kusabi-companion";
+  const { command: companionCmd, defaultCompanion } = resolveCompanionCommand(companionBin, env);
   const companionArgs = ["chain-wait", chainId];
-  const waitResult = await runResolvedProcess(companionCmd, companionArgs, { cwd, env });
+  const waitResult = await runResolvedProcess(companionCmd, companionArgs, { cwd, env, defaultCompanion });
 
   if (waitResult.exitCode !== 0) {
     if (isSignalInterruption(waitResult)) {
@@ -1667,8 +1806,8 @@ export async function watchTask({
   writeRecordAtomic(recordPath, currentRecord);
 
   // 1. Run task-wait — the watcher owns this single blocking process
-  const companionCmd = companionBin || env.KUSABI_COMPANION_BIN || "kusabi-companion";
-  const waitResult = await runResolvedProcess(companionCmd, ["task-wait", jobId], { cwd, env });
+  const { command: companionCmd, defaultCompanion } = resolveCompanionCommand(companionBin, env);
+  const waitResult = await runResolvedProcess(companionCmd, ["task-wait", jobId], { cwd, env, defaultCompanion });
 
   const taskWait = {
     exitCode: waitResult.exitCode,

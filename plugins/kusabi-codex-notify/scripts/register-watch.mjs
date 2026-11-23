@@ -46,6 +46,7 @@ import {
   getProcessStartTime,
   checkWatcherProcess,
   isWatcherProcessAlive,
+  resolveCompanionCommand,
   runResolvedProcess,
   watchChain,
   watchTask,
@@ -855,14 +856,14 @@ export async function launchAndWatch({
   env = process.env,
   timeoutMs = DEFAULT_APPEAR_TIMEOUT_MS,
 } = {}) {
-  const companionCmd = companionBin || env.KUSABI_COMPANION_BIN || "kusabi-companion";
+  const { command: companionCmd, defaultCompanion } = resolveCompanionCommand(companionBin, env);
   const cwd = path.resolve(rawCwd || process.cwd());
   const threadId = rawThreadId || env.CODEX_THREAD_ID || env.CODEX_SESSION_ID || null;
 
   // Build argv: ensure "chain-detach" is subcommand
   const dispatchArgs = args[0] === "chain-detach" ? args : ["chain-detach", ...args];
 
-  const dispatchResult = await runResolvedProcess(companionCmd, dispatchArgs, { cwd, env });
+  const dispatchResult = await runResolvedProcess(companionCmd, dispatchArgs, { cwd, env, defaultCompanion });
 
   const stdout = dispatchResult.stdout;
   const stderr = dispatchResult.stderr;
@@ -957,7 +958,7 @@ export async function launchAndWatch({
     threadId,
     cwd,
     stateDir,
-    companionBin: companionCmd,
+    companionBin,
     codexBin,
     remote,
     sync,
@@ -997,14 +998,14 @@ export async function launchTaskAndWatch({
   env = process.env,
   timeoutMs = DEFAULT_APPEAR_TIMEOUT_MS,
 } = {}) {
-  const companionCmd = companionBin || env.KUSABI_COMPANION_BIN || "kusabi-companion";
+  const { command: companionCmd, defaultCompanion } = resolveCompanionCommand(companionBin, env);
   const cwd = path.resolve(rawCwd || process.cwd());
   const threadId = rawThreadId || env.CODEX_THREAD_ID || env.CODEX_SESSION_ID || null;
 
   // Build argv: ensure "task-detach" is subcommand
   const dispatchArgs = args[0] === "task-detach" ? args : ["task-detach", ...args];
 
-  const dispatchResult = await runResolvedProcess(companionCmd, dispatchArgs, { cwd, env });
+  const dispatchResult = await runResolvedProcess(companionCmd, dispatchArgs, { cwd, env, defaultCompanion });
 
   const stdout = dispatchResult.stdout;
   const stderr = dispatchResult.stderr;
@@ -1100,7 +1101,7 @@ export async function launchTaskAndWatch({
     threadId,
     cwd,
     stateDir,
-    companionBin: companionCmd,
+    companionBin,
     codexBin,
     remote,
     sync,
