@@ -2176,25 +2176,41 @@ describe("ensureServer opencodeDb compatibility (#798 / PR #799)", () => {
       fs.mkdirSync(cwd, { recursive: true });
       const stateDir = stateDirFor(cwd);
       const otherDb = path.join(tmpDir, "other", "opencode.db");
+      // Another caller holds the lock and has not published yet, so the
+      // first (existing-record) reuse point sees no server.json and this
+      // call goes on to waitForPublishedHealthy.  The record appears only
+      // after that, which makes the published reuse point the one refusing.
       fs.mkdirSync(path.join(stateDir, "serve.lock"));
-      writeJson(path.join(stateDir, "server.json"), {
-        port,
-        password: "pw",
-        pid: process.pid,
-        cwd,
-        profile: "default",
-        pure: false,
-        opencodeDb: otherDb,
-      });
+      const serverFile = path.join(stateDir, "server.json");
+      assert.equal(fs.existsSync(serverFile), false, "test premise: nothing published yet");
+      const publishLater = setTimeout(() => {
+        writeJson(serverFile, {
+          port,
+          password: "pw",
+          pid: process.pid,
+          cwd,
+          profile: "default",
+          pure: false,
+          opencodeDb: otherDb,
+        });
+      }, 300);
 
       const expectedDb = kusabiOpencodeDb();
-      await assert.rejects(ensureServer(cwd), (err) => {
-        assert.ok(err.message.includes("kusabi serve-stop"), err.message);
-        assert.ok(err.message.includes(otherDb), err.message);
-        assert.ok(err.message.includes(expectedDb), err.message);
-        assert.ok(err.message.includes(stateDir), err.message);
-        return true;
-      });
+      const pending = ensureServer(cwd);
+      // Still no record when ensureServer has already started: the refusal
+      // below can only come from the published reuse point.
+      assert.equal(fs.existsSync(serverFile), false);
+      try {
+        await assert.rejects(pending, (err) => {
+          assert.ok(err.message.includes("kusabi serve-stop"), err.message);
+          assert.ok(err.message.includes(otherDb), err.message);
+          assert.ok(err.message.includes(expectedDb), err.message);
+          assert.ok(err.message.includes(stateDir), err.message);
+          return true;
+        });
+      } finally {
+        clearTimeout(publishLater);
+      }
       assert.equal(srv.listening, true);
     } finally {
       await new Promise((resolve) => srv.close(resolve));
