@@ -582,7 +582,7 @@ const JS_SCRIPT_EXTENSIONS = new Set([".mjs", ".cjs", ".js"]);
 //   exec node "<abs target>" "$@"
 // Anything else is a /bin/sh script we do not own and must not rewrite.
 const COMPANION_SHIM_PATTERN =
-  /^#!\/bin\/sh\r?\n[ \t]*exec[ \t]+node[ \t]+"([^"\r\n]+)"[ \t]+"\$@"[ \t]*\r?\n?$/;
+  /^#!\/bin\/sh\r?\n[ \t]*exec[ \t]+node[ \t]+"((?:[^"\\\r\n]|\\.)+)"[ \t]+"\$@"[ \t]*\r?\n?$/;
 
 function isExecutableFile(candidate) {
   try {
@@ -678,12 +678,19 @@ function readFirstLine(filePath) {
 }
 
 /** Recognize exactly the two-line shim `kusabi-companion install-cli` writes
- *  (`#!/bin/sh` then `exec node "<target>" "$@"`).  Returns the target path,
- *  or null for any other content: a /bin/sh script we do not own. */
+ *  (`#!/bin/sh` then `exec node "<target>" "$@"`), decoding the
+ *  JSON-string-escaped target.  Returns the decoded target path, or null for
+ *  any other content or invalid JSON escaping: a /bin/sh script we do not own. */
 export function parseCompanionShim(content) {
   if (typeof content !== "string") return null;
   const m = COMPANION_SHIM_PATTERN.exec(content);
-  return m ? m[1] : null;
+  if (!m) return null;
+  try {
+    const target = JSON.parse(`"${m[1]}"`);
+    return typeof target === "string" && target.length > 0 ? target : null;
+  } catch {
+    return null;
+  }
 }
 
 function isRegularFile(candidate) {
@@ -702,12 +709,13 @@ function readFileText(filePath) {
   }
 }
 
-/** Resolve a JS entry point given by path (relative to cwd, or as given when
- *  it contains `/`) that is NOT executable: a git checkout keeps `.mjs`
- *  files at mode 100644, so spawn fails with EACCES even though the running
- *  Node can start them.  Returns null when the command does not name one. */
+/** Resolve a JS entry point given by a command containing `/` (relative to cwd
+ *  or absolute) that is NOT executable: a git checkout keeps `.mjs` files at
+ *  mode 100644, so spawn fails with EACCES even though the running Node can
+ *  start them.  Bare names without `/` are never resolved from cwd (matching
+ *  `execvp`).  Returns null when the command does not name one. */
 function resolveNonExecutableScript(command, { cwd = process.cwd() } = {}) {
-  if (typeof command !== "string" || command === "") return null;
+  if (typeof command !== "string" || !command.includes("/")) return null;
   const candidate = path.resolve(cwd || process.cwd(), command);
   if (!JS_SCRIPT_EXTENSIONS.has(path.extname(candidate))) return null;
   if (!isRegularFile(candidate)) return null;
@@ -741,9 +749,10 @@ function nodeLaunch(scriptPath, args, { env, nodePath, resolvedPath }) {
  *    Node when the child PATH cannot resolve the interpreter the shebang asks
  *    for;
  *  - (kusabi #792) when the child PATH cannot resolve `node` at all: a
- *    non-executable `.mjs`/`.cjs`/`.js` given by path (A), the exact
- *    install-cli `/bin/sh` shim (B), or the default `kusabi-companion` when
- *    nothing on PATH provides it (C, falling back to this checkout's sibling
+ *    non-executable `.mjs`/`.cjs`/`.js` command containing `/` (relative to
+ *    cwd or absolute) (A), the exact install-cli `/bin/sh` shim (B), or the
+ *    default `kusabi-companion` when nothing on PATH provides it (C, falling
+ *    back to this checkout's sibling
  *    `plugins/kusabi/scripts/kusabi-companion.mjs`).
  *
  * `defaultCompanion` is true only when neither `--companion-bin` nor
@@ -800,7 +809,7 @@ export function resolveNodeLaunch(command, args = [], {
     if (target) return nodeLaunch(target, args, { env, nodePath, resolvedPath });
   }
 
-  // (A) A JS entry point given by path that is not executable.
+  // (A) A JS entry point containing `/` (relative to cwd or absolute) that is not executable.
   if (!resolvedPath) {
     const script = resolveNonExecutableScript(command, { cwd });
     if (script) return nodeLaunch(script, args, { env, nodePath, resolvedPath: script });
@@ -832,14 +841,19 @@ export function describeLaunch(requested, launch) {
 
 /** runProcess with node-shebang resolution applied.  `defaultCompanion` marks
  *  the implicit `kusabi-companion` command so it may fall back to this
- *  checkout's sibling (kusabi #792). */
+ *  checkout's sibling (kusabi #792).  Calls `options.onLaunch(launch)` once
+ *  with the resolved launch decision before spawning, and attaches `launch` to
+ *  the returned result. */
 export function runResolvedProcess(command, args, options = {}) {
+  const { onLaunch, ...processOptions } = options;
   const launch = resolveNodeLaunch(command, args, {
     cwd: options.cwd,
     env: options.env ?? process.env,
     defaultCompanion: options.defaultCompanion === true,
   });
-  return runProcess(launch.command, launch.args, { ...options, env: launch.env });
+  if (typeof onLaunch === "function") onLaunch(launch);
+  return runProcess(launch.command, launch.args, { ...processOptions, env: launch.env })
+    .then((result) => ({ ...result, launch }));
 }
 
 export function runProcess(command, args, { cwd, env = process.env, timeout = 0, onSpawn = null, isolateProcessGroup = true } = {}) {
@@ -1375,12 +1389,22 @@ export async function watchChain({
   currentRecord.pid = process.pid;
   currentRecord.startTime = getProcessStartTime(process.pid, procRoot);
   currentRecord.updatedAt = new Date().toISOString();
-  writeRecordAtomic(recordPath, currentRecord);
 
   // 1. Run chain-wait
   const { command: companionCmd, defaultCompanion } = resolveCompanionCommand(companionBin, env);
   const companionArgs = ["chain-wait", chainId];
-  const waitResult = await runResolvedProcess(companionCmd, companionArgs, { cwd, env, defaultCompanion });
+  const waitResult = await runResolvedProcess(companionCmd, companionArgs, {
+    cwd,
+    env,
+    defaultCompanion,
+    onLaunch: (launch) => {
+      currentRecord = {
+        ...currentRecord,
+        companionLaunch: describeLaunch(companionCmd, launch),
+      };
+      writeRecordAtomic(recordPath, currentRecord);
+    },
+  });
 
   if (waitResult.exitCode !== 0) {
     if (isSignalInterruption(waitResult)) {
@@ -1803,11 +1827,20 @@ export async function watchTask({
       model: model || currentRecord.launch?.model || null,
     };
   }
-  writeRecordAtomic(recordPath, currentRecord);
-
   // 1. Run task-wait — the watcher owns this single blocking process
   const { command: companionCmd, defaultCompanion } = resolveCompanionCommand(companionBin, env);
-  const waitResult = await runResolvedProcess(companionCmd, ["task-wait", jobId], { cwd, env, defaultCompanion });
+  const waitResult = await runResolvedProcess(companionCmd, ["task-wait", jobId], {
+    cwd,
+    env,
+    defaultCompanion,
+    onLaunch: (launch) => {
+      currentRecord = {
+        ...currentRecord,
+        companionLaunch: describeLaunch(companionCmd, launch),
+      };
+      writeRecordAtomic(recordPath, currentRecord);
+    },
+  });
 
   const taskWait = {
     exitCode: waitResult.exitCode,
