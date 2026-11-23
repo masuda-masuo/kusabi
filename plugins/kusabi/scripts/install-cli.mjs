@@ -27,7 +27,10 @@ function companionShimPath(binDir = companionBinDir()) {
   return path.join(binDir, SHIM_NAME);
 }
 
-function renderCompanionShim(targetPath) {
+/** The exact shim content `install-cli` writes.  Exported so the watcher's
+ *  recognizer (kusabi #792) can be tested against the real renderer rather
+ *  than a copy that could drift. */
+export function renderCompanionShim(targetPath) {
   return `#!/bin/sh\nexec node ${JSON.stringify(targetPath)} "$@"\n`;
 }
 
