@@ -28,6 +28,7 @@ import { spawn } from "node:child_process";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 import {
+  OUTCOME_CHAIN_WAIT_FAILURE,
   OUTCOME_DELIVERED,
   OUTCOME_TASK_WAIT_FAILURE,
   parseCompanionShim,
@@ -305,8 +306,12 @@ if (process.argv[1] && fileURLToPath(import.meta.url) === path.resolve(process.a
       assert.equal(env.PATH, noNodeBin, "caller env must not be mutated");
     });
 
-    it("(A) resolves a bare .mjs name against cwd and supports .cjs/.js", () => {
-      const launch = resolveNodeLaunch("mock-companion.mjs", ["x"], { cwd: tmpRoot, env: { PATH: noNodeBin } });
+    it("(A) resolves ./ relative .mjs against cwd (not bare names) and supports .cjs/.js", () => {
+      const bare = resolveNodeLaunch("mock-companion.mjs", ["x"], { cwd: tmpRoot, env: { PATH: noNodeBin } });
+      assert.equal(bare.viaNode, false);
+      assert.equal(bare.command, "mock-companion.mjs");
+
+      const launch = resolveNodeLaunch("./mock-companion.mjs", ["x"], { cwd: tmpRoot, env: { PATH: noNodeBin } });
       assert.equal(launch.viaNode, true);
       assert.deepEqual(launch.args, [companionPath, "x"]);
 
@@ -880,6 +885,218 @@ if (process.argv[1] && fileURLToPath(import.meta.url) === path.resolve(process.a
       for (const call of explicitCalls) {
         assert.equal(call.script, explicitCompanion);
       }
+    });
+  });
+  describe("kusabi #796 follow-ups", () => {
+    it("#796 (A) leaves bare JS name in cwd unchanged (viaNode: false) while ./x.mjs uses Node", () => {
+      const xPath = writeFile(path.join(tmpRoot, "x.mjs"), "console.log('x');\n", 0o644);
+      const bare = resolveNodeLaunch("x.mjs", ["a"], { cwd: tmpRoot, env: { PATH: noNodeBin } });
+      assert.equal(bare.viaNode, false);
+      assert.equal(bare.command, "x.mjs");
+      assert.equal(bare.resolvedPath, null);
+
+      const rel = resolveNodeLaunch("./x.mjs", ["a"], { cwd: tmpRoot, env: { PATH: noNodeBin } });
+      assert.equal(rel.viaNode, true);
+      assert.equal(rel.command, process.execPath);
+      assert.equal(rel.resolvedPath, xPath);
+      assert.deepEqual(rel.args, [xPath, "a"]);
+    });
+
+    it("#796 (B) decodes JSON-escaped shim targets and returns null on invalid JSON escapes", () => {
+      const specialPaths = [
+        "/tmp/with\\backslash/kusabi-companion.mjs",
+        "/tmp/with space/kusabi-companion.mjs",
+        "/tmp/日本語-αβγ/kusabi-companion.mjs",
+        "/tmp/日本語 dir\\sub/kusabi-companion.mjs",
+        '/tmp/with"quote/kusabi-companion.mjs',
+      ];
+      for (const p of specialPaths) {
+        assert.equal(parseCompanionShim(renderCompanionShim(p)), p, p);
+      }
+
+      const invalidCases = [
+        '#!/bin/sh\nexec node "/tmp/bad\\q" "$@"\n',
+        '#!/bin/sh\nexec node "/tmp/bad\\u12" "$@"\n',
+        '#!/bin/sh\nexec node "/tmp/bad\\" "$@"\n',
+        '#!/bin/sh\nexec node "/tmp/bad\tchar" "$@"\n',
+      ];
+      for (const content of invalidCases) {
+        assert.equal(parseCompanionShim(content), null, content);
+      }
+
+      const specialDir = path.join(tmpRoot, "日本語 \\ dir");
+      fs.mkdirSync(specialDir, { recursive: true });
+      const specialCompanion = writeFile(path.join(specialDir, "mock.mjs"), companionBody(marker), 0o644);
+      const validShim = writeFile(path.join(tmpRoot, "special-shim"), renderCompanionShim(specialCompanion), 0o755);
+      const launch = resolveNodeLaunch(validShim, ["task-wait", "j1"], { cwd: tmpRoot, env: { PATH: noNodeBin } });
+      assert.equal(launch.viaNode, true);
+      assert.equal(launch.command, process.execPath);
+      assert.deepEqual(launch.args, [specialCompanion, "task-wait", "j1"]);
+
+      const badShim = writeFile(path.join(tmpRoot, "bad-shim"), '#!/bin/sh\nexec node "/tmp/bad\\q" "$@"\n', 0o755);
+      const badLaunch = resolveNodeLaunch(badShim, ["task-wait", "j1"], { cwd: tmpRoot, env: { PATH: noNodeBin } });
+      assert.equal(badLaunch.viaNode, false);
+      assert.equal(badLaunch.command, badShim);
+    });
+
+    it("#796 records companionLaunch on task-wait for (A)/(B)/(C) and failed wait, and on chain-wait", async () => {
+      // task-wait (A)
+      setupJob("job-796a");
+      const taskA = await watchTask({
+        jobId: "job-796a",
+        threadId: "thread-796a",
+        cwd: workspaceDir,
+        stateDir,
+        companionBin: companionPath,
+        codexBin: codexPath,
+        env: minimalEnv(),
+      });
+      assert.equal(taskA.outcome, OUTCOME_DELIVERED);
+      assert.deepEqual(taskA.record.companionLaunch, {
+        requested: companionPath,
+        resolvedPath: companionPath,
+        viaNode: true,
+        command: process.execPath,
+      });
+      const diskTaskA = JSON.parse(fs.readFileSync(path.join(stateDir, "records", "task-job-796a.json"), "utf8"));
+      assert.deepEqual(diskTaskA.companionLaunch, taskA.record.companionLaunch);
+
+      // task-wait (B) via PATH and via explicit path
+      const shimDir = path.join(tmpRoot, "shim-bin-796");
+      fs.mkdirSync(shimDir);
+      const shimOnPath = writeFile(path.join(shimDir, "kusabi-companion"), renderCompanionShim(companionPath), 0o755);
+      setupJob("job-796b1");
+      const taskB1 = await watchTask({
+        jobId: "job-796b1",
+        threadId: "thread-796b1",
+        cwd: workspaceDir,
+        stateDir,
+        codexBin: codexPath,
+        env: minimalEnv({ PATH: `${shimDir}${path.delimiter}${noNodeBin}` }),
+      });
+      assert.equal(taskB1.outcome, OUTCOME_DELIVERED);
+      assert.deepEqual(taskB1.record.companionLaunch, {
+        requested: "kusabi-companion",
+        resolvedPath: shimOnPath,
+        viaNode: true,
+        command: process.execPath,
+      });
+
+      const shimExplicit = writeFile(path.join(tmpRoot, "shim-796"), renderCompanionShim(companionPath), 0o755);
+      setupJob("job-796b2");
+      const taskB2 = await watchTask({
+        jobId: "job-796b2",
+        threadId: "thread-796b2",
+        cwd: workspaceDir,
+        stateDir,
+        companionBin: shimExplicit,
+        codexBin: codexPath,
+        env: minimalEnv(),
+      });
+      assert.equal(taskB2.outcome, OUTCOME_DELIVERED);
+      assert.deepEqual(taskB2.record.companionLaunch, {
+        requested: shimExplicit,
+        resolvedPath: shimExplicit,
+        viaNode: true,
+        command: process.execPath,
+      });
+
+      // task-wait (C) default sibling
+      const { mod, siblingPath } = await makeCheckout();
+      setupJob("job-796c");
+      const taskC = await mod.watchTask({
+        jobId: "job-796c",
+        threadId: "thread-796c",
+        cwd: workspaceDir,
+        stateDir,
+        codexBin: codexPath,
+        env: minimalEnv(),
+      });
+      assert.equal(taskC.outcome, mod.OUTCOME_DELIVERED);
+      assert.deepEqual(taskC.record.companionLaunch, {
+        requested: "kusabi-companion",
+        resolvedPath: siblingPath,
+        viaNode: true,
+        command: process.execPath,
+      });
+
+      // task-wait failure still records companionLaunch with viaNode: false
+      const missing = path.join(tmpRoot, "missing-companion.mjs");
+      setupJob("job-796-fail");
+      const taskFail = await mod.watchTask({
+        jobId: "job-796-fail",
+        threadId: "thread-796-fail",
+        cwd: workspaceDir,
+        stateDir,
+        companionBin: missing,
+        codexBin: codexPath,
+        env: minimalEnv(),
+      });
+      assert.equal(taskFail.outcome, OUTCOME_TASK_WAIT_FAILURE);
+      assert.equal(taskFail.record.status, "task_wait_failed");
+      assert.deepEqual(taskFail.record.companionLaunch, {
+        requested: missing,
+        resolvedPath: null,
+        viaNode: false,
+        command: missing,
+      });
+      const diskTaskFail = JSON.parse(fs.readFileSync(path.join(stateDir, "records", "task-job-796-fail.json"), "utf8"));
+      assert.deepEqual(diskTaskFail.companionLaunch, taskFail.record.companionLaunch);
+
+      // chain-wait (A), (C), and failure
+      setupChain("chain-796a");
+      const chainA = await watchChain({
+        chainId: "chain-796a",
+        threadId: "thread-796ca",
+        cwd: workspaceDir,
+        stateDir,
+        companionBin: companionPath,
+        codexBin: codexPath,
+        env: minimalEnv(),
+      });
+      assert.equal(chainA.outcome, OUTCOME_DELIVERED);
+      assert.deepEqual(chainA.record.companionLaunch, {
+        requested: companionPath,
+        resolvedPath: companionPath,
+        viaNode: true,
+        command: process.execPath,
+      });
+
+      setupChain("chain-796c");
+      const chainC = await mod.watchChain({
+        chainId: "chain-796c",
+        threadId: "thread-796cc",
+        cwd: workspaceDir,
+        stateDir,
+        codexBin: codexPath,
+        env: minimalEnv(),
+      });
+      assert.equal(chainC.outcome, mod.OUTCOME_DELIVERED);
+      assert.deepEqual(chainC.record.companionLaunch, {
+        requested: "kusabi-companion",
+        resolvedPath: siblingPath,
+        viaNode: true,
+        command: process.execPath,
+      });
+
+      setupChain("chain-796-fail");
+      const chainFail = await mod.watchChain({
+        chainId: "chain-796-fail",
+        threadId: "thread-796cf",
+        cwd: workspaceDir,
+        stateDir,
+        companionBin: missing,
+        codexBin: codexPath,
+        env: minimalEnv(),
+      });
+      assert.equal(chainFail.outcome, OUTCOME_CHAIN_WAIT_FAILURE);
+      assert.equal(chainFail.record.status, "chain_wait_failed");
+      assert.deepEqual(chainFail.record.companionLaunch, {
+        requested: missing,
+        resolvedPath: null,
+        viaNode: false,
+        command: missing,
+      });
     });
   });
 });
