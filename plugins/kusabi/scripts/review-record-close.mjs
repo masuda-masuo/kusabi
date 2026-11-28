@@ -306,7 +306,7 @@ export function closeReviewRecords({
       const subject = inboxSubject(entry.stateDir, entry.chainId);
       if (seenSubjects.has(subject)) continue;
       seenSubjects.add(subject);
-      ackItems.push({ stateDir: entry.stateDir, chainId: entry.chainId, isRecordless: true });
+      ackItems.push({ stateDir: entry.stateDir, chainId: entry.chainId, subject, isRecordless: true });
     }
 
     // Best-effort, after the control locks are released so a slow or hung
@@ -320,17 +320,27 @@ export function closeReviewRecords({
       mcpConfigFile,
       timeoutMs: notifyTimeoutMs,
     });
-    let recordlessAcknowledged = 0;
+    // Match results by subject, not by position, so a change in how
+    // acknowledgeChainInbox orders or filters its results cannot shift the
+    // counts. recordlessAcknowledged counts chains whose ack call succeeded;
+    // recordlessEntriesAcknowledged counts the inbox entries kaiba actually
+    // acknowledged for them (0 when nothing was open).
+    const resultBySubject = new Map();
     if (!ackResult?.skipped && Array.isArray(ackResult?.results)) {
-      for (let index = 0; index < ackItems.length; index += 1) {
-        if (!ackItems[index].isRecordless) continue;
-        const row = ackResult.results[index];
-        if (row && !row.error && !row.skipped) {
-          recordlessAcknowledged += 1;
-        }
+      for (const row of ackResult.results) {
+        if (row && typeof row.subject === "string") resultBySubject.set(row.subject, row);
       }
     }
-    return { ...closed, recordlessAcknowledged };
+    let recordlessAcknowledged = 0;
+    let recordlessEntriesAcknowledged = 0;
+    for (const item of ackItems) {
+      if (!item.isRecordless) continue;
+      const row = resultBySubject.get(item.subject);
+      if (!row || row.error || row.skipped || !Number.isInteger(row.acknowledged)) continue;
+      recordlessAcknowledged += 1;
+      recordlessEntriesAcknowledged += row.acknowledged;
+    }
+    return { ...closed, recordlessAcknowledged, recordlessEntriesAcknowledged };
   }
   return {
     targets: targets.map(({ path: recordPath }) => recordPath),
@@ -338,6 +348,7 @@ export function closeReviewRecords({
     written: 0,
     recordless,
     recordlessAcknowledged: 0,
+    recordlessEntriesAcknowledged: 0,
   };
 }
 
@@ -375,7 +386,7 @@ export function cmdReviewRecordClose(argv, { env, mcpConfigFile, notifyTimeoutMs
   const lines = options.apply
     ? [
         `Wrote ${result.written} historical mark(s).`,
-        `Acknowledged ${result.recordlessAcknowledged} record-less chain(s).`,
+        `Acknowledged ${result.recordlessEntriesAcknowledged} inbox entr${result.recordlessEntriesAcknowledged === 1 ? "y" : "ies"} for ${result.recordlessAcknowledged} record-less chain(s).`,
       ]
     : [`Targets: ${result.targets.length}`, ...result.targets.map((recordPath) => `target: ${recordPath}`)];
   lines.push(`Skipped: ${result.skipped.length}`);

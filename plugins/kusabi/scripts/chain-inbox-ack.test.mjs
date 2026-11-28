@@ -749,7 +749,7 @@ describe("historical close acknowledges record-less terminal chains", () => {
     assert.deepEqual(lines, []);
     assert.deepEqual(snapshotTree(root), beforeTree, "no file or directory created under state root");
     assert.match(output, /^Wrote 0 historical mark\(s\)\.$/m);
-    assert.match(output, /^Acknowledged 3 record-less chain\(s\)\.$/m);
+    assert.match(output, /^Acknowledged 3 inbox entries for 3 record-less chain\(s\)\.$/m);
 
     const state = readStatefulState(fixture);
     assert.equal(state.entries.length, 3);
@@ -926,7 +926,7 @@ describe("historical close acknowledges record-less terminal chains", () => {
       { mcpConfigFile: fixture.configPath, env: { KUSABI_CHAIN_NOTIFY: "1" } },
     );
     assert.match(output, /^Wrote 1 historical mark\(s\)\.$/m);
-    assert.match(output, /^Acknowledged 1 record-less chain\(s\)\.$/m);
+    assert.match(output, /^Acknowledged 1 inbox entry for 1 record-less chain\(s\)\.$/m);
     assert.ok(fs.readFileSync(recordPath, "utf8").includes("<!-- historical:"));
 
     assert.equal(spawnCount(fixture), 1, "records and record-less chains share one kaiba spawn");
@@ -935,6 +935,30 @@ describe("historical close acknowledges record-less terminal chains", () => {
       `${hash}:chain-record`,
       `${hash}:chain-recordless`,
     ]);
+  });
+
+  it("reports 0 acknowledged inbox entries when kaiba has nothing open for a record-less chain", () => {
+    const root = makeCloseRoot();
+    const hash = "ffffffffffff";
+    writeControl(root, "chain-already-read", {
+      chainId: "chain-already-read",
+      status: "failed",
+      finishedAt: "2021-05-01T00:00:00.000Z",
+      terminalOccurrenceId: "occ-already-read",
+    }, hash);
+    const fixture = makeAckFixture("success");
+    const args = ["--historical", "--before", BEFORE, "--apply", "--state-root", root];
+    const opts = { mcpConfigFile: fixture.configPath, env: { KUSABI_CHAIN_NOTIFY: "1" } };
+
+    const first = cmdReviewRecordClose(args, opts);
+    assert.match(first, /^Acknowledged 1 inbox entry for 1 record-less chain\(s\)\.$/m);
+    // The fixture now returns {acknowledged: []} for this subject: the call
+    // succeeds, but no inbox entry changes, and the output must say so.
+    const second = cmdReviewRecordClose(args, opts);
+    assert.match(second, /^Acknowledged 0 inbox entries for 1 record-less chain\(s\)\.$/m);
+    const result = closeReviewRecords({ before: BEFORE, stateRootDir: root, apply: true, ...opts });
+    assert.equal(result.recordlessAcknowledged, 1);
+    assert.equal(result.recordlessEntriesAcknowledged, 0);
   });
 
   it("reports 0 record-less acknowledged and spawns nothing when KUSABI_CHAIN_NOTIFY=0 or ack fails", () => {
@@ -952,7 +976,7 @@ describe("historical close acknowledges record-less terminal chains", () => {
       ["--historical", "--before", BEFORE, "--apply", "--state-root", root],
       { mcpConfigFile: successFixture.configPath, env: { KUSABI_CHAIN_NOTIFY: "0" } },
     );
-    assert.match(optOutOutput, /^Acknowledged 0 record-less chain\(s\)\.$/m);
+    assert.match(optOutOutput, /^Acknowledged 0 inbox entries for 0 record-less chain\(s\)\.$/m);
     assert.deepEqual(requestRows(successFixture), []);
 
     const errorFixture = makeAckFixture("error-result");
@@ -960,7 +984,7 @@ describe("historical close acknowledges record-less terminal chains", () => {
       ["--historical", "--before", BEFORE, "--apply", "--state-root", root],
       { mcpConfigFile: errorFixture.configPath, env: { KUSABI_CHAIN_NOTIFY: "1" } },
     ));
-    assert.match(errorOutput, /^Acknowledged 0 record-less chain\(s\)\.$/m);
+    assert.match(errorOutput, /^Acknowledged 0 inbox entries for 0 record-less chain\(s\)\.$/m);
     assert.ok(lines.some((line) => line.startsWith("[chain-notify]") && line.includes("chain-optout")));
   });
 
