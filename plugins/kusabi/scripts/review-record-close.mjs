@@ -5,6 +5,7 @@ import { randomUUID } from "node:crypto";
 import { stateRoot } from "./state-paths.mjs";
 import { isUnadjudicatedRecord } from "./review-record-scan.mjs";
 import { withControlWriteLock } from "./chain-control.mjs";
+import { acknowledgeChainInbox, stateDirForChain } from "./chain-notify.mjs";
 
 export const FINDINGS_HEADER = "## Findings adjudication (fill at inspection)";
 const FINDINGS_HEADER_PATTERN = /^[ \t]*## Findings adjudication \(fill at inspection\)[ \t]*(\r?\n|$)/m;
@@ -127,14 +128,21 @@ function withAllControlWriteLocks(dirs, fn) {
   return acquire(0);
 }
 
-export function closeReviewRecords({ before, stateRootDir = stateRoot(), apply = false }) {
+export function closeReviewRecords({
+  before,
+  stateRootDir = stateRoot(),
+  apply = false,
+  env = process.env,
+  mcpConfigFile,
+  notifyTimeoutMs,
+}) {
   validateBefore(before);
   const { targets, skipped } = scanReviewRecords({ before, stateRootDir });
   if (apply && targets.length > 0) {
     const sortedTargets = [...targets].sort((a, b) => a.path.localeCompare(b.path));
     const dirs = [...new Set(sortedTargets.map((target) => path.dirname(target.path)))].sort();
 
-    return withAllControlWriteLocks(dirs, () => {
+    const closed = withAllControlWriteLocks(dirs, () => {
       const planned = [];
       for (const target of sortedTargets) {
         let currentContent;
@@ -208,6 +216,22 @@ export function closeReviewRecords({ before, stateRootDir = stateRoot(), apply =
         written: planned.length,
       };
     });
+
+    // Best-effort, after the control locks are released so a slow or hung
+    // kaiba never holds them: the marks are written either way and a failed
+    // ack only logs. The chain directory is <stateDir>/chains/<chainId>, so
+    // the record path yields both the chain id and the state directory whose
+    // hash prefixes the ack subject.
+    acknowledgeChainInbox({
+      chains: closed.targets.map((targetPath) => {
+        const chainDir = path.dirname(targetPath);
+        return { stateDir: stateDirForChain(chainDir), chainId: path.basename(chainDir) };
+      }),
+      env,
+      mcpConfigFile,
+      timeoutMs: notifyTimeoutMs,
+    });
+    return closed;
   }
   return { targets: targets.map(({ path: recordPath }) => recordPath), skipped, written: 0 };
 }

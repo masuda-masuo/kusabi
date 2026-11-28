@@ -11,6 +11,7 @@ import {
   notifyChainTerminal,
   stateDirForChain,
   chainIdFromDir,
+  inboxSubject,
 } from "./chain-notify.mjs";
 
 const tempDirs = new Set();
@@ -85,6 +86,11 @@ describe("chain notifier local behavior", () => {
     assert.equal(chainIdFromDir("/some/path/chain-x"), "chain-x");
   });
 
+  it("namespaces the inbox subject with the state directory's hash name", () => {
+    assert.equal(inboxSubject("/home/user/.kusabi/9a8d0269177e", "chain-abc"), "9a8d0269177e:chain-abc");
+    assert.equal(inboxSubject("/home/user/.kusabi/other/", "chain-abc"), "other:chain-abc");
+  });
+
   it("writes a durable local inbox and emits a structured terminal event", () => {
     const dir = makeTmpDir();
     const fixture = makeMcpFixture(dir);
@@ -126,7 +132,7 @@ describe("chain notifier local behavior", () => {
     assert.deepEqual(requests.at(-1).params.arguments, {
       event_key: "chain-terminal:chain-test:occ-1",
       event_type: "chain_terminal",
-      subject: "chain-test",
+      subject: "state:chain-test",
       title: "repo",
       metadata: {
         status: "completed",

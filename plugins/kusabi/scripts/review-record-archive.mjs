@@ -4,6 +4,7 @@ import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { chainStateDirFor, stateRoot } from "./state-paths.mjs";
 import { unfilledAdjudicationLines } from "./review-record-table.mjs";
+import { acknowledgeChainInbox, stateDirForChain } from "./chain-notify.mjs";
 
 export const USAGE = "Usage: review-record-archive <chainId> --kairanban <path> [--force] [--state-root <dir>]";
 
@@ -96,7 +97,16 @@ function shellQuote(value) {
   return `'${value.replace(/'/g, "'\\''")}'`;
 }
 
-export function archiveReviewRecord({ chainId, kairanbanDir, force = false, stateRootDir = stateRoot(), cwd = process.cwd() }) {
+export function archiveReviewRecord({
+  chainId,
+  kairanbanDir,
+  force = false,
+  stateRootDir = stateRoot(),
+  cwd = process.cwd(),
+  env = process.env,
+  mcpConfigFile,
+  notifyTimeoutMs,
+}) {
   if (!/^chain-[a-z0-9]+$/.test(chainId ?? "")) throw new Error(`invalid chain id: ${chainId}`);
   if (typeof kairanbanDir !== "string" || !fs.existsSync(kairanbanDir) || !fs.statSync(kairanbanDir).isDirectory()) {
     throw new Error(`kairanban clone not found: ${kairanbanDir}`);
@@ -155,6 +165,16 @@ export function archiveReviewRecord({ chainId, kairanbanDir, force = false, stat
       content: target.content,
     })));
   }
+
+  // Best-effort: the record is archived either way. A failed ack only logs.
+  // The subject carries the state directory's hash so the ack cannot reach a
+  // same-named chain in another state directory.
+  acknowledgeChainInbox({
+    chains: [{ stateDir: stateDirForChain(chainDir), chainId }],
+    env,
+    mcpConfigFile,
+    timeoutMs: notifyTimeoutMs,
+  });
 
   const commands = `git -C ${shellQuote(path.resolve(kairanbanDir))} add ${targetRelative} && git -C ${shellQuote(path.resolve(kairanbanDir))} commit -m "Archive review record for ${repoName} ${chainId}" && git -C ${shellQuote(path.resolve(kairanbanDir))} push`;
   return [
