@@ -357,7 +357,7 @@ function writeRecord(root, chain, finished = "2021-01-01T00:00:00.000Z", hash = 
 }
 
 describe("archive acknowledges a closed chain", () => {
-  it("acks exactly once with the chain id after the files exist, and stdout matches the opt-out", () => {
+  it("acks exactly once with the chain id after the files exist, and stdout differs from opt-out only in the ack line", () => {
     const f = makeArchiveFixture();
     const fixture = makeAckFixture("success", { markerPath: f.targetRecordPath });
     const { result: output, lines } = withStderr(() => archive(f, {
@@ -379,14 +379,77 @@ describe("archive acknowledges a closed chain", () => {
     assert.ok(rows.every(({ env }) => env.producer === "kusabi" && env.readonly === "1"));
     assert.ok(rows.every(({ env }) => env.configured === "preserved"));
 
-    // Same paths, same input, notifier opted out: byte-identical stdout.
+    // Same paths, same input, notifier opted out: differs only in the ack line.
     fs.rmSync(f.targetDir, { recursive: true, force: true });
     const { result: optedOut } = withStderr(() => archive(f, {
       mcpConfigFile: fixture.configPath,
       env: { KUSABI_CHAIN_NOTIFY: "0" },
     }));
-    assert.equal(optedOut, output);
+    const outputLines = output.split("\n");
+    const optedOutLines = optedOut.split("\n");
+    assert.equal(outputLines.length, optedOutLines.length);
+    assert.equal(outputLines.at(-2), "Acknowledged 1 inbox entry for chain-test.");
+    assert.equal(optedOutLines.at(-2), "Inbox ack skipped for chain-test: KUSABI_CHAIN_NOTIFY=0");
+    assert.deepEqual(
+      [...outputLines.slice(0, -2), outputLines.at(-1)],
+      [...optedOutLines.slice(0, -2), optedOutLines.at(-1)],
+    );
     assert.equal(ackCalls(fixture).length, 1, "the opt-out spawned nothing");
+  });
+
+  it("prints acked counts (2, 0 on repeat, 1 singular) as the second-to-last archive stdout line", () => {
+    const f = makeArchiveFixture();
+    const fixture = makeStatefulFixture();
+    const stateDir = path.join(f.root, workspaceHash());
+    for (const occurrenceId of ["occ-1", "occ-2"]) {
+      assert.equal(notifyChainTerminal({
+        stateDir,
+        chainId: "chain-test",
+        status: "completed",
+        disposition: "accept",
+        occurrenceId,
+        mcpConfigFile: fixture.configPath,
+        env: { KUSABI_CHAIN_NOTIFY: "1" },
+      }).inboxDelivered, true);
+    }
+
+    const firstLines = archive(f, {
+      mcpConfigFile: fixture.configPath,
+      env: { KUSABI_CHAIN_NOTIFY: "1" },
+    }).split("\n");
+    assert.equal(firstLines.at(-2), "Acknowledged 2 inbox entries for chain-test.");
+    assert.match(firstLines.at(-1), /^git -C /);
+    assert.ok(firstLines.slice(-2).includes("Acknowledged 2 inbox entries for chain-test."));
+
+    const repeatLines = archive(f, {
+      mcpConfigFile: fixture.configPath,
+      env: { KUSABI_CHAIN_NOTIFY: "1" },
+    }).split("\n");
+    assert.equal(repeatLines[0], "unchanged");
+    assert.equal(repeatLines.at(-2), "Acknowledged 0 inbox entries for chain-test.");
+    assert.match(repeatLines.at(-1), /^git -C /);
+
+    const single = makeArchiveFixture({ chainId: "chain-one" });
+    const singleFixture = makeStatefulFixture();
+    assert.equal(notifyChainTerminal({
+      stateDir: path.join(single.root, workspaceHash()),
+      chainId: "chain-one",
+      status: "completed",
+      disposition: "accept",
+      occurrenceId: "occ-single",
+      mcpConfigFile: singleFixture.configPath,
+      env: { KUSABI_CHAIN_NOTIFY: "1" },
+    }).inboxDelivered, true);
+    const singleLines = archiveReviewRecord({
+      chainId: "chain-one",
+      kairanbanDir: single.clone,
+      stateRootDir: single.root,
+      cwd: CWD,
+      mcpConfigFile: singleFixture.configPath,
+      env: { KUSABI_CHAIN_NOTIFY: "1" },
+    }).split("\n");
+    assert.equal(singleLines.at(-2), "Acknowledged 1 inbox entry for chain-one.");
+    assert.match(singleLines.at(-1), /^git -C /);
   });
 
   it("acks again when the record is unchanged (kaiba keeps the ack idempotent)", () => {
@@ -496,8 +559,16 @@ describe("ack failures are fail-soft and observable", () => {
       }));
 
       assert.match(output, /wrote/);
-      assert.ok(lines.some((line) => line.startsWith("[chain-notify]") && line.includes("chain-test")),
-        `expected a [chain-notify] line naming the chain, got: ${lines.join(" | ")}`);
+      const stderrLine = lines.find((line) => line.startsWith("[chain-notify]") && line.includes("chain-test"));
+      assert.ok(stderrLine, `expected a [chain-notify] line naming the chain, got: ${lines.join(" | ")}`);
+      const outputLines = output.split("\n");
+      const ackLine = outputLines.at(-2);
+      assert.ok(ackLine?.startsWith("Inbox ack failed for chain-test: "), `unexpected ack line: ${ackLine}`);
+      const reason = ackLine.slice("Inbox ack failed for chain-test: ".length);
+      assert.ok(reason.length > 0);
+      assert.equal(stderrLine, `[chain-notify] inbox ack failed for ${workspaceHash()}:chain-test: ${reason}`);
+      assert.match(outputLines.at(-1), /^git -C /);
+      assert.ok(outputLines.slice(-2).includes(ackLine));
       if (mode === "hang") {
         assert.ok(Date.now() - started < 5000, "bounded by the stated ack bound");
         assertDescendantGone(fixture);
@@ -536,8 +607,14 @@ describe("ack failures are fail-soft and observable", () => {
       env: { KUSABI_CHAIN_NOTIFY: "1" },
     }));
     assert.match(archiveOutput, /wrote/);
-    assert.ok(archiveLines.some((line) => line.startsWith("[chain-notify]") && line.includes("chain-test")),
-      `expected a [chain-notify] line naming the chain, got: ${archiveLines.join(" | ")}`);
+    const absentStderr = archiveLines.find((line) => line.startsWith("[chain-notify]") && line.includes("chain-test"));
+    assert.ok(absentStderr, `expected a [chain-notify] line naming the chain, got: ${archiveLines.join(" | ")}`);
+    const absentOutputLines = archiveOutput.split("\n");
+    const absentAckLine = absentOutputLines.at(-2);
+    assert.ok(absentAckLine?.startsWith("Inbox ack failed for chain-test: "), `unexpected ack line: ${absentAckLine}`);
+    const absentReason = absentAckLine.slice("Inbox ack failed for chain-test: ".length);
+    assert.equal(absentStderr, `[chain-notify] inbox ack failed for ${workspaceHash()}:chain-test: ${absentReason}`);
+    assert.match(absentOutputLines.at(-1), /^git -C /);
 
     const root = makeCloseRoot();
     writeRecord(root, "chain-absent");
@@ -560,6 +637,7 @@ describe("opt-out and the ack bound", () => {
     const fixture = makeAckFixture("success");
     const output = archive(f, { mcpConfigFile: fixture.configPath, env: { KUSABI_CHAIN_NOTIFY: "0" } });
     assert.match(output, /wrote/);
+    assert.equal(output.split("\n").at(-2), "Inbox ack skipped for chain-test: KUSABI_CHAIN_NOTIFY=0");
     assert.deepEqual(requestRows(fixture), []);
 
     const root = makeCloseRoot();
@@ -1128,5 +1206,115 @@ describe("historical close acknowledges record-less terminal chains", () => {
       env: { KUSABI_CHAIN_NOTIFY: "1" },
     });
     assert.equal(afterRearm.recordless.some((entry) => entry.chainId === "chain-rearm-api"), false);
+  });
+
+  it("prints one sorted <hash>/<chainId> ack line per chain on --apply, including failures and opt-out, and none on dry-run or empty apply", () => {
+    const root = makeCloseRoot();
+    const hashRec = "222222222222";
+    const hashRl = "111111111111";
+    writeRecord(root, "chain-rec", "2021-01-01T00:00:00.000Z", hashRec);
+    writeControl(root, "chain-rl", {
+      chainId: "chain-rl",
+      status: "failed",
+      finishedAt: "2021-02-01T00:00:00.000Z",
+      terminalOccurrenceId: "occ-rl",
+    }, hashRl);
+
+    const fixture = makeStatefulFixture();
+    for (const occurrenceId of ["occ-r1", "occ-r2"]) {
+      assert.equal(notifyChainTerminal({
+        stateDir: path.join(root, hashRec),
+        chainId: "chain-rec",
+        status: "completed",
+        disposition: "accept",
+        occurrenceId,
+        mcpConfigFile: fixture.configPath,
+        env: { KUSABI_CHAIN_NOTIFY: "1" },
+      }).inboxDelivered, true);
+    }
+    assert.equal(notifyChainTerminal({
+      stateDir: path.join(root, hashRl),
+      chainId: "chain-rl",
+      status: "failed",
+      disposition: null,
+      occurrenceId: "occ-rl",
+      mcpConfigFile: fixture.configPath,
+      env: { KUSABI_CHAIN_NOTIFY: "1" },
+    }).inboxDelivered, true);
+
+    const dryOutput = cmdReviewRecordClose(
+      ["--historical", "--before", BEFORE, "--state-root", root],
+      { mcpConfigFile: fixture.configPath, env: { KUSABI_CHAIN_NOTIFY: "1" } },
+    );
+    assert.doesNotMatch(dryOutput, /^Acknowledged \d+ inbox entr/m);
+    assert.doesNotMatch(dryOutput, /^Inbox ack /m);
+
+    const applyOutput = cmdReviewRecordClose(
+      ["--historical", "--before", BEFORE, "--apply", "--state-root", root],
+      { mcpConfigFile: fixture.configPath, env: { KUSABI_CHAIN_NOTIFY: "1" } },
+    );
+    assert.deepEqual(applyOutput.split("\n"), [
+      "Wrote 1 historical mark(s).",
+      "Acknowledged 1 inbox entry for 1 record-less chain(s).",
+      `Acknowledged 1 inbox entry for ${hashRl}/chain-rl.`,
+      `Acknowledged 2 inbox entries for ${hashRec}/chain-rec.`,
+      "Skipped: 0",
+    ]);
+
+    const emptyRoot = makeCloseRoot();
+    const emptyOutput = cmdReviewRecordClose(
+      ["--historical", "--before", BEFORE, "--apply", "--state-root", emptyRoot],
+      { mcpConfigFile: fixture.configPath, env: { KUSABI_CHAIN_NOTIFY: "1" } },
+    );
+    assert.equal(emptyOutput, [
+      "Wrote 0 historical mark(s).",
+      "Acknowledged 0 inbox entries for 0 record-less chain(s).",
+      "Skipped: 0",
+    ].join("\n"));
+
+    const failRoot = makeCloseRoot();
+    writeRecord(failRoot, "chain-rec", "2021-01-01T00:00:00.000Z", hashRec);
+    writeControl(failRoot, "chain-rl", {
+      chainId: "chain-rl",
+      status: "failed",
+      finishedAt: "2021-02-01T00:00:00.000Z",
+      terminalOccurrenceId: "occ-rl",
+    }, hashRl);
+
+    const errorFixture = makeAckFixture("error-result");
+    const { result: failOutput, lines: failStderr } = withStderr(() => cmdReviewRecordClose(
+      ["--historical", "--before", BEFORE, "--apply", "--state-root", failRoot],
+      { mcpConfigFile: errorFixture.configPath, env: { KUSABI_CHAIN_NOTIFY: "1" } },
+    ));
+    const failLines = failOutput.split("\n");
+    assert.equal(failLines[0], "Wrote 1 historical mark(s).");
+    assert.equal(failLines[1], "Acknowledged 0 inbox entries for 0 record-less chain(s).");
+    assert.match(failLines[2], new RegExp(`^Inbox ack failed for ${hashRl}/chain-rl: .+$`));
+    assert.match(failLines[3], new RegExp(`^Inbox ack failed for ${hashRec}/chain-rec: .+$`));
+    assert.equal(failLines[4], "Skipped: 0");
+    const reasonRl = failLines[2].slice(`Inbox ack failed for ${hashRl}/chain-rl: `.length);
+    const reasonRec = failLines[3].slice(`Inbox ack failed for ${hashRec}/chain-rec: `.length);
+    assert.ok(failStderr.includes(`[chain-notify] inbox ack failed for ${hashRl}:chain-rl: ${reasonRl}`));
+    assert.ok(failStderr.includes(`[chain-notify] inbox ack failed for ${hashRec}:chain-rec: ${reasonRec}`));
+
+    const optOutRoot = makeCloseRoot();
+    writeRecord(optOutRoot, "chain-rec", "2021-01-01T00:00:00.000Z", hashRec);
+    writeControl(optOutRoot, "chain-rl", {
+      chainId: "chain-rl",
+      status: "failed",
+      finishedAt: "2021-02-01T00:00:00.000Z",
+      terminalOccurrenceId: "occ-rl",
+    }, hashRl);
+    const optOutOutput = cmdReviewRecordClose(
+      ["--historical", "--before", BEFORE, "--apply", "--state-root", optOutRoot],
+      { mcpConfigFile: fixture.configPath, env: { KUSABI_CHAIN_NOTIFY: "0" } },
+    );
+    assert.deepEqual(optOutOutput.split("\n"), [
+      "Wrote 1 historical mark(s).",
+      "Acknowledged 0 inbox entries for 0 record-less chain(s).",
+      `Inbox ack skipped for ${hashRl}/chain-rl: KUSABI_CHAIN_NOTIFY=0`,
+      `Inbox ack skipped for ${hashRec}/chain-rec: KUSABI_CHAIN_NOTIFY=0`,
+      "Skipped: 0",
+    ]);
   });
 });

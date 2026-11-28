@@ -6,6 +6,7 @@ import { stateRoot } from "./state-paths.mjs";
 import { isUnadjudicatedRecord } from "./review-record-scan.mjs";
 import { readChainControl, withControlWriteLock } from "./chain-control.mjs";
 import { acknowledgeChainInbox, inboxSubject, stateDirForChain } from "./chain-notify.mjs";
+import { formatInboxAckLine } from "./review-record-archive.mjs";
 
 export const FINDINGS_HEADER = "## Findings adjudication (fill at inspection)";
 const FINDINGS_HEADER_PATTERN = /^[ \t]*## Findings adjudication \(fill at inspection\)[ \t]*(\r?\n|$)/m;
@@ -300,7 +301,7 @@ export function closeReviewRecords({
       const subject = inboxSubject(stateDir, chainId);
       if (seenSubjects.has(subject)) continue;
       seenSubjects.add(subject);
-      ackItems.push({ stateDir, chainId, isRecordless: false });
+      ackItems.push({ stateDir, chainId, subject, isRecordless: false });
     }
     for (const entry of closed.recordless) {
       const subject = inboxSubject(entry.stateDir, entry.chainId);
@@ -314,33 +315,54 @@ export function closeReviewRecords({
     // ack only logs. The chain directory is <stateDir>/chains/<chainId>, so
     // it yields both the chain id and the state directory whose hash prefixes
     // the ack subject.
-    const ackResult = acknowledgeChainInbox({
-      chains: ackItems.map(({ stateDir, chainId }) => ({ stateDir, chainId })),
-      env,
-      mcpConfigFile,
-      timeoutMs: notifyTimeoutMs,
-    });
+    const ackResult = ackItems.length > 0
+      ? acknowledgeChainInbox({
+          chains: ackItems.map(({ stateDir, chainId }) => ({ stateDir, chainId })),
+          env,
+          mcpConfigFile,
+          timeoutMs: notifyTimeoutMs,
+        })
+      : { results: [] };
     // Match results by subject, not by position, so a change in how
     // acknowledgeChainInbox orders or filters its results cannot shift the
     // counts. recordlessAcknowledged counts chains whose ack call succeeded;
     // recordlessEntriesAcknowledged counts the inbox entries kaiba actually
     // acknowledged for them (0 when nothing was open).
     const resultBySubject = new Map();
-    if (!ackResult?.skipped && Array.isArray(ackResult?.results)) {
+    if (Array.isArray(ackResult?.results)) {
       for (const row of ackResult.results) {
         if (row && typeof row.subject === "string") resultBySubject.set(row.subject, row);
       }
     }
     let recordlessAcknowledged = 0;
     let recordlessEntriesAcknowledged = 0;
-    for (const item of ackItems) {
-      if (!item.isRecordless) continue;
-      const row = resultBySubject.get(item.subject);
-      if (!row || row.error || row.skipped || !Number.isInteger(row.acknowledged)) continue;
-      recordlessAcknowledged += 1;
-      recordlessEntriesAcknowledged += row.acknowledged;
+    if (!ackResult?.skipped) {
+      for (const item of ackItems) {
+        if (!item.isRecordless) continue;
+        const row = resultBySubject.get(item.subject);
+        if (!row || typeof row.error === "string" || row.skipped || !Number.isInteger(row.acknowledged)) continue;
+        recordlessAcknowledged += 1;
+        recordlessEntriesAcknowledged += row.acknowledged;
+      }
     }
-    return { ...closed, recordlessAcknowledged, recordlessEntriesAcknowledged };
+    const ackResults = ackItems
+      .map((item) => {
+        const name = `${path.basename(path.resolve(item.stateDir))}/${item.chainId}`;
+        const row = resultBySubject.get(item.subject);
+        const skippedAck = Boolean(ackResult?.skipped || row?.skipped);
+        return {
+          name,
+          chainId: item.chainId,
+          subject: item.subject,
+          ...(skippedAck
+            ? { skipped: true }
+            : row && typeof row.error !== "string" && Number.isInteger(row.acknowledged)
+              ? { acknowledged: row.acknowledged }
+              : { error: row?.error ?? "kaiba ack client returned no result" }),
+        };
+      })
+      .sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+    return { ...closed, recordlessAcknowledged, recordlessEntriesAcknowledged, ackResults };
   }
   return {
     targets: targets.map(({ path: recordPath }) => recordPath),
@@ -349,6 +371,7 @@ export function closeReviewRecords({
     recordless,
     recordlessAcknowledged: 0,
     recordlessEntriesAcknowledged: 0,
+    ackResults: [],
   };
 }
 
@@ -387,6 +410,7 @@ export function cmdReviewRecordClose(argv, { env, mcpConfigFile, notifyTimeoutMs
     ? [
         `Wrote ${result.written} historical mark(s).`,
         `Acknowledged ${result.recordlessEntriesAcknowledged} inbox entr${result.recordlessEntriesAcknowledged === 1 ? "y" : "ies"} for ${result.recordlessAcknowledged} record-less chain(s).`,
+        ...(result.ackResults ?? []).map((entry) => formatInboxAckLine(entry.name, entry, { skipped: Boolean(entry.skipped) })),
       ]
     : [`Targets: ${result.targets.length}`, ...result.targets.map((recordPath) => `target: ${recordPath}`)];
   lines.push(`Skipped: ${result.skipped.length}`);

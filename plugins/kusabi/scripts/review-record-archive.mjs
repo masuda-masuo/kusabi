@@ -97,6 +97,26 @@ function shellQuote(value) {
   return `'${value.replace(/'/g, "'\\''")}'`;
 }
 
+/**
+ * Format a single stdout summary line for one chain's inbox ack outcome.
+ *
+ * @param {string} label - `<chainId>` for archive, `<state-dir-hash>/<chainId>` for historical close.
+ * @param {{ acknowledged?: number, error?: string, skipped?: boolean } | undefined} row
+ * @param {{ skipped?: boolean }} [opts]
+ * @returns {string}
+ */
+export function formatInboxAckLine(label, row, { skipped = false } = {}) {
+  if (skipped || row?.skipped) {
+    return `Inbox ack skipped for ${label}: KUSABI_CHAIN_NOTIFY=0`;
+  }
+  if (row && typeof row.error !== "string" && Number.isInteger(row.acknowledged)) {
+    const noun = row.acknowledged === 1 ? "entry" : "entries";
+    return `Acknowledged ${row.acknowledged} inbox ${noun} for ${label}.`;
+  }
+  const reason = row?.error ?? "kaiba ack client returned no result";
+  return `Inbox ack failed for ${label}: ${reason}`;
+}
+
 export function archiveReviewRecord({
   chainId,
   kairanbanDir,
@@ -169,17 +189,19 @@ export function archiveReviewRecord({
   // Best-effort: the record is archived either way. A failed ack only logs.
   // The subject carries the state directory's hash so the ack cannot reach a
   // same-named chain in another state directory.
-  acknowledgeChainInbox({
+  const ackResult = acknowledgeChainInbox({
     chains: [{ stateDir: stateDirForChain(chainDir), chainId }],
     env,
     mcpConfigFile,
     timeoutMs: notifyTimeoutMs,
   });
+  const ackLine = formatInboxAckLine(chainId, ackResult?.results?.[0], { skipped: Boolean(ackResult?.skipped) });
 
   const commands = `git -C ${shellQuote(path.resolve(kairanbanDir))} add ${targetRelative} && git -C ${shellQuote(path.resolve(kairanbanDir))} commit -m "Archive review record for ${repoName} ${chainId}" && git -C ${shellQuote(path.resolve(kairanbanDir))} push`;
   return [
     ...(fallbackMessage ? [fallbackMessage] : []),
     unchanged ? "unchanged" : `wrote ${path.join(targetRelative, "review-record.md")} and ${path.join(targetRelative, "brief.md")}`,
+    ackLine,
     commands,
   ].join("\n");
 }
