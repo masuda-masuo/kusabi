@@ -111,6 +111,26 @@ function ackFailureReason(error) {
     : String(error);
 }
 
+/**
+ * Format a single stdout summary line for one chain's inbox ack outcome.
+ *
+ * @param {string} label - `<chainId>` for archive, `<state-dir-hash>/<chainId>` for historical close.
+ * @param {{ acknowledged?: number, error?: string, skipped?: boolean } | undefined} row
+ * @param {{ skipped?: boolean }} [opts]
+ * @returns {string}
+ */
+export function formatInboxAckLine(label, row, { skipped = false } = {}) {
+  if (skipped || row?.skipped) {
+    return `Inbox ack skipped for ${label}: KUSABI_CHAIN_NOTIFY=0`;
+  }
+  if (row && typeof row.error !== "string" && Number.isInteger(row.acknowledged)) {
+    const noun = row.acknowledged === 1 ? "entry" : "entries";
+    return `Acknowledged ${row.acknowledged} inbox ${noun} for ${label}.`;
+  }
+  const reason = row?.error ?? "kaiba ack client returned no result";
+  return `Inbox ack failed for ${label}: ${reason}`;
+}
+
 function logAckFailure(subject, reason) {
   console.error(`[chain-notify] inbox ack failed for ${subject}: ${reason}`);
 }

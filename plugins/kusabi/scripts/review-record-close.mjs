@@ -5,8 +5,7 @@ import { randomUUID } from "node:crypto";
 import { stateRoot } from "./state-paths.mjs";
 import { isUnadjudicatedRecord } from "./review-record-scan.mjs";
 import { readChainControl, withControlWriteLock } from "./chain-control.mjs";
-import { acknowledgeChainInbox, inboxSubject, stateDirForChain } from "./chain-notify.mjs";
-import { formatInboxAckLine } from "./review-record-archive.mjs";
+import { acknowledgeChainInbox, formatInboxAckLine, inboxSubject, stateDirForChain } from "./chain-notify.mjs";
 
 export const FINDINGS_HEADER = "## Findings adjudication (fill at inspection)";
 const FINDINGS_HEADER_PATTERN = /^[ \t]*## Findings adjudication \(fill at inspection\)[ \t]*(\r?\n|$)/m;
