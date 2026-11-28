@@ -581,7 +581,9 @@ The one place the disposition set lies is **after a `chain-resume`**: `rearmChai
   - a timeout.
 - **Time bound.** One kaiba session's cost is startup, not per-subject calls. The whole attempt is therefore bounded to 2 s regardless of how many chain ids a close run acknowledges — the same bound as an append.
 - **Opt-out.** `KUSABI_CHAIN_NOTIFY=0` skips the acknowledgement entirely, with no spawn; close reports `0` record-less acknowledged.
-- **Retry.** A failed ack is retried by running `review-record-archive <chainId>` again — an unchanged record still acknowledges again.
+- **Retry.** A failed ack is retried per chain:
+  - a chain with a record — archived, or historically marked by close (the mark counts as adjudicated, so archive accepts the record) — by running `review-record-archive <chainId>` again; an unchanged record still acknowledges again. Re-running historical close does not retry it, because a marked record is no longer a close target;
+  - a record-less chain by running `review-record-close --historical --before <ISO> --apply` again, since close writes no file for it and the chain still qualifies.
 
 #### 3.5.7d `task-detach` and `task-wait` — standalone background tasks and external notifier boundary (kusabi #491)
 
