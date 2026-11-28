@@ -4,7 +4,7 @@ import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { chainStateDirFor, stateRoot } from "./state-paths.mjs";
 import { unfilledAdjudicationLines } from "./review-record-table.mjs";
-import { acknowledgeChainInbox, stateDirForChain } from "./chain-notify.mjs";
+import { acknowledgeChainInbox, formatInboxAckLine, stateDirForChain } from "./chain-notify.mjs";
 
 export const USAGE = "Usage: review-record-archive <chainId> --kairanban <path> [--force] [--state-root <dir>]";
 
@@ -169,17 +169,19 @@ export function archiveReviewRecord({
   // Best-effort: the record is archived either way. A failed ack only logs.
   // The subject carries the state directory's hash so the ack cannot reach a
   // same-named chain in another state directory.
-  acknowledgeChainInbox({
+  const ackResult = acknowledgeChainInbox({
     chains: [{ stateDir: stateDirForChain(chainDir), chainId }],
     env,
     mcpConfigFile,
     timeoutMs: notifyTimeoutMs,
   });
+  const ackLine = formatInboxAckLine(chainId, ackResult?.results?.[0], { skipped: Boolean(ackResult?.skipped) });
 
   const commands = `git -C ${shellQuote(path.resolve(kairanbanDir))} add ${targetRelative} && git -C ${shellQuote(path.resolve(kairanbanDir))} commit -m "Archive review record for ${repoName} ${chainId}" && git -C ${shellQuote(path.resolve(kairanbanDir))} push`;
   return [
     ...(fallbackMessage ? [fallbackMessage] : []),
     unchanged ? "unchanged" : `wrote ${path.join(targetRelative, "review-record.md")} and ${path.join(targetRelative, "brief.md")}`,
+    ackLine,
     commands,
   ].join("\n");
 }
