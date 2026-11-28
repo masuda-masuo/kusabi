@@ -4,13 +4,14 @@ import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { stateRoot } from "./state-paths.mjs";
 import { isUnadjudicatedRecord } from "./review-record-scan.mjs";
-import { withControlWriteLock } from "./chain-control.mjs";
-import { acknowledgeChainInbox, stateDirForChain } from "./chain-notify.mjs";
+import { readChainControl, withControlWriteLock } from "./chain-control.mjs";
+import { acknowledgeChainInbox, inboxSubject, stateDirForChain } from "./chain-notify.mjs";
 
 export const FINDINGS_HEADER = "## Findings adjudication (fill at inspection)";
 const FINDINGS_HEADER_PATTERN = /^[ \t]*## Findings adjudication \(fill at inspection\)[ \t]*(\r?\n|$)/m;
 export const HISTORICAL_MARK_PREFIX = "<!-- historical: not adjudicated; closed by review-record-close before ";
 export const USAGE = "Usage: kusabi-companion review-record-close --historical --before <ISO> [--apply] [--state-root <dir>]";
+const TERMINAL_CHAIN_STATUSES = new Set(["completed", "failed", "cancelled"]);
 
 export function finishedTimestamp(content) {
   for (const line of content.split(/\r?\n/)) {
@@ -39,13 +40,13 @@ export function hasHistoricalMark(content) {
   return false;
 }
 
-export function listRecords(root) {
-  const records = [];
+function listChainDirectories(root) {
+  const dirs = [];
   let workspaces;
   try {
     workspaces = fs.readdirSync(root, { withFileTypes: true });
   } catch {
-    return records;
+    return dirs;
   }
   for (const workspace of workspaces) {
     if (!workspace.isDirectory()) continue;
@@ -58,12 +59,20 @@ export function listRecords(root) {
     }
     for (const chain of chains) {
       if (!chain.isDirectory()) continue;
-      const recordPath = path.join(chainsDir, chain.name, "review-record.md");
-      try {
-        if (fs.statSync(recordPath).isFile()) records.push(recordPath);
-      } catch {
-        // Missing or unreadable record: it cannot be a target.
-      }
+      dirs.push(path.join(chainsDir, chain.name));
+    }
+  }
+  return dirs.sort();
+}
+
+export function listRecords(root) {
+  const records = [];
+  for (const chainDir of listChainDirectories(root)) {
+    const recordPath = path.join(chainDir, "review-record.md");
+    try {
+      if (fs.statSync(recordPath).isFile()) records.push(recordPath);
+    } catch {
+      // Missing or unreadable record: it cannot be a target.
     }
   }
   return records.sort();
@@ -107,6 +116,51 @@ export function scanReviewRecords({ before, stateRootDir = stateRoot() }) {
   return { targets, skipped };
 }
 
+function hasReviewRecordEntry(chainDir) {
+  try {
+    fs.lstatSync(path.join(chainDir, "review-record.md"));
+    return true;
+  } catch (error) {
+    return error?.code !== "ENOENT";
+  }
+}
+
+function evaluateRecordlessChain(chainDir, cutoff) {
+  if (hasReviewRecordEntry(chainDir)) return null;
+  const control = readChainControl(chainDir);
+  if (!control || typeof control !== "object" || Array.isArray(control)) return null;
+  if (typeof control.status !== "string" || !TERMINAL_CHAIN_STATUSES.has(control.status)) return null;
+  if (typeof control.finishedAt !== "string") return null;
+  const finished = Date.parse(control.finishedAt);
+  if (!Number.isFinite(finished) || finished >= cutoff) return null;
+  if (typeof control.terminalOccurrenceId !== "string" || control.terminalOccurrenceId.trim().length === 0) {
+    return null;
+  }
+  return {
+    stateDir: stateDirForChain(chainDir),
+    chainId: path.basename(chainDir),
+    status: control.status,
+    finishedAt: control.finishedAt,
+  };
+}
+
+function chainDirForRecordless(entry) {
+  return path.join(entry.stateDir, "chains", entry.chainId);
+}
+
+export function scanRecordlessChains({ before, stateRootDir = stateRoot() }) {
+  validateBefore(before);
+  const cutoff = Date.parse(before);
+  if (!Number.isFinite(cutoff)) throw new Error(`--before must be a parseable date: ${before}`);
+
+  const recordless = [];
+  for (const chainDir of listChainDirectories(stateRootDir)) {
+    const entry = evaluateRecordlessChain(chainDir, cutoff);
+    if (entry) recordless.push(entry);
+  }
+  return recordless;
+}
+
 function insertHistoricalMark(content, before) {
   validateBefore(before);
   const header = content.match(/^[ \t]*## Findings adjudication \(fill at inspection\)[ \t]*(\r?\n|$)/m);
@@ -137,10 +191,18 @@ export function closeReviewRecords({
   notifyTimeoutMs,
 }) {
   validateBefore(before);
+  const cutoff = Date.parse(before);
   const { targets, skipped } = scanReviewRecords({ before, stateRootDir });
-  if (apply && targets.length > 0) {
+  const recordless = scanRecordlessChains({ before, stateRootDir });
+  if (apply && (targets.length > 0 || recordless.length > 0)) {
     const sortedTargets = [...targets].sort((a, b) => a.path.localeCompare(b.path));
-    const dirs = [...new Set(sortedTargets.map((target) => path.dirname(target.path)))].sort();
+    const sortedRecordless = [...recordless].sort((a, b) =>
+      chainDirForRecordless(a).localeCompare(chainDirForRecordless(b)),
+    );
+    const dirs = [...new Set([
+      ...sortedTargets.map((target) => path.dirname(target.path)),
+      ...sortedRecordless.map(chainDirForRecordless),
+    ])].sort();
 
     const closed = withAllControlWriteLocks(dirs, () => {
       const planned = [];
@@ -210,30 +272,73 @@ export function closeReviewRecords({
         throw error;
       }
 
+      const confirmedRecordless = [];
+      for (const entry of sortedRecordless) {
+        const chainDir = chainDirForRecordless(entry);
+        const rechecked = evaluateRecordlessChain(chainDir, cutoff);
+        if (!rechecked) {
+          skipped.push({ path: chainDir, reason: "changed since scan" });
+          continue;
+        }
+        confirmedRecordless.push(rechecked);
+      }
+
       return {
         targets: planned.map(({ targetPath }) => targetPath),
         skipped,
         written: planned.length,
+        recordless: confirmedRecordless,
       };
     });
+
+    const ackItems = [];
+    const seenSubjects = new Set();
+    for (const targetPath of closed.targets) {
+      const chainDir = path.dirname(targetPath);
+      const stateDir = stateDirForChain(chainDir);
+      const chainId = path.basename(chainDir);
+      const subject = inboxSubject(stateDir, chainId);
+      if (seenSubjects.has(subject)) continue;
+      seenSubjects.add(subject);
+      ackItems.push({ stateDir, chainId, isRecordless: false });
+    }
+    for (const entry of closed.recordless) {
+      const subject = inboxSubject(entry.stateDir, entry.chainId);
+      if (seenSubjects.has(subject)) continue;
+      seenSubjects.add(subject);
+      ackItems.push({ stateDir: entry.stateDir, chainId: entry.chainId, isRecordless: true });
+    }
 
     // Best-effort, after the control locks are released so a slow or hung
     // kaiba never holds them: the marks are written either way and a failed
     // ack only logs. The chain directory is <stateDir>/chains/<chainId>, so
-    // the record path yields both the chain id and the state directory whose
-    // hash prefixes the ack subject.
-    acknowledgeChainInbox({
-      chains: closed.targets.map((targetPath) => {
-        const chainDir = path.dirname(targetPath);
-        return { stateDir: stateDirForChain(chainDir), chainId: path.basename(chainDir) };
-      }),
+    // it yields both the chain id and the state directory whose hash prefixes
+    // the ack subject.
+    const ackResult = acknowledgeChainInbox({
+      chains: ackItems.map(({ stateDir, chainId }) => ({ stateDir, chainId })),
       env,
       mcpConfigFile,
       timeoutMs: notifyTimeoutMs,
     });
-    return closed;
+    let recordlessAcknowledged = 0;
+    if (!ackResult?.skipped && Array.isArray(ackResult?.results)) {
+      for (let index = 0; index < ackItems.length; index += 1) {
+        if (!ackItems[index].isRecordless) continue;
+        const row = ackResult.results[index];
+        if (row && !row.error && !row.skipped) {
+          recordlessAcknowledged += 1;
+        }
+      }
+    }
+    return { ...closed, recordlessAcknowledged };
   }
-  return { targets: targets.map(({ path: recordPath }) => recordPath), skipped, written: 0 };
+  return {
+    targets: targets.map(({ path: recordPath }) => recordPath),
+    skipped,
+    written: 0,
+    recordless,
+    recordlessAcknowledged: 0,
+  };
 }
 
 function parseArgs(argv) {
@@ -257,14 +362,29 @@ function parseArgs(argv) {
   return options;
 }
 
-export function cmdReviewRecordClose(argv) {
+export function cmdReviewRecordClose(argv, { env, mcpConfigFile, notifyTimeoutMs } = {}) {
   const options = parseArgs(argv);
   const stateRootDir = options.stateRoot ?? stateRoot();
-  const result = closeReviewRecords({ ...options, stateRootDir });
+  const result = closeReviewRecords({
+    ...options,
+    stateRootDir,
+    ...(env !== undefined ? { env } : {}),
+    ...(mcpConfigFile !== undefined ? { mcpConfigFile } : {}),
+    ...(notifyTimeoutMs !== undefined ? { notifyTimeoutMs } : {}),
+  });
   const lines = options.apply
-    ? [`Wrote ${result.written} historical mark(s).`]
+    ? [
+        `Wrote ${result.written} historical mark(s).`,
+        `Acknowledged ${result.recordlessAcknowledged} record-less chain(s).`,
+      ]
     : [`Targets: ${result.targets.length}`, ...result.targets.map((recordPath) => `target: ${recordPath}`)];
   lines.push(`Skipped: ${result.skipped.length}`);
   lines.push(...result.skipped.map(({ path: recordPath, reason }) => `skipped: ${reason}: ${recordPath}`));
+  if (!options.apply && result.recordless.length > 0) {
+    lines.push(`Record-less chains: ${result.recordless.length}`);
+    for (const entry of result.recordless) {
+      lines.push(`record-less: ${path.basename(entry.stateDir)}/${entry.chainId} ${entry.status} ${entry.finishedAt}`);
+    }
+  }
   return lines.join("\n");
 }

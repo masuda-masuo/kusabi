@@ -2,7 +2,7 @@
 // The stdio child below is a protocol fixture that substitutes for kaiba; it
 // never touches a real kaiba server or the operator's config.
 
-import { after, describe, it } from "node:test";
+import { after, describe, it, mock } from "node:test";
 import assert from "node:assert/strict";
 import crypto from "node:crypto";
 import fs from "node:fs";
@@ -10,7 +10,8 @@ import os from "node:os";
 import path from "node:path";
 
 import { archiveReviewRecord } from "./review-record-archive.mjs";
-import { closeReviewRecords } from "./review-record-close.mjs";
+import { closeReviewRecords, cmdReviewRecordClose } from "./review-record-close.mjs";
+import { rearmChainControl } from "./chain-control.mjs";
 import {
   KAIBA_INBOX_TOOLS,
   acknowledgeChainInbox,
@@ -673,5 +674,435 @@ describe("the ack bound does not scale with the number of chains", () => {
 describe("shared kaiba tool list", () => {
   it("declares both inbox operations used by the append and ack lookups", () => {
     assert.deepEqual(KAIBA_INBOX_TOOLS, ["inbox_append", "inbox_ack_subject"]);
+  });
+});
+
+function writeControl(root, chain, control, hash = "workspace-hash") {
+  const chainDir = path.join(root, hash, "chains", chain);
+  fs.mkdirSync(chainDir, { recursive: true });
+  if (control !== null) {
+    fs.writeFileSync(path.join(chainDir, "control.json"), JSON.stringify(control, null, 2));
+  }
+  return chainDir;
+}
+
+function snapshotTree(root) {
+  const entries = [];
+  function walk(dir) {
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      const fullPath = path.join(dir, entry.name);
+      entries.push(`${path.relative(root, fullPath)}${entry.isDirectory() ? "/" : ""}`);
+      if (entry.isDirectory()) walk(fullPath);
+    }
+  }
+  walk(root);
+  return entries.sort();
+}
+
+describe("historical close acknowledges record-less terminal chains", () => {
+  it("acknowledges record-less failed and cancelled chains before --before via stateful fixture without creating any files", () => {
+    const root = makeCloseRoot();
+    const hash = "aaaaaaaaaaaa";
+    writeControl(root, "chain-failed", {
+      chainId: "chain-failed",
+      status: "failed",
+      finishedAt: "2021-06-01T00:00:00.000Z",
+      terminalOccurrenceId: "occ-fail-1",
+    }, hash);
+    writeControl(root, "chain-cancelled", {
+      chainId: "chain-cancelled",
+      status: "cancelled",
+      finishedAt: "2021-07-01T00:00:00.000Z",
+      terminalOccurrenceId: "occ-cancel-1",
+    }, hash);
+    writeControl(root, "chain-completed", {
+      chainId: "chain-completed",
+      status: "completed",
+      finishedAt: "2021-08-01T00:00:00.000Z",
+      terminalOccurrenceId: "occ-done-1",
+    }, hash);
+
+    const fixture = makeStatefulFixture();
+    const stateDir = path.join(root, hash);
+    for (const [chainId, status, occurrenceId] of [
+      ["chain-failed", "failed", "occ-fail-1"],
+      ["chain-cancelled", "cancelled", "occ-cancel-1"],
+      ["chain-completed", "completed", "occ-done-1"],
+    ]) {
+      assert.equal(notifyChainTerminal({
+        stateDir,
+        chainId,
+        status,
+        disposition: null,
+        occurrenceId,
+        mcpConfigFile: fixture.configPath,
+        env: { KUSABI_CHAIN_NOTIFY: "1" },
+      }).inboxDelivered, true);
+    }
+
+    const beforeTree = snapshotTree(root);
+    const { result: output, lines } = withStderr(() => cmdReviewRecordClose(
+      ["--historical", "--before", BEFORE, "--apply", "--state-root", root],
+      { mcpConfigFile: fixture.configPath, env: { KUSABI_CHAIN_NOTIFY: "1" } },
+    ));
+
+    assert.deepEqual(lines, []);
+    assert.deepEqual(snapshotTree(root), beforeTree, "no file or directory created under state root");
+    assert.match(output, /^Wrote 0 historical mark\(s\)\.$/m);
+    assert.match(output, /^Acknowledged 3 record-less chain\(s\)\.$/m);
+
+    const state = readStatefulState(fixture);
+    assert.equal(state.entries.length, 3);
+    assert.deepEqual(state.entries.map((entry) => entry.open), [false, false, false]);
+  });
+
+  it("excludes non-qualifying record-less chains and chains without terminalOccurrenceId", () => {
+    const root = makeCloseRoot();
+    const hash = "bbbbbbbbbbbb";
+    writeControl(root, "chain-future", {
+      chainId: "chain-future",
+      status: "failed",
+      finishedAt: "2023-01-01T00:00:00.000Z",
+      terminalOccurrenceId: "occ-future",
+    }, hash);
+    writeControl(root, "chain-running", {
+      chainId: "chain-running",
+      status: "running",
+      finishedAt: "2021-01-01T00:00:00.000Z",
+      terminalOccurrenceId: "occ-running",
+    }, hash);
+    writeControl(root, "chain-stopping", {
+      chainId: "chain-stopping",
+      status: "stopping",
+      finishedAt: "2021-01-01T00:00:00.000Z",
+      terminalOccurrenceId: "occ-stopping",
+    }, hash);
+    writeControl(root, "chain-no-control", null, hash);
+    writeControl(root, "chain-no-finished", {
+      chainId: "chain-no-finished",
+      status: "failed",
+      terminalOccurrenceId: "occ-no-finished",
+    }, hash);
+    writeControl(root, "chain-bad-finished", {
+      chainId: "chain-bad-finished",
+      status: "cancelled",
+      finishedAt: "not-a-date",
+      terminalOccurrenceId: "occ-bad-finished",
+    }, hash);
+    writeControl(root, "chain-no-occurrence", {
+      chainId: "chain-no-occurrence",
+      status: "failed",
+      finishedAt: "2021-01-01T00:00:00.000Z",
+    }, hash);
+    writeControl(root, "chain-empty-occurrence", {
+      chainId: "chain-empty-occurrence",
+      status: "cancelled",
+      finishedAt: "2021-01-01T00:00:00.000Z",
+      terminalOccurrenceId: "",
+    }, hash);
+    // chain.json finishedAt/status must not override control.json.
+    const chainJsonOnlyDir = writeControl(root, "chain-json-only", {
+      chainId: "chain-json-only",
+      status: "running",
+      terminalOccurrenceId: "occ-json-only",
+    }, hash);
+    fs.writeFileSync(path.join(chainJsonOnlyDir, "chain.json"), JSON.stringify({
+      chainId: "chain-json-only",
+      status: "failed",
+      finishedAt: "2020-01-01T00:00:00.000Z",
+    }));
+    // A chain with a review-record.md must follow only the record path even if control.json looks record-less.
+    writeRecord(root, "chain-has-record", "2023-01-01T00:00:00.000Z", hash);
+    writeControl(root, "chain-has-record", {
+      chainId: "chain-has-record",
+      status: "failed",
+      finishedAt: "2020-01-01T00:00:00.000Z",
+      terminalOccurrenceId: "occ-has-record",
+    }, hash);
+
+    const fixture = makeAckFixture("success");
+    const dryOutput = cmdReviewRecordClose(
+      ["--historical", "--before", BEFORE, "--state-root", root],
+      { mcpConfigFile: fixture.configPath, env: { KUSABI_CHAIN_NOTIFY: "1" } },
+    );
+    assert.equal(dryOutput, "Targets: 0\nSkipped: 0");
+    assert.deepEqual(requestRows(fixture), []);
+
+    const applyResult = closeReviewRecords({
+      before: BEFORE,
+      stateRootDir: root,
+      apply: true,
+      mcpConfigFile: fixture.configPath,
+      env: { KUSABI_CHAIN_NOTIFY: "1" },
+    });
+    assert.equal(applyResult.written, 0);
+    assert.deepEqual(applyResult.recordless, []);
+    assert.equal(applyResult.recordlessAcknowledged, 0);
+    assert.deepEqual(requestRows(fixture), []);
+  });
+
+  it("lists record-less chains in their own dry-run block without writing or spawning kaiba", () => {
+    const root = makeCloseRoot();
+    const hash = "cccccccccccc";
+    const recordPath = writeRecord(root, "chain-rec", "2021-01-01T00:00:00.000Z", hash);
+    writeControl(root, "chain-rl-b", {
+      chainId: "chain-rl-b",
+      status: "cancelled",
+      finishedAt: "2021-03-01T00:00:00.000Z",
+      terminalOccurrenceId: "occ-b",
+    }, hash);
+    writeControl(root, "chain-rl-a", {
+      chainId: "chain-rl-a",
+      status: "failed",
+      finishedAt: "2021-02-01T00:00:00.000Z",
+      terminalOccurrenceId: "occ-a",
+    }, hash);
+    writeControl(root, "chain-rl-no-occ", {
+      chainId: "chain-rl-no-occ",
+      status: "failed",
+      finishedAt: "2021-01-01T00:00:00.000Z",
+    }, hash);
+
+    const fixture = makeAckFixture("success");
+    const beforeRecord = fs.readFileSync(recordPath, "utf8");
+    const beforeTree = snapshotTree(root);
+
+    const result = closeReviewRecords({
+      before: BEFORE,
+      stateRootDir: root,
+      apply: false,
+      mcpConfigFile: fixture.configPath,
+      env: { KUSABI_CHAIN_NOTIFY: "1" },
+    });
+    assert.equal(result.written, 0);
+    assert.deepEqual(result.targets, [recordPath]);
+    assert.deepEqual(result.recordless, [
+      {
+        stateDir: path.join(root, hash),
+        chainId: "chain-rl-a",
+        status: "failed",
+        finishedAt: "2021-02-01T00:00:00.000Z",
+      },
+      {
+        stateDir: path.join(root, hash),
+        chainId: "chain-rl-b",
+        status: "cancelled",
+        finishedAt: "2021-03-01T00:00:00.000Z",
+      },
+    ]);
+
+    const output = cmdReviewRecordClose(
+      ["--historical", "--before", BEFORE, "--state-root", root],
+      { mcpConfigFile: fixture.configPath, env: { KUSABI_CHAIN_NOTIFY: "1" } },
+    );
+    assert.equal(output, [
+      "Targets: 1",
+      `target: ${recordPath}`,
+      "Skipped: 0",
+      "Record-less chains: 2",
+      `record-less: ${hash}/chain-rl-a failed 2021-02-01T00:00:00.000Z`,
+      `record-less: ${hash}/chain-rl-b cancelled 2021-03-01T00:00:00.000Z`,
+    ].join("\n"));
+    assert.equal(fs.readFileSync(recordPath, "utf8"), beforeRecord);
+    assert.deepEqual(snapshotTree(root), beforeTree);
+    assert.deepEqual(requestRows(fixture), []);
+  });
+
+  it("acknowledges written records and record-less chains in one kaiba spawn", () => {
+    const root = makeCloseRoot();
+    const hash = "dddddddddddd";
+    const recordPath = writeRecord(root, "chain-record", "2021-01-01T00:00:00.000Z", hash);
+    writeRecord(root, "chain-record-future", "2023-01-01T00:00:00.000Z", hash);
+    writeControl(root, "chain-recordless", {
+      chainId: "chain-recordless",
+      status: "failed",
+      finishedAt: "2021-04-01T00:00:00.000Z",
+      terminalOccurrenceId: "occ-rl",
+    }, hash);
+
+    const fixture = makeAckFixture("success");
+    const output = cmdReviewRecordClose(
+      ["--historical", "--before", BEFORE, "--apply", "--state-root", root],
+      { mcpConfigFile: fixture.configPath, env: { KUSABI_CHAIN_NOTIFY: "1" } },
+    );
+    assert.match(output, /^Wrote 1 historical mark\(s\)\.$/m);
+    assert.match(output, /^Acknowledged 1 record-less chain\(s\)\.$/m);
+    assert.ok(fs.readFileSync(recordPath, "utf8").includes("<!-- historical:"));
+
+    assert.equal(spawnCount(fixture), 1, "records and record-less chains share one kaiba spawn");
+    const subjects = ackCalls(fixture).map(({ request }) => request.params.arguments.subject);
+    assert.deepEqual([...subjects].sort(), [
+      `${hash}:chain-record`,
+      `${hash}:chain-recordless`,
+    ]);
+  });
+
+  it("reports 0 record-less acknowledged and spawns nothing when KUSABI_CHAIN_NOTIFY=0 or ack fails", () => {
+    const root = makeCloseRoot();
+    const hash = "eeeeeeeeeeee";
+    writeControl(root, "chain-optout", {
+      chainId: "chain-optout",
+      status: "cancelled",
+      finishedAt: "2021-04-01T00:00:00.000Z",
+      terminalOccurrenceId: "occ-optout",
+    }, hash);
+
+    const successFixture = makeAckFixture("success");
+    const optOutOutput = cmdReviewRecordClose(
+      ["--historical", "--before", BEFORE, "--apply", "--state-root", root],
+      { mcpConfigFile: successFixture.configPath, env: { KUSABI_CHAIN_NOTIFY: "0" } },
+    );
+    assert.match(optOutOutput, /^Acknowledged 0 record-less chain\(s\)\.$/m);
+    assert.deepEqual(requestRows(successFixture), []);
+
+    const errorFixture = makeAckFixture("error-result");
+    const { result: errorOutput, lines } = withStderr(() => cmdReviewRecordClose(
+      ["--historical", "--before", BEFORE, "--apply", "--state-root", root],
+      { mcpConfigFile: errorFixture.configPath, env: { KUSABI_CHAIN_NOTIFY: "1" } },
+    ));
+    assert.match(errorOutput, /^Acknowledged 0 record-less chain\(s\)\.$/m);
+    assert.ok(lines.some((line) => line.startsWith("[chain-notify]") && line.includes("chain-optout")));
+  });
+
+  it("acknowledges only the qualifying state directory when two state directories share a record-less chain id", () => {
+    const root = makeCloseRoot();
+    const hashA = "111111111111";
+    const hashB = "222222222222";
+    const chainId = "chain-shared";
+    writeControl(root, chainId, {
+      chainId,
+      status: "failed",
+      finishedAt: "2021-01-01T00:00:00.000Z",
+      terminalOccurrenceId: "occ-a",
+    }, hashA);
+    writeControl(root, chainId, {
+      chainId,
+      status: "failed",
+      finishedAt: "2023-01-01T00:00:00.000Z",
+      terminalOccurrenceId: "occ-b",
+    }, hashB);
+
+    const fixture = makeStatefulFixture();
+    assert.equal(notifyChainTerminal({
+      stateDir: path.join(root, hashA),
+      chainId,
+      status: "failed",
+      disposition: null,
+      occurrenceId: "occ-a",
+      mcpConfigFile: fixture.configPath,
+      env: { KUSABI_CHAIN_NOTIFY: "1" },
+    }).inboxDelivered, true);
+    assert.equal(notifyChainTerminal({
+      stateDir: path.join(root, hashB),
+      chainId,
+      status: "failed",
+      disposition: null,
+      occurrenceId: "occ-b",
+      mcpConfigFile: fixture.configPath,
+      env: { KUSABI_CHAIN_NOTIFY: "1" },
+    }).inboxDelivered, true);
+
+    const result = closeReviewRecords({
+      before: BEFORE,
+      stateRootDir: root,
+      apply: true,
+      mcpConfigFile: fixture.configPath,
+      env: { KUSABI_CHAIN_NOTIFY: "1" },
+    });
+    assert.equal(result.recordless.length, 1);
+    assert.equal(result.recordlessAcknowledged, 1);
+
+    const state = readStatefulState(fixture);
+    const entryA = state.entries.find((entry) => entry.subject === `${hashA}:${chainId}`);
+    const entryB = state.entries.find((entry) => entry.subject === `${hashB}:${chainId}`);
+    assert.equal(entryA.open, false);
+    assert.equal(entryB.open, true);
+  });
+
+  it("drops a record-less chain rearmed or given a record between scan and lock", () => {
+    const root = makeCloseRoot();
+    const hash = "ffffffffffff";
+    const rearmedDir = writeControl(root, "chain-rearmed", {
+      chainId: "chain-rearmed",
+      status: "failed",
+      finishedAt: "2021-01-01T00:00:00.000Z",
+      terminalOccurrenceId: "occ-rearm",
+    }, hash);
+    const recordAddedDir = writeControl(root, "chain-record-added", {
+      chainId: "chain-record-added",
+      status: "cancelled",
+      finishedAt: "2021-01-01T00:00:00.000Z",
+      terminalOccurrenceId: "occ-added",
+    }, hash);
+    writeControl(root, "chain-still-valid", {
+      chainId: "chain-still-valid",
+      status: "failed",
+      finishedAt: "2021-01-01T00:00:00.000Z",
+      terminalOccurrenceId: "occ-valid",
+    }, hash);
+
+    let mutated = false;
+    const originalMkdirSync = fs.mkdirSync;
+    const lockOrder = [];
+    const mkdirSpy = mock.method(fs, "mkdirSync", function(dirPath, options) {
+      if (typeof dirPath === "string" && dirPath.endsWith(".control-write.lock")) {
+        lockOrder.push(path.basename(path.dirname(dirPath)));
+      }
+      const res = originalMkdirSync.call(this, dirPath, options);
+      if (!mutated && typeof dirPath === "string" && dirPath.endsWith(".control-write.lock")) {
+        mutated = true;
+        // Simulate rearm and record creation before the re-check inside the lock.
+        fs.writeFileSync(path.join(recordAddedDir, "review-record.md"), "# late record\n");
+        const control = JSON.parse(fs.readFileSync(path.join(rearmedDir, "control.json"), "utf8"));
+        fs.writeFileSync(path.join(rearmedDir, "control.json"), JSON.stringify({
+          ...control,
+          status: "running",
+          finishedAt: undefined,
+          terminalOccurrenceId: undefined,
+        }));
+      }
+      return res;
+    });
+
+    const fixture = makeAckFixture("success");
+    try {
+      const result = closeReviewRecords({
+        before: BEFORE,
+        stateRootDir: root,
+        apply: true,
+        mcpConfigFile: fixture.configPath,
+        env: { KUSABI_CHAIN_NOTIFY: "1" },
+      });
+      assert.deepEqual(lockOrder, ["chain-rearmed", "chain-record-added", "chain-still-valid"]);
+      assert.deepEqual(result.skipped, [
+        { path: rearmedDir, reason: "changed since scan" },
+        { path: recordAddedDir, reason: "changed since scan" },
+      ]);
+      assert.equal(result.recordless.length, 1);
+      assert.equal(result.recordless[0].chainId, "chain-still-valid");
+      assert.equal(result.recordlessAcknowledged, 1);
+      assert.deepEqual(
+        ackCalls(fixture).map(({ request }) => request.params.arguments.subject),
+        [`${hash}:chain-still-valid`],
+      );
+    } finally {
+      mkdirSpy.mock.restore();
+    }
+    // Also confirm real rearmChainControl clears finishedAt / terminalOccurrenceId so rearmed chains do not qualify.
+    const rearmedCheck = writeControl(root, "chain-rearm-api", {
+      chainId: "chain-rearm-api",
+      status: "failed",
+      finishedAt: "2021-01-01T00:00:00.000Z",
+      terminalOccurrenceId: "occ-api",
+    }, hash);
+    rearmChainControl({ chainDir: rearmedCheck, round: 1 });
+    const afterRearm = closeReviewRecords({
+      before: BEFORE,
+      stateRootDir: root,
+      apply: false,
+      mcpConfigFile: fixture.configPath,
+      env: { KUSABI_CHAIN_NOTIFY: "1" },
+    });
+    assert.equal(afterRearm.recordless.some((entry) => entry.chainId === "chain-rearm-api"), false);
   });
 });
