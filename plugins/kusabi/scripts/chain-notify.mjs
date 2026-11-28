@@ -129,7 +129,7 @@ function logAckFailure(subject, reason) {
  * @param {NodeJS.ProcessEnv} [opts.env=process.env]
  * @param {string} [opts.mcpConfigFile]
  * @param {number} [opts.timeoutMs]
- * @returns {{ skipped?: boolean, results: Array<{ chainId: string, acknowledged?: number, error?: string, skipped?: boolean }> }}
+ * @returns {{ skipped?: boolean, results: Array<{ chainId: string, subject: string, acknowledged?: number, error?: string, skipped?: boolean }> }}
  */
 export function acknowledgeChainInbox({ chains = [], env = process.env, mcpConfigFile, timeoutMs } = {}) {
   const entries = [];
@@ -144,13 +144,13 @@ export function acknowledgeChainInbox({ chains = [], env = process.env, mcpConfi
   }
   if (entries.length === 0) return { results: [] };
   if (env.KUSABI_CHAIN_NOTIFY === "0") {
-    return { skipped: true, results: entries.map(({ chainId }) => ({ chainId, skipped: true })) };
+    return { skipped: true, results: entries.map(({ chainId, subject }) => ({ chainId, subject, skipped: true })) };
   }
 
   const boundMs = ackTimeoutFor(timeoutMs);
   const failAll = (reason) => {
     for (const { subject } of entries) logAckFailure(subject, reason);
-    return { results: entries.map(({ chainId }) => ({ chainId, error: reason })) };
+    return { results: entries.map(({ chainId, subject }) => ({ chainId, subject, error: reason })) };
   };
 
   let definition;
@@ -209,17 +209,17 @@ export function acknowledgeChainInbox({ chains = [], env = process.env, mcpConfi
       const row = bySubject.get(subject);
       if (!row) {
         logAckFailure(subject, "kaiba ack client returned no result");
-        return { chainId, error: "kaiba ack client returned no result" };
+        return { chainId, subject, error: "kaiba ack client returned no result" };
       }
       if (typeof row.error === "string") {
         logAckFailure(subject, row.error);
-        return { chainId, error: row.error };
+        return { chainId, subject, error: row.error };
       }
       if (!Number.isInteger(row.acknowledged) || row.acknowledged < 0) {
         logAckFailure(subject, "kaiba ack client returned an invalid acknowledged count");
-        return { chainId, error: "kaiba ack client returned an invalid acknowledged count" };
+        return { chainId, subject, error: "kaiba ack client returned an invalid acknowledged count" };
       }
-      return { chainId, acknowledged: row.acknowledged };
+      return { chainId, subject, acknowledged: row.acknowledged };
     }),
   };
 }
