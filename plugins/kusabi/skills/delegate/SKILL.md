@@ -91,7 +91,7 @@ Worker reports are claims, not evidence. They have been false before.
 - **`NOT CAUGHT` mutation = your mutation's problem until proven otherwise.** When default value equals boundary moved, mutation is equivalent and unobservable — adding test is not the answer.
 - **Machine dispositions decide rounds, not outward actions.** `accept-with-followup` drafts follow-up; filing it is yours. Never conclude on followup while critical/high finding open; treat wrong premise as brief to rewrite, not finding to defer.
 - **Close loop on review record.** Chain reaching terminal disposition prints `review-record.md` path (`docs/design/phase-chain.md`). Fill two fill-at-inspection sections (adjudication + precedent) and post to archive repo (orchestrator-exclusive, same exit principle as publish; unposted record = write-only state).
-- **Terminal notification is automatic.** Every terminal chain writes inbox file at `{stateDir}/inbox/{chainId}.md` and best-effort appends kaiba agenda row (opt-out: `KUSABI_CHAIN_NOTIFY=0`). Durable completion signal without session-bound `chain-wait`.
+- **Terminal notification is automatic.** Every terminal chain writes inbox file at `{stateDir}/inbox/{chainId}.md` and best-effort appends a kaiba inbox entry, acknowledged automatically when the record is archived or historically closed (opt-out: `KUSABI_CHAIN_NOTIFY=0`). Durable completion signal without session-bound `chain-wait`.
 - **Move work queue in same turn that chain terminates or merge confirmed.** Terminal digest and merge confirmation each arrive as a turn; one-line queue update belongs in that turn to prevent stale state.
 
 ## Publish

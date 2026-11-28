@@ -8,6 +8,13 @@ import { describe, it, mock } from "node:test";
 import { archiveReviewRecord, cmdReviewRecordArchive } from "./review-record-archive.mjs";
 import { countUnfilledReviewRecords } from "./review-record-scan.mjs";
 
+// Archive now acknowledges the chain's kaiba inbox entries (kusabi #800).
+// These tests cover the archive itself; keep them from resolving the
+// operator's real kaiba definition. The ack path is covered with protocol
+// fixtures in chain-inbox-ack.test.mjs. node --test runs each file in its
+// own process, so this does not leak into other files.
+process.env.KUSABI_CHAIN_NOTIFY = "0";
+
 const CWD = path.join(os.tmpdir(), "kusabi-review-record-archive-workspace");
 const HASH = crypto.createHash("sha256").update(CWD).digest("hex").slice(0, 12);
 

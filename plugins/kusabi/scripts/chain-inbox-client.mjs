@@ -1,4 +1,6 @@
-// Minimal bounded stdio MCP client for kaiba inbox_append.
+// Minimal bounded stdio MCP client for the kaiba inbox operations kusabi uses:
+// inbox_append (terminal notifications) and inbox_ack_subject (acknowledging a
+// chain's open entries once the orchestrator has closed it).
 import { spawn } from "node:child_process";
 import { createInterface } from "node:readline";
 
@@ -78,6 +80,32 @@ function compatibleTool(tool) {
   return metadataAcceptsObject(schema.properties.metadata);
 }
 
+function ackCompatibleTool(tool) {
+  const schema = tool?.inputSchema;
+  return tool?.name === "inbox_ack_subject" &&
+    schema?.type === "object" &&
+    Boolean(schema.properties) && typeof schema.properties === "object" &&
+    Array.isArray(schema.required) &&
+    schema.required.every((name) => name === "subject") &&
+    schema.required.includes("subject") &&
+    schema.properties.subject?.type === "string";
+}
+
+function validAck(result) {
+  if (!result || result.isError === true) return null;
+  let value = result.structuredContent;
+  if (value === undefined) {
+    for (const part of result.content ?? []) {
+      if (part?.type !== "text" || typeof part.text !== "string") continue;
+      try { value = JSON.parse(part.text); break; } catch { /* Try another text block. */ }
+    }
+  }
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  if (typeof value.error === "string") return { error: value.error };
+  if (!Array.isArray(value.acknowledged)) return null;
+  return { acknowledged: value.acknowledged };
+}
+
 function validSuccess(result) {
   if (!result || result.isError === true || result.structuredContent?.error) return null;
   let value = result.structuredContent;
@@ -113,6 +141,9 @@ async function main() {
   const chunks = [];
   for await (const chunk of process.stdin) chunks.push(chunk);
   const input = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+  const operation = input.operation ?? "append";
+  // Same bound as an append: one kaiba session's cost is startup, not the
+  // number of subjects, so ack does not scale with the subject count.
   const deadline = Date.now() + Math.max(50, Math.min(input.timeoutMs - 200, 1800));
   const env = { ...process.env, ...input.env, KAIBA_INBOX_PRODUCER: "kusabi", KAIBA_READONLY: "1" };
   delete env.KAIBA_HTTP_PORT;
@@ -135,6 +166,31 @@ async function main() {
   }
   server.stdin.write(JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized", params: {} }) + "\n");
   const listing = await request("tools/list", {}, deadline);
+
+  if (operation === "ack") {
+    if (!listing || !Array.isArray(listing.tools) || !listing.tools.some(ackCompatibleTool)) {
+      throw new Error("inbox_ack_subject tool unavailable or incompatible");
+    }
+    const subjects = Array.isArray(input.subjects)
+      ? input.subjects.filter((subject) => typeof subject === "string" && subject.length > 0)
+      : [];
+    const results = [];
+    for (const subject of subjects) {
+      try {
+        const result = await request("tools/call", { name: "inbox_ack_subject", arguments: { subject } }, deadline);
+        const parsed = validAck(result);
+        if (!parsed) results.push({ subject, error: "inbox_ack_subject returned an invalid or failed result" });
+        else if (parsed.error !== undefined) results.push({ subject, error: parsed.error });
+        else results.push({ subject, acknowledged: parsed.acknowledged.length });
+      } catch (error) {
+        results.push({ subject, error: error instanceof Error ? error.message : String(error) });
+      }
+    }
+    process.stdout.write(JSON.stringify({ ok: true, results }) + "\n");
+    await cleanup("SIGTERM");
+    return;
+  }
+
   if (!listing || !Array.isArray(listing.tools) || !listing.tools.some(compatibleTool)) {
     throw new Error("inbox_append tool unavailable or incompatible");
   }

@@ -12,6 +12,13 @@ import { countUnfilledReviewRecords } from "./review-record-scan.mjs";
 import { scanReviewRecords } from "./review-record-close.mjs";
 import { adjudicateReviewRecord } from "./review-record-adjudicate.mjs";
 
+// Historical close now acknowledges the closed chains' kaiba inbox entries
+// (kusabi #800). Keep these tests, and the companion subprocesses they spawn
+// (which inherit this env), from resolving the operator's real kaiba
+// definition. The ack path is covered with protocol fixtures in
+// chain-inbox-ack.test.mjs. node --test runs each file in its own process.
+process.env.KUSABI_CHAIN_NOTIFY = "0";
+
 const BEFORE = "2022-01-01T00:00:00.000Z";
 const COMPANION = fileURLToPath(new URL("./kusabi-companion.mjs", import.meta.url));
 

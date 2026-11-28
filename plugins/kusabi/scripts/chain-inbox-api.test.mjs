@@ -298,7 +298,7 @@ describe("notifyChainTerminal kaiba inbox stdio boundary", () => {
     assert.deepEqual(call.params.arguments, {
       event_key: "chain-terminal:chain-fixture-752:occurrence-1",
       event_type: "chain_terminal",
-      subject: "chain-fixture-752",
+      subject: "state:chain-fixture-752",
       title: "fixture workspace",
       metadata: {
         status: "completed",
